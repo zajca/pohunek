@@ -175,7 +175,7 @@ impl Fixture {
                 tag: "ci",
             });
         }
-        for (component, target) in [("cli", MAC), ("cli", GNU), ("cli", MUSL), ("relay", GNU)] {
+        for (component, target) in [("cli", MAC), ("cli", GNU), ("cli", MUSL)] {
             self.write_plain_archive(component, target);
         }
         for name in ["protocol", "sdk", "testkit"] {
@@ -505,7 +505,6 @@ fn a_complete_set_assembles_a_verifiable_reproducible_bundle() {
         format!("pohunek-daemon-{VERSION}-{MAC}.tar.gz"),
         format!("pohunek-daemon-{VERSION}-{GNU}.tar.gz"),
         format!("pohunek-daemon-{VERSION}-{MUSL}.tar.gz"),
-        format!("pohunek-relay-{VERSION}-{GNU}.tar.gz"),
         format!("pohunek-ts-protocol-{VERSION}.tgz"),
         format!("pohunek-ts-sdk-{VERSION}.tgz"),
         format!("pohunek-ts-testkit-{VERSION}.tgz"),
@@ -1195,7 +1194,7 @@ fn the_checked_in_policy_lists_every_archive_the_release_workflow_builds() {
             .or_default()
             .push(slot.target.clone());
     }
-    assert_eq!(slots.len(), 7);
+    assert_eq!(slots.len(), 6);
     assert_eq!(policy.daemon_targets(), [MAC, GNU, MUSL]);
     assert_eq!(policy.catalog_validity_days, 365);
     assert_eq!(policy.sdk_packages, ["protocol", "sdk", "testkit"]);

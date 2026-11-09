@@ -79,10 +79,10 @@ env:
   PYTHONSAFEPATH: "1"
   # Test binaries (issue #170): job `build-tests` compiles the workspace test
   # binaries once (`cargo nextest archive --workspace --all-features`) and
-  # uploads the archive. The test jobs (fast shards, heavy, relay DB) download
+  # uploads the archive. The test jobs (fast shards, heavy) download
   # it and run from it via scripts/test-partitions --archive-file; they install
-  # only cargo-nextest, no rust-cache (the heavy job also needs a toolchain with
-  # Clippy and the fetched crate sources for xtask::dependency_policy). Tests
+  # only cargo-nextest, no rust-cache (the heavy job also needs the fetched
+  # crate sources for xtask::dependency_policy). Tests
   # resolve binaries and sources at run time (`CARGO_BIN_EXE_*`,
   # `CARGO_MANIFEST_DIR`, the worker beside the test binaries), so the archive
   # is relocatable: the test jobs check the repository out into `relocated/`,
@@ -744,7 +744,6 @@ jobs:
       sdk_gates: ${{ steps.select.outputs.sdk_gates }}
       fast_shards: ${{ steps.plan.outputs.fast_shards }}
       heavy: ${{ steps.plan.outputs.heavy }}
-      relay_db: ${{ steps.plan.outputs.relay_db }}
       lane: ${{ steps.plan.outputs.lane }}
     steps:
       - uses: actions/checkout@v4
@@ -853,7 +852,7 @@ jobs:
           if-no-files-found: error
 
   # Compiles every workspace test binary exactly once for the fast shards, the
-  # heavy job, and the relay DB job (issue #170). Designated `test-debug`
+  # and heavy job (issue #170). Designated `test-debug`
   # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
@@ -923,7 +922,7 @@ jobs:
       fail-fast: false
       matrix:
         # The shards a narrowed selection plans; every shard otherwise.
-        shard: ${{ fromJSON(github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.fast_shards || '["core", "daemon", "relay", "cli"]') }}
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.fast_shards || '["core", "daemon", "cli"]') }}
     defaults:
       run:
         working-directory: relocated
@@ -1018,9 +1017,8 @@ jobs:
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
   # drift) only run when their inputs change or on a schedule; the
   # always-critical jobs (fmt, clippy, fast tests, heavy tests, doctests,
-  # docs check, relay DB) still run on every push and PR. The release build
-  # is gated by the `release` filter. The workflow file
-  # itself forces a relay run so filter edits are always validated. Every
+  # docs check) still run on every push and PR. The release build
+  # is gated by the `release` filter. Every
   # filter lists rust-toolchain.toml and .github/actions/setup-rust/**, so a
   # toolchain pin change runs every Rust job.
   changes:
@@ -1030,7 +1028,6 @@ jobs:
       pull-requests: read
       actions: write
     outputs:
-      relay: ${{ steps.filter.outputs.relay }}
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
       macos: ${{ steps.filter.outputs.macos }}
       macos_package: ${{ steps.filter.outputs.macos_package }}
@@ -1075,15 +1072,6 @@ jobs:
         id: filter
         with:
           filters: |
-            relay:
-              - 'crates/relay/**'
-              - 'crates/relay-client/**'
-              - 'crates/relay-protocol/**'
-              - 'crates/relay/migrations/**'
-              - 'Cargo.lock'
-              - '.github/workflows/ci.yml'
-              - 'rust-toolchain.toml'
-              - '.github/actions/setup-rust/**'
             # cargo-hack feature-powerset is expensive (issue #125): run only
             # on schedule or when the dependency graph, feature set, or any
             # workspace Rust source changes — the powerset compiles feature
@@ -1137,8 +1125,6 @@ jobs:
               - '.config/nextest.toml'
               - '.github/actions/hermes-test-python/**'
               - '.github/actions/setup-uv/**'
-              - 'crates/relay-client/**'
-              - 'crates/relay-protocol/**'
               - 'Cargo.lock'
               - '.cargo/**'
               - '.github/workflows/ci.yml'
@@ -1203,16 +1189,13 @@ jobs:
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
             # Covers both generators' inputs and outputs: the main protocol
-            # bindings plus the relay bindings (`crates/relay-protocol`, its
-            # `pohunek-relay-protocol` ts-rs export, `relay-generated`, and the
-            # emitted JSON fixtures) that `cargo xtask ts check` regenerates.
+            # bindings and the emitted JSON fixtures that `cargo xtask ts check`
+            # regenerates.
             docs_ts:
               - 'crates/protocol/**'
-              - 'crates/relay-protocol/**'
               - 'crates/xtask/Cargo.toml'
               - 'crates/xtask/src/**'
               - 'sdk/ts/protocol/src/generated/**'
-              - 'sdk/ts/protocol/src/relay-generated/**'
               - 'sdk/ts/protocol/fixtures/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
@@ -1349,14 +1332,11 @@ jobs:
         with:
           tool: cargo-nextest
 
-      # xtask::dependency_policy resolves an isolated fixture with
-      # `cargo tree --offline` and runs Clippy on it, so this job needs a
-      # toolchain with Clippy and the locked crates in the cargo registry. It
-      # compiles nothing else: the test binaries come from the archive.
+      # xtask::dependency_policy reads `cargo metadata --offline`, so this job
+      # needs the locked crates in the cargo registry. It compiles nothing
+      # else: the test binaries come from the archive.
       - name: Install Rust toolchain
         uses: ./relocated/.github/actions/setup-rust
-        with:
-          components: clippy
 
       - name: Fetch locked dependency sources
         run: cargo fetch --locked
@@ -1586,119 +1566,6 @@ jobs:
           echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
           gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
-  # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
-  # their own job whose Postgres service only starts when relay-relevant files
-  # changed (issue #121) — except on the nightly sweep and nightly manual
-  # dispatch, which are full runs even when the paths filter is empty.
-  # Push to main stays filtered on purpose: the merged commit's relay files
-  # still trigger the job via fetch-depth-2 detection, while unrelated pushes
-  # never start the Postgres service.
-  integration-relay:
-    name: tests (relay DB, PostgreSQL)
-    needs: [changes, build-tests, test-selection]
-    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || needs.changes.outputs.relay == 'true') && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.relay_db != 'false') }}
-    runs-on: ubuntu-26.04
-    permissions:
-      contents: read
-      actions: write
-    services:
-      postgres:
-        # Docker Official Image from Google's cache, pinned to its OCI index.
-        image: mirror.gcr.io/library/postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
-        env:
-          POSTGRES_DB: pohunek_test
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -U postgres -d pohunek_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-    defaults:
-      run:
-        working-directory: relocated
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: relocated
-          persist-credentials: false
-
-      # The sparse test tree and the relocated checkout hold no .github/actions
-      # at the workspace root when the cancel step runs, so the action is copied
-      # out of the checkout next to it.
-      - name: Keep the fail-fast action
-        run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: cargo-nextest
-
-      - name: Download test archive
-        uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
-          path: ${{ runner.temp }}/nextest-archive
-
-      # A test that runs cargo, such as `cargo metadata` in xtask's affected
-      # tests, finds the pinned toolchain installed. Otherwise rustup installs
-      # it mid-test, and concurrent installs race on ~/.rustup/downloads.
-      - name: Install Rust toolchain
-        uses: ./relocated/.github/actions/setup-rust
-
-      - name: Download test selection
-        if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: test-selection
-          path: ${{ runner.temp }}/test-selection
-
-      # The tests run from a tree holding only the files whose change selects
-      # them, so a read of any other path fails instead of passing with the
-      # test skipped. A run without sparse.txt keeps the full tree.
-      - name: Keep only the selection's files in the tree
-        if: env.TEST_SELECTION_SPARSE == 'true' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sparse="$RUNNER_TEMP/test-selection/sparse.txt"
-          if [ -f "$sparse" ]; then
-            git sparse-checkout set --no-cone --stdin < "$sparse"
-            echo "sparse tree of $(wc -l < "$sparse") files"
-          fi
-
-      - name: Relay database tests (bounded nextest concurrency)
-        shell: bash
-        env:
-          SHARD: relay-db
-          # Resolved at step level: the `job` context is not available in
-          # job-level `env`, where it makes the whole workflow invalid.
-          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
-          NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
-        run: |
-          set -euo pipefail
-          selection=()
-          if [ "$NARROWED" = true ]; then
-            selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
-          fi
-          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
-
-      - name: Summarize flaky tests
-        if: always()
-        run: python3 scripts/junit-flaky-summary --label relay-db target/nextest/relay-db/junit.xml
-
-      - name: Upload relay DB test report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nextest-junit-relay-db
-          path: relocated/target/nextest/relay-db/junit.xml
-          if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./cancel-run-action
-
   # G3 of #1218: each package's tests run from a tree holding only the files
   # whose change selects that package, so a test that reads a path outside
   # its selector's map fails here every night instead of passing a narrowed
@@ -1713,20 +1580,6 @@ jobs:
       actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    services:
-      postgres:
-        # Docker Official Image from Google's cache, pinned to its OCI index.
-        image: mirror.gcr.io/library/postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
-        env:
-          POSTGRES_DB: pohunek_test
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432/tcp
-        options: >-
-          --health-cmd "pg_isready -U postgres -d pohunek_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1745,11 +1598,9 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       # The selector is built here. xtask::dependency_policy, one of the
-      # audited tests, also needs Clippy and the locked crates in the registry.
+      # audited tests, also needs the locked crates in the registry.
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
-        with:
-          components: clippy
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1776,10 +1627,6 @@ jobs:
 
       - name: Run every package from its own sparse tree
         shell: bash
-        env:
-          # Resolved at step level: the `job` context is not available in
-          # job-level `env`, where it makes the whole workflow invalid.
-          POHUNEK_RELAY_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/pohunek_test
         run: |
           set -euo pipefail
           python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" audit-sparse --selector "$RUNNER_TEMP/xtask" --report-dir "$RUNNER_TEMP/test-selection-audit"
@@ -1854,21 +1701,20 @@ jobs:
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
-  # a pull request that plans nothing for it. The relay DB job is also gated
-  # by its paths filter, so only its failure or cancellation counts. The gate
+  # a pull request that plans nothing for it. The gate
   # jobs of the docs-only path must succeed or be skipped by that path, and the
   # macOS lane by its paths filter or a narrowed selection without lane tests.
   test-selection-verdict:
     name: test selection verdict
-    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, integration-relay, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos]
+    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos]
     if: ${{ always() }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
       - name: Fail a test job that failed or was skipped without a narrowed selection
-        if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')) || needs.integration-relay.result == 'failure' || needs.integration-relay.result == 'cancelled' || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
+        if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
         shell: bash
         env:
-          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }} relay-db=${{ needs.integration-relay.result }}"
+          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }}"
         run: |
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1
@@ -3555,7 +3401,6 @@ jobs:
       - macos-tier
       - fast-tests
       - integration
-      - integration-relay
       - hermes-package
       - pi-package
       - codex-package

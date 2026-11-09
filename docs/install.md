@@ -17,12 +17,12 @@ documentation under `docs/offline/`.
 Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `packaging/install-daemon.sh` wrapper around `pohunek service install`, plus
 `runtime-catalog-anchor.json`, the runtime-catalog trust anchor that the daemon
-reads from the directory of its executable. CLI and relay archives do not
+reads from the directory of its executable. The CLI archive does not
 contain it. A release daemon archive also carries a `runtime/` directory with
 the signed `runtime-catalog.json` and, for the Linux x86_64 targets and the
 Apple Silicon target, `runtime/packages/<runtime>.tar.zst` and
 `runtime/attestations/<runtime>-<target>.json`. The `MANIFEST` covers these files.
-Every CLI, daemon, and relay archive is packed deterministically
+Every CLI and daemon archive is packed deterministically
 (members sorted, root-owned, stamped with the tagged commit time) and carries a
 `MANIFEST` with the SHA-256 of every member; the daemon installer verifies
 it, the host OS and architecture, and member permissions before they run or
@@ -69,9 +69,7 @@ sets no quarantine attribute), check it with `shasum -a 256 -c` and
 `gh attestation verify`, extract it, and run `./packaging/install-daemon.sh`.
 A file downloaded through a browser gets `com.apple.quarantine`, and Gatekeeper
 blocks it because it is not notarized; see the runbook before removing the
-attribute. After an upgrade macOS may ask again whether `pohunek` may access its
-`pohunek-relay` Keychain items, because an ad-hoc signature has no stable
-designated requirement.
+attribute.
 
 On Linux, download from [Releases](https://github.com/zajca/pohunek/releases),
 unpack, and install the daemon archive with `packaging/install-daemon.sh` (see

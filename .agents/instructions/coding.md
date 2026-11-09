@@ -86,7 +86,7 @@
   is a module of its own, not more `impl SessionRegistry`.
 - Comments and all repository text are in **English**.
 
-The first complete team-relay release intentionally trusts collaborators at the
+The first complete team-relay release (separate repository) intentionally trusts collaborators at the
 host Unix-account boundary. Relay API ACLs are authorization controls, not
 command or hostile-workload isolation: direct-host profiles run under the
 daemon owner's account. Real profile-backed container and VM isolation is a

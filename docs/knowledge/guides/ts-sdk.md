@@ -19,7 +19,6 @@ this repository in the external `zajca/pohunek-work` client repository.
 
 - `@pohunek/protocol`: types generated from the Rust protocol source
   (`cargo xtask ts generate`; `cargo xtask ts check` is the drift gate).
-- `@pohunek/protocol/relay`: the Rust team relay's wire types.
 - `@pohunek/sdk`: the shared runtime plus Bun/Node Unix and TCP transports.
 - `@pohunek/sdk/browser`: the browser-safe entry with only the WebSocket path;
   it contains no `node:net` dependency.

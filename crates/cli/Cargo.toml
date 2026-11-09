@@ -24,11 +24,8 @@ embed-agent-skill = []
 test-util = []
 
 [dependencies]
-pohunek-relay-client.workspace = true
-pohunek-relay-protocol.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
-zeroize.workspace = true
 semver = { workspace = true }
 # Staging directory of the files an install by package id downloads.
 tempfile.workspace = true
@@ -99,9 +96,3 @@ ed25519-dalek = { workspace = true }
 ruzstd = { workspace = true }
 # `session_process_api.rs` writes daemon log files with the real writer.
 pohunek-logging = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["async-secret-service", "tokio", "crypto-rust"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }

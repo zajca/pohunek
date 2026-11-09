@@ -39,9 +39,8 @@ partitions = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(partitions)
 
 # The CLI's shard arguments, as the operations they name are documented (the
-# per-package fast shards, the relay-PostgreSQL shard, and the heavy
-# complement): the inventory every check run must split exactly once.
-SHARD_NAMES = ("core", "daemon", "relay", "cli", "relay-db", "heavy")
+# per-package fast shards and the heavy complement): the inventory every check run must split exactly once.
+SHARD_NAMES = ("core", "daemon", "cli", "heavy")
 
 # How long one scenario lets the script + its fake run before the scenario
 # fails instead of hanging CI; a scenario finishes well under a second.
@@ -49,25 +48,20 @@ SCRIPT_TIMEOUT_SECONDS = 120
 
 
 def shard_expressions(fast):
-    """The six shard selections, composed from the repository's own decisions.
+    """The four shard selections, composed from the repository's own decisions.
 
     Not a copy of the script's code, but of its documented composition: the
     fast filter from `.config/nextest.toml` bounds the per-package shards, and
-    the fast complement is split between relay-db (the relay packages, the
-    PostgreSQL fixture consumers) and heavy. `filters()` must keep producing
+    the fast complement is heavy. `filters()` must keep producing
     exactly these strings.
     """
     daemon = ("package(=pohunek-daemon) or package(=pohunek-session-worker) "
               "or package(=pohunek-client)")
-    relay = ("package(=pohunek-relay) or package(=pohunek-relay-client) "
-             "or package(=pohunek-relay-protocol)")
     return {
         "daemon": f"({fast}) and ({daemon})",
-        "relay": f"({fast}) and ({relay})",
         "cli": f"({fast}) and (package(=pohunek-cli))",
-        "core": f"({fast}) and (not (({daemon}) or ({relay}) or (package(=pohunek-cli))))",
-        "relay-db": f"(not ({fast})) and ({relay})",
-        "heavy": f"(not ({fast})) and not ({relay})",
+        "core": f"({fast}) and (not (({daemon}) or (package(=pohunek-cli))))",
+        "heavy": f"not ({fast})",
     }
 
 
@@ -107,15 +101,11 @@ def shard_of(expression, fast):
 
     The expression must be the fast filter with the wrap the script composes
     it in: `(fast) and (owner)` for the owned shards, `not ((owners))` for
-    core, and the fast complement split by the conjunction that follows it:
-    relay-db takes the relay owners, heavy rejects them.
+    core, and the fast complement `not (fast)` for heavy.
     """
+    if expression == f"not ({fast})":
+        return "heavy"
     if expression.startswith("(not ("):
-        rest = expression.removeprefix(f"(not ({fast})) ")
-        if rest.startswith("and (package(=pohunek-relay"):
-            return "relay-db"
-        if rest.startswith("and not (package(=pohunek-relay"):
-            return "heavy"
         # An owned shard composes `(fast) and (owner)`, and a fast filter
         # starting with `not (` makes that expression start `(not (` too.
         rest = expression.removeprefix(f"({fast}) and (")
@@ -123,7 +113,7 @@ def shard_of(expression, fast):
             return "core"
     else:
         rest = expression.removeprefix(f"({fast}) and (")
-    for name in ("daemon", "relay", "cli"):
+    for name in ("daemon", "cli"):
         if rest.startswith(f"package(=pohunek-{name}"):
             return name
     raise SystemExit(
@@ -344,18 +334,14 @@ def nextest_inventory():
     Recorded per test as the shards whose filter matches it. The names mirror
     the repository's package split: fast daemon tests belong to the daemon
     shard, their compiled companions without the fast filter to the heavy
-    complement (which keeps ignored tests), non-fast relay tests to relay-db,
-    and the remaining fast tests to their own shards.
+    complement (which keeps ignored tests), and the remaining fast tests to
+    their own shards.
     """
     return [
         {"id": "pohunek-daemon-111111", "tests": {
             "store::migrate": {"matches": ["daemon"], "ignored": False},
             "reconcile::worker_leak": {"matches": ["heavy"], "ignored": False},
             "upgrade_preflight::refuse": {"matches": ["heavy"], "ignored": True},
-        }},
-        {"id": "pohunek-relay-222222", "tests": {
-            "acl::owner_allow": {"matches": ["relay"], "ignored": False},
-            "marshal::append": {"matches": ["relay-db"], "ignored": False},
         }},
         {"id": "pohunek-cli-333333", "tests": {
             "service::upgrade": {"matches": ["cli"], "ignored": False},
@@ -477,18 +463,16 @@ class CheckActionTests(ScriptScenario):
 
     def test_a_covering_partition_is_reported_test_by_test(self):
         # The numbers pin the ignored case: heavy's three include the one
-        # ignored fixture test, and the eight are only exact with it.
+        # ignored fixture test, and the six are only exact with it.
         self.set_inventory(nextest_inventory())
         result = self.run_script("check")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("core: 1 tests", result.stdout)
         self.assertIn("daemon: 1 tests", result.stdout)
-        self.assertIn("relay: 1 tests", result.stdout)
         self.assertIn("cli: 1 tests", result.stdout)
-        self.assertIn("relay-db: 1 tests", result.stdout)
         self.assertIn("heavy: 3 tests", result.stdout)
         self.assertIn(
-            "Coverage OK: 8 tests selected exactly once (including ignored tests)",
+            "Coverage OK: 6 tests selected exactly once (including ignored tests)",
             result.stdout,
         )
 
@@ -498,7 +482,7 @@ class CheckActionTests(ScriptScenario):
         calls = self.nextest_calls()
         # Without an archive the script asks for the workspace build: the full
         # inventory plus one list per shard.
-        self.assertEqual([call["name"] for call in calls], ["cargo"] * 7)
+        self.assertEqual([call["name"] for call in calls], ["cargo"] * 5)
         argvs = [call["argv"] for call in calls]
         first, rest = argvs[0], argvs[1:]
         self.assertEqual(first[:4], ["nextest", "list", "--profile", "ci"])
@@ -514,13 +498,13 @@ class CheckActionTests(ScriptScenario):
         for argv in argvs:
             self.assertEqual(argv[argv.index("--run-ignored") + 1], "all")
             self.assertEqual(argv[argv.index("--message-format") + 1], "json")
-        self.assertEqual(len({argv[argv.index("-E") + 1] for argv in rest}), 6)
+        self.assertEqual(len({argv[argv.index("-E") + 1] for argv in rest}), 4)
 
     def test_a_test_two_shards_match_is_rejected_as_an_overlap(self):
         # A nextest whose daemon filter also swallowed a cli test: the guard
         # must catch selections that stop partitioning.
         inventory = nextest_inventory()
-        inventory[2]["tests"]["service::upgrade"]["matches"] = ["cli", "daemon"]
+        inventory[1]["tests"]["service::upgrade"]["matches"] = ["cli", "daemon"]
         self.set_inventory(inventory)
         result = self.run_script("check")
         self.assertEqual(result.returncode, 1)
@@ -530,7 +514,7 @@ class CheckActionTests(ScriptScenario):
 
     def test_a_test_no_shard_matches_is_reported_missing(self):
         inventory = nextest_inventory()
-        inventory[3]["tests"]["source_map::drift"]["matches"] = []
+        inventory[2]["tests"]["source_map::drift"]["matches"] = []
         self.set_inventory(inventory)
         result = self.run_script("check")
         self.assertEqual(result.returncode, 1)
@@ -542,7 +526,7 @@ class CheckActionTests(ScriptScenario):
         # A nextest whose shard selection reports a test its full inventory
         # omitted: the guard must refuse the inconsistent inventory.
         inventory = nextest_inventory()
-        inventory[3]["tests"]["source_map::drift"] = {
+        inventory[2]["tests"]["source_map::drift"] = {
             "matches": ["heavy"], "ignored": False, "listed": False,
         }
         self.set_inventory(inventory)
@@ -553,21 +537,21 @@ class CheckActionTests(ScriptScenario):
         self.assertIn("source_map::drift", result.stderr)
 
     def test_an_empty_shard_selection_is_rejected(self):
-        # A fast-filter edit that cut the relay shard's whole selection.
+        # A fast-filter edit that cut the daemon shard's whole selection.
         inventory = nextest_inventory()
-        inventory[1]["tests"]["acl::owner_allow"]["matches"] = ["relay-db"]
+        inventory[0]["tests"]["store::migrate"]["matches"] = ["heavy"]
         self.set_inventory(inventory)
         result = self.run_script("check")
         self.assertEqual(result.returncode, 1)
         self.assertIn("partition coverage failed", result.stderr)
-        self.assertIn("empty=['relay']", result.stderr)
+        self.assertIn("empty=['daemon']", result.stderr)
 
     def test_an_empty_workspace_inventory_is_rejected(self):
         # The default fixture: a nextest that lists no compiled test at all.
         result = self.run_script("check")
         self.assertEqual(result.returncode, 1)
         self.assertIn("empty workspace test inventory", result.stderr)
-        self.assertEqual(len(self.nextest_calls()), 7)
+        self.assertEqual(len(self.nextest_calls()), 5)
 
 
 class ArchiveActionTests(ScriptScenario):
@@ -583,13 +567,13 @@ class ArchiveActionTests(ScriptScenario):
         result = self.run_script("check", "--archive-file", str(self.archive))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "Coverage OK: 8 tests selected exactly once (including ignored tests)",
+            "Coverage OK: 6 tests selected exactly once (including ignored tests)",
             result.stdout,
         )
         calls = self.nextest_calls()
         # One extraction for the whole check, then only the extracted state's
         # metadata: no `cargo` run, no workspace or feature selection.
-        self.assertEqual([call["name"] for call in calls], ["cargo-nextest"] * 7)
+        self.assertEqual([call["name"] for call in calls], ["cargo-nextest"] * 5)
         argvs = [call["argv"] for call in calls]
         first, rest = argvs[0], argvs[1:]
         self.assertEqual(first[:4], ["nextest", "list", "--profile", "ci"])
@@ -612,17 +596,17 @@ class ArchiveActionTests(ScriptScenario):
             self.assertNotIn("--archive-file", argv)
             self.assertNotIn("--extract-to", argv)
             self.assertIn("-E", argv)
-        self.assertEqual(len({argv[argv.index("-E") + 1] for argv in rest}), 6)
+        self.assertEqual(len({argv[argv.index("-E") + 1] for argv in rest}), 4)
 
     def test_the_archive_mode_still_fails_an_overlapping_partition(self):
         inventory = nextest_inventory()
-        inventory[2]["tests"]["service::upgrade"]["matches"] = ["cli", "daemon"]
+        inventory[1]["tests"]["service::upgrade"]["matches"] = ["cli", "daemon"]
         self.set_inventory(inventory)
         result = self.run_script("check", "--archive-file", str(self.archive))
         self.assertEqual(result.returncode, 1)
         self.assertIn("partition coverage failed", result.stderr)
         self.assertIn("overlap=", result.stderr)
-        self.assertEqual(len(self.nextest_calls()), 7)
+        self.assertEqual(len(self.nextest_calls()), 5)
 
     def test_an_archive_built_at_any_path_is_accepted_without_calling_nextest(self):
         result = self.run_script("filter", "core", "--archive-file", str(self.archive))
@@ -692,13 +676,13 @@ class PlanActionTests(ScriptScenario):
         self.assertEqual(self.nextest_calls(), [])
         return result
 
-    def assert_plan(self, selection, fast_shards, heavy, relay_db, lane=True):
+    def assert_plan(self, selection, fast_shards, heavy, lane=True):
         result = self.plan(selection)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout,
             f"fast_shards={json.dumps(fast_shards)}\nheavy={str(heavy).lower()}\n"
-            f"relay_db={str(relay_db).lower()}\nlane={str(lane).lower()}\n",
+            f"lane={str(lane).lower()}\n",
         )
 
     def packages(self, *names, script_tests=False):
@@ -710,25 +694,22 @@ class PlanActionTests(ScriptScenario):
 
     def test_a_full_selection_runs_every_job(self):
         self.assert_plan({"mode": "full", "script_tests": True},
-                         ["core", "daemon", "relay", "cli"], True, True)
+                         ["core", "daemon", "cli"], True)
 
     def test_each_selected_package_starts_the_shard_that_owns_it(self):
         self.assert_plan(self.packages("pohunek-session-worker", "pohunek-cli"),
-                         ["daemon", "cli"], True, False)
-        self.assert_plan(self.packages("pohunek-protocol"), ["core"], True, False)
-
-    def test_relay_packages_start_only_the_relay_jobs(self):
-        self.assert_plan(self.packages("pohunek-relay-client"), ["relay"], False, True)
+                         ["daemon", "cli"], True)
+        self.assert_plan(self.packages("pohunek-protocol"), ["core"], True)
 
     def test_the_script_regressions_start_core_without_a_rust_test(self):
         self.assert_plan({"mode": "none", "script_tests": True, "packages": []},
-                         ["core"], False, False)
+                         ["core"], False)
         self.assert_plan(self.packages("pohunek-cli", script_tests=True),
-                         ["core", "cli"], True, False)
+                         ["core", "cli"], True)
 
     def test_a_selection_of_nothing_starts_no_test_job(self):
         self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
-                         [], False, False)
+                         [], False)
 
     def lane(self, mode, *names):
         return {
@@ -740,19 +721,19 @@ class PlanActionTests(ScriptScenario):
     def test_the_lane_runs_unless_its_part_selects_no_lane_package(self):
         cli = self.packages("pohunek-cli")
         # A selector without the lane part runs the whole lane.
-        self.assert_plan(cli, ["cli"], True, False, lane=True)
+        self.assert_plan(cli, ["cli"], True, lane=True)
         self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
-                         [], False, False, lane=True)
+                         [], False, lane=True)
         self.assert_plan({**cli, "lane": self.lane("packages", "pohunek-cli")},
-                         ["cli"], True, False, lane=True)
-        self.assert_plan({**cli, "lane": self.lane("full")}, ["cli"], True, False, lane=True)
-        self.assert_plan({**cli, "lane": self.lane("none")}, ["cli"], True, False, lane=False)
+                         ["cli"], True, lane=True)
+        self.assert_plan({**cli, "lane": self.lane("full")}, ["cli"], True, lane=True)
+        self.assert_plan({**cli, "lane": self.lane("none")}, ["cli"], True, lane=False)
         knowledge = self.packages("pohunek-knowledge", "xtask")
         self.assert_plan({**knowledge, "lane": self.lane("packages", "xtask")},
-                         ["core"], True, False, lane=False)
+                         ["core"], True, lane=False)
         # A full selection runs the whole lane whatever its lane part says.
         self.assert_plan({"mode": "full", "script_tests": True, "lane": self.lane("none")},
-                         ["core", "daemon", "relay", "cli"], True, True, lane=True)
+                         ["core", "daemon", "cli"], True, lane=True)
 
     def test_a_lane_part_the_plan_cannot_trust_fails(self):
         cli = self.packages("pohunek-cli")
@@ -854,22 +835,22 @@ class SelectionActionTests(ScriptScenario):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("daemon: 1 tests", result.stdout)
-        self.assertIn("relay: 0 tests", result.stdout)
+        self.assertIn("cli: 0 tests", result.stdout)
         self.assertIn("Coverage OK: 3 tests selected exactly once", result.stdout)
 
     def test_check_fails_a_selected_test_in_a_shard_the_plan_does_not_start(self):
-        # A pohunek-relay selection starts relay and relay-db, never heavy.
+        # A pohunek-cli selection starts cli and heavy, never core.
         self.set_inventory(self.selected_inventory({
-            ("pohunek-relay-222222", "acl::owner_allow"),
-            ("pohunek-knowledge-444444", "source_map::drift"),
+            ("pohunek-cli-333333", "service::upgrade"),
+            ("pohunek-knowledge-444444", "bundle::materialize"),
         }))
-        selection = self.write_selection("packages", ["pohunek-relay"])
+        selection = self.write_selection("packages", ["pohunek-cli"])
         result = self.run_script(
             "check", "--selection", selection,
             extra_env={"PARTITIONS_FILTERSET": self.FILTERSET},
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("the plan does not start the shards ['heavy']", result.stderr)
+        self.assertIn("the plan does not start the shards ['core']", result.stderr)
 
     def test_a_selection_without_its_filterset_is_refused(self):
         selection = self.write_selection("packages", ["pohunek-daemon"], filterset="")
@@ -1457,7 +1438,6 @@ class AuditSparseTests(ScriptScenario):
     TRACKED = (
         ".config/nextest.toml",
         "crates/daemon/src/lib.rs",
-        "crates/relay/src/lib.rs",
         "crates/cli/src/lib.rs",
         "crates/knowledge/src/lib.rs",
         "docs/guide.md",
@@ -1492,7 +1472,6 @@ class AuditSparseTests(ScriptScenario):
         own = lambda name: [".config/nextest.toml", "scripts/test-partitions", f"crates/{name}/src/lib.rs"]
         self.trees.write_text(json.dumps({
             "pohunek-daemon": own("daemon"),
-            "pohunek-relay": own("relay"),
             "pohunek-cli": own("cli"),
             "pohunek-knowledge": own("knowledge"),
         }))
@@ -1517,9 +1496,8 @@ class AuditSparseTests(ScriptScenario):
         result = self.audit(nextest_inventory())
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("7 of 7 package runs passed, each with exactly the tests of the full tree", result.stdout)
+        self.assertIn("5 of 5 package runs passed, each with exactly the tests of the full tree", result.stdout)
         self.assertIn("| pohunek-daemon | heavy | 3 | 1 / 1 | 0 | passed |", result.stdout)
-        self.assertIn("| pohunek-relay | relay-db | 3 | 1 / 1 | 0 | passed |", result.stdout)
         self.assertEqual(
             (self.reports / "summary.md").read_text().splitlines()[0],
             result.stdout.splitlines()[0],
@@ -1537,18 +1515,17 @@ class AuditSparseTests(ScriptScenario):
             package = expression.rsplit("package(=", 1)[1].rstrip(")")
             profiles.setdefault(package, set()).add(argv[argv.index("--profile") + 1])
         self.assertEqual(profiles["pohunek-daemon"], {"ci", "heavy"})
-        self.assertEqual(profiles["pohunek-relay"], {"ci", "relay-db"})
         self.assertEqual(profiles["pohunek-cli"], {"ci"})
 
     def test_a_test_reading_a_file_outside_its_tree_fails_the_audit(self):
         binaries = nextest_inventory()
-        binaries[3]["tests"]["bundle::materialize"]["reads"] = "docs/guide.md"
+        binaries[2]["tests"]["bundle::materialize"]["reads"] = "docs/guide.md"
 
         result = self.audit(binaries)
 
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("| pohunek-knowledge | core | 3 | 1 / 1 | 100 | failed |", result.stdout)
-        self.assertIn("6 of 7 package runs passed", result.stdout)
+        self.assertIn("4 of 5 package runs passed", result.stdout)
         self.assert_full_tree()
 
     def test_a_test_the_sparse_tree_skips_fails_the_audit_although_nextest_passes(self):
@@ -1797,7 +1774,7 @@ class JunitReportActionTests(ScriptScenario):
         return report
 
     def test_run_removes_the_effective_profiles_report_before_nextest(self):
-        profiles = (("core", "ci"), ("heavy", "heavy"), ("relay-db", "relay-db"))
+        profiles = (("core", "ci"), ("heavy", "heavy"))
         for shard, profile in profiles:
             with self.subTest(shard=shard):
                 stale = self.stale_report(profile)

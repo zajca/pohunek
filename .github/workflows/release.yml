@@ -7,7 +7,7 @@ name: Release
 #   gate, docs-gate, sdk-gate, upgrade-test   the quality gate on the tagged
 #       commit (a tag push does not run the CI workflow, so the gate is
 #       duplicated here);
-#   build            release-build.yml: the Linux CLI/daemon/relay archives, the
+#   build            release-build.yml: the Linux CLI/daemon archives, the
 #                    official runtime package archives and the SDK tarballs;
 #   stage-macos, package-macos, verify-macos   the ad-hoc signed Apple Silicon
 #                    archives (see the macOS comment below);

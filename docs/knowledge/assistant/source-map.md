@@ -114,24 +114,12 @@ TypeScript SDK and test relay (the web control center is an external client in
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
-Team relay status. Implemented means the issue of the team-relay delivery list
-(RFC section 23, umbrella [#56](https://github.com/zajca/pohunek/issues/56)) is
-closed as completed; deferred means it is still open:
+Team relay status. The relay lives in its own repository,
+`pohunekd/pohunek-relay`; this repository keeps only the host-local identity and
+governance foundation (stable host identity #81, the direct-overlay foundation
+#69) and the daemon seams the relay builds on. Relay sources, design documents,
+and open relay issues are in that repository.
 
-- Implemented: direct-overlay foundation (#69), RFC landing (#80), stable host
-  identity (#81), the reduced relay foundation (#85: PostgreSQL fencing and
-  recovery, protected provisioning, generic OIDC browser and device
-  authentication, bounded HTTPS account and credential lifecycle, native
-  credential CLI), Google and GitHub team admission with bounded revalidation
-  (#92), provider-neutral account linking (#107), and the RFC reconciliation (#91).
-- Deferred: host enrollment and the userspace WireGuard link (#72), protocol v4
-  host link (#70), `HostShare` enforcement (#82), session visibility and sharing
-  (#83), snapshots and subscriptions (#84), routing, aggregation, attach and the
-  typed public API (#71), the complete team administration API (#108), team
-  clients and web (#86), operational hardening (#87), and the post-release
-  webhook delivery (#73) and runtime-backed profiles (#88).
-
-- `docs/design/team-relay-control-plane-rfc.md`
 - `docs/architecture.md`
 - `docs/ROADMAP.md`
 - `docs/public-api.md`
@@ -140,37 +128,6 @@ closed as completed; deferred means it is still open:
 - `docs/knowledge/guides/remote-hosts.md`
 - `docs/knowledge/guides/tailscale.md`
 - `docs/knowledge/guides/ts-sdk.md`
-- `crates/relay-protocol/src/`
-- `crates/relay-protocol/src/link.rs` — typed account-link contracts: channel,
-  state, safe revisioned record and page, browser/device start, poll request and
-  result, cancel and unlink requests, and the identity-removal result. No type
-  here carries a provider profile attribute.
-- `crates/relay/migrations/`
-- `crates/relay/migrations/0004_account_linking.sql` — the durable account-link
-  guarantees: monotonic `principals.account_link_generation`, active
-  `(issuer, subject)` uniqueness for identities that are not removed, link-once
-  identity provenance, one pending transaction per account, one unconsumed
-  provider row per transaction, immutable transaction provenance, and
-  terminal-state transition enforcement.
-- `crates/relay/src/auth/service/link.rs` — the account-link lifecycle: browser
-  and device start, device poll, browser-callback commit, status page, cancel,
-  and unlink, with the current-actor, generation, possession, collision, and
-  audit checks each transition makes.
-- `crates/relay/src/operator.rs`
-- `crates/relay/src/lifecycle.rs`
-- `crates/relay/src/lifecycle/local.rs`
-- `crates/relay/src/recovery/mod.rs`
-- `crates/relay/src/config.rs`
-- `crates/relay/src/store/`
-- `crates/relay/src/auth/`
-- `crates/relay/src/authorization/`
-- `crates/relay/src/admission/`
-- `crates/relay/src/server/mod.rs`
-- `crates/relay/src/runtime.rs`
-- `crates/relay/src/bin/pohunek-relayd.rs`
-- `crates/relay-client/src/`
-- `crates/cli/src/commands/relay.rs`
-- `crates/cli/src/commands/relay/`
 
 Shipped host-local identity and governance:
 
@@ -197,7 +154,7 @@ Release packaging and contributor verification:
 - `.config/nextest.toml` — shared fast cost boundary, bounded heavy profile,
   the serial `package` profile of the runtime package jobs (no retries, a
   per-test timeout, JUnit report), and the flaky-test policy
-  (`flaky-result = "fail"`; retries on `heavy` and `relay-db` only).
+  (`flaky-result = "fail"`; retries on `heavy` only).
 - `.cargo/config.toml` — `cargo t`/`cargo ti` select fast unit and integration
   tests; `cargo tw` keeps the full suite; `cargo ta` runs `cargo xtask
   affected`. Fast loops do not replace full gates.
@@ -226,13 +183,11 @@ Release packaging and contributor verification:
   and the release fold.
 - `crates/xtask/src/knowledge_log.rs` — `cargo xtask docs log fold|migrate` and
   the `knowledge-log` docs check.
-- `scripts/test-partitions` — disjoint unit/daemon/relay/cli/relay-db/heavy CI
+- `scripts/test-partitions` — disjoint core/daemon/cli/heavy CI
   shards and exhaustive inventory check, and the macOS lane selections
   (`check-macos`, `run-macos`, `run-macos-tier`) that the `platform contracts
   (arm64)` and `macOS tier packages (arm64)` jobs run from one archive. Heavy is the exact complement of the
-  fast filter; relay heavy tests (`relay-db`, the only PostgreSQL fixture
-  consumers) run in a CI job gated by a paths filter on relay-relevant files,
-  so non-relay changes never start the Postgres service. The shards run from
+  fast filter. The shards run from
   one nextest archive built once by the `build-tests` CI job
   (`--archive-file`, extracted at any path) and
   retain per-shard JUnit timing evidence. Cold compilation
@@ -284,9 +239,7 @@ Release packaging and contributor verification:
   rows are the default `rust` contribution path; `--path` (repeatable) adds
   `docs` (`rustc` and its pin row for `cargo xtask docs check`), `sdk` (bun at the `.bun-version`/`packageManager` pin), `scripts`
   (`python3`, `shellcheck`, Linux `dash`), `macos-lint` (the
-  `aarch64-apple-darwin` target and `zig`), `relay-db`
-  (`POHUNEK_RELAY_TEST_DATABASE_URL` as set/unset only, never passed to child
-  commands) and `native` (the systemd user manager or the launchd `gui/<uid>`
+  `aarch64-apple-darwin` target and `zig`) and `native` (the systemd user manager or the launchd `gui/<uid>`
   domain; the other platform's suites are `ci-only`). Each path also lists,
   never runs, its `focused` commands (e.g. `cargo xtask affected`, the Bun
   gates, `scripts/darwin-check`), a `final` pointer to the gate set in
@@ -306,8 +259,7 @@ Release packaging and contributor verification:
   copies, the Hermes test interpreter check (explicit, policy, version,
   `yaml`, action-derived fix, a pin problem failing only its row, the real CI files), the byte-exact default report, every contribution path, each
   path's focused checks and final-gate pointer (listed only with an explicit
-  `--path`), the `--json` contract and its error codes, and that the relay
-  database URL never reaches any output. The `platform contracts (arm64)` CI
+  `--path`), the `--json` contract and its error codes. The `platform contracts (arm64)` CI
   job runs it on macOS and asserts the real host's `launchd-gui-domain` row.
 - `scripts/ci-timings` — reproduction of CI timing evidence from `gh` run
   data: per-job wall clock and workflow medians (`runs`, `compare`), per-shard
@@ -335,7 +287,7 @@ Release packaging and contributor verification:
   retry) and persistently failed tests from nextest JUnit reports as a
   Markdown table in `$GITHUB_STEP_SUMMARY` (or stdout with `--stdout`); a
   missing or unreadable report is written into the summary. CI runs it with
-  `if: always()` after the fast, heavy, and relay-db nextest steps.
+  `if: always()` after the fast and heavy nextest steps.
 - `scripts/test-duplicates` — reads one CI run's downloaded JUnit artifacts and
   fails on a test that two jobs of the same OS ran, unless
   `scripts/test-duplicates.json` allows it with a reason; that file also names
@@ -878,10 +830,6 @@ Workspace crates by role (every workspace crate has an entry in this map;
 - `crates/terminal/src/lib.rs` — VT screen tracking and attach compositing.
 - `crates/service-config/src/lib.rs` — typed `service.toml` and the upgrade
   preflight reports.
-- `crates/relay-protocol/src/lib.rs` — typed public API contract of the optional
-  team relay.
-- `crates/relay-client/src/lib.rs` — HTTPS-only native relay authentication
-  client without a daemon dependency.
 - `crates/shape-guard/src/lib.rs` — dev-only persisted-shape guard helpers.
 - `crates/test-support/src/lib.rs` — test-only helpers: hermetic fixture roots
   and environments, binary resolution, bounded readiness waits.

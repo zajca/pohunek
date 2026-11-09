@@ -304,9 +304,6 @@ address its findings in a new fix PR off the updated `main` (same loop).
   (including `env | grep -c` to verify): a runtime permission or ask rule may
   fire on any occurrence and block the autonomous run on a confirmation;
   verify with `compgen -e | grep -c '^POHUNEK_'`.
-- The relay PostgreSQL tests need `POHUNEK_RELAY_TEST_DATABASE_URL`; without
-  it about 140 relay tests fail locally by design — they are CI-only
-  evidence, not regressions.
 - `cargo clippy --target aarch64-apple-darwin` cannot build `ring` or `psm` on a
   Linux host without an Apple SDK; run `scripts/darwin-check` instead (it needs
   `zig` on PATH). It only lints, so macOS behavior is CI-only evidence.

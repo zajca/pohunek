@@ -283,7 +283,7 @@ fn retired_pages_and_the_history_log_are_not_held_to_the_current_tree() {
 #[test]
 fn a_leaf_command_without_a_reference_row_fails_coverage() {
     let checkout = Checkout::consistent();
-    checkout.write("docs/cli.md", &reference(&["relay login"], &[]));
+    checkout.write("docs/cli.md", &reference(&["session rename"], &[]));
     assert_eq!(checkout.failed_checks(), vec!["cli-reference-coverage"]);
 }
 

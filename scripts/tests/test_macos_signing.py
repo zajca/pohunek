@@ -300,7 +300,7 @@ class PackageReleaseTest(Base):
     def test_modes_and_components_are_validated(self):
         for args in (
             ("--sideload", "daemon", "1.2.3", self.root, self.root, self.root),
-            ("--development", "relay", "1.2.3", self.root, self.root, self.root),
+            ("--development", "unknown", "1.2.3", self.root, self.root, self.root),
             ("--development", "daemon"),
             ("--release", "daemon", "1.2.3", self.root, self.root, self.root),
             ("--sign-release", "daemon", "1.2.3", self.root),

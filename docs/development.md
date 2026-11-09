@@ -30,9 +30,6 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/logging` | Bounded owner-private JSON-lines file logging with rotation shared by the processes of one family. |
 | `crates/platform` | Narrow operating-system contracts shared by the daemon and the session worker: process facts and kernel peer identity. |
 | `crates/service-config` | Typed owner-private `service.toml` and the upgrade preflight and runtime-plan reports shared by the installer, daemon, and worker. |
-| `crates/relay-protocol` | Typed public API contract of the optional team relay, with redacted secret diagnostics. |
-| `crates/relay` | `pohunek-relayd`: the optional team relay process and service composition. |
-| `crates/relay-client` | HTTPS-only native relay authentication client without a daemon dependency. |
 | `crates/shape-guard` | Dev-dependency-only helpers of the persisted-shape guard tests: key and string-leaf collection, enum registry classification, snapshot comparison, and the `unit_values!`/`data_values!` macros. |
 | `crates/test-support` | Test-only helpers: trusted-filesystem fixture roots, hermetic per-test environment, test binary resolution, and bounded readiness waits. |
 | `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
@@ -49,7 +46,7 @@ of your contribution path and run the fixes it prints:
 
 ```bash
 git clone https://github.com/zajca/pohunek.git && cd pohunek
-scripts/dev-bootstrap --path rust          # docs, rust, sdk, scripts, macos-lint, relay-db, native; repeatable
+scripts/dev-bootstrap --path rust          # docs, rust, sdk, scripts, macos-lint, native; repeatable
 scripts/dev-bootstrap --json --path sdk    # one versioned JSON document, for agents
 ```
 
@@ -82,7 +79,6 @@ this table and prints a note per check):
 | `sdk` | `bun install --frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, `bun test sdk/ts/scripts` | `SDK workspace (macOS arm64)`, off macOS |
 | `scripts` | `python3 -m unittest discover -s scripts/tests -p 'test_*.py'` (one file: `-p test_<name>.py`) | — |
 | `macos-lint` | `scripts/darwin-check` | `platform contracts (arm64)` |
-| `relay-db` | `python3 scripts/test-partitions run relay-db` with `POHUNEK_RELAY_TEST_DATABASE_URL` exported | `tests (relay DB, PostgreSQL)` |
 | `native` | `cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins`, then on Linux `POHUNEK_SYSTEMD_E2E=1 cargo test <suite> --ignored --test-threads 1 --skip privileged_` for each `<suite>` of `-p pohunek-platform --test systemd --`, `-p pohunek-daemon --test systemd_durable_worker --`, `-p pohunek-cli --test all -- service_systemd::`, `-p pohunek-cli --test all -- setup_host_native::`, `-p pohunek-cli --test all -- setup_host::`, `-p pohunek-daemon --test supervised_lifecycle --`, `-p pohunek-cli --test all -- service_upgrade::`, then `POHUNEK_SYSTEMD_E2E=1 cargo test -p pohunek-cli --test all -- --test-threads 1 service_config_migration::` (no `--ignored`: its tests run in every lane, and here they get the real bus); on macOS `cargo test --locked -p` each of `pohunek-platform`, `pohunek-daemon`, `pohunek-cli` | the other OS's suites, as a `ci-only` row: `platform contracts (arm64)` or `real systemd supervision` |
 
 Final gates: run the applicable set once, on the final revision, before
@@ -121,7 +117,7 @@ passed, and a failing, cancelled or still pending check does not.
   job, the macOS lane or the Hermes macOS job that the selection requires did
   not pass. Its `needs` are `required jobs (paths filter)`, `test selection`,
   `test selection check`, `build tests (nextest archive)`, the fast shards (`tests (<shard>, fast)`),
-  `tests (heavy, PTY + Hermes)`, `tests (relay DB, PostgreSQL)`,
+  `tests (heavy, PTY + Hermes)`,
   `fmt + clippy`, `macOS lint from Linux (aarch64-apple-darwin clippy)`,
   `doctests`, `build bins (pohunekd + pohunek-sessiond + pohunek)`,
   `SDK workspace`, `cargo-audit (RustSec advisories)`,
@@ -151,8 +147,7 @@ passed, and a failing, cancelled or still pending check does not.
   release evidence there (a `tier=nightly` dispatch for the release rehearsal),
   or relies on a later run on `main`: the post-merge `main` run is the main
   tier, while the release rehearsal, the release gate and the other
-  nightly-only jobs (`test selection audit (G3)`, `tests (relay DB,
-  PostgreSQL)`) get their evidence only from the scheduled nightly run or a
+  nightly-only jobs (`test selection audit (G3)`) get their evidence only from the scheduled nightly run or a
   `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
@@ -232,7 +227,7 @@ cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
 bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
 bacon                          # watcher: profile-fast nextest loop (bacon.toml)
-python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/relay/cli/relay-db/heavy)
+python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/cli/heavy)
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
 # macOS only, from a nextest archive: `check-macos` (`--scope lane` for the PR lane archive) and `run-macos` (PR lane), `run-macos-tier` (main/nightly); see verification.md, Fast loops
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
@@ -268,13 +263,9 @@ tool cache; `astral-sh/setup-uv` then finds that exact version there, so no job
 fetches the uv version manifest. Raising the pin means changing `UV_VERSION`
 and the four checksums of `uv-<target>.tar.gz.sha256` together.
 
-CI runs four fast matrix shards and separate heavy jobs without waiting for
+CI runs three fast matrix shards and a separate heavy job without waiting for
 Clippy or release builds. Heavy uses four test processes and the real worker
-binary. Relay heavy tests (the only PostgreSQL fixture consumers) run in a
-dedicated `relay-db` job whose `POHUNEK_RELAY_TEST_DATABASE_URL` points at a
-disposable PostgreSQL service; a `paths-filter` job skips that job — including
-the Postgres service — when no relay-relevant file (`crates/relay*/**`,
-`migrations/**`, `Cargo.lock`, the CI workflow) changed. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
+binary. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
 writes `target/nextest/heavy/junit.xml`. The runtime package jobs run their
@@ -674,9 +665,8 @@ assembles and publishes the release in one fixed flow.
 The `gate` job calls the reusable workflow `.github/workflows/gate-tests.yml`
 and tests the way CI does: it builds the `cargo nextest archive
 --profile ci --workspace --all-features` archive, proves the shards of
-`scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy` and
-`relay-db` under their bounded profiles, the PostgreSQL URL set for
-`relay-db` only), and runs the doctests with `cargo test --doc --workspace
+`scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy`
+under its bounded profile), and runs the doctests with `cargo test --doc --workspace
 --all-features`, because nextest runs none. Every shard runs before the step
 fails, so one red shard does not hide another. The same workflow runs in CI as
 the job `release gate (full test set)`: in the nightly tier (schedule or a
@@ -699,8 +689,8 @@ jobs (real systemd supervision, the four `*-package` jobs with
 main and nightly evidence of the release commit covers those.
 
 1. **Producers** upload workflow artifacts only: `release-build.yml` (reusable)
-   builds the glibc and MUSL x86_64 CLI and daemon archives and the glibc relay
-   archive in one job per target, each component with its own `cargo build`
+   builds the glibc and MUSL x86_64 CLI and daemon archives
+   in one job per target, each component with its own `cargo build`
    and archived before the next one builds (artifacts
    `build-<component>-<target>`). One job builds the official runtime package
    archives (every `runtime-packages/*` directory: `package verify`, then

@@ -11,8 +11,8 @@ There is no retry: a failing iteration is the result (the stress invocation
 passes `--retries 0`, so a `retries = 2` profile such as `heavy` cannot turn a
 failure into a FLAKY pass).
 
-Suggested counts (a lane, not a default; `--count` is required): 50 for
-`heavy`, 20 for `relay-db`. The profile must be one whose filter contains the
+Suggested count (a lane, not a default; `--count` is required): 50 for
+`heavy`. The profile must be one whose filter contains the
 test: a heavy test selected under `fast` is excluded by the profile's
 default-filter and the gate then fails instead of running nothing.
 
@@ -91,7 +91,7 @@ STRESS_CPUS = 4
 TEST_ATTRIBUTE = "test"
 VARIANT_ATTRIBUTES = ("rstest", "test_case", "bench")
 # CI's Linux test archive builds with `--all-features`, so feature-gated tests
-# (for example relay `postgres-tests`) exist only with it. The macOS lane and
+# exist only with it. The macOS lane and
 # tier archives build default features, so the profiles below do the same.
 ALL_FEATURES_FLAGS = ("--all-features",)
 DEFAULT_FEATURE_PROFILES = ("macos",)
@@ -881,7 +881,7 @@ def build_parser():
         description=(
             "Stress the Rust tests that BASE...HEAD plus the working tree add or "
             "change, under the pinned CPU load of scripts/stress-run. No retries. "
-            "Suggested --count: 50 for the heavy lane, 20 for relay-db."),
+            "Suggested --count: 50 for the heavy lane."),
         epilog=(
             "A test is selected when any changed line lies between its first doc "
             "comment/attribute and its closing brace (edits, comment edits; a moved "
@@ -893,11 +893,11 @@ def build_parser():
     parser.add_argument("--base", required=True, metavar="REV",
                         help="revision the change is measured against (e.g. origin/main)")
     parser.add_argument("--count", required=True, type=positive_int, metavar="N",
-                        help="nextest --stress-count (heavy: 50, relay-db: 20)")
+                        help="nextest --stress-count (heavy: 50)")
     parser.add_argument("--deadline", required=True, metavar="DURATION",
                         help="scripts/stress-run deadline for the whole run, e.g. 30m")
     parser.add_argument("--profile", required=True, metavar="PROFILE",
-                        help="nextest profile that owns the tests (heavy, relay-db, macos, ...)")
+                        help="nextest profile that owns the tests (heavy, macos, ...)")
     parser.add_argument("--unpinned", action="store_true",
                         help="pass --unpinned to stress-run (required on macOS)")
     parser.add_argument("--allow-missing-on-host", action="store_true",

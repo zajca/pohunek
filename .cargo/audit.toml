@@ -1,47 +1,14 @@
 [advisories]
 ignore = [
-    # rsa 0.9.10 is reachable only through the reviewed openidconnect 4.0.1
-    # dependency. The relay performs public-key signature verification, never
-    # private RSA signing/decryption affected by this timing side channel.
-    # .clippy.toml bans private RSA APIs; xtask's dependency_policy test pins the
-    # reviewed upstream checksums and rejects any new rsa dependency parent.
-    # Reassess/remove this exception when upstream provides a fixed version.
-    "RUSTSEC-2023-0071",
     # quick-xml is only pulled through the wayland-scanner proc-macro, which parses
     # trusted Wayland protocol XML at build time. Remove these ignores once
     # wayland-scanner accepts quick-xml >= 0.41.0.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # Dated 2026-10-23, tracked in #1504. zvariant, zvariant_derive and
-    # zbus_names are merged into zbus 6, which the workspace links. The only
-    # remaining consumer is the CLI's Linux Secret Service backend:
-    # keyring 3 -> zbus 4 and keyring 3 -> secret-service 4 -> zbus 4. No
-    # keyring/secret-service release on zbus 6 exists (secret-service 5
-    # requires zbus 5). xtask's dependency_policy test fails if any other
-    # crate or version pulls zbus < 6 or these crates. Remove these ignores
-    # once keyring's Secret Service stack is on zbus 6.
-    "RUSTSEC-2026-0370",
-    "RUSTSEC-2026-0371",
-    "RUSTSEC-2026-0372",
     # Dated 2026-10-23, tracked in #1505. smartstring is locked only through
     # the optional `ts` feature (ts-rs `format` -> dprint-plugin-typescript
     # =0.95 -> swc) used by `cargo xtask ts`; no shipped binary links it.
     # Remove this ignore once ts-rs drops the dependency or the bindings
     # are formatted another way.
     "RUSTSEC-2026-0249",
-    # Dated 2026-10-24, tracked in #1575. crypto-bigint 0.5.5 is locked only
-    # through pohunek-relay -> openidconnect 4.0.1 -> p256 0.13 / p384 0.13 ->
-    # ecdsa 0.16 / primeorder 0.13 -> elliptic-curve 0.13. The relay reaches it
-    # only to verify ID-token signatures: auth/oidc.rs:626 and :649 call
-    # IdToken::claims, which runs openidconnect's core/crypto.rs:100
-    # verify_ec_signature (VerifyingKey::from_sec1_bytes over the public JWK
-    # x/y, then verify) and ecdsa's hazmat.rs:281 verify_prehashed
-    # (invert_vartime on the signature's s, public-point lincomb). Every operand
-    # is public, so timing variability leaks nothing secret; no EC signing, ECDH
-    # or secret-scalar path exists in openidconnect or the relay. No shipped
-    # binary except pohunek-relay links it; xtask's dependency_policy test pins the
-    # exact parent edges into it and .clippy.toml bans the p256/p384 secret-key,
-    # signing and ECDH APIs. Remove this ignore, that test and those bans once
-    # openidconnect releases on p256/p384 0.14 (crypto-bigint >= 0.7.6).
-    "RUSTSEC-2026-0387",
 ]

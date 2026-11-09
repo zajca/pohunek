@@ -50,6 +50,49 @@ fn assert_json_usage_error(arguments: &[&str], message_fragment: &str) {
 }
 
 #[test]
+fn the_removed_relay_command_group_is_an_unknown_subcommand() {
+    for arguments in [
+        &[
+            "relay",
+            "login",
+            "--origin",
+            "https://relay.invalid",
+            "--json",
+        ][..],
+        &[
+            "relay",
+            "status",
+            "--origin",
+            "https://relay.invalid",
+            "--json",
+        ][..],
+        &[
+            "relay",
+            "logout",
+            "--origin",
+            "https://relay.invalid",
+            "--json",
+        ][..],
+        &[
+            "relay",
+            "rotate",
+            "--origin",
+            "https://relay.invalid",
+            "--json",
+        ][..],
+        &[
+            "relay",
+            "resume-rotation",
+            "--origin",
+            "https://relay.invalid",
+            "--json",
+        ][..],
+    ] {
+        assert_json_usage_error(arguments, "unrecognized subcommand");
+    }
+}
+
+#[test]
 fn assistant_rejects_project_and_repo_at_the_cli_process_boundary() {
     assert_json_usage_error(
         &[

@@ -3,7 +3,7 @@
 //! `release assemble` turns the artifacts the producer jobs of one release
 //! produced into the bundle the publisher uploads: the final daemon archives
 //! (the producer tree plus the signed runtime catalog and the packages and
-//! attestations of that target), the unchanged CLI, relay and SDK artifacts,
+//! attestations of that target), the unchanged CLI and SDK artifacts,
 //! the catalog, the package archives and attestations, and the inventory that
 //! lists them all.
 //!
@@ -120,7 +120,7 @@ pub enum InputClass {
     Version,
     /// The release commit.
     Commit,
-    /// A release archive (CLI, daemon or relay).
+    /// A release archive (CLI or daemon).
     Archive,
     /// A `.sha256` file.
     Checksum,
@@ -840,7 +840,7 @@ fn copy_public(from: &Path, to: &Path) -> Result<(), XtaskError> {
     fs::set_permissions(to, fs::Permissions::from_mode(PUBLIC_FILE_MODE)).map_err(io_error(to))
 }
 
-/// Copies the unchanged artifacts into the bundle: CLI and relay archives
+/// Copies the unchanged artifacts into the bundle: CLI archives
 /// and SDK tarballs with their checksums, package archives and attestations.
 fn publish_files(
     args: &AssembleArgs,

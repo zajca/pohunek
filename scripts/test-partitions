@@ -46,12 +46,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # Package ownership partitions the fast set. The complement catches new crates
 # and targets automatically; fixture ownership is in profile.fast's filter.
 DAEMON = "package(=pohunek-daemon) or package(=pohunek-session-worker) or package(=pohunek-client)"
-RELAY = "package(=pohunek-relay) or package(=pohunek-relay-client) or package(=pohunek-relay-protocol)"
 CLI = "package(=pohunek-cli)"
-# Relay heavy tests are the only consumers of the PostgreSQL fixture, so they
-# form their own shard: CI runs them in a job whose Postgres service is gated
-# by a paths filter on the relay crates.
-SHARDS = ("core", "daemon", "relay", "cli", "relay-db", "heavy")
+SHARDS = ("core", "daemon", "cli", "heavy")
 # The macOS lane runs on every pull request whose platform inputs change and
 # holds the packages that gate it natively. The tier packages have macOS-only
 # test code too, but a PR does not run them: a separate main and nightly job
@@ -188,19 +184,18 @@ RETAIN_POLL_SECONDS = 2
 def filters():
     with (ROOT / ".config/nextest.toml").open("rb") as config:
         fast = tomllib.load(config)["profile"]["fast"]["default-filter"]
-    owners = {"daemon": DAEMON, "relay": RELAY, "cli": CLI}
-    owners["core"] = f"not (({DAEMON}) or ({RELAY}) or ({CLI}))"
+    owners = {"daemon": DAEMON, "cli": CLI}
+    owners["core"] = f"not (({DAEMON}) or ({CLI}))"
     return {
         **{name: f"({fast}) and ({owner})" for name, owner in owners.items()},
-        "relay-db": f"(not ({fast})) and ({RELAY})",
-        "heavy": f"(not ({fast})) and not ({RELAY})",
+        "heavy": f"not ({fast})",
     }
 
 
 # The fast shards a pull request can run, and the owners that route a
 # selected package to one of them; every other package belongs to core.
-FAST_SHARDS = ("core", "daemon", "relay", "cli")
-SHARD_OWNERS = {"daemon": DAEMON, "relay": RELAY, "cli": CLI}
+FAST_SHARDS = ("core", "daemon", "cli")
+SHARD_OWNERS = {"daemon": DAEMON, "cli": CLI}
 # `selection.json` shape (`cargo xtask affected ci`) that `plan` reads.
 SELECTION_SCHEMA_VERSION = 1
 
@@ -211,12 +206,12 @@ def owned_packages(owner):
 
 
 def shard_plan(selection):
-    """The CI test jobs a selection runs: the fast shards, heavy and relay-db.
+    """The CI test jobs a selection runs: the fast shards and heavy.
 
     A fast shard runs when it owns a selected package, and core also runs for
-    the script regressions its job carries. The heavy and relay-db jobs run
-    whenever a package they hold tests of may be selected; which of its tests
-    run is the selection's filterset.
+    the script regressions its job carries. The heavy job runs whenever a
+    package it holds tests of may be selected; which of its tests run is the
+    selection's filterset.
     """
     if selection.get("schema_version") != SELECTION_SCHEMA_VERSION:
         raise ValueError(
@@ -224,7 +219,7 @@ def shard_plan(selection):
             f"{SELECTION_SCHEMA_VERSION}")
     mode = selection.get("mode")
     if mode == "full":
-        return {"fast_shards": list(FAST_SHARDS), "heavy": True, "relay_db": True, "lane": True}
+        return {"fast_shards": list(FAST_SHARDS), "heavy": True, "lane": True}
     if mode not in ("packages", "none"):
         raise ValueError(f"unknown selection mode {mode!r}")
     names = {package["name"] for package in selection.get("packages", [])}
@@ -239,11 +234,9 @@ def shard_plan(selection):
     }
     if selection.get("script_tests") is True:
         shards.add("core")
-    relay = owners["relay"]
     return {
         "fast_shards": [shard for shard in FAST_SHARDS if shard in shards],
-        "heavy": any(name not in relay for name in names),
-        "relay_db": any(name in relay for name in names),
+        "heavy": bool(names),
         "lane": lane_selection(selection)["mode"] != "none",
     }
 
@@ -302,10 +295,9 @@ def selected_expression(expression, selection):
 def shard_profile(shard):
     """The nextest profile a shard runs under.
 
-    Heavy shards run bounded: heavy spawns real worker/PTY fixtures, and
-    relay-db opens per-test database pools that exhaust the fixture limit.
+    The heavy shard runs bounded: it spawns real worker/PTY fixtures.
     """
-    return {"heavy": "heavy", "relay-db": "relay-db"}.get(shard, "ci")
+    return {"heavy": "heavy"}.get(shard, "ci")
 
 
 def planned_shards(plan):
@@ -313,7 +305,6 @@ def planned_shards(plan):
     return {
         *plan["fast_shards"],
         *(["heavy"] if plan["heavy"] else []),
-        *(["relay-db"] if plan["relay_db"] else []),
     }
 
 
@@ -732,7 +723,6 @@ def main():
             sys.exit(f"test-partitions plan: {error}")
         print(f"fast_shards={json.dumps(plan['fast_shards'])}")
         print(f"heavy={str(plan['heavy']).lower()}")
-        print(f"relay_db={str(plan['relay_db']).lower()}")
         print(f"lane={str(plan['lane']).lower()}")
         return
     selection = plan = None

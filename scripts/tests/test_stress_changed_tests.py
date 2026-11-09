@@ -407,8 +407,7 @@ class Listing(Fixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         recorded = [json.loads(line) for line in self.log.read_text().splitlines()]
         self.assertEqual([r[1] for r in recorded], ["list", "run"])
-        # The list and the run build with CI's feature set, so feature-gated
-        # tests (relay postgres-tests) are compiled.
+        # The list and the run build with CI's feature set.
         for argv in recorded:
             self.assertIn("--all-features", argv)
         argv = recorded[1]
@@ -735,7 +734,7 @@ class Arguments(Fixture):
         result = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True,
                                 text=True, timeout=WAIT_SECONDS)
         self.assertEqual(result.returncode, 0)
-        for token in ("heavy", "relay-db", "50", "20", "moved", "deleted"):
+        for token in ("heavy", "50", "moved", "deleted"):
             self.assertIn(token, result.stdout)
 
 

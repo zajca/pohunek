@@ -35,11 +35,10 @@
 //! packages would build them with other dependency features: Cargo unifies
 //! features over the packages selected for a build, and the pinned Cargo 1.99.0
 //! ignores `resolver.feature-unification` without `-Zfeature-unification`. On
-//! 2026-10-16 `cargo tree --all-features` resolved 13 dependency units (clap,
-//! futures-util, nix, ...) with other feature sets for the three relay crates
-//! than for `--workspace`, and 23 units for `pohunek-daemon`, `pohunek-cli`,
-//! `pohunek-session-worker`, `pohunek-paths` and `xtask` (digest, ed25519,
-//! hyper-util, ...). Such a build would test binaries that neither the full run
+//! 2026-10-16 `cargo tree --all-features` resolved 23 dependency units for
+//! `pohunek-daemon`, `pohunek-cli`, `pohunek-session-worker`, `pohunek-paths`
+//! and `xtask` (digest, ed25519, hyper-util, ...) with other feature sets than
+//! for `--workspace`. Such a build would test binaries that neither the full run
 //! nor the release build produces, and it would miss the compile cache of the
 //! full build.
 //!
@@ -506,16 +505,6 @@ const RULES: &[Rule] = &[
         Pattern::File(".github/workflows/release-build.yml"),
         Effect::Packages(&["pohunek-cli"]),
         "release build workflow asserted by pohunek-cli's daemon_packaging test",
-    ),
-    rule(
-        Pattern::File("crates/relay/src/lib.rs"),
-        Effect::Packages(&["xtask"]),
-        "relay sources scanned by xtask's dependency_policy test",
-    ),
-    rule(
-        Pattern::File("crates/relay/src/bin/pohunek-relayd.rs"),
-        Effect::Packages(&["xtask"]),
-        "relay sources scanned by xtask's dependency_policy test",
     ),
     // Reviewed non-Rust paths. More specific rules above take precedence.
     reminding(
@@ -1625,7 +1614,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 23] = [
+        let cases: [(&str, &[&str]); 22] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1702,7 +1691,6 @@ mod tests {
             ("packaging/stage-archive", &["pohunek-cli", "xtask"]),
             (".github/workflows/release.yml", &["pohunek-cli"]),
             (".github/workflows/release-build.yml", &["pohunek-cli"]),
-            ("crates/relay/src/lib.rs", &["pohunek-relay", "xtask"]),
         ];
         for (path, expected) in cases {
             assert_eq!(
