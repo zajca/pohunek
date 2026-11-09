@@ -1,3 +1,0 @@
-## Unreleased (2026-11-08, retire covered screen rules, #2042)
-
-- A detection rule may set `below_authority = true`: it serves runtime releases below the `[program_status] authority_from` gate and is skipped for activity while the gate is open and a record is held, while input readiness still evaluates it. The Claude working and idle screen rules (`live_status_spinner`, `live_turn_footer`, `live_prompt_box`, `completed_turn_status`) and the Pi `working_rule` and `idle_editor_rule` carry it; Codex keeps every rule, since its non-title rules are dialog, blocked or record-correcting. See [runtime packages](guides/runtime-packages.md#declaring-program-status).

@@ -5,6 +5,57 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.41.0
+
+### 2026-11-09, notification lifecycle cut, #2046, #2043, #2058
+
+- Protocol 5 is the only served version (announced break): the notification update, delete, policy and retention methods are gone, `pohunek notifications` has `list` and `watch` only, and sessions launched before the upgrade must be relaunched because their hooks announce protocol 4.
+- The inbox holds `agent_blocked` and `approval_required` only. Wait for a turn end with `pohunek session wait` (`turn_completed`, or the new `turn_error`); see [agent skill](guides/agent-skill.md) and [sessions](concepts/sessions.md).
+- Resolved attention records expire after the `[notifications]` `record_ttl_secs` of `service.toml` (default 14 days); the store is `notifications.jsonl` format 3.
+- A terminal approval notice (`OSC 9`, `OSC 777 notify`, `OSC 99`) is a fallback attention source when neither a program-status record nor a hook speaks for the session.
+
+### 2026-11-09, assistant context package, #2049
+
+- The assistant knowledge bundle is no longer embedded in the binaries. `pohunek assistant` reads it from the selected, enabled context package `pohunek.context.assistant` (`[context]` in `runtime.toml`, feature `package-context-v1`), and the launch fails with `assistant_package_missing` and a remedy when the package is absent, unselected, disabled or modified. The launch snapshot records `pohunek_version` (the launching client); the prompt names the package version. `pohunek assistant --degraded` is gone, and a remote repeat under a request id replays instead of answering `session_request_conflict`. See [runtime-packages.md](guides/runtime-packages.md) (Declaring a context package).
+
+### 2026-11-09, relay extraction, #2053, #2054, #2055
+
+- The team relay (server, HTTPS API, client library, CLI command group and design documents) moved to the separate `pohunekd/pohunek-relay` repository with its history and open issues. [Team relay](concepts/team-relay.md) now states what core keeps: stable host identity, host-local governance, the `RelayId`, relay principal and team types, and the `LaunchSource::RelayProfile` seam. Core release archives no longer contain `pohunek-relayd`, and the relay PostgreSQL CI shard is gone.
+
+### 2026-11-08, OSC 9;4 progress parser, #2040
+
+- The detector reads `OSC 9 ; 4 ; <state> [; <percent>]` as typed progress (states 0 to 4, percent 0 to 100) and exposes it to manifests as the `osc_progress` region text `4;<state>`. A plain `OSC 9 ; <text>` notification and a malformed `9;4` sequence are no longer progress evidence, so approval notices no longer flip a session to blocked or working. The generic shell manifest maps `4;0` to idle and `4;3` to working; states 1, 2 and 4 map to no activity. See `docs/public-api.md` (`state_source`).
+
+### 2026-11-08, program status release gate, #2041
+
+- A detection manifest may declare `[program_status] authority_from`. OSC 7501 records are authoritative only for a runtime release at or above it, as probed by the session's launch; below it, or with the release unknown, the worker answers no probe and the title and screen rules decide. The official Claude (2.1.309), Codex (0.163.0) and Pi (1.1.0) manifests declare it. A visible dialog over a `blocked` record is reported with `state_source = screen`. See [runtime packages](guides/runtime-packages.md#declaring-program-status) and [Claude package](guides/claude-package.md#program-status-osc-7501).
+
+### 2026-11-08, retire covered screen rules, #2042
+
+- A detection rule may set `below_authority = true`: it serves runtime releases below the `[program_status] authority_from` gate and is skipped for activity while the gate is open and a record is held, while input readiness still evaluates it. The Claude working and idle screen rules (`live_status_spinner`, `live_turn_footer`, `live_prompt_box`, `completed_turn_status`) and the Pi `working_rule` and `idle_editor_rule` carry it; Codex keeps every rule, since its non-title rules are dialog, blocked or record-correcting. See [runtime packages](guides/runtime-packages.md#declaring-program-status).
+
+### 2026-11-08, detection status, #2044
+
+- `session.detection` gains an optional additive `status` object and `pohunek session detection` prints it before the region previews: the `state_source` that decided the activity, whether the OSC 7501 probe is answered, the held record and its state, the release gate (`declared`, `open`, `reason`, `runtime_version`, `authority_from`) and the age of the last applied evidence. A probe the worker does not answer under a closed gate reads `unanswered, screen only`. See `docs/public-api.md` (`session.detection`).
+
+### 2026-11-08, prune wave 0, #2058, #2039, #2037, #2038, #2036
+
+- Workflow plugins, daemon idle stop, session fork and the debug commands `store rejected`, `runtime-inventory` and `session policy` are gone from the CLI, the protocol (`method_not_found` on every version) and the guides. `capabilities.fork` stays on session listings and is always `false`.
+- Fork data in an older runtime descriptor, host profile or stored session record is accepted and ignored (a descriptor or host profile also logs a warning); see [runtime packages](guides/runtime-packages.md#fork-data-is-ignored).
+- The Hermes operator plugin no longer offers `pohunek_session_fork`; `pohunek doctor` still reports metadata-store lines no loader accepts, and the [recovery runbook](runbooks/runtime-package-recovery.md) has the manual remedy.
+
+### 2026-11-06, plugin distribution follow-ups, #1967, #1969, #1971, #2023
+
+The [recovery runbook](runbooks/runtime-package-recovery.md) covers `plugin_trust_required`, `plugin_archive_digest_mismatch` and the unparsable package reference of `plugin_source_invalid`, and names `service_version_lacks_index_channel` beside `service_version_conflict`. The [key ceremony runbook](runbooks/plugin-index-keys.md) stages the offline primary seed as `$d/primary.key` and destroys it with `shred -u`. [Runtime catalog](concepts/runtime-catalog.md) lists `catalog keygen`.
+
+### 2026-11-06, plugin tooling follow-ups, #1975
+
+The refusal names of `xtask index check-entry` are listed in [Plugin repositories](guides/plugin-repositories.md) and [Runtime catalog](concepts/runtime-catalog.md); the proof root of `plugin prove` falls back to `/tmp` when the control socket path does not fit under `$TMPDIR` ([Plugin index keys](runbooks/plugin-index-keys.md)).
+
+### 2026-11-06, checkout trust batch, #1978, #1979, #1980
+
+- Trusted checkout arguments follow the directory and project a session was created in (`ResumeBinding.launch_checkout`, store schema 16, an empty migration with no backfill). Resume and fork append them only when the relaunch directory equals the create-time directory; a fork copies its source's pair. A session stored before schema 16 resumes and forks without the arguments (one `checkout_trust.failed` warning each) until it is created again: fail closed. A run of `trusted_checkout_args` in a descriptor's or host profile's `args` is dropped at create too, and declared files are opened without following a final symbolic link and hashed from the opened descriptor (at most 4 MiB). See [runtime packages](guides/runtime-packages.md#trusted-checkout-arguments).
+
 ## 0.40.0
 
 ### 2026-11-06, trusted checkout arguments, #1925
