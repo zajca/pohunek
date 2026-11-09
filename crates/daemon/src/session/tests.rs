@@ -7419,6 +7419,56 @@ async fn attach_from_inside_the_same_session_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_hook_that_spoke_covers_only_its_own_runtime_generation() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let root = pohunek_test_support::tempdir_with_prefix("ph-notice-").expect("fixture root");
+    let notifications = crate::notifications::NotificationService::open(root.path())
+        .expect("notification service opens");
+    let (attention, mut probe) = crate::notifications::AttentionCoordinator::probed();
+    registry.bind_approval_notice_sink(crate::notifications::ApprovalNoticeSink::new(
+        notifications,
+        attention,
+    ));
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+
+    // A notice with no hook is attention.
+    let expected = RuntimeWatchIdentity::from_info(&created).expect("live detector identity");
+    registry
+        .record_approval_notice(&created.id, &expected, 0)
+        .await;
+    assert_eq!(probe.defers(), 1);
+
+    // The hook that spoke in this generation covers the notice.
+    registry.note_hook_spoke(&created.id).await;
+    registry
+        .record_approval_notice(&created.id, &expected, 0)
+        .await;
+    assert_eq!(probe.defers(), 0);
+
+    // A new runtime generation starts without the hook having spoken.
+    let replaced = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        let runtime = entry.info.runtime.as_mut().expect("runtime projection");
+        runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
+        RuntimeWatchIdentity::from_info(&entry.info).expect("replacement identity")
+    };
+    registry
+        .record_approval_notice(&created.id, &replaced, 0)
+        .await;
+    assert_eq!(probe.defers(), 1);
+
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+#[tokio::test]
 async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),

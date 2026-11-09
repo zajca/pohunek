@@ -200,6 +200,42 @@ fn a_sweep_that_cannot_replace_the_log_leaves_it_whole_and_the_next_sweep_succee
     assert_eq!(listed_ids(&reopened), ["n-open", "n-read", "n-young"]);
 }
 
+#[test]
+fn a_sweep_whose_rename_fails_after_a_complete_temporary_file_keeps_the_set_and_recovers() {
+    let dir = pohunek_test_support::tempdir_with_prefix("ph-format3-").expect("temp dir");
+    write_format_2(dir.path());
+    let service = NotificationService::open_with_settings(dir.path(), settings()).expect("opens");
+    let notifications = dir.path().join("notifications");
+    let log = notifications.join("notifications.jsonl");
+    let original = std::fs::read(&log).expect("read the log");
+    // The copy of the old format exists already, so the failure comes from the
+    // rename and not from taking the copy.
+    std::fs::write(
+        notifications.join("notifications.jsonl.pre-format-3"),
+        &original,
+    )
+    .expect("provide the copy");
+
+    // A non-empty directory in the place of the log makes the rename fail
+    // after the temporary file was written, synced and re-opened.
+    std::fs::remove_file(&log).expect("move the log away");
+    std::fs::create_dir(&log).expect("block the rename target");
+    std::fs::write(log.join("keep"), b"x").expect("make the directory non-empty");
+    service
+        .run_retention_at(now())
+        .expect_err("the rename cannot replace the directory");
+    assert_eq!(listed_ids(&service).len(), 5, "the service keeps its set");
+
+    std::fs::remove_file(log.join("keep")).expect("unblock");
+    std::fs::remove_dir(&log).expect("unblock");
+    std::fs::write(&log, &original).expect("restore the log");
+    let outcome = service.run_retention_at(now()).expect("the sweep succeeds");
+    assert_eq!(outcome.removed, 5);
+    drop(service);
+    let reopened = NotificationService::open_with_settings(dir.path(), settings()).expect("opens");
+    assert_eq!(listed_ids(&reopened), ["n-open", "n-read", "n-young"]);
+}
+
 fn attention_params(title: &str) -> protocol::NotificationCreateParams {
     protocol::NotificationCreateParams {
         source: protocol::NotificationSource {

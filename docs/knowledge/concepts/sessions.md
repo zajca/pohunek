@@ -45,7 +45,7 @@ To follow agents across turns, a client runs `pohunek session wait <target>...
 also the mode with no flags) or calls the protocol method `session.wait_turn`
 (Rust SDK `Client::session_wait_turn`, TypeScript SDK `client.sessionWaitTurn`).
 It waits for the
-next turn event of one or more sessions, `turn_completed`, `agent_blocked`,
+next turn event of one or more sessions, `turn_completed`, `turn_error`, `agent_blocked`,
 `approval_required`, or `exited`, newer than an opaque cursor (or newer than
 the call when no cursor is given), bounded by an agent-chosen `timeout_ms`
 (daemon default 5 minutes, ceiling 30 minutes, both set by `service.toml`

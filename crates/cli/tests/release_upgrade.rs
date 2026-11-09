@@ -664,6 +664,54 @@ fn wait_turn_error(cli: &Cli, id: &str, cursor: &str) {
     );
 }
 
+/// Asserts that session `id` records no `turn_error` event after `cursor`
+/// within a bounded wait.
+fn assert_no_turn_error(cli: &Cli, id: &str, cursor: &str) {
+    let waited = cli.json(&[
+        "session",
+        "wait",
+        id,
+        "--until",
+        "turn_error",
+        "--after",
+        cursor,
+        "--timeout",
+        "3s",
+        "--json",
+    ]);
+    assert_eq!(
+        waited["reason"], "timeout",
+        "a refused hook report must not surface as a turn event: {waited}"
+    );
+}
+
+/// Asserts that a call of the previous release's CLI is refused with a
+/// protocol version mismatch: this build's daemon serves protocol 5 only.
+fn assert_refused_as_version_mismatch(cli: &Cli, args: &[&str]) {
+    let refusal = cli
+        .try_json(args)
+        .expect_err("the previous release's client must be refused");
+    assert!(
+        refusal.contains("version_mismatch"),
+        "`pohunek {}` is not refused as a version mismatch: {refusal}",
+        args.join(" ")
+    );
+}
+
+/// Asserts that the inbox of session `id` holds no `error` record: turn
+/// reports are signals, not stored notifications.
+fn assert_no_error_record(cli: &Cli, id: &str) {
+    let list = cli.json(&["notifications", "list", "--session", id, "--json"]);
+    let records = list["notifications"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        records.iter().all(|record| record["kind"] != "error"),
+        "an error report must not be stored: {list}"
+    );
+}
+
 fn input(cli: &Cli, id: &str, text: &str) {
     let result = cli.json(&["session", "input", id, text, "--json"]);
     assert_eq!(
@@ -2321,10 +2369,10 @@ impl Upgrade {
         );
     }
 
-    /// `screen` and `input` reach the adopted worker through the new daemon,
-    /// and the previous release's hooks, running in the previous release's
-    /// worker, still reach the new daemon. The hook event at the end is sent
-    /// through the hooks the upgrade reinstalled.
+    /// `screen` and `input` reach the adopted worker through the new daemon.
+    /// The adopted worker still runs the previous release's hooks, which
+    /// announce protocol 4, so this build's daemon refuses their report until
+    /// the session relaunches.
     fn assert_session_works(&self) {
         let (head, id) = (&self.head, &self.id);
         wait_screen(head, id, "fake-agent ready");
@@ -2336,25 +2384,31 @@ impl Upgrade {
         wait_native_id(head, id, NATIVE_AFTER);
         let cursor = turn_cursor(head, id);
         input(head, id, &format!("stopfail:{EVENT_AFTER_UPGRADE}"));
-        wait_turn_error(head, id, &cursor);
+        wait_screen(
+            head,
+            id,
+            &format!("fake-agent notified {EVENT_AFTER_UPGRADE}"),
+        );
+        assert_no_turn_error(head, id, &cursor);
     }
 
-    /// A client of the previous release talks to the new daemon: reads and a
-    /// write, within the protocol window.
-    fn assert_previous_client(&self, after: &Runtime) {
+    /// A client of the previous release gets a clear protocol refusal on
+    /// reads and writes alike: the window is protocol 5 only.
+    fn assert_previous_client_refused(&self) {
         let (previous, id) = (&self.previous, &self.id);
-        let listed = previous.json(&["session", "list", "--json"]);
-        assert!(
-            listed.to_string().contains(id),
-            "previous client lost {id}: {listed}"
+        assert_refused_as_version_mismatch(previous, &["session", "list", "--json"]);
+        assert_refused_as_version_mismatch(previous, &["session", "inspect", id, "--json"]);
+        assert_refused_as_version_mismatch(previous, &["health", "--json"]);
+        assert_refused_as_version_mismatch(
+            previous,
+            &[
+                "session",
+                "input",
+                id,
+                "echo:input-from-previous-client",
+                "--json",
+            ],
         );
-        assert_eq!(
-            runtime(&previous.json(&["session", "inspect", id, "--json"])).as_ref(),
-            Some(after)
-        );
-        previous.json(&["health", "--json"]);
-        input(previous, id, "echo:input-from-previous-client");
-        wait_screen(previous, id, "fake-agent ack input-from-previous-client");
     }
 
     /// Resumes session `id` with a plain `session resume`, which must succeed:
@@ -2409,6 +2463,7 @@ impl Upgrade {
         assert_eq!(status["active_version"], self.head_version.as_str());
         wait_native_id(head, id, native);
         wait_turn_error(head, id, cursor);
+        assert_no_error_record(head, id);
         assert_store_pin(
             &self.run,
             id,
@@ -2463,33 +2518,22 @@ impl Upgrade {
         self.assert_package_served(CODEX_PACKAGE_ID, self.profile_digest(CODEX_PACKAGE_ID));
     }
 
-    /// The published client's request deadline bounds a silent-reader create.
-    fn assert_previous_client_creates_with_input(&self) {
+    /// The previous release's client cannot create a session either.
+    fn assert_previous_client_cannot_create(&self) {
         let cwd = self.run.home.display().to_string();
-        let created = self.previous.json(&[
-            "session",
-            "new",
-            "--agent",
-            SILENT_PROFILE,
-            "--cwd",
-            &cwd,
-            "--input",
-            "echo:input-from-previous-create",
-            "--json",
-        ]);
-        let id = created
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| panic!("previous client did not receive a session id: {created}"));
-        wait_screen(
+        assert_refused_as_version_mismatch(
             &self.previous,
-            id,
-            "silent-agent ack echo:input-from-previous-create",
-        );
-        let removed = self.head.json(&["session", "rm", id, "--json"]);
-        assert_eq!(
-            removed["removed"], true,
-            "compat session was not removed: {removed}"
+            &[
+                "session",
+                "new",
+                "--agent",
+                SILENT_PROFILE,
+                "--cwd",
+                &cwd,
+                "--input",
+                "echo:input-from-previous-create",
+                "--json",
+            ],
         );
     }
 }
@@ -2534,11 +2578,11 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.resize_live_on_previous();
     upgrade.upgrade();
     upgrade.assert_downgrade_guard();
-    let after = upgrade.assert_adopted(&before.live, before.daemon);
+    upgrade.assert_adopted(&before.live, before.daemon);
     upgrade.assert_resize_applied_by_adopted_worker();
     upgrade.assert_session_works();
     upgrade.assert_head_links_a_package_of_its_format();
-    upgrade.assert_previous_client(&after);
+    upgrade.assert_previous_client_refused();
 
     // The stopped session resumes with a plain resume onto the package its
     // profile names; a second stop and plain resume succeed.
@@ -2561,7 +2605,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
     upgrade.resume(&upgrade.id, LIVE_NAME, NATIVE_AFTER, &stopped);
 
     upgrade.assert_new_sessions_launch_through_packages();
-    upgrade.assert_previous_client_creates_with_input();
+    upgrade.assert_previous_client_cannot_create();
     upgrade.head.json(&[
         "service",
         "uninstall",

@@ -167,6 +167,21 @@ impl AttentionCoordinator {
         }
     }
 
+    /// Create a handle whose deferred notifications a test counts through the
+    /// returned probe; no task consumes them.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn probed() -> (Self, DeferProbe) {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                commands,
+                as_of: None,
+            },
+            DeferProbe(receiver),
+        )
+    }
+
     /// Create a handle with no backing task, for tests that never exercise debounce.
     ///
     /// `defer`/`resolve` become silent no-ops because the receiver is dropped, so
@@ -180,6 +195,25 @@ impl AttentionCoordinator {
             commands,
             as_of: None,
         }
+    }
+}
+
+/// Counts the notifications deferred through a [`AttentionCoordinator::probed`]
+/// handle.
+#[cfg(test)]
+pub(crate) struct DeferProbe(mpsc::UnboundedReceiver<Command>);
+
+#[cfg(test)]
+impl DeferProbe {
+    /// The notifications deferred since the last call.
+    pub(crate) fn defers(&mut self) -> usize {
+        let mut count = 0;
+        while let Ok(command) = self.0.try_recv() {
+            if matches!(command, Command::Defer(_)) {
+                count += 1;
+            }
+        }
+        count
     }
 }
 

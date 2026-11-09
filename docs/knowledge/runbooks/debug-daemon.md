@@ -99,12 +99,12 @@ For durable notification issues:
    `notifications.jsonl.pre-format-3` once.
 6. Run `pohunek notifications watch --json` in one terminal, then reproduce the
    event. A create should emit `notification_created`; a resolve, provider upgrade, or
-   dedupe upgrade should emit
-   `notification_updated`; delete should emit `notification_deleted`.
+   dedupe upgrade should emit `notification_updated`; the retention sweep
+   emits `notification_deleted` for each attention record it removes.
    To follow one session, add `--session <id>`, `--kind <kind>`, or
    `--status <status>` (`--unread`); these filter the record in each create or
    update event client-side and drop delete events, so leave them off while
-   checking that a delete is emitted.
+   checking that a sweep deletes.
 8. If a provider approval prompt does not appear, reinstall hooks with
    `pohunek integration install --agent <codex-or-claude>` and confirm the
    provider build supports the modern hook surface. Codex approval notifications

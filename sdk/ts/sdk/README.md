@@ -179,7 +179,7 @@ completed, so inspect the current session before deciding whether to resend.
 ## Turn Waits
 
 `client.sessionWaitTurn(params)` waits for the next `turn_completed`,
-`agent_blocked`, `approval_required`, or `exited` event of up to
+`turn_error`, `agent_blocked`, `approval_required`, or `exited` event of up to
 `MAX_SESSION_WAIT_TURN_TARGETS` sessions after an opaque cursor. Pass the
 returned `cursor` as `after` to the next wait so no event is missed between
 calls, and branch on `reason` (`event`, `timeout`, `cursor_reset`,
@@ -190,7 +190,13 @@ let after: string | undefined;
 for (;;) {
   const result = await client.sessionWaitTurn({
     session_ids: ["s-41", "s-42"],
-    until: ["turn_completed", "agent_blocked", "approval_required", "exited"],
+    until: [
+      "turn_completed",
+      "turn_error",
+      "agent_blocked",
+      "approval_required",
+      "exited",
+    ],
     ...(after === undefined ? {} : { after }),
     timeout_ms: 300_000,
   });
