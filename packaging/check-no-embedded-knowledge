@@ -1,0 +1,29 @@
+#!/bin/sh
+# Refuse a release binary that embeds the assistant knowledge bundle.
+#
+# usage: check-no-embedded-knowledge <system.md> <binary>...
+#
+# The assistant bundle ships as a context package. The marker is the first
+# sentence of the Mission section of the prompt contract (<system.md>, normally
+# docs/knowledge/assistant/system.md); a binary that contains it carries the
+# bundle.
+
+set -eu
+
+[ "$#" -ge 2 ] || { echo "usage: check-no-embedded-knowledge <system.md> <binary>..." >&2; exit 2; }
+contract=$1
+shift
+[ -f "$contract" ] || { echo "check-no-embedded-knowledge: $contract is not a file" >&2; exit 2; }
+
+marker=$(sed -n '/^## Mission$/,/^## /{/^## /d;/^$/d;p;}' "$contract" | sed -n 1p)
+[ -n "$marker" ] || { echo "check-no-embedded-knowledge: $contract has no Mission text" >&2; exit 2; }
+
+status=0
+for binary in "$@"; do
+    [ -f "$binary" ] || { echo "check-no-embedded-knowledge: $binary is not a file" >&2; exit 2; }
+    if grep -aqF -- "$marker" "$binary"; then
+        echo "error: $binary embeds the assistant knowledge bundle (found: $marker)" >&2
+        status=1
+    fi
+done
+exit "$status"

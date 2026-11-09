@@ -898,7 +898,7 @@ dir = "bundle"   # package-relative directory that holds the files
 - The daemon verifies the package root against its archive digest each time it
   resolves the files for a request, and uses only the selected, enabled package
   of the id. The files are then read by path: a session that already started
-  keeps reading them, and uninstalling the package removes them under it.
+  keeps reading them, and uninstalling the package removes them under it (#2066).
 - For the assistant, `dir` holds `index.md`, `assistant/system.md` (the prompt
   contract) and the concept files; the daemon answers `assistant.materialize`
   with the directory, its concept index and the contract text, and

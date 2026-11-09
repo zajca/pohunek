@@ -648,5 +648,41 @@ class ArchiveTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+class EmbeddedKnowledgeTest(unittest.TestCase):
+    """The release binaries must not carry the assistant knowledge bundle."""
+
+    CONTRACT = "# Contract\n\n## Mission\n\nYou are the fixture assistant. More.\n\n## Safety\n"
+
+    def check(self, binary_bytes):
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = Path(tmp) / "system.md"
+            contract.write_text(self.CONTRACT)
+            binary = Path(tmp) / "pohunekd"
+            binary.write_bytes(binary_bytes)
+            return run(
+                [PACKAGING / "check-no-embedded-knowledge", contract, binary],
+                check=False,
+            )
+
+    def test_a_binary_with_the_mission_sentence_is_refused(self):
+        result = self.check(b"\x00\x01You are the fixture assistant. More.\x00")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("embeds the assistant knowledge bundle", result.stderr)
+
+    def test_a_binary_without_it_passes(self):
+        result = self.check(b"\x00\x01unrelated bytes\x00")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_repository_contract_has_a_mission_marker(self):
+        result = run(
+            [
+                PACKAGING / "check-no-embedded-knowledge",
+                ROOT / "docs/knowledge/assistant/system.md",
+                PACKAGING / "check-no-embedded-knowledge",
+            ]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

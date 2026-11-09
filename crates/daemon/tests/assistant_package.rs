@@ -485,8 +485,19 @@ async fn a_bundle_cache_left_by_an_earlier_release_is_not_a_fallback() {
     let error = materialize(&mut client, json!({ "snapshot": "{}" }))
         .await
         .expect_err("a stale bundle cache is ignored");
-
     assert_eq!(error.code, "assistant_package_missing", "{error:?}");
+
+    install(&mut client, &servers.plugins, &bundle_entries(CONTRACT))
+        .await
+        .expect("install");
+    let served = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect("the installed package is used");
+    assert!(
+        !served.bundle_path.contains("xdg-cache"),
+        "the bundle comes from the package, not the old cache: {}",
+        served.bundle_path
+    );
     servers.stop().await;
 }
 

@@ -407,6 +407,30 @@ The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).
 
+## Install the assistant package
+
+`pohunek assistant` reads its knowledge bundle from the context package
+`pohunek.context.assistant`; the daemon binaries carry no copy. Install the
+package once per host that runs assistant sessions (a remote assistant reads the
+package installed on that remote host). The package is published as a release
+asset of [`pohunekd/plugin-assistant`](https://github.com/pohunekd/plugin-assistant)
+with its SHA-256 digest in the release notes; a context package installs by
+digest, never through the catalog:
+
+```bash
+pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
+pohunek plugin select pohunek.context.assistant
+```
+
+Until that repository publishes its first release there is no archive to
+install, and `pohunek assistant` answers `assistant_package_missing` with the
+step to take. After a core upgrade, install the package version whose release
+notes name your core version; `pohunek plugin list` shows the installed version,
+and a package that was disabled, left unselected or modified is refused the same
+way (`pohunek plugin doctor` names the cause). The
+[runtime packages guide](knowledge/guides/runtime-packages.md#declaring-a-context-package)
+describes the package format.
+
 ## Install the Pi runtime package from a checkout
 
 Pi (`pi`, the Pi coding agent) is an optional runtime delivered as a runtime

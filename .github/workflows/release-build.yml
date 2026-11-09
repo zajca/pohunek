@@ -208,6 +208,18 @@ jobs:
                 exit 1
                 ;;
             esac
+            case "$component" in
+              cli)
+                packaging/check-no-embedded-knowledge docs/knowledge/assistant/system.md \
+                  "target/$TARGET/release/pohunek"
+                ;;
+              daemon)
+                packaging/check-no-embedded-knowledge docs/knowledge/assistant/system.md \
+                  "target/$TARGET/release/pohunek" \
+                  "target/$TARGET/release/pohunekd" \
+                  "target/$TARGET/release/pohunek-sessiond"
+                ;;
+            esac
             name="$(packaging/stage-archive "$component" "$VERSION" "$TARGET" \
               "target/$TARGET/release" target/pohunek-docs dist)"
             if [ "$name" != "pohunek-$component-$VERSION-$TARGET" ]; then

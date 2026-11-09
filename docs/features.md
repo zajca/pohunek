@@ -137,8 +137,8 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   text and its sha256. It is fully local: no daemon contact, no filesystem
   reads, no network access; `--host` is accepted and ignored.
 - **Universal assistant**: `pohunek assistant "how do I …"` launches a capable
-  agent session preloaded with an offline knowledge bundle about pohunek
-  itself and the launch context (selected host, project and agent) —
+  agent session preloaded with the knowledge bundle of the
+  assistant package about pohunek itself and the launch context (selected host, project and agent) —
   self-hosted support for setup, project configuration, updates, and debugging.
 - **SDKs — build your own GUI or client**: a Rust client crate
   (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
