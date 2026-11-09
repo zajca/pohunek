@@ -78,8 +78,7 @@ done
 
 if [ -n "$resume_ref" ]; then
     native_id="$resume_ref"
-    # The daemon merges notifications that carry one hook event id, whichever
-    # session sends it, so each resumed launch sends its own.
+    # The event ids only label the phases of the test.
     launch_event="evt-after-resume-$$"
 else
     native_id="$FAKE_AGENT_NATIVE_ID"
@@ -89,9 +88,8 @@ fi
 printf 'launch args=[%s] native=%s\n' "$launch_args" "$native_id" >>"$FAKE_AGENT_LOG"
 printf 'fake-agent started args=[%s]\n' "$launch_args"
 report_native "$native_id"
-# An error notification, not a permission prompt: the daemon debounces an
-# attention notification and drops it once the session starts working, which
-# this agent's own output can trigger at launch.
+# The launch report is an error report, which the daemon surfaces as a
+# `turn_error` event and stores no record for.
 notify stop_failure "" "$launch_event"
 printf 'fake-agent ready native=%s\n' "$native_id"
 

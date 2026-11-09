@@ -665,7 +665,8 @@ fn wait_turn_error(cli: &Cli, id: &str, cursor: &str) {
 }
 
 /// Asserts that session `id` records no `turn_error` event after `cursor`
-/// within a bounded wait.
+/// within a wait longer than the attention debounce window an admitted report
+/// waits out.
 fn assert_no_turn_error(cli: &Cli, id: &str, cursor: &str) {
     let waited = cli.json(&[
         "session",
@@ -676,7 +677,7 @@ fn assert_no_turn_error(cli: &Cli, id: &str, cursor: &str) {
         "--after",
         cursor,
         "--timeout",
-        "3s",
+        "10s",
         "--json",
     ]);
     assert_eq!(

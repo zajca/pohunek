@@ -198,22 +198,23 @@ impl Fixture {
     /// `trigger` (`notice` or `other`) and waits until its marker is on screen.
     pub(super) async fn emit_notice(&self, session: &str, tag: &str, trigger: &str, marker: &str) {
         std::fs::write(self.cwd(tag).join(trigger), b"").expect("ask the agent for a notice");
-        Box::pin(pohunek_test_support::wait::wait_until(
-            "the notice marker is on screen",
-            || async {
+        // Yields instead of sleeping: the scenarios hold a paused clock, on
+        // which a sleep would not end.
+        guard("the notice marker is on screen", async {
+            loop {
                 let screen = ok(self
                     .call(method::SESSION_SCREEN, json!({"session_id": session}))
                     .await);
-                screen["visible_lines"]
-                    .as_array()
-                    .is_some_and(|lines| {
-                        lines
-                            .iter()
-                            .any(|line| line.as_str().is_some_and(|line| line.contains(marker)))
-                    })
-                    .then_some(())
-            },
-        ))
+                if screen["visible_lines"].as_array().is_some_and(|lines| {
+                    lines
+                        .iter()
+                        .any(|line| line.as_str().is_some_and(|line| line.contains(marker)))
+                }) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await;
     }
 
@@ -381,6 +382,25 @@ pub(super) async fn pause_clock() -> AutoAdvanceInhibitor {
     tokio::time::advance(debounce() + TIMER_TICK).await;
     settle().await;
     inhibitor
+}
+
+/// Moves the paused clock in [`CLOCK_STEP`] increments until the inbox holds a
+/// record, and returns the inbox.
+///
+/// The step yields to the scheduler instead of sleeping, so a debounce window
+/// passes in virtual time and the wait costs no real time.
+pub(super) async fn surfaced_inbox(fixture: &Fixture) -> Vec<Value> {
+    guard("a record to surface", async {
+        loop {
+            tokio::time::advance(CLOCK_STEP).await;
+            settle().await;
+            let inbox = fixture.inbox().await;
+            if !inbox.is_empty() {
+                return inbox;
+            }
+        }
+    })
+    .await
 }
 
 /// Waits until `count` turn waits hold slots, so their deadlines are armed
@@ -1313,13 +1333,7 @@ async fn an_approval_notice_creates_one_approval_record_and_nothing_else() {
     let _inhibitor = pause_clock().await;
 
     Box::pin(fixture.emit_notice(&session, "notice", "notice", "noticed")).await;
-    let records = Box::pin(wait_until("the approval record surfaces", || async {
-        tokio::time::advance(CLOCK_STEP).await;
-        settle().await;
-        let inbox = fixture.inbox().await;
-        (!inbox.is_empty()).then_some(inbox)
-    }))
-    .await;
+    let records = surfaced_inbox(&fixture).await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["kind"], "approval_required");
     assert_eq!(records[0]["dedupe_key"], format!("attention:{session}"));
@@ -1381,13 +1395,7 @@ async fn a_notice_and_a_hook_approval_for_one_moment_are_one_record() {
         )
         .await);
     assert_eq!(approval["created"], true);
-    let records = Box::pin(wait_until("the approval record surfaces", || async {
-        tokio::time::advance(CLOCK_STEP).await;
-        settle().await;
-        let inbox = fixture.inbox().await;
-        (!inbox.is_empty()).then_some(inbox)
-    }))
-    .await;
+    let records = surfaced_inbox(&fixture).await;
     tokio::time::advance(debounce() + FLUSH_SLACK).await;
     settle().await;
     assert_eq!(records.len(), 1, "{records:?}");
@@ -1424,13 +1432,7 @@ async fn a_session_that_stops_while_blocked_resolves_its_attention_record() {
     let _inhibitor = pause_clock().await;
 
     fixture.activity(&session, "blocked").await;
-    let records = Box::pin(wait_until("the blocked record surfaces", || async {
-        tokio::time::advance(CLOCK_STEP).await;
-        settle().await;
-        let inbox = fixture.inbox().await;
-        (!inbox.is_empty()).then_some(inbox)
-    }))
-    .await;
+    let records = surfaced_inbox(&fixture).await;
     assert_eq!(records[0]["kind"], "agent_blocked");
     assert_eq!(records[0]["status"], "unread");
 
