@@ -983,6 +983,12 @@ struct ExternalAssociationBlock {
     release: tokio::sync::Notify,
 }
 
+/// The runtime generation in which a provider hook spoke for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HookSpoke {
+    generation: Option<protocol::RuntimeGeneration>,
+}
+
 #[derive(Debug, Clone)]
 struct SessionEntry {
     info: SessionInfo,
@@ -1049,7 +1055,7 @@ struct SessionEntry {
     /// session (an activity report or an admitted notification). An approval
     /// notice on the terminal is ignored while it equals the current
     /// generation, because the hook already covers the session there.
-    hook_spoke: Option<Option<protocol::RuntimeGeneration>>,
+    hook_spoke: Option<HookSpoke>,
     /// Whether the session worker answers the program's OSC 7501 probe, as set
     /// when the generation launched.
     probe_answered: bool,
@@ -5096,13 +5102,13 @@ impl SessionRegistry {
         );
         entry.set_activity(activity);
         entry.info.state_source = StateSource::Report;
-        entry.hook_spoke = Some(
-            entry
+        entry.hook_spoke = Some(HookSpoke {
+            generation: entry
                 .info
                 .runtime
                 .as_ref()
                 .map(|runtime| runtime.runtime_generation),
-        );
+        });
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
     }
 

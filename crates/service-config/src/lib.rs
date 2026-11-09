@@ -1295,10 +1295,8 @@ impl ServiceConfig {
         }
         validate_required_hooks(&spec.hook_required)?;
         let trusted_repositories = parse_trusted_repositories(&spec.trusted_repositories)?;
-        validate_event_retention(spec.event_retention)?;
         validate_inventory_probe(spec.inventory_probe)?;
-        validate_worker_journal_max_age(spec.worker_journal_max_age)?;
-        validate_notification_settings(spec.notifications)?;
+        validate_retention(&spec)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -2266,6 +2264,10 @@ fn is_default_worker_journal_max_age_days(value: &u64) -> bool {
 /// The optional `[notifications]` table: each key is optional and omitted while
 /// it equals its default.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the keys name the unit of each setting"
+)]
 struct RawNotifications {
     #[serde(
         default = "default_attention_debounce_secs",
@@ -3365,6 +3367,14 @@ fn validate_worker_journal_max_age(max_age: Duration) -> Result<(), ConfigError>
         });
     }
     Ok(())
+}
+
+/// Validates the lifetimes of the event journal, the worker journals and the
+/// notification inbox.
+fn validate_retention(spec: &ConfigSpec) -> Result<(), ConfigError> {
+    validate_event_retention(spec.event_retention)?;
+    validate_worker_journal_max_age(spec.worker_journal_max_age)?;
+    validate_notification_settings(spec.notifications)
 }
 
 /// Validates each `[notifications]` bound.

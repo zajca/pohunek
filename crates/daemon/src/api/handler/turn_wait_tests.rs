@@ -198,19 +198,22 @@ impl Fixture {
     /// `trigger` (`notice` or `other`) and waits until its marker is on screen.
     pub(super) async fn emit_notice(&self, session: &str, tag: &str, trigger: &str, marker: &str) {
         std::fs::write(self.cwd(tag).join(trigger), b"").expect("ask the agent for a notice");
-        pohunek_test_support::wait::wait_until("the notice marker is on screen", || async {
-            let screen = ok(self
-                .call(method::SESSION_SCREEN, json!({"session_id": session}))
-                .await);
-            screen["visible_lines"]
-                .as_array()
-                .is_some_and(|lines| {
-                    lines
-                        .iter()
-                        .any(|line| line.as_str().is_some_and(|line| line.contains(marker)))
-                })
-                .then_some(())
-        })
+        Box::pin(pohunek_test_support::wait::wait_until(
+            "the notice marker is on screen",
+            || async {
+                let screen = ok(self
+                    .call(method::SESSION_SCREEN, json!({"session_id": session}))
+                    .await);
+                screen["visible_lines"]
+                    .as_array()
+                    .is_some_and(|lines| {
+                        lines
+                            .iter()
+                            .any(|line| line.as_str().is_some_and(|line| line.contains(marker)))
+                    })
+                    .then_some(())
+            },
+        ))
         .await;
     }
 
@@ -692,10 +695,10 @@ async fn a_timeout_reports_every_progress_field_and_output_since_the_cursor() {
         "session_ids": [first, second], "until": ["turn_completed"],
         "after": cursor, "timeout_ms": 1
     });
-    let result = wait_until("output after the cursor", || async {
+    let result = Box::pin(wait_until("output after the cursor", || async {
         let result = ok(joined(fixture.spawn_wait(since.clone())).await);
         (result["progress"][1]["output_advanced"] == true).then_some(result)
-    })
+    }))
     .await;
     assert_eq!(result["reason"], "timeout");
     assert!(result.get("event").is_none());
@@ -1309,15 +1312,13 @@ async fn an_approval_notice_creates_one_approval_record_and_nothing_else() {
     let session = fixture.session("notice").await;
     let _inhibitor = pause_clock().await;
 
-    fixture
-        .emit_notice(&session, "notice", "notice", "noticed")
-        .await;
-    let records = wait_until("the approval record surfaces", || async {
+    Box::pin(fixture.emit_notice(&session, "notice", "notice", "noticed")).await;
+    let records = Box::pin(wait_until("the approval record surfaces", || async {
         tokio::time::advance(CLOCK_STEP).await;
         settle().await;
         let inbox = fixture.inbox().await;
         (!inbox.is_empty()).then_some(inbox)
-    })
+    }))
     .await;
     assert_eq!(records.len(), 1, "{records:?}");
     assert_eq!(records[0]["kind"], "approval_required");
@@ -1325,9 +1326,7 @@ async fn an_approval_notice_creates_one_approval_record_and_nothing_else() {
     assert_eq!(records[0]["metadata"]["reason"], "terminal_notice");
 
     // A notice with other text is no attention.
-    fixture
-        .emit_notice(&session, "notice", "other", "other-noticed")
-        .await;
+    Box::pin(fixture.emit_notice(&session, "notice", "other", "other-noticed")).await;
     tokio::time::advance(debounce() + FLUSH_SLACK).await;
     settle().await;
     assert_eq!(fixture.inbox().await.len(), 1);
@@ -1341,9 +1340,7 @@ async fn an_approval_notice_is_ignored_once_a_hook_spoke_for_the_session() {
     fixture.activity(&session, "working").await;
     let _inhibitor = pause_clock().await;
 
-    fixture
-        .emit_notice(&session, "hook-first", "notice", "noticed")
-        .await;
+    Box::pin(fixture.emit_notice(&session, "hook-first", "notice", "noticed")).await;
     let mut moved = Duration::ZERO;
     while moved < debounce() + FLUSH_SLACK {
         tokio::time::advance(CLOCK_STEP).await;
@@ -1363,9 +1360,7 @@ async fn a_notice_and_a_hook_approval_for_one_moment_are_one_record() {
     let session = fixture.session("both").await;
     let _inhibitor = pause_clock().await;
 
-    fixture
-        .emit_notice(&session, "both", "notice", "noticed")
-        .await;
+    Box::pin(fixture.emit_notice(&session, "both", "notice", "noticed")).await;
     let approval = ok(fixture
         .call(
             method::NOTIFICATION_CREATE,
@@ -1386,12 +1381,12 @@ async fn a_notice_and_a_hook_approval_for_one_moment_are_one_record() {
         )
         .await);
     assert_eq!(approval["created"], true);
-    let records = wait_until("the approval record surfaces", || async {
+    let records = Box::pin(wait_until("the approval record surfaces", || async {
         tokio::time::advance(CLOCK_STEP).await;
         settle().await;
         let inbox = fixture.inbox().await;
         (!inbox.is_empty()).then_some(inbox)
-    })
+    }))
     .await;
     tokio::time::advance(debounce() + FLUSH_SLACK).await;
     settle().await;
@@ -1429,25 +1424,25 @@ async fn a_session_that_stops_while_blocked_resolves_its_attention_record() {
     let _inhibitor = pause_clock().await;
 
     fixture.activity(&session, "blocked").await;
-    let records = wait_until("the blocked record surfaces", || async {
+    let records = Box::pin(wait_until("the blocked record surfaces", || async {
         tokio::time::advance(CLOCK_STEP).await;
         settle().await;
         let inbox = fixture.inbox().await;
         (!inbox.is_empty()).then_some(inbox)
-    })
+    }))
     .await;
     assert_eq!(records[0]["kind"], "agent_blocked");
     assert_eq!(records[0]["status"], "unread");
 
     fixture.stop_all(&[&session]).await;
-    let resolved = wait_until("the record resolves", || async {
+    let resolved = Box::pin(wait_until("the record resolves", || async {
         settle().await;
         let inbox = fixture.inbox().await;
         (inbox
             .first()
             .is_some_and(|record| record["status"] == "acknowledged"))
         .then_some(inbox)
-    })
+    }))
     .await;
     assert_eq!(resolved.len(), 1);
 }
@@ -1469,10 +1464,10 @@ async fn a_session_that_fails_leaves_no_notification_record_of_any_kind() {
     let session = created["id"].as_str().expect("session id").to_owned();
     let _inhibitor = pause_clock().await;
 
-    wait_until("the session fails", || async {
+    Box::pin(wait_until("the session fails", || async {
         let info = ok(fixture.call(method::SESSION_INSPECT, json!(session)).await);
         (info["state"] == "failed").then_some(())
-    })
+    }))
     .await;
     tokio::time::advance(debounce() + FLUSH_SLACK).await;
     settle().await;

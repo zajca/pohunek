@@ -1365,11 +1365,6 @@ mod tests {
         );
     }
 
-    /// Builds a request line of the previous public protocol version.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "test helper takes the json! literal by value to keep call sites terse"
-    )]
     fn idle_state() -> DaemonState {
         daemon_state(
             HealthInfo::new("test"),

@@ -360,13 +360,13 @@ impl SessionRegistry {
     /// runs now.
     pub(crate) async fn note_hook_spoke(&self, id: &SessionId) {
         if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
-            entry.hook_spoke = Some(
-                entry
+            entry.hook_spoke = Some(super::HookSpoke {
+                generation: entry
                     .info
                     .runtime
                     .as_ref()
                     .map(|runtime| runtime.runtime_generation),
-            );
+            });
         }
     }
 
@@ -401,7 +401,7 @@ impl SessionRegistry {
             .runtime
             .as_ref()
             .map(|runtime| runtime.runtime_generation);
-        if entry.hook_spoke == Some(generation) {
+        if entry.hook_spoke == Some(super::HookSpoke { generation }) {
             debug!(session_id = %id.0, "approval notice ignored: a hook already spoke");
             return;
         }
