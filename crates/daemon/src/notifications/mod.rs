@@ -28,8 +28,6 @@ use crate::session::TurnId;
 
 #[doc(inline)]
 pub use coordinator::AttentionCoordinator;
-#[cfg(test)]
-pub(crate) use coordinator::DeferProbe;
 pub(crate) use coordinator::ResolveAsOf;
 #[doc(inline)]
 pub use notice_sink::ApprovalNoticeSink;

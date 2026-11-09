@@ -7422,7 +7422,6 @@ async fn attach_from_inside_the_same_session_is_rejected() {
 async fn a_hook_that_spoke_covers_only_its_own_runtime_generation() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
     let root = pohunek_test_support::tempdir_with_prefix("ph-notice-").expect("fixture root");
