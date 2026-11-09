@@ -58,9 +58,6 @@ pub use sweep::{
 #[doc(inline)]
 pub use darwin::{DarwinInspector, ExitReportWatch, ProcessExit};
 
-#[cfg(target_os = "macos")]
-pub(crate) use darwin::environment_entry_is;
-
 /// Process inspector backing this host.
 ///
 /// Daemon, worker, and client code name this alias instead of a concrete

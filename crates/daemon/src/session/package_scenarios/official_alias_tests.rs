@@ -145,18 +145,6 @@ fn assert_migration_refusal(refused: &protocol::ProtocolError, alias: &str) {
     }
 }
 
-/// A same-directory fork of session `id`.
-fn fork_params(id: &protocol::SessionId) -> protocol::SessionForkParams {
-    protocol::SessionForkParams {
-        session_id: id.clone(),
-        name: None,
-        cwd_mode: protocol::ForkCwdMode::Same,
-        cols: 100,
-        rows: 30,
-        accept_profile_change: false,
-    }
-}
-
 /// The preflight inputs of `fixture`'s installed state, over the workers
 /// `workers_of` started.
 fn preflight_inputs(
@@ -586,12 +574,12 @@ fn compiled_in_daemon(fixture: &Fixture, store_path: &Path) -> SessionRegistry {
 }
 
 #[tokio::test]
-async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeover() {
+async fn a_built_in_claude_session_is_not_resumed_after_the_takeover() {
     let key = signing_key("root");
-    let dir = temp_dir("alias-claude-fork");
-    let store_path = temp_store_path("alias-claude-fork");
+    let dir = temp_dir("alias-claude-resume");
+    let store_path = temp_store_path("alias-claude-resume");
     let fixture = Fixture::with_anchor_and_store(
-        "alias-claude-fork-plugins",
+        "alias-claude-resume-plugins",
         anchor(&[&key], Vec::new()),
         store_path.clone(),
     );
@@ -600,10 +588,6 @@ async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeo
         "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
     );
     let created = launch_on_a_compiled_in_daemon(&fixture, &store_path, dir).await;
-    assert!(
-        created.capabilities.fork,
-        "the built-in Claude runtime forks"
-    );
     assert!(matches!(
         durable_recovery(&store_path, &created.id)
             .launch_binding
@@ -624,12 +608,6 @@ async fn a_built_in_claude_session_is_neither_resumed_nor_forked_after_the_takeo
         .await
         .expect_err("the package serves the runtime now");
     assert_migration_refusal(&resumed, RuntimeId::CLAUDE);
-    let forked = restarted
-        .registry
-        .fork(fork_params(&created.id))
-        .await
-        .expect_err("a fork never launches the package for a built-in session");
-    assert_migration_refusal(&forked, RuntimeId::CLAUDE);
     assert_eq!(
         fs::read(&store_path).expect("read the store"),
         before,
@@ -673,11 +651,10 @@ fn assert_removed_built_in_refusal(
 }
 
 /// A session of the official alias `alias` a previous release launched from
-/// its built-in runtime, on a daemon that serves no `alias`: resume and fork
-/// are refused as a removed built-in whose recovery is the official package
-/// and a new session, and once the package is installed, as a session the
-/// package does not serve, or as a fork the built-in never supported. No
-/// refusal touches the stored session.
+/// its built-in runtime, on a daemon that serves no `alias`: resume is refused
+/// as a removed built-in whose recovery is the official package and a new
+/// session, and once the package is installed, as a session the package does
+/// not serve. No refusal touches the stored session.
 async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
     alias: &'static str,
 ) {
@@ -702,7 +679,6 @@ async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
             .map(|binding| &binding.provenance),
         Some(protocol::BindingProvenance::Builtin { .. })
     ));
-    let forks = created.capabilities.fork;
     let restarted = fixture.reopen();
     Box::pin(restarted.registry.reconcile_workers())
         .await
@@ -719,15 +695,7 @@ async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
         .resume(&created.id)
         .await
         .expect_err("nothing serves the built-in the session was launched from");
-    // The runtime source is checked before the fork capability.
-    let forked = restarted
-        .registry
-        .fork(fork_params(&created.id))
-        .await
-        .expect_err("nothing serves the built-in the session was launched from");
-    for (operation, removed) in [("resume", resumed), ("fork", forked)] {
-        assert_removed_built_in_refusal(&removed, alias, operation);
-    }
+    assert_removed_built_in_refusal(&resumed, alias, "resume");
     assert_eq!(
         fs::read(&store_path).expect("read the store"),
         before,
@@ -747,19 +715,6 @@ async fn assert_built_in_session_is_refused_as_removed_until_the_package_serves(
         .await
         .expect_err("the package serves the runtime now");
     assert_migration_refusal(&refused, alias);
-    let refused = served
-        .registry
-        .fork(fork_params(&created.id))
-        .await
-        .expect_err("a fork never launches the package for a built-in session");
-    if forks {
-        assert_migration_refusal(&refused, alias);
-    } else {
-        assert_eq!(
-            refused.code, "agent_fork_unsupported",
-            "{alias}: {refused:?}"
-        );
-    }
 
     served
         .registry
@@ -773,15 +728,11 @@ async fn a_built_in_codex_session_is_refused_as_removed_until_the_package_serves
     assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::CODEX).await;
 }
 
-/// The built-in Claude runtime forks, so its fork is refused like its resume.
 #[tokio::test]
 async fn a_built_in_claude_session_is_refused_as_removed_until_the_package_serves_claude() {
     assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::CLAUDE).await;
 }
 
-/// The built-in Hermes runtime does not fork: without the package its fork is
-/// refused as a removed built-in like its resume, and once the package serves
-/// `hermes` as a fork Hermes does not support.
 #[tokio::test]
 async fn a_built_in_hermes_session_is_refused_as_removed_until_the_package_serves_hermes() {
     assert_built_in_session_is_refused_as_removed_until_the_package_serves(RuntimeId::HERMES).await;
@@ -1054,19 +1005,13 @@ async fn a_built_in_session_adopted_after_a_takeover_is_observed_only_through_it
     assert_observed_only_through_the_pin(&restarted, &created.id, launched_rules).await;
     assert_hooks_not_attributed_through_the_package(&restarted, &created.id).await;
 
-    // Resume and fork are refused; Hermes declares no fork at all.
+    // Resume is refused while the built-in pin is not served.
     let resumed = restarted
         .registry
         .resume(&created.id)
         .await
         .expect_err("the built-in pin is not served");
     assert_migration_refusal(&resumed, RuntimeId::HERMES);
-    let forked = restarted
-        .registry
-        .fork(fork_params(&created.id))
-        .await
-        .expect_err("Hermes does not fork");
-    assert_eq!(forked.code, "agent_fork_unsupported");
 
     // Stop and remove release what the session owns.
     restarted
@@ -1976,31 +1921,27 @@ async fn install_real_official(
         .expect("official install");
 }
 
-/// The resume and fork flags `session list` reports for session `id`.
-async fn listed_recovery(registry: &SessionRegistry, id: &protocol::SessionId) -> (bool, bool) {
+/// The resume flag `session list` reports for session `id`.
+async fn listed_recovery(registry: &SessionRegistry, id: &protocol::SessionId) -> bool {
     let mut list = registry.list().await;
     registry.enrich_native_activity(&mut list).await;
     let info = list
         .iter()
         .find(|info| info.id.0 == id.0)
         .unwrap_or_else(|| panic!("{} is listed", id.0));
-    (info.capabilities.resume, info.capabilities.fork)
+    info.capabilities.resume
 }
 
-/// The resume and fork refusal codes `session list` reports for session `id`.
-async fn listed_refusals(
-    registry: &SessionRegistry,
-    id: &protocol::SessionId,
-) -> (Option<String>, Option<String>) {
+/// The resume refusal code `session list` reports for session `id`.
+async fn listed_refusals(registry: &SessionRegistry, id: &protocol::SessionId) -> Option<String> {
     let mut list = registry.list().await;
     registry.enrich_native_activity(&mut list).await;
-    let refusals = list
-        .into_iter()
+    list.into_iter()
         .find(|info| info.id.0 == id.0)
         .unwrap_or_else(|| panic!("{} is listed", id.0))
         .capability_refusals
-        .unwrap_or_default();
-    (refusals.resume, refusals.fork)
+        .unwrap_or_default()
+        .resume
 }
 
 /// Rewrites the durable recovery binding of session `id` through `edit`, as an
@@ -2124,14 +2065,13 @@ async fn a_stopped_built_in_claude_session_resumes_through_the_official_package_
     )
     .await;
     let restarted = restart(&session.fixture).await;
-    assert_eq!(
+    assert!(
         listed_recovery(&restarted.registry, &session.id).await,
-        (true, true),
-        "the package adopts the session, so it lists as resumable and forkable"
+        "the package adopts the session, so it lists as resumable"
     );
     assert_eq!(
         listed_refusals(&restarted.registry, &session.id).await,
-        (None, None)
+        None
     );
 
     // The host profile over the built-in changed its base runtime's launch
@@ -2167,26 +2107,17 @@ async fn a_stopped_built_in_claude_session_resumes_through_the_official_package_
 async fn a_built_in_claude_session_is_not_listed_as_resumable_while_no_package_serves_it() {
     let session = stopped_built_in_claude("claude-no-package").await;
     let restarted = restart(&session.fixture).await;
-    assert_eq!(
-        listed_recovery(&restarted.registry, &session.id).await,
-        (false, false)
-    );
+    assert!(!listed_recovery(&restarted.registry, &session.id).await);
     let resumed = restarted
         .registry
         .resume(&session.id)
         .await
         .expect_err("nothing serves the built-in the session was launched from");
     assert_eq!(resumed.code, "runtime_builtin_removed", "{resumed:?}");
-    let forked = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect_err("nothing serves the built-in the session was launched from");
-    assert_eq!(forked.code, "runtime_builtin_removed", "{forked:?}");
     assert_eq!(
         listed_refusals(&restarted.registry, &session.id).await,
-        (Some(resumed.code), Some(forked.code)),
-        "the listing names the codes resume and fork refuse with"
+        Some(resumed.code),
+        "the listing names the code resume refuses with"
     );
 }
 
@@ -2205,26 +2136,17 @@ async fn an_unpinned_built_in_claude_session_is_never_resumed_through_the_packag
         binding.launch_binding = crate::agent::host::LaunchPin::Unpinned;
     });
     let restarted = restart(&session.fixture).await;
-    assert_eq!(
-        listed_recovery(&restarted.registry, &session.id).await,
-        (false, false)
-    );
+    assert!(!listed_recovery(&restarted.registry, &session.id).await);
     let resumed = restarted
         .registry
         .resume(&session.id)
         .await
         .expect_err("an unpinned session names no built-in to adopt");
     assert_eq!(resumed.code, "runtime_served_by_package", "{resumed:?}");
-    let forked = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect_err("an unpinned session names no built-in to adopt");
-    assert_eq!(forked.code, "runtime_served_by_package", "{forked:?}");
     assert_eq!(
         listed_refusals(&restarted.registry, &session.id).await,
-        (Some(resumed.code), Some(forked.code)),
-        "the listing names the codes resume and fork refuse with"
+        Some(resumed.code),
+        "the listing names the code resume refuses with"
     );
 }
 
@@ -2246,79 +2168,23 @@ async fn a_built_in_claude_session_is_refused_when_the_package_does_not_honor_it
             crate::agent::NativeSessionLaunch::from_templates(
                 crate::agent::SessionRefKind::Path,
                 &["--resume", "{reference}"],
-                Some(&["--resume", "{reference}", "--fork-session"]),
             )
             .expect("a valid path-kind spec"),
         );
     });
     let restarted = restart(&session.fixture).await;
-    assert_eq!(
-        listed_recovery(&restarted.registry, &session.id).await,
-        (false, false)
-    );
+    assert!(!listed_recovery(&restarted.registry, &session.id).await);
     let resumed = restarted
         .registry
         .resume(&session.id)
         .await
         .expect_err("the package does not honor the frozen reference kind");
     assert_eq!(resumed.code, "runtime_served_by_package", "{resumed:?}");
-    let forked = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect_err("the package does not honor the frozen reference kind");
-    assert_eq!(forked.code, "runtime_served_by_package", "{forked:?}");
     assert_eq!(
         listed_refusals(&restarted.registry, &session.id).await,
-        (Some(resumed.code), Some(forked.code)),
-        "the listing names the codes resume and fork refuse with"
+        Some(resumed.code),
+        "the listing names the code resume refuses with"
     );
-}
-
-/// A stopped session of the built-in `alias` that has no fork, launched by a
-/// daemon that compiles it in, once the official package of `alias` serves it,
-/// neither lists as forkable nor forks through the package.
-async fn assert_built_in_session_without_fork_stays_unforkable(alias: &'static str) {
-    let tag = format!("alias-{alias}-no-fork");
-    let key = signing_key("root");
-    let dir = temp_dir(&tag);
-    let store_path = temp_store_path(&tag);
-    let fixture = Fixture::with_anchor_and_store(
-        &format!("{tag}-plugins"),
-        anchor(&[&key], Vec::new()),
-        store_path.clone(),
-    );
-    fixture.write_profile(
-        PROFILE,
-        &format!("base = \"{alias}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n"),
-    );
-    let created = launch_on_a_compiled_in_daemon(&fixture, &store_path, dir).await;
-    assert!(
-        !created.capabilities.fork,
-        "the built-in {alias} has no fork"
-    );
-    install_real_official(&fixture, &fixture.registry, alias, &real_official(alias), 5).await;
-    let restarted = restart(&fixture).await;
-    assert!(
-        !listed_recovery(&restarted.registry, &created.id).await.1,
-        "{alias}: the listing does not advertise a fork"
-    );
-    let forked = restarted
-        .registry
-        .fork(fork_params(&created.id))
-        .await
-        .expect_err("the built-in has no fork to adopt");
-    assert_eq!(forked.code, "agent_fork_unsupported", "{alias}: {forked:?}");
-}
-
-#[tokio::test]
-async fn a_built_in_codex_session_stays_unforkable_once_the_package_adopts_it() {
-    assert_built_in_session_without_fork_stays_unforkable(RuntimeId::CODEX).await;
-}
-
-#[tokio::test]
-async fn a_built_in_hermes_session_stays_unforkable_once_the_package_adopts_it() {
-    assert_built_in_session_without_fork_stays_unforkable(RuntimeId::HERMES).await;
 }
 
 /// The identity report a Claude hook sends for session `id`.
@@ -2404,7 +2270,7 @@ async fn a_live_built_in_claude_session_takes_its_callbacks_once_a_package_is_in
         .expect("remove the adopted session");
 }
 
-/// Arms `registry` to park its next resume or fork after its definition
+/// Arms `registry` to park its next resume after its definition
 /// resolved and before the record is registered.
 fn arm_recovery_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
     let gate = crate::runtime::lifecycle::tests::StartGate {
@@ -2418,20 +2284,6 @@ fn arm_recovery_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::t
         .lock()
         .expect("recovery hold is never poisoned") = Some(gate.clone());
     gate
-}
-
-/// The official Claude package with its fork removed from its descriptor: a
-/// package that resumes the conversation but cannot fork it.
-fn claude_without_fork() -> Package {
-    let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
-    let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
-    let forking =
-        "[fork]\nsupported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]\n";
-    assert!(descriptor.contains(forking), "the descriptor forks");
-    entries[0].contents = descriptor
-        .replace(forking, "[fork]\nsupported = false\n")
-        .into_bytes();
-    Package::from_entries(&entries)
 }
 
 /// The Debug form of a detector configuration, which compares its manifest.
@@ -2467,14 +2319,10 @@ async fn assert_adopted_resume_refuses_a_changed_root(
         .await
         .expect_err("the changed package root does not serve the adopted session");
     assert_eq!(refused.code, code, "{refused:?}");
-    assert_eq!(
-        listed_recovery(&restarted.registry, &session.id).await,
-        (false, false)
-    );
+    assert!(!listed_recovery(&restarted.registry, &session.id).await);
     assert_eq!(
         listed_refusals(&restarted.registry, &session.id).await,
-        (Some(code.to_owned()), Some(code.to_owned())),
-        "fork resolves the same changed root first"
+        Some(code.to_owned())
     );
     assert_eq!(
         fs::read(&session.store_path).expect("read the store"),
@@ -2583,36 +2431,6 @@ async fn an_uninstall_waits_for_an_adopted_resume_to_persist_its_package_pin() {
         }
         other => panic!("the resumed run pins the package, not {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn an_adopted_resume_onto_a_package_without_fork_cannot_fork() {
-    let session = stopped_built_in_claude("claude-no-fork-adopter").await;
-    install_real_official(
-        &session.fixture,
-        &session.fixture.registry,
-        RuntimeId::CLAUDE,
-        &claude_without_fork(),
-        5,
-    )
-    .await;
-    let restarted = restart(&session.fixture).await;
-    restarted
-        .registry
-        .resume_with(&session.id, crate::session::ProfileChange::Accept)
-        .await
-        .expect("the package honors the resume");
-    assert_eq!(
-        listed_recovery(&restarted.registry, &session.id).await,
-        (true, false),
-        "the resumed session does not list a fork the package cannot make"
-    );
-    let forked = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect_err("the package cannot fork");
-    assert_eq!(forked.code, "agent_fork_unsupported", "{forked:?}");
 }
 
 #[tokio::test]
@@ -3304,7 +3122,7 @@ async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_thro
         &adopted,
         &adopted.registry,
         RuntimeId::CLAUDE,
-        &claude_next_version_without_fork(),
+        &claude_next_version(),
         "1.0.3",
         6,
     )
@@ -3326,23 +3144,19 @@ async fn an_own_runtime_report_naming_a_profile_keeps_its_manifest_override_thro
         .expect("remove the adopted session");
 }
 
-/// The official Claude package without fork, one version above the real one:
+/// The official Claude package one version above the real one:
 /// the next release of the same package identity.
-fn claude_next_version_without_fork() -> Package {
+fn claude_next_version() -> Package {
     let mut entries = crate::agent::host::fixture::official_package_entries(RuntimeId::CLAUDE);
     let descriptor = String::from_utf8(entries[0].contents.clone()).expect("UTF-8 descriptor");
-    let forking =
-        "[fork]\nsupported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]\n";
     let (_, version) = crate::agent::host::fixture::official_package_identity(RuntimeId::CLAUDE);
     let release = format!("version = \"{version}\"");
-    assert!(descriptor.contains(forking), "the descriptor forks");
     assert!(
         descriptor.contains(&release),
         "the descriptor declares its version"
     );
     entries[0].contents = descriptor
         .replacen(&release, "version = \"1.0.3\"", 1)
-        .replace(forking, "[fork]\nsupported = false\n")
         .into_bytes();
     Package::from_entries(&entries)
 }
@@ -3582,7 +3396,7 @@ async fn persist_session(registry: &SessionRegistry, id: &protocol::SessionId) {
 /// that the refresh sees while the session keeps its pin, to which the
 /// profile of the runtime's name is bound.
 async fn install_unselected_next_claude(fixture: &Fixture) {
-    let next = claude_next_version_without_fork();
+    let next = claude_next_version();
     let (package_id, _) = crate::agent::host::fixture::official_package_identity(RuntimeId::CLAUDE);
     let key = signing_key("root");
     let document = signed_by(
@@ -4247,7 +4061,7 @@ async fn an_explicit_report_of_a_differently_named_profile_keeps_its_override_th
         &adopted,
         &adopted.registry,
         RuntimeId::CLAUDE,
-        &claude_next_version_without_fork(),
+        &claude_next_version(),
         "1.0.3",
         6,
     )
@@ -5546,8 +5360,8 @@ async fn a_damaged_profile_session_the_head_cannot_repair_is_reported_as_a_loss_
     damaged_profile_session_loss(true).await;
 }
 
-/// The previous release, with its built-in runtimes compiled in, resumes and forks
-/// the session once its startup repairs the binding. The head cannot repair it,
+/// The previous release, with its built-in runtimes compiled in, resumes the
+/// session once its startup repairs the binding. The head cannot repair it,
 /// so the preflight must report the loss on the store as it stands before the
 /// upgrade, not only on the store after the previous release touched it.
 async fn damaged_profile_session_loss(installed: bool) {
@@ -5584,10 +5398,9 @@ async fn damaged_profile_session_loss(installed: bool) {
     Box::pin(previous.reconcile_workers())
         .await
         .expect("the previous release reconciles the store");
-    assert_eq!(
+    assert!(
         listed_recovery(&previous, &id).await,
-        (true, true),
-        "the previous release resumes and forks the session"
+        "the previous release resumes the session"
     );
 
     if installed {
@@ -6039,23 +5852,18 @@ async fn a_package_root_changed_between_two_lists_clears_resume_on_the_second() 
         .await;
         let restarted = restart(&session.fixture).await;
 
-        assert_eq!(
+        assert!(
             listed_recovery(&restarted.registry, &session.id).await,
-            (true, true),
             "{tag}: the intact root is resumable"
         );
         change(&session.fixture, &package);
-        assert_eq!(
-            listed_recovery(&restarted.registry, &session.id).await,
-            (false, false),
+        assert!(
+            !listed_recovery(&restarted.registry, &session.id).await,
             "{tag}: the changed root is not resumable"
         );
         assert_eq!(
             listed_refusals(&restarted.registry, &session.id).await,
-            (
-                Some("runtime_incompatible".to_owned()),
-                Some("runtime_incompatible".to_owned())
-            ),
+            Some("runtime_incompatible".to_owned()),
             "{tag}"
         );
     }

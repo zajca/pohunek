@@ -309,7 +309,7 @@ impl ProtocolError {
     /// adopted by it. Either the session record names no package (an unpinned
     /// record of an earlier release), or the package does not honor the
     /// session's recovery binding (its native reference kind, a hook-reported
-    /// reference, or fork support for a fork). Nothing is launched by this
+    /// reference). Nothing is launched by this
     /// refusal and the stored session keeps its binding; a relaunch under a
     /// package that adopts the session re-pins it to that package only when
     /// the relaunch succeeds. The recovery hint names the one migration: a
@@ -336,7 +336,7 @@ impl ProtocolError {
     /// serves the alias. Nothing is launched and the stored session keeps its
     /// binding. Installing the official package adopts the session: the
     /// package then serves its input and, when it honors the session's
-    /// recovery binding, its resume and fork. Otherwise the package answers
+    /// recovery binding, its resume. Otherwise the package answers
     /// with [`Self::runtime_served_by_package`]. The recovery hint names the
     /// install and the new-session fallback. The identity is a validated
     /// [`RuntimeId`], so echoing it is safe.
@@ -378,15 +378,6 @@ impl ProtocolError {
     #[must_use]
     pub fn observation(code: &'static str, msg: &'static str) -> Self {
         Self::new(ErrorClass::Runtime, code, msg, None)
-    }
-
-    /// The canonical `runtime/agent_fork_unsupported` error.
-    #[must_use]
-    pub fn agent_fork_unsupported() -> Self {
-        Self::observation(
-            "agent_fork_unsupported",
-            "the selected agent does not support fork",
-        )
     }
 
     /// The canonical rejection for input outside an agent's safe-text contract.
@@ -986,7 +977,7 @@ impl ProtocolError {
     /// The canonical `runtime/worktree_busy` error.
     ///
     /// Raised by `session.input`, attach with terminal control,
-    /// `session.resume`, `session.fork` with `cwd_mode: "same"` and in-place
+    /// `session.resume` and in-place
     /// `session.new` while a task occupies the session's worktree; only
     /// observation is admitted (task RFC invariant 11 write fence). Code is
     /// stable: `worktree_busy`.
@@ -1033,7 +1024,7 @@ impl ProtocolError {
 
     /// The canonical `runtime/task_session_ended` error.
     ///
-    /// Raised by `session.resume`, `session.fork` and explicit session recovery
+    /// Raised by `session.resume` and explicit session recovery
     /// when the session belongs to an `ended` task (task RFC section 6.1).
     /// Code is stable: `task_session_ended`.
     #[must_use]
@@ -1473,21 +1464,6 @@ impl ProtocolError {
             "task_investigate_no_checks",
             "investigate-mode tasks accept neither checks nor checks_baseline",
             Some("omit checks and checks_baseline and rely on the executor task's checks"),
-        )
-    }
-
-    /// The canonical `runtime/task_fork_unsupported` error.
-    ///
-    /// Raised by `session.fork` on a task session whose agent cannot fork its
-    /// native session across per-session servers, as with `OpenCode` (task RFC
-    /// section 9.3). Code is stable: `task_fork_unsupported`.
-    #[must_use]
-    pub fn task_fork_unsupported() -> Self {
-        Self::fixed(
-            ErrorClass::Runtime,
-            "task_fork_unsupported",
-            "the task's agent cannot fork its session",
-            Some("start a new task on the same worktree with worktree_of"),
         )
     }
 

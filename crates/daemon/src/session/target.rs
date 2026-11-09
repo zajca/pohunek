@@ -13,14 +13,13 @@ use super::{
     build_pty_command, debug, detect_at, event, host, mpsc, plan_initial_input_delivery,
     runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdAssociation, CwdSource,
     DesiredState, DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
-    DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch,
-    Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
-    RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState, RuntimeWatchIdentity,
-    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind,
-    SessionRegistry, SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource,
-    TransactionKind, Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
-    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
-    SESSION_RECORD_SCHEMA_VERSION,
+    DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, Ordering, PathBuf,
+    ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot, RuntimeHandle,
+    RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState, RuntimeWatchIdentity, SessionEntry,
+    SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind, SessionRegistry,
+    SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource, TransactionKind,
+    Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
+    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION,
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::runtime::lifecycle::{
@@ -804,10 +803,6 @@ impl SessionRegistry {
         };
         let capabilities = protocol::SessionCapabilities {
             resume: snapshot.native.is_some(),
-            fork: snapshot
-                .native
-                .as_ref()
-                .is_some_and(NativeSessionLaunch::supports_fork),
             ..protocol::SessionCapabilities::default()
         };
         let carried_native_report = match &registration {
@@ -1156,8 +1151,6 @@ impl SessionRegistry {
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
             reference_launch,
-            activity_since: crate::time::now(),
-            background_quiet_since: None,
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
             create_request,

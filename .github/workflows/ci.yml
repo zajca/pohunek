@@ -1541,17 +1541,6 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'service_upgrade::'
 
-      # Issue #326: workflow plugin jobs and services as persistent user units
-      # running the `pohunek workflow __exec` trampoline.
-      - name: Workflow plugin units
-        if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'workflow_systemd::'
-
-      # Issue #148: the reaction dispatcher unit and its event delivery.
-      - name: Workflow event reactions
-        if: ${{ !cancelled() }}
-        run: cargo test --locked -p pohunek-cli --test all -- --ignored --test-threads 1 'workflow_reactions::'
-
       # Issue #422: the `privileged_` scenario kills and restarts the runner's
       # own user manager through `sudo`, so it runs alone and last; every step
       # above has finished with the original manager.
@@ -2801,7 +2790,7 @@ jobs:
   # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,
   # builds the package with `cargo xtask package build`, installs it into a real
   # daemon with explicit-digest trust and drives a real `pi` through launch,
-  # detection, resume and fork. The model is a loopback stub: no provider, no
+  # detection and resume. The model is a loopback stub: no provider, no
   # credential and no model call. The always-running unit tests in the same
   # test binary keep the descriptor, the supported range and the lock in sync;
   # this job proves the locked release still behaves as they say.

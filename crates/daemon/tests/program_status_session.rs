@@ -436,6 +436,69 @@ async fn a_probe_waiting_agent_reports_activity_through_program_status() {
         .expect("stop the session");
 }
 
+/// A tracing writer that keeps what the daemon logs.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_profile_with_fork_args_starts_and_logs_that_they_are_ignored() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let captured = CapturedLog::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    )
+    .expect("no other subscriber is installed in this test process");
+    let fixture = Fixture::new(true).await;
+    let program = fixture.env.root().join("fake-agent");
+    std::fs::write(
+        fixture.env.root().join("agents/fake-fork-args.toml"),
+        format!(
+            "base = \"claude\"\n{}program = \"{}\"\nargs = [\"silent\", \"{}\", \"stdin\"]\nmanifest = \"fake\"\n\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{{reference}}\"]\nfork_args = [\"--resume\", \"{{reference}}\", \"--fork-session\"]\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
+            official_runtimes::profile_pin("claude"),
+            program.display(),
+            fixture.scratch.display()
+        ),
+    )
+    .expect("write the profile");
+
+    let created = fixture.start("fake-fork-args").await;
+    let logged = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
+    assert!(
+        logged.contains("ignoring resume.fork_args in the host profile"),
+        "{logged}"
+    );
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
 #[tokio::test]
 async fn a_record_without_input_changes_the_activity() {
     if !pohunek_test_support::process_env::in_own_process() {

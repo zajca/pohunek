@@ -14,17 +14,6 @@
 //!
 //! Session IDs and generations never contain `.` and generations never
 //! contain `-`, so both separators split unambiguously.
-//!
-//! Workflow plugin units on systemd are
-//! `pohunek-<ns>-wf-<plugin-hash>-<kind>-<name>.service` plus, for a periodic
-//! job, the `.timer` of the same stem. `<plugin-hash>` is the first 12
-//! lowercase hex characters of SHA-256 over the plugin ID, so an arbitrary
-//! plugin ID becomes a fixed-size, name-safe segment, and `<kind>` is `j` for
-//! a job or `s` for a service, so a job and a service of one name never share
-//! a unit. On launchd the same unit is the label
-//! `io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<kind>.<name>`. These names
-//! never match the worker glob or the worker label grammar, so worker
-//! discovery never sees them, and they are never parsed back.
 
 use std::path::Path;
 
@@ -52,14 +41,8 @@ const WORKER_LABEL_SEGMENT: &str = ".worker.";
 const DAEMON_UNIT_SUFFIX: &str = "-daemon.service";
 /// systemd unit segment introducing a worker generation.
 const WORKER_UNIT_SEGMENT: &str = "-worker-";
-/// launchd label segment introducing a workflow plugin unit.
-const PLUGIN_LABEL_SEGMENT: &str = ".wf.";
-/// systemd unit segment introducing a workflow plugin unit.
-const PLUGIN_UNIT_SEGMENT: &str = "-wf-";
 /// systemd service unit suffix.
 const SERVICE_SUFFIX: &str = ".service";
-/// systemd timer unit suffix.
-const TIMER_SUFFIX: &str = ".timer";
 /// systemd slice suffix grouping every worker of one namespace.
 const SESSIONS_SLICE_SUFFIX: &str = "-sessions.slice";
 
@@ -75,64 +58,6 @@ const _: () = assert!(
         <= super::MAX_SERVICE_ID_BYTES,
     "the longest worker session ID and generation must fit a service ID"
 );
-
-/// Hex characters kept from the SHA-256 of a plugin ID.
-///
-/// Matches [`NAMESPACE_LEN`]: 48 bits keep a collision between one owner's
-/// plugins out of reach while leaving unit names short.
-const PLUGIN_HASH_LEN: usize = 12;
-
-/// Longest accepted plugin unit name.
-///
-/// Keeps the longest systemd unit name within the service ID bound, and leaves
-/// room for the longer launchd label
-/// `io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<kind>.<name>` plus its
-/// `.plist` suffix (125 bytes at this bound).
-pub const MAX_PLUGIN_UNIT_NAME_BYTES: usize = 64;
-
-/// Longest accepted plugin ID; IDs are hashed, so the bound only limits work.
-const MAX_PLUGIN_ID_BYTES: usize = super::MAX_JOB_VALUE_BYTES;
-
-/// Unit name segment of a periodic job; one byte, like [`SERVICE_KIND`].
-const JOB_KIND: &str = "j";
-/// Unit name segment of a long-running service.
-const SERVICE_KIND: &str = "s";
-
-// The longest plugin unit name must form a valid service ID, so that the
-// backends can report it without a fallible conversion.
-const _: () = assert!(
-    UNIT_PREFIX.len()
-        + NAMESPACE_LEN
-        + PLUGIN_UNIT_SEGMENT.len()
-        + PLUGIN_HASH_LEN
-        + 1
-        + JOB_KIND.len()
-        + 1
-        + MAX_PLUGIN_UNIT_NAME_BYTES
-        + SERVICE_SUFFIX.len()
-        <= super::MAX_SERVICE_ID_BYTES,
-    "the longest plugin unit name must fit a service ID"
-);
-
-/// Longest launchd label of a workflow plugin unit:
-/// `io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<kind>.<name>` at the longest
-/// name, 119 bytes.
-pub(super) const MAX_PLUGIN_LABEL_BYTES: usize = LABEL_PREFIX.len()
-    + NAMESPACE_LEN
-    + PLUGIN_LABEL_SEGMENT.len()
-    + PLUGIN_HASH_LEN
-    + 1
-    + JOB_KIND.len()
-    + 1
-    + MAX_PLUGIN_UNIT_NAME_BYTES;
-
-// The longest plugin label must form a valid service ID, so that the launchd
-// backend can report it without a fallible conversion.
-const _: () = assert!(
-    MAX_PLUGIN_LABEL_BYTES <= super::MAX_SERVICE_ID_BYTES,
-    "the longest plugin label must fit a service ID"
-);
-
 /// Installation namespace embedded in every native job name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Namespace(String);
@@ -280,34 +205,6 @@ impl Namespace {
     pub fn sessions_slice(&self) -> String {
         format!("{UNIT_PREFIX}{}{SESSIONS_SLICE_SUFFIX}", self.0)
     }
-
-    /// Returns the systemd service unit of one workflow plugin unit.
-    #[must_use]
-    pub fn plugin_service_unit(&self, key: &PluginUnitKey) -> String {
-        format!("{}{SERVICE_SUFFIX}", self.plugin_unit_stem(key))
-    }
-
-    /// Returns the systemd timer unit scheduling one periodic plugin job.
-    #[must_use]
-    pub fn plugin_timer_unit(&self, key: &PluginUnitKey) -> String {
-        format!("{}{TIMER_SUFFIX}", self.plugin_unit_stem(key))
-    }
-
-    /// Returns the launchd label of one workflow plugin unit.
-    #[must_use]
-    pub fn plugin_label(&self, key: &PluginUnitKey) -> String {
-        format!(
-            "{LABEL_PREFIX}{}{PLUGIN_LABEL_SEGMENT}{}.{}.{}",
-            self.0,
-            key.plugin_hash,
-            key.kind.segment(),
-            key.name
-        )
-    }
-
-    fn plugin_unit_stem(&self, key: &PluginUnitKey) -> String {
-        format!("{UNIT_PREFIX}{}{PLUGIN_UNIT_SEGMENT}{key}", self.0)
-    }
 }
 
 /// Returns the first `len` lowercase hex characters of a SHA-256 digest.
@@ -401,96 +298,6 @@ impl WorkerKey {
 impl std::fmt::Display for WorkerKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.session_id, self.generation)
-    }
-}
-
-/// The kind of one persistent workflow plugin unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum PluginUnitKind {
-    /// A periodic job: a service started by a schedule.
-    Job,
-    /// A long-running service restarted after every exit.
-    Service,
-}
-
-impl PluginUnitKind {
-    fn segment(self) -> &'static str {
-        match self {
-            Self::Job => JOB_KIND,
-            Self::Service => SERVICE_KIND,
-        }
-    }
-}
-
-/// One persistent unit of one workflow plugin: a job or a service.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PluginUnitKey {
-    plugin_hash: String,
-    kind: PluginUnitKind,
-    name: String,
-}
-
-impl PluginUnitKey {
-    /// Binds a job or service name to the plugin that declares it.
-    ///
-    /// The plugin ID is hashed, so any non-empty ID of at most
-    /// [`MAX_JOB_VALUE_BYTES`](super::MAX_JOB_VALUE_BYTES) bytes is accepted. The name is one lowercase ASCII letter followed by lowercase
-    /// letters, digits, or `_`, at most [`MAX_PLUGIN_UNIT_NAME_BYTES`] bytes:
-    /// lowercase keeps names distinct on case-insensitive file systems, and
-    /// the alphabet never forms a separator, specifier, or escape of either
-    /// native manager.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidServiceId`] for an empty or oversized plugin ID
-    /// or a name outside that grammar.
-    pub fn new(
-        plugin_id: &str,
-        kind: PluginUnitKind,
-        name: impl Into<String>,
-    ) -> Result<Self, Error> {
-        let name = name.into();
-        if plugin_id.is_empty() || plugin_id.len() > MAX_PLUGIN_ID_BYTES {
-            return Err(Error::InvalidServiceId(
-                "plugin ID must be non-empty and bounded".to_owned(),
-            ));
-        }
-        let valid_name = name.len() <= MAX_PLUGIN_UNIT_NAME_BYTES
-            && name
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_lowercase())
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
-        if !valid_name {
-            return Err(Error::InvalidServiceId(name));
-        }
-        let mut digest = Sha256::new();
-        digest.update(plugin_id.as_bytes());
-        Ok(Self {
-            plugin_hash: hex_prefix(digest, PLUGIN_HASH_LEN),
-            kind,
-            name,
-        })
-    }
-
-    /// Returns whether the key names a job or a service.
-    #[must_use]
-    pub fn kind(&self) -> PluginUnitKind {
-        self.kind
-    }
-}
-
-impl std::fmt::Display for PluginUnitKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}-{}-{}",
-            self.plugin_hash,
-            self.kind.segment(),
-            self.name
-        )
     }
 }
 

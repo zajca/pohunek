@@ -319,10 +319,6 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Plugin(#[from] crate::commands::plugin::Error),
 
-    /// A `pohunek workflow` command was refused or its store failed.
-    #[error(transparent)]
-    Workflow(#[from] crate::workflow::Error),
-
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -639,12 +635,6 @@ impl CliError {
                 error.to_string(),
                 Some(error.hint().into_owned()),
             ),
-            CliError::Workflow(error) => ProtocolError::new(
-                error.class(),
-                error.code(),
-                error.to_string(),
-                Some(error.recovery()),
-            ),
             CliError::Spawn(msg) => ProtocolError::new(
                 ErrorClass::Daemon,
                 "daemon_spawn_failed",
@@ -730,7 +720,6 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::RefreshConfigChanged
         | Error::RefreshPending { .. }
         | Error::LiveSessions { .. } => ErrorClass::Configuration,
-        Error::Workflow { class, .. } => *class,
         Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,
         _ => ErrorClass::Runtime,
     }
@@ -885,7 +874,7 @@ const CLI_USAGE_EXIT_CODE: u8 = 2;
 /// error class.
 ///
 /// The block 40..=52 is distinct from the generic failure (`1`), the usage error
-/// (`2`) and the workflow limits (`124`/`125`). A status never carries the
+/// (`2`). A status never carries the
 /// program's own exit code: that travels in the `--json` error's
 /// `details.process_exit`.
 pub(crate) mod command_exit {

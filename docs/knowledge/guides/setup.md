@@ -337,7 +337,7 @@ For detailed hook findings, including Python interpreter readiness, run
 
 Completion installation is idempotent and does not edit shell startup files.
 The default script is static and performs no runtime lookup. Add `--dynamic`
-only when host, session-target, package and workflow plugin candidates are
+only when host, session-target and package candidates are
 wanted; those lookups are deadline-bounded, do not start a daemon, and fail
 silently. Zsh installation
 prints the `fpath` line that must appear before `compinit`.

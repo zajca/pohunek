@@ -14,10 +14,10 @@
 //! When the release carries a `runtime/` directory, the judgement serves the
 //! runtimes the release step would leave behind: the planner of that step runs
 //! read-only ([`plan_official_runtimes`]) and its planned packages replace the
-//! installed ones of their runtime ids. A session resumes and forks through the
+//! installed ones of their runtime ids. A session resumes through the
 //! same version probe resume runs, so a probe the executable fails is judged
 //! as the refusal resume would return. Stopped sessions that keep native
-//! resume or fork are judged by the same recovery rules.
+//! resume are judged by the same recovery rules.
 //!
 //! Each at-risk verdict of a loaded record whose code is proven stable across
 //! the replacement daemon's startup also carries an acceptance scope (see
@@ -92,8 +92,8 @@ use crate::runtime::lifecycle::IDENTITY_MISMATCH;
 use crate::runtime::LaunchEnvironment;
 use crate::session::native_repair::repair_native_recovery;
 use crate::session::resume::{
-    binding_native_launch, binding_program, check_recovery_reference, recovery_contract,
-    recovery_definition, reference_existence, session_ref_from_binding,
+    binding_native_launch, binding_program, check_recovery_reference, recovery_definition,
+    reference_existence, session_ref_from_binding,
 };
 use crate::session::resume::{recovery_profile_in, ProfileChange};
 use crate::session::{plan_official_runtimes, EnsureInputs, OfficialPlan, PlannedProfile};
@@ -748,10 +748,10 @@ impl Repaired {
 }
 
 /// The verdict of every session whose runtime has ended and that keeps native
-/// resume or fork, ordered by session id.
+/// resume, ordered by session id.
 ///
 /// A stopped session has no worker to adopt, so only its recovery is judged:
-/// resume and fork must still resolve through the runtime source the new
+/// resume must still resolve through the runtime source the new
 /// daemon serves, under the same rules as a live session's recovery.
 fn judge_stopped_sessions(
     dry: &DryRun,
@@ -808,7 +808,7 @@ fn judge_stopped_sessions(
     verdicts
 }
 
-/// Judges one stopped session. A session without native resume or fork is still
+/// Judges one stopped session. A session without native resume is still
 /// judged on its migration outcome: the previous release may have resumed it
 /// from the stored reference, and startup can fail to repair that reference.
 /// Any other session without a recovery binding, or without either capability,
@@ -867,7 +867,7 @@ fn judge_stopped_candidate(
     }
     candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return match facts.recovery {
             RecoveryOutcome::Lost | RecoveryOutcome::NeedsRegistry => {
                 recovery_loss(facts, candidate, judging)
@@ -954,16 +954,16 @@ fn adoptable_verdict(candidate: &SessionRecord, judging: &Judging<'_>) -> Judgem
             Verdict::Adoptable,
             CODE_ADOPTABLE_BY_NEWER_PACKAGE.to_owned(),
             format!(
-                "the stored native recovery resumes and forks through {} {}, which adopts the \
+                "the stored native recovery resumes through {} {}, which adopts the \
                  session launched from {}; the session is moved to the newer version on its next \
-                 resume or fork",
+                 resume",
                 served.id, served.version, frozen.version
             ),
         ),
         None => (
             Verdict::Adoptable,
             CODE_ADOPTABLE.to_owned(),
-            "the stored native recovery resumes and forks through the runtime source this daemon \
+            "the stored native recovery resumes through the runtime source this daemon \
              serves"
                 .to_owned(),
         ),
@@ -1133,20 +1133,18 @@ const STORE_SCHEMA_V034: u32 = 5;
 fn judge_reference(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return None;
     }
     // judge_pin and judge_launch refuse a definition, profile or base
     // environment that does not resolve before this check is reached, so the
     // lookups below succeed for every session that gets here.
-    let fork = !capabilities.resume;
     let definition = recovery_definition(judging.profiles, binding).ok()?;
     let profile = recovery_profile_in(
         judging.profiles,
         binding,
         Some(&definition),
         ProfileChange::Refuse,
-        fork,
     )
     .ok()?;
     let base = judging.base_env.as_ref().ok()?;
@@ -2085,7 +2083,7 @@ fn recovery_loss(
             format!(
                 "the stored native recovery needs the runtime registry to complete its launch \
                  spec, and the registry the new daemon will have cannot: {reason}. The session \
-                 cannot resume or fork natively"
+                 cannot resume natively"
             ),
         ));
     }
@@ -2099,57 +2097,47 @@ fn recovery_loss(
 /// environment that profile gives the agent; a runtime without one is only
 /// checked for an executable.
 ///
-/// Only a session that resumes or forks reaches it. A profile refusal carries
+/// Only a session that resumes reaches it. A profile refusal carries
 /// resume's own code, and so does a probe refusal, so the verdict names the
 /// refusal resume would return.
 fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return None;
     }
     let definition = recovery_definition(judging.profiles, binding);
-    let mut profile_env = None;
-    for (fork, required) in [(false, capabilities.resume), (true, capabilities.fork)] {
-        if !required {
-            continue;
+    let profile_env = match recovery_profile_in(
+        judging.profiles,
+        binding,
+        definition.as_ref().ok(),
+        ProfileChange::Refuse,
+    ) {
+        Ok(profile) => profile.env,
+        Err(error) if error.code == protocol::SECRET_ENV_MISSING_CODE => {
+            // The profile's secret slots refuse every relaunch on the running
+            // release too, so the upgrade loses no recovery.
+            return Some((
+                Verdict::AlreadyNotResumable,
+                error.code.clone(),
+                "resume refuses the session's host profile because it declares secret \
+                 variables a relaunch cannot fill, on the running release too"
+                    .to_owned(),
+            ));
         }
-        match recovery_profile_in(
-            judging.profiles,
-            binding,
-            definition.as_ref().ok(),
-            ProfileChange::Refuse,
-            fork,
-        ) {
-            Ok(profile) => {
-                profile_env.get_or_insert(profile.env);
-            }
-            Err(error) if error.code == protocol::SECRET_ENV_MISSING_CODE => {
-                // The profile's secret slots refuse every relaunch on the running
-                // release too, so the upgrade loses no recovery.
-                return Some((
-                    Verdict::AlreadyNotResumable,
-                    error.code.clone(),
-                    "resume refuses the session's host profile because it declares secret \
-                     variables a relaunch cannot fill, on the running release too"
-                        .to_owned(),
-                ));
-            }
-            Err(error) => {
-                return Some((
-                    Verdict::WouldLoseRecovery,
-                    error.code.clone(),
-                    format!(
-                        "resume refuses the session's host profile ({}: {}), so the session \
-                         cannot resume natively; restore the profile it was launched from, or \
-                         upgrade with --accept-runtime-loss",
-                        error.code, error.msg
-                    ),
-                ));
-            }
+        Err(error) => {
+            return Some((
+                Verdict::WouldLoseRecovery,
+                error.code.clone(),
+                format!(
+                    "resume refuses the session's host profile ({}: {}), so the session \
+                     cannot resume natively; restore the profile it was launched from, or \
+                     upgrade with --accept-runtime-loss",
+                    error.code, error.msg
+                ),
+            ));
         }
-    }
-    let profile_env = profile_env.unwrap_or_default();
+    };
     let definition = definition.ok()?;
     // Resume builds the base environment for every relaunch and validates the
     // frozen executable for every relaunch; only a declared version probe reads
@@ -2185,7 +2173,7 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
             code.clone(),
             format!(
                 "the agent the session launches from does not pass the version probe of its \
-                 runtime ({code}: {detail}), so resume and fork refuse it; install a supported \
+                 runtime ({code}: {detail}), so resume refuses it; install a supported \
                  release of the agent, or upgrade with --accept-runtime-loss"
             ),
         )),
@@ -2211,9 +2199,9 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
 /// runtime resolves nowhere: a built-in of an official alias this binary does
 /// not compile in while no package serves the alias, or a runtime that is not
 /// installed. Such a session is judged with the guard itself, whatever its
-/// resume and fork capabilities. Its worker is adopted, so the verdict is
+/// resume capability. Its worker is adopted, so the verdict is
 /// `would_lose_recovery` with the code of an unserved runtime source, like a
-/// session whose pin only resume and fork refuse, and the detail names what
+/// session whose pin only resume refuses, and the detail names what
 /// is refused beyond them.
 fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Option<Judgement> {
     let pin = candidate
@@ -2230,14 +2218,14 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
         Ok(runtime_id) if error.code == "runtime_builtin_removed" => format!(
             "every interaction with the session (input, attach, resize, rename, metadata) is \
              refused until you {}; the official package then adopts the session, and resume \
-             and fork run through it when it honors the launch the session froze (otherwise \
-             they answer `runtime_served_by_package` and the work continues in a new session \
+             runs through it when it honors the launch the session froze (otherwise \
+             it answers `runtime_served_by_package` and the work continues in a new session \
              started with `pohunek session new --agent {runtime}`)",
             protocol::official_package_install_step(runtime_id)
         ),
         _ => format!(
             "every interaction with the session (input, attach, resize, rename, metadata) and \
-             resume and fork are refused until the runtime it was launched from is installed \
+             resume are refused until the runtime it was launched from is installed \
              and enabled again; otherwise the session cannot be resumed through another \
              runtime source, so continue in a new session started with `pohunek session new \
              --agent {runtime}` once this daemon serves that runtime"
@@ -2256,27 +2244,22 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
 }
 
 /// The session's launch pin must name a runtime source the new daemon serves:
-/// resume and fork resolve exactly that source, and nothing else stands in.
+/// resume resolves exactly that source, and nothing else stands in.
 ///
 /// The pin is resolved as resume resolves it ([`recovery_definition`]), against
 /// the built-in runtimes of this binary and the packages installed now, so a
 /// package digest that is not installed and a package that does not honor the
-/// frozen launch each lose the session's recovery, and a fork the package
-/// does not honor is judged the same way ([`recovery_contract`]). A session
-/// without native resume or fork has no recovery to lose. A runtime source no
+/// frozen launch each lose the session's recovery ([`recovery_contract`]). A
+/// session without native resume has no recovery to lose. A runtime source no
 /// interaction is served from is judged first, by [`judge_runtime_source`].
 fn judge_pin(candidate: &SessionRecord, profiles: &ProfileRegistry) -> Option<Judgement> {
     let binding = candidate.recovery.as_ref()?;
     let capabilities = &candidate.info.capabilities;
-    if !capabilities.resume && !capabilities.fork {
+    if !capabilities.resume {
         return None;
     }
-    let error = match recovery_definition(profiles, binding) {
-        Err(error) => error,
-        Ok(definition) if capabilities.fork => {
-            recovery_contract(binding, &definition, true).err()?
-        }
-        Ok(_) => return None,
+    let Err(error) = recovery_definition(profiles, binding) else {
+        return None;
     };
     let runtime = binding.agent_base.as_wire();
     Some((

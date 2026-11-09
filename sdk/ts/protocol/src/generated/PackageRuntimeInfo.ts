@@ -7,7 +7,7 @@ import type { RuntimeId } from "./RuntimeId";
  * installation.
  *
  * The program, the fixed arguments and every argument template the daemon can
- * add to a launch (reference passing, resume, fork, the first prompt) are
+ * add to a launch (reference passing, resume, the first prompt) are
  * exactly what it will run as the owner, so the owner can review all of them
  * before consenting to an install. The descriptor carries no environment
  * values, setup commands or hooks.
@@ -41,17 +41,6 @@ export type PackageRuntimeInfo = {
    */
   resume_args?: Array<string>;
   /**
-   * Arguments of a native fork, with `{reference}` for the reference.
-   * Absent when the runtime cannot fork.
-   */
-  fork_args?: Array<string>;
-  /**
-   * Arguments core appends after `fork_args` to pass the forked
-   * conversation's own generated reference; `{reference}` marks where that
-   * reference goes. Absent when a fork gets no assigned reference.
-   */
-  fork_launch_args?: Array<string>;
-  /**
    * Whether the first prompt of a session is appended to the launch
    * arguments instead of being typed into the terminal.
    */
@@ -66,7 +55,8 @@ export type PackageRuntimeInfo = {
    */
   resumable: boolean;
   /**
-   * Whether the runtime supports native fork.
+   * Always `false`: runtimes cannot fork. The field stays for clients of
+   * earlier releases, which require it.
    */
   forkable: boolean;
   /**

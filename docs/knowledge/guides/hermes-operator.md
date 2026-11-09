@@ -13,9 +13,7 @@ Hermes is a first-class Pohunek managed runtime, selected explicitly as
 `hermes` or through a Hermes-based profile. Pohunek starts its managed terminal
 as `hermes chat`. Native recovery resumes only an exact reported native
 reference with `hermes chat --resume <reference>`; it never infers a reference
-from an ambient Hermes conversation. Hermes native fork is unsupported, so a
-fork request returns typed unsupported data instead of creating a child session
-or worktree.
+from an ambient Hermes conversation.
 
 `runtime-packages/hermes/` is the official Hermes runtime package. Releases
 build it, attest it on Linux x86_64 (glibc and musl) and Apple Silicon
@@ -219,10 +217,9 @@ plugin and policy with `pohunek integration update --agent hermes` using its
 installed target. The bridge is removed when protocol 3 leaves the window.
 
 The plugin preserves the daemon's exact origin-session protection. It must deny
-these eight methods when they target the session hosting Hermes:
+these seven methods when they target the session hosting Hermes:
 
-`stop`, `resume`, `remove`, `fork`, `resize`, `set_metadata`, `rename`, and
-`input`.
+`stop`, `resume`, `remove`, `resize`, `set_metadata`, `rename`, and `input`.
 
 The daemon additionally denies `session.remove_accepting_unconfirmed` for the
 origin session; the plugin never offers that consent removal.
@@ -252,7 +249,6 @@ Manage tools:
 - `pohunek_session_start`
 - `pohunek_session_send`
 - `pohunek_session_resume`
-- `pohunek_session_fork`
 - `pohunek_session_resize`
 - `pohunek_session_rename`
 - `pohunek_session_set_metadata`
@@ -345,6 +341,6 @@ When troubleshooting, start with `integration status` and `integration doctor`
 for the selected Hermes home. Use `integration update` only after reviewing the
 typed stale or compatibility finding. Use `integration uninstall` rather than
 manual deletion. If an operation is denied for host, access mode, self-target,
-ambiguous name, unsupported fork, cursor gap, runtime change, timeout, or
+ambiguous name, cursor gap, runtime change, timeout, or
 terminal state, keep the typed result and choose the documented recovery step;
 do not bypass it through a shell command or attach stream.

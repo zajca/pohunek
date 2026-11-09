@@ -6,11 +6,6 @@
 //! jobs. Observations are evidence, never readiness: callers still prove a
 //! worker through its private authenticated socket.
 //!
-//! A [`PluginUnits`] backend installs the persistent units of workflow
-//! plugins: a periodic job ([`Activation::Interval`]) or a long-running service
-//! ([`Activation::Service`]) per [`PluginUnitKey`], enabled for login and kept
-//! apart from worker discovery.
-//!
 //! Labels and unit names are derived by [`namespace`], which binds every job to
 //! one installation so foreign or other-namespace jobs are never touched.
 
@@ -103,7 +98,7 @@ impl std::fmt::Debug for UnitEnvironment {
 }
 
 #[doc(inline)]
-pub use namespace::{Namespace, PluginUnitKey, PluginUnitKind, WorkerKey};
+pub use namespace::{Namespace, WorkerKey};
 
 // Rust guideline compliant 2026-10-13
 
@@ -153,23 +148,6 @@ pub const MAX_JOB_VALUE_BYTES: usize = 4_096;
 /// Ten minutes is far above the configured 45 s start and 30 s stop budgets;
 /// longer values would only hide a wedged job from reconciliation.
 pub const MAX_JOB_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Longest accepted interval of a periodic plugin job.
-///
-/// The interval is awake time counted from the timer's activation within one
-/// service-manager lifetime (see [`Activation::Interval`]), so it suits the
-/// short periods a caller uses to check whether wall-clock work is due. A week
-/// is far above any such period; the bound keeps a corrupted value from
-/// scheduling a job that effectively never runs.
-pub const MAX_JOB_INTERVAL: Duration = Duration::from_hours(7 * 24);
-
-/// Shortest accepted interval, accuracy, and restart delay of a plugin unit.
-///
-/// launchd expresses these durations only in whole seconds, and a shorter
-/// systemd timer or restart delay, with start rate limiting disabled, is a
-/// spawn loop. Plugin unit durations are therefore whole seconds of at least
-/// this value.
-pub const MIN_JOB_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Smallest accepted open-file limit.
 ///
@@ -370,16 +348,6 @@ pub enum RestartPolicy {
         /// Minimum delay between restarts.
         throttle: Duration,
     },
-    /// Restart after every exit, successful or not; used for long-running
-    /// plugin services.
-    ///
-    /// `delay` paces the restarts. Its native meaning differs (systemd waits
-    /// it after the exit, launchd keeps it as the minimum spacing between
-    /// spawns), so it is a backstop and callers enforce their own backoff.
-    Always {
-        /// Pacing of consecutive starts.
-        delay: Duration,
-    },
 }
 
 /// Files receiving a job's standard output and standard error.
@@ -460,7 +428,6 @@ impl JobDefinition {
             RestartPolicy::OnFailure { throttle } => {
                 validate_timeout("restart throttle", throttle)?;
             }
-            RestartPolicy::Always { delay } => validate_timeout("restart delay", delay)?,
         }
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(invalid(format!(
@@ -780,12 +747,10 @@ pub trait Supervisor: std::fmt::Debug + Send + Sync {
 /// Manages the single long-lived daemon job of one installation.
 ///
 /// The daemon is registered for login as a launchd agent in
-/// `~/Library/LaunchAgents` or an enabled systemd user unit. The only other
-/// login units of an installation are the workflow plugin units the CLI
-/// installs through [`PluginUnits`]. The daemon restarts on failure with the
-/// definition's throttle. Operations here never touch worker jobs or plugin
-/// units, so upgrading or removing the daemon leaves live workers and plugin
-/// units running.
+/// `~/Library/LaunchAgents` or an enabled systemd user unit. It is the only
+/// login unit of an installation. The daemon restarts on failure with the
+/// definition's throttle. Operations here never touch worker jobs, so
+/// upgrading or removing the daemon leaves live workers running.
 pub trait DaemonSupervisor: std::fmt::Debug + Send + Sync {
     /// Writes the persistent daemon definition, enables it for login, and
     /// starts it.
@@ -809,179 +774,6 @@ pub trait DaemonSupervisor: std::fmt::Debug + Send + Sync {
     /// An already absent job is not an error, so an interrupted uninstall can
     /// be resumed.
     fn uninstall(&self) -> Operation<'_, ()>;
-}
-
-/// How the native manager activates one plugin unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Activation {
-    /// A periodic job: runs start about `every` apart and never overlap.
-    ///
-    /// `every` is awake time counted from the unit's activation within one
-    /// service-manager lifetime: the count pauses while the host sleeps (or,
-    /// on launchd, a firing due during sleep is skipped) and starts over
-    /// whenever the manager starts the unit again, such as at the
-    /// next login. An interval longer than the host's awake time per
-    /// session may therefore never elapse; a caller that needs wall-clock
-    /// cadence keeps its own last-run record, uses a short interval, and
-    /// skips runs that are not due yet. Whether the first run starts at
-    /// activation and whether `every` counts from a run's start or its end
-    /// are backend details. The definition's start timeout is a native
-    /// backstop where the backend has one (launchd has none); the caller
-    /// enforces the real run bound.
-    Interval {
-        /// Approximate spacing of runs.
-        every: Duration,
-        /// How late the manager may start a run to coalesce wakeups, where
-        /// the backend supports it.
-        accuracy: Duration,
-    },
-    /// A long-running process restarted after every exit.
-    Service,
-}
-
-/// Validated description of one persistent workflow plugin unit.
-///
-/// Wraps a [`JobDefinition`] whose environment holds only
-/// [`BOOTSTRAP_ENV_ALLOWLIST`] keys (never [`SEARCH_PATH_VARIABLE`]) and whose
-/// restart policy matches the activation: [`RestartPolicy::Never`] for an
-/// [`Activation::Interval`] job, because the schedule starts every run, and
-/// [`RestartPolicy::Always`] for an [`Activation::Service`]. A user service
-/// manager adds its own environment block to every process it spawns, so the
-/// unit's executable clears what it must not forward.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginUnitDefinition {
-    job: JobDefinition,
-    activation: Activation,
-}
-
-impl PluginUnitDefinition {
-    /// Validates a plugin unit description.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidDefinition`] for a `PATH` environment entry, a
-    /// restart policy that does not match the activation, an interval outside
-    /// `[MIN_JOB_INTERVAL, MAX_JOB_INTERVAL]`, an accuracy outside
-    /// `[MIN_JOB_INTERVAL, every]`, a restart delay below [`MIN_JOB_INTERVAL`],
-    /// or any of these durations not being whole seconds.
-    pub fn new(job: JobDefinition, activation: Activation) -> Result<Self, Error> {
-        if job.environment().contains_key(SEARCH_PATH_VARIABLE) {
-            return Err(invalid(
-                "a plugin unit environment holds only the bootstrap roots".to_owned(),
-            ));
-        }
-        match (activation, job.restart()) {
-            (Activation::Interval { every, accuracy }, RestartPolicy::Never) => {
-                validate_whole_seconds("job interval", every, MAX_JOB_INTERVAL)?;
-                validate_whole_seconds("job accuracy", accuracy, every)?;
-            }
-            (Activation::Service, RestartPolicy::Always { delay }) => {
-                validate_whole_seconds("restart delay", delay, MAX_JOB_TIMEOUT)?;
-            }
-            (Activation::Interval { .. }, _) => {
-                return Err(invalid(
-                    "a periodic job must never restart; its schedule starts every run".to_owned(),
-                ));
-            }
-            (Activation::Service, _) => {
-                return Err(invalid(
-                    "a plugin service must restart after every exit".to_owned(),
-                ));
-            }
-        }
-        Ok(Self { job, activation })
-    }
-
-    /// Returns the job run by the unit.
-    #[must_use]
-    pub fn job(&self) -> &JobDefinition {
-        &self.job
-    }
-
-    /// Returns how the unit is activated.
-    #[must_use]
-    pub fn activation(&self) -> Activation {
-        self.activation
-    }
-
-    /// Returns the unit kind matching the activation.
-    #[must_use]
-    pub fn kind(&self) -> PluginUnitKind {
-        match self.activation {
-            Activation::Interval { .. } => PluginUnitKind::Job,
-            Activation::Service => PluginUnitKind::Service,
-        }
-    }
-}
-
-/// Requires `value` to be whole seconds within `[MIN_JOB_INTERVAL, max]`.
-fn validate_whole_seconds(field: &str, value: Duration, max: Duration) -> Result<(), Error> {
-    if value.subsec_nanos() != 0 || value < MIN_JOB_INTERVAL || value > max {
-        return Err(invalid(format!(
-            "{field} must be whole seconds within [{}s, {}s]",
-            MIN_JOB_INTERVAL.as_secs(),
-            max.as_secs()
-        )));
-    }
-    Ok(())
-}
-
-/// Installs, starts, stops, and removes persistent workflow plugin units.
-///
-/// One [`PluginUnitKey`] names one unit set of one [`PluginUnitKind`]: a
-/// service plus, for an [`Activation::Interval`] job, its schedule. A job and
-/// a service of the same plugin and name are distinct sets. The set is enabled for login,
-/// so it survives logout and reboot until [`PluginUnits::remove`]. Worker
-/// discovery never matches these units, so [`Supervisor`] operations neither
-/// adopt nor retire them. Callers serialize operations on one key.
-pub trait PluginUnits: std::fmt::Debug + Send + Sync {
-    /// Writes or replaces the unit set, enables it for login, and starts it.
-    ///
-    /// A set that is already installed is stopped first, so a replaced
-    /// definition takes effect. Fails with [`Error::InvalidDefinition`] when
-    /// the definition's kind differs from the key's.
-    fn install<'a>(
-        &'a self,
-        key: &'a PluginUnitKey,
-        definition: &'a PluginUnitDefinition,
-    ) -> Operation<'a, ()>;
-
-    /// Starts an installed unit set: arms a job's schedule or starts a
-    /// service.
-    ///
-    /// Fails with [`Error::NotFound`] when the set is not installed.
-    fn start<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()>;
-
-    /// Stops an installed unit set until it is started again or the user
-    /// logs in again, waiting until its processes have exited.
-    ///
-    /// The stop's `SIGTERM` reaches only the unit's main process, which may
-    /// stop its own descendants first. What remains of the unit (systemd: its
-    /// control group; launchd: the job's process group) is then killed, at
-    /// the latest once the definition's exit timeout passed.
-    ///
-    /// A job's schedule is stopped before its run, so no new run starts in
-    /// between. Fails with [`Error::NotFound`] when the set is not installed.
-    fn stop<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()>;
-
-    /// Stops and disables the unit set and deletes its definitions.
-    ///
-    /// An absent set is not an error, so an interrupted removal can be
-    /// resumed.
-    fn remove<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()>;
-
-    /// Reports the native state of an installed unit set.
-    ///
-    /// A service reports its own state. A job reports
-    /// [`ServiceState::Failed`] while its last run failed,
-    /// [`ServiceState::Running`] while its schedule is armed, and
-    /// [`ServiceState::Stopped`] otherwise. [`ServiceState::Failed`] comes
-    /// only from a manager that reports a failure without its human-readable
-    /// output being parsed; launchd does not, so its backend never reports it
-    /// and callers keep their own record of run outcomes. Evidence that fits
-    /// more than one state is [`ServiceState::Unknown`]. Fails with
-    /// [`Error::NotFound`] when the set is not installed.
-    fn state<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ServiceState>;
 }
 
 fn invalid(detail: String) -> Error {

@@ -24,15 +24,13 @@ const ROOT_KILL: &str = "k  Kill session";
 const ROOT_REMOVE: &str = "t  Terminate and delete session";
 const ROOT_DETACH: &str = "d  Detach";
 const ROOT_NEW_SESSION: &str = "n  New session in this worktree";
-const ROOT_FORK: &str = "f  Fork session";
 const ROOT_RENAME: &str = "r  Rename session";
 /// Root rows in display order.
-const ROOT_ROWS: [&str; 6] = [
+const ROOT_ROWS: [&str; 5] = [
     ROOT_KILL,
     ROOT_REMOVE,
     ROOT_DETACH,
     ROOT_NEW_SESSION,
-    ROOT_FORK,
     ROOT_RENAME,
 ];
 
@@ -219,38 +217,22 @@ fn navigation_and_session_actions_render_their_progress_and_results() {
     let (back, _) = step(back, MenuEvent::Key(MenuKey::Esc));
     assert_eq!(back, root);
 
-    for (key, effect, busy_text, result, result_text) in [
-        (
-            b'n',
-            MenuEffect::RunNewSession,
-            "Starting session",
-            MenuOutcome::NewSession {
-                id: "s-10".to_owned(),
-            },
-            "New session created: s-10",
-        ),
-        (
-            b'f',
-            MenuEffect::RunFork,
-            "Forking session",
-            MenuOutcome::Forked {
-                id: "s-11".to_owned(),
-            },
-            "Forked session created: s-11",
-        ),
-    ] {
-        let (busy, effects) = step(root.clone(), MenuEvent::Key(MenuKey::Byte(key)));
-        assert_eq!(effects, vec![effect]);
-        assert!(terminal.show(&busy).contents().contains(busy_text));
-        let (result_state, effects) = step(busy, MenuEvent::RpcDone(result));
-        assert!(effects.is_empty());
-        let screen = terminal.show(&result_state);
-        assert!(screen.contents().contains(result_text));
-        assert!(screen.hide_cursor(), "a result must hide the cursor");
-        let (returned, effects) = step(result_state, MenuEvent::Key(MenuKey::Esc));
-        assert_eq!(returned, root);
-        assert!(effects.is_empty());
-    }
+    let (busy, effects) = step(root.clone(), MenuEvent::Key(MenuKey::Byte(b'n')));
+    assert_eq!(effects, vec![MenuEffect::RunNewSession]);
+    assert!(terminal.show(&busy).contents().contains("Starting session"));
+    let (result_state, effects) = step(
+        busy,
+        MenuEvent::RpcDone(MenuOutcome::NewSession {
+            id: "s-10".to_owned(),
+        }),
+    );
+    assert!(effects.is_empty());
+    let screen = terminal.show(&result_state);
+    assert!(screen.contents().contains("New session created: s-10"));
+    assert!(screen.hide_cursor(), "a result must hide the cursor");
+    let (returned, effects) = step(result_state, MenuEvent::Key(MenuKey::Esc));
+    assert_eq!(returned, root);
+    assert!(effects.is_empty());
 
     let (closed, effects) = step(root, MenuEvent::Key(MenuKey::Byte(b'd')));
     assert_eq!(effects, vec![MenuEffect::RunDetach, MenuEffect::Close]);
@@ -330,7 +312,7 @@ fn rename_input_is_bounded_and_the_composed_result_reports_failure() {
     assert!(effects.is_empty());
     assert_rename_cursor(terminal.show(&hotkey_input), "");
     let (last_row, effects) = step(MenuState::open_root(), MenuEvent::Key(MenuKey::Up));
-    assert_eq!(last_row, MenuState::Root { selected: 5 });
+    assert_eq!(last_row, MenuState::Root { selected: 4 });
     assert!(effects.is_empty());
     assert_eq!(
         highlighted_root_rows(terminal.show(&last_row)),

@@ -198,14 +198,13 @@ filter = 'package(=pohunek-hostcheck)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
 # Tests that bootstrap, bootout or kickstart jobs in the shared `gui/<uid>`
-# domain. workflow_store boots out labels on macOS in one of its tests.
+# domain.
 [[profile.macos.overrides]]
 filter = '''
 (package(=pohunek-platform) and binary(=launchd))
 or (package(=pohunek-daemon) and binary(=supervised_lifecycle))
 or (package(=pohunek-cli) and (
-  (binary(=all) and test(/^service_launchd::/)) or (binary(=all) and test(/^service_upgrade::/)) or (binary(=all) and test(/^setup_host_native::/))
-  or (binary(=all) and test(/^workflow_launchd::/)) or (binary(=all) and test(/^workflow_store::/))))
+  (binary(=all) and test(/^service_launchd::/)) or (binary(=all) and test(/^service_upgrade::/)) or (binary(=all) and test(/^setup_host_native::/))))
 '''
 test-group = 'launchd-gui'
 

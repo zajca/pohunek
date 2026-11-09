@@ -38,8 +38,8 @@
 //!
 //! The resume binding additionally carries the **structural relaunch snapshot**
 //! (Part C, C.4): `program`, `args`, `input_rules`, `native_launch` (the typed
-//! native-session launch spec: reference kind plus resume and optional fork argv
-//! with one reference slot each), and `agent_base`. These are the non-secret
+//! native-session launch spec: reference kind plus the resume argv
+//! with one reference slot), and `agent_base`. These are the non-secret
 //! fields needed to relaunch-and-resume a host-profile session with exactly its
 //! launch-time shape after a daemon restart. The profile's **`env` is deliberately NOT among them** —
 //! it may hold secrets, so it is re-resolved by agent name at resume, never
@@ -99,8 +99,7 @@ const BODY_CAPACITY_SLACK: usize = 4096;
 
 /// The launch directory and project a session was created with.
 ///
-/// Recorded once at create and never refreshed by a cwd change or a resume; a
-/// fork copies its source's. The trusted-checkout predicate evaluates this pair,
+/// Recorded once at create and never refreshed by a cwd change or a resume. The trusted-checkout predicate evaluates this pair,
 /// not the session's current directory, which terminal output and the focus
 /// process can move.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +112,7 @@ pub struct LaunchCheckout {
     pub project_id: Option<String>,
 }
 
-/// One session's native resume and fork recovery binding.
+/// One session's native resume recovery binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResumeBinding {
     /// The pohunek session id (stable across restart).
@@ -135,10 +134,10 @@ pub struct ResumeBinding {
     pub cols: u16,
     /// Terminal height at capture time.
     pub rows: u16,
-    /// Captured native session id used to build resume or fork argv.
+    /// Captured native session id used to build resume argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
-    /// Captured native session path, for agents that resume or fork from a path.
+    /// Captured native session path, for agents that resume from a path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_path: Option<String>,
     /// Project this session belongs to ([`ProjectRecord::id`]), captured here so a
@@ -177,7 +176,7 @@ pub struct ResumeBinding {
     #[serde(default)]
     pub input_rules: StoredInputRules,
     /// Structural relaunch snapshot (C.4): the native-session launch spec, frozen
-    /// at creation so a profile's `[resume]` override drives the relaunch and fork
+    /// at creation so a profile's `[resume]` override drives the relaunch
     /// argv and decides which validation guard the captured reference passes.
     /// `None` for a session without native recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,7 +193,7 @@ pub struct ResumeBinding {
     pub native_reference_provenance: NativeReferenceProvenance,
     /// The keyed revision of the host profile the session was launched from,
     /// frozen when it was created or when the owner accepted a profile change.
-    /// Resume and fork relaunch under the profile only while its current
+    /// Resume relaunches under the profile only while its current
     /// revision matches. Absent for a session without a profile and for a
     /// binding written before revisions were frozen. A keyed MAC, so it reveals
     /// nothing about the profile's `[env]` values.
@@ -224,14 +223,6 @@ impl ResumeBinding {
     #[must_use]
     pub fn resumable(&self) -> bool {
         self.native_launch.is_some()
-    }
-
-    /// Whether the binding can fork natively.
-    #[must_use]
-    pub fn forkable(&self) -> bool {
-        self.native_launch
-            .as_ref()
-            .is_some_and(NativeSessionLaunch::supports_fork)
     }
 }
 
@@ -2281,6 +2272,8 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
         let reason = match parsed {
             Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
                 mirror_worker_instance_id(&mut record);
+                // Sessions cannot be forked, so a stored flag never survives a load.
+                record.info.capabilities.fork = false;
                 sessions.push(*record);
                 continue;
             }
@@ -2332,14 +2325,13 @@ fn partition_lines_logged(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, 
 /// The store holds no secrets, so logging the offending line is safe and aids
 /// debugging. The line stays in the store and every rewrite re-emits it
 /// unchanged. Editing the file while the daemon runs is unsafe, because a
-/// half-written read drops the lines after the cut at the next rewrite: the
-/// remedy is `pohunek store rejected set-aside`, which moves the line into the
-/// quarantine file under the write lock.
+/// half-written read drops the lines after the cut at the next rewrite: stop
+/// the daemon before removing a line.
 fn warn_rejected(line: &RejectedLine) {
     warn!(
         reason = %line.reason,
         line = %line.text,
-        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`"
+        "skipping a metadata-store line this build cannot load; the line stays in the store unchanged; to stop this warning, stop the daemon and remove the line (docs/knowledge/runbooks/runtime-package-recovery.md)"
     );
 }
 
@@ -2762,11 +2754,10 @@ mod tests {
         assert!(store.load_resume().expect("bindings").is_empty());
     }
 
-    fn launch(kind: SessionRefKind, resume: &[&str], fork: Option<&[&str]>) -> NativeSessionLaunch {
+    fn launch(kind: SessionRefKind, resume: &[&str]) -> NativeSessionLaunch {
         NativeSessionLaunch::new(
             kind,
             NativeArgs::from_template(resume).expect("resume template"),
-            fork.map(|tokens| NativeArgs::from_template(tokens).expect("fork template")),
         )
     }
 
@@ -2808,11 +2799,7 @@ mod tests {
                 restricted: false,
                 refuse_while_blocked: false,
             },
-            native_launch: Some(launch(
-                SessionRefKind::Id,
-                &["--resume", "{reference}"],
-                Some(&["--resume", "{reference}", "--fork-session"]),
-            )),
+            native_launch: Some(launch(SessionRefKind::Id, &["--resume", "{reference}"])),
             launch_binding: LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             profile_revision: None,
@@ -2898,7 +2885,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":16,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":17,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2914,7 +2901,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":16,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":17,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -3026,7 +3013,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":16,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":17,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3077,8 +3064,8 @@ mod tests {
     #[test]
     fn resume_legacy_line_loads_with_default_snapshot() {
         // A resume line written before the C.4 snapshot existed (no program/args/
-        // input_rules/resume/fork fields) still loads for inspection. This is not
-        // a compatibility promise: absent fork fields default fail-closed rather
+        // input_rules/resume fields) still loads for inspection. This is not
+        // a compatibility promise: absent resume fields default fail-closed rather
         // than inferring current compiled provider behavior.
         let store = Store::new(temp_store_path("resume-legacy"));
         let legacy = concat!(
@@ -3098,7 +3085,6 @@ mod tests {
         assert_eq!(b.input_rules, StoredInputRules::default());
         assert_eq!(b.native_launch, None);
         assert!(!b.resumable());
-        assert!(!b.forkable());
         assert_eq!(b.reference_kind(), None);
         assert!(b.metadata.is_empty());
     }
@@ -3149,7 +3135,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":16,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":17,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),

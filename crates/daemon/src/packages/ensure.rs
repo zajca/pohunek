@@ -311,11 +311,11 @@ impl PlanInputs<'_> {
 
 /// Appended to a refusal that every installed version took part in because a
 /// metadata-store line that may pin a package cannot be read.
-const UNREADABLE_PIN_NOTE: &str = "; a metadata-store line that cannot be read may pin a version, so every installed version counts: run `pohunek store rejected list`";
+const UNREADABLE_PIN_NOTE: &str = "; a metadata-store line that cannot be read may pin a version, so every installed version counts: see docs/knowledge/runbooks/runtime-package-recovery.md";
 
 /// The step that releases the pin an unreadable metadata-store line may hold,
 /// ending in `; then `.
-const UNREADABLE_PIN_STEP: &str = "a metadata-store line that cannot be read may pin it, so the registry refuses its removal until the line is set aside: run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`; then ";
+const UNREADABLE_PIN_STEP: &str = "a metadata-store line that cannot be read may pin it, so the registry refuses its removal until the line is removed from the store (see docs/knowledge/runbooks/runtime-package-recovery.md); then ";
 
 /// The release catalog, verified, and where its archives are.
 struct Release<'a> {

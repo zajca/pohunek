@@ -48,7 +48,6 @@ import {
   type ProjectRemoveParams,
   type ProjectShowParams,
   type ProjectWorktree,
-  type SessionForkParams,
   type ProtocolError,
   type ProtocolEvent,
   type ProtocolVersion,
@@ -838,8 +837,6 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         return this.handleSessionResume(request);
       case "session.report_native_id":
         return this.handleSessionReportNativeId(request);
-      case "session.fork":
-        return this.handleSessionFork(request);
       case "session.remove":
       case "session.remove_accepting_unconfirmed":
         return this.handleSessionRemove(request);
@@ -1151,26 +1148,6 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     session.updated_at = timestamp();
     this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
     return okResponse(request.id, { recorded: true } satisfies SessionReportNativeIdResult);
-  }
-
-  private handleSessionFork(request: ControlRequest): ControlResponse {
-    const params = readObjectParams<SessionForkParams>(request);
-    if (params === undefined || typeof params.session_id !== "string" || params.cwd_mode !== "same" || !isPositiveInteger(params.cols) || !isPositiveInteger(params.rows)) {
-      return errResponse(request.id, invalidParams(request.method));
-    }
-    const source = this.sessions.get(params.session_id);
-    if (source === undefined) return errResponse(request.id, sessionNotFound(params.session_id));
-    if (source.external === true) return errResponse(request.id, badRequest("external sessions cannot be forked"));
-    if (!source.capabilities.fork) return errResponse(request.id, agentForkUnsupported());
-    const session = this.buildSession(
-      { agent: source.agent, cols: params.cols, rows: params.rows, cwd: source.cwd, ...(params.name === undefined ? {} : { name: params.name }) },
-      source.agent_base,
-    );
-    if (source.metadata !== undefined) session.metadata = cloneValue(source.metadata);
-    if (request.origin !== undefined) session.spawned_by = { ...request.origin };
-    this.sessions.set(session.id, session);
-    this.emitSessionEvent(EVENT_SESSION_CREATED, session);
-    return okResponse(request.id, cloneValue(session));
   }
 
   private handleSessionRemove(request: ControlRequest): ControlResponse {
@@ -2493,7 +2470,6 @@ function mutationSessionId(request: ControlRequest): string | undefined {
       return typeof request.params === "string" ? request.params : undefined;
     case "session.resume":
       return resumeSessionId(request.params);
-    case "session.fork":
     case "session.resize":
     case "session.set_metadata":
     case "session.rename":
@@ -3221,10 +3197,6 @@ function agentResumeUnsupported(sessionId: string): ProtocolError {
   return protocolError("runtime", "agent_resume_unsupported", `agent does not support resume: ${sessionId}`);
 }
 
-function agentForkUnsupported(): ProtocolError {
-  return protocolError("runtime", "agent_fork_unsupported", "the selected agent does not support fork");
-}
-
 function isResumableSessionState(session: SessionInfo): boolean {
   if (session.runtime !== undefined) {
     return session.runtime.state === "lost" || session.runtime.state === "terminal";
@@ -3303,11 +3275,8 @@ function agentBaseFor(agent: string): RuntimeRef {
 }
 
 function agentCapabilities(base: RuntimeRef): { readonly resume: boolean; readonly fork: boolean } {
-  if (base === "hermes") {
+  if (base === "hermes" || base === "codex" || base === "claude") {
     return { resume: true, fork: false };
-  }
-  if (base === "codex" || base === "claude") {
-    return { resume: true, fork: true };
   }
   return { resume: false, fork: false };
 }

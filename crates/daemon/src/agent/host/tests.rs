@@ -171,7 +171,6 @@ struct Expected {
     args: &'static [&'static str],
     input: InputRules,
     resume: &'static [&'static str],
-    fork: Option<&'static [&'static str]>,
     manifest: fn() -> &'static Manifest,
 }
 
@@ -183,7 +182,6 @@ fn builtin_definitions_match_the_compiled_behavior() {
         args: &[],
         input: InputRules::unrestricted(false, Duration::ZERO),
         resume: &[],
-        fork: None,
         manifest: generic_shell_manifest,
     }];
     let registry = builtin_registry("/bin/sh");
@@ -201,12 +199,8 @@ fn builtin_definitions_match_the_compiled_behavior() {
             None
         } else {
             Some(
-                NativeSessionLaunch::from_templates(
-                    crate::agent::SessionRefKind::Id,
-                    case.resume,
-                    case.fork,
-                )
-                .expect("expected templates are valid"),
+                NativeSessionLaunch::from_templates(crate::agent::SessionRefKind::Id, case.resume)
+                    .expect("expected templates are valid"),
             )
         };
         assert_eq!(definition.native(), native.as_ref(), "{kind:?}");
@@ -227,16 +221,13 @@ fn builtin_session_behavior_flags_match_the_compiled_dispatch() {
             definition.prompt_arg(),
             definition.submit_delay_configurable(),
             definition
-                .native()
-                .is_some_and(NativeSessionLaunch::supports_fork),
-            definition
                 .version_probe_parser()
                 .map(|parser| parser.as_str().to_owned()),
         )
     };
     // The shell takes no initial prompt as a launch argument, uses no
-    // configured submit delay, does not fork natively and has no version probe.
-    assert_eq!(flags("shell"), (false, false, false, None));
+    // configured submit delay and has no version probe.
+    assert_eq!(flags("shell"), (false, false, None));
 }
 
 #[test]
@@ -356,7 +347,6 @@ fn resume_templates_cover_id_and_path_references() {
             .expect("renders"),
         ["resume", "abc"]
     );
-    assert!(!native.supports_fork());
 
     let by_path = parse(&document(
         "supported = true\nreference_kind = \"path\"\nargs = [\"--transcript\", \"{reference}\"]",
@@ -413,33 +403,14 @@ fn reference_slot_must_be_one_whole_token() {
             source: NativeLaunchError::EmptyLiteral { index: 0 }
         }
     );
-    let fork = parse(&document(
-        "supported = true\nreference_kind = \"id\"\nargs = [\"resume\", \"{reference}\"]",
-        "supported = true\nargs = [\"fork\", \"x{reference}\"]",
-    ))
-    .expect_err("embedded placeholder in fork");
-    assert_eq!(
-        fork,
-        DefinitionError::Native {
-            field: "fork.args",
-            source: NativeLaunchError::BracesInLiteral { index: 1 }
-        }
-    );
 }
 
 #[test]
-fn resume_and_fork_tables_must_be_consistent() {
+fn resume_table_must_be_consistent() {
     let field = |resume: &str, fork: &str| match parse(&document(resume, fork)) {
         Err(DefinitionError::Field { field, .. }) => field,
         other => panic!("expected a field error, got {other:?}"),
     };
-    assert_eq!(
-        field(
-            "supported = false",
-            "supported = true\nargs = [\"{reference}\"]"
-        ),
-        "fork"
-    );
     assert_eq!(
         field(
             "supported = false\nargs = [\"resume\", \"{reference}\"]",
@@ -457,20 +428,6 @@ fn resume_and_fork_tables_must_be_consistent() {
             "supported = false"
         ),
         "resume.args"
-    );
-    assert_eq!(
-        field(
-            "supported = true\nreference_kind = \"id\"\nargs = [\"{reference}\"]",
-            "supported = true"
-        ),
-        "fork.args"
-    );
-    assert_eq!(
-        field(
-            "supported = true\nreference_kind = \"id\"\nargs = [\"{reference}\"]",
-            "supported = false\nargs = [\"{reference}\"]"
-        ),
-        "fork"
     );
 }
 
@@ -876,46 +833,23 @@ fn native_templates_are_bounded_on_every_path() {
         tokens.push("{reference}".to_owned());
         tokens
     };
-    let parts_with = |resume: Vec<String>, fork: Option<Vec<String>>| {
-        let native = NativeSessionLaunch::from_templates(
-            crate::agent::SessionRefKind::Id,
-            &resume,
-            fork.as_deref(),
-        )
-        .expect("structurally valid template");
+    let parts_with = |resume: Vec<String>| {
+        let native = NativeSessionLaunch::from_templates(crate::agent::SessionRefKind::Id, &resume)
+            .expect("structurally valid template");
         RuntimeDefinition::new(DefinitionParts {
             native: Some(native),
             ..builtin_parts()
         })
     };
-    parts_with(
-        template(super::MAX_LAUNCH_ARGS, super::MAX_ARG_BYTES),
-        Some(template(super::MAX_LAUNCH_ARGS, super::MAX_ARG_BYTES)),
-    )
-    .expect("boundary is accepted");
+    parts_with(template(super::MAX_LAUNCH_ARGS, super::MAX_ARG_BYTES))
+        .expect("boundary is accepted");
     assert_eq!(
-        field_of(parts_with(template(super::MAX_LAUNCH_ARGS + 1, 1), None)),
+        field_of(parts_with(template(super::MAX_LAUNCH_ARGS + 1, 1))),
         ("resume.args", "has too many arguments")
     );
     assert_eq!(
-        field_of(parts_with(template(2, super::MAX_ARG_BYTES + 1), None)),
+        field_of(parts_with(template(2, super::MAX_ARG_BYTES + 1))),
         ("resume.args", "has a token over 1024 bytes")
-    );
-    assert_eq!(
-        field_of(parts_with(
-            template(2, 1),
-            Some(template(super::MAX_LAUNCH_ARGS + 1, 1))
-        ))
-        .0,
-        "fork.args"
-    );
-    assert_eq!(
-        field_of(parts_with(
-            template(2, 1),
-            Some(template(2, super::MAX_ARG_BYTES + 1))
-        ))
-        .0,
-        "fork.args"
     );
 
     let toml_args = |count: usize| {

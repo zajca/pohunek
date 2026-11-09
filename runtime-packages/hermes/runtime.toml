@@ -2,7 +2,7 @@
 
 schema = 1
 id = "pohunek.runtime.hermes"
-version = "1.1.0"
+version = "1.2.0"
 runtime_api = 1
 requires = ["placement-v1"]
 
@@ -36,9 +36,6 @@ startup_grace_ms = 30000
 supported = true
 reference_kind = "id"
 args = ["--resume", "{reference}"]
-
-[fork]
-supported = false
 
 [native_reference]
 strategy = "hook"

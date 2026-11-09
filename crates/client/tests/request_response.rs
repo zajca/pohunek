@@ -965,7 +965,7 @@ async fn session_resume_past_its_deadline_reports_an_unknown_outcome() {
     inhibitor.release().await;
 }
 
-/// Daemon-side duration of a fork, stop or remove the fixture answers, above
+/// Daemon-side duration of a stop or remove the fixture answers, above
 /// the client's 5 s default request timeout.
 const SLOW_LIFECYCLE: Duration = Duration::from_secs(6);
 
@@ -1028,17 +1028,6 @@ impl LifecycleFixture {
     }
 }
 
-fn fork_params() -> protocol::SessionForkParams {
-    protocol::SessionForkParams {
-        session_id: protocol::SessionId("s-source".to_owned()),
-        name: None,
-        cwd_mode: protocol::ForkCwdMode::Same,
-        cols: 80,
-        rows: 24,
-        accept_profile_change: false,
-    }
-}
-
 fn source_session() -> protocol::SessionId {
     protocol::SessionId("s-source".to_owned())
 }
@@ -1049,102 +1038,6 @@ fn removed_result() -> Value {
 
 fn explicit_options(timeout: Duration) -> ClientOptions {
     no_origin_options().with_request_timeout(timeout)
-}
-
-#[tokio::test(start_paused = true)]
-async fn session_fork_outlasts_the_default_request_timeout() {
-    let (mut client, mut fixture) =
-        LifecycleFixture::start(session_info_json("s-forked"), no_origin_options()).await;
-    let fork = tokio::spawn(async move { client.session_fork(fork_params()).await });
-    let (request, dedicated) = fixture.request().await;
-    assert_eq!(request.method(), protocol::method::SESSION_FORK);
-    assert!(dedicated, "the fork runs on a dedicated connection");
-    tokio::time::advance(SLOW_LIFECYCLE).await;
-    fixture.release();
-    let forked = fork
-        .await
-        .expect("fork task completed")
-        .expect("the client waits for the daemon's reply instead of timing out");
-    assert_eq!(forked.session.id.0, "s-forked");
-    fixture.finish().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn generic_fork_call_takes_the_dedicated_budget() {
-    let (mut client, mut fixture) =
-        LifecycleFixture::start(session_info_json("s-forked"), no_origin_options()).await;
-    let fork = tokio::spawn(async move {
-        client
-            .call::<protocol::method::SessionFork>(fork_params())
-            .await
-    });
-    let (_request, dedicated) = fixture.request().await;
-    assert!(
-        dedicated,
-        "the generic fork call runs on a dedicated connection"
-    );
-    tokio::time::advance(SLOW_LIFECYCLE).await;
-    fixture.release();
-    let forked = fork
-        .await
-        .expect("fork task completed")
-        .expect("the generic call waits for the daemon's reply instead of timing out");
-    assert_eq!(forked.session.id.0, "s-forked");
-    fixture.finish().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn session_fork_past_its_deadline_reports_an_unknown_outcome() {
-    let explicit = Duration::from_millis(200);
-    let (mut client, mut fixture) =
-        LifecycleFixture::start(session_info_json("s-forked"), explicit_options(explicit)).await;
-    let fork = tokio::spawn(async move { client.session_fork(fork_params()).await });
-    fixture.request().await;
-    tokio::time::advance(explicit + TIMER_TICK).await;
-
-    let error = fork
-        .await
-        .expect("fork task completed")
-        .expect_err("the explicit deadline elapses before the daemon answers");
-    assert!(
-        matches!(&error, ClientError::SessionForkOutcomeUnknown { timeout, .. } if *timeout == explicit),
-        "{error:?}"
-    );
-    let structured = error.to_protocol_error();
-    assert_eq!(structured.code, "session_fork_outcome_unknown");
-    assert_eq!(structured.class, ErrorClass::Transport);
-    let hint = structured.recover.as_deref().expect("a recover hint");
-    assert!(
-        hint.contains("may still complete") && hint.contains("session list"),
-        "{hint}"
-    );
-    assert!(
-        hint.contains("second") && hint.contains("child"),
-        "a retried fork creates another child, which the hint must say: {hint}"
-    );
-    fixture.release();
-    fixture.finish().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn session_fork_explicit_timeout_wins_over_the_lifecycle_budget() {
-    let explicit = Duration::from_secs(2);
-    let (mut client, mut fixture) =
-        LifecycleFixture::start(session_info_json("s-forked"), explicit_options(explicit)).await;
-    let fork = tokio::spawn(async move { client.session_fork(fork_params()).await });
-    fixture.request().await;
-    tokio::time::advance(explicit + TIMER_TICK).await;
-
-    let error = fork
-        .await
-        .expect("fork task completed")
-        .expect_err("the daemon answers after the explicit deadline");
-    assert!(
-        matches!(&error, ClientError::SessionForkOutcomeUnknown { timeout, .. } if *timeout == explicit),
-        "{error:?}"
-    );
-    fixture.release();
-    fixture.finish().await;
 }
 
 #[tokio::test(start_paused = true)]

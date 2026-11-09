@@ -82,7 +82,7 @@ handles it once, for every agent CLI:
 | Submit a multi-line prompt into an Ink TUI without it being half-swallowed | `session input` with per-agent framing (bracketed paste, delayed submit). Prompts can come from stdin so they never appear in argv or logs. |
 | Hear about it when something needs you, on any machine | Durable notification records (`unread → read → acknowledged → archived`), fed by agent hooks and daemon-side detection, deduped and debounced, fanned out with `--all-hosts`. |
 | Keep two agents out of one working tree | `--branch` creates a worktree per session off the base branch; ownership is recorded and checked before any reuse or cleanup. |
-| Get a conversation back, or branch it | Hooks capture the agent's own session id for explicit `session resume`; `session fork` branches a Claude Code conversation into a new session and PTY. |
+| Get a conversation back | Hooks capture the agent's own session id for explicit `session resume`, which reopens the conversation in the same session. |
 | Watch without stealing the terminal | `session screen`, paged `session output` with exact runtime cursors, and `session wait` for bounded change polling. |
 | Drive it from a script or another agent | One versioned `--json` envelope, typed errors with recovery hints, `subscribe` event streams, Rust and TypeScript SDKs. |
 
@@ -97,7 +97,7 @@ handles it once, for every agent CLI:
   generated from the Rust source of truth. A shell script around `--json` is a
   legitimate client too. [docs/sdk.md](docs/sdk.md) has the examples.
 - **A stable base for tooling you build yourself.** Each agent CLI has its own
-  TUI quirks, prompt framing, hooks, session ids, and resume and fork rules.
+  TUI quirks, prompt framing, hooks, session ids, and resume rules.
   pohunek absorbs those differences once, so your scripts, launchers, review
   bots, and manager agents talk to one contract instead of every harness.
 - **Multihost from the start.** Every host is authoritative for its own
@@ -233,10 +233,6 @@ backbone: every surface there uses only the CLI with `--json` and the public
 protocol through the SDKs, pinned to one core release. They show one way to
 build on pohunek, not the way.
 
-- **Workflow plugin.** Joins Linear or GitHub Issues, pull request state, and
-  pohunek sessions into one table with a derived `on_turn` column (me, an
-  agent, or a reviewer); named actions such as `implement`, `babysit`, `fix-ci`,
-  and `review` launch linked sessions in fresh worktrees. Merging stays manual.
 - **Native GUI** (`pohunek-gui`, Iced) for Linux (Wayland) and macOS; opening a
   session launches your own terminal.
 - **Web control center**: Bun backend, Svelte SPA with an in-browser terminal,
@@ -273,8 +269,7 @@ public source of truth for scope, order, and status.
 
 | Track | Where it is heading | Status |
 |---|---|---|
-| **Runtime plugin packages** — [#139](https://github.com/zajca/pohunek/issues/139) | Pi, Codex, Claude Code, and Hermes become signed, content-addressed runtime packages installed per host, with their own CI and compatibility matrix. Only `shell` stays built in. | In progress (37/46): the registry, package format, signed catalog, CLI lifecycle, the Pi, Codex, Claude Code, and Hermes packages (#145, #146, #147), the package CI and compatibility matrix (#149), workflow plugins (#148) and the package documentation (#151) have landed, with the compiled-in Codex, Claude Code, and Hermes removed; the open children are follow-ups (#868, #870, #899, #911, #1003, #1011, #1013, #1019, #1061). |
-| **Workflow plugins** — [#148](https://github.com/zajca/pohunek/issues/148), [#325](https://github.com/zajca/pohunek/issues/325), [#326](https://github.com/zajca/pohunek/issues/326) | Bounded out-of-process plugins with declared actions and event reactions, invoked from the CLI. This is the packaging path for `pohunek-work`-style tooling. They are separate from runtime packages and run as the owner over the public CLI or SDK; v1 adds no core channel for plugin data and no launch-time policy hook ([#480](https://github.com/zajca/pohunek/issues/480)). | Done (4/4): the metadata filter and display decision are done; `pohunek workflow` installs plugins into a CLI-owned store pinned by digest with consent, and `pohunek workflow run` runs an action under owner limits with verbatim arguments, a byte-exact `--json` result, and shell completion of plugins and actions (#325); enabled plugins run their periodic jobs and long-running services as user service manager units, `pohunek workflow status` reports them, and `pohunek service uninstall` refuses while a plugin still has any (#326); event reactions run argv for matching daemon events through one dispatcher unit per namespace, with bounded per-plugin queues and drop records (#148). |
+| **Runtime plugin packages** — [#139](https://github.com/zajca/pohunek/issues/139) | Pi, Codex, Claude Code, and Hermes become signed, content-addressed runtime packages installed per host, with their own CI and compatibility matrix. Only `shell` stays built in. | In progress (37/46): the registry, package format, signed catalog, CLI lifecycle, the Pi, Codex, Claude Code, and Hermes packages (#145, #146, #147), the package CI and compatibility matrix (#149), and the package documentation (#151) have landed, with the compiled-in Codex, Claude Code, and Hermes removed; the open children are follow-ups (#868, #870, #899, #911, #1003, #1011, #1013). |
 | **More agents** — [#50](https://github.com/zajca/pohunek/issues/50), [#227](https://github.com/zajca/pohunek/issues/227) | Pi and OpenCode 2.x as further first-class runtimes. | Pi ships as an official runtime package; its end-to-end acceptance and OpenCode are open. |
 | **Delegated task runs** — [#182](https://github.com/zajca/pohunek/issues/182), [WS1–WS8](https://github.com/zajca/pohunek/issues/219) | Tasks and turns over ordinary sessions: causal turn settlement, a blocking `task.wait`, typed results with repository evidence and checks, and an optional MCP adapter. Agents can then delegate work to other agents reliably. | RFC accepted; implementation started with the WS1 protocol |
 | **Durability and detection** — [#420–#426](https://github.com/zajca/pohunek/issues/426), [#59–#67](https://github.com/zajca/pohunek/issues/67) | Recovery from crashes and host-wide session loss in one action, and explainable, arbitrated `working` / `blocked` / `idle` detection. | In progress: `lost` classification and recovery binding landed; one-action recovery and detection work are open. |

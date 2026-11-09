@@ -1675,12 +1675,12 @@ async fn a_session_of_the_built_in_hermes_is_adopted_only_when_pinned_and_the_pa
 }
 
 /// A live session of `runtime` the v0.33.0 daemon launched from its built-in
-/// runtime that cannot resume or fork (a host profile with `[resume]
+/// runtime that cannot resume (a host profile with `[resume]
 /// resumable = false`) still depends on the runtime source: this binary ships
 /// no built-in `runtime`, so without the official package every interaction
 /// with the adopted session is refused. The preflight reports that loss
 /// instead of `adoptable`. With the package installed the session is adopted
-/// and has no resume or fork to lose.
+/// and has no resume to lose.
 async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_package(runtime: &str) {
     let recoveries = built_in_pins(runtime)
         .into_iter()
@@ -1742,10 +1742,10 @@ async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_packa
                 detail.contains(&release_install_step(runtime)),
                 "{case}: {detail}"
             );
-            // The install restores interaction; resume and fork follow only
+            // The install restores interaction; resume follows only
             // when the package honors the frozen launch.
             assert!(
-                detail.contains("resume and fork run through it when it honors the launch"),
+                detail.contains("resume runs through it when it honors the launch"),
                 "{case}: {detail}"
             );
         }
@@ -3022,7 +3022,6 @@ struct ScopedFacts {
     package_digest: &'static str,
     native_id: Option<&'static str>,
     native_path: Option<&'static str>,
-    forkable: bool,
 }
 
 impl ScopedFacts {
@@ -3034,7 +3033,6 @@ impl ScopedFacts {
             package_digest: MISSING_PACKAGE_DIGEST,
             native_id: Some("native-fixture-2"),
             native_path: None,
-            forkable: true,
         }
     }
 
@@ -3059,7 +3057,6 @@ impl ScopedFacts {
         line["recovery"]["native_session_id"] = self.native_id.map_or(Value::Null, |id| json!(id));
         line["recovery"]["native_session_path"] =
             self.native_path.map_or(Value::Null, |path| json!(path));
-        line["recovery"]["forkable"] = json!(self.forkable);
         line
     }
 
@@ -3179,13 +3176,6 @@ async fn the_acceptance_scope_is_stable_for_identical_facts_and_changes_with_eac
                 ..facts()
             },
         ),
-        (
-            "fork capability",
-            ScopedFacts {
-                forkable: false,
-                ..facts()
-            },
-        ),
     ];
     let mut seen = vec![baseline.clone()];
     for (changed, variant) in variants {
@@ -3282,9 +3272,10 @@ async fn the_acceptance_scope_does_not_depend_on_the_volatile_fields_startup_rew
 
 /// The scope of the frozen v1 encoding for the literal facts of
 /// [`ScopedFacts::baseline`] as a stopped session. A change to this digest is
-/// a change to the cross-release scope contract and needs a new scheme name.
+/// a change to the cross-release scope contract and needs a new scheme name,
+/// unless it can only make an acceptance fail closed (`project.md`).
 const GOLDEN_STOPPED_SCOPE_V1: &str =
-    "v1:523812f1bc359af6878d88f1cf27b8b4d460ef73139d8f0964fd6bfc73246ff8";
+    "v1:0b9a099942dec811bb7f4a07936c6345a29762615cf44948831ffe97e02fb137";
 
 #[tokio::test]
 async fn the_v1_acceptance_scope_of_fixed_facts_is_frozen() {
@@ -3709,7 +3700,6 @@ async fn a_flagged_binding_with_a_spec_is_judged_normally() {
         pohunek_daemon::agent::NativeSessionLaunch::from_templates(
             pohunek_daemon::agent::SessionRefKind::Id,
             &["--session", pohunek_daemon::agent::REFERENCE_PLACEHOLDER],
-            Some(&["--fork", pohunek_daemon::agent::REFERENCE_PLACEHOLDER][..]),
         )
         .expect("a launch spec"),
     )
@@ -3775,7 +3765,7 @@ async fn a_stop_intent_record_is_repaired_before_its_merge() {
 #[tokio::test]
 async fn the_preflight_repair_resolves_against_the_planned_profile_text() {
     let damaged = DamagedHost::new().await;
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.4.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.5.1");
     damaged
         .catalog
         .write_release_archives(&damaged.release, 2, &[("claude", &bytes, &digest)]);
@@ -3839,7 +3829,7 @@ fn slot_profile_session(host: &Host, session: &str, worker: &str, name: &str) ->
 }
 
 /// A live session of a profile that declares secret slots cannot be relaunched
-/// by `session.resume` or `session.fork` on the running release either
+/// by `session.resume` on the running release either
 /// (`secret_env_missing`), so the upgrade loses no recovery: the verdict is
 /// `already_not_resumable`, not the `would_lose_recovery` of a profile that no
 /// longer resolves.

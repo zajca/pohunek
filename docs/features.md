@@ -28,7 +28,7 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   bounded typed tools, a generated skill, and best-effort lifecycle hooks.
 - The Pi coding agent `1.x` (from `1.0.0`) is an optional runtime package
   (`runtime-packages/pi`) installed with `pohunek plugin install`: launch,
-  detection, resume and fork need no daemon release, and the daemon assigns the
+  detection and resume need no daemon release, and the daemon assigns the
   session id Pi stores its conversation under.
 - **Live agent state detection** — `working` / `blocked` / `idle` — derived
   from OSC terminal titles, screen-content pattern matching, and PTY activity.
@@ -38,8 +38,6 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   lost or terminal runtime can be recovered explicitly. Recovery creates a new
   PTY generation; ordinary daemon restart reconnects to the existing worker and
   never invokes provider-native resume.
-- **Session fork** — branch a Claude Code conversation into a new session and
-  PTY without disturbing the original.
 - **Prompt injection done right**: `session input` and `--input` use per-agent
   framing (bracketed paste, delayed submit) so multi-line prompts actually
   submit into Ink/TUI agents instead of being half-swallowed.
@@ -75,7 +73,7 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   under its existing XDG state directory.
 - **Shell completion**: generate static Bash, Zsh, or Fish completion from the
   clap command tree. An explicit `--dynamic` mode adds bounded, failure-silent
-  host, session-target, package and workflow plugin lookup without starting a
+  host, session-target and package lookup without starting a
   daemon.
 
 **Projects and worktree isolation**
@@ -116,7 +114,7 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
 - **Attach session menu**: raw terminal passthrough preserves native scrollback;
   `Ctrl-\` temporarily shows a composited dialog headed by the session's host,
   project, branch, name, and live state, with a menu (kill, terminate and
-  delete, detach, new session in the same worktree, fork, rename), then restores
+  delete, detach, new session in the same worktree, rename), then restores
   the agent screen and raw passthrough when the menu closes.
 - Attach auto-reconnects after a daemon restart to the same worker, PTY, child
   PID, and runtime generation. Retries use a minimum interval and consecutive

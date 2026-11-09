@@ -109,7 +109,7 @@ The assistant must:
 - Preserve paired `origin_session_id`/`origin_daemon_id` request markers on
   ordinary, subscription, and dedicated SDK connections. The daemon uses them
   to deny exactly `session.stop`, `session.resume`, `session.remove`,
-  `session.remove_accepting_unconfirmed`, `session.fork`, `session.resize`,
+  `session.remove_accepting_unconfirmed`, `session.resize`,
   `session.set_metadata`, `session.rename`, and `session.input` when they target the session hosting the caller. Do not strip
   or forge them to bypass `plugin_self_target_denied`. This is a narrow
   confused-deputy guard within the owner trust boundary, not per-session
@@ -141,22 +141,8 @@ The assistant must:
   raw attach bytes. Use only the installed typed tool surface, an explicit host
   allowlist, and the selected `read_only`, `manage`, or `full` access mode.
   The plugin policy is an owner-private delegated-tool guardrail, not a
-  same-user sandbox; the daemon's exact nine-method origin-session denial is
+  same-user sandbox; the daemon's exact eight-method origin-session denial is
   authoritative. Ask a human to attach when typed model control is insufficient.
-
-- Treat a workflow plugin as owner code with the owner's full authority. Its
-  archive digest proves which bytes the owner approved, not what they do; the
-  plugin can read the owner's files and use every public owner API, as any
-  same-UID process can. Show the owner the review `pohunek workflow install`
-  prints, pass `--yes` only after the owner approved it, and never describe a
-  plugin as sandboxed. `pohunek workflow run` forwards the complete
-  `POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID` pair to the action, so an action run
-  from inside a managed session is still refused `plugin_self_target_denied`
-  against that session. Never unset or change either marker to get around
-  it; a single marker refuses the run with `workflow_origin_incomplete`, and
-  the fix is to restore the missing marker, not to drop the other. Its environment
-  holds no `PATH`, token or worker variable, and its run log holds no argv,
-  environment, context or output bytes.
 
 The assistant may write host or repo configuration when that is the requested
 task, but it must stay inside the user's requested scope and respect the

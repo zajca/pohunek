@@ -7,7 +7,7 @@ use crate::{OverlayFrame, OverlayLine};
 /// Root-menu row selected when the modal opens or walks back.
 const ROOT_DEFAULT_SELECTED: usize = 0;
 /// Number of actions shown in the attach session menu.
-const ROOT_ITEM_COUNT: usize = 6;
+const ROOT_ITEM_COUNT: usize = 5;
 /// Root row for killing the current session.
 const ROOT_KILL_INDEX: usize = 0;
 /// Root row for stopping the current session and evicting it from the registry.
@@ -16,10 +16,8 @@ const ROOT_REMOVE_INDEX: usize = 1;
 const ROOT_DETACH_INDEX: usize = 2;
 /// Root row for starting another session in the same worktree.
 const ROOT_NEW_SESSION_INDEX: usize = 3;
-/// Root row for forking the current native agent conversation.
-const ROOT_FORK_INDEX: usize = 4;
 /// Root row for renaming the current session.
-const ROOT_RENAME_INDEX: usize = 5;
+const ROOT_RENAME_INDEX: usize = 4;
 /// Cursor row of the rename input, relative to the first body line.
 const RENAME_INPUT_CURSOR_ROW: u16 = 0;
 /// Visible prompt before the editable rename buffer.
@@ -139,11 +137,6 @@ pub enum MenuOutcome {
         /// New session id.
         id: String,
     },
-    /// A session was forked.
-    Forked {
-        /// Forked session id.
-        id: String,
-    },
     /// The current session was renamed.
     Renamed {
         /// New display name, or `None` when cleared.
@@ -162,8 +155,6 @@ pub enum MenuEffect {
     RunDetach,
     /// Inspect the current session, then send `session.new`.
     RunNewSession,
-    /// Send `session.fork`.
-    RunFork,
     /// Send `session.rename`.
     RunRename(String),
     /// Close and clear the compositor overlay.
@@ -213,7 +204,6 @@ fn root_step(selected: usize, key: MenuKey) -> (MenuState, Vec<MenuEffect>) {
             vec![MenuEffect::RunDetach, MenuEffect::Close],
         ),
         MenuKey::Byte(b'n') => (busy("Starting session"), vec![MenuEffect::RunNewSession]),
-        MenuKey::Byte(b'f') => (busy("Forking session"), vec![MenuEffect::RunFork]),
         MenuKey::Byte(b'r') => (
             MenuState::RenameInput {
                 buffer: String::new(),
@@ -285,7 +275,6 @@ fn run_selected(selected: usize) -> (MenuState, Vec<MenuEffect>) {
             vec![MenuEffect::RunDetach, MenuEffect::Close],
         ),
         ROOT_NEW_SESSION_INDEX => (busy("Starting session"), vec![MenuEffect::RunNewSession]),
-        ROOT_FORK_INDEX => (busy("Forking session"), vec![MenuEffect::RunFork]),
         ROOT_RENAME_INDEX => (
             MenuState::RenameInput {
                 buffer: String::new(),
@@ -326,7 +315,6 @@ fn outcome_message(outcome: MenuOutcome) -> String {
             worktrees_failed,
         } => removed_message(worktrees_removed, worktrees_failed),
         MenuOutcome::NewSession { id } => format!("New session created: {id}"),
-        MenuOutcome::Forked { id } => format!("Forked session created: {id}"),
         MenuOutcome::Renamed { name: Some(name) } => format!("Session renamed: {name}"),
         MenuOutcome::Renamed { name: None } => "Session name cleared".to_owned(),
     }
@@ -362,7 +350,6 @@ fn root_overlay(selected: usize) -> OverlayFrame {
                 "n  New session in this worktree",
                 selected == ROOT_NEW_SESSION_INDEX,
             ),
-            overlay_line("f  Fork session", selected == ROOT_FORK_INDEX),
             overlay_line("r  Rename session", selected == ROOT_RENAME_INDEX),
         ],
         footer: Some("Enter select  Esc close".to_owned()),

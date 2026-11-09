@@ -961,8 +961,15 @@ impl SessionRegistry {
                     super::send_detector_config(entry, config);
                 }
             }
-            let (subagents_changed, background_changed) =
-                entry.replace_background_view(subagents, background_update.as_ref());
+            let subagents_changed = entry.info.subagents != subagents;
+            entry.info.subagents = subagents;
+            let background_changed = match background_update.as_ref() {
+                Some(update) if entry.info.background != *update => {
+                    entry.info.background.clone_from(update);
+                    true
+                }
+                _ => false,
+            };
             let changed = projected.any || subagents_changed || background_changed;
             entry
                 .last_native_report
@@ -982,9 +989,6 @@ impl SessionRegistry {
         if updated.0 {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
-            // The held-or-idle verdict of the session reads the published
-            // subagents and background snapshot.
-            self.wake_idle_stop();
             let runtime = event_runtime(&updated.1);
             for subagent in updated.2 {
                 let event = crate::events::event(
@@ -4265,8 +4269,6 @@ impl SessionRegistry {
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
-            activity_since: crate::time::now(),
-            background_quiet_since: None,
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
         };
@@ -4611,8 +4613,6 @@ impl SessionRegistry {
             bound_reporter: None,
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
-            activity_since: crate::time::now(),
-            background_quiet_since: None,
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
         };
@@ -7264,10 +7264,9 @@ mod tests {
         TransactionId, Version, WorkerId, WorkerInstanceId,
     };
     use protocol::{
-        AgentActivity, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
-        RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionForkParams, SessionId,
-        SessionInfo, SessionNewParams, SessionReportNativeIdParams, SessionRuntime, SessionState,
-        StateSource,
+        AgentActivity, CwdSource, ProcessStartIdentity, ReportSequence, RuntimeInventoryStatus,
+        RuntimeRef, RuntimeState, SessionId, SessionInfo, SessionNewParams,
+        SessionReportNativeIdParams, SessionRuntime, SessionState, StateSource,
     };
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
@@ -7815,7 +7814,7 @@ while os.getppid() == parent:
             .recovery
             .as_mut()
             .expect("recovery binding")
-            .native_launch = Some(test_native_launch(SessionRefKind::Path, false));
+            .native_launch = Some(test_native_launch(SessionRefKind::Path));
     }
     fn no_recovery(record: &mut SessionRecord) {
         record.recovery = None;
@@ -8837,7 +8836,7 @@ while os.getppid() == parent:
             let binding = record.recovery.as_mut().expect("recovery");
             binding.agent = provider.to_owned();
             binding.agent_base = agent_base;
-            binding.native_launch = Some(test_native_launch(kind, false));
+            binding.native_launch = Some(test_native_launch(kind));
             let mut snapshot = identity_snapshot(launch_reference);
             snapshot.launch_identity.as_mut().expect("launch").provider = provider.to_owned();
             snapshot
@@ -9305,9 +9304,9 @@ while os.getppid() == parent:
         clippy::too_many_lines,
         reason = "restart continuity test keeps original and replacement registry assertions together"
     )]
-    async fn replacement_registry_preserves_native_recovery_and_fork_binding() {
+    async fn replacement_registry_preserves_native_recovery_binding() {
         let root = temp_root();
-        // The Claude recovery binding this fixture forks clears the transcript
+        // The Claude recovery binding this fixture resumes clears the transcript
         // preflight against a fixture config home: it declares it through the
         // registry's launch environment, which its relaunch reads.
         let claude_home = root.join("claude-home");
@@ -9494,7 +9493,7 @@ while os.getppid() == parent:
             exit_code: None,
             capabilities: protocol::SessionCapabilities {
                 resume: true,
-                fork: true,
+                fork: false,
                 ..Default::default()
             },
         };
@@ -9517,7 +9516,7 @@ while os.getppid() == parent:
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
             input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
-            native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
+            native_launch: Some(test_native_launch(SessionRefKind::Id)),
             launch_binding: crate::agent::host::fixture::official_launch_pin(
                 protocol::RuntimeId::CLAUDE,
             ),
@@ -9693,7 +9692,7 @@ while os.getppid() == parent:
                 .as_ref()
                 .and_then(|binding| binding.native_session_id.as_deref()),
             Some("native-restart-test"),
-            "reconciliation must commit the merged fork binding"
+            "reconciliation must commit the merged native binding"
         );
         let self_attach = replacement
             .attach(&protocol::SessionAttachParams {
@@ -9720,28 +9719,6 @@ while os.getppid() == parent:
             .resize(&SessionId(session_id.to_owned()), 100, 30)
             .await
             .expect("worker-backed resize after adoption");
-        let forked = replacement
-            .fork(SessionForkParams {
-                session_id: SessionId(session_id.to_owned()),
-                name: Some("restart recovery fork".to_owned()),
-                cwd_mode: ForkCwdMode::Same,
-                cols: 100,
-                rows: 30,
-                accept_profile_change: false,
-            })
-            .await
-            .expect("fork adopted session from preserved native binding");
-        assert_ne!(forked.id, SessionId(session_id.to_owned()));
-        // A fork starts a distinct conversation: only the child's own verified
-        // launch report may give it a recovery reference of its own.
-        assert_eq!(
-            forked.native_session_id, None,
-            "the fork child cannot resume its source's conversation as its own"
-        );
-        replacement
-            .stop(&forked.id)
-            .await
-            .expect("stop recovery fork");
         replacement
             .stop(&SessionId(session_id.to_owned()))
             .await
@@ -9857,7 +9834,7 @@ while os.getppid() == parent:
         recovery.args = vec!["chat".to_owned()];
         recovery.input_rules =
             StoredInputRules::from(InputRules::hermes(true, Duration::from_millis(150)));
-        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
+        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id));
         record.runtime.worker_id = Some(worker_id.to_owned());
         record.runtime.worker_instance_id = Some(worker_instance_id.to_string());
 
@@ -11007,13 +10984,9 @@ while os.getppid() == parent:
         record.runtime.executable = Some(PathBuf::from(TEST_WORKER_EXECUTABLE));
     }
 
-    fn test_native_launch(kind: SessionRefKind, fork: bool) -> NativeSessionLaunch {
-        NativeSessionLaunch::from_templates(
-            kind,
-            &["--resume", "{reference}"],
-            fork.then_some(&["--resume", "{reference}", "--fork-session"][..]),
-        )
-        .expect("valid test templates")
+    fn test_native_launch(kind: SessionRefKind) -> NativeSessionLaunch {
+        NativeSessionLaunch::from_templates(kind, &["--resume", "{reference}"])
+            .expect("valid test templates")
     }
 
     fn identity_record() -> SessionRecord {
@@ -11099,7 +11072,7 @@ while os.getppid() == parent:
                 program: "codex".to_owned(),
                 args: Vec::new(),
                 input_rules: StoredInputRules::default(),
-                native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+                native_launch: Some(test_native_launch(SessionRefKind::Id)),
                 launch_binding: crate::agent::host::LaunchPin::Unpinned,
                 native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
                 profile_revision: None,
@@ -11138,7 +11111,7 @@ while os.getppid() == parent:
         binding.native_session_id = Some(reference.to_owned());
         binding.native_reference_provenance = NativeReferenceProvenance::Assigned;
         binding.native_launch = Some(
-            test_native_launch(SessionRefKind::Id, false)
+            test_native_launch(SessionRefKind::Id)
                 .with_assigned(crate::agent::AssignedReference::new(
                     crate::agent::NativeArgs::from_template(&["--session-id", "{reference}"])
                         .expect("launch template"),
@@ -11743,50 +11716,7 @@ while os.getppid() == parent:
     }
 
     #[tokio::test]
-    async fn deleted_profile_keeps_frozen_fork_disable_after_restart() {
-        let root = temp_root();
-        let store_path = root.join("data/metadata.jsonl");
-        let mut record = identity_record();
-        record.info.agent = "deleted-profile".to_owned();
-        record.info.agent_base = RuntimeRef::claude();
-        record.info.native_session_id = Some("native-before-restart".to_owned());
-        let recovery = record.recovery.as_mut().expect("recovery binding");
-        recovery.agent = "deleted-profile".to_owned();
-        recovery.agent_base = RuntimeRef::claude();
-        recovery.native_session_id = Some("native-before-restart".to_owned());
-        recovery.program = "/bin/sh".to_owned();
-        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
-        Store::new(store_path.clone())
-            .record_session(&record)
-            .expect("persist deleted-profile session");
-
-        let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            store_path: Some(store_path),
-            worker_runtime_root: Some(root.join("runtime")),
-            ..SessionRegistryConfig::default()
-        });
-        Box::pin(registry.reconcile_workers())
-            .await
-            .expect("rehydrate session without its profile");
-
-        let error = registry
-            .fork(SessionForkParams {
-                session_id: SessionId("s-identity".to_owned()),
-                name: None,
-                cwd_mode: ForkCwdMode::Same,
-                cols: 80,
-                rows: 24,
-                accept_profile_change: false,
-            })
-            .await
-            .expect_err("frozen fork disable survives profile deletion and restart");
-        assert_eq!(error.code, "agent_fork_unsupported");
-        assert_eq!(registry.list().await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn legacy_record_without_fork_fields_stays_fail_closed_after_restart() {
+    async fn legacy_record_without_capabilities_stays_fail_closed_after_restart() {
         let root = temp_root();
         let store_path = root.join("data/metadata.jsonl");
         let mut record = identity_record();
@@ -11798,7 +11728,7 @@ while os.getppid() == parent:
         recovery.agent_base = RuntimeRef::claude();
         recovery.native_session_id = Some("legacy-native".to_owned());
         recovery.program = "claude".to_owned();
-        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
+        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id));
         Store::new(store_path.clone())
             .record_session(&record)
             .expect("persist pre-migration record shape");
@@ -11841,19 +11771,6 @@ while os.getppid() == parent:
             .await
             .expect_err("legacy session capabilities must not infer current resume support");
         assert_eq!(resume_error.code, "agent_not_resumable");
-
-        let error = registry
-            .fork(SessionForkParams {
-                session_id: SessionId("s-identity".to_owned()),
-                name: None,
-                cwd_mode: ForkCwdMode::Same,
-                cols: 80,
-                rows: 24,
-                accept_profile_change: false,
-            })
-            .await
-            .expect_err("legacy binding must not infer current Claude fork support");
-        assert_eq!(error.code, "agent_fork_unsupported");
         assert_eq!(registry.list().await.len(), 1);
     }
 
@@ -11912,10 +11829,7 @@ while os.getppid() == parent:
         let sessions = registry.list().await;
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
-        assert!(
-            session.capabilities.resume && session.capabilities.fork,
-            "{session:?}"
-        );
+        assert!(session.capabilities.resume, "{session:?}");
         assert!(session.warnings.is_empty(), "{:?}", session.warnings);
         assert_ne!(
             session.runtime.as_ref().map(|runtime| runtime.state),
@@ -11935,10 +11849,7 @@ while os.getppid() == parent:
         let sessions = registry.list().await;
         assert_eq!(sessions.len(), 1);
         let session = &sessions[0];
-        assert!(
-            session.capabilities.resume && session.capabilities.fork,
-            "{session:?}"
-        );
+        assert!(session.capabilities.resume, "{session:?}");
         assert!(session.warnings.is_empty(), "{:?}", session.warnings);
         assert_ne!(
             session.runtime.as_ref().map(|runtime| runtime.state),
@@ -12663,18 +12574,6 @@ handler = "codex-hook-v1"
 
         let resume = registry.resume(&id).await.expect_err("resume is refused");
         assert_eq!(resume.code, "runtime_not_installed");
-        let fork = registry
-            .fork(protocol::SessionForkParams {
-                session_id: id.clone(),
-                name: None,
-                cwd_mode: protocol::ForkCwdMode::default(),
-                cols: 80,
-                rows: 24,
-                accept_profile_change: false,
-            })
-            .await
-            .expect_err("fork is refused");
-        assert_eq!(fork.code, "runtime_not_installed");
         let input = registry
             .input(protocol::SessionInputParams {
                 session_id: id.clone(),
@@ -18988,7 +18887,8 @@ generation "$1"
                     .supervisor
                     .script_job(id.clone(), present(ServiceState::Unknown, None));
             }
-            let orphaned = |inventory: &protocol::RuntimeInventoryResult, id: &ServiceId| {
+            let orphaned = |inventory: &crate::session::RuntimeInventorySnapshot,
+                            id: &ServiceId| {
                 inventory.entries.iter().any(|entry| {
                     entry.runtime_slot == id.as_str()
                         && entry.status == RuntimeInventoryStatus::Orphaned
@@ -19079,7 +18979,8 @@ generation "$1"
             fixture
                 .supervisor
                 .script_retire_unavailable(unproven.clone());
-            let orphaned = |inventory: &protocol::RuntimeInventoryResult, id: &ServiceId| {
+            let orphaned = |inventory: &crate::session::RuntimeInventorySnapshot,
+                            id: &ServiceId| {
                 inventory.entries.iter().any(|entry| {
                     entry.runtime_slot == id.as_str()
                         && entry.status == RuntimeInventoryStatus::Orphaned
@@ -19171,7 +19072,8 @@ generation "$1"
             fixture
                 .supervisor
                 .script_job(unreadable.clone(), present(ServiceState::Failed, None));
-            let orphaned = |inventory: &protocol::RuntimeInventoryResult, id: &ServiceId| {
+            let orphaned = |inventory: &crate::session::RuntimeInventorySnapshot,
+                            id: &ServiceId| {
                 inventory.entries.iter().any(|entry| {
                     entry.runtime_slot == id.as_str()
                         && entry.status == RuntimeInventoryStatus::Orphaned
@@ -19256,7 +19158,7 @@ generation "$1"
                 Some(INITIALIZE),
                 supervisor,
             );
-            let orphaned = |inventory: &protocol::RuntimeInventoryResult| {
+            let orphaned = |inventory: &crate::session::RuntimeInventorySnapshot| {
                 inventory.entries.iter().any(|entry| {
                     entry.runtime_slot == stale.as_str()
                         && entry.status == RuntimeInventoryStatus::Orphaned
@@ -19917,7 +19819,6 @@ generation "$1"
                 crate::agent::NativeSessionLaunch::from_templates(
                     crate::agent::SessionRefKind::Id,
                     &["--session", "{reference}"],
-                    None,
                 )
                 .expect("resume template")
                 .with_assigned(crate::agent::AssignedReference::new(
@@ -20024,7 +19925,6 @@ generation "$1"
                 crate::agent::NativeSessionLaunch::from_templates(
                     crate::agent::SessionRefKind::Id,
                     &["--session", "{reference}"],
-                    None,
                 )
                 .expect("resume template")
                 .with_assigned(crate::agent::AssignedReference::new(

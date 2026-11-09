@@ -89,7 +89,7 @@ rule. The current state of each place is stated separately.
   completed upgrade, bound to the installed version, namespace and metadata
   store). It fails closed in both directions: a missing, mismatched, unknown or
   unreadable scope, scheme, schema or ledger means not accepted, and there are
-  no reader shims. A change to the digested facts needs a new scheme name.
+  no reader shims. A change to the digested facts needs a new scheme name; a value change that can only make an acceptance fail closed (the operator accepts once more) may keep the scheme.
 - **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
   from any older kept schema, because skipping releases is normal with
   `update-pohunek`. A persisted shape change requires a schema bump and a
@@ -98,14 +98,12 @@ rule. The current state of each place is stated separately.
 Every persisted record that cannot be migrated or adopted is logged at WARN,
 surfaced to the operator, and carries a recovery hint. A `metadata.jsonl` line
 no loader accepts stays in the file: every rewrite re-emits it unchanged after
-the parsed records. The supported recovery is `pohunek store rejected list` and
-`pohunek store rejected set-aside <content-hash>`, which move the line into the
-owner-private quarantine file `metadata.rejected.jsonl` next to the store with an
-audit record, under the store's write lock; a line that may belong to a live
-runtime needs `--accept-pin-loss`. Editing `metadata.jsonl` while the daemon runs
+the parsed records. The recovery is manual: stop the daemon,
+move the line, keeping its text, into the owner-private quarantine file
+`metadata.rejected.jsonl` next to the store, and start it (the runtime package
+recovery runbook has the steps). Editing `metadata.jsonl` while the daemon runs
 can be read half-written, and the next rewrite then drops every line after the
-cut; a daemon that predates the commands is recovered by stopping it, moving the
-line into a backup file and starting it. An unreadable line never shrinks a retention
+cut. An unreadable line never shrinks a retention
 gate's set: package gates judge every installed digest while a line that may pin
 a package cannot be read (`package.uninstall` is refused with
 `package_retention_uncertain`; listing, inspecting and doctor still work), and no
@@ -206,14 +204,11 @@ no snapshot guard:
 
 - `events.jsonl`: write-only journal, never read back; each line is a protocol
   `Event` whose enums fall under the protocol enum rule.
-- `session-idle-stop.json`: one optional integer (`default_after_secs`), no enum. The
-  record is unversioned and strict (`deny_unknown_fields`, a parse error stops the
-  daemon), so a new key needs a format version first.
 - assistant `snapshot.json`: regenerated at every launch in the per-launch runtime
   directory and only handed to the assistant session as prompt input; its `intent`
   string is not read back by any daemon or CLI code.
-- `metadata.rejected.jsonl`: write-only audit trail (`quarantine_schema`); `kind`
-  and `reason` are free text, and the daemon never interprets the file.
+- `metadata.rejected.jsonl`: the operator's quarantine file; the daemon never reads
+  or interprets it.
 
 `notifications.jsonl`, `policy.json` and any document not named here are not
 covered by these guards.
@@ -271,7 +266,7 @@ Hard constraints, decided on purpose — respect them in every change:
   `subscribe`) is still a public obligation: core keeps server-side contract
   tests for it, listed in `docs/public-api.md` ("External clients"). Core adds
   no CLI command only to serve a UI.
-- **Plugins live outside core.** Every new runtime package or workflow plugin
+- **Plugins live outside core.** Every new runtime package
   starts outside `zajca/pohunek`: an official plugin in
   `pohunekd/plugin-<name>`, a third-party plugin in its author's account
   (`<owner>/pohunek-plugin-<name>`).

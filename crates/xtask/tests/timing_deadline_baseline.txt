@@ -18,7 +18,6 @@ crates/cli/tests/support/hermes_provider.rs 1
 crates/cli/tests/support/native.rs 2
 crates/cli/tests/support/release_bounded.rs 3
 crates/cli/tests/support/release_host.rs 1
-crates/cli/tests/support/workflow_units.rs 2
 crates/client/src/discovery.rs 1
 crates/client/src/transport.rs 6
 crates/client/tests/diagnose_overlays.rs 1
@@ -44,7 +43,7 @@ crates/daemon/src/session/profile_freeze_tests.rs 1
 crates/daemon/src/session/profile_pin_tests.rs 1
 crates/daemon/src/session/reconcile.rs 12
 crates/daemon/src/session/supervision.rs 1
-crates/daemon/src/session/tests.rs 197
+crates/daemon/src/session/tests.rs 192
 crates/daemon/src/session/tests/lifecycle_queue.rs 2
 crates/daemon/src/session/tests/native_recovery.rs 1
 crates/daemon/src/session/tests/native_supersede.rs 3
@@ -81,9 +80,9 @@ crates/platform/src/supervisor/launchd/registration.rs 1
 crates/platform/src/supervisor/mod.rs 3
 crates/platform/src/supervisor/systemd.rs 4
 crates/platform/src/supervisor/systemd/unit_file.rs 4
-crates/platform/tests/launchd.rs 14
+crates/platform/tests/launchd.rs 11
 crates/platform/tests/process_lineage.rs 1
-crates/platform/tests/systemd.rs 8
+crates/platform/tests/systemd.rs 6
 crates/relay-client/tests/https.rs 6
 crates/relay/src/admission/mod.rs 3
 crates/relay/src/auth/parent_integrity_tests.rs 2

@@ -45,8 +45,8 @@ use pohunek_worker_protocol::{
     ResponseKind,
 };
 use protocol::{
-    method, RuntimeInventoryStatus, RuntimeState, SessionId, SessionInputParams,
-    SessionResizeParams, SessionTurnEventKind, SessionWaitTurnParams, SessionWaitTurnReason,
+    method, RuntimeState, SessionId, SessionInputParams, SessionResizeParams, SessionTurnEventKind,
+    SessionWaitTurnParams, SessionWaitTurnReason,
 };
 use supervised::{
     backend, contains, counters, eventually, explained, loss_reason, read_until, runtime_state,
@@ -64,9 +64,6 @@ const IDENTITY_MISMATCH: &str = "runtime_identity_mismatch";
 
 /// Reason of a worker that speaks no compatible private protocol.
 const PROTOCOL_INCOMPATIBLE: &str = "worker_protocol_incompatible";
-
-/// Inventory reason of a live job whose generation no record names.
-const STALE_GENERATION: &str = "stale_worker_generation";
 
 /// How long a settled state must hold to rule out a delayed restart or kill.
 ///
@@ -641,11 +638,6 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
         "silent job was preserved"
     );
 
-    let contradictory = fixture.inventory().await.entries.into_iter().any(|entry| {
-        entry.runtime_slot == lost
-            && entry.status == RuntimeInventoryStatus::IdentityMismatch
-            && entry.reason.as_deref() == Some("worker_unavailable")
-    });
     let resumed = fixture
         .client()
         .await
@@ -659,10 +651,6 @@ async fn stale_refused_socket_without_job_recovers_but_silent_job_stays_conflict
     assert!(
         fixture.is_running(silent_process),
         "resume left the silent job alone"
-    );
-    assert!(
-        !contradictory,
-        "the inventory must not call a refused, jobless socket identity_mismatch/worker_unavailable"
     );
 }
 
@@ -835,15 +823,6 @@ async fn foreign_malformed_stale_and_incompatible_inputs_fail_closed() {
         assert!(labels.contains(&namespace.worker_label(&stale_running)));
         assert!(labels.contains(&malformed), "unowned definitions are kept");
     }
-    let inventory = fixture.inventory().await;
-    assert!(
-        inventory.entries.iter().any(|entry| {
-            entry.runtime_slot == stale_running.service_id().as_str()
-                && entry.status == RuntimeInventoryStatus::Orphaned
-                && entry.reason.as_deref() == Some(STALE_GENERATION)
-        }),
-        "the live stale job is reported, not killed: {inventory:?}"
-    );
     stays(
         "nothing but the ended stale job was touched",
         SETTLED,

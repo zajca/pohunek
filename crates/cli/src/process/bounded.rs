@@ -22,19 +22,13 @@
 //! - **Bounded output.** Each pipe is drained on its own thread to prevent a
 //!   pipe deadlock, but at most the caller's limit is retained; the rest is
 //!   discarded and reported as [`BoundedOutput::overflow`]. Collection shares
-//!   the child's deadline. [`spawn_capped_reader`] instead forwards a stream
-//!   to any [`Write`] sink (a terminal, a capture buffer, or a discarding
-//!   counter) and stops reading at the limit, so the caller's stop check can
-//!   end the run early; [`drain_capped`] collects it without counting time
-//!   the sink's consumer takes.
+//!   the child's deadline.
 
 // Rust guideline compliant 2026-10-13
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -102,32 +96,6 @@ pub(crate) struct Ended {
     pub(crate) status: ExitStatus,
     /// Why the group was stopped, or `None` when the child exited by itself.
     pub(crate) cut: Option<Cut>,
-}
-
-/// What one capped stream delivered, readable while its reader still runs.
-#[derive(Debug, Default)]
-pub(crate) struct Tally {
-    delivered: AtomicU64,
-    overflowed: AtomicBool,
-    /// Whether the reader is inside a sink write, waiting on the consumer.
-    writing: AtomicBool,
-}
-
-impl Tally {
-    /// Bytes handed to the sink so far; never more than the limit.
-    pub(crate) fn delivered(&self) -> u64 {
-        self.delivered.load(Ordering::Acquire)
-    }
-
-    /// Whether the stream produced more bytes than the limit.
-    pub(crate) fn overflowed(&self) -> bool {
-        self.overflowed.load(Ordering::Acquire)
-    }
-
-    /// Whether the reader is writing to its sink right now.
-    fn writing(&self) -> bool {
-        self.writing.load(Ordering::Acquire)
-    }
 }
 
 /// One drained output stream, truncated to the caller's byte limit.
@@ -549,108 +517,6 @@ fn receive_reader(
         Ok(output) => Ok(output),
         Err(RecvTimeoutError::Timeout) => Err(Error::Timeout),
         Err(RecvTimeoutError::Disconnected) => Err(Error::ReaderLost),
-    }
-}
-
-/// Forwards `reader` to `sink` on its own thread, at most `limit` bytes.
-///
-/// Every chunk is written and flushed as it arrives, so a terminal sink
-/// streams. When the stream passes `limit`, only the bytes up to the limit
-/// reach the sink, the [`Tally`] reports the overflow, and the reader stops
-/// and closes the pipe: a child that keeps writing gets `EPIPE` or
-/// `SIGPIPE`. A failing sink is handled the same way, like a closed pipe
-/// downstream of a shell pipeline. The receiver yields the sink at end of
-/// stream, or [`Error::Read`] when reading the pipe fails.
-pub(crate) fn spawn_capped_reader<W>(
-    mut reader: impl Read + Send + 'static,
-    mut sink: W,
-    limit: u64,
-) -> (Arc<Tally>, Receiver<Result<W, Error>>)
-where
-    W: Write + Send + 'static,
-{
-    let tally = Arc::new(Tally::default());
-    let shared = Arc::clone(&tally);
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let mut buffer = [0_u8; READ_CHUNK_BYTES];
-        let result = loop {
-            let count = match reader.read(&mut buffer) {
-                Ok(0) => break Ok(sink),
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => break Err(Error::Read(error)),
-            };
-            let room = limit.saturating_sub(shared.delivered());
-            let taken = usize::try_from(room).map_or(count, |room| room.min(count));
-            shared.writing.store(true, Ordering::Release);
-            let written = sink.write_all(&buffer[..taken]).and_then(|()| sink.flush());
-            shared.writing.store(false, Ordering::Release);
-            shared
-                .delivered
-                .fetch_add(u64::try_from(taken).unwrap_or(u64::MAX), Ordering::AcqRel);
-            if taken < count {
-                shared.overflowed.store(true, Ordering::Release);
-            }
-            if taken < count || written.is_err() {
-                break Ok(sink);
-            }
-        };
-        let _ = sender.send(result);
-    });
-    (tally, receiver)
-}
-
-/// How [`drain_capped`] ended.
-#[derive(Debug)]
-pub(crate) enum Drain<W> {
-    /// The stream ended; the reader handed back its sink.
-    Ended(W),
-    /// The stream stayed open for the idle budget; it is cut.
-    Idle,
-    /// The caller's stop check fired first.
-    Stopped,
-}
-
-/// Receives a capped reader's result once its stream ends.
-///
-/// Call it after the child's group is gone. Every poll interval in which the
-/// reader is not inside a sink write counts against `idle`, whether or not
-/// bytes arrived in it, so a process outside the group that keeps the pipe
-/// open, writing or not, is cut once the counted time reaches `idle`.
-/// Intervals the reader spends blocked writing to its sink are never counted:
-/// a consumer that applies backpressure (a pager, a slow pipe, a paused
-/// terminal) is waited for, and it never has more than the cap to take.
-/// `stop` is checked every interval and ends the wait at once.
-///
-/// # Errors
-///
-/// Returns [`Error::ReaderLost`] when the reader thread ended without a
-/// result, and the reader's own [`Error::Read`].
-pub(crate) fn drain_capped<W>(
-    receiver: &Receiver<Result<W, Error>>,
-    tally: &Tally,
-    idle: Duration,
-    stop: &mut dyn FnMut() -> bool,
-) -> Result<Drain<W>, Error> {
-    let mut counted = Duration::ZERO;
-    loop {
-        let polled = Instant::now();
-        match receiver.recv_timeout(PROCESS_POLL_INTERVAL) {
-            Ok(result) => return result.map(Drain::Ended),
-            Err(RecvTimeoutError::Disconnected) => return Err(Error::ReaderLost),
-            Err(RecvTimeoutError::Timeout) => {
-                if stop() {
-                    return Ok(Drain::Stopped);
-                }
-                if !tally.writing() {
-                    counted += polled.elapsed();
-                    if counted >= idle {
-                        return Ok(Drain::Idle);
-                    }
-                }
-            }
-        }
     }
 }
 

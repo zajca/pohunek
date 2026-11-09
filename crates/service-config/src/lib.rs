@@ -550,7 +550,7 @@ pub const DEFAULT_REGISTRY_SHUTDOWN: Duration = Duration::from_secs(5);
 pub const DEFAULT_CREATE_DRAIN: Duration = Duration::from_secs(10);
 
 /// Default `deadlines.driver_shutdown_ms`: how long daemon shutdown waits for
-/// the tasks that drive the registry from outside (idle-stop, retention,
+/// the tasks that drive the registry from outside (retention,
 /// notifications, agent-state hooks) to stop. All of them share this one bound.
 pub const DEFAULT_DRIVER_SHUTDOWN: Duration = Duration::from_secs(5);
 

@@ -10,35 +10,34 @@ use protocol::{
     BackgroundKind, BackgroundRevision, BackgroundStatus, ConceptDeprecation, ConceptIntent,
     ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
     DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
-    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin, ForkCwdMode,
-    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
-    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
-    IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
-    IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery,
-    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
-    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationPolicy,
-    NotificationPolicyParams, NotificationRecord, NotificationRetentionParams,
-    NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
-    OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault, PackageFindingKind,
-    PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PackageTrust, PrincipalId,
-    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
-    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
-    Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
+    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin, HostApprovalSignature,
+    HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
+    IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
+    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
+    IntegrationRecovery, IntegrationUninstallState, NotificationCreateParams,
+    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
+    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationPolicy, NotificationPolicyParams, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionPolicy, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdatedEvent,
+    ObservationParamsError, OutputOffset, OwnerRevision, PackageBindProfileParams,
+    PackageBindStatus, PackageFault, PackageFindingKind, PackageInstallStatus, PackageOrigin,
+    PackageSelectionBlockReason, PackageTrust, PrincipalId, ProcessStartIdentity, ProjectSource,
+    ProposalExpiry, ProposalId, ProposalNonce, ProtocolError, ProtocolVersion,
+    ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence, Request,
+    Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
     RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
     SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
-    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
+    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -1011,57 +1010,6 @@ fn session_new_params_roundtrips_with_initial_input() {
 }
 
 #[test]
-fn session_fork_params_json_shape_roundtrips() {
-    let params = SessionForkParams {
-        session_id: SessionId("s-42".to_owned()),
-        name: Some("forked review".to_owned()),
-        cwd_mode: ForkCwdMode::Same,
-        cols: 100,
-        rows: 30,
-        accept_profile_change: false,
-    };
-
-    let value = serde_json::to_value(&params).expect("serialize fork params");
-    assert_eq!(
-        value,
-        json!({
-            "session_id": "s-42",
-            "name": "forked review",
-            "cwd_mode": "same",
-            "cols": 100,
-            "rows": 30
-        })
-    );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
-}
-
-#[test]
-fn session_fork_params_carry_the_profile_override_only_when_set() {
-    let accepted: SessionForkParams = serde_json::from_value(json!({
-        "session_id": "s-42",
-        "cols": 100,
-        "rows": 30,
-        "accept_profile_change": true
-    }))
-    .expect("deserialize fork params with the override");
-    assert!(accepted.accept_profile_change);
-    assert_eq!(
-        serde_json::to_value(&accepted).expect("serialize")["accept_profile_change"],
-        json!(true)
-    );
-
-    let plain: SessionForkParams = serde_json::from_value(json!({
-        "session_id": "s-42",
-        "cols": 100,
-        "rows": 30
-    }))
-    .expect("deserialize fork params of an older client");
-    assert!(!plain.accept_profile_change);
-}
-
-#[test]
 fn session_resume_params_accept_the_bare_id_and_the_object_form() {
     let bare: SessionResumeParams = serde_json::from_value(json!("s-42")).expect("bare id");
     assert_eq!(bare.session_id(), &SessionId("s-42".to_owned()));
@@ -1105,43 +1053,6 @@ fn session_resume_params_reject_a_malformed_shape() {
             "{malformed}"
         );
     }
-}
-
-#[test]
-fn session_fork_params_default_to_same_cwd_mode() {
-    let params: SessionForkParams = serde_json::from_value(json!({
-        "session_id": "s-42",
-        "cols": 100,
-        "rows": 30
-    }))
-    .expect("deserialize fork params without cwd_mode");
-
-    assert_eq!(params.cwd_mode, ForkCwdMode::Same);
-}
-
-#[test]
-fn session_fork_result_flattens_session_info() {
-    let result = SessionForkResult {
-        session: SessionInfo {
-            id: SessionId("s-99".to_owned()),
-            ..running_shell_session(None)
-        },
-        applied_input: None,
-    };
-
-    let value = serde_json::to_value(&result).expect("serialize fork result");
-    assert_eq!(value["id"], "s-99");
-    assert!(
-        value.get("session").is_none(),
-        "fork result must flatten SessionInfo, not wrap it: {value}"
-    );
-    assert!(
-        value.get("applied_input").is_none(),
-        "absent applied_input must stay omitted: {value}"
-    );
-
-    let back = line_roundtrip(&result);
-    assert_eq!(back, result);
 }
 
 #[test]
@@ -3190,7 +3101,6 @@ fn native_identity_debug_redacts_sensitive_values() {
 #[test]
 fn m1_observation_errors_are_stable_and_payload_free() {
     let errors = [
-        ProtocolError::agent_fork_unsupported(),
         ProtocolError::agent_runtime_unsupported(),
         ProtocolError::session_input_rejected(),
         ProtocolError::session_agent_blocked(),
@@ -3577,7 +3487,6 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
         session_new_request_id_supported: true,
-        session_idle_stop_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
@@ -3615,7 +3524,6 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_input_ack_supported": true,
             "session_new_secret_env_supported": true,
             "session_new_request_id_supported": true,
-            "session_idle_stop_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true
         })
@@ -3704,10 +3612,6 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.session_new_request_id_supported,
         "a host that omits the request-id flag drops client_request_id"
-    );
-    assert!(
-        !caps.session_idle_stop_supported,
-        "a host that omits the idle-stop flag does not serve session.idle_stop"
     );
     assert!(
         !caps.package_install_commands_supported,

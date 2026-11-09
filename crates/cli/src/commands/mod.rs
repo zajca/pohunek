@@ -31,8 +31,6 @@ pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod setup;
 pub(crate) mod setup_host;
-pub(crate) mod store;
-pub(crate) mod workflow;
 
 /// Render a command result as the pretty-printed JSON document (with a trailing
 /// newline) emitted under `--json`.
@@ -63,7 +61,6 @@ pub(crate) fn render_json_with_v3_identity<T: Serialize + ?Sized>(
             method,
             method::SESSION_NEW
                 | method::SESSION_INSPECT
-                | method::SESSION_FORK
                 | method::SESSION_LIST
                 | method::SESSION_WAIT
                 | method::SESSION_RESUME
@@ -93,7 +90,7 @@ fn merge_v3_session_runtime(
                 }
             }
         }
-        method::SESSION_NEW | method::SESSION_INSPECT | method::SESSION_FORK => {
+        method::SESSION_NEW | method::SESSION_INSPECT => {
             merge_v3_runtime_id(current, legacy);
         }
         method::SESSION_WAIT

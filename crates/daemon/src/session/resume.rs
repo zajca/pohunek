@@ -3,11 +3,11 @@
 // Rust guideline compliant 2026-10-12
 
 use super::{
-    agent_fork_unsupported, agent_not_resumable, fork_pty_command_from_launch, host,
-    input_rules_for_definition, is_terminal, resume_pty_command_from_launch, runtime_error,
-    session_not_found, validate_session_name, warn, LaunchOpts, NativeSessionLaunch, Ordering,
-    PathBuf, ProtocolError, PtySessionSpec, ResumeBinding, SessionEntry, SessionForkParams,
-    SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
+    agent_not_resumable, host, input_rules_for_definition, is_terminal,
+    resume_pty_command_from_launch, runtime_error, session_not_found, warn, LaunchOpts,
+    NativeSessionLaunch, Ordering, PathBuf, ProtocolError, PtySessionSpec, ResumeBinding,
+    SessionEntry, SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry,
+    ValidatedLaunchProgram,
 };
 
 use std::ffi::OsString;
@@ -46,8 +46,8 @@ pub(super) struct ResumeSnapshot {
     pub(super) program: String,
     /// Launch args (the profile's `args`; empty for a bare base kind).
     pub(super) args: Vec<String>,
-    /// Resolved native-session launch spec; `None` ⇒ this session neither resumes
-    /// nor forks natively.
+    /// Resolved native-session launch spec; `None` ⇒ this session does not resume
+    /// natively.
     pub(super) native: Option<NativeSessionLaunch>,
     /// The runtime identity this launch shape was frozen with.
     pub(super) launch_binding: host::LaunchPin,
@@ -59,7 +59,7 @@ pub(super) struct ResumeSnapshot {
     pub(super) profile_revision: Option<ProfileRevision>,
     /// The directory and project the session was created with; the trusted
     /// checkout arguments are evaluated on this pair. Set once at create,
-    /// carried unchanged by every resume and copied by a fork.
+    /// carried unchanged by every resume.
     pub(super) launch_checkout: Option<Box<LaunchCheckout>>,
 }
 
@@ -90,7 +90,7 @@ impl ResumeSnapshot {
         }
     }
 
-    /// Return the native reference kind required by resume or fork.
+    /// Return the native reference kind required by resume.
     pub(super) fn native_ref_kind(&self) -> Option<SessionRefKind> {
         self.native
             .as_ref()
@@ -125,7 +125,7 @@ impl ProfileChange {
     }
 }
 
-/// The host profile a resume or fork relaunches under, resolved once.
+/// The host profile a resume relaunches under, resolved once.
 pub(super) struct RecoveryProfile {
     /// Profile `[env]`, secret-bearing.
     pub(super) env: LaunchEnv,
@@ -147,7 +147,7 @@ impl RecoveryProfile {
     }
 }
 
-/// Everything a resume or fork launches with, resolved once and consumed by
+/// Everything a resume launches with, resolved once and consumed by
 /// verification, launch and the relaunched snapshot.
 pub(super) struct RelaunchPlan {
     definition: Arc<RuntimeDefinition>,
@@ -238,7 +238,6 @@ impl SessionRegistry {
             &binding,
             &definition,
             ProfileChange::Refuse,
-            false,
             resolutions,
         ) else {
             return None;
@@ -329,7 +328,7 @@ impl SessionRegistry {
     }
 
     /// Adds verified native-reference last activity to public response copies,
-    /// and clears the resume and fork capabilities of each listed session whose
+    /// and clears the resume capabilities of each listed session whose
     /// recovery resolution refuses them, naming the refusal codes, so a
     /// response never advertises an operation that resolution refuses. Refusals
     /// that depend on the session's state or on one request are left to the
@@ -351,9 +350,7 @@ impl SessionRegistry {
             sessions
                 .iter()
                 .map(|info| {
-                    let recoverable = info.capabilities.resume
-                        || info.capabilities.fork
-                        || info.native_session_id.is_some();
+                    let recoverable = info.capabilities.resume || info.native_session_id.is_some();
                     recoverable
                         .then(|| entries.get(&info.id))
                         .flatten()
@@ -386,10 +383,6 @@ impl SessionRegistry {
                         resume: info
                             .capabilities
                             .resume
-                            .then(|| NATIVE_EVIDENCE_UNAVAILABLE.to_owned()),
-                        fork: info
-                            .capabilities
-                            .fork
                             .then(|| NATIVE_EVIDENCE_UNAVAILABLE.to_owned()),
                     };
                     info.capabilities.resume = false;
@@ -449,7 +442,7 @@ impl SessionRegistry {
                     return None;
                 }
                 entry.snapshot.native_ref_kind()?;
-                // Resume/fork recovery becomes actionable once the agent reports
+                // Resume recovery becomes actionable once the agent reports
                 // the native reference required by either frozen capability.
                 if entry.info.native_session_id.is_none()
                     && entry.info.native_session_path.is_none()
@@ -527,7 +520,7 @@ impl SessionRegistry {
         // Held from resolving the pin until the detached registration has
         // persisted the resumed record, so an adopting package cannot be
         // uninstalled in between: the built-in pin does not count as a
-        // reference to it. Taken before the lifecycle guard, as `fork` does.
+        // reference to it. Taken before the lifecycle guard.
         let package_authority = self.inner.packages.hold_launch().await;
         let guard = self.lock_lifecycle(id).await;
         let (binding, definition, registration, record) = {
@@ -604,7 +597,7 @@ impl SessionRegistry {
             .await?;
         #[cfg(test)]
         self.hold_definition().await;
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change, false)?;
+        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
 
         let info = match self
             .resume_binding_with_registration(
@@ -830,178 +823,6 @@ impl SessionRegistry {
         }
     }
 
-    /// Fork a native agent conversation into a new pohunek session.
-    ///
-    /// The fork launches under the source session's host profile only while
-    /// the profile still has the revision frozen into the source (see
-    /// [`ProfileChange`]); the fork freezes the revision it launched under.
-    /// A runtime whose assigned reference covers forks launches the fork under
-    /// a freshly generated reference, which the fork holds with provenance
-    /// `assigned` from its creation on, so the fork is resumable at once.
-    ///
-    /// # Errors
-    ///
-    /// Returns `agent_profile_changed` or
-    /// `agent_profile_missing` when the profile no longer matches the source,
-    /// `native_identity_evidence_unavailable` when the source's durable record
-    /// or exact worker generation cannot be read and matched,
-    /// `native_identity_uncertain` when the source's worker journal carries a
-    /// newer conversation switch the daemon cannot verify, so no fork child
-    /// launches from a source whose target the daemon cannot confirm,
-    /// `agent_native_reference_missing` when the source's conversation file is
-    /// absent or cannot be verified, `agent_native_store_relocated` when the
-    /// agent would keep its conversations outside the declared store,
-    /// and otherwise the source lookup, launch-template, or launch error.
-    pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
-        self.fork_spawned_by(params, None).await
-    }
-
-    /// [`Self::fork`] recording `spawned_by`, the origin of the forking
-    /// request, on the new session. The source session's own `spawned_by` is
-    /// never inherited: the fork is a distinct session created by this request.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::fork`].
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the fork transaction stays linear so every refusal precedes the registration"
-    )]
-    pub async fn fork_spawned_by(
-        &self,
-        params: SessionForkParams,
-        spawned_by: Option<protocol::SpawnedBy>,
-    ) -> Result<SessionInfo, ProtocolError> {
-        self.ensure_not_external(&params.session_id).await?;
-        // Held from resolving the pin until the detached registration has
-        // persisted the fork's record, so the pinned package cannot be
-        // uninstalled in between. A disabled package still forks.
-        let package_authority = self.inner.packages.hold_launch().await;
-        let (binding, repo, branch, worktree_path, record) =
-            self.fork_source(&params.session_id).await?;
-        let definition = self.binding_definition(&binding)?;
-
-        // Fork is fail-closed: only a spec frozen into the binding can fork, never
-        // the base kind's compiled spec.
-        let launch = frozen_fork_launch(&binding)?;
-        recovery_contract(&binding, &definition, true)?;
-        self.hook_recovery_journal_error(&record, &binding, &launch)
-            .await?;
-        #[cfg(test)]
-        self.hold_definition().await;
-        // A fork starts a new process of the runtime, so a runtime with a
-        // version probe is probed again before anything is allocated.
-        let change = ProfileChange::requested(params.accept_profile_change);
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change, true)?;
-        let relaunch_pin = host::relaunch_pin(&binding.launch_binding, &relaunch.definition);
-        let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
-        let id = Self::allocate_session_id();
-        self.ensure_worker_socket(&id)?;
-        let input_rules = self.recovery_input_rules(&binding, &relaunch.definition);
-
-        // Fork is fail-closed on a reference that no longer names a conversation.
-        verify_recovery_reference(&binding, &relaunch).await?;
-        #[cfg(test)]
-        self.hold_recovery(&id).await;
-        let RelaunchPlan {
-            launch,
-            session_ref,
-            program,
-            validated_program,
-            profile:
-                RecoveryProfile {
-                    env,
-                    manifest,
-                    revision,
-                },
-            ..
-        } = relaunch;
-        let name = validate_session_name(params.name.as_deref())?;
-        let trusted_args = self
-            .trusted_relaunch_args(&relaunch.definition, &binding)
-            .await;
-        let inputs = self.launch_inputs(
-            &relaunch.definition,
-            &env,
-            binding.agent_base.clone(),
-            &id,
-            LaunchSubject {
-                kind: LaunchKind::Fork,
-                frozen_args: &binding.args,
-                name: name.as_deref(),
-                trusted_args: &trusted_args,
-            },
-        )?;
-        let opts = LaunchOpts {
-            cwd: binding.cwd.clone(),
-            cols: params.cols,
-            rows: params.rows,
-            env_extra: inputs.env,
-            validated_program,
-        };
-        let (command, fork_reference) = fork_pty_command_from_launch(
-            &program,
-            command_args(&binding.args, &inputs.root_args, &relaunch.definition),
-            &launch,
-            &session_ref,
-            &opts,
-        )?;
-        // A fork reads the source reference but starts a distinct conversation.
-        // Its own target is the reference core assigned to it at launch, when
-        // the runtime assigns forks one, and otherwise only a verified report
-        // from the child process may set it.
-        let snapshot = ResumeSnapshot {
-            program,
-            args: binding.args.clone(),
-            native: Some(launch),
-            launch_binding: relaunch_pin,
-            reference_provenance: if fork_reference.is_some() {
-                NativeReferenceProvenance::Assigned
-            } else {
-                NativeReferenceProvenance::Reported
-            },
-            profile_revision: revision,
-            launch_checkout: binding.launch_checkout.clone(),
-        };
-        let guard = self.lock_lifecycle(&id).await;
-        let info = self
-            .register_pty_session(
-                PtySessionSpec {
-                    id,
-                    registration: super::target::PtyRegistration::Create,
-                    name,
-                    agent: binding.agent,
-                    agent_base: binding.agent_base.clone(),
-                    input_rules,
-                    snapshot,
-                    manifest_override: manifest,
-                    cwd: binding.cwd,
-                    cols: params.cols,
-                    rows: params.rows,
-                    command,
-                    native_session_id: fork_reference.map(|reference| reference.value().to_owned()),
-                    native_session_path: None,
-                    project_id: binding.project_id,
-                    is_linked_worktree: binding.is_linked_worktree,
-                    repo,
-                    branch,
-                    worktree_path,
-                    metadata: binding.metadata,
-                    spawned_by,
-                    create_request: None,
-                    warnings: outdated_hooks,
-                    reference_launch: None,
-                    initial_input_pending: false,
-                    prompt_in_argv: false,
-                    package_authority: Some(package_authority),
-                },
-                guard,
-            )
-            .await?;
-        self.persist_resume_binding(&info.id).await;
-        Ok(info)
-    }
-
     /// The base environment `host.inspect` assumes for launches.
     ///
     /// A registry whose base environment cannot be built cannot launch an
@@ -1063,13 +884,11 @@ impl SessionRegistry {
         binding: &ResumeBinding,
         definition: &Arc<RuntimeDefinition>,
         change: ProfileChange,
-        fork: bool,
     ) -> Result<RecoveryProfile, ProtocolError> {
         self.resolve_recovery_profile_memo(
             binding,
             definition,
             change,
-            fork,
             &mut PinResolutions::default(),
         )
     }
@@ -1081,7 +900,6 @@ impl SessionRegistry {
         binding: &ResumeBinding,
         definition: &Arc<RuntimeDefinition>,
         change: ProfileChange,
-        fork: bool,
         resolutions: &mut PinResolutions,
     ) -> Result<RecoveryProfile, ProtocolError> {
         recovery_profile_memo(
@@ -1089,7 +907,6 @@ impl SessionRegistry {
             binding,
             Some(definition),
             change,
-            fork,
             resolutions,
         )
     }
@@ -1108,7 +925,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Resolves everything a resume or fork of `binding` launches with, once:
+    /// Resolves everything a resume of `binding` launches with, once:
     /// the profile, the native reference, the program and the version probe.
     ///
     /// # Errors
@@ -1124,14 +941,12 @@ impl SessionRegistry {
         definition: Arc<RuntimeDefinition>,
         launch: NativeSessionLaunch,
         change: ProfileChange,
-        fork: bool,
     ) -> Result<RelaunchPlan, ProtocolError> {
-        let launch = host::relaunch_launch(&binding.launch_binding, &definition, launch);
         // Build the native reference from the field the frozen reference kind
         // names, so a `path`-kind spec applies the absolute-path guard and an
         // `id`-kind spec the leading-dash guard (the documented asymmetry).
         let session_ref = session_ref_from_binding(launch.reference_kind(), binding)?;
-        let profile = self.resolve_recovery_profile(binding, &definition, change, fork)?;
+        let profile = self.resolve_recovery_profile(binding, &definition, change)?;
         let base_environment = self.launch_base_environment()?;
         let program = binding_program(binding, &definition);
         let launch_path = self.probe_search_path(&definition, profile.env.as_slice())?;
@@ -1149,34 +964,6 @@ impl SessionRegistry {
             base_environment,
             profile,
         })
-    }
-
-    /// The resume binding and git context a fork of `id` launches from.
-    async fn fork_source(
-        &self,
-        id: &SessionId,
-    ) -> Result<
-        (
-            ResumeBinding,
-            Option<PathBuf>,
-            Option<String>,
-            Option<PathBuf>,
-            crate::store::SessionRecord,
-        ),
-        ProtocolError,
-    > {
-        let sessions = self.inner.sessions.lock().await;
-        let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-        if !entry.info.capabilities.fork {
-            return Err(agent_fork_unsupported());
-        }
-        Ok((
-            Self::resume_binding_from_entry(id, entry),
-            entry.info.repo.clone(),
-            entry.info.branch.clone(),
-            entry.info.worktree_path.clone(),
-            Self::session_record(id, entry, entry.desired_state, None),
-        ))
     }
 
     pub(super) fn resume_binding_from_entry(id: &SessionId, entry: &SessionEntry) -> ResumeBinding {
@@ -1234,7 +1021,7 @@ impl SessionRegistry {
         let definition = self.binding_definition(&binding)?;
         let launch = binding_native_launch(&binding, &definition)
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change, false)?;
+        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
         let id = SessionId(binding.session_id.clone());
         let guard = self.lock_lifecycle(&id).await;
         let registration = match self.load_durable_session_record(&id).await? {
@@ -1554,15 +1341,14 @@ pub(super) fn reference_existence(
     }
 }
 
-/// Clears the resume and fork capabilities of a listed session that the
+/// Clears the resume capability of a listed session that the
 /// recovery `definition` would refuse, and records the error code each
 /// refused operation returns in [`SessionInfo::capability_refusals`]. A
 /// capability is never set here.
 ///
-/// The checks follow [`SessionRegistry::resume_with`] and
-/// [`SessionRegistry::fork`] past their frozen capability gate: both resolve
-/// the definition first, then resume needs a native launch spec and fork the
-/// fork contract.
+/// The check follows [`SessionRegistry::resume_with`] past its frozen
+/// capability gate: it resolves the definition first, then needs a native
+/// launch spec.
 fn clear_refused_capabilities(
     info: &mut SessionInfo,
     binding: &ResumeBinding,
@@ -1574,15 +1360,10 @@ fn clear_refused_capabilities(
             .map(drop)
             .ok_or_else(|| agent_not_resumable(&binding.agent).code)
     });
-    let fork = info.capabilities.fork.then(|| {
-        let definition = definition.map_err(|error| error.code.clone())?;
-        recovery_contract(binding, definition, true).map_err(|error| error.code)
-    });
     info.capabilities.resume = matches!(resume, Some(Ok(())));
-    info.capabilities.fork = matches!(fork, Some(Ok(())));
+    info.capabilities.fork = false;
     let refusals = protocol::SessionCapabilityRefusals {
         resume: resume.and_then(Result::err),
-        fork: fork.and_then(Result::err),
     };
     info.capability_refusals = (!refusals.is_empty()).then_some(refusals);
 }
@@ -1604,7 +1385,6 @@ fn adopted_profile_matches_in(
     name: &str,
     definition: &RuntimeDefinition,
     frozen: &ProfileRevision,
-    fork: bool,
     resolutions: &mut PinResolutions,
 ) -> Result<bool, ProtocolError> {
     let built_in = host::adopts(&binding.launch_binding, definition);
@@ -1619,7 +1399,7 @@ fn adopted_profile_matches_in(
             resolutions,
         );
     }
-    if recovery_contract(binding, definition, fork).is_err() {
+    if recovery_contract(binding, definition).is_err() {
         return Ok(false);
     }
     let (
@@ -1728,7 +1508,7 @@ fn repinned_profile_matches_in(
 }
 
 /// Resolves the host profile `binding` was launched from and checks it against
-/// the revision frozen into the binding, as a resume or a fork of `binding`
+/// the revision frozen into the binding, as a resume of `binding`
 /// does. Resume and the upgrade preflight both run this one check.
 ///
 /// `definition` is the [`recovery_definition`] the operation resolved; the
@@ -1750,14 +1530,12 @@ pub(super) fn recovery_profile_in(
     binding: &ResumeBinding,
     definition: Option<&Arc<RuntimeDefinition>>,
     change: ProfileChange,
-    fork: bool,
 ) -> Result<RecoveryProfile, ProtocolError> {
     recovery_profile_memo(
         profiles,
         binding,
         definition,
         change,
-        fork,
         &mut PinResolutions::default(),
     )
 }
@@ -1768,7 +1546,6 @@ pub(super) fn recovery_profile_memo(
     binding: &ResumeBinding,
     definition: Option<&Arc<RuntimeDefinition>>,
     change: ProfileChange,
-    fork: bool,
     resolutions: &mut PinResolutions,
 ) -> Result<RecoveryProfile, ProtocolError> {
     let frozen = binding.profile_revision.as_ref();
@@ -1810,7 +1587,6 @@ pub(super) fn recovery_profile_memo(
                     &resolved.name,
                     &resolved.definition,
                     frozen,
-                    fork,
                     resolutions,
                 )?
         }
@@ -1848,7 +1624,7 @@ pub(super) fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefin
 /// launch.
 ///
 /// A newer version adopts the session only when it honors everything the
-/// frozen launch supports (resume, and fork when the frozen spec forks), and,
+/// frozen launch supports (resume), and,
 /// for a session launched from a host profile, only when that profile now pins
 /// the newer version: a profile still pinned to the frozen digest keeps the
 /// session on it. Otherwise the session resolves its exact digest, as it would
@@ -1966,25 +1742,19 @@ pub(super) fn recovery_definition_memo(
         }
     }
     let definition = resolutions.pinned(runtimes, binding)?;
-    recovery_contract(binding, &definition, false)?;
+    recovery_contract(binding, &definition)?;
     Ok(definition)
 }
 
 /// Whether the newer package version `adopter` may serve `binding`'s relaunch:
-/// it honors the frozen resume, and the frozen fork when there is one, and a
+/// it honors the frozen resume, and a
 /// host profile the session was launched from pins `adopter`.
 fn newer_adoption_holds(
     profiles: &ProfileRegistry,
     binding: &ResumeBinding,
     adopter: &RuntimeDefinition,
 ) -> bool {
-    let forks = binding
-        .native_launch
-        .as_ref()
-        .is_some_and(NativeSessionLaunch::supports_fork);
-    if recovery_contract(binding, adopter, false).is_err()
-        || (forks && recovery_contract(binding, adopter, true).is_err())
-    {
+    if recovery_contract(binding, adopter).is_err() {
         return false;
     }
     let BindingProvenance::Package {
@@ -2014,42 +1784,19 @@ fn newer_adoption_holds(
     }
 }
 
-/// Checks that `definition` honors the launch `binding` froze for a resume,
-/// or for a fork when `fork` is set (see [`host::honors_frozen_launch`]).
-///
-/// A fork needs fork support in the frozen spec, which is the spec fork
-/// launches from, and in `definition`.
+/// Checks that `definition` honors the launch `binding` froze for a resume
+/// (see [`host::honors_frozen_launch`]).
 ///
 /// # Errors
 ///
-/// Returns `agent_fork_unsupported` for a fork the frozen spec does not
-/// support, and `runtime_served_by_package` for an adopted package that does
-/// not honor the frozen launch.
+/// Returns `runtime_served_by_package` for an adopted package that does not
+/// honor the frozen launch.
 pub(super) fn recovery_contract(
     binding: &ResumeBinding,
     definition: &RuntimeDefinition,
-    fork: bool,
 ) -> Result<(), ProtocolError> {
-    let frozen = if fork {
-        Some(frozen_fork_launch(binding)?)
-    } else {
-        binding_native_launch(binding, definition)
-    };
-    host::honors_frozen_launch(&binding.launch_binding, definition, frozen.as_ref(), fork)
-}
-
-/// The launch spec a fork of `binding` runs from: only a spec frozen into the
-/// binding can fork, never the base kind's compiled spec.
-///
-/// # Errors
-///
-/// Returns `agent_fork_unsupported` when the frozen spec does not fork.
-fn frozen_fork_launch(binding: &ResumeBinding) -> Result<NativeSessionLaunch, ProtocolError> {
-    binding
-        .native_launch
-        .clone()
-        .filter(NativeSessionLaunch::supports_fork)
-        .ok_or_else(agent_fork_unsupported)
+    let frozen = binding_native_launch(binding, definition);
+    host::honors_frozen_launch(&binding.launch_binding, definition, frozen.as_ref())
 }
 
 /// Return the native-session launch spec frozen into a persisted binding.

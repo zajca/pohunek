@@ -73,15 +73,6 @@ fn argv(binding: &ResumeBinding, id: &str) -> Vec<String> {
         .expect("resume argv")
 }
 
-fn fork_argv(binding: &ResumeBinding, id: &str) -> Option<Vec<String>> {
-    binding.native_launch.as_ref().and_then(|launch| {
-        launch
-            .fork_argv(&SessionRef::id(id).expect("id reference"))
-            .ok()
-            .map(|fork| fork.argv)
-    })
-}
-
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -127,15 +118,11 @@ fn the_v0_33_0_fixture_binding_maps_to_a_native_launch() {
     let bindings = store.load_resume().expect("load resume");
     assert_eq!(bindings.len(), 1);
     let binding = &bindings[0];
-    assert!(binding.resumable() && binding.forkable());
+    assert!(binding.resumable());
     assert_eq!(
         argv(binding, "native-fixture-1"),
         strings(&["resume", "native-fixture-1"]),
         "the fixture froze the subcommand resume mode"
-    );
-    assert_eq!(
-        fork_argv(binding, "native-fixture-1"),
-        Some(strings(&["--resume", "native-fixture-1", "--fork-session"])),
     );
 
     let sessions = store.load_sessions().expect("load sessions");
@@ -148,7 +135,6 @@ fn the_v0_33_0_fixture_binding_maps_to_a_native_launch() {
         sessions[0].info.capabilities,
         SessionCapabilities {
             resume: true,
-            fork: true,
             ..Default::default()
         },
         "the frozen capabilities follow the mapped launch spec"
@@ -166,7 +152,6 @@ fn legacy_modes_of_every_built_in_agent_keep_their_argv() {
                    "fork_mode": "claude_session", "fork_resume_mode": "flag",
                    "fork_ref_kind": "id", "forkable": true}),
             vec!["--resume", "native-legacy"],
-            Some(vec!["--resume", "native-legacy", "--fork-session"]),
         ),
         (
             "codex",
@@ -174,7 +159,6 @@ fn legacy_modes_of_every_built_in_agent_keep_their_argv() {
             vec![],
             json!({"resume_mode": "subcommand", "ref_kind": "id", "resumable": true}),
             vec!["resume", "native-legacy"],
-            None,
         ),
         (
             "hermes",
@@ -182,10 +166,9 @@ fn legacy_modes_of_every_built_in_agent_keep_their_argv() {
             vec!["chat"],
             json!({"resume_mode": "flag", "ref_kind": "id", "resumable": true}),
             vec!["--resume", "native-legacy"],
-            None,
         ),
     ];
-    for (agent, program, args, legacy, resume, fork) in cases {
+    for (agent, program, args, legacy, resume) in cases {
         let line = legacy_resume_line(agent, program, &args, &legacy);
         let (store, path) = migrated(&format!("argv-{agent}"), &line);
 
@@ -194,11 +177,6 @@ fn legacy_modes_of_every_built_in_agent_keep_their_argv() {
         assert_eq!(
             argv(&bindings[0], "native-legacy"),
             strings(&resume),
-            "{agent}"
-        );
-        assert_eq!(
-            fork_argv(&bindings[0], "native-legacy"),
-            fork.map(|fork| strings(&fork)),
             "{agent}"
         );
     }
@@ -246,7 +224,7 @@ fn a_legacy_binding_frozen_as_not_resumable_stays_not_resumable() {
 }
 
 #[test]
-fn a_legacy_fork_that_cannot_be_expressed_is_dropped_and_resume_is_kept() {
+fn a_legacy_fork_with_a_mismatched_reference_kind_is_ignored_and_resume_is_kept() {
     let mismatched_reference_kind = json!({
         "resume_mode": "flag", "ref_kind": "id", "resumable": true,
         "fork_mode": "claude_session", "fork_resume_mode": "flag",
@@ -257,10 +235,6 @@ fn a_legacy_fork_that_cannot_be_expressed_is_dropped_and_resume_is_kept() {
 
     let binding = &store.load_resume().expect("load")[0];
     assert!(binding.resumable());
-    assert!(
-        !binding.forkable(),
-        "fork fails closed when it cannot be mapped"
-    );
 }
 
 #[test]
@@ -308,11 +282,6 @@ fn the_v0_33_1_damaged_fixture_binding_is_repaired_for_a_built_in_agent() {
         argv(binding, "native-fixture-1"),
         strings(&["--resume", "native-fixture-1"])
     );
-    assert_eq!(
-        fork_argv(binding, "native-fixture-1"),
-        Some(strings(&["--resume", "native-fixture-1", "--fork-session"])),
-        "fork is restored where the v0.33.1 claude spec supports it"
-    );
 
     let sessions = store.load_sessions().expect("load sessions");
     let recovery = sessions[0].recovery.as_ref().expect("recovery");
@@ -321,7 +290,6 @@ fn the_v0_33_1_damaged_fixture_binding_is_repaired_for_a_built_in_agent() {
         sessions[0].info.capabilities,
         SessionCapabilities {
             resume: true,
-            fork: true,
             ..Default::default()
         }
     );
@@ -342,9 +310,8 @@ fn damaged_store_of(agent: &str) -> String {
 }
 
 #[test]
-fn damaged_codex_and_hermes_bindings_are_repaired_without_fork() {
-    // The resume arguments of `codex.toml` and `hermes.toml` at tag v0.33.1;
-    // neither supported fork.
+fn damaged_codex_and_hermes_bindings_are_repaired_to_resume_only() {
+    // The resume arguments of `codex.toml` and `hermes.toml` at tag v0.33.1.
     for (agent, resume) in [
         ("codex", ["resume", "native-fixture-1"]),
         ("hermes", ["--resume", "native-fixture-1"]),
@@ -361,7 +328,6 @@ fn damaged_codex_and_hermes_bindings_are_repaired_without_fork() {
             strings(&resume),
             "{agent}"
         );
-        assert!(!binding.forkable(), "{agent}");
         let sessions = store.load_sessions().expect("load sessions");
         assert_eq!(
             sessions[0].info.capabilities,

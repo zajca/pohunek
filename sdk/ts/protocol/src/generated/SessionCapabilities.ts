@@ -3,7 +3,7 @@
 /**
  * Mutation capabilities frozen for one logical session.
  *
- * Clients use these flags to render resume and fork actions without inferring
+ * Clients use these flags to render the resume action without inferring
  * provider behavior from [`SessionInfo::agent`] or [`SessionInfo::agent_base`].
  * A daemon loading a record that predates this field defaults both flags to
  * false, preserving the fail-closed persistence contract.
@@ -14,7 +14,8 @@ export type SessionCapabilities = {
    */
   resume: boolean;
   /**
-   * Whether the session has a frozen native fork operation.
+   * Always `false`: sessions cannot be forked. The field stays for
+   * clients of earlier releases.
    */
   fork: boolean;
 };

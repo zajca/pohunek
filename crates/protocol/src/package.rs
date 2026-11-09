@@ -172,7 +172,7 @@ pub struct PackageInfo {
 /// installation.
 ///
 /// The program, the fixed arguments and every argument template the daemon can
-/// add to a launch (reference passing, resume, fork, the first prompt) are
+/// add to a launch (reference passing, resume, the first prompt) are
 /// exactly what it will run as the owner, so the owner can review all of them
 /// before consenting to an install. The descriptor carries no environment
 /// values, setup commands or hooks.
@@ -199,17 +199,6 @@ pub struct PackageRuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub resume_args: Option<Vec<String>>,
-    /// Arguments of a native fork, with `{reference}` for the reference.
-    /// Absent when the runtime cannot fork.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub fork_args: Option<Vec<String>>,
-    /// Arguments core appends after `fork_args` to pass the forked
-    /// conversation's own generated reference; `{reference}` marks where that
-    /// reference goes. Absent when a fork gets no assigned reference.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub fork_launch_args: Option<Vec<String>>,
     /// Whether the first prompt of a session is appended to the launch
     /// arguments instead of being typed into the terminal.
     pub prompt_argument: bool,
@@ -220,7 +209,8 @@ pub struct PackageRuntimeInfo {
     pub version_probe: Option<String>,
     /// Whether the runtime supports native resume.
     pub resumable: bool,
-    /// Whether the runtime supports native fork.
+    /// Always `false`: runtimes cannot fork. The field stays for clients of
+    /// earlier releases, which require it.
     pub forkable: bool,
     /// The core-owned integration handler the runtime names, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -438,8 +438,7 @@ and is reported by the host (package-pinned sessions are then incompatible).
 - A session pinned to a package is observed (detection rules, input framing,
   profile recovery) and controlled from that pinned definition, also after the
   package is disabled or another version is selected, and an active agent that
-  is the session's own runtime is covered by the same pin. Fork holds the shared
-  authority until its registration persisted. The uninstall transaction runs in
+  is the session's own runtime is covered by the same pin. The uninstall transaction runs in
   a task of its own, so a caller that stops waiting cannot release the exclusive
   authority mid-removal. The retained-set scan of the durable store is strict: a
   record that cannot be interpreted may pin a package: the uninstall is
@@ -485,7 +484,7 @@ and is reported by the host (package-pinned sessions are then incompatible).
   official package of the same package identity that serves the alias, when the
   session's pin names that package id (the version may differ). That package
   adopts the session, live or stopped: its callbacks, detector and input rules
-  apply, and resume and fork run through it when the session's recovery contract
+  apply, and resume runs through it when the session's recovery contract
   is honored. A session whose contract is not honored is refused with
   `runtime_served_by_package` (hint: a new session with `pohunek session new
   --agent <alias>`; no rebind). The upgrade preflight reports a session the package

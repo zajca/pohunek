@@ -462,44 +462,6 @@ pub fn is_valid_client_request_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
-/// Working-directory policy for `session.fork`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "ForkCwdMode.ts"))]
-#[serde(rename_all = "snake_case")]
-pub enum ForkCwdMode {
-    /// Launch the fork in the source session's current worktree or directory.
-    #[default]
-    Same,
-}
-
-/// Parameters for `session.fork`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "SessionForkParams.ts"))]
-pub struct SessionForkParams {
-    /// Source session whose native agent conversation should be forked.
-    pub session_id: SessionId,
-    /// Owner-set display name for the forked session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub name: Option<String>,
-    /// Working-directory policy for the fork.
-    #[serde(default)]
-    pub cwd_mode: ForkCwdMode,
-    /// Initial terminal width in columns.
-    pub cols: u16,
-    /// Initial terminal height in rows.
-    pub rows: u16,
-    /// Fork under the source session's current host profile although the
-    /// profile changed since the session was launched, or never recorded a
-    /// revision. Accepted from the local owner only; the fork freezes the
-    /// current revision.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
-    pub accept_profile_change: bool,
-}
-
 /// Parameters for `session.resume`.
 ///
 /// A bare session id is the original shape and stays valid; the object form
@@ -2698,15 +2660,6 @@ pub struct RuntimeInventoryEntry {
     pub reason: Option<String>,
 }
 
-/// Result of `session.runtime_inventory`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "RuntimeInventoryResult.ts"))]
-pub struct RuntimeInventoryResult {
-    /// Authenticated endpoints and quarantined discovery failures.
-    pub entries: Vec<RuntimeInventoryEntry>,
-}
-
 /// Event payload emitted when discovery quarantines a worker endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -2869,7 +2822,7 @@ pub enum SessionWarningKind {
     /// enum stays `Copy` and serializes to the bare string `"hook"`).
     Hook,
     /// The session's stored native recovery record could not be completed
-    /// after an upgrade, so it cannot resume or fork natively. The session
+    /// after an upgrade, so it cannot resume natively. The session
     /// stays listed; start a new session and resume the native conversation
     /// from the reference in the warning's `detail`.
     NativeRecovery,
@@ -2917,7 +2870,7 @@ where
 
 /// Mutation capabilities frozen for one logical session.
 ///
-/// Clients use these flags to render resume and fork actions without inferring
+/// Clients use these flags to render the resume action without inferring
 /// provider behavior from [`SessionInfo::agent`] or [`SessionInfo::agent_base`].
 /// A daemon loading a record that predates this field defaults both flags to
 /// false, preserving the fail-closed persistence contract.
@@ -2927,7 +2880,8 @@ where
 pub struct SessionCapabilities {
     /// Whether the session has a frozen native resume operation.
     pub resume: bool,
-    /// Whether the session has a frozen native fork operation.
+    /// Always `false`: sessions cannot be forked. The field stays for
+    /// clients of earlier releases.
     pub fork: bool,
     /// Keys of a newer daemon this build does not know; refused outside
     /// `protocol::tolerant`.
@@ -2939,7 +2893,7 @@ pub struct SessionCapabilities {
 /// Typed reasons the session's recovery resolution refuses an operation its
 /// frozen [`SessionCapabilities`] allow.
 ///
-/// Each code is the error code `session.resume` or `session.fork` returns for
+/// Each code is the error code `session.resume` returns for
 /// that resolution, derived from the same check that clears the matching
 /// capability in a list or inspect response. Refusals that depend on the
 /// session's current state or on one request are not listed. Unlike the capability
@@ -2953,18 +2907,13 @@ pub struct SessionCapabilityRefusals {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub resume: Option<String>,
-    /// Error code `session.fork` refuses with when the recovery resolution
-    /// refuses it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub fork: Option<String>,
 }
 
 impl SessionCapabilityRefusals {
     /// Whether no operation is refused.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.resume.is_none() && self.fork.is_none()
+        self.resume.is_none()
     }
 }
 
@@ -3006,7 +2955,7 @@ pub struct SessionPlacementProcess {
 /// The origin pair of the request that created a session.
 ///
 /// The daemon copies the pair from the request envelope when it handles
-/// `session.new` or `session.fork`; a client cannot supply it as a parameter.
+/// `session.new`; a client cannot supply it as a parameter.
 /// The record is attribution, not a security boundary: a process of the same
 /// user can omit the origin variables, and then nothing is recorded. The pair
 /// is kept as received and is never resolved against the sessions of this
@@ -3451,20 +3400,6 @@ pub struct SessionNewResult {
     pub replayed: Option<bool>,
 }
 
-/// Result returned by `session.fork`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "SessionForkResult.ts"))]
-pub struct SessionForkResult {
-    /// The freshly forked session.
-    #[serde(flatten)]
-    pub session: SessionInfo,
-    /// Reserved for parity with session-creation flows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "ts", ts(optional))]
-    pub applied_input: Option<bool>,
-}
-
 /// Result returned by `session.stop`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3791,25 +3726,6 @@ pub struct SessionRetentionResult {
     pub failed: u32,
     /// Per-session detail for every matched session, held ones included.
     pub sessions: Vec<SessionRetentionCandidate>,
-}
-
-/// Parameters for `session.policy.set`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyParams.ts"))]
-#[serde(deny_unknown_fields)]
-pub struct SessionPolicyParams {
-    /// Replacement session retention policy.
-    pub retention: SessionRetentionPolicy,
-}
-
-/// Result returned by `session.policy.get` and `session.policy.set`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "SessionPolicyResult.ts"))]
-pub struct SessionPolicyResult {
-    /// Current session retention policy.
-    pub retention: SessionRetentionPolicy,
 }
 
 /// Result returned by `session.resize`.

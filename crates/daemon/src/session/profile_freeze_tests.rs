@@ -1,5 +1,5 @@
-//! Tests of the host-profile revision frozen into a session: resume and fork
-//! relaunch under the profile only while its revision matches, and an owner
+//! Tests of the host-profile revision frozen into a session: resume
+//! relaunches under the profile only while its revision matches, and an owner
 //! decision relaunches under the current profile and freezes its revision.
 //!
 //! Every test drives real session registries over a real agent script. The
@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pohunek_test_support::wait::HANG_GUARD;
-use protocol::{
-    method, ForkCwdMode, ProtocolError, Request, SessionForkParams, SessionId, SessionNewParams,
-};
+use protocol::{method, ProtocolError, Request, SessionId, SessionNewParams};
 
 use super::tests::{
     append_launch_record, complete_lines, durable_recovery, hermetic_shell, hook_gate, params,
@@ -212,18 +210,7 @@ fn current_revision(registry: &SessionRegistry) -> ProfileRevision {
         .expect("a profile has a revision")
 }
 
-fn fork_params(id: &SessionId, accept_profile_change: bool) -> SessionForkParams {
-    SessionForkParams {
-        session_id: id.clone(),
-        name: None,
-        cwd_mode: ForkCwdMode::Same,
-        cols: 80,
-        rows: 24,
-        accept_profile_change,
-    }
-}
-
-/// Arms `registry` to park its next resume or fork after the profile resolved.
+/// Arms `registry` to park its next resume after the profile resolved.
 fn hold_recovery(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
     let gate = crate::runtime::lifecycle::tests::StartGate {
         session_id: None,
@@ -527,78 +514,6 @@ async fn an_unavailable_revision_key_fails_closed_for_profile_sessions_only() {
 }
 
 #[tokio::test]
-async fn fork_of_an_unchanged_profile_freezes_the_same_revision() {
-    let frozen = Frozen::new("fork-same");
-    let registry = frozen.registry();
-    let id = frozen.created_and_settled(registry).await;
-    let revision = frozen.frozen_revision(&id);
-
-    let restarted = frozen.restarted().await;
-    let forked = restarted.fork(fork_params(&id, false)).await.expect("fork");
-
-    assert_eq!(
-        frozen.wait_for_launches(2).await,
-        [SECRET_MARK, SECRET_MARK]
-    );
-    assert_eq!(frozen.frozen_revision(&forked.id), revision);
-    restarted.stop(&forked.id).await.expect("stop the session");
-}
-
-#[tokio::test]
-async fn fork_of_an_edited_or_deleted_profile_is_refused_and_the_override_forks_under_the_current_one(
-) {
-    let frozen = Frozen::new("fork-edit");
-    let registry = frozen.registry();
-    let id = frozen.created_and_settled(registry).await;
-
-    frozen.write_profile("second-account");
-    let restarted = frozen.restarted().await;
-    let refused = restarted
-        .fork(fork_params(&id, false))
-        .await
-        .expect_err("an edited profile is not forked under silently");
-    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
-    assert_eq!(launch_count(&frozen.marker), 1);
-    assert_eq!(
-        restarted.list().await.len(),
-        1,
-        "a refused fork registers no session"
-    );
-
-    let forked = restarted
-        .fork(fork_params(&id, true))
-        .await
-        .expect("the owner accepts the edited profile");
-    assert_eq!(
-        frozen.wait_for_launches(2).await,
-        [SECRET_MARK, "second-account"]
-    );
-    assert_eq!(
-        frozen.frozen_revision(&forked.id),
-        Some(current_revision(&restarted)),
-        "the fork freezes the revision it launched under"
-    );
-    assert_ne!(
-        frozen.frozen_revision(&forked.id),
-        frozen.frozen_revision(&id),
-        "the source keeps its own revision"
-    );
-    restarted.stop(&forked.id).await.expect("stop the session");
-
-    frozen.delete_profile();
-    for accept in [false, true] {
-        let missing = restarted
-            .fork(fork_params(&id, accept))
-            .await
-            .expect_err("a deleted profile cannot be forked under");
-        assert_eq!(
-            missing.code, "agent_profile_missing",
-            "accept={accept} {missing:?}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn resume_resolves_the_profile_once_so_an_edit_during_the_operation_cannot_launch() {
     let frozen = Frozen::new("resume-once");
     let registry = frozen.registry();
@@ -637,38 +552,6 @@ async fn resume_resolves_the_profile_once_so_an_edit_during_the_operation_cannot
     assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
 }
 
-#[tokio::test]
-async fn fork_resolves_the_profile_once_so_an_edit_during_the_operation_cannot_launch() {
-    let frozen = Frozen::new("fork-once");
-    let registry = frozen.registry();
-    let id = frozen.created_and_settled(registry).await;
-    let restarted = frozen.restarted().await;
-
-    let gate = hold_recovery(&restarted);
-    let task = tokio::spawn({
-        let registry = restarted.clone();
-        let id = id.clone();
-        async move { registry.fork(fork_params(&id, false)).await }
-    });
-    gate.entered.notified().await;
-    frozen.write_profile("edited-in-flight");
-    gate.release.notify_one();
-    let forked = task
-        .await
-        .expect("fork task")
-        .expect("the resolved profile is what launches");
-
-    assert_eq!(
-        frozen.wait_for_launches(2).await,
-        [SECRET_MARK, SECRET_MARK]
-    );
-    assert_eq!(
-        frozen.frozen_revision(&forked.id),
-        frozen.frozen_revision(&id)
-    );
-    restarted.stop(&forked.id).await.expect("stop the session");
-}
-
 fn daemon_state(registry: &SessionRegistry, transport: ControlTransport) -> DaemonState {
     DaemonState::new(
         HealthInfo::new("test"),
@@ -694,10 +577,6 @@ fn resume_with_override(id: &SessionId) -> serde_json::Value {
     serde_json::json!({"session_id": id, "accept_profile_change": true})
 }
 
-fn fork_with_override(id: &SessionId) -> serde_json::Value {
-    serde_json::json!({"session_id": id, "cols": 80, "rows": 24, "accept_profile_change": true})
-}
-
 #[tokio::test]
 async fn a_remote_connection_cannot_accept_a_changed_profile() {
     let frozen = Frozen::new("remote-override");
@@ -708,21 +587,16 @@ async fn a_remote_connection_cannot_accept_a_changed_profile() {
     let remote = daemon_state(&restarted, ControlTransport::Remote);
     let before = frozen.frozen_revision(&id);
 
-    for (name, params) in [
-        (method::SESSION_RESUME, resume_with_override(&id)),
-        (method::SESSION_FORK, fork_with_override(&id)),
-    ] {
-        let refused = call(&remote, name, params)
-            .await
-            .expect_err("a remote caller cannot hold the owner's decision");
-        assert_eq!(
-            refused.code, "agent_profile_change_local_only",
-            "{name} {refused:?}"
-        );
-    }
+    let refused = call(&remote, method::SESSION_RESUME, resume_with_override(&id))
+        .await
+        .expect_err("a remote caller cannot hold the owner's decision");
+    assert_eq!(
+        refused.code, "agent_profile_change_local_only",
+        "{refused:?}"
+    );
     assert_eq!(launch_count(&frozen.marker), 1, "nothing launched");
     assert_eq!(frozen.frozen_revision(&id), before);
-    assert_eq!(restarted.list().await.len(), 1, "no fork registered");
+    assert_eq!(restarted.list().await.len(), 1, "nothing registered");
 
     // Without the override a remote caller reaches the same typed refusal a
     // local one gets.
@@ -763,10 +637,6 @@ async fn a_local_connection_accepts_a_changed_profile_and_the_bare_id_shape_stil
         [SECRET_MARK, "second-account", "second-account"]
     );
 
-    let forked = call(&local, method::SESSION_FORK, fork_with_override(&id))
-        .await
-        .expect("a local fork with the override");
-    assert!(forked["id"].is_string(), "{forked}");
     restarted.stop(&id).await.expect("stop the session");
 }
 

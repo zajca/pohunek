@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use pohunek_test_support::wait::HANG_GUARD;
-use protocol::{ForkCwdMode, SessionForkParams, SessionId, SessionNewParams, SessionSecretEnv};
+use protocol::{SessionNewParams, SessionSecretEnv};
 
 use super::tests::{
     complete_lines, durable_recovery, hermetic_shell, hook_gate, params, temp_dir, temp_store_path,
@@ -266,7 +266,7 @@ async fn a_launch_leaving_a_declared_slot_unfilled_is_refused() {
 }
 
 #[tokio::test]
-async fn resume_and_fork_of_a_slot_profile_session_never_inherit_its_secrets() {
+async fn resume_of_a_slot_profile_session_never_inherits_its_secrets() {
     let slots = Slots::new("secret-env-relaunch");
     let registry = slots.registry();
     let created = registry
@@ -286,11 +286,6 @@ async fn resume_and_fork_of_a_slot_profile_session_never_inherit_its_secrets() {
         .await
         .expect_err("a relaunch cannot fill the slots");
     assert_refusal(&resumed, "secret_env_missing");
-    let forked = registry
-        .fork(fork_params(&created.id))
-        .await
-        .expect_err("a fork cannot fill the slots");
-    assert_refusal(&forked, "secret_env_missing");
 
     assert_eq!(slots.recorded().len(), launches, "nothing was relaunched");
     let store = fs::read_to_string(&slots.store_path).expect("read store");
@@ -304,17 +299,6 @@ async fn resume_and_fork_of_a_slot_profile_session_never_inherit_its_secrets() {
             .is_some(),
         "the session still froze its profile revision"
     );
-}
-
-fn fork_params(id: &SessionId) -> SessionForkParams {
-    SessionForkParams {
-        session_id: id.clone(),
-        name: None,
-        cwd_mode: ForkCwdMode::Same,
-        cols: 80,
-        rows: 24,
-        accept_profile_change: false,
-    }
 }
 
 #[tokio::test]

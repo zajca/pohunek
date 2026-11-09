@@ -693,23 +693,12 @@ fn runtime_info(definition: &RuntimeDefinition) -> PackageRuntimeInfo {
         resume_args: definition
             .native()
             .map(|native| template_tokens(native.resume_args())),
-        fork_args: definition
-            .native()
-            .and_then(NativeSessionLaunch::fork_args)
-            .map(template_tokens),
-        fork_launch_args: definition
-            .native()
-            .and_then(NativeSessionLaunch::assigned)
-            .filter(|assigned| assigned.assigns_fork())
-            .map(|assigned| template_tokens(assigned.launch_args())),
         prompt_argument: definition.prompt_arg(),
         version_probe: definition
             .version_probe_parser()
             .map(|parser| parser.as_str().to_owned()),
         resumable: definition.native().is_some(),
-        forkable: definition
-            .native()
-            .is_some_and(|native| native.fork_args().is_some()),
+        forkable: false,
         integration_handler: definition
             .integration_handler()
             .map(|handler| handler.as_str().to_owned()),

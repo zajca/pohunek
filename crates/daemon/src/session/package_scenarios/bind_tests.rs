@@ -580,14 +580,6 @@ fn hook_strategy(document: &str) -> String {
     )
 }
 
-/// A hook runtime that cannot fork.
-fn hook_without_fork(document: &str) -> String {
-    hook_strategy(document).replace(
-        "[fork]\nsupported = true\nargs = [\"--fork\", \"{reference}\"]",
-        "[fork]\nsupported = false",
-    )
-}
-
 const RESUME_OVERRIDE: &str =
     "\n[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n";
 
@@ -631,22 +623,6 @@ async fn a_resume_override_that_conflicts_with_an_assigned_target_is_refused() {
         .expect("already pinned to the hook version");
 
     expect_refused(&fixture, &path, &assigned).await;
-}
-
-#[tokio::test]
-async fn a_fork_override_is_refused_when_the_target_cannot_fork() {
-    let fixture = Fixture::new("bind-fork-removed");
-    let forking = capability_variant("1.0.0", |document| hook_strategy(&document));
-    let plain = capability_variant("2.0.0", |document| hook_without_fork(&document));
-    install(&fixture, &forking).await;
-    install_with(&fixture, &plain, true, false).await;
-    let override_with_fork = format!(
-        "{}{RESUME_OVERRIDE}fork_args = [\"--fork\", \"{{reference}}\"]\n",
-        pinned(&forking.digest)
-    );
-    let path = fixture.write_profile(PROFILE, &override_with_fork);
-
-    expect_refused(&fixture, &path, &plain).await;
 }
 
 #[tokio::test]

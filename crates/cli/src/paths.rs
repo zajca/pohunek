@@ -5,7 +5,7 @@
 //! daemon, a missing required base directory is a fail-fast error: no silent
 //! invented fallbacks (hard project rule).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use pohunek_client::OriginSource;
 use pohunek_paths::{PathEnv, Platform};
@@ -59,27 +59,6 @@ impl Paths {
                     .join(pohunek_paths::PLUGINS_SUBDIR)
             })
             .map_err(path_error)
-    }
-
-    /// Resolve the workflow plugin store directories without runtime paths.
-    ///
-    /// Workflow commands never reach the daemon, so they need neither
-    /// `XDG_RUNTIME_DIR` nor the control socket.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CliError::MissingEnv`] when neither the relevant XDG
-    /// variable nor `HOME` is available, and a workflow `DirsOverlap` error
-    /// when one of the three locations lies inside another: a purge of one
-    /// plugin's directory must never reach the store or another directory.
-    pub(crate) fn workflow_dirs() -> Result<WorkflowDirs, CliError> {
-        let state = pohunek_paths::state_home()
-            .map_err(path_error)?
-            .join(pohunek_paths::APP_DIR);
-        let config = pohunek_paths::config_home()
-            .map_err(path_error)?
-            .join(pohunek_paths::APP_DIR);
-        Ok(WorkflowDirs::new(&state, &config)?)
     }
 
     /// Resolve only the pohunek cache directory.
@@ -143,56 +122,6 @@ impl Paths {
             config_dir: base.config_dir,
             origin_source: OriginSource::Environment,
         })
-    }
-}
-
-/// The workflow plugin store: its registry root and the parents of the
-/// per-plugin state and config directories, each named by plugin id.
-#[derive(Debug, Clone)]
-pub(crate) struct WorkflowDirs {
-    /// `<state>/pohunek/workflow-plugins`, the package registry root.
-    pub(crate) root: PathBuf,
-    /// `<state>/pohunek/workflow-plugin-state`.
-    pub(crate) state: PathBuf,
-    /// `<config>/pohunek/workflow-plugin-config`.
-    pub(crate) config: PathBuf,
-    /// `<config>/pohunek/workflow.toml`, the owner's run limits.
-    pub(crate) knobs: PathBuf,
-}
-
-impl WorkflowDirs {
-    /// The workflow plugin store below pohunek's state directory `state` and
-    /// config directory `config`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a workflow `DirsOverlap` error when one of the three locations
-    /// lies inside another: a purge of one plugin's directory must never
-    /// reach the store or another directory.
-    pub(crate) fn new(state: &Path, config: &Path) -> Result<Self, crate::workflow::Error> {
-        let dirs = Self {
-            root: state.join(pohunek_paths::WORKFLOW_PLUGINS_SUBDIR),
-            state: state.join(pohunek_paths::WORKFLOW_PLUGIN_STATE_SUBDIR),
-            config: config.join(pohunek_paths::WORKFLOW_PLUGIN_CONFIG_SUBDIR),
-            knobs: config.join(crate::workflow::config::FILE_NAME),
-        };
-        let named = [
-            ("store", &dirs.root),
-            ("state", &dirs.state),
-            ("config", &dirs.config),
-        ];
-        for (index, (name, path)) in named.iter().enumerate() {
-            for (other, other_path) in &named[index + 1..] {
-                if path.starts_with(other_path) || other_path.starts_with(path) {
-                    return Err(crate::workflow::Error::DirsOverlap(format!(
-                        "the {name} directory {} and the {other} directory {}",
-                        path.display(),
-                        other_path.display()
-                    )));
-                }
-            }
-        }
-        Ok(dirs)
     }
 }
 

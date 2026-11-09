@@ -1044,7 +1044,7 @@ fn session_detection_does_not_claim_a_probe_state_for_an_unknown_release() {
 }
 
 #[test]
-fn detection_regions_and_inventory_status_from_a_newer_daemon_are_dropped_or_shown_unknown() {
+fn detection_regions_from_a_newer_daemon_are_dropped_or_shown_unknown() {
     let detection = run_against_scripted_daemon(
         &["session", "detection", "s-1", "--json"],
         results_daemon(vec![
@@ -1072,23 +1072,6 @@ fn detection_regions_and_inventory_status_from_a_newer_daemon_are_dropped_or_sho
     );
     assert_eq!(
         document["ok"]["previews"][0]["kind"], "unknown",
-        "{document}"
-    );
-
-    let inventory = run_against_scripted_daemon(
-        &["session", "runtime-inventory", "--json"],
-        single_result_daemon(
-            protocol::method::SESSION_RUNTIME_INVENTORY,
-            json!({"entries": [{
-                "runtime_slot": "slot-1",
-                "status": "a_status_from_a_newer_daemon",
-            }]}),
-        ),
-    );
-    assert_eq!(inventory.status.code(), Some(0), "{inventory:?}");
-    let document: Value = serde_json::from_slice(&inventory.stdout).expect("one JSON document");
-    assert_eq!(
-        document["ok"]["entries"][0]["status"], "unknown",
         "{document}"
     );
 }
@@ -1301,34 +1284,5 @@ fn a_notification_policy_set_sends_back_the_keys_of_a_newer_daemon() {
     assert_eq!(
         policy["retention"]["a_retention_key_from_a_newer_daemon"], 5,
         "{policy}"
-    );
-}
-
-#[test]
-fn a_session_policy_set_sends_back_the_retention_keys_of_a_newer_daemon() {
-    let mut current =
-        serde_json::to_value(protocol::SessionRetentionPolicy::default()).expect("policy JSON");
-    current["a_key_from_a_newer_daemon"] = json!("kept");
-    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-
-    let output = run_against_scripted_daemon(
-        &["session", "policy", "set", "--enabled"],
-        policy_round_trip_daemon(
-            protocol::method::SESSION_POLICY_GET,
-            protocol::method::SESSION_POLICY_SET,
-            "retention",
-            current,
-            std::sync::Arc::clone(&sent),
-        ),
-    );
-
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let sent = sent.lock().expect("recorded params");
-    assert_eq!(sent.len(), 1, "{sent:?}");
-    let retention = &sent[0]["retention"];
-    assert_eq!(retention["enabled"], true, "{retention}");
-    assert_eq!(
-        retention["a_key_from_a_newer_daemon"], "kept",
-        "{retention}"
     );
 }

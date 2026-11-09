@@ -7,7 +7,6 @@ use super::*;
 const LAUNCH: &str = "fixture-claude-launch";
 const CLEAR: &str = "fixture-claude-clear";
 const SELECTED: &str = "fixture-claude-selected";
-const FORKED: &str = "fixture-claude-forked";
 const SOURCE_SPAWNER_SESSION: &str = "s-source-spawner";
 const SOURCE_SPAWNER_DAEMON: &str = "d-source-spawner";
 
@@ -168,8 +167,8 @@ impl ClaudeRig {
         let mut control = connect(&socket).await;
         let mut params = session_params_in(cwd.to_path_buf());
         "claude-fixture".clone_into(&mut params.agent);
-        // The source session has a spawner of its own, so a fork that copied it
-        // would show.
+        // The session has a spawner of its own, so a recovery that copied another
+        // session's origin would show.
         let create = Request::make(
             "claude-fixture-new",
             method::SESSION_NEW,
@@ -1203,7 +1202,7 @@ async fn pi_package_store_relocation_is_refused_at_launch_and_followed_through_t
 }
 
 #[tokio::test]
-async fn pi_package_settings_written_after_launch_refuse_resume_and_fork() {
+async fn pi_package_settings_written_after_launch_refuse_resume() {
     let bin = temp_dir("pi-moved-bin");
     let state = temp_dir("pi-moved-state");
     let cwd = temp_dir("pi-moved-cwd");
@@ -1265,38 +1264,17 @@ async fn pi_package_settings_written_after_launch_refuse_resume_and_fork() {
         r#"{"sessionDir": "/elsewhere"}"#,
     )
     .expect("write project settings");
-    let forked = exchange(
-        &mut control,
-        &Request::make(
-            "pi-moved-fork",
-            method::SESSION_FORK,
-            serde_json::json!({
-                "session_id": session.id,
-                "cwd_mode": "same",
-                "cols": 80,
-                "rows": 24
-            }),
-        ),
-    )
-    .await;
-    let left_by_fork = listed_sessions(&mut control).await;
     let resumed = resume_and_remove(&mut control, &session.id).await;
     let _ = shutdown.send(());
     server.await.expect("Pi control server stops");
 
-    assert_recovery_refused(&err_payload(forked), "fork after a project sessionDir");
-    assert_eq!(
-        left_by_fork.len(),
-        1,
-        "a refused fork creates no child: {left_by_fork:?}"
-    );
     assert_recovery_refused(
         &resumed.expect_err("resume after a project sessionDir is refused"),
         "resume after a project sessionDir",
     );
 }
 
-/// Asserts that a resume or fork was refused because a setting moves the
+/// Asserts that a resume was refused because a setting moves the
 /// store, with a hint to undo what changed since the launch: remove the
 /// setting, or restore the variable the launch had.
 fn assert_recovery_refused(error: &protocol::ProtocolError, case: &str) {
@@ -1428,41 +1406,6 @@ async fn claude_missing_transcript_refuses_before_a_new_worker_generation() {
 }
 
 #[tokio::test]
-async fn claude_missing_transcript_refuses_fork_before_creating_a_child() {
-    let mut rig = ClaudeRig::new("claude-missing-fork-transcript").await;
-    rig.report("startup", LAUNCH).await;
-    let argv_before = std::fs::read(&rig.argv_log).expect("initial launch argv");
-    let request = Request::make(
-        "claude-missing-transcript-fork",
-        method::SESSION_FORK,
-        serde_json::json!({
-            "session_id": rig.session.id,
-            "cwd_mode": "same",
-            "cols": 80,
-            "rows": 24
-        }),
-    );
-    let response = exchange(&mut rig.control, &request).await;
-    let sessions: Vec<SessionInfo> = serde_json::from_value(ok_payload(
-        exchange(
-            &mut rig.control,
-            &Request::make("list-after-refused-fork", method::SESSION_LIST, Value::Null),
-        )
-        .await,
-    ))
-    .expect("session list after refused fork");
-    let argv_after = std::fs::read(&rig.argv_log).expect("argv after fork attempt");
-    rig.finish(None).await;
-
-    let Err(error) = response.into_result() else {
-        panic!("missing transcript must refuse fork");
-    };
-    assert_eq!(error.code, "agent_native_reference_missing");
-    assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
-    assert_eq!(argv_after, argv_before, "refused fork cannot launch");
-}
-
-#[tokio::test]
 async fn claude_symlinked_transcript_refuses_resume_before_launch() {
     let mut rig = ClaudeRig::new("claude-symlinked-transcript").await;
     let project = rig.config_home.join("projects/fixture");
@@ -1488,190 +1431,6 @@ async fn claude_symlinked_transcript_refuses_resume_before_launch() {
     assert_eq!(error.code, "agent_native_reference_missing");
     assert_eq!(after.runtime, stopped.runtime);
     assert_eq!(argv_after, argv_before, "symlink cannot launch recovery");
-}
-
-#[tokio::test]
-async fn claude_fork_child_does_not_inherit_the_source_recovery_target() {
-    let mut rig = ClaudeRig::new("claude-fork-target").await;
-    rig.transcript(LAUNCH);
-    rig.transcript(CLEAR);
-    rig.report("startup", LAUNCH).await;
-    rig.report("clear", CLEAR).await;
-    let request = Request::make(
-        "claude-recovery-fork",
-        method::SESSION_FORK,
-        serde_json::json!({
-            "session_id": rig.session.id,
-            "cwd_mode": "same",
-            "cols": 80,
-            "rows": 24
-        }),
-    );
-    let forked: protocol::SessionForkResult =
-        serde_json::from_value(ok_payload(exchange(&mut rig.control, &request).await))
-            .expect("fork Claude conversation");
-    let argv = read_file_until(&rig.argv_log, b"--fork-session").await;
-    let child_id = forked.session.id.clone();
-    rig.finish(Some(child_id)).await;
-
-    assert!(
-        String::from_utf8_lossy(&argv).contains(&format!("--resume {CLEAR} --fork-session")),
-        "fork must read the source's current verified conversation"
-    );
-    assert_eq!(
-        forked.session.native_session_id, None,
-        "a fork cannot resume its source conversation as its own"
-    );
-}
-
-/// `claude --resume <id> --fork-session` starts a new conversation and reports
-/// it with `SessionStart` `source: fork`. The fork child holds no reference of
-/// its own, so that first verified report becomes its recovery target, and
-/// resuming the child relaunches its own conversation, never the source's.
-#[tokio::test]
-async fn claude_fork_child_records_its_own_conversation_and_resumes_it() {
-    let mut rig = ClaudeRig::new("claude-fork-own-target").await;
-    rig.transcript(LAUNCH);
-    rig.report("startup", LAUNCH).await;
-    let request = Request::make(
-        "claude-recovery-fork",
-        method::SESSION_FORK,
-        serde_json::json!({
-            "session_id": rig.session.id,
-            "cwd_mode": "same",
-            "cols": 80,
-            "rows": 24
-        }),
-    );
-    let forked: protocol::SessionForkResult =
-        serde_json::from_value(ok_payload(exchange(&mut rig.control, &request).await))
-            .expect("fork Claude conversation");
-    let child = forked.session.id.clone();
-    let fork_argv = read_file_until(&rig.argv_log, b"--fork-session").await;
-    rig.transcript(FORKED);
-    rig.report_for(&child, "fork", FORKED).await;
-    let child_after_report = inspect_session(&mut rig.control, &child).await;
-    let source_after_report = inspect_session(&mut rig.control, &rig.session.id).await;
-    rig.stop(&child).await;
-    let resumed = rig.resume_session(&child).await;
-    let resume_marker = format!("--resume {FORKED}\n");
-    let argv = read_file_until(&rig.argv_log, resume_marker.as_bytes()).await;
-    let child_after_resume = inspect_session(&mut rig.control, &child).await;
-    rig.finish(Some(child)).await;
-
-    assert!(
-        String::from_utf8_lossy(&fork_argv).contains(&format!("--resume {LAUNCH} --fork-session")),
-        "the fork reads the source's conversation"
-    );
-    assert_eq!(
-        child_after_report.native_session_id.as_deref(),
-        Some(FORKED),
-        "the fork's first verified report is its own recovery target"
-    );
-    assert_eq!(
-        source_after_report.native_session_id.as_deref(),
-        Some(LAUNCH),
-        "the fork's report never changes its source's target"
-    );
-    assert!(resumed.is_ok(), "the fork's own conversation is resumable");
-    let resume_line = String::from_utf8_lossy(&argv)
-        .lines()
-        .last()
-        .map(str::to_owned)
-        .expect("the resumed fork recorded its argv");
-    assert_eq!(
-        resume_line,
-        format!("--resume {FORKED}"),
-        "resuming the fork relaunches its own conversation, not a fork of the source"
-    );
-    assert_eq!(
-        child_after_resume.native_session_id.as_deref(),
-        Some(FORKED),
-        "the resumed fork keeps its own target"
-    );
-}
-
-/// A fork records the origin of the forking request on the child, never the
-/// source's, and the child keeps it through a stop, a resume and a daemon
-/// restart.
-#[tokio::test]
-async fn a_fork_records_the_forking_request_origin_and_keeps_it_through_resume_and_restart() {
-    let mut rig = ClaudeRig::new("claude-fork-spawned-by").await;
-    rig.transcript(LAUNCH);
-    rig.report("startup", LAUNCH).await;
-    let origin = protocol::SpawnedBy {
-        session_id: SessionId("s-forking-parent".to_owned()),
-        daemon_id: "d-forking-parent".to_owned(),
-    };
-    let fork_request = |request_id: &str| {
-        Request::make(
-            request_id,
-            method::SESSION_FORK,
-            serde_json::json!({
-                "session_id": rig.session.id,
-                "cwd_mode": "same",
-                "cols": 80,
-                "rows": 24
-            }),
-        )
-    };
-    let with_origin = fork_request("fork-with-origin")
-        .with_origin(
-            Some(origin.session_id.clone()),
-            Some(origin.daemon_id.clone()),
-        )
-        .expect("valid origin pair");
-    let without_origin = fork_request("fork-without-origin");
-    let forked: protocol::SessionForkResult =
-        serde_json::from_value(ok_payload(exchange(&mut rig.control, &with_origin).await))
-            .expect("fork with an origin");
-    let plain: protocol::SessionForkResult = serde_json::from_value(ok_payload(
-        exchange(&mut rig.control, &without_origin).await,
-    ))
-    .expect("fork without an origin");
-    let child = forked.session.id.clone();
-    rig.additional_sessions.push(plain.session.id.clone());
-
-    rig.transcript(FORKED);
-    rig.report_for(&child, "fork", FORKED).await;
-    let source_id = rig.session.id.clone();
-    let source = inspect_session(&mut rig.control, &source_id).await;
-    rig.stop(&child).await;
-    ok_payload(rig.resume_session(&child).await);
-    let resumed = inspect_session(&mut rig.control, &child).await;
-    for id in [child.clone(), plain.session.id.clone(), source_id.clone()] {
-        rig.stop(&id).await;
-    }
-
-    let mut rig = rig.restarted().await;
-    let restarted_child = inspect_session(&mut rig.control, &child).await;
-    let restarted_plain = inspect_session(&mut rig.control, &plain.session.id).await;
-    rig.stop_daemon().await;
-
-    assert_eq!(forked.session.spawned_by.as_ref(), Some(&origin));
-    assert_eq!(
-        plain.session.spawned_by, None,
-        "a fork without an origin does not inherit its source's spawner"
-    );
-    assert_eq!(
-        source.spawned_by,
-        Some(protocol::SpawnedBy {
-            session_id: SessionId(SOURCE_SPAWNER_SESSION.to_owned()),
-            daemon_id: SOURCE_SPAWNER_DAEMON.to_owned(),
-        }),
-        "the source keeps its own spawner and never gains the fork's origin"
-    );
-    assert_eq!(
-        resumed.spawned_by.as_ref(),
-        Some(&origin),
-        "a resume keeps the spawner"
-    );
-    assert_eq!(
-        restarted_child.spawned_by.as_ref(),
-        Some(&origin),
-        "a daemon restart keeps the spawner"
-    );
-    assert_eq!(restarted_plain.spawned_by, None);
 }
 
 impl ClaudeRig {
@@ -1760,43 +1519,6 @@ async fn claude_newer_unverified_switch_claim_must_not_resume_the_older_verified
     );
 }
 
-#[tokio::test]
-async fn claude_newer_unverified_switch_claim_refuses_fork_before_creating_a_child() {
-    let mut rig = ClaudeRig::new("claude-unverified-fork-switch").await;
-    rig.transcript(LAUNCH);
-    rig.report("startup", LAUNCH).await;
-    let argv_before = std::fs::read(&rig.argv_log).expect("initial launch argv");
-    rig.rejournal_newer_switch(SELECTED);
-    let request = Request::make(
-        "claude-unverified-switch-fork",
-        method::SESSION_FORK,
-        serde_json::json!({
-            "session_id": rig.session.id,
-            "cwd_mode": "same",
-            "cols": 80,
-            "rows": 24
-        }),
-    );
-    let response = exchange(&mut rig.control, &request).await;
-    let sessions: Vec<SessionInfo> = serde_json::from_value(ok_payload(
-        exchange(
-            &mut rig.control,
-            &Request::make("list-after-refused-fork", method::SESSION_LIST, Value::Null),
-        )
-        .await,
-    ))
-    .expect("session list after refused fork");
-    let argv_after = std::fs::read(&rig.argv_log).expect("argv after fork attempt");
-    rig.finish(None).await;
-
-    let Err(error) = response.into_result() else {
-        panic!("a newer unverified switch claim must refuse fork");
-    };
-    assert_eq!(error.code, "native_identity_uncertain");
-    assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
-    assert_eq!(argv_after, argv_before, "refused fork cannot launch");
-}
-
 async fn assert_unavailable_journal_refuses_recovery(
     tag: &str,
     rewrite: impl FnOnce(&[u8]) -> Vec<u8>,
@@ -1812,45 +1534,18 @@ async fn assert_unavailable_journal_refuses_recovery(
     let argv_before = std::fs::read(&rig.argv_log).expect("initial launch argv");
 
     let resume = rig.resume().await;
-    let fork = exchange(
-        &mut rig.control,
-        &Request::make(
-            "fork-with-unavailable-journal",
-            method::SESSION_FORK,
-            serde_json::json!({
-                "session_id": id,
-                "cwd_mode": "same",
-                "cols": 80,
-                "rows": 24
-            }),
-        ),
-    )
-    .await;
     let after = inspect_session(&mut rig.control, &id).await;
     let argv_after = std::fs::read(&rig.argv_log).expect("argv after refused recovery");
     std::fs::write(&journal, original).expect("restore worker journal for cleanup");
-    let sessions: Vec<SessionInfo> = serde_json::from_value(ok_payload(
-        exchange(
-            &mut rig.control,
-            &Request::make(
-                "list-after-unavailable-journal",
-                method::SESSION_LIST,
-                Value::Null,
-            ),
-        )
-        .await,
-    ))
-    .expect("session list after refused fork");
+    let sessions = listed_sessions(&mut rig.control).await;
     rig.finish(None).await;
 
-    for response in [resume, fork] {
-        let Err(error) = response.into_result() else {
-            panic!("unavailable generation evidence must refuse resume and fork");
-        };
-        assert_eq!(error.code, "native_identity_evidence_unavailable");
-        assert!(error.recover.is_some(), "recovery must offer a retry hint");
-    }
-    assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
+    let Err(error) = resume.into_result() else {
+        panic!("unavailable generation evidence must refuse resume");
+    };
+    assert_eq!(error.code, "native_identity_evidence_unavailable");
+    assert!(error.recover.is_some(), "recovery must offer a retry hint");
+    assert_eq!(sessions.len(), 1, "refused resume cannot register a child");
     assert_eq!(
         after.runtime, stopped.runtime,
         "resume cannot mint a generation"
@@ -1862,7 +1557,7 @@ async fn assert_unavailable_journal_refuses_recovery(
 }
 
 #[tokio::test]
-async fn claude_corrupt_exact_generation_journal_refuses_resume_and_fork() {
+async fn claude_corrupt_exact_generation_journal_refuses_resume() {
     Box::pin(assert_unavailable_journal_refuses_recovery(
         "claude-corrupt-recovery-journal",
         |_original| b"{ invalid journal".to_vec(),
@@ -1871,7 +1566,7 @@ async fn claude_corrupt_exact_generation_journal_refuses_resume_and_fork() {
 }
 
 #[tokio::test]
-async fn claude_mismatched_generation_instance_refuses_resume_and_fork() {
+async fn claude_mismatched_generation_instance_refuses_resume() {
     Box::pin(assert_unavailable_journal_refuses_recovery(
         "claude-mismatched-recovery-journal",
         |original| {
@@ -1885,7 +1580,7 @@ async fn claude_mismatched_generation_instance_refuses_resume_and_fork() {
 }
 
 #[tokio::test]
-async fn claude_mismatched_durable_worker_refuses_resume_and_fork() {
+async fn claude_mismatched_durable_worker_refuses_resume() {
     let mut rig = ClaudeRig::new("claude-mismatched-durable-worker").await;
     rig.transcript(LAUNCH);
     rig.report("startup", LAUNCH).await;
@@ -1901,39 +1596,19 @@ async fn claude_mismatched_durable_worker_refuses_resume_and_fork() {
     let argv_before = std::fs::read(&rig.argv_log).expect("initial launch argv");
 
     let resume = rig.resume().await;
-    let fork = exchange(
-        &mut rig.control,
-        &Request::make(
-            "fork-with-mismatched-durable-worker",
-            method::SESSION_FORK,
-            serde_json::json!({
-                "session_id": id,
-                "cwd_mode": "same",
-                "cols": 80,
-                "rows": 24
-            }),
-        ),
-    )
-    .await;
     let after = inspect_session(&mut rig.control, &id).await;
     let argv_after = std::fs::read(&rig.argv_log).expect("argv after refused recovery");
     if !resume.is_ok() {
         rig.rewrite_durable_worker_id("different-worker", &original_worker);
     }
     let sessions = listed_sessions(&mut rig.control).await;
-    let child = sessions
-        .iter()
-        .find(|session| session.id != id)
-        .map(|session| session.id.clone());
-    rig.finish(child).await;
+    rig.finish(None).await;
 
-    for response in [resume, fork] {
-        let Err(error) = response.into_result() else {
-            panic!("mismatched durable worker must refuse resume and fork");
-        };
-        assert_eq!(error.code, "native_identity_evidence_unavailable");
-    }
-    assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
+    let Err(error) = resume.into_result() else {
+        panic!("mismatched durable worker must refuse resume");
+    };
+    assert_eq!(error.code, "native_identity_evidence_unavailable");
+    assert_eq!(sessions.len(), 1, "refused resume cannot register a child");
     assert_eq!(
         after.runtime, stopped.runtime,
         "resume cannot mint a generation"

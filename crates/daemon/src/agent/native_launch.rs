@@ -1,11 +1,10 @@
 //! Typed, shell-free native-session launch specification.
 //!
-//! A [`NativeSessionLaunch`] declares how an agent CLI resumes (and optionally
-//! forks) one of its own conversations: the kind of native reference it
-//! consumes plus a literal argv with exactly one reference slot per operation.
-//! Compiled adapters, host profiles, persisted resume bindings, recovery, and
-//! explicit fork all share this one representation, so generic code never
-//! branches on a provider name.
+//! A [`NativeSessionLaunch`] declares how an agent CLI resumes one of its own
+//! conversations: the kind of native reference it consumes plus a literal argv
+//! with one reference slot. Compiled adapters, host profiles, persisted resume
+//! bindings and recovery all share this one representation, so generic code
+//! never branches on a provider name.
 //!
 //! The reference is a [`NativeArg::Reference`] token, never a substring of a
 //! larger string: rendering substitutes the validated [`SessionRef`] value as
@@ -15,7 +14,7 @@
 use protocol::{ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
-use super::{generate_assigned_reference, AssignedReference, SessionRef, SessionRefKind};
+use super::{AssignedReference, SessionRef, SessionRefKind};
 
 /// Whole-token sentinel that marks the reference slot in a profile template.
 pub const REFERENCE_PLACEHOLDER: &str = "{reference}";
@@ -70,9 +69,6 @@ pub enum NativeLaunchError {
     /// not a path.
     #[error("an assigned reference requires an id reference kind")]
     AssignedRequiresId,
-    /// An assignment that also covers forks needs a spec that forks.
-    #[error("an assigned fork reference requires fork arguments")]
-    AssignedForkRequiresFork,
 }
 
 /// A validated argv fragment with exactly one reference slot.
@@ -175,24 +171,10 @@ impl From<NativeArgs> for Vec<NativeArg> {
     }
 }
 
-/// The argv fragment of a fork and the reference core assigned to the forked
-/// conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForkArgv {
-    /// The fork arguments, followed by the assignment's launch arguments when
-    /// [`Self::reference`] is present.
-    pub argv: Vec<String>,
-    /// The forked conversation's own generated reference; `None` when the
-    /// spec assigns forks no reference.
-    pub reference: Option<SessionRef>,
-}
-
-/// How an agent resumes and optionally forks its native conversations.
+/// How an agent resumes its native conversations.
 ///
-/// Resume is mandatory: a fork is only expressible alongside the resume that
-/// declares the reference kind. The spec is frozen into persisted session
-/// snapshots so recovery uses the launch-time shape even after the host
-/// profile changes.
+/// The spec is frozen into persisted session snapshots so recovery uses the
+/// launch-time shape even after the host profile changes.
 ///
 /// Deserialization runs the same invariants as [`NativeSessionLaunch::with_assigned`],
 /// so a stored spec that pairs an assignment with a non-id reference kind does
@@ -202,8 +184,6 @@ pub struct ForkArgv {
 pub struct NativeSessionLaunch {
     reference_kind: SessionRefKind,
     resume_args: NativeArgs,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    fork_args: Option<NativeArgs>,
     /// Present when core generates the reference and passes it at launch
     /// instead of waiting for an integration report. Boxed: most specs have
     /// none, and this keeps the persisted binding small.
@@ -217,8 +197,10 @@ pub struct NativeSessionLaunch {
 struct StoredNativeSessionLaunch {
     reference_kind: SessionRefKind,
     resume_args: NativeArgs,
+    /// Fork arguments written by an earlier release; read and dropped.
     #[serde(default)]
-    fork_args: Option<NativeArgs>,
+    #[expect(dead_code, reason = "accepted so a record of an earlier release loads")]
+    fork_args: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     assigned: Option<Box<AssignedReference>>,
 }
@@ -227,7 +209,7 @@ impl TryFrom<StoredNativeSessionLaunch> for NativeSessionLaunch {
     type Error = NativeLaunchError;
 
     fn try_from(stored: StoredNativeSessionLaunch) -> Result<Self, Self::Error> {
-        let spec = Self::new(stored.reference_kind, stored.resume_args, stored.fork_args);
+        let spec = Self::new(stored.reference_kind, stored.resume_args);
         match stored.assigned {
             Some(assigned) => spec.with_assigned(*assigned),
             None => Ok(spec),
@@ -236,17 +218,12 @@ impl TryFrom<StoredNativeSessionLaunch> for NativeSessionLaunch {
 }
 
 impl NativeSessionLaunch {
-    /// Build a spec from validated resume and optional fork argv fragments.
+    /// Build a spec from a validated resume argv fragment.
     #[must_use]
-    pub fn new(
-        reference_kind: SessionRefKind,
-        resume_args: NativeArgs,
-        fork_args: Option<NativeArgs>,
-    ) -> Self {
+    pub fn new(reference_kind: SessionRefKind, resume_args: NativeArgs) -> Self {
         Self {
             reference_kind,
             resume_args,
-            fork_args,
             assigned: None,
         }
     }
@@ -256,39 +233,32 @@ impl NativeSessionLaunch {
     /// # Errors
     ///
     /// Returns [`NativeLaunchError::AssignedRequiresId`] unless the spec's
-    /// reference kind is [`SessionRefKind::Id`], and
-    /// [`NativeLaunchError::AssignedForkRequiresFork`] when the assignment
-    /// covers forks but the spec declares no fork.
+    /// reference kind is [`SessionRefKind::Id`].
     pub fn with_assigned(mut self, assigned: AssignedReference) -> Result<Self, NativeLaunchError> {
         if self.reference_kind != SessionRefKind::Id {
             return Err(NativeLaunchError::AssignedRequiresId);
-        }
-        if assigned.assigns_fork() && self.fork_args.is_none() {
-            return Err(NativeLaunchError::AssignedForkRequiresFork);
         }
         self.assigned = Some(Box::new(assigned));
         Ok(self)
     }
 
-    /// Build a spec from resume and optional fork templates, applying the
-    /// whole-token `{reference}` rules of [`NativeArgs::from_template`].
+    /// Build a spec from a resume template, applying the whole-token
+    /// `{reference}` rules of [`NativeArgs::from_template`].
     ///
     /// # Errors
     ///
-    /// Returns the first [`NativeLaunchError`] of either template.
+    /// Returns the [`NativeLaunchError`] of the template.
     pub fn from_templates<S: AsRef<str>>(
         reference_kind: SessionRefKind,
         resume: &[S],
-        fork: Option<&[S]>,
     ) -> Result<Self, NativeLaunchError> {
         Ok(Self::new(
             reference_kind,
             NativeArgs::from_template(resume)?,
-            fork.map(NativeArgs::from_template).transpose()?,
         ))
     }
 
-    /// The kind of native reference both operations consume.
+    /// The kind of native reference the resume consumes.
     #[must_use]
     pub fn reference_kind(&self) -> SessionRefKind {
         self.reference_kind
@@ -306,37 +276,6 @@ impl NativeSessionLaunch {
         &self.resume_args
     }
 
-    /// The fork argv fragment, when the agent supports native fork.
-    #[must_use]
-    pub fn fork_args(&self) -> Option<&NativeArgs> {
-        self.fork_args.as_ref()
-    }
-
-    /// Whether the agent supports native fork.
-    #[must_use]
-    pub fn supports_fork(&self) -> bool {
-        self.fork_args.is_some()
-    }
-
-    /// The same spec without fork support.
-    ///
-    /// Only a spec whose reference is not assigned may drop its fork: an
-    /// assigned fork reference needs fork arguments.
-    #[must_use]
-    pub fn without_fork(&self) -> Self {
-        debug_assert!(
-            !self
-                .assigned
-                .as_ref()
-                .is_some_and(|assigned| assigned.assigns_fork()),
-            "an assigned fork reference keeps its fork arguments"
-        );
-        Self {
-            fork_args: None,
-            ..self.clone()
-        }
-    }
-
     /// Build the resume argv fragment for `reference`.
     ///
     /// # Errors
@@ -346,39 +285,6 @@ impl NativeSessionLaunch {
     pub fn resume_argv(&self, reference: &SessionRef) -> Result<Vec<String>, ProtocolError> {
         self.ensure_kind(reference)?;
         Ok(self.resume_args.render(reference.value()))
-    }
-
-    /// Build the fork argv fragment that forks the conversation `reference`
-    /// names.
-    ///
-    /// When the assignment covers forks, a fresh reference is generated for
-    /// the forked conversation and its launch arguments follow the fork
-    /// arguments; [`ForkArgv::reference`] carries it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `agent_fork_unsupported` when the spec declares no fork,
-    /// `native_reference_kind_mismatch` when `reference` is of another kind,
-    /// or `invalid_session_ref` if the generated reference is refused.
-    pub fn fork_argv(&self, reference: &SessionRef) -> Result<ForkArgv, ProtocolError> {
-        let fork_args = self
-            .fork_args
-            .as_ref()
-            .ok_or_else(ProtocolError::agent_fork_unsupported)?;
-        self.ensure_kind(reference)?;
-        let mut argv = fork_args.render(reference.value());
-        let assigned = match self.assigned().filter(|assigned| assigned.assigns_fork()) {
-            Some(assigned) => {
-                let fork_reference = generate_assigned_reference()?;
-                argv.extend(assigned.launch_argv(&fork_reference));
-                Some(fork_reference)
-            }
-            None => None,
-        };
-        Ok(ForkArgv {
-            argv,
-            reference: assigned,
-        })
     }
 
     fn ensure_kind(&self, reference: &SessionRef) -> Result<(), ProtocolError> {
@@ -472,35 +378,19 @@ mod tests {
         }
     }
 
-    fn launch(fork: Option<&[&str]>) -> NativeSessionLaunch {
+    fn launch() -> NativeSessionLaunch {
         NativeSessionLaunch::new(
             SessionRefKind::Path,
             NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
-            fork.map(|tokens| NativeArgs::from_template(tokens).expect("fork")),
         )
     }
 
     #[test]
-    fn fork_is_unsupported_without_fork_args() {
-        let spec = launch(None);
-        let reference = SessionRef::path("/work/s.jsonl").expect("path reference");
-        assert!(!spec.supports_fork());
-        assert_eq!(
-            spec.fork_argv(&reference).expect_err("no fork").code,
-            "agent_fork_unsupported"
-        );
-    }
-
-    #[test]
     fn a_reference_of_the_wrong_kind_is_refused() {
-        let spec = launch(Some(&["--fork", "{reference}"]));
+        let spec = launch();
         let reference = SessionRef::id("native-1").expect("id reference");
         assert_eq!(
             spec.resume_argv(&reference).expect_err("kind").code,
-            "native_reference_kind_mismatch"
-        );
-        assert_eq!(
-            spec.fork_argv(&reference).expect_err("kind").code,
             "native_reference_kind_mismatch"
         );
     }
@@ -515,13 +405,12 @@ mod tests {
     #[test]
     fn an_assignment_needs_an_id_reference_kind() {
         assert_eq!(
-            launch(None).with_assigned(assignment()),
+            launch().with_assigned(assignment()),
             Err(NativeLaunchError::AssignedRequiresId)
         );
         let id_spec = NativeSessionLaunch::new(
             SessionRefKind::Id,
             NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
-            None,
         )
         .with_assigned(assignment())
         .expect("an id spec accepts an assignment");

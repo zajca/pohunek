@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.7.0";
+const PACKAGE_VERSION: &str = "1.8.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -272,8 +272,6 @@ fn the_descriptor_declares_the_verified_codex_launch_contract() {
         native.resume_argv(&reference).expect("resume"),
         ["resume", reference.value()]
     );
-    assert!(!native.supports_fork(), "Codex sessions are not forkable");
-    native.fork_argv(&reference).expect_err("fork has no argv");
 
     assert_eq!(
         definition.integration_handler().map(HandlerId::as_str),
@@ -373,6 +371,15 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
             .expect("a [runtime] table");
         assert!(runtime.remove("detect_manifest").is_some());
         runtime.remove("version_probe");
+        // The frozen built-in descriptor declares fork data the package
+        // does not carry.
+        table.remove("fork");
+        if let Some(reference) = table
+            .get_mut("native_reference")
+            .and_then(toml::Value::as_table_mut)
+        {
+            reference.remove("assign_fork");
+        }
         table
     };
     let mut package = strip(
@@ -382,7 +389,6 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     for section in [
         "input",
         "resume",
-        "fork",
         "native_reference",
         "integration",
         "config_home",
@@ -2875,13 +2881,6 @@ async fn a_real_codex_session_launches_and_is_detected_through_package_facts() {
         fixture.rollout_file(&reference).is_some(),
         "Codex wrote a rollout file for the reported conversation {reference}"
     );
-
-    // Fork stays unsupported.
-    let (code, forked) = fixture
-        .harness
-        .json(&["session", "fork", &id, "--name", "e2e-fork"])
-        .await;
-    assert_ne!(code, 0, "{forked}");
 
     fixture.stop(&id).await;
     fixture.finish().await;

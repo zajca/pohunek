@@ -7,10 +7,9 @@
 
 use protocol::{
     ErrorClass, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
-    SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
-    SessionIdleStopParams, SessionInputParams, SessionListParams, SessionNewParams,
-    SessionNewResult, SessionOutputParams, SessionPolicyParams, SessionPolicyResult,
-    SessionReadParams, SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
+    SessionDetectionParams, SessionDiffParams, SessionId, SessionInputParams, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionOutputParams, SessionReadParams,
+    SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
     SessionReportNativeIdParams, SessionResizeParams, SessionResumeParams, SessionResumeResult,
     SessionRetentionParams, SessionScreenParams, SessionSetMetadataParams, SessionWaitParams,
     SessionWaitTurnParams,
@@ -75,16 +74,6 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
     }
     sessions.enrich_native_activity(&mut list).await;
     ok_value(request, &list)
-}
-
-pub(super) async fn handle_session_runtime_inventory(
-    request: &Request,
-    sessions: &SessionRegistry,
-) -> Response {
-    if let Err(err) = parse_optional_params::<()>(request) {
-        return error_value(request, err);
-    }
-    ok_value(request, &sessions.runtime_inventory().await)
 }
 
 pub(super) async fn handle_session_inspect(
@@ -157,30 +146,6 @@ pub(super) async fn handle_session_resume(request: &Request, state: &DaemonState
     }
 }
 
-pub(super) async fn handle_session_fork(request: &Request, state: &DaemonState) -> Response {
-    let params = match parse_params::<SessionForkParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    if let Err(err) = profile_change(state, params.accept_profile_change) {
-        return error_value(request, err);
-    }
-    match state
-        .sessions
-        .fork_spawned_by(params, request_spawned_by(request))
-        .await
-    {
-        Ok(session) => ok_value(
-            request,
-            &SessionForkResult {
-                session,
-                applied_input: None,
-            },
-        ),
-        Err(err) => error_value(request, err),
-    }
-}
-
 pub(super) async fn handle_session_remove(
     request: &Request,
     sessions: &SessionRegistry,
@@ -207,66 +172,6 @@ async fn remove_session(
         Err(err) => return error_value(request, err),
     };
     match sessions.remove_with(&id, cleanup).await {
-        Ok(result) => ok_value(request, &result),
-        Err(err) => error_value(request, err),
-    }
-}
-
-/// `session.policy.get`: return the current session retention policy.
-pub(super) fn handle_session_policy_get(request: &Request, sessions: &SessionRegistry) -> Response {
-    if !request.params().is_null() {
-        return error_value(
-            request,
-            ProtocolError::bad_request("session.policy.get does not accept params"),
-        );
-    }
-    ok_value(
-        request,
-        &SessionPolicyResult {
-            retention: sessions.retention_policy(),
-        },
-    )
-}
-
-/// `session.policy.set`: persist a replacement session retention policy.
-pub(super) async fn handle_session_policy_set(
-    request: &Request,
-    sessions: &SessionRegistry,
-) -> Response {
-    let params = match parse_params::<SessionPolicyParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    match sessions.set_retention_policy(params.retention).await {
-        Ok(retention) => ok_value(request, &SessionPolicyResult { retention }),
-        Err(err) => error_value(request, err),
-    }
-}
-
-/// `session.idle_stop.get`: return the host default of the idle-stop duration.
-pub(super) fn handle_session_idle_stop_get(
-    request: &Request,
-    sessions: &SessionRegistry,
-) -> Response {
-    if !request.params().is_null() {
-        return error_value(
-            request,
-            ProtocolError::bad_request("session.idle_stop.get does not accept params"),
-        );
-    }
-    ok_value(request, &sessions.idle_stop_policy())
-}
-
-/// `session.idle_stop.set`: persist a replacement idle-stop default.
-pub(super) async fn handle_session_idle_stop_set(
-    request: &Request,
-    sessions: &SessionRegistry,
-) -> Response {
-    let params = match parse_params::<SessionIdleStopParams>(request) {
-        Ok(params) => params,
-        Err(err) => return error_value(request, err),
-    };
-    match sessions.set_idle_stop_policy(params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

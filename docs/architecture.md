@@ -346,55 +346,6 @@ D-Bus; macOS implements it through `/bin/launchctl` `bootstrap`, `bootout`, and
 never sees unit names, labels, D-Bus paths, or raw `MainPID` semantics. Worker
 readiness and authority still come from the private worker handshake.
 
-A separate plugin-unit contract installs persistent workflow plugin units, each
-keyed by plugin, kind, and name: a periodic job or a long-running service
-restarted after every exit. A job's runs never overlap and start about one
-interval apart. The interval is awake time counted from the unit's activation
-within one service-manager lifetime: it pauses while the host sleeps (launchd
-skips a firing due during sleep) and starts over at every login, so
-wall-clock cadence (catching up a daily job on a host that is never awake
-that long) belongs to the caller, which keeps its own last-run record and
-skips runs that are not due yet. Intervals, timer
-accuracy, and restart delays are whole seconds of at least one second, the
-granularity both native managers express. The native run bound and restart
-delay are backstops; the caller enforces the real run and restart policy.
-On systemd the plugin units use `KillMode=mixed` (worker and daemon units keep
-`control-group`): a stop signals only the unit's main process, which stops
-its own descendants within its grace, as launchd does, and the final
-`SIGKILL` still reaches every process left in the unit.
-Each unit is enabled for login, and the unit definition adds only the
-bootstrap roots to the environment, never `PATH`; the user service manager
-still passes its own environment block to the process, so the executable a
-unit runs clears what it must not forward. Linux implements it with user unit
-files `pohunek-<ns>-wf-<plugin-hash>-<j|s>-<name>.service`: a job is
-`Type=oneshot`, bounded by `TimeoutStartSec=`, plus a `.timer` with
-`OnActiveSec=` and `OnUnitInactiveSec=` (the next run one interval after the
-previous one ended); a service is `Type=exec` with `Restart=always` and
-`RestartSec=` waited after each exit. Both disable start rate limiting and
-kill the whole control group. macOS implements it with LaunchAgents
-`~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<j|s>.<name>.plist`
-in the `gui/<uid>` domain, written and replaced through the same crash-safe
-registration as the daemon agent: a job has `StartInterval` set to the
-interval, `RunAtLoad=false` (the first run one interval after load, then the
-load-relative cadence), and `ThrottleInterval` of one second, because launchd
-otherwise spawns a job at most every 10 s; a service has `KeepAlive=true`
-and its restart delay as `ThrottleInterval`. launchd skips an interval firing
-while a run is active and never runs two processes of one label, so runs
-never overlap. A unit's process is matched by its executable, exact argv,
-and the `XPC_SERVICE_NAME` entry launchd sets to the label, so two
-installations running the same argv never act on each other's processes.
-launchd has no key that bounds a running job and reports a job's exit
-status only in `launchctl print` text, which the backend never parses, so on
-macOS the executable a unit runs is the only run bound and the caller's own
-run record is the only failure record; `ExitTimeOut` bounds a stop, after
-which the backend kills the rest of the job's process group captured before
-the stop. Stopping a unit boots it out but keeps its definition,
-so it runs again at the next login until it is removed. Worker discovery
-never matches these names or labels, so it neither adopts nor sweeps them.
-`pohunek workflow enable` installs a plugin's job and service units through
-this contract, and `disable` and `uninstall` remove them
-(`crates/cli/src/workflow/units.rs`).
-
 The shared contract crate compiles and tests natively on Apple Silicon Darwin
 with a macOS 14 deployment target. macOS 14 is a supported build target without
 CI acceptance; CI and release acceptance run on macOS 15 only (revision of
@@ -539,12 +490,12 @@ manager, and commits the session `stopped`; a refused proof retires nothing.
 The daemon stops its own background work through one tree (`crates/daemon/src/shutdown.rs`).
 The session registry spawns every watcher, exit committer, forwarder and retry
 through a tracker it owns, and runs its blocking store writes through the same
-tracker. The tasks around it (idle stop, session and notification retention,
+tracker. The tasks around it (session and notification retention,
 package command runs, the notification projector, the attention coordinator, the agent-state hook flush and
 the event-log drains) belong to `DaemonShutdown`, which stops them in four ordered
 phases, each inside its own bound from `[deadlines]` in `service.toml`:
 `create_drain_ms` (creates still running commit or compensate), `driver_shutdown_ms`
-(the producers, idle stop, retention, package command runs and the connection tasks of the control socket and of the remote listeners stop together; then the consumers of
+(the producers, retention, package command runs and the connection tasks of the control socket and of the remote listeners stop together; then the consumers of
 the registry's events, the notification projector and the agent-state hook flush,
 so the events the producers emit while stopping are still consumed; then the
 attention coordinator, so the last defers and resolves they hand over are
@@ -936,9 +887,9 @@ logged at WARN, surfaced to the operator, and carries a recovery hint. A
 `metadata.jsonl` line that no loader accepts stays in the file: every rewrite
 re-emits it unchanged after the parsed records, so the line is never lost to a
 later write; package gates treat it as possibly pinning any installed package.
-`pohunek store rejected list` shows such lines and `pohunek store rejected
-set-aside` moves one, with an audit record, into the owner-private
-`metadata.rejected.jsonl`, which the daemon never deletes.
+The recovery is manual, with the daemon stopped: the line moves, keeping its
+text, into the owner-private `metadata.rejected.jsonl`, which the daemon never
+reads or deletes (the runtime package recovery runbook has the steps).
 The operator-facing gate of the window is the upgrade preflight. `pohunek
 service check` and `pohunek service upgrade` of an existing service run
 `pohunekd upgrade-preflight` of the new archive before any effect; it prints a
@@ -979,7 +930,7 @@ loss-accepting flag, is given or an earlier upgrade accepted the identical risk
 (the CLI-owned ledger `service-accepted-risks.json`, matched against the
 daemon-computed `acceptance_scope`; no session is changed); a store the new daemon would refuse
 (`service_upgrade_store_unusable`) and a preflight that cannot run
-(`service_upgrade_preflight_failed`) and a systemd user manager whose `PATH` cannot be read (`service_manager_environment_unavailable`) are never overridable. The report also carries the release's official runtime plan (`runtimes`, an `EnsureReport` of `ensure-official-runtimes --dry-run` judged against the registry as it will be after the plan is applied) and the stopped sessions that keep native resume or fork (`stopped_sessions`, judged by the same rules as live sessions and at risk under the same flag).  The official runtime step adds five codes, none overridden by `--accept-runtime-loss`: `service_upgrade_runtimes_refused` (the release's plan cannot be applied; nothing was stopped), `service_upgrade_runtimes_failed` (the release's runtime step did not produce a finished report), `service_runtime_backup_invalid` (a registry, catalog state or host profile cannot be backed up exactly), `service_staged_runtime_invalid` (the release's `runtime/` tree is not the layout the release assembles, or a sealed release lists a `runtime/` file it does not carry), and `service_upgrade_runtimes_unconfirmed` (the step's daemon run could not be ended and its exit confirmed, so the upgrade is kept and not rolled back). The preflight runs before any effect and again right
+(`service_upgrade_preflight_failed`) and a systemd user manager whose `PATH` cannot be read (`service_manager_environment_unavailable`) are never overridable. The report also carries the release's official runtime plan (`runtimes`, an `EnsureReport` of `ensure-official-runtimes --dry-run` judged against the registry as it will be after the plan is applied) and the stopped sessions that keep native resume (`stopped_sessions`, judged by the same rules as live sessions and at risk under the same flag).  The official runtime step adds five codes, none overridden by `--accept-runtime-loss`: `service_upgrade_runtimes_refused` (the release's plan cannot be applied; nothing was stopped), `service_upgrade_runtimes_failed` (the release's runtime step did not produce a finished report), `service_runtime_backup_invalid` (a registry, catalog state or host profile cannot be backed up exactly), `service_staged_runtime_invalid` (the release's `runtime/` tree is not the layout the release assembles, or a sealed release lists a `runtime/` file it does not carry), and `service_upgrade_runtimes_unconfirmed` (the step's daemon run could not be ended and its exit confirmed, so the upgrade is kept and not rolled back). The preflight runs before any effect and again right
 before the daemon is replaced (the previous daemon cannot be paused, and its own
 adoption fails closed for what remains); a resumed upgrade whose daemon replacement
 has not completed is judged again. A rerun for the active version and a resume
@@ -1092,12 +1043,11 @@ profile migrate`). A session launched from the built-in Codex, Claude Code or
 Hermes of an earlier release is refused with `runtime_builtin_removed` while
 nothing serves its runtime id. Once the official package serves that id, the
 package adopts the session, live or stopped, when the session's launch pin
-names that package id; the package version may differ. Resume and fork then run
+names that package id; the package version may differ. Resume then runs
 through the package, and the relaunched run is pinned to the package digest. Resume
-and fork additionally require that the package honors the session's frozen
-recovery contract: the same native reference kind, a hook-reported (not
-core-assigned) reference, and for fork, fork support in both the frozen spec and
-the package. A Hermes fork still answers `agent_fork_unsupported`. A session
+additionally requires that the package honors the session's frozen
+recovery contract: the same native reference kind and a hook-reported (not
+core-assigned) reference. A session
 whose recovery contract the package cannot honor is refused with
 `runtime_served_by_package`, and its recovery is a new session. So is a session
 whose pin names no package (an unpinned record of an earlier release). A
@@ -1119,7 +1069,7 @@ Runtime responsibilities:
 
 ### Launch source and special-case guard
 
-Launch, resume, fork, input framing, detection, probes, profile bases and
+Launch, resume, input framing, detection, probes, profile bases and
 runtime inventory resolve an agent through the daemon's runtime registry; no
 per-agent code path exists for them. A launch names its agent through a
 `LaunchSource`. `OwnerLocal` carries the name the owner typed on this host (a
@@ -1138,7 +1088,7 @@ it is stable across daemon restarts. A missing or unreadable key fails closed
 with `agent_profile_revision_unavailable`; there is no unkeyed fallback. A
 profile-backed `session.new` freezes the revision into the session's resume
 binding, so it needs the key; a launch of a bare runtime never does.
-`session.resume` and `session.fork` resolve the profile once, compare its
+`session.resume` resolves the profile once, compare its
 current revision with the frozen one and refuse an edited, legacy or missing
 profile with `agent_profile_changed` or `agent_profile_missing` unless the
 local owner accepts the change. The one exception is the migration pin: for an
@@ -1616,7 +1566,7 @@ wait, and diff. `manage` additionally exposes structured project/worktree/agent
 profile session operations with exact unique-name resolution. `full` alone
 registers stop and remove. The plugin repeats the daemon's origin-session guard
 before subprocess start: it denies exactly `session.stop`, `session.resume`,
-`session.remove`, `session.fork`, `session.resize`, `session.set_metadata`,
+`session.remove`, `session.resize`, `session.set_metadata`,
 `session.rename`, and `session.input` when they target the hosting session. The plugin exposes no consent removal, so it has no counterpart for the daemon's denial of `session.remove_accepting_unconfirmed`. The
 only origin-session exceptions are the lifecycle reports
 `session.report_agent`, `session.release_agent`, and
@@ -1651,7 +1601,6 @@ session-side retention and adopted-pin refresh in `session/package_pins.rs`.
 | Official package | A signed release catalog entry that binds package id, runtime id, version and archive digest, verified against `runtime-catalog-anchor.json` beside `pohunekd` (`crates/package/src/catalog.rs`, `crates/daemon/src/catalog_anchor.rs`, `crates/daemon/src/packages/trust.rs`). | Shipped. Each Linux daemon archive carries the Pi, Codex, Claude Code and Hermes packages and the catalog under `runtime/`. Only an official package may serve the reserved ids `codex`, `claude` and `hermes` (`crates/daemon/src/agent/host/claim.rs`); `shell` is never claimable. |
 | Indexed official plugin package | A signed plugin index entry that binds package id `pohunek.runtime.<runtime_id>`, runtime id, version and archive digest, verified by the daemon alone against the endorser root that `plugin-index-channel.json` names among the roots of the trust anchor (`crates/package/src/plugin_index.rs`, `crates/daemon/src/catalog_anchor.rs`, `crates/daemon/src/packages/trust.rs`). `package.install` with `PackageTrust::Index` looks the raw archive digest up before decompressing, persists the index and revocation marks (`index-state.json`) before the registry install, refuses commands and the runtime ids `shell`, `codex`, `claude`, `hermes` and `pi`, and records the package with the `official` source. A missing channel file refuses it with `official_trust_unavailable`. | Shipped in the daemon; the CLI and the signing pipeline follow in later slices of [#1614](https://github.com/zajca/pohunek/issues/1614). Reports `package_install_index_supported` in `host.inspect` only with a loaded channel. |
 | Third-party package | The archive digest the owner supplies (`--sha256`). `plugin link` copies a developer directory and installs it disabled. | Shipped. Never serves a reserved id. |
-| Workflow plugin | The archive digest the owner supplies (`pohunek workflow install --sha256`). Not a runtime package: the archive carries `workflow.toml` and never `runtime.toml`. | Shipped ([#148](https://github.com/zajca/pohunek/issues/148)): the CLI-owned store `<state>/pohunek/workflow-plugins/` (a package registry of its own, never read by the daemon), the strict manifest, the consent install, and `pohunek workflow run`, which runs one action without a shell under the owner limits of `<config>/pohunek/workflow.toml` with a minimal environment that keeps the complete session origin pair, and logs a content-free record per run (`crates/cli/src/workflow/`, `crates/cli/src/commands/workflow.rs`). `workflow run --json` places the action's single JSON document byte for byte in the CLI envelope. Declared jobs and services run as user service manager units of the `pohunek service` installation that `workflow enable` installs and `disable`/`uninstall` remove; each unit runs the CLI's hidden `pohunek workflow __exec` trampoline, which owns the overlap lock, the wall-clock job schedule, the service backoff and the stop handling (`crates/cli/src/workflow/units.rs`, `crates/cli/src/workflow/supervised.rs`). Shipped: event reactions. A plugin's `[reactions.<name>]` tables run its argv once per matching public event (the protocol's event table minus `attach_opened` and `attach_closed`). One dispatcher unit per namespace, running the CLI's hidden `pohunek workflow __dispatch`, reads the daemon's `subscribe` stream as a separate process: it never starts the daemon, reconnects with bounded backoff, drops events for a full per-plugin queue with one `dropped` record per overflow episode, and never delays the daemon or another plugin (`crates/cli/src/workflow/dispatch.rs`). A plugin is an external command that runs as the owner and calls the public CLI or SDK. The v1 boundary ([#480](https://github.com/zajca/pohunek/issues/480)) gives core no channel or record for plugin data and no launch-time policy hook; a launch still names one concrete, locally approved profile. |
 | Daemon, overlay, session worker or GUI extension | None. | Unsupported. Protocol methods, overlay providers, worker behavior and GUI code stay compiled and audited in core or in the client that owns them. |
 
 An integration handler may also contribute per-launch input
@@ -1662,7 +1611,7 @@ and private files. Core validates it, writes the files atomically as
 outside the paths a runtime's sandbox lets the agent write (the worktree, the
 session `TMPDIR`, the config home) though not outside the owner's account, and
 which is deleted with the session's journals, and resolves `{file:<name>}` placeholders to their absolute
-paths. The contribution is rebuilt for every create, resume and fork and applied
+paths. The contribution is rebuilt for every create and resume and applied
 in one place per launch: the environment between the profile `[env]` and the
 daemon handshake, the arguments after the frozen arguments and before the native
 session arguments. It is never part of the frozen resume snapshot, so a relaunch
@@ -1685,7 +1634,7 @@ tree and environment, and stopping that session would strand the others.
 A runtime declares how it avoids that in its descriptor's `[placement]` table
 (runtime feature `placement-v1`). `mode = "in_process"` states that the agent
 stays in the PTY's process tree, by literal `keep_local_args` that the core
-adds to every create, resume and fork launch (never frozen into the resume
+adds to every create and resume launch (never frozen into the resume
 snapshot), by `keep_local_handler = true` when the compiled integration handler
 contributes the launch input (Codex), or by neither when the agent has no
 daemon. `mode = "owned_server"` is refused until a backend that can honour it
@@ -1722,7 +1671,7 @@ directory, never in the session `TMPDIR`, the worktree or the Muse config home
 (Muse hooks run outside Muse's sandbox, so a sandbox-writable overlay would be
 a sandbox escape). The reporter is stateless and reaches the worker only.
 
-Plugins live outside core. A new runtime package or workflow plugin is never
+Plugins live outside core. A new runtime package is never
 added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,
 a third-party plugin in its author's account, and a plugin becomes installable
 by id through a reviewed pull request to `pohunekd/pohunek-plugin-index`, which
@@ -1754,7 +1703,7 @@ persisted field.
 
 A descriptor can also export package commands, `[commands.<name>]` tables
 gated by the runtime feature `package-commands-v1`, next to the runtime group
-(`[runtime]`, `[input]`, `[resume]`, `[fork]`, `[native_reference]`, all or
+(`[runtime]`, `[input]`, `[resume]`, `[native_reference]`, all or
 none) or without it. A command is a separate owner process the daemon runs on
 request: a package-relative `program` that the manifest marks executable,
 literal `args` and an `expose` scope, all fixed by the digest, so a call can
@@ -1821,21 +1770,7 @@ Trust boundary:
   socket only (`crates/daemon/src/api/handler/package.rs`, error
   `local_only_method`), and the CLI refuses a remote `--host`
   (`plugin_local_only`). A remote owner connection over the overlay can launch
-  only what is already installed and enabled on that host. The `pohunek workflow`
-  commands never contact a daemon and refuse a remote `--host` before any I/O
-  (`workflow_local_only`); only the reaction dispatcher unit reads the local
-  daemon's `subscribe` stream, as a client that never starts it.
-- **Workflow plugins are owner code outside core.** The CLI keeps them in its
-  own registry root and per-plugin state and config directories, all `0700`,
-  and serializes every change under one store lock.
-  The digest proves which bytes the owner approved; plugin code runs with the
-  owner's full authority and may use every public owner API, as any same-UID
-  process can. No daemon, worker, protocol or event surface knows about them.
-  `pohunek workflow run` gives an action a minimal environment that keeps the
-  complete session origin pair, so `plugin_self_target_denied` still covers an
-  action run inside a managed session; a single marker refuses the run. A
-  job or service started by the service manager never carries an origin pair
-  or the manager's own environment.
+  only what is already installed and enabled on that host.
 - **Remote and relay launches select approved profiles.** A relay-origin launch
   names only a locally approved profile at its approved revision
   (`LaunchSource::RelayProfile` in `crates/daemon/src/agent/host/source.rs`),
@@ -1848,7 +1783,7 @@ Trust boundary:
   `crates/daemon/src/agent/host/handle.rs`). A pinned session or profile
   resolves exactly its digest and never falls back to another package or to
   `shell`. There is one exception, for a relaunch only:
-  - the resume or fork of a stopped session pinned to an official package may be
+  - the resume of a stopped session pinned to an official package may be
     adopted by a strictly newer, selected official version of the same package
     id and runtime id (reserved or not, so Pi too) (`RuntimeHost::newer_adopter`, `recovery_definition` in
     `crates/daemon/src/session/resume.rs`);
@@ -2249,7 +2184,7 @@ that remain are cheap, free-by-default, or inherited:
   `origin_session_id` and `origin_daemon_id` envelope markers. When both identify
   the target as the caller's origin, the daemon rejects exactly `session.stop`,
   `session.resume`, `session.remove`, `session.remove_accepting_unconfirmed`,
-  `session.fork`, `session.resize`, `session.set_metadata`, `session.rename`,
+  `session.resize`, `session.set_metadata`, `session.rename`,
   and `session.input` with `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
   reports `session.report_agent`, `session.release_agent`, and
   `session.report_native_id` are also deliberately allowed: managed hooks must
@@ -2276,7 +2211,7 @@ that remain are cheap, free-by-default, or inherited:
   peer. The values live in a redacting protocol type, leave the request before
   any record or hook is built, and reach the agent once through the worker's
   private `Initialize` message. They are never persisted, listed, journaled or
-  logged; every declared slot is required on every launch, so a resume, a fork or
+  logged; every declared slot is required on every launch, so a resume or
   a relay-origin launch fails with `secret_env_missing` instead of running with
   the host's own credentials. The residual exposure is the agent's own
   environment, as for profile `[env]`.
@@ -2479,9 +2414,9 @@ Each protocol type has one field policy, kept in the table of
   generated TypeScript). A plain decode, which is the daemon's, refuses an
   unknown key as strictly as `deny_unknown_fields`, so the store, the policy
   files and params stay strict. A decode inside `protocol::tolerant` keeps the
-  keys and serialization writes them back, so `notifications policy set` and
-  `session policy set` return every key they decoded and never reset a
-  setting they do not know. An empty member serializes nothing, so the store
+  keys and serialization writes them back, so `notifications policy set`
+  returns every key it decoded and never resets a
+  setting it does not know. An empty member serializes nothing, so the store
   shape, `policy.json` and every recorded document keep their bytes. `--json`
   prints the kept keys of a scoped type. `NotificationKindPolicy` is a map from
   the wire name of a `NotificationKind` to a boolean, not a struct: the keys it

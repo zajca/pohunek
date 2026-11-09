@@ -240,7 +240,7 @@ separator or format character such as a bidirectional override. The name is
 stored in the logical session record, so it survives daemon and worker loss.
 
 A runtime package can also hand the name to its agent: the Claude Code package
-passes `--name=<name>` at launch, resume and fork, so the agent shows it in its
+passes `--name=<name>` at launch and resume, so the agent shows it in its
 prompt box and title, and a rename reaches the agent only at the next resume
 (see [the Claude package](../guides/claude-package.md#session-name) and
 [session name arguments](../guides/runtime-packages.md#session-name-arguments)).
@@ -318,8 +318,7 @@ predicates are all required to match, including contradictory values for the
 same key, which produce no sessions. These options affect selection only and do
 not add metadata to the human table or quiet output.
 
-A session records which session created it. When `session.new` or
-`session.fork` carries the request origin pair (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`;
+A session records which session created it. When `session.new` carries the request origin pair (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`;
 the CLI and the Rust client send the inherited pair unless the Rust client
 selects `OriginSource::Omitted`, and the TypeScript SDK sends it only when
 `ConnectOptions.origin` is set), the daemon
@@ -327,8 +326,7 @@ stores it as the immutable `spawned_by` (`session_id`, `daemon_id`) of the new
 session, and `session inspect --json` and `session list --json` report it. A
 request without an origin records nothing; `daemon_id` names the daemon instance
 that launched the spawner's runtime (an earlier instance on this host or another
-host) and is kept as received, never resolved against local sessions; a fork does
-not inherit the source session's value. `pohunek session list --spawned-by <session-id>` returns
+host) and is kept as received, never resolved against local sessions. `pohunek session list --spawned-by <session-id>` returns
 exactly the sessions that session spawned and combines with `--meta-eq`,
 `--meta-has` and `--filter` using AND semantics. The link is attribution written
 by the host from the request origin, not a security boundary: a process of the
@@ -671,9 +669,7 @@ the reason codes are in the
 [debug-session-runtime](../runbooks/debug-session-runtime.md) runbook.
 
 This collection does not change the parent session's
-`activity`, launch identity, or recovery binding. The background snapshot it
-feeds holds an opted-in session's [idle stop](#idle-stop) while it lists live
-work. The hook validates its action
+`activity`, launch identity, or recovery binding. The hook validates its action
 and Pohunek handshake before reading a bounded payload directly from stdin (at
 most 64 KiB, or 1 MiB for the main `Stop`, whose input also carries the final
 assistant message and each task's description and command); it does not create a payload
@@ -974,9 +970,9 @@ identifies the PTY owner and `worker_instance_id` identifies one PTY generation.
 daemon restart preserves both ids. Explicit native recovery preserves the
 logical session id but changes the worker and runtime ids.
 
-`SessionInfo.capabilities.resume` and `.fork` are frozen flags derived from the
-session's native-session launch spec; fork is only offered together with
-resume. Clients must use them instead of guessing from the provider name. Long-lived
+`SessionInfo.capabilities.resume` is a frozen flag derived from the session's
+native-session launch spec. `SessionInfo.capabilities.fork` is always `false` and
+stays in the session JSON. Clients must use the flags instead of guessing from the provider name. Long-lived
 wire counters (`runtime_generation`, output offsets, terminal watermarks, hook
 sequences, and subagent revisions) are canonical unsigned decimal strings so JavaScript clients do
 not lose precision.
@@ -1197,7 +1193,7 @@ branch (when the session has one), and live agent state. The menu owns kill
 confirmation (`k` then `y`), terminate and delete (`t` then `y`, which stops the
 session, removes it from the registry, and deletes its pohunek-owned worktree
 checkout including uncommitted changes while keeping the branch), detach (`d`),
-new session in the same worktree (`n`), fork (`f`), and rename (`r`). Agent output received while the menu is
+new session in the same worktree (`n`), and rename (`r`). Agent output received while the menu is
 open is buffered; closing the menu restores the frozen screen, replays that raw
 output, and resumes passthrough without losing terminal modes or scroll margins.
 
@@ -1280,77 +1276,28 @@ worker discovery, the job listing or the journal scan failed, or a rejected
 store line names no session, it deletes nothing. A launch whose directory is not a private directory of the daemon's user fails
 with `session_tmpdir_unsafe` before the agent starts.
 
-## Idle stop
-
-An agent session launched for one task stays `running` and `idle` after the
-agent finishes. A session can opt in to being stopped for that, so interactive
-sessions are never affected: set the metadata key `pohunek.idle_stop_after_secs`
-(`session new --meta pohunek.idle_stop_after_secs=900`, or `session metadata <target> --set pohunek.idle_stop_after_secs=900`)
-to a number of seconds, or to `default` to use the host default that
-`pohunek session policy set --idle-stop-after <seconds>` sets (`0` clears it;
-`pohunek session policy get` shows it). The smallest accepted time is 60 seconds.
-A session without the key, and a `default` session while no default is set, is
-never stopped.
-
-The clock starts when the agent's activity becomes `idle` and restarts on every
-activity change; a daemon restart starts it again when the session is adopted. A
-session is never stopped while it is `working` or `blocked`, while an
-`agent_blocked` or `approval_required` notification for it is still unread or
-read (acknowledge it first), while a `session.input`, `session.wait` or
-`session.wait_turn` call waits on it, or while the notification store is
-unavailable (its attention records are then unknown, so no session is stopped
-until the daemon runs over a usable store). The stop is an ordinary `session stop`: the
-worktree is kept, the `session-stop` hook fires, and the session can be resumed.
-The idle clock and the reported activity are memory only, so after a daemon
-restart a session is armed again when it reports `idle` again.
-
-A session whose `background` snapshot lists live background work is not idle
-for this purpose, although its `activity` stays `idle` (the turn ended and the
-session accepts input): stopping it would kill that work mid-run. The kinds
-that hold are `subagent`, `workflow`, `shell`, `monitor` and `mcp_task`, in any
-status the provider lists (it lists only running or pending tasks). A
-`subagent` item does not hold when the `subagents` row with its id is already
-terminal, which covers a listing that lags behind the subagent's own stop hook.
-A `teammate` is listed `running` while it idles, and `dream`, `auto_mode_scan`,
-`memory_import`, `cloud_session` and `other` carry no evidence that their end
-starts a main turn, so none of them holds; a `running` subagent row without a
-background item never holds, which keeps Codex sessions, whose children stay
-`running` after an interrupt, unchanged. A held session has no deadline.
-When the work ends (the next main-turn end lists none, or the snapshot is
-cleared by a release, an owner exit or the end of the runtime) the idle clock
-restarts from that moment, so the session gets a full limit after the work, not
-an instant stop. The hold has no age limit: a long build is never stopped, and a
-task killed from Claude's own task UI without a following turn stays listed
-until the next main-turn end, an owner exit or the runtime end. `session
-inspect` shows each item with its observation time, and `session stop` stops
-the session by hand.
-
-To see why a session stopped, read the daemon log line `session.idle_stop.stopped`
-(INFO) or the `session_stopped` event in the event log. A `system` notification
-with `reason=idle_stop` is recorded only when the notification policy keeps
-`system` records, which the default policy does not (`pohunek notifications
-policy`). The default is a separate file, `<data_dir>/session-idle-stop.json`,
-so an older CLI keeps reading the retention policy unchanged.
-
 ## Retention
 
 A host that runs agents for weeks accumulates logical records for sessions that
 can never be attached again, and those records keep owning their worktrees. The
 daemon therefore runs a retention sweep that ages unavailable sessions out.
 
-The policy lives at `<data_dir>/session-policy.json` and is read with
-`pohunek session policy get` (add `--json` for the machine-readable shape) and
-changed with `pohunek session policy set`, which accepts `--enabled` /
-`--disabled`, `--sweep-interval-secs`, `--terminal-ttl-secs`,
-`--lost-ttl-secs` and `--max-removals-per-sweep`. Unspecified fields keep their
-current value, and the running sweep task picks the new policy up on its next
-cycle, so no daemon restart is needed.
+The policy is a stored file at `<data_dir>/session-policy.json`. `pohunek session
+retention sweep` uses it. The daemon reads the file at startup, so an edit takes
+effect after a daemon restart.
 
 The shipped default is deliberately conservative: sweeps are **disabled**, and
 once enabled they run every 6 hours, keep a terminal (`stopped`/`done`/`failed`)
 session for 30 days, keep a session whose runtime is `lost` for 90 days, and
 remove at most 25 sessions per sweep. The `lost` grace period is the longer one
 because such a session may still be recoverable with `session resume`.
+
+The file is a JSON object with the keys `enabled` (boolean), `sweep_interval_secs`,
+`terminal_ttl_secs`, `lost_ttl_secs` and `max_removals_per_sweep` (positive
+integers, each at or above the minimum the daemon enforces; the cap must be
+greater than zero). The file has mode `0600` in a `0700` directory (`chmod 600`; any other mode stops the daemon at startup). The minimums are 60 for `sweep_interval_secs` and 3600 for `terminal_ttl_secs` and `lost_ttl_secs`. Unknown keys, a value
+below a minimum or a file that is not valid JSON make the daemon refuse to
+start, naming the file.
 
 `pohunek session retention sweep --dry-run` reports exactly what the current
 policy selects without touching anything; `--apply` removes the selection, and
@@ -1474,7 +1421,7 @@ current terminal repaint, followed atomically by live output. It never rebuilds
 the screen from raw bytes emitted at historical terminal sizes.
 Workers negotiated below private protocol v3 cannot guarantee that ordering;
 the daemon returns `attach_snapshot_unsupported`, and the session must be
-restarted on an upgraded worker or forked into a new session.
+restarted on an upgraded worker.
 Interactive attach input is ordered by a stream-scoped sequence and does not
 consume the worker's bounded control-input deduplication capacity. The worker
 acknowledges each attach input frame on the private stream once the program's
@@ -1565,8 +1512,7 @@ version probe to confirm a release in the package's supported range and fails wi
 the parsed release and the supported range, never the probe output. The Hermes operator plugin reports a native
 reference through its bounded lifecycle hooks for a managed Hermes session; it
 does not infer or read one from Hermes state. Its resume capability is
-independent from a temporarily unavailable report; fork is always unsupported
-and rejects before any child/worktree side effect. See
+independent from a temporarily unavailable report. See
 [Hermes operator](../guides/hermes-operator.md) for the typed tool and hook
 boundaries.
 
@@ -1583,24 +1529,17 @@ process itself. An assigned reference is recorded with provenance `assigned`,
 is never identity evidence for ancestry, sequence or pid validation, and is
 persisted before the agent starts, so the session is resumable at once. It goes
 stale when the user switches conversation inside the agent (`/clear`, in-session
-resume) or when the agent never wrote the conversation, so `session.resume` and
-`session.fork` first run the existence check the runtime declared (a bounded,
+resume) or when the agent never wrote the conversation, so `session.resume` first runs the existence check the runtime declared (a bounded,
 shell-free, symlink-free file listing below a declared config home) and fail
 closed with `agent_native_reference_missing` instead of launching an agent into
 an empty conversation; a runtime that declares `check = "none"` is relaunched
 unchecked. Recovery never falls back to another runtime, the shell or
-"continue latest". A fork holds no reference of its own until its launch
-process reports one, regardless of the source reference's provenance; it
-cannot resume its parent's conversation. A runtime whose `assigned` strategy
-declares `assign_fork = true` (the official Pi package) instead launches each
-fork under a reference core generates for it (`--fork <source> --session-id
-<fork>` for Pi), so the fork holds its own `assigned` reference from creation
-and resumes into its own conversation after a stop or a daemon restart. A later validated report always supersedes an
+"continue latest". A later validated report always supersedes an
 assigned reference: an assigned runtime that declares an integration handler and
 hook schema may report, and the report replaces the stored value and its
 provenance (`reported`) in the session, its durable record and its resume
-binding, so `/clear` and in-session resume are followed and `session.resume` and
-`session.fork` launch with the reported conversation. The declared existence
+binding, so `/clear` and in-session resume are followed and `session.resume`
+launches with the reported conversation. The declared existence
 check runs for a still-assigned reference. A hook runtime may declare the same
 kind of check under `[native_reference.existence]` for its id-kind reference;
 the official `claude` package declares one, so its recovery additionally requires a
@@ -1610,7 +1549,7 @@ launch when the file is absent or cannot be verified. A check may also declare
 how the agent moves its store: a variable that names the store directly (the
 check follows it; Pi's `PI_CODING_AGENT_SESSION_DIR`), and launch arguments or
 settings-file keys it cannot follow (Pi's `--session-dir` and `sessionDir`).
-`session.new`, `session.resume` and `session.fork` refuse a launch that moves
+`session.new` and `session.resume` refuse a launch that moves
 the store out of reach with `agent_native_store_relocated` before anything is
 spawned; its hint names the variable to set instead. A tested worker journal
 that carries a newer conversation switch the daemon cannot verify makes both
@@ -1701,39 +1640,24 @@ root included, so its native reference comes only from the worker. Its runtime,
 process-identity, ordering and expiry checks still apply to an admitted report.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
-`session.fork` creates a new pohunek session id and PTY from the source session's
-native agent conversation. The source may still be live; fork does not require a
-terminal state. With `cwd_mode: "same"`, the new session starts in the source
-cwd/worktree. The child begins without its own native recovery reference;
-only its own verified launch-agent report can set one, except for a runtime
-whose assigned reference covers forks (`assign_fork`), where the child starts
-with the reference core assigned to it. The fork argv comes
-from the session's frozen native-session
-launch spec: Claude forks as `claude --resume <native_session_id>
---fork-session`, and a host profile that declares `fork_args` forks with exactly
-those arguments. Codex fork is intentionally not enabled in this daemon contract;
-Codex-backed sessions return the typed `agent_fork_unsupported` error instead
-of fabricating an unsupported branch. Hermes-backed sessions return the same
-typed unsupported error.
-
 Recovery records written by earlier releases are completed when the daemon
 starts, so every such session stays listed with its recovery record. The
-metadata store migration maps the flat `resume_mode`/`ref_kind`/`resumable`/`fork_*`
+metadata store migration maps the flat `resume_mode`/`ref_kind`/`resumable`
 fields of v0.33.0 onto the session's native-session launch spec with the argv
 they already produced. A v0.33.1 record that kept its native reference but lost
 its launch spec is restored with the spec v0.33.1 compiled in for Claude, Codex
 and Hermes, which the migration keeps frozen and never reads from a current
-descriptor (a restored Claude record carries its fork arguments again); for a
+descriptor; for a
 profile or package runtime the spec is resolved by agent name when the record
 is loaded. The migration never launches anything: a restored session stays
-`lost` until an explicit `session.resume`. A record of the built-in Codex,
+`lost` until an explicit `session.resume`. Fork data in a descriptor, host profile
+or stored record from an older release is ignored; the daemon logs a warning for a descriptor or host profile. A record of the built-in Codex,
 Claude Code or Hermes, or of a host profile over one of them, is restored and
-listed, but this daemon compiles none of them in: its resume and fork answer
+listed, but this daemon compiles none of them in: its resume answers
 `runtime_builtin_removed` while no package serves the alias. Once the official
 package serves it, the package adopts the record (see
-[official aliases](../guides/runtime-packages.md#official-aliases)) and resume
-and fork run through it when the recovery contract is honored; otherwise they
-answer `runtime_served_by_package`, and the migration is a new session. A record that
+[official aliases](../guides/runtime-packages.md#official-aliases)) and resume runs through it when the recovery contract is honored; otherwise it
+answers `runtime_served_by_package`, and the migration is a new session. A record that
 cannot be completed (the profile was deleted, no longer runs on the same
 runtime, or declares no native resume) still loads and keeps its place in
 `session list`. The daemon logs `reconcile.native_recovery.unrepairable` at
@@ -1743,7 +1667,7 @@ in it, using the reference in the warning's `detail`. Never resume the old
 record when the native conversation already continues under another session,
 because that would start a second agent on the same native id.
 
-A launch (new, resume or fork) whose agent's installed Claude or Codex hook
+A launch (new or resume) whose agent's installed Claude or Codex hook
 assets are outdated (an older version marker, or content that differs from the
 daemon's embedded script) carries a `hook` warning on the session: its hooks may
 report nothing, so `message` names the `pohunek integration install --agent
@@ -1764,5 +1688,5 @@ Rust SDK's remote path prepends `host '<host>':` to `msg`. Branch on `class`
 and `code` and show `msg` and `recover` verbatim. The full code table is in the Delegated Task
 Errors section of `docs/public-api.md`. Sessions that belong to tasks use
 `worktree_busy` (only observation is admitted while a task occupies the
-worktree), `task_session_ended`, `task_fork_unsupported`, `worktree_in_use`,
+worktree), `task_session_ended`, `worktree_in_use`,
 `worktree_users_changed` and `task_snapshot_retired`.

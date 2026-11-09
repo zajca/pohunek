@@ -46,13 +46,7 @@ Start here:
   [Hermes runtime package](guides/hermes-package.md) documents the official
   Hermes package (the only source of `hermes`) with its operator plugin
   payload, where releases ship it, and how its tests, CI and the release keep
-  it honest. The
-  [workflow plugins guide](guides/workflow-plugins.md) covers owner tooling
-  installed with `pohunek workflow`: the `workflow.toml` manifest, install
-  pinned by the owner's digest with consent, the CLI-owned store, running an
-  action with `pohunek workflow run` (verbatim arguments, `--json` results,
-  environment, context, limits, run log, owner knobs), and the same-UID trust
-  boundary.
+  it honest.
   The [plugin repositories guide](guides/plugin-repositories.md) is the rule
   that a new plugin lives in its own repository and is admitted through the
   plugin index, with the naming, required CI, compatibility declaration, release

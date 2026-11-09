@@ -419,6 +419,19 @@ pub enum Error {
         detail: String,
     },
 
+    /// Units of the removed workflow plugin feature are still installed.
+    #[error(
+        "workflow plugin units are still installed in {}: {}",
+        directory.display(),
+        units.join(", ")
+    )]
+    WorkflowUnitsInstalled {
+        /// The unit directory holding them.
+        directory: std::path::PathBuf,
+        /// File names of the leftover units.
+        units: Vec<String>,
+    },
+
     /// The daemon did not answer as the expected version in time.
     #[error(
         "the daemon did not report version {version} within {} s{}",
@@ -865,31 +878,6 @@ pub enum Error {
     #[cfg(test)]
     #[error("interrupted after step {0:?}")]
     Interrupted(super::record::Step),
-
-    /// A workflow plugin refuses the service uninstall, with the code,
-    /// message, recovery and class its `pohunek workflow` error carries.
-    #[error("{message}")]
-    Workflow {
-        /// The stable code of the workflow error.
-        code: &'static str,
-        /// The message of the workflow error.
-        message: String,
-        /// The recovery hint of the workflow error.
-        hint: &'static str,
-        /// The error class of the workflow error.
-        class: protocol::ErrorClass,
-    },
-}
-
-impl From<crate::workflow::Error> for Error {
-    fn from(error: crate::workflow::Error) -> Self {
-        Self::Workflow {
-            code: error.code(),
-            message: error.to_string(),
-            hint: error.hint(),
-            class: error.class(),
-        }
-    }
 }
 
 /// What a `refresh-path` run did to `service.toml`, observed after it ended.
@@ -1132,6 +1120,7 @@ impl Error {
             Self::Supervisor { .. } => "service_supervisor_failed",
             Self::VerifierMissing => "service_verifier_missing",
             Self::UnitVerification { .. } => "service_unit_invalid",
+            Self::WorkflowUnitsInstalled { .. } => "service_workflow_units_installed",
             Self::DaemonNotReady { .. } => "service_daemon_not_ready",
             Self::SupervisedVersion { .. } => "service_daemon_version_unexpected",
             Self::Control { .. } => "service_daemon_request_failed",
@@ -1176,7 +1165,6 @@ impl Error {
             Self::RollbackFailed { .. } => "service_rollback_failed",
             #[cfg(test)]
             Self::Interrupted(_) => "service_interrupted",
-            Self::Workflow { code, .. } => code,
         }
     }
 
@@ -1213,6 +1201,13 @@ impl Error {
             Self::StopTimeout { .. } => {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
+            Self::WorkflowUnitsInstalled { .. } => Some(if cfg!(target_os = "macos") {
+                "remove each listed agent: `launchctl bootout gui/$(id -u)/<label>` with the file name \
+                 without `.plist` as the label, then delete the file; then retry"
+            } else {
+                "stop and remove each listed unit: `systemctl --user disable --now <unit>`, delete \
+                 the file, run `systemctl --user daemon-reload`; then retry"
+            }),
             Self::UpgradeAtRisk {
                 warnings, resumed, ..
             } => {
@@ -1285,7 +1280,6 @@ impl Error {
             Self::NonUtf8Env { .. } => {
                 Some("point the named variable at a UTF-8 path, then retry")
             }
-            Self::Workflow { hint, .. } => Some(hint),
             Self::MissingEnv { var } if var == pohunek_paths::HOME => Some(
                 "set HOME to your existing home directory, the session workers' working directory, then retry",
             ),

@@ -876,7 +876,7 @@ fn placement_check(
 }
 
 /// The check that reports the metadata-store lines no loader accepts. It
-/// carries counts and the command that lists them, never a line's text.
+/// carries counts, never a line's text.
 fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
     match state {
         RejectedLinesState::Counted { total: 0, .. } => check(
@@ -896,7 +896,7 @@ fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
                 METADATA_STORE_REJECTED_LINES_CHECK,
                 DoctorStatus::Warn,
                 &format!(
-                    "The metadata store keeps {total} line(s) this build cannot load; {effect}. Run `pohunek store rejected list`, then `pohunek store rejected set-aside <content-hash>`."
+                    "The metadata store keeps {total} line(s) this build cannot load; {effect}. See docs/knowledge/runbooks/runtime-package-recovery.md."
                 ),
             )
         }

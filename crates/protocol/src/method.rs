@@ -25,21 +25,18 @@ use crate::{
     PackageUninstallResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
     ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, RuntimeInventoryResult, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionIdleStopParams, SessionIdleStopResult, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionOutputParams, SessionOutputResult, SessionPolicyParams, SessionPolicyResult,
-    SessionReadParams, SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
-    SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, StoreRejectedListResult,
-    StoreRejectedSetAsideParams, StoreRejectedSetAsideResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionDiffParams, SessionDiffResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionResumeResult, SessionRetentionParams, SessionRetentionResult, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
+    SessionWaitParams, SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -169,15 +166,6 @@ method_table!(
     "SessionListParams",
     "SessionInfo[]";
 
-    /// List authenticated and quarantined durable worker endpoints.
-    SessionRuntimeInventory,
-    SESSION_RUNTIME_INVENTORY,
-    "session.runtime_inventory",
-    (),
-    RuntimeInventoryResult,
-    "null",
-    "RuntimeInventoryResult";
-
     /// Inspect one session.
     SessionInspect,
     SESSION_INSPECT,
@@ -204,15 +192,6 @@ method_table!(
     SessionResumeResult,
     "SessionResumeParams",
     "SessionResumeResult";
-
-    /// Fork a native agent conversation into a new pohunek session.
-    SessionFork,
-    SESSION_FORK,
-    "session.fork",
-    SessionForkParams,
-    SessionForkResult,
-    "SessionForkParams",
-    "SessionForkResult";
 
     /// Evict a session from the registry, stopping it first if still live.
     SessionRemove,
@@ -388,42 +367,6 @@ method_table!(
     SessionDiffResult,
     "SessionDiffParams",
     "SessionDiffResult";
-
-    /// Read the session retention policy.
-    SessionPolicyGet,
-    SESSION_POLICY_GET,
-    "session.policy.get",
-    (),
-    SessionPolicyResult,
-    "null",
-    "SessionPolicyResult";
-
-    /// Replace the session retention policy.
-    SessionPolicySet,
-    SESSION_POLICY_SET,
-    "session.policy.set",
-    SessionPolicyParams,
-    SessionPolicyResult,
-    "SessionPolicyParams",
-    "SessionPolicyResult";
-
-    /// Read the host default of the idle-stop duration.
-    SessionIdleStopGet,
-    SESSION_IDLE_STOP_GET,
-    "session.idle_stop.get",
-    (),
-    SessionIdleStopResult,
-    "null",
-    "SessionIdleStopResult";
-
-    /// Replace the host default of the idle-stop duration.
-    SessionIdleStopSet,
-    SESSION_IDLE_STOP_SET,
-    "session.idle_stop.set",
-    SessionIdleStopParams,
-    SessionIdleStopResult,
-    "SessionIdleStopParams",
-    "SessionIdleStopResult";
 
     /// Run one session retention sweep.
     SessionRetentionSweep,
@@ -742,25 +685,6 @@ method_table!(
     PackageBindProfileResult,
     "PackageBindProfileParams",
     "PackageBindProfileResult";
-
-    /// List the metadata-store lines no loader accepts (local-only).
-    StoreRejectedList,
-    STORE_REJECTED_LIST,
-    "store.rejected_list",
-    (),
-    StoreRejectedListResult,
-    "null",
-    "StoreRejectedListResult";
-
-    /// Move a rejected metadata-store line into the quarantine file
-    /// (local-only).
-    StoreRejectedSetAside,
-    STORE_REJECTED_SET_ASIDE,
-    "store.rejected_set_aside",
-    StoreRejectedSetAsideParams,
-    StoreRejectedSetAsideResult,
-    "StoreRejectedSetAsideParams",
-    "StoreRejectedSetAsideResult";
 
     /// Run one command a package declared, once, and return its stdout.
     CommandRun,

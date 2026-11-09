@@ -104,13 +104,6 @@ export type HostCapabilities = {
    */
   session_new_request_id_supported?: boolean;
   /**
-   * Whether the daemon serves `session.idle_stop.get` and
-   * `session.idle_stop.set` and stops sessions opted in to idle stop.
-   *
-   * Omitted when `false`, like [`Self::session_wait_turn_supported`].
-   */
-  session_idle_stop_supported?: boolean;
-  /**
    * Whether `package.install` and `package.link` accept `accept_commands`
    * and install packages that declare commands.
    *

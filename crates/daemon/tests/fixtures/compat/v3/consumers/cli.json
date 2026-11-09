@@ -244,18 +244,6 @@
       }
     },
     {
-      "label": "session.runtime_inventory",
-      "line": {
-        "v": {
-          "minimum": 3,
-          "maximum": 3
-        },
-        "id": "sdk-session.runtime_inventory-00000000000000000000-0",
-        "method": "session.runtime_inventory",
-        "params": null
-      }
-    },
-    {
       "label": "notification.list",
       "line": {
         "v": {

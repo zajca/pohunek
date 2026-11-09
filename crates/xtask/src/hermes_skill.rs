@@ -33,7 +33,7 @@ const REQUIRED_TOOLS: [&str; 7] = [
     "pohunek_session_wait",
     "pohunek_session_diff",
 ];
-const REGISTERED_TOOLS: [&str; 16] = [
+const REGISTERED_TOOLS: [&str; 15] = [
     "pohunek_hosts",
     "pohunek_sessions",
     "pohunek_session_get",
@@ -44,7 +44,6 @@ const REGISTERED_TOOLS: [&str; 16] = [
     "pohunek_session_start",
     "pohunek_session_send",
     "pohunek_session_resume",
-    "pohunek_session_fork",
     "pohunek_session_resize",
     "pohunek_session_rename",
     "pohunek_session_set_metadata",
@@ -463,7 +462,7 @@ mod tests {
     #[test]
     fn validator_requires_exact_seven_and_sixteen_tool_contract() {
         let root = temp_root();
-        let missing = tool_lines(&REGISTERED_TOOLS[..15]);
+        let missing = tool_lines(&REGISTERED_TOOLS[..14]);
         let plugin = format!("name: pohunek\nprovides_tools:\n{missing}provides_hooks:\n");
         write_sources(root.path(), source(), &plugin);
         render(root.path()).expect_err("missing registered tool must fail");
@@ -484,7 +483,6 @@ mod tests {
             REGISTERED_TOOLS[12],
             REGISTERED_TOOLS[13],
             REGISTERED_TOOLS[14],
-            REGISTERED_TOOLS[15],
         ]);
         let plugin = format!("name: pohunek\nprovides_tools:\n{reordered}provides_hooks:\n");
         write_sources(root.path(), source(), &plugin);

@@ -310,46 +310,6 @@ pub(super) async fn register(
     settle(directory, &file_name, &parked, leftover, outcome, operation)
 }
 
-/// Bootstraps the existing `<label>.plist` in `directory` into `domain`
-/// without rewriting it.
-///
-/// A label loaded by a concurrent bootstrap or a login counts as loaded. The
-/// definition stays in place whatever the outcome, because it is the
-/// installed definition, not a replacement.
-///
-/// # Errors
-///
-/// Returns the `bootstrap` failure, [`ExternalVolume`] inside
-/// [`Error::Unavailable`] when launchd refused a definition outside the boot
-/// volume group, and [`Error::DomainUnavailable`] for a missing domain.
-#[cfg_attr(
-    not(target_os = "macos"),
-    expect(
-        dead_code,
-        reason = "only the macOS backend starts installed plugin units"
-    )
-)]
-pub(super) async fn load(
-    launchctl: &Launchctl,
-    domain: &str,
-    operation: &'static str,
-    id: &ServiceId,
-    label: &str,
-    directory: &TrustedDir,
-) -> Result<(), Error> {
-    let file_name = definition_name(label);
-    match bootstrap(
-        launchctl, domain, operation, id, label, directory, &file_name,
-    )
-    .await
-    {
-        Outcome::Kept(Ok(()) | Err(Error::AlreadyRegistered(_))) => Ok(()),
-        Outcome::Kept(Err(error)) | Outcome::Refused(error) | Outcome::Unpublished(error) => {
-            Err(error)
-        }
-    }
-}
-
 /// Bootstraps the published `file_name` and classifies what launchd loaded.
 async fn bootstrap(
     launchctl: &Launchctl,

@@ -1,5 +1,5 @@
 //! A stopped session launched from an official package version is adopted by a
-//! newer version of the same package on resume and fork, and stays on its
+//! newer version of the same package on resume, and stays on its
 //! exact digest in every other case.
 //!
 //! The packages are the official Claude, Codex and Pi packages as they ship,
@@ -381,41 +381,6 @@ async fn assert_resume_adopted(tag: &str, kind: &Kind) {
         .expect("remove the resumed session");
 }
 
-/// A same-directory fork of session `id`.
-fn fork_params(id: &SessionId) -> protocol::SessionForkParams {
-    protocol::SessionForkParams {
-        session_id: id.clone(),
-        name: None,
-        cwd_mode: protocol::ForkCwdMode::Same,
-        cols: 100,
-        rows: 30,
-        accept_profile_change: false,
-    }
-}
-
-/// A fork of a stopped session of `kind` runs through the newer version and the
-/// fork is pinned to it, while the source keeps its pin until it resumes.
-async fn assert_fork_adopted(tag: &str, kind: &Kind) {
-    let (session, old, new) = moved_to_newer(tag, kind).await;
-    let restarted = restart(&session.fixture).await;
-    let forked = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect("the newer version adopts the fork");
-    assert_eq!(pinned_digest(&session.store_path, &forked.id), new.digest);
-    assert_eq!(
-        pinned_digest(&session.store_path, &session.id),
-        old.digest,
-        "the source keeps its own pin until it is resumed"
-    );
-    restarted
-        .registry
-        .remove(&forked.id)
-        .await
-        .expect("remove the fork");
-}
-
 #[tokio::test]
 async fn a_newer_package_version_adopts_a_stopped_claude_session_whose_profile_moved_to_it() {
     assert_resume_adopted("newer-adopts-claude", &CLAUDE).await;
@@ -429,29 +394,6 @@ async fn a_newer_package_version_adopts_a_stopped_codex_session_whose_profile_mo
 #[tokio::test]
 async fn a_newer_package_version_adopts_a_stopped_pi_session_whose_profile_moved_to_it() {
     assert_resume_adopted("newer-adopts-pi", &PI).await;
-}
-
-#[tokio::test]
-async fn a_newer_package_version_adopts_a_fork_of_a_stopped_claude_session() {
-    assert_fork_adopted("newer-adopts-fork-claude", &CLAUDE).await;
-}
-
-#[tokio::test]
-async fn a_newer_package_version_adopts_a_fork_of_a_stopped_pi_session() {
-    assert_fork_adopted("newer-adopts-fork-pi", &PI).await;
-}
-
-#[tokio::test]
-async fn a_codex_session_stays_unforkable_once_a_newer_version_adopts_it() {
-    let (session, old, _new) = moved_to_newer("newer-codex-no-fork", &CODEX).await;
-    let restarted = restart(&session.fixture).await;
-    let refused = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect_err("Codex has no native fork");
-    assert_eq!(refused.code, "agent_fork_unsupported", "{refused:?}");
-    assert_eq!(pinned_digest(&session.store_path, &session.id), old.digest);
 }
 
 #[tokio::test]
@@ -572,13 +514,6 @@ fn path_reference_kind(text: &str) -> String {
     text.replacen("reference_kind = \"id\"", "reference_kind = \"path\"", 1)
 }
 
-fn without_fork(text: &str) -> String {
-    let forking =
-        "[fork]\nsupported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]\n";
-    assert!(text.contains(forking), "Claude forks");
-    text.replacen(forking, "[fork]\nsupported = false\n", 1)
-}
-
 fn other_assignment(text: &str) -> String {
     let assigned = "launch_args = [\"--session-id\", \"{reference}\"]";
     assert!(text.contains(assigned), "Pi assigns its reference");
@@ -664,12 +599,6 @@ async fn a_newer_version_that_does_not_adopt_keeps_the_session_on_its_frozen_dig
             name: "another reference kind",
             kind: &CODEX,
             newer: Newer::Edited(path_reference_kind),
-            expected: Expected::Frozen,
-        },
-        FailClosed {
-            name: "no fork where the frozen launch forks",
-            kind: &CLAUDE,
-            newer: Newer::Edited(without_fork),
             expected: Expected::Frozen,
         },
         FailClosed {
@@ -1180,8 +1109,8 @@ async fn a_planned_digest_with_an_explicit_digest_record_is_not_the_official_new
     .await;
 }
 
-/// Arms `registry` to park its next resume or fork once its recovery
-/// definition is resolved.
+/// Arms `registry` to park its next resume once its recovery definition is
+/// resolved.
 fn arm_definition_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
     let gate = crate::runtime::lifecycle::tests::StartGate {
         session_id: None,
@@ -1235,12 +1164,11 @@ fn revision_on(
         .expect("a profile has a revision")
 }
 
-/// A resume or fork (`fork`) of a session on the older version resolves its
-/// recovery definition once. The profile is repinned to the newer version, which
-/// would adopt the session, after the definition resolved: the operation
-/// launches the digest it resolved, and the profile revision it records
-/// describes that digest.
-async fn assert_repin_during_recovery(tag: &str, fork: bool) {
+/// A resume of a session on the older version resolves its recovery definition
+/// once. The profile is repinned to the newer version, which would adopt the
+/// session, after the definition resolved: the operation launches the digest it
+/// resolved, and the profile revision it records describes that digest.
+async fn assert_repin_during_recovery(tag: &str) {
     let old = CLAUDE.older();
     let new = CLAUDE.newer();
     let session = stopped_on(tag, &CLAUDE, &old, CLAUDE.old_version).await;
@@ -1250,23 +1178,16 @@ async fn assert_repin_during_recovery(tag: &str, fork: bool) {
     let task = tokio::spawn({
         let registry = restarted.registry.clone();
         let id = session.id.clone();
-        async move {
-            if fork {
-                registry.fork(fork_params(&id)).await
-            } else {
-                registry.resume_with(&id, ProfileChange::Refuse).await
-            }
-        }
+        async move { registry.resume_with(&id, ProfileChange::Refuse).await }
     });
     gate.entered.notified().await;
     repin_profile_file(&session.fixture, &old, &new);
     gate.release.notify_one();
-    let recovered = task
-        .await
+    task.await
         .expect("recovery task")
         .expect("the operation completes on the definition it resolved");
 
-    let id = if fork { &recovered.id } else { &session.id };
+    let id = &session.id;
     assert_eq!(
         pinned_digest(&session.store_path, id),
         old.digest,
@@ -1279,17 +1200,6 @@ async fn assert_repin_during_recovery(tag: &str, fork: bool) {
     );
     // The repin is part of the profile now: stopping and recovering the session
     // again needs no further decision and adopts the newer version.
-    if fork {
-        let report = native_report_params(
-            &restarted.registry,
-            id.clone(),
-            CLAUDE.runtime.to_owned(),
-            CONVERSATION.to_owned(),
-            None,
-        )
-        .await;
-        assert!(restarted.registry.report_as_root(report).await.recorded);
-    }
     restarted.registry.stop(id).await.expect("stop the session");
     restarted
         .registry
@@ -1359,12 +1269,7 @@ async fn a_metadata_edit_during_a_resume_survives_the_relaunch() {
 
 #[tokio::test]
 async fn a_repin_during_a_resume_leaves_the_binding_and_the_profile_revision_consistent() {
-    assert_repin_during_recovery("repin-during-resume", false).await;
-}
-
-#[tokio::test]
-async fn a_repin_during_a_fork_leaves_the_binding_and_the_profile_revision_consistent() {
-    assert_repin_during_recovery("repin-during-fork", true).await;
+    assert_repin_during_recovery("repin-during-resume").await;
 }
 
 /// A stopped session of the bare Claude runtime (no host profile) launched from
@@ -1455,24 +1360,6 @@ async fn a_newer_package_version_adopts_a_stopped_bare_runtime_session() {
         .remove(&session.id)
         .await
         .expect("remove the resumed session");
-}
-
-#[tokio::test]
-async fn a_newer_package_version_adopts_a_fork_of_a_stopped_bare_runtime_session() {
-    let (session, old, new) = bare_moved_to_newer("bare-adopts-fork").await;
-    let restarted = restart(&session.fixture).await;
-    let forked = restarted
-        .registry
-        .fork(fork_params(&session.id))
-        .await
-        .expect("the newer version adopts the fork");
-    assert_eq!(pinned_digest(&session.store_path, &forked.id), new.digest);
-    assert_eq!(pinned_digest(&session.store_path, &session.id), old.digest);
-    restarted
-        .registry
-        .remove(&forked.id)
-        .await
-        .expect("remove the fork");
 }
 
 /// A session of a host profile whose frozen revision outlives the profile file

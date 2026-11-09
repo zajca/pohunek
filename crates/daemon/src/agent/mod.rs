@@ -22,7 +22,7 @@ mod profile;
 
 pub use launch_env::LaunchEnv;
 pub use native_launch::{
-    ForkArgv, NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
+    NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
 };
 pub(crate) use native_reference::StoreRoot;
 pub(crate) use native_reference::{env_name_problem, is_plain_relative_path};
@@ -459,23 +459,6 @@ pub(crate) fn resume_pty_command_from_launch(
     build_pty_command(program, args, opts)
 }
 
-/// Build the PTY command that forks a native session from a frozen snapshot.
-///
-/// Returns the command with the reference core assigned to the forked
-/// conversation, when the frozen spec assigns forks one.
-pub(crate) fn fork_pty_command_from_launch(
-    program: &str,
-    frozen_args: Vec<String>,
-    launch: &NativeSessionLaunch,
-    session_ref: &SessionRef,
-    opts: &LaunchOpts,
-) -> Result<(LaunchCommand, Option<SessionRef>), ProtocolError> {
-    let ForkArgv { argv, reference } = launch.fork_argv(session_ref)?;
-    let mut args = frozen_args;
-    args.extend(argv);
-    Ok((build_pty_command(program, args, opts)?, reference))
-}
-
 pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -483,10 +466,6 @@ pub(crate) fn agent_not_resumable(agent: &str) -> ProtocolError {
         format!("{agent} sessions cannot be resumed"),
         None,
     )
-}
-
-pub(crate) fn agent_fork_unsupported() -> ProtocolError {
-    ProtocolError::agent_fork_unsupported()
 }
 
 /// Resolve `program` with the shared executable policy of
@@ -574,10 +553,9 @@ mod tests {
 
     use super::host::launch_command;
     use super::{
-        build_pty_command, fork_pty_command_from_launch, resolve_binary,
-        resume_pty_command_from_launch, served_native_launch, trusted_program, which_executable,
-        LaunchCommand, LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef, SessionRefKind,
-        ValidatedLaunchProgram,
+        build_pty_command, resolve_binary, resume_pty_command_from_launch, served_native_launch,
+        trusted_program, which_executable, LaunchCommand, LaunchOpts, NativeArgs,
+        NativeSessionLaunch, SessionRef, SessionRefKind, ValidatedLaunchProgram,
     };
 
     fn launch_opts(cwd: impl AsRef<Path>) -> LaunchOpts {
@@ -996,41 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn fork_pty_command_preserves_claude_argv_with_frozen_args() {
-        in_own_process(|| {
-            let bin_dir = temp_dir("template-fork-bin");
-            write_executable(&bin_dir, "claude-sonnet");
-            let cwd = temp_dir("template-fork-cwd");
-            let session = SessionRef::id("native-123").expect("id ref");
-            let launch =
-                served_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
-
-            let command = with_path(&bin_dir, || {
-                fork_pty_command_from_launch(
-                    "claude-sonnet",
-                    vec!["--model".to_owned(), "sonnet".to_owned()],
-                    &launch,
-                    &session,
-                    &launch_opts(&cwd),
-                )
-                .expect("fork command")
-                .0
-            });
-
-            assert_eq!(
-                command.args,
-                vec![
-                    "--model",
-                    "sonnet",
-                    "--resume",
-                    "native-123",
-                    "--fork-session",
-                ]
-            );
-        });
-    }
-
-    #[test]
     fn hermes_resume_keeps_reference_as_one_argument_after_chat() {
         in_own_process(|| {
             let bin_dir = temp_dir("hermes-resume-bin");
@@ -1089,37 +1032,21 @@ mod tests {
             let path_launch = NativeSessionLaunch::new(
                 SessionRefKind::Path,
                 NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
-                Some(NativeArgs::from_template(&["--fork", "{reference}"]).expect("fork")),
             );
             let path = SessionRef::path(hostile_path).expect("path");
-            let (resume, fork) = with_path(&bin_dir, || {
-                (
-                    resume_pty_command_from_launch(
-                        "myagent",
-                        Vec::new(),
-                        &path_launch,
-                        &path,
-                        &launch_opts(&cwd),
-                    )
-                    .expect("path resume"),
-                    fork_pty_command_from_launch(
-                        "myagent",
-                        Vec::new(),
-                        &path_launch,
-                        &path,
-                        &launch_opts(&cwd),
-                    )
-                    .expect("path fork")
-                    .0,
+            let resume = with_path(&bin_dir, || {
+                resume_pty_command_from_launch(
+                    "myagent",
+                    Vec::new(),
+                    &path_launch,
+                    &path,
+                    &launch_opts(&cwd),
                 )
+                .expect("path resume")
             });
             assert_eq!(
                 resume.args,
                 vec!["--session".to_owned(), hostile_path.to_owned()]
-            );
-            assert_eq!(
-                fork.args,
-                vec!["--fork".to_owned(), hostile_path.to_owned()]
             );
         });
     }

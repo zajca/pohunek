@@ -6,7 +6,7 @@
 mod tests {
     use std::path::Path;
 
-    const REGISTERED_TOOLS: [&str; 16] = [
+    const REGISTERED_TOOLS: [&str; 15] = [
         "pohunek_hosts",
         "pohunek_sessions",
         "pohunek_session_get",
@@ -17,7 +17,6 @@ mod tests {
         "pohunek_session_start",
         "pohunek_session_send",
         "pohunek_session_resume",
-        "pohunek_session_fork",
         "pohunek_session_resize",
         "pohunek_session_rename",
         "pohunek_session_set_metadata",

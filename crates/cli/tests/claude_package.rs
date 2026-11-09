@@ -100,7 +100,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.4.0";
+const PACKAGE_VERSION: &str = "1.5.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -814,11 +814,6 @@ fn the_descriptor_declares_the_verified_claude_launch_contract() {
         native.resume_argv(&reference).expect("resume"),
         ["--resume", reference.value()]
     );
-    assert!(native.supports_fork(), "Claude sessions are forkable");
-    assert_eq!(
-        native.fork_argv(&reference).expect("fork").argv,
-        ["--resume", reference.value(), "--fork-session"]
-    );
 
     assert_eq!(
         definition.integration_handler().map(HandlerId::as_str),
@@ -903,6 +898,15 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
             .expect("a [runtime] table");
         assert!(runtime.remove("detect_manifest").is_some());
         runtime.remove("version_probe");
+        // The frozen built-in descriptor declares fork data the package
+        // does not carry.
+        table.remove("fork");
+        if let Some(reference) = table
+            .get_mut("native_reference")
+            .and_then(toml::Value::as_table_mut)
+        {
+            reference.remove("assign_fork");
+        }
         table
     };
     let mut package = strip(
@@ -912,7 +916,6 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     for section in [
         "input",
         "resume",
-        "fork",
         "native_reference",
         "integration",
         "config_home",
@@ -3113,19 +3116,6 @@ impl Fixture {
             .find(|candidate| candidate.is_file())
     }
 
-    /// How many conversation transcripts Claude has written.
-    fn transcript_count(&self) -> usize {
-        let Ok(folders) = fs::read_dir(self.claude_home.join("projects")) else {
-            return 0;
-        };
-        folders
-            .flatten()
-            .filter_map(|folder| fs::read_dir(folder.path()).ok())
-            .flat_map(Iterator::flatten)
-            .filter(|file| file.path().extension().is_some_and(|ext| ext == "jsonl"))
-            .count()
-    }
-
     /// Stops the session and waits until its runtime is no longer live.
     async fn stop(&self, id: &str) {
         let (code, stopped) = self.harness.json(&["session", "stop", id]).await;
@@ -3524,7 +3514,7 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     let id = launched["id"].as_str().expect("session id").to_owned();
     assert_eq!(launched["agent_base"], "claude");
     assert_eq!(launched["capabilities"]["resume"], true);
-    assert_eq!(launched["capabilities"]["fork"], true);
+    assert_eq!(launched["capabilities"]["fork"], false);
 
     // The launched process is what the package's process matchers describe:
     // the distribution and native-installer binary is named `claude`, the npm
@@ -4167,13 +4157,13 @@ async fn show_named_screen(fixture: &Fixture, id: &str, label: &str) {
     }
 }
 
-/// A session's pohunek name reaches Claude as `--name=<name>` at launch,
-/// resume and fork, from the name the launch uses, and a named session is
-/// detected like an unnamed one. A dash-leading name stays one value, and two
-/// sessions with one name both launch.
+/// A session's pohunek name reaches Claude as `--name=<name>` at launch and
+/// resume, from the name the launch uses, and a named session is detected like
+/// an unnamed one. A dash-leading name stays one value, and two sessions with
+/// one name both launch.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
-async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
+async fn a_real_claude_carries_the_pohunek_name_at_launch_and_resume() {
     require_real_claude();
     let package = installed_definition();
     let fixture = Fixture::start(Seed::Trusted).await;
@@ -4211,7 +4201,7 @@ async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
     show_named_screen(&fixture, &dashed, "launch --help").await;
     fixture.stop(&dashed).await;
 
-    // One turn gives the conversation a transcript to resume and fork.
+    // One turn gives the conversation a transcript to resume.
     fixture.input(&id, PROMPT).await;
     fixture
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
@@ -4242,49 +4232,7 @@ async fn a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork() {
     fixture.wait_screen_line(&id, "beta").await;
     show_named_screen(&fixture, &id, "resume beta").await;
 
-    // Fork: its own name, never the source's.
-    let (code, forked) = fixture
-        .harness
-        .json(&["session", "fork", &id, "--name", "gamma"])
-        .await;
-    assert_eq!(code, 0, "{forked}");
-    let fork_id = forked["ok"]["id"]
-        .as_str()
-        .or_else(|| forked["ok"]["session"]["id"].as_str())
-        .unwrap_or_else(|| panic!("the fork names its session: {forked}"))
-        .to_owned();
-    fixture.wait_activity(&fork_id, "idle").await;
-    let argv = session_argv(&fixture, &fork_id).await;
-    assert_eq!(name_argument(&argv), ["--name=gamma"], "{argv:?}");
-    assert!(argv.iter().any(|argument| argument == "--fork-session"));
-    let (title, rows) = fixture.screen(&fork_id).await;
-    assert!(
-        title
-            .as_deref()
-            .is_some_and(|title| title.contains("gamma"))
-            && !title
-                .as_deref()
-                .is_some_and(|title| title.contains('\u{2442}')),
-        "the fork shows its own name and no fork suffix: {title:?}"
-    );
-    assert!(rows.iter().any(|row| row.contains("gamma")), "{rows:#?}");
-    show_named_screen(&fixture, &fork_id, "fork gamma").await;
-
-    // A fork without a name passes none.
-    let (code, unnamed) = fixture.harness.json(&["session", "fork", &id]).await;
-    assert_eq!(code, 0, "{unnamed}");
-    let unnamed_id = unnamed["ok"]["id"]
-        .as_str()
-        .or_else(|| unnamed["ok"]["session"]["id"].as_str())
-        .unwrap_or_else(|| panic!("the fork names its session: {unnamed}"))
-        .to_owned();
-    fixture.wait_activity(&unnamed_id, "idle").await;
-    let argv = session_argv(&fixture, &unnamed_id).await;
-    assert!(name_argument(&argv).is_empty(), "{argv:?}");
-
-    for stopped in [&unnamed_id, &fork_id, &id] {
-        fixture.stop(stopped).await;
-    }
+    fixture.stop(&id).await;
     fixture.finish().await;
 }
 
@@ -4330,13 +4278,11 @@ async fn a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle(
     fixture.finish().await;
 }
 
-/// Resume and fork launch Claude with the descriptor's arguments and the
-/// hook-reported conversation id: `--resume <id>`, and `--resume <id>
-/// --fork-session` for a fork, which is a new conversation with its own id.
-/// Resuming the fork runs `--resume` with the fork's own id.
+/// Resume launches Claude with the descriptor's arguments and the hook-reported
+/// conversation id: `--resume <id>` for the same conversation.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
-async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
+async fn a_real_claude_resumes_with_the_descriptor_arguments() {
     require_real_claude();
     let package = installed_definition();
     let fixture = Fixture::start(Seed::Trusted).await;
@@ -4355,7 +4301,6 @@ async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
         .expect("the conversation id")
         .to_owned();
 
-    // Resume: the same conversation again, `--resume <id>`.
     fixture.stop(&id).await;
     let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
     assert_eq!(code, 0, "{resumed}");
@@ -4369,10 +4314,6 @@ async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
             .any(|pair| pair[0] == "--resume" && pair[1] == reference),
         "the resumed Claude runs `--resume {reference}`: {argv:?}"
     );
-    assert!(
-        !argv.iter().any(|argument| argument == "--fork-session"),
-        "{argv:?}"
-    );
     let native = package.native().expect("native recovery");
     assert_eq!(
         native
@@ -4384,97 +4325,8 @@ async fn a_real_claude_resumes_and_forks_with_the_descriptor_arguments() {
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;
 
-    // Fork: a new session on a new conversation, `--resume <id> --fork-session`.
-    let (code, forked) = fixture
-        .harness
-        .json(&["session", "fork", &id, "--name", "forked"])
-        .await;
-    assert_eq!(code, 0, "{forked}");
-    let fork_id = forked["ok"]["id"]
-        .as_str()
-        .or_else(|| forked["ok"]["session"]["id"].as_str())
-        .unwrap_or_else(|| panic!("the fork names its session: {forked}"))
-        .to_owned();
-    assert_ne!(fork_id, id);
-    fixture.wait_activity(&fork_id, "idle").await;
-    let forked_process = fixture.inspect(&fork_id).await["pid"]
-        .as_u64()
-        .expect("the fork process id");
-    let forked_argv = command_line(forked_process);
-    assert!(
-        forked_argv.windows(3).any(|triple| triple[0] == "--resume"
-            && triple[1] == reference
-            && triple[2] == "--fork-session"),
-        "the forked Claude runs `--resume {reference} --fork-session`: {forked_argv:?}"
-    );
-    assert_eq!(
-        package
-            .native()
-            .expect("native recovery")
-            .fork_argv(&SessionRef::id(&reference).expect("reference"))
-            .expect("fork argv")
-            .argv,
-        ["--resume", reference.as_str(), "--fork-session"]
-    );
-    // The fork runs a conversation of its own: a second transcript appears
-    // once it takes a turn.
-    fixture.input(&fork_id, "again").await;
-    wait_until("the fork's own transcript", || async {
-        (fixture.transcript_count() == 2).then_some(())
-    })
-    .await;
-
-    let fork_record = fixture.wait_reported_conversation(&fork_id).await;
-    let fork_reference = fork_record["active_agent_session_id"]
-        .as_str()
-        .expect("the fork's own conversation id");
-    assert_ne!(fork_reference, reference);
-    assert_eq!(
-        fork_record["native_session_id"], fork_reference,
-        "the fork adopts only its own verified conversation: {fork_record}"
-    );
-    assert_eq!(
-        fixture.inspect(&id).await["native_session_id"],
-        reference.as_str(),
-        "the fork's report never changes its source's conversation"
-    );
-
-    resume_the_fork(&fixture, &fork_id, fork_reference, &reference).await;
-
-    fixture.stop(&fork_id).await;
     fixture.stop(&id).await;
     fixture.finish().await;
-}
-
-/// Stops the fork `fork_id` and resumes it: Claude relaunches the fork's own
-/// conversation `fork_reference` with `--resume`, neither forking again nor
-/// naming the `source` conversation, and the session keeps that reference.
-async fn resume_the_fork(fixture: &Fixture, fork_id: &str, fork_reference: &str, source: &str) {
-    fixture.stop(fork_id).await;
-    let (code, resumed_fork) = fixture.harness.json(&["session", "resume", fork_id]).await;
-    assert_eq!(code, 0, "{resumed_fork}");
-    fixture.wait_activity(fork_id, "idle").await;
-    let resumed_fork_process = fixture.inspect(fork_id).await["pid"]
-        .as_u64()
-        .expect("the resumed fork process id");
-    let resumed_fork_argv = command_line(resumed_fork_process);
-    assert!(
-        resumed_fork_argv
-            .windows(2)
-            .any(|pair| pair[0] == "--resume" && pair[1] == fork_reference),
-        "the resumed fork runs `--resume {fork_reference}`: {resumed_fork_argv:?}"
-    );
-    assert!(
-        !resumed_fork_argv
-            .iter()
-            .any(|argument| argument == "--fork-session" || argument == source),
-        "the resumed fork neither forks again nor names its source: {resumed_fork_argv:?}"
-    );
-    let resumed_fork_record = fixture.wait_reported_conversation(fork_id).await;
-    assert_eq!(
-        resumed_fork_record["native_session_id"], fork_reference,
-        "the resumed fork keeps its own conversation: {resumed_fork_record}"
-    );
 }
 
 /// A subagent the model starts is reported by the `SubagentStart` and

@@ -5,9 +5,9 @@
 use std::path::PathBuf;
 
 use pohunek_client::{
-    LIFECYCLE_STEP_BOUND_MS, RESUME_SWEEP_PASSES, SESSION_FORK_REQUEST_BUDGET_MS,
-    SESSION_NEW_REQUEST_BUDGET_MS, SESSION_REMOVE_REQUEST_BUDGET_MS,
-    SESSION_RESUME_REQUEST_BUDGET_MS, SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
+    LIFECYCLE_STEP_BOUND_MS, RESUME_SWEEP_PASSES, SESSION_NEW_REQUEST_BUDGET_MS,
+    SESSION_REMOVE_REQUEST_BUDGET_MS, SESSION_RESUME_REQUEST_BUDGET_MS,
+    SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
 };
 use serde_json::{json, Value};
 
@@ -22,7 +22,6 @@ fn the_typescript_sdk_fixture_matches_the_client_budgets() {
         "resume_sweep_passes": RESUME_SWEEP_PASSES,
         "session_new_request_budget_ms": SESSION_NEW_REQUEST_BUDGET_MS,
         "session_resume_request_budget_ms": SESSION_RESUME_REQUEST_BUDGET_MS,
-        "session_fork_request_budget_ms": SESSION_FORK_REQUEST_BUDGET_MS,
         "session_stop_request_budget_ms": SESSION_STOP_REQUEST_BUDGET_MS,
         "worktree_hook_timeout_ms": WORKTREE_HOOK_TIMEOUT_MS,
         "session_remove_request_budget_ms": SESSION_REMOVE_REQUEST_BUDGET_MS,

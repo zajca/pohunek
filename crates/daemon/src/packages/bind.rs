@@ -224,7 +224,7 @@ pub(super) fn bind_profile(
     ensure_coexists(context, &read_state(context)?, retained.gate(), &pin.digest)?;
     let rewritten = apply_pin(file.text(), &pin).map_err(|detail| unusable(name, &detail))?;
     // The candidate must resolve against the target exactly as a launch of it
-    // would (size bound, structure, resume and fork overrides against the
+    // would (size bound, structure, resume overrides against the
     // target's capabilities), in a preview as in a commit, so a published
     // profile is never one the launch or retention path rejects.
     let definition = context

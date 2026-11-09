@@ -138,11 +138,18 @@ live workers keep running from their versioned directory. Agents receive only
 an allowlisted base environment (`[environment] allowlist` in `service.toml`)
 rather than the daemon's whole environment. `pohunek service uninstall` refuses
 while sessions are live unless `--stop-sessions` is given, and keeps durable
-metadata unless `--purge` is given.
+metadata unless `--purge` is given. `pohunek service check`, `upgrade` and
+`uninstall` also refuse with `service_workflow_units_installed` while units of the
+removed workflow plugin feature remain in the unit directory (systemd
+`pohunek-<namespace>-wf-*.service` and `.timer`, launchd
+`io.github.zajca.pohunek.<namespace>.wf.*.plist`); the error names each one. Stop
+and delete them (`systemctl --user disable --now <unit>` and
+`systemctl --user daemon-reload`, or `launchctl bootout gui/$(id -u)/<label>`),
+then retry.
 
 `pohunek service upgrade` first runs a read-only preflight with the new
 binaries. It judges every live session and every stopped session that keeps
-native resume or fork, and refuses while one would lose its recovery or would
+native resume, and refuses while one would lose its recovery or would
 not be adopted by the new daemon (`service_upgrade_sessions_at_risk`, listing
 each session with a reason code). The same preflight carries the release's
 official runtime plan: the packages the upgrade installs and the profiles it
@@ -153,7 +160,7 @@ sessions, leaves its stopped sessions resumable (a resume relaunches them from
 the package digest), and reinstalls the hooks. A host already on official
 packages gets the release's versions: profiles pinned to an older version of the
 same official package are repinned, and its stopped sessions move to the newer
-version on their next resume or fork, see the update runbook. An accepted risk is remembered:
+version on their next resume, see the update runbook. An accepted risk is remembered:
 after `--accept-runtime-loss` the completed upgrade records each verdict the daemon binds to a
 scope, and the next upgrade lists the identical risk as previously accepted instead of refusing
 (see the update runbook); no session is changed by that. `--accept-runtime-loss` is only
@@ -328,13 +335,10 @@ it (input, attach, resize, rename, metadata) is refused too
 (`runtime_builtin_removed`; only stop and remove work), so its work cannot be
 finished until the package is installed. With the official package installed,
 the package adopts the session, live or stopped, whatever its version, and
-serves its input again. Resume and fork then run through the package, and the
+serves its input again. Resume then runs through the package, and the
 relaunched run is pinned to the package digest. A session whose recovery the
-package cannot honor (its native reference kind, a hook-reported reference, or
-fork support for a fork), and a session record of v0.33.0 that names no package,
-answer `runtime_served_by_package`, and its work continues in a new session. A
-fork of a Hermes session answers `agent_fork_unsupported`, because Hermes has no
-native fork. A host on an
+package cannot honor (its native reference kind or a hook-reported reference), and a session record of v0.33.0 that names no package,
+answer `runtime_served_by_package`, and its work continues in a new session. A host on an
 earlier release that runs the built-in Claude Code or Codex needs no package
 install before upgrading: the upgrade from a release with the official runtime
 step installs and pins the packages itself, see the
@@ -407,7 +411,7 @@ in [the architecture](architecture.md#runtime-packages-and-trust) and the
 
 Pi (`pi`, the Pi coding agent) is an optional runtime delivered as a runtime
 package, not compiled into the daemon. The package declares launch, native
-resume and fork, input framing, and detection for Pi `1.x` from `1.0.0` (verified
+resume, input framing, and detection for Pi `1.x` from `1.0.0` (verified
 on `1.4.0`, with the `1.0.2` captures kept as the previous release); the supported range and the verified release are in
 `compat/pi/compatibility-lock.json`. It needs a
 Pi on the daemon's `PATH` (`npm install --global
@@ -430,18 +434,11 @@ pohunek session new --agent pi --name "refactor-parser" --input "Refactor the pa
 
 - Pi chooses its own conversation file from the session id the daemon passes
   at launch (`pi --session-id <id>`), so `pohunek session resume` runs
-  `pi --session <id>` and `pohunek session fork` runs
-  `pi --fork <id> --session-id <fork id>` under a second id the daemon
-  generates for the fork.
+  `pi --session <id>`.
 - Pi writes its session file only after the first model reply. A session that
   never got one has nothing to resume, and resume is refused with
   `agent_native_reference_missing` before anything launches. The same code
   answers a session file that was deleted.
-- A forked session holds its own reference from the start: Pi writes the
-  fork's session file `<time>_<fork id>.jsonl` at once, before any model
-  reply, so `pohunek session resume` reopens the fork with
-  `pi --session <fork id>`. Forks get their own reference from Pi package
-  1.0.1 on; a session launched from package 1.0.0 keeps forks without one.
 - Recovery looks for the session file below `PI_CODING_AGENT_DIR` (default
   `~/.pi/agent`) in `sessions/`, or directly in `PI_CODING_AGENT_SESSION_DIR`
   when the profile `[env]` (or the daemon's environment) sets it to an absolute

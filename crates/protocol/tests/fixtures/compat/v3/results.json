@@ -225,33 +225,6 @@
       ]
     },
     {
-      "method": "session.runtime_inventory",
-      "result": {
-        "entries": [
-          {
-            "claimed_session_id": "s-42",
-            "reason": "authenticated",
-            "runtime_id": "runtime-42",
-            "runtime_slot": "slot-1",
-            "status": "managed",
-            "worker_id": "worker-1"
-          },
-          {
-            "claimed_session_id": "s-77",
-            "reason": "no durable session record",
-            "runtime_id": "runtime-77",
-            "runtime_slot": "slot-2",
-            "status": "orphaned",
-            "worker_id": "worker-2"
-          },
-          {
-            "runtime_slot": "slot-3",
-            "status": "incompatible"
-          }
-        ]
-      }
-    },
-    {
       "method": "session.inspect",
       "result": {
         "active_agent": "claude",
@@ -429,93 +402,6 @@
           ],
           "worktree_path": "/workspace/project/.worktrees/feature-auth"
         }
-      }
-    },
-    {
-      "method": "session.fork",
-      "result": {
-        "active_agent": "claude",
-        "active_agent_base": "claude",
-        "active_agent_pid": 4300,
-        "active_agent_session_id": "claude-active-abc",
-        "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
-        "activity": "working",
-        "agent": "claude",
-        "agent_base": "claude",
-        "applied_input": false,
-        "branch": "feature/auth",
-        "capabilities": {
-          "fork": true,
-          "resume": true
-        },
-        "cols": 120,
-        "created_at": "2026-06-17T10:00:00Z",
-        "cwd": "/workspace/project/.worktrees/feature-auth",
-        "cwd_source": "osc7",
-        "exit_code": 0,
-        "external": false,
-        "id": "s-42",
-        "is_linked_worktree": true,
-        "metadata": {
-          "owner": "cli",
-          "ticket": "DMD-1356"
-        },
-        "name": "review auth flow",
-        "native_session_id": "claude-native-abc",
-        "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
-        "pid": 4242,
-        "project_id": "p-7",
-        "project_label": "project",
-        "repo": "/workspace/project",
-        "rows": 40,
-        "runtime": {
-          "last_connected_at": "2026-06-17T10:05:00Z",
-          "loss_reason": "worker control socket closed",
-          "runtime_generation": "3",
-          "runtime_id": "runtime-42",
-          "started_at": "2026-06-17T10:00:00Z",
-          "state": "live",
-          "worker_id": "worker-1"
-        },
-        "state": "running",
-        "state_source": "report",
-        "subagents": [
-          {
-            "activity": "working",
-            "agent_type": "code-reviewer",
-            "finished_at_ms": 1781690520000,
-            "id": "sub-1",
-            "lifecycle": "running",
-            "parent_id": "sub-0",
-            "provider": "claude",
-            "revision": "4",
-            "started_at_ms": 1781690400000,
-            "updated_at_ms": 1781690460000
-          }
-        ],
-        "updated_at": "2026-06-17T10:01:00Z",
-        "warnings": [
-          {
-            "detail": "could not resolve host: github.com",
-            "kind": "fetch",
-            "message": "git fetch failed"
-          },
-          {
-            "kind": "base_branch_fallback",
-            "message": "base branch main not found, using master"
-          },
-          {
-            "detail": "exit status: 1",
-            "kind": "setup_script",
-            "message": "setup script exited with status 1"
-          },
-          {
-            "detail": "timed out after 30s",
-            "kind": "hook",
-            "message": "post-create hook timed out"
-          }
-        ],
-        "worktree_path": "/workspace/project/.worktrees/feature-auth"
       }
     },
     {
@@ -1046,30 +932,6 @@
         "base": "main",
         "diff": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
         "truncated": false
-      }
-    },
-    {
-      "method": "session.policy.get",
-      "result": {
-        "retention": {
-          "enabled": true,
-          "lost_ttl_secs": 3600,
-          "max_removals_per_sweep": 25,
-          "sweep_interval_secs": 600,
-          "terminal_ttl_secs": 86400
-        }
-      }
-    },
-    {
-      "method": "session.policy.set",
-      "result": {
-        "retention": {
-          "enabled": true,
-          "lost_ttl_secs": 3600,
-          "max_removals_per_sweep": 25,
-          "sweep_interval_secs": 600,
-          "terminal_ttl_secs": 86400
-        }
       }
     },
     {

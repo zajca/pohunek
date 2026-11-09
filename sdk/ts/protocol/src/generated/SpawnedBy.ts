@@ -6,7 +6,7 @@ import type { SessionId } from "./SessionId";
  * The origin pair of the request that created a session.
  *
  * The daemon copies the pair from the request envelope when it handles
- * `session.new` or `session.fork`; a client cannot supply it as a parameter.
+ * `session.new`; a client cannot supply it as a parameter.
  * The record is attribution, not a security boundary: a process of the same
  * user can omit the origin variables, and then nothing is recorded. The pair
  * is kept as received and is never resolved against the sessions of this

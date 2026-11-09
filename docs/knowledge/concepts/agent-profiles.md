@@ -34,7 +34,7 @@ A profile can also declare `secret_env = ["NAME", ...]`: variables whose values
 come from the `session.new` request (`secret_env` map) instead of the file. The
 profile owns the names, every declared name is required on every launch, and
 the values reach only the agent process; they are never stored, listed or
-logged, and `session.resume`, `session.fork` and relay launches of such a
+logged, and `session.resume` and relay launches of such a
 profile fail with `secret_env_missing`. A client checks
 `HostCapabilities.session_new_secret_env_supported` before sending the map. The API contract is the "Secret session environment" section of the public API
 reference.
@@ -160,14 +160,14 @@ Codex and Claude packages' `--version` probe; a custom runtime's wrapper must
 handle the probe arguments that its own package declares.
 
 Hermes profiles use `base = "hermes"`. Their program and fixed arguments may
-wrap the local terminal command, but they cannot enable fork semantics. The
+wrap the local terminal command. The
 package's bare launch is exactly `hermes chat`; a valid native reference resumes
 only as `hermes chat --resume <reference>`. The separately selected Hermes
 operator plugin provides lifecycle hooks, typed tools, and a generated skill in
 an isolated profile or custom absolute home; it never reads the profile's
 `state.db`. See [Hermes operator](../guides/hermes-operator.md).
 
-Resume and fork come from one native-session launch spec frozen into each
+Resume comes from one native-session launch spec frozen into each
 session at creation (see below). Clients read `SessionInfo.capabilities` rather
 than branching on profile or base-kind names.
 An unknown future base-kind string is presentation-only: it can be displayed
@@ -250,11 +250,11 @@ reveals no environment value, and an unreadable key fails closed with
 caller exists yet; it depends on the locally approved host share of
 [#82](https://github.com/zajca/pohunek/issues/82).
 
-## Resuming and forking a profile-backed session
+## Resuming a profile-backed session
 
 A session launched from a host profile freezes the profile's keyed revision
-into its resume binding when it is created. Resume and fork resolve the profile
-once, compare its current revision with the frozen one, and relaunch under that
+into its resume binding when it is created. Resume resolves the profile
+once, compares its current revision with the frozen one, and relaunches under that
 single resolution only while they match:
 
 - an edited profile (its text, `[env]`, detection manifest, runtime binding,
@@ -270,7 +270,7 @@ The migration pin is not an edit. When an official package adopts a built-in
 session, `plugin profile migrate` (or `package.bind_profile`) adds the `package`
 and `digest` keys to its profile. The revision is keyed over the profile text
 without those two keys, so a session whose frozen revision was keyed over the profile
-without the pin resumes and forks without the decision when the profile differs
+without the pin resumes without the decision when the profile differs
 only by the pin. The rule applies only to a built-in binding the package serves, and never to
 a session whose frozen revision is absent or whose pin is a package pin. Any other
 change to the profile still needs the decision.
@@ -278,7 +278,7 @@ change to the profile still needs the decision.
 This is what keeps a switch of account from taking effect silently: editing a
 profile's `[env]` (for example the config home of a second subscription) makes
 every existing session of that profile refuse to resume until the owner decides.
-`pohunek session resume <id> --accept-profile-change` (and `session fork`) is
+`pohunek session resume <id> --accept-profile-change` is
 that decision. It relaunches under the current profile's env and detection
 manifest and freezes its revision, so the next resume needs no flag. The launch
 shape frozen at creation (program, arguments, resume spec, runtime pin) stays
@@ -290,10 +290,9 @@ profile need the flag once. Profile values never appear in these errors.
 
 ## Native recovery spec
 
-A native-session launch spec states how an agent CLI resumes and optionally
-forks one of its own conversations: the kind of native reference it consumes
-(`id` or `path`), the resume argv, and an optional fork argv. Each argv has
-exactly one reference slot. The daemon runs the argv directly and never invokes
+A native-session launch spec states how an agent CLI resumes one of its own
+conversations: the kind of native reference it consumes (`id` or `path`) and
+the resume argv. The argv has exactly one reference slot. The daemon runs the argv directly and never invokes
 a shell, so a reference containing spaces or shell metacharacters stays one
 argument. A `path` reference must still be an absolute path and an `id`
 reference must not begin with `-`; both checks run where the reference is
@@ -302,15 +301,15 @@ recorded and again when it is used.
 Specs of the official runtimes (all `id` references; `claude`, `codex` and
 `hermes` come from their official packages, `shell` is built in):
 
-| Base | Resume | Fork |
-|------|--------|------|
-| `claude` | `--resume <reference>` | `--resume <reference> --fork-session` |
-| `codex` | `resume <reference>` | unsupported |
-| `hermes` | `--resume <reference>` | unsupported |
-| `shell` | none | none |
+| Base | Resume |
+|------|--------|
+| `claude` | `--resume <reference>` |
+| `codex` | `resume <reference>` |
+| `hermes` | `--resume <reference>` |
+| `shell` | none |
 
 A profile without a `[resume]` table inherits its base spec. A `[resume]` table
-is either `resumable = false` (no native recovery and therefore no fork) or a
+is either `resumable = false` (no native recovery) or a
 complete spec; nothing is merged with the base:
 
 ```toml
@@ -318,46 +317,39 @@ base = "claude"
 [resume]
 reference_kind = "path"                 # "id" or "path"
 args = ["--session", "{reference}"]     # resume argv, required
-fork_args = ["--fork", "{reference}"]   # optional; absent means no fork
 ```
 
 A runtime that declares `[native_reference] strategy = "assigned"` passes a
 core-generated reference to the agent at launch, so a profile on that base
-inherits the assignment (launch template, existence check and whether forks
-get a reference of their own) without a `[resume]` table. A profile that restates `[resume]` on such a base is rejected
+inherits the assignment (launch template and existence check) without a `[resume]` table. A profile that restates `[resume]` on such a base is rejected
 with `invalid_profile`; `resumable = false` switches recovery off and no
 reference is generated. See the sessions concept page for the strategy and its
 limits.
-
-`fork_args` is accepted only on a base whose runtime declares a native fork
-(`claude`, or a runtime package with a `[fork]` table); a `codex`, `hermes`,
-or `shell` profile that sets it is rejected, so those bases keep returning
-`agent_fork_unsupported`.
 
 `{reference}` must be a whole argv token, appear exactly once per list, and is
 never part of a larger string. The daemon rejects, with `invalid_profile` naming
 the profile and the field, an unknown `reference_kind`, a missing `reference_kind`
 or `args`, an empty list, a list without or with more than one `{reference}`, an
 embedded form such as `--session={reference}`, any other brace in a token, an
-empty or control-character token, `fork_args` without `args` or on a base without compiled fork support, and any
+empty or control-character token, and any
 `[resume]` table on a `shell` base. A malformed profile fails before any worker,
 session record, or worktree exists. Parse errors report the message and line
 only, never profile environment values. The resolved spec is stored in the
-session's recovery binding as `native_launch`; recovery and fork use that frozen
+session's recovery binding as `native_launch`; recovery uses that frozen
 copy even after the profile changes. The binding also records the base runtime's
 launch binding (runtime id plus where its definition came from). A profile whose
 `base` is a valid runtime id that is not installed fails with
 `runtime_not_installed`; a `base` that is not a runtime id fails with
 `invalid_profile`. A recovery binding whose runtime is not installed stays in the
-store, refuses resume and fork with `runtime_not_installed`, and works again once
+store, refuses resume with `runtime_not_installed`, and works again once
 the runtime is installed. The exception is a session launched from the built-in
 runtime of an official alias this daemon does not compile in (the built-in Codex,
 Claude Code or Hermes of an earlier release): it is refused with `runtime_builtin_removed` while no
 package serves the alias. Once the official package serves it, the package adopts the session, live or
-stopped, and resume and fork run through it when the session's recovery contract is honored;
+stopped, and resume runs through it when the session's recovery contract is honored;
 otherwise they answer `runtime_served_by_package`. `session stop` and `session rm` still work on such
 a session (or one whose recorded kind is a historical label): they release the
-worker and the session's worktrees and never launch, resume, fork or write
+worker and the session's worktrees and never launch, resume or write
 input, so they need no runtime definition. Removal keeps its fail-closed
 supervision rules.
 
@@ -397,7 +389,7 @@ digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch f
   that moves a pin by itself: it repins a profile pinned to an older version of
   the release's official package, and leaves every other pin as it is.
 - A stopped session launched from such a profile moves to a strictly newer
-  official version of its package on resume or fork only when the profile pins
+  official version of its package on resume only when the profile pins
   that version. The upgrade's repin is such a change, and resume does not count
   it as a profile change.
 - A digest that is not installed is `runtime_not_installed`; a digest that
@@ -417,7 +409,7 @@ package does not touch the digest and leaves the approved revision valid.
 Disabling a package stops fresh launches only. `session.new` through a pinned
 profile, owner-local or relay-approved, fails with `runtime_not_installed`
 because every fresh launch verifies that its package is enabled and its root
-intact; a session already pinned to that digest still resumes and forks.
+intact; a session already pinned to that digest still resumes.
 `host.inspect.runtimes` describes a pinned profile from its pinned definition
 and reports `available: false` while its package is disabled, uninstalled or
 fails verification.

@@ -45,7 +45,7 @@ impl SessionRegistry {
                 session_id = %record.session_id,
                 agent = %record.info.agent,
                 reason = %reason,
-                "stored native recovery record cannot be completed; the session cannot resume or fork natively"
+                "stored native recovery record cannot be completed; the session cannot resume natively"
             );
         }
     }
@@ -164,7 +164,6 @@ pub(super) fn repair_native_recovery(
             .or_else(|| binding.as_deref().and_then(|b| b.native_launch.as_ref()));
         record.info.capabilities = SessionCapabilities {
             resume: launch.is_some(),
-            fork: launch.is_some_and(crate::agent::NativeSessionLaunch::supports_fork),
             ..SessionCapabilities::default()
         };
     }

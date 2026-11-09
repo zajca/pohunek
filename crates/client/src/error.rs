@@ -221,16 +221,6 @@ pub enum ClientError {
         timeout: Duration,
     },
 
-    /// A `session.fork` exceeded its response deadline, so the daemon may
-    /// still complete the fork and a retry would create a second child.
-    #[error("timed out after {timeout:?} waiting for the result of a session fork")]
-    SessionForkOutcomeUnknown {
-        /// Remote host involved in the request, or `None` for the local daemon.
-        host: Option<String>,
-        /// Configured response deadline that elapsed.
-        timeout: Duration,
-    },
-
     /// A `session.stop` exceeded its response deadline, so the daemon may
     /// still complete the stop.
     #[error("timed out after {timeout:?} waiting for the result of a session stop")]
@@ -488,15 +478,6 @@ impl ClientError {
                 ),
                 Some(
                     "the resume may still complete: run `pohunek session inspect <session>` and read its runtime state before retrying"
-                        .to_owned(),
-                ),
-            ),
-            ClientError::SessionForkOutcomeUnknown { host, timeout } => ProtocolError::new(
-                ErrorClass::Transport,
-                "session_fork_outcome_unknown",
-                lifecycle_timeout_message(host.as_deref(), *timeout, "fork the session"),
-                Some(
-                    "the fork may still complete and a retried fork creates a second child session: run `pohunek session list` and look for the new session before retrying"
                         .to_owned(),
                 ),
             ),

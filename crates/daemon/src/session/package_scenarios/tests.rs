@@ -72,7 +72,7 @@ async fn a_package_goes_from_install_to_uninstall_and_the_runtime_registry_follo
     assert_eq!(runtime.runtime_id.as_str(), RUNTIME);
     assert_eq!(runtime.program, INERT_PROGRAM);
     assert_eq!(runtime.args, ["--model", "fast"]);
-    assert!(runtime.resumable && runtime.forkable);
+    assert!(runtime.resumable);
     assert!(installed.commands.is_empty());
     assert_eq!(fixture.serving(RUNTIME), None, "recorded but not loaded");
 
@@ -991,10 +991,6 @@ async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
     assert_eq!(
         runtime.resume_args.as_deref(),
         Some(&["--session".to_owned(), "{reference}".to_owned()][..])
-    );
-    assert_eq!(
-        runtime.fork_args.as_deref(),
-        Some(&["--fork".to_owned(), "{reference}".to_owned()][..])
     );
     assert!(runtime.prompt_argument);
 

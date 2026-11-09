@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.pi"
-version = "1.3.0"
+version = "1.4.0"
 runtime_api = 1
 requires = ["input-refuse-while-blocked-v1", "naming-launch-args-v1", "placement-v1", "program-status-gate-v1"]
 
@@ -51,19 +51,11 @@ supported = true
 reference_kind = "id"
 args = ["--session", "{reference}"]
 
-[fork]
-supported = true
-args = ["--fork", "{reference}"]
-
 # Pi creates the session with the id it is given (`--session-id`), so the
-# daemon assigns the reference at launch and needs no integration. A fork gets
-# a reference of its own the same way: `pi --fork <source> --session-id <fork>`
-# writes the forked conversation at once as `<timestamp>_<fork>.jsonl`, and
-# refuses an id that already names a session.
+# daemon assigns the reference at launch and needs no integration.
 [native_reference]
 strategy = "assigned"
 launch_args = ["--session-id", "{reference}"]
-assign_fork = true
 
 # Pi writes `<agent dir>/sessions/--<encoded cwd>--/<timestamp>_<id>.jsonl`
 # once the first assistant message exists. `--session` for an id with no such

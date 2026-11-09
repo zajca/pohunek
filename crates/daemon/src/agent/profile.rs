@@ -150,24 +150,23 @@ struct RawInputRules {
 
 /// A `[resume]` table: either `resumable = false` (no native recovery) or a
 /// complete native-session launch spec. A spec is never merged with the base
-/// kind's argv, so a fork shape can never be combined with a different resume
-/// shape.
+/// kind's argv.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawResume {
     /// `false` disables native recovery; absent or `true` requires a spec.
     #[serde(default)]
     resumable: Option<bool>,
-    /// `id` | `path`: the kind of native reference both operations consume.
+    /// `id` | `path`: the kind of native reference the resume consumes.
     #[serde(default)]
     reference_kind: Option<String>,
     /// Resume argv template with exactly one whole-token `{reference}`.
     #[serde(default)]
     args: Option<Vec<String>>,
-    /// Fork argv template with exactly one whole-token `{reference}`; absent ⇒
-    /// the profile cannot fork natively.
+    /// Fork argv template of a profile written for an earlier release; read,
+    /// warned about and dropped.
     #[serde(default)]
-    fork_args: Option<Vec<String>>,
+    fork_args: Option<serde::de::IgnoredAny>,
 }
 
 /// Host-profile launch overrides. Present on a [`ResolvedAgent`] only when a
@@ -191,8 +190,7 @@ pub(crate) struct ResolvedProfile {
     pub secret_env: Vec<String>,
     /// Input-rules override; `None` ⇒ inherit the base kind's rules.
     pub input_rules: Option<InputRules>,
-    /// Resolved native-session launch spec; `None` ⇒ not resumable and not
-    /// forkable. Authoritative for a profile (does NOT fall back to the base kind
+    /// Resolved native-session launch spec; `None` ⇒ not resumable. Authoritative for a profile (does NOT fall back to the base kind
     /// when `None`).
     pub native: Option<NativeSessionLaunch>,
     /// Parsed detection-manifest override; `None` ⇒ inherit the base kind's manifest.
@@ -1616,8 +1614,7 @@ fn official_base_unavailable(name: &str, base: &RuntimeId) -> ProtocolError {
 ///
 /// An absent `[resume]` inherits the base kind's compiled spec. `resumable =
 /// false` yields no native recovery. Otherwise `[resume]` must carry a complete
-/// spec (`reference_kind` and `args`, optionally `fork_args` on a base with
-/// compiled fork support); nothing is merged
+/// spec (`reference_kind` and `args`); nothing is merged
 /// with the base kind, and every template is validated here so a malformed
 /// profile fails before any session is created.
 fn resolve_native(
@@ -1629,10 +1626,10 @@ fn resolve_native(
         return Ok(definition.native().cloned());
     };
     if raw.resumable == Some(false) {
-        if raw.reference_kind.is_some() || raw.args.is_some() || raw.fork_args.is_some() {
+        if raw.reference_kind.is_some() || raw.args.is_some() {
             return Err(invalid_profile(
                 name,
-                "resume.resumable = false cannot be combined with resume.reference_kind, resume.args, or resume.fork_args",
+                "resume.resumable = false cannot be combined with resume.reference_kind or resume.args",
             ));
         }
         return Ok(None);
@@ -1658,28 +1655,13 @@ fn resolve_native(
         .as_deref()
         .ok_or_else(|| invalid_profile(name, "resume.args is required"))
         .and_then(|tokens| parse_template(name, "resume.args", tokens))?;
-    // Fork semantics are owned by the compiled base: a profile may restate or
-    // omit its base's fork, but cannot grant fork to a base that has none.
-    if raw.fork_args.is_some()
-        && !definition
-            .native()
-            .is_some_and(NativeSessionLaunch::supports_fork)
-    {
-        return Err(invalid_profile(
-            name,
-            "resume.fork_args requires a base kind with native fork support",
-        ));
+    if raw.fork_args.is_some() {
+        tracing::warn!(
+            profile = name,
+            "ignoring resume.fork_args in the host profile; session fork is not supported"
+        );
     }
-    let fork_args = raw
-        .fork_args
-        .as_deref()
-        .map(|tokens| parse_template(name, "resume.fork_args", tokens))
-        .transpose()?;
-    Ok(Some(NativeSessionLaunch::new(
-        reference_kind,
-        resume_args,
-        fork_args,
-    )))
+    Ok(Some(NativeSessionLaunch::new(reference_kind, resume_args)))
 }
 
 fn parse_template(name: &str, field: &str, tokens: &[String]) -> Result<NativeArgs, ProtocolError> {
@@ -1938,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn hermes_profile_resolves_program_args_resume_and_no_fork() {
+    fn hermes_profile_resolves_program_args_and_resume() {
         let dir = tmp_agents_dir("hermes-profile");
         write_profile(
             &dir,
@@ -1962,7 +1944,7 @@ mod tests {
             profile.native,
             served_native_launch(&protocol::RuntimeId::hermes())
         );
-        assert!(!profile.native.expect("Hermes recovers").supports_fork());
+        assert!(profile.native.is_some(), "Hermes recovers");
     }
 
     #[test]
@@ -2085,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_only_spec_resolves_without_fork() {
+    fn resume_only_spec_resolves_with_a_path_reference() {
         let dir = tmp_agents_dir("resume-only");
         write_profile(
             &dir,
@@ -2104,11 +2086,10 @@ mod tests {
                 NativeArg::Reference
             ]
         );
-        assert!(!native.supports_fork(), "fork is explicit, never inherited");
     }
 
     #[test]
-    fn pi_shaped_spec_resolves_resume_and_fork() {
+    fn pi_shaped_spec_resolves_resume_and_ignores_fork_args() {
         let dir = tmp_agents_dir("pi-shaped");
         write_profile(
             &dir,
@@ -2125,14 +2106,10 @@ mod tests {
             native.resume_argv(&path).expect("resume"),
             vec!["--session", "/work/a b/$(x);.jsonl"]
         );
-        assert_eq!(
-            native.fork_argv(&path).expect("fork").argv,
-            vec!["--fork", "/work/a b/$(x);.jsonl"]
-        );
     }
 
     #[test]
-    fn spec_may_restate_the_claude_shapes_with_or_without_fork() {
+    fn spec_may_restate_the_claude_shapes_with_or_without_fork_args() {
         let dir = tmp_agents_dir("claude-restated");
         write_profile(
             &dir,
@@ -2148,11 +2125,7 @@ mod tests {
             resolve(&dir, "with-fork").expect("resolves").native,
             served_native_launch(&protocol::RuntimeId::claude())
         );
-        let no_fork = resolve(&dir, "no-fork")
-            .expect("resolves")
-            .native
-            .expect("spec");
-        assert!(!no_fork.supports_fork());
+        assert!(resolve(&dir, "no-fork").expect("resolves").native.is_some());
     }
 
     #[test]
@@ -2177,7 +2150,7 @@ mod tests {
     #[test]
     fn malformed_resume_specs_are_rejected_with_profile_and_field() {
         let dir = tmp_agents_dir("resume-bad-specs");
-        let cases: [(&str, &str, &str); 14] = [
+        let cases: [(&str, &str, &str); 11] = [
             (
                 "unknown-kind",
                 "reference_kind = \"socket\"\nargs = [\"--resume\", \"{reference}\"]\n",
@@ -2193,11 +2166,7 @@ mod tests {
                 "reference_kind = \"id\"\n",
                 "resume.args is required",
             ),
-            (
-                "empty-table",
-                "",
-                "resume.reference_kind is required",
-            ),
+            ("empty-table", "", "resume.reference_kind is required"),
             (
                 "empty-args",
                 "reference_kind = \"id\"\nargs = []\n",
@@ -2227,21 +2196,6 @@ mod tests {
                 "empty-literal",
                 "reference_kind = \"id\"\nargs = [\"\", \"{reference}\"]\n",
                 "resume.args: argument 0 is an empty literal",
-            ),
-            (
-                "bad-fork",
-                "reference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = [\"--fork\"]\n",
-                "resume.fork_args: the argument list has no `{reference}` placeholder",
-            ),
-            (
-                "empty-fork",
-                "reference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = []\n",
-                "resume.fork_args: the argument list is empty",
-            ),
-            (
-                "fork-without-resume",
-                "reference_kind = \"id\"\nfork_args = [\"--fork\", \"{reference}\"]\n",
-                "resume.args is required",
             ),
             (
                 "off-with-spec",
@@ -2281,27 +2235,6 @@ mod tests {
                 "{name}"
             );
         }
-    }
-
-    #[test]
-    fn fork_args_require_a_base_with_compiled_fork_support() {
-        let dir = tmp_agents_dir("fork-args-base");
-        let spec = "[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = [\"--fork\", \"{reference}\"]\n";
-        for base in ["codex", "hermes"] {
-            let name = format!("{base}-fork");
-            write_profile(&dir, &name, &format!("base = \"{base}\"\n{spec}"));
-            let message = invalid_message(&dir, &name);
-            assert!(message.contains(&format!("'{name}'")), "{message}");
-            assert!(
-                message.contains("resume.fork_args requires a base kind with native fork support"),
-                "{message}"
-            );
-        }
-        write_profile(&dir, "claude-fork", &format!("base = \"claude\"\n{spec}"));
-        let native = resolve(&dir, "claude-fork")
-            .expect("claude owns fork")
-            .native;
-        assert!(native.expect("spec").supports_fork());
     }
 
     #[test]

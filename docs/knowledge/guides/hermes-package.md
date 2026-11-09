@@ -85,13 +85,12 @@ On a host without the package nothing serves `hermes`:
   is not attributed to Hermes: process recognition reads the package's
   `detect.toml`.
 - A session the built-in Hermes of an earlier release launched (pinned, or a
-  v0.33.0 record without a launch binding) is refused on resume, fork and
+  v0.33.0 record without a launch binding) is refused on resume and
   every interaction (input, attach, resize, rename, metadata) with
   `runtime_builtin_removed`, whose hint names the install; only stop and remove
   still work. With the package installed, the package adopts the session, live
   or stopped, and serves its input again. Resume runs through the package when it
-  honors the session's recovery contract; fork answers `agent_fork_unsupported`,
-  because Hermes declares no native fork. A session whose contract the package
+  honors the session's recovery contract. A session whose contract the package
   cannot honor answers `runtime_served_by_package`, and no command rebinds the
   session to another runtime source. A v0.33.0 record without a launch binding answers it
   as well. Without the package, `pohunekd upgrade-preflight` reports every live
@@ -120,7 +119,7 @@ of both built-in files are in `compat/hermes/builtin-v0.34/` (`runtime.toml`,
 tag; the package tests compare the package with them.
 
 - Launch: `hermes chat`; resume is `hermes chat --resume <reference>` with an
-  `id` reference; fork is unsupported. Later input is a bracketed paste
+  `id` reference. Later input is a bracketed paste
   followed by Enter 150 ms later, filtered by the `hermes_safe_text` policy.
 - Readiness: `ready = "screen_idle"`. Hermes 0.20.0 queries the terminal's
   background colour while it starts and restores the terminal mode with

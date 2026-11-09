@@ -34,7 +34,6 @@ import { Subscription } from "./subscription";
 import type { ConnectOptions, ControlChannel, ResolvedConnectOptions, Transport } from "./transport";
 import {
   resolveConnectOptions,
-  SESSION_FORK_REQUEST_BUDGET_MS,
   SESSION_NEW_REQUEST_BUDGET_MS,
   SESSION_REMOVE_REQUEST_BUDGET_MS,
   SESSION_RESUME_REQUEST_BUDGET_MS,
@@ -160,13 +159,6 @@ export class Client {
         "session.resume",
         params as Methods["session.resume"]["params"],
         SESSION_RESUME_REQUEST_BUDGET_MS,
-      );
-    }
-    if (method === "session.fork") {
-      return this.callDedicated(
-        "session.fork",
-        params as Methods["session.fork"]["params"],
-        SESSION_FORK_REQUEST_BUDGET_MS,
       );
     }
     if (method === "session.stop") {
@@ -699,7 +691,6 @@ export class Client {
       | "session.new"
       | "command.run"
       | "session.resume"
-      | "session.fork"
       | "session.stop"
       | "session.remove"
       | "session.remove_accepting_unconfirmed"
@@ -809,7 +800,6 @@ function closeWithin(channel: ControlChannel, ms: number): Promise<void> {
 /** Lifecycle requests that report an unknown outcome when their deadline elapses. */
 const LIFECYCLE_OPERATIONS: ReadonlyMap<string, LifecycleOperation> = new Map([
   ["session.resume", "resume"],
-  ["session.fork", "fork"],
   ["session.stop", "stop"],
   ["session.remove", "remove"],
   ["session.remove_accepting_unconfirmed", "remove"],

@@ -41,7 +41,7 @@ unrelated runbooks.
   [.agents/instructions/workflow.md](.agents/instructions/workflow.md) and the
   [github-workflow skill](.agents/skills/github-workflow/SKILL.md). That skill
   owns issue/project operations; `.github/agent-workflow.json` is its config.
-- **A new plugin (runtime package or workflow plugin):** never add it to this
+- **A new runtime package:** never add it to this
   repository. An official plugin lives in its own repository
   `pohunekd/plugin-<name>`, created from `pohunekd/pohunek-plugin-template` by
   the owner; a third-party plugin lives in its author's account. A plugin

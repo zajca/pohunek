@@ -142,8 +142,8 @@ keep_local_args = ["--no-daemon"]
 runtime declares at most one of:
 
 - `keep_local_args`: 1 to 8 literal tokens, validated like `[runtime] args`
-  (no `{session_name}` placeholder). The core adds them on every create, resume
-  and fork launch after the contributor's arguments and before `[naming]`'s,
+  (no `{session_name}` placeholder). The core adds them on every create and resume
+  launch after the contributor's arguments and before `[naming]`'s,
   skips them when the frozen arguments already hold all of them, and never
   freezes them into the resume snapshot, so a session created before the
   descriptor gained them is covered on its next resume.
@@ -262,21 +262,21 @@ placeholder, in one of two shapes:
 A bare placeholder as the first token or after `--`, `-`, a joined flag or a
 non-flag token, text after the placeholder, a second placeholder, `{reference}`
 and any other brace are `descriptor_invalid`, as is the placeholder in
-`runtime.args` or the resume and fork templates. The diagnostic never reflects a
+`runtime.args` or the resume template. The diagnostic never reflects a
 token.
 
 A package that declares the pair form must show, for the lock minimum and the
 locked release, that the flag consumes the next element whatever it holds, that
 no argument scan outside the parser matches a value that does not start with a
 dash, that the flag exists at the lock minimum (the version probe enforces the
-minimum on create, resume and fork), where the agent persists or shows the name,
+minimum on create and resume), where the agent persists or shows the name,
 and that its detection manifest holds with a marker-like name wherever the name
 is drawn. [Pi package](pi-package.md#session-name) records this for Pi.
 
 The arguments are rendered at every launch from the name that launch uses and
-are never frozen into the resume snapshot: a new session uses its `name`, a
+are never frozen into the resume snapshot: a new session uses its `name` and
 resume the name the session has now (a `session.rename` since the last launch
-shows), and a fork its own `name`, never the source's. They follow the frozen
+shows). They follow the frozen
 arguments and the runtime contributor's arguments, and precede the native
 reference arguments and the prompt argument. A session without a name, or with a
 stored name that fails the session-name rule, launches without the group. A
@@ -290,7 +290,7 @@ withheld from manifest evaluation; screen regions are never filtered, and
 agent, so the kept name changes at the next resume.
 
 The table joins the digest of a built-in descriptor, so the package that adopts
-it changes its digest. A session pinned to the earlier digest resumes and forks
+it changes its digest. A session pinned to the earlier digest resumes
 without the name until it is adopted. A core older than 0.39 refuses the
 descriptor with `runtime_feature_unsupported` (0.38) or `descriptor_invalid`
 (0.37).
@@ -319,13 +319,13 @@ at most 256 bytes), none equal to or inside another (per component, ignoring
 ASCII letter case). Either key without the other, or a violation, is
 `descriptor_invalid`.
 
-At every create, resume and fork the daemon appends the arguments to the root
+At every create and resume the daemon appends the arguments to the root
 arguments (after the frozen, contributor and `[naming]` arguments, before the
 native reference and prompt arguments) only when all of these hold; any error,
 timeout, ambiguity or missing fact means they are not appended:
 
-0. A resume or fork evaluates the directory and project the session was created in
-   (recorded once at create, store schema 16, copied by a fork, never refreshed by a
+0. A resume evaluates the directory and project the session was created in
+   (recorded once at create, store schema 16, never refreshed by a
    cwd change or a resume), not its current ones, and only when the relaunch directory
    is byte-equal to the create-time directory. A session that moved (OSC 7, the focus
    process) or one stored before schema 16 relaunches without the arguments and logs
@@ -369,7 +369,7 @@ arguments are never frozen into the resume snapshot. A failure (an unreachable r
 an unreadable path, the deadline) logs one `checkout_trust.failed` warning naming the
 checkout and the reason, never a URL, and launches without the arguments. A run of
 fixed arguments equal to the `trusted_checkout_args`, in the descriptor's `args` or a host
-profile's `args`, is dropped from a create, resume or fork command, so only the predicate
+profile's `args`, is dropped from a create or resume command, so only the predicate
 adds them and a session whose frozen arguments hold them does not carry them into an
 untrusted checkout. Each declared file is opened without following a symbolic link in its last path component,
 checked on the opened descriptor (a regular file of at most 4 MiB) and hashed from that
@@ -632,7 +632,7 @@ unverified against a real Muse run.
 process tree and reports its identity and subagents. Without sandbox mode Cline
 attaches a session to a shared per-machine hub daemon, or starts one that
 outlives the session, and the hooks of a hub-run session carry neither the
-session's environment nor its process tree. Every create, resume and fork launch
+session's environment nor its process tree. Every create and resume launch
 therefore carries `CLINE_SANDBOX=1` and `CLINE_SANDBOX_DATA_DIR=<data root>` as
 per-launch input, where the data root is `CLINE_DATA_DIR` (an absolute path in a
 profile `[env]`) or else `<config home>/data`, so the session keeps the user's
@@ -707,7 +707,7 @@ session (a hook overlay and the reporter it names, say). A descriptor never
 carries this; only the handler's compiled code does. Core writes the files as
 `launch-input.<name>` (owner-only) in the session's worker state directory,
 outside the paths the runtime's sandbox lets the agent write, resolves `{file:<name>}` placeholders to their
-absolute paths, applies the result to every create, resume and fork, and never
+absolute paths, applies the result to every create and resume, and never
 stores it in the resume snapshot. A contribution core cannot accept refuses the
 launch with `launch_input_invalid`; one it cannot write, or a declared
 config home that does not resolve (for example a relative `XDG_CONFIG_HOME`),
@@ -782,11 +782,15 @@ repeating the command; the CLI never retries an install on its own.
 
 Packages are trusted local software, not a sandbox: the digest and the catalog
 signature establish integrity and provenance, and an installed package can name
-any program your account could run. [Workflow plugins](workflow-plugins.md)
-are a separate class with their own CLI-owned store and `pohunek workflow`
-install path; `pohunek plugin install` refuses a workflow archive because it
-has no `runtime.toml`. Daemon, overlay, session worker and GUI extensions are
+any program your account could run. Daemon, overlay, session worker and GUI extensions are
 not packages at all; see "Runtime packages and trust" in `docs/architecture.md`.
+
+### Fork data is ignored
+
+A descriptor, host profile or stored record can carry fork data: `[fork]`,
+`native_reference.assign_fork`, `forkable`, `fork_args`, `fork_launch_args`, or a
+profile's `[resume] fork_args`. The daemon accepts it and ignores the fork data. For a
+descriptor or host profile it also writes a warning to the daemon log. Official descriptors do not carry it.
 
 ## Consent
 
@@ -797,7 +801,7 @@ they need `--yes`.
   (nothing is installed), prints what the package declares (package id,
   version, digest, trust origin, runtime id, display name, the program and fixed
   arguments the daemon will launch as the owner, the arguments it appends at
-  launch to pass the session reference, the resume and fork argument templates
+  launch to pass the session reference, the resume argument template
   (`{reference}` marks the reference slot), whether the first prompt is
   appended to the arguments, the version probe and the integration handler; the
   hook schema is part of the same descriptor), lists every exported
@@ -811,8 +815,8 @@ they need `--yes`.
 
 A package can export named commands: fixed programs the daemon runs as the
 owner when a command is called. `command.run` is the method that calls them
-(see [Calling a command](#calling-a-command)). A descriptor exports a runtime (`[runtime]`, `[input]`, `[resume]`,
-`[fork]` and `[native_reference]`, all or none), commands, or both, and at
+(see [Calling a command](#calling-a-command)). A descriptor exports a runtime (`[runtime]`, `[input]`, `[resume]` and
+`[native_reference]`, all or none), commands, or both, and at
 least one of the two. A package that exports commands only serves no runtime:
 it never appears among the supported agents and no session can be started
 under its id. It installs, enables, disables, selects, updates and uninstalls
@@ -1098,9 +1102,8 @@ read counts as incompatible.
   While a `metadata.jsonl` line that may pin a package cannot be read, every
   installed version counts as referenced, so a version stays held back with no
   session or profile naming it and `uninstall` fails with
-  `package_retention_uncertain`. List the line with `pohunek store rejected
-  list` and move it into the quarantine file with `pohunek store rejected
-  set-aside <content-hash>` (see the runtime package recovery runbook). The
+  `package_retention_uncertain`. The line is moved by hand: see the runtime
+  package recovery runbook. The
   offline `ensure` step reads the store the same way: it never searches such a
   line for a digest, judges every installed version while one exists and names
   the command in the refusal it causes.
@@ -1138,17 +1141,15 @@ outside pohunek are recognized only through the package's detection manifest
 (and the Codex and Claude `[transcripts]` table), so without the package they
 are not observed as that agent. A session launched from the built-in Codex,
 Claude or Hermes of an earlier release is refused with
-`runtime_builtin_removed` on resume, fork and every interaction (input,
+`runtime_builtin_removed` on resume and every interaction (input,
 attach, resize, rename, metadata) while nothing serves its runtime id; once the
 package is installed, the official package adopts the session, live or stopped,
 when the session's launch pin names the package id; the package version may
 differ. The live session accepts input again, and its hook reports and processes
-are attributed through the package. Resume and fork run through the package when
-it honors the session's recovery contract: the same native reference kind, a
-hook-reported (not core-assigned) reference, and for fork, fork support in both
-the frozen spec and the package. The relaunched run is pinned to the package
-digest. A Hermes fork answers `agent_fork_unsupported`, because Hermes declares
-no native fork. A session whose contract the package cannot honor, and a
+are attributed through the package. Resume runs through the package when
+it honors the session's recovery contract: the same native reference kind and a
+hook-reported (not core-assigned) reference. The relaunched run is pinned to the package
+digest. A session whose contract the package cannot honor, and a
 session record that names no package (v0.33.0), answer `runtime_served_by_package`;
 the migration is a new session: `pohunek session new --agent <alias>`, which the
 package serves. No command rebinds a session to another runtime source. Stop and

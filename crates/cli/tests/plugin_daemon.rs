@@ -133,6 +133,7 @@ args = ["--fork", "{{reference}}"]
 [native_reference]
 strategy = "assigned"
 launch_args = ["--session-id", "{{reference}}"]
+assign_fork = true
 
 [native_reference.existence]
 check = "none"
@@ -1421,7 +1422,7 @@ async fn update_compares_official_versions_by_precedence_ignoring_build_metadata
 }
 
 #[tokio::test]
-async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_session_with() {
+async fn session_list_names_the_code_resume_refuses_a_damaged_package_session_with() {
     let harness = Harness::start().await;
     let built = harness.archive("1.0.0");
     install_enabled(&harness, &built).await;
@@ -1433,7 +1434,7 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
         .to_owned();
     assert_eq!(
         created["ok"]["capabilities"],
-        serde_json::json!({"resume": true, "fork": true}),
+        serde_json::json!({"resume": true, "fork": false}),
         "{created}"
     );
     assert!(
@@ -1451,9 +1452,6 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
     let resume_code = resumed["err"]["code"]
         .as_str()
         .expect("resume refusal code");
-    let (code, forked) = harness.json(&["session", "fork", &id]).await;
-    assert_eq!(code, 1, "{forked}");
-    let fork_code = forked["err"]["code"].as_str().expect("fork refusal code");
 
     let (code, listed) = harness.json(&["session", "list"]).await;
     assert_eq!(code, 0, "{listed}");
@@ -1471,13 +1469,13 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
     );
     assert_eq!(
         session["capability_refusals"],
-        serde_json::json!({"resume": resume_code, "fork": fork_code}),
+        serde_json::json!({"resume": resume_code}),
         "{session}"
     );
 
     let human = harness.run(&["session", "list"]).await;
     assert_eq!(human.status.code(), Some(0), "{}", stderr_text(&human));
-    let line = format!("refused {id}: resume={resume_code} fork={fork_code}");
+    let line = format!("refused {id}: resume={resume_code}");
     assert!(
         stdout_text(&human)
             .lines()
@@ -1486,5 +1484,77 @@ async fn session_list_names_the_code_resume_and_fork_refuse_a_damaged_package_se
         stdout_text(&human)
     );
 
+    harness.stop().await;
+}
+
+/// Commands the CLI no longer has.
+const REMOVED_COMMANDS: &[&[&str]] = &[
+    &["workflow", "list"],
+    &["session", "fork", "s-1"],
+    &["session", "runtime-inventory"],
+    &["session", "policy", "get"],
+    &["store", "rejected", "list"],
+];
+
+#[tokio::test]
+async fn the_removed_commands_are_unknown_and_a_leftover_workflow_store_does_not_stop_the_daemon() {
+    let harness = Harness::start().await;
+    for arguments in REMOVED_COMMANDS {
+        let output = harness.run(arguments).await;
+        assert!(!output.status.success(), "{arguments:?} must not run");
+        assert!(
+            stderr_text(&output).contains("unrecognized subcommand"),
+            "{arguments:?}: {}",
+            stderr_text(&output)
+        );
+    }
+
+    let state = harness.env.state_home().join("pohunek");
+    let config = harness.env.config_home().join("pohunek");
+    for leftover in [
+        state.join("workflow-plugins").join("acme"),
+        state.join("workflow-plugin-state").join("acme"),
+        config.join("workflow-plugin-config").join("acme"),
+    ] {
+        fs::create_dir_all(&leftover).expect("create a leftover workflow directory");
+        fs::write(leftover.join("record.json"), "{}").expect("write a leftover workflow record");
+    }
+    let restarted = harness.restart().await;
+    let (code, listed) = restarted.json(&["session", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    restarted.stop().await;
+}
+
+#[tokio::test]
+async fn a_session_of_a_descriptor_with_fork_data_lists_without_fork_and_resumes() {
+    let harness = Harness::start().await;
+    let built = harness.archive("1.0.0");
+    install_enabled(&harness, &built).await;
+    let (code, created) = launch(&harness, RUNTIME).await;
+    assert_eq!(code, 0, "{created}");
+    let id = created["ok"]["id"]
+        .as_str()
+        .expect("created session id")
+        .to_owned();
+
+    let (code, listed) = harness.json(&["session", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    let session = listed["ok"]
+        .as_array()
+        .expect("session list array")
+        .iter()
+        .find(|session| session["id"] == id.as_str())
+        .expect("the session is listed")
+        .clone();
+    assert_eq!(
+        session["capabilities"],
+        serde_json::json!({"resume": true, "fork": false}),
+        "{session}"
+    );
+
+    let (code, stopped) = harness.json(&["session", "stop", &id]).await;
+    assert_eq!(code, 0, "{stopped}");
+    let (code, resumed) = harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 0, "{resumed}");
     harness.stop().await;
 }

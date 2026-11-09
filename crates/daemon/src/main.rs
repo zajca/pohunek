@@ -66,9 +66,8 @@ use pohunek_daemon::session::upgrade_preflight::{
     self, PreflightInputs, PreflightOptions, ReleaseInputs,
 };
 use pohunek_daemon::session::{
-    detect_official_runtimes, ensure_official_runtimes, spawn_idle_stop, spawn_session_retention,
-    EnsureInputs, SessionRegistry, SessionRegistryConfig, IDLE_STOP_POLICY_NAME,
-    RETENTION_POLICY_NAME,
+    detect_official_runtimes, ensure_official_runtimes, spawn_session_retention, EnsureInputs,
+    SessionRegistry, SessionRegistryConfig, RETENTION_POLICY_NAME,
 };
 use pohunek_daemon::shutdown::{drop_runtime, DaemonShutdown, ShutdownPlan, Stage};
 use pohunek_daemon::{logging, DaemonError, Paths, DAEMON_VERSION};
@@ -625,7 +624,6 @@ async fn run() -> Result<(), DaemonError> {
         session_tmp_root: Some(session_tmp_root),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),
-        idle_stop_policy_path: Some(paths.data_dir.join(IDLE_STOP_POLICY_NAME)),
         log_dir: Some(paths.log_dir.clone()),
         // Slice 0 owns this line: B3 (host-global hooks) and C1 (agent profiles)
         // read it through SessionRegistry::config_dir() / derive off it — they must
@@ -659,17 +657,6 @@ async fn run() -> Result<(), DaemonError> {
         session.retention_lost_ttl_secs = retention_policy.lost_ttl_secs,
         "loaded session retention policy"
     );
-    // The idle-stop default fails startup the same way: a corrupt record must not
-    // silently turn into "no default".
-    let idle_stop_policy = sessions
-        .load_idle_stop_policy()
-        .await
-        .map_err(DaemonError::IdleStopPolicy)?;
-    info!(
-        session.idle_stop_default_secs = idle_stop_policy.default_after_secs,
-        session.idle_stop_min_secs = idle_stop_policy.min_after_secs,
-        "loaded session idle-stop default"
-    );
     let notifications =
         NotificationService::open(&paths.data_dir).map_err(|source| DaemonError::Directory {
             path: paths.data_dir.join(NOTIFICATIONS_SUBDIR),
@@ -687,7 +674,6 @@ async fn run() -> Result<(), DaemonError> {
     )?;
     spawn_notification_retention(&tasks, notifications.clone());
     spawn_session_retention(&tasks, sessions.clone());
-    spawn_idle_stop(&tasks, sessions.clone(), notifications.clone());
     // Spawn the debounce coordinator: it owns the lifecycle of session-scoped
     // agent_blocked/approval_required and turn_completed notifications, holding
     // them for the policy debounce window so transient signals never surface,

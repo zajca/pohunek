@@ -32,7 +32,6 @@ mod doctor;
 mod envelope;
 mod error;
 mod governance;
-mod idle_stop;
 mod integration;
 mod limits;
 pub mod method;
@@ -86,10 +85,6 @@ pub use governance::{
     TransferProposal,
 };
 #[doc(inline)]
-pub use idle_stop::{
-    IdleStopOptIn, IdleStopValueError, SessionIdleStopParams, SessionIdleStopResult,
-    IDLE_STOP_DEFAULT_VALUE, IDLE_STOP_METADATA_KEY,
-};
 #[doc(inline)]
 pub use integration::{
     IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
@@ -164,15 +159,14 @@ pub use session::{
     is_valid_client_request_id, AgentActivity, AgentStateEvent, AttachEvent, AttachHeader,
     AuthorityGate, AuthorityGateReason, BackgroundItem, BackgroundKind, BackgroundStateEvent,
     BackgroundStatus, BranchSource, CwdSource, DetectionRegionKind, DetectionRegionPreview,
-    DetectionStatus, ForkCwdMode, ObservationParamsError, OnDiverged, RuntimeExit,
-    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryResult, RuntimeInventoryStatus,
-    RuntimeState, SessionAttachParams, SessionAttachResult, SessionBackground, SessionCapabilities,
-    SessionCapabilityRefusals, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionEvent, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionListParams, SessionNativeRecoveredEvent,
-    SessionNewParams, SessionNewResult, SessionOutputGap, SessionOutputParams, SessionOutputResult,
-    SessionPlacement, SessionPlacementProcess, SessionPolicyParams, SessionPolicyResult,
+    DetectionStatus, ObservationParamsError, OnDiverged, RuntimeExit, RuntimeInventoryEntry,
+    RuntimeInventoryEvent, RuntimeInventoryStatus, RuntimeState, SessionAttachParams,
+    SessionAttachResult, SessionBackground, SessionCapabilities, SessionCapabilityRefusals,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionDiffParams, SessionDiffResult, SessionEvent, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionNewResult, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionPlacement, SessionPlacementProcess,
     SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
     SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
@@ -187,12 +181,7 @@ pub use session::{
     WorktreeSource, MAX_CLIENT_REQUEST_ID_BYTES,
 };
 #[doc(inline)]
-pub use store::{
-    StoreRejectedLine, StoreRejectedListResult, StoreRejectedSetAsideParams,
-    StoreRejectedSetAsideResult, STORE_QUARANTINE_FAILED, STORE_READ_FAILED,
-    STORE_REJECTED_LINE_LIVE, STORE_REJECTED_LINE_NOT_FOUND, STORE_REJECTED_LIST_MAX_LINES,
-    STORE_REJECTED_TEXT_MAX_BYTES,
-};
+pub use store::{StoreRejectedLine, STORE_REJECTED_TEXT_MAX_BYTES};
 #[doc(inline)]
 pub use turn_wait::{
     SessionTurnCursor, SessionTurnEvent, SessionTurnEventKind, SessionTurnProgress,

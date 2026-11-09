@@ -89,7 +89,6 @@ const MUST_SUCCEED: &[&str] = &[
     method::SESSION_RESIZE,
     method::SESSION_RENAME,
     method::SESSION_SET_METADATA,
-    method::SESSION_RUNTIME_INVENTORY,
     method::NOTIFICATION_LIST,
 ];
 
@@ -533,20 +532,6 @@ async fn previous_version_client_drives_a_worker_backed_session_in_the_previous_
     );
     assert_previous_spelling(waited);
 
-    let inventory = exchange(
-        &mut client,
-        &previous_request(
-            "inventory-1",
-            method::SESSION_RUNTIME_INVENTORY,
-            Value::Null,
-        ),
-    )
-    .await;
-    // A managed worker is not an inventory entry (only unadopted and quarantined
-    // endpoints are), so the entry rename is covered by the golden fixtures.
-    assert!(previous_ok(&inventory)["entries"].is_array(), "{inventory}");
-    assert_previous_spelling(&inventory);
-
     let current_spelling = exchange(
         &mut client,
         &previous_request(
@@ -872,6 +857,44 @@ async fn an_inherited_origin_guards_a_protocol_3_mutation() {
     assert_eq!(control["id"], "origin-other", "{control}");
     assert!(control.get("ok").is_some(), "{control}");
 
+    daemon.stop().await;
+}
+
+/// Methods no version of the window serves any more.
+const REMOVED_METHODS: &[&str] = &[
+    "session.fork",
+    "session.runtime_inventory",
+    "session.policy.get",
+    "session.policy.set",
+    "session.idle_stop.get",
+    "session.idle_stop.set",
+    "store.rejected_list",
+    "store.rejected_set_aside",
+];
+
+#[tokio::test]
+async fn removed_methods_are_unknown_on_every_version_of_the_window() {
+    let daemon = Daemon::start("window-removed").await;
+    let mut previous = daemon.connect().await;
+    let mut current = daemon.connect().await;
+    for name in REMOVED_METHODS {
+        let response = exchange(
+            &mut previous,
+            &previous_request("removed-previous", name, json!({})),
+        )
+        .await;
+        assert_eq!(response["v"], PREVIOUS_VERSION, "{name}: {response}");
+        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
+
+        let request = Request::new("removed-current", *name, json!({})).expect("valid request");
+        let response = exchange(
+            &mut current,
+            &serde_json::to_value(&request).expect("serialize request"),
+        )
+        .await;
+        assert_eq!(response["v"], PROTOCOL_VERSION.get(), "{name}: {response}");
+        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
+    }
     daemon.stop().await;
 }
 
@@ -1387,89 +1410,6 @@ async fn prebump_notify_hooks_create_notifications_through_the_daemon_socket() {
     daemon.stop().await;
 }
 
-/// The retention policy as release v0.35.2 decodes it: every field is required
-/// and an unknown one is refused (`SessionRetentionPolicy` at `v0.35.2`,
-/// `crates/protocol/src/session.rs`).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FrozenRetentionPolicy {
-    enabled: bool,
-    sweep_interval_secs: u32,
-    terminal_ttl_secs: u32,
-    lost_ttl_secs: u32,
-    max_removals_per_sweep: u32,
-}
-
-/// `session.policy.get` and `session.policy.set` result of release v0.35.2.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FrozenPolicyResult {
-    retention: FrozenRetentionPolicy,
-}
-
-/// Sends a current-version request and returns the response.
-async fn current_call(client: &mut Client, id: &str, method: &str, params: Value) -> Value {
-    let request = Request::new(id, method, params).expect("valid request");
-    let response = exchange(
-        client,
-        &serde_json::to_value(&request).expect("serialize request"),
-    )
-    .await;
-    assert_eq!(response["v"], PROTOCOL_VERSION.get(), "{response}");
-    assert!(response.get("err").is_none(), "{method}: {response}");
-    response
-}
-
-#[tokio::test]
-async fn a_previous_release_reads_and_rewrites_the_retention_policy_beside_an_idle_stop_default() {
-    let daemon = Daemon::start("window-idle-stop").await;
-    let mut client = daemon.connect().await;
-
-    let set = current_call(
-        &mut client,
-        "idle-set",
-        method::SESSION_IDLE_STOP_SET,
-        json!({"default_after_secs": 600}),
-    )
-    .await;
-    assert_eq!(set["ok"]["default_after_secs"], 600);
-
-    // A v0.35.2 client decodes the policy strictly: no new key may appear in it.
-    let policy = current_call(
-        &mut client,
-        "policy-get",
-        method::SESSION_POLICY_GET,
-        Value::Null,
-    )
-    .await;
-    let frozen: FrozenPolicyResult = serde_json::from_value(policy["ok"].clone())
-        .expect("the v0.35.2 decode accepts the policy");
-
-    // Its read-modify-write sends back exactly what it decoded.
-    let rewritten = current_call(
-        &mut client,
-        "policy-set",
-        method::SESSION_POLICY_SET,
-        json!({"retention": frozen.retention}),
-    )
-    .await;
-    serde_json::from_value::<FrozenPolicyResult>(rewritten["ok"].clone())
-        .expect("the v0.35.2 decode accepts the rewritten policy");
-
-    let idle = current_call(
-        &mut client,
-        "idle-get",
-        method::SESSION_IDLE_STOP_GET,
-        Value::Null,
-    )
-    .await;
-    assert_eq!(
-        idle["ok"]["default_after_secs"], 600,
-        "the rewrite kept the default"
-    );
-    daemon.stop().await;
-}
-
 /// A `runtime` object of observation params, with a key the daemon does not
 /// know when `with_unknown_key` is set.
 fn nested_runtime(with_unknown_key: bool) -> Value {
@@ -1574,16 +1514,6 @@ async fn params_with_an_unknown_key_are_refused_by_the_daemon() {
                     "compaction_min_actions": 1,
                     "key_from_a_newer_client": 1,
                 },
-            }}),
-        ),
-        (
-            "session-policy-extra",
-            method::SESSION_POLICY_SET,
-            json!({"retention": {
-                "enabled": true, "sweep_interval_secs": 3600,
-                "terminal_ttl_secs": 3600, "lost_ttl_secs": 3600,
-                "max_removals_per_sweep": 5,
-                "key_from_a_newer_client": 1,
             }}),
         ),
         (

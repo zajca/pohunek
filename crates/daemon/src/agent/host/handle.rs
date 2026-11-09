@@ -2,7 +2,7 @@
 //!
 //! One [`RuntimeHost`] is built when the session registry starts and is
 //! cloned wherever a runtime identity has to be resolved: agent-name
-//! resolution, launch, resume, fork and the mutation guards. It is the only
+//! resolution, launch, resume and the mutation guards. It is the only
 //! place that turns an [`RuntimeRef`] into a launchable [`RuntimeDefinition`],
 //! so every caller answers an unknown runtime with the same stable error.
 //!

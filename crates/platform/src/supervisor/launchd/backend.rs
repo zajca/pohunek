@@ -1,4 +1,4 @@
-//! launchd worker supervisor, daemon agent, and workflow plugin unit backends.
+//! launchd worker supervisor and daemon agent backends.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -8,20 +8,18 @@ use std::time::{Duration, Instant};
 
 use super::super::{
     DaemonSupervisor, Error, ExitEvidence, JobDefinition, JobExit, JobLogs, Namespace, Operation,
-    PluginUnitDefinition, PluginUnitKey, PluginUnitKind, PluginUnits, RestartPolicy, ServiceId,
-    ServiceObservation, ServiceState, Supervisor, WorkerKey, MAX_JOB_TIMEOUT,
+    RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
+    MAX_JOB_TIMEOUT,
 };
 use super::discovery::{classify, refuse_rejected, set_aside_loaded};
 use super::launchctl::{Launchctl, Status};
 use super::plist::{self, Stored, MAX_DEFINITION_BYTES};
-use super::registration::{
-    self, definition_name, fs_error, remove_file, set_aside_name, DEFINITION_MODE,
-};
+use super::registration::{self, definition_name, fs_error, remove_file, DEFINITION_MODE};
 use super::{run_error, status_error, Presence};
-use crate::filesystem::{EntryKind, TrustedDir};
+use crate::filesystem::TrustedDir;
 use crate::process::{
-    environment_entry_is, DarwinInspector, ExitReportWatch, Pid, ProcessExit, ProcessFact,
-    ProcessIdentity, ProcessInspector as _,
+    DarwinInspector, ExitReportWatch, Pid, ProcessExit, ProcessFact, ProcessIdentity,
+    ProcessInspector as _,
 };
 use rustix::process::{kill_process, Pid as NativePid, Signal};
 
@@ -33,8 +31,7 @@ const LAUNCHD_PID: Pid = 1;
 /// Mode of the private worker definition and log directories.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
-/// Bits that make a directory unsafe to hold the daemon agent and plugin unit
-/// definitions.
+/// Bits that make a directory unsafe to hold the daemon agent definition.
 ///
 /// `~/Library/LaunchAgents` is commonly `0755`; only write access for others
 /// would let another account substitute the agent.
@@ -65,13 +62,6 @@ const ABSENCE_MARGIN: Duration = Duration::from_secs(5);
 /// Each probe spawns `launchctl`; 100 ms keeps a 30 s wait under 300 spawns
 /// while adding at most a tenth of a second to retirement.
 const ABSENCE_POLL: Duration = Duration::from_millis(100);
-
-/// Environment variable launchd sets to the label in every job it spawns.
-///
-/// A plugin unit's argv need not be unique across installations, so its
-/// process is bound to its label through this entry as well; the value is
-/// compared in place and never read out.
-const SERVICE_NAME_VARIABLE: &str = "XPC_SERVICE_NAME";
 
 /// Worker argument introducing the session ID.
 const SESSION_ID_ARGUMENT: &str = "--session-id";
@@ -602,9 +592,6 @@ impl LaunchdDaemon {
             RestartPolicy::Never => Err(Error::InvalidDefinition {
                 detail: "the daemon agent must restart after a failure".to_owned(),
             }),
-            RestartPolicy::Always { .. } => Err(Error::InvalidDefinition {
-                detail: "the daemon agent must stay stopped after a clean exit".to_owned(),
-            }),
         }
     }
 
@@ -722,303 +709,6 @@ impl DaemonSupervisor for LaunchdDaemon {
     }
 }
 
-/// Installs the persistent workflow plugin units of one installation
-/// namespace in `gui/<uid>`.
-///
-/// Each unit is one job labeled
-/// `io.github.zajca.pohunek.<ns>.wf.<plugin-hash>.<kind>.<name>` and defined by
-/// `<agents>/<label>.plist`; production passes `~/Library/LaunchAgents`, so
-/// launchd loads every installed unit again at login. Definitions are
-/// written, replaced, and removed through the same crash-safe registration
-/// as the daemon agent ([`registration::register`], [`registration::recover`]).
-/// Errors about one unit report its label as the service ID.
-///
-/// A periodic job is loaded with `StartInterval` and `RunAtLoad=false`, so
-/// its first run starts one interval after it is loaded and later runs follow
-/// that cadence; launchd skips a firing while a run is active, so runs never
-/// overlap. A service is loaded with `KeepAlive=true` and its restart delay as
-/// `ThrottleInterval`. launchd has no key bounding a run, so the definition's
-/// start timeout is not rendered and the unit's executable bounds its own
-/// run; `ExitTimeOut` bounds a stop. See the `plist` module for every key.
-///
-/// A unit's process is matched by launchd parentage, executable, exact argv,
-/// and launchd's `XPC_SERVICE_NAME` entry naming its label, so units of two
-/// installations running the same argv are never mistaken for each other; a
-/// process whose environment cannot be read is never matched. The worker
-/// label grammar never matches these labels, so worker discovery neither
-/// adopts, sweeps, nor reports them, even in a shared directory.
-#[derive(Debug)]
-pub struct LaunchdPluginUnits {
-    namespace: Namespace,
-    jobs: Jobs,
-    agents: PathBuf,
-}
-
-impl LaunchdPluginUnits {
-    /// Creates the plugin unit installer for `namespace` in `gui/<uid>`.
-    ///
-    /// `agents` is the `LaunchAgents` directory; `install` creates it `0700`
-    /// when missing, and every operation refuses an existing one that the
-    /// user does not own or that group or others can write, as for the daemon
-    /// agent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidDefinition`] for a relative directory or a zero
-    /// deadline.
-    pub fn new(
-        namespace: Namespace,
-        uid: u32,
-        agents: PathBuf,
-        command_deadline: Duration,
-    ) -> Result<Self, Error> {
-        require_absolute("LaunchAgents directory", &agents)?;
-        Ok(Self {
-            namespace,
-            jobs: Jobs::new(uid, command_deadline)?,
-            agents,
-        })
-    }
-
-    /// Returns the label of `key` and the service ID errors report it under.
-    fn label(&self, key: &PluginUnitKey) -> (String, ServiceId) {
-        let label = self.namespace.plugin_label(key);
-        let id = ServiceId::parse(label.as_str())
-            .expect("plugin labels are bounded and use the service ID alphabet");
-        (label, id)
-    }
-
-    /// Ends the loaded job of `label`, if any, with its process group.
-    ///
-    /// The stored definition bounds the wait and identifies the main process;
-    /// an unusable one is never fatal, because a damaged unit must still stop.
-    async fn end(
-        &self,
-        operation: &'static str,
-        label: &str,
-        directory: Option<&TrustedDir>,
-    ) -> Result<Presence, Error> {
-        let stored = directory
-            .and_then(|directory| usable_stored(directory, &definition_name(label), operation))
-            .filter(|stored| stored.label == label);
-        self.jobs
-            .end_job(operation, label, stored.as_ref(), labeled(label))
-            .await
-    }
-
-    async fn install_unit(
-        &self,
-        key: &PluginUnitKey,
-        definition: &PluginUnitDefinition,
-    ) -> Result<(), Error> {
-        const OPERATION: &str = "install_plugin_unit";
-
-        if definition.kind() != key.kind() {
-            return Err(Error::InvalidDefinition {
-                detail: "the definition's kind differs from the unit key's".to_owned(),
-            });
-        }
-        let (label, id) = self.label(key);
-        let bytes = plist::render_plugin(&label, definition)?;
-        let directory = create_agents(&self.agents, OPERATION)?;
-        registration::recover(&directory, &label, OPERATION)?;
-        // A replaced unit is stopped first, so no process or run of the
-        // previous definition outlives the rewrite.
-        self.end(OPERATION, &label, Some(&directory)).await?;
-        self.jobs
-            .register(OPERATION, &id, &label, &directory, &bytes)
-            .await
-    }
-
-    /// Opens the agents directory and settles an interrupted registration of
-    /// `label`; a missing directory or definition is [`Error::NotFound`].
-    fn installed(
-        &self,
-        label: &str,
-        id: &ServiceId,
-        operation: &'static str,
-    ) -> Result<TrustedDir, Error> {
-        let directory =
-            open_agents(&self.agents, operation)?.ok_or_else(|| Error::NotFound(id.clone()))?;
-        registration::recover(&directory, label, operation)?;
-        registration::require_definition(&directory, id, label, operation)?;
-        Ok(directory)
-    }
-
-    async fn start_unit(&self, key: &PluginUnitKey) -> Result<(), Error> {
-        const OPERATION: &str = "start_plugin_unit";
-
-        let (label, id) = self.label(key);
-        let directory = self.installed(&label, &id, OPERATION)?;
-        if self.jobs.presence(OPERATION, &label).await? == Presence::Loaded {
-            return Ok(());
-        }
-        // Only a definition this backend wrote for this label is loaded.
-        let stored = read_stored(&directory, &definition_name(&label), OPERATION)?
-            .ok_or_else(|| Error::NotFound(id.clone()))?;
-        if stored.label != label {
-            return Err(Error::InvalidData {
-                operation: OPERATION,
-                detail: "definition label differs from its file name".to_owned(),
-            });
-        }
-        registration::load(
-            &self.jobs.launchctl,
-            &self.jobs.domain,
-            OPERATION,
-            &id,
-            &label,
-            &directory,
-        )
-        .await
-    }
-
-    async fn stop_unit(&self, key: &PluginUnitKey) -> Result<(), Error> {
-        const OPERATION: &str = "stop_plugin_unit";
-
-        let (label, id) = self.label(key);
-        let directory = self.installed(&label, &id, OPERATION)?;
-        self.end(OPERATION, &label, Some(&directory)).await?;
-        Ok(())
-    }
-
-    async fn remove_unit(&self, key: &PluginUnitKey) -> Result<(), Error> {
-        const OPERATION: &str = "remove_plugin_unit";
-
-        let (label, _) = self.label(key);
-        let directory = open_agents(&self.agents, OPERATION)?;
-        // No definition an interrupted registration left set aside survives.
-        if let Some(directory) = &directory {
-            registration::recover(directory, &label, OPERATION)?;
-        }
-        self.end(OPERATION, &label, directory.as_ref()).await?;
-        if let Some(directory) = &directory {
-            remove_file(directory, &definition_name(&label), OPERATION)?;
-        }
-        Ok(())
-    }
-
-    async fn unit_state(&self, key: &PluginUnitKey) -> Result<ServiceState, Error> {
-        const OPERATION: &str = "plugin_unit_state";
-
-        let (label, id) = self.label(key);
-        let file_name = definition_name(&label);
-        let (stored, set_aside) = match open_agents(&self.agents, OPERATION)? {
-            Some(directory) => (
-                read_stored(&directory, &file_name, OPERATION)?,
-                directory
-                    .entry_identity(set_aside_name(&label), EntryKind::RegularFile)
-                    .map_err(fs_error(OPERATION))?
-                    .is_some(),
-            ),
-            None => (None, false),
-        };
-        let presence = self.jobs.presence(OPERATION, &label).await?;
-        let Some(stored) = stored else {
-            // A loaded label or a set-aside definition without the definition
-            // itself is an interrupted registration, which the next `start`,
-            // `stop`, `install`, or `remove` settles; this read never does.
-            return match (presence, set_aside) {
-                (Presence::Absent, false) => Err(Error::NotFound(id)),
-                (Presence::Loaded, _) | (Presence::Absent, true) => Ok(ServiceState::Unknown),
-            };
-        };
-        if stored.label != label {
-            return Err(Error::InvalidData {
-                operation: OPERATION,
-                detail: "definition label differs from its file name".to_owned(),
-            });
-        }
-        if presence == Presence::Absent {
-            return Ok(ServiceState::Stopped);
-        }
-        if key.kind() == PluginUnitKind::Job {
-            // A loaded job's schedule is armed, whether or not a run is
-            // active now.
-            return Ok(ServiceState::Running);
-        }
-        let directory = &self.agents;
-        let observation = self
-            .jobs
-            .observe(
-                OPERATION,
-                &id,
-                &label,
-                labeled(&label),
-                || match open_agents(directory, OPERATION)? {
-                    Some(directory) => read_stored(&directory, &file_name, OPERATION),
-                    None => Ok(None),
-                },
-            )
-            .await;
-        match observation {
-            // Without a matching process the service is between two spawns,
-            // throttled, or not spawned yet; launchd tells them apart only
-            // in `print` text.
-            Ok(observation) => Ok(observation.state),
-            Err(Error::NotFound(_)) => Ok(ServiceState::Stopped),
-            Err(Error::Race { .. }) => Ok(ServiceState::Unknown),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl PluginUnits for LaunchdPluginUnits {
-    /// Writes `<label>.plist` and bootstraps it, after booting out and ending
-    /// the job of a replaced definition.
-    ///
-    /// The kind is checked and the definition rendered before anything is
-    /// written. A leftover definition stays set aside until `bootstrap`
-    /// decides which file remains, as for the daemon agent.
-    fn install<'a>(
-        &'a self,
-        key: &'a PluginUnitKey,
-        definition: &'a PluginUnitDefinition,
-    ) -> Operation<'a, ()> {
-        Box::pin(self.install_unit(key, definition))
-    }
-
-    /// Bootstraps the installed definition; a loaded label is already
-    /// started.
-    fn start<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()> {
-        Box::pin(self.start_unit(key))
-    }
-
-    /// Boots the job out and ends its process group, keeping the definition,
-    /// so launchd loads it again at the next login.
-    ///
-    /// `bootout` unloads a job's schedule together with its run, so no new
-    /// run starts in between.
-    fn stop<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()> {
-        Box::pin(self.stop_unit(key))
-    }
-
-    /// Boots the job out, ends its process group, and removes its definition,
-    /// including one an interrupted registration left set aside.
-    fn remove<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ()> {
-        Box::pin(self.remove_unit(key))
-    }
-
-    /// Combines the stored definition, `print` presence, and, for a service,
-    /// process facts.
-    ///
-    /// | Definition | Label | Kind | Result |
-    /// |---|---|---|---|
-    /// | missing, nothing set aside | absent | any | [`Error::NotFound`] |
-    /// | missing, set aside by an interrupted registration | absent | any | [`ServiceState::Unknown`] |
-    /// | missing | loaded | any | [`ServiceState::Unknown`] |
-    /// | present | absent | any | [`ServiceState::Stopped`] |
-    /// | present | loaded | job | [`ServiceState::Running`] (schedule armed) |
-    /// | present | loaded | service, matching process | [`ServiceState::Running`] |
-    /// | present | loaded | service, no matching process or a race | [`ServiceState::Unknown`] |
-    ///
-    /// launchd reports an exit status only in `print` text, which is never
-    /// parsed, so [`ServiceState::Failed`] is never reported.
-    fn state<'a>(&'a self, key: &'a PluginUnitKey) -> Operation<'a, ServiceState> {
-        Box::pin(self.unit_state(key))
-    }
-}
-
 /// Which process arguments identify a job's process.
 #[derive(Debug, Clone)]
 enum ArgvRule {
@@ -1031,18 +721,7 @@ enum ArgvRule {
     /// The daemon: argv after the executable equals the stored arguments,
     /// which name the installation's service configuration.
     Exact,
-    /// A plugin unit: argv after the executable equals the stored arguments
-    /// and the process environment's [`SERVICE_NAME_VARIABLE`] is `label`.
-    Labeled { label: String },
 }
-
-/// Returns the rule binding a plugin unit's process to `label`.
-fn labeled(label: &str) -> ArgvRule {
-    ArgvRule::Labeled {
-        label: label.to_owned(),
-    }
-}
-
 impl ArgvRule {
     fn matches_arguments(&self, arguments: &[String]) -> bool {
         match self {
@@ -1053,7 +732,7 @@ impl ArgvRule {
                 has_pair(arguments, SESSION_ID_ARGUMENT, session_id)
                     && has_pair(arguments, GENERATION_ARGUMENT, generation)
             }
-            Self::Exact | Self::Labeled { .. } => true,
+            Self::Exact => true,
         }
     }
 }
@@ -1093,7 +772,7 @@ impl Expected {
         };
         match &self.rule {
             ArgvRule::Worker { .. } => self.rule.matches_arguments(arguments),
-            ArgvRule::Exact | ArgvRule::Labeled { .. } => arguments == self.arguments.as_slice(),
+            ArgvRule::Exact => arguments == self.arguments.as_slice(),
         }
     }
 
@@ -1482,18 +1161,7 @@ fn scan(
         if !expected.matches_executable(&executable) {
             continue;
         }
-        if let ArgvRule::Labeled { label } = &expected.rule {
-            match environment_entry_is(fact.pid, SERVICE_NAME_VARIABLE, label) {
-                Ok(true) => {}
-                // Another job's process, possibly of another installation
-                // running the same argv, or one whose environment cannot be
-                // read: that never proves the process is this job's, so it is
-                // neither reported nor signalled as the job.
-                Ok(false) | Err(crate::process::Error::Unobservable { .. }) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        // An `exec` between the table read and the path and environment reads
+        // An `exec` between the table read and the path read
         // would pair one image's evidence with another's facts, so the
         // identity must still hold.
         if inspector.identity(fact.pid)? == Some(fact.identity()) {

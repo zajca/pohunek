@@ -103,8 +103,8 @@ Interpret the runtime independently from the agent lifecycle:
 | `conflict` | More than one or mismatched runtime identity is present: `runtime_supervision_ambiguous` (job present, worker socket silent, journal not terminal) or `runtime_identity_mismatch` (job definition or process does not match the record) | Preserve evidence; the daemon never kills a worker automatically and re-checks the conflict in the background (1 s doubling to 60 s) until it adopts the worker `live` (only while no other socket claims the session) or the session becomes `lost`. `session stop` ends a conflict whose recorded identity the journal proves; `session rm` removes the logical record. |
 | `incompatible` | A live worker has no compatible private protocol (`worker_protocol_incompatible`), or its journal names a release before 0.33.1, whose children carry no worker-instance marker (`worker_marker_legacy`) | Run a compatible daemon; leave the worker alive |
 
-`pohunek session runtime-inventory --json` lists worker endpoints and jobs
-outside that table: `worker_job_absent` marks a live, adopted worker whose
+Startup reconciliation reports worker endpoints and jobs outside that table
+through `session_runtime_discovered` events: `worker_job_absent` marks a live, adopted worker whose
 native job is missing (the worker is managed; the job was removed outside
 Pohunek), and `stale_worker_generation` marks a still-running job of a
 generation no record owns (left alive, `orphaned`, `runtime_slot` = its service
