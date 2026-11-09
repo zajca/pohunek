@@ -2,8 +2,8 @@
 
 use sha2::{Digest, Sha256};
 
-/// Pohunek version of this build, recorded in a degraded launch's snapshot.
-pub const BUNDLE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Pohunek version of this build; keys launch ids and the launch snapshot.
+pub const POHUNEK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Return a unique runtime launch id for one assistant materialization.
 ///

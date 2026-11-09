@@ -854,22 +854,19 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
 }
 
+/// The bundle of the repository: a real directory with a readable `index.md`,
+/// which is all a local launch checks before it starts the agent.
+fn bundle_root() -> PathBuf {
+    pohunek_test_support::manifest_dir().join("../../docs/knowledge")
+}
+
 /// The `assistant.materialize` result of the fixture daemon: a bundle
-/// directory that outlives the test binary and a valid prompt contract.
+/// directory path and a valid prompt contract.
 fn assistant_materialize_result() -> Value {
-    static BUNDLE: std::sync::OnceLock<&'static Path> = std::sync::OnceLock::new();
-    let root = BUNDLE.get_or_init(|| {
-        // Leaked on purpose: the directory must outlive every test of the binary.
-        let root: &'static _ = Box::leak(Box::new(
-            pohunek_test_support::tempdir().expect("create the bundle root"),
-        ));
-        std::fs::write(root.path().join("index.md"), "# index\n").expect("write the index");
-        std::fs::write(root.path().join("snapshot.json"), "{}").expect("write the snapshot");
-        root.path()
-    });
+    let root = bundle_root();
     json!({
         "bundle_path": root,
-        "snapshot_path": root.join("snapshot.json"),
+        "snapshot_path": root.join("index.md"),
         "version": "1.0.0",
         "content_hash": "sha256:fixture",
         "concepts": [],

@@ -542,8 +542,8 @@ is refused the same way.
 there is no second flag. See [debug session runtime](debug-session-runtime.md).
 
 When the assistant feature is available, its update intent should compare the
-bundle version in the launch snapshot with the installed binary's version and
-check behavior against that binary before recommending edits.
+snapshot's `pohunek_version` and the package version in the prompt with the
+installed binary's version and check behavior against that binary before recommending edits.
 
 ## Testing an install or upgrade with an isolated HOME (macOS)
 

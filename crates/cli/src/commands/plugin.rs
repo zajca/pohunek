@@ -1732,8 +1732,6 @@ fn selection_after(
     }
 }
 
-/// The review printed before an install-like command asks for consent;
-/// `selected` is the outcome of [`selection_after`].
 /// What a package without a runtime exports: commands, or else a context
 /// directory.
 fn runtimeless_note(commands: &[protocol::CommandInfo]) -> &'static str {
@@ -1744,6 +1742,8 @@ fn runtimeless_note(commands: &[protocol::CommandInfo]) -> &'static str {
     }
 }
 
+/// The review printed before an install-like command asks for consent;
+/// `selected` is the outcome of [`selection_after`].
 fn render_install_review(preview: &PackageInstallResult, enable: bool, selected: bool) -> String {
     let mut output = String::from("The package declares:\n");
     render_package_details(&mut output, &preview.package);

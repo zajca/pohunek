@@ -566,7 +566,7 @@ pohunek assistant --agent hermes "Explain the current session runtime."
 The assistant is an ordinary agent session — the same PTY, attach, and
 notification machinery — launched with a materialized offline knowledge
 bundle and a launch snapshot that holds launch metadata only (intent, request,
-selected host, project and agent, bundle version). The snapshot is not redacted
+selected host, project and agent, launching client version). The snapshot is not redacted
 and carries no live state, so keep secrets out of the request. Its
 automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 `hermes`; explicit Hermes selection still requires the supported runtime on the

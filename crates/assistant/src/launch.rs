@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use knowledge::{PromptContract, BUNDLE_VERSION};
+use knowledge::{PromptContract, POHUNEK_VERSION};
 use pohunek_client::{session_new_request_deadline, Client, ClientError, DEFAULT_REQUEST_TIMEOUT};
 use protocol::{
     method, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent, ConceptMeta,
@@ -657,7 +657,7 @@ struct SnapshotAssistant {
     selected_project: Option<String>,
     selected_agent: String,
     auto_started_daemon: bool,
-    knowledge_bundle_version: String,
+    pohunek_version: String,
     snapshot_collected: bool,
 }
 
@@ -681,7 +681,7 @@ fn collect_snapshot(
             selected_project: params.project.clone(),
             selected_agent: selected_agent.to_owned(),
             auto_started_daemon: params.auto_started_daemon,
-            knowledge_bundle_version: BUNDLE_VERSION.to_owned(),
+            pohunek_version: POHUNEK_VERSION.to_owned(),
             snapshot_collected: true,
         },
         warnings: Vec::new(),
@@ -709,7 +709,7 @@ fn skipped_snapshot(
             selected_project: params.project.clone(),
             selected_agent: selected_agent.to_owned(),
             auto_started_daemon: params.auto_started_daemon,
-            knowledge_bundle_version: BUNDLE_VERSION.to_owned(),
+            pohunek_version: POHUNEK_VERSION.to_owned(),
             snapshot_collected: false,
         },
         warnings: vec!["snapshot collection skipped (--no-snapshot)".to_owned()],
@@ -769,7 +769,7 @@ fn compose(params: &ComposeParams<'_>) -> String {
     let _ = writeln!(
         prompt,
         "You are the universal assistant for configuring, updating, troubleshooting, and \
-         explaining pohunek (version {}).\n",
+         explaining pohunek (knowledge package version {}).\n",
         params.version
     );
     write_contract_safety(&mut prompt, params.contract);

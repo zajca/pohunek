@@ -13,7 +13,7 @@ mod validation;
 
 #[doc(inline)]
 pub use assistant::{
-    assistant_keyed_launch_id, assistant_launch_id, sha256_for_bytes, BUNDLE_VERSION,
+    assistant_keyed_launch_id, assistant_launch_id, sha256_for_bytes, POHUNEK_VERSION,
 };
 #[doc(inline)]
 pub use index::{bundle_index, BundleIndexError, ConceptMeta};

@@ -197,6 +197,16 @@ async fn install(
     plugins: &Path,
     entries: &[ArchiveEntry],
 ) -> Result<PackageDigest, ProtocolError> {
+    install_selected(framed, plugins, entries, true).await
+}
+
+/// Like [`install`], with the choice of selecting the package.
+async fn install_selected(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    plugins: &Path,
+    entries: &[ArchiveEntry],
+    select: bool,
+) -> Result<PackageDigest, ProtocolError> {
     let bytes = build_archive(entries, &Limits::DEFAULT).expect("archive builds");
     let digest = read_archive(&bytes, &Limits::DEFAULT)
         .expect("archive reads")
@@ -211,7 +221,7 @@ async fn install(
             "archive_path": archive_path,
             "trust": { "kind": "explicit_digest", "digest": digest },
             "enable": true,
-            "select": true,
+            "select": select,
             "dry_run": false
         }),
     )
@@ -369,6 +379,114 @@ async fn a_disabled_package_is_refused_until_it_is_enabled_again() {
     materialize(&mut client, json!({ "snapshot": "{}" }))
         .await
         .expect("an enabled package is used again");
+    servers.stop().await;
+}
+
+/// The first file named `name` below `dir`.
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for found in std::fs::read_dir(dir).ok()? {
+        let path = found.ok()?.path();
+        if path.is_dir() {
+            if let Some(hit) = find_file(&path, name) {
+                return Some(hit);
+            }
+        } else if path.file_name().is_some_and(|file| file == name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn an_installed_but_unselected_package_is_refused_with_the_select_command() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers("asst-unselected").await;
+    let mut client = connect(&servers.socket).await;
+    install_selected(
+        &mut client,
+        &servers.plugins,
+        &bundle_entries(CONTRACT),
+        false,
+    )
+    .await
+    .expect("install");
+
+    let error = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect_err("an unselected package is not used");
+
+    assert_eq!(error.code, "assistant_package_missing", "{error:?}");
+    assert!(error.msg.contains("not selected"), "{error:?}");
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("plugin select")),
+        "{error:?}"
+    );
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_package_whose_files_were_modified_after_install_is_refused() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers("asst-modified").await;
+    let mut client = connect(&servers.socket).await;
+    install(&mut client, &servers.plugins, &bundle_entries(CONTRACT))
+        .await
+        .expect("install");
+    materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect("the intact package is used");
+
+    let index = find_file(&servers.plugins, "index.md").expect("the installed bundle index");
+    let mut permissions = std::fs::metadata(&index)
+        .expect("stat the index")
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&index, permissions).expect("make the index writable");
+    std::fs::write(&index, "# tampered\n").expect("modify the installed file");
+
+    let error = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect_err("a modified package is not used");
+
+    assert_eq!(error.code, "assistant_package_missing", "{error:?}");
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("plugin doctor")),
+        "{error:?}"
+    );
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_bundle_cache_left_by_an_earlier_release_is_not_a_fallback() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers("asst-stale-cache").await;
+    let stale = servers
+        .socket
+        .parent()
+        .expect("socket directory")
+        .join("xdg-cache/pohunek/knowledge/0.0.1");
+    std::fs::create_dir_all(stale.join("assistant")).expect("create the stale bundle");
+    std::fs::write(stale.join("index.md"), "# stale\n").expect("write the stale index");
+    std::fs::write(stale.join("assistant/system.md"), CONTRACT).expect("write the stale contract");
+    let mut client = connect(&servers.socket).await;
+
+    let error = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect_err("a stale bundle cache is ignored");
+
+    assert_eq!(error.code, "assistant_package_missing", "{error:?}");
     servers.stop().await;
 }
 

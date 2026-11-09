@@ -162,9 +162,9 @@ and retention prune with `--all-hosts`. Single-record actions use the target
 host: `host/id` overrides `--host`, while a bare id targets the selected
 `--host` or local daemon.
 
-The assistant design keeps the same boundary. A remote assistant must use a
-knowledge bundle materialized on the remote host, version-matched to the remote
-binary, and readable by the selected remote agent profile.
+The assistant design keeps the same boundary. A remote assistant must use the
+bundle of the assistant context package installed on the remote host, and that
+bundle must be readable by the selected remote agent profile.
 
 The Hermes operator uses the same direct overlay path but never performs host
 discovery on a model's behalf. Its policy allows only explicitly listed hosts;

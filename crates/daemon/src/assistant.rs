@@ -7,14 +7,14 @@ use std::path::Path;
 
 use knowledge::{
     assistant_keyed_launch_id, assistant_launch_id, bundle_index, read_prompt_contract,
-    BUNDLE_VERSION,
+    POHUNEK_VERSION,
 };
 use protocol::{
     AssistantMaterializeParams, AssistantMaterializeResult, PackageId, ProtocolError,
     ASSISTANT_CONTEXT_PACKAGE_ID,
 };
 
-use crate::agent::host::ContextError;
+use crate::agent::host::{ContextError, PackageRejection};
 use crate::packages::PackageService;
 use crate::Paths;
 
@@ -40,6 +40,14 @@ pub async fn materialize_assistant(
         ProtocolError::materialization_failed("assistant package id", &error.to_string())
     })?;
     let context = packages.context_dir(id).await.map_err(|error| {
+        // A registry read error is transient and says nothing about the
+        // package, so it must not suggest reinstalling a healthy one.
+        if let ContextError::Rejected(PackageRejection::Registry(registry)) = &error {
+            return ProtocolError::materialization_failed(
+                "assistant package registry",
+                &registry.to_string(),
+            );
+        }
         let (detail, remedy) = match &error {
             ContextError::NotInstalled => (
                 "it is not installed".to_owned(),
@@ -87,8 +95,8 @@ pub async fn materialize_assistant(
             )
         })?;
         let launch_id = match params.request_id.as_deref() {
-            Some(request_id) => assistant_keyed_launch_id(BUNDLE_VERSION, request_id),
-            None => assistant_launch_id(BUNDLE_VERSION),
+            Some(request_id) => assistant_keyed_launch_id(POHUNEK_VERSION, request_id),
+            None => assistant_launch_id(POHUNEK_VERSION),
         };
         let runtime_dir = paths.assistant_runtime_dir(&launch_id).ok_or_else(|| {
             ProtocolError::materialization_failed("assistant runtime", "invalid launch id")

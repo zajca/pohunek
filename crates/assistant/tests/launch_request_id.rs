@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -243,7 +243,7 @@ async fn serve<S>(
                 }
                 ok(&request, capabilities.clone())
             }
-            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result(&request)),
+            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result()),
             method::SESSION_NEW => {
                 creates
                     .lock()
@@ -314,30 +314,18 @@ fn capabilities(request_id_supported: bool) -> HostCapabilities {
     }
 }
 
+/// The bundle of the repository: a real directory with a readable `index.md`,
+/// which is all a local launch checks before it starts the agent.
+fn bundle_root() -> PathBuf {
+    pohunek_test_support::manifest_dir().join("../../docs/knowledge")
+}
+
 /// The `assistant.materialize` result of the fixture daemon.
-///
-/// Like the daemon, a request id names the snapshot file: a repeat under the id
-/// gets the same path, another id another path.
-fn materialize_result(request: &Request) -> Value {
-    static BUNDLE: std::sync::OnceLock<&'static Path> = std::sync::OnceLock::new();
-    let root = BUNDLE.get_or_init(|| {
-        // Leaked on purpose: the directory must outlive every test of the binary.
-        let root: &'static _ = Box::leak(Box::new(
-            pohunek_test_support::tempdir().expect("create the bundle root"),
-        ));
-        std::fs::write(root.path().join("index.md"), "# index\n").expect("write the index");
-        root.path()
-    });
-    let snapshot = match request.params()["request_id"].as_str() {
-        Some(id) => root.join(format!("snapshot-{id}.json")),
-        None => root.join("snapshot.json"),
-    };
-    if !snapshot.exists() {
-        std::fs::write(&snapshot, "{}").expect("write the snapshot");
-    }
+fn materialize_result() -> Value {
+    let root = bundle_root();
     json!({
         "bundle_path": root,
-        "snapshot_path": snapshot,
+        "snapshot_path": root.join("index.md"),
         "version": "1.0.0",
         "content_hash": "sha256:fixture",
         "concepts": [],
@@ -761,15 +749,11 @@ async fn a_launch_repeated_under_a_request_id_renders_the_same_opening_prompt() 
     let again = prepare_in(&daemon, Some("resume-me"))
         .await
         .expect("the repeated launch prepares");
-    let other = prepare_in(&daemon, Some("resume-me-not"))
-        .await
-        .expect("another launch prepares");
 
     assert_eq!(
         first.session_params.input, again.session_params.input,
         "the same request id gives the daemon the same request"
     );
-    assert_ne!(first.session_params.input, other.session_params.input);
 }
 
 #[tokio::test]

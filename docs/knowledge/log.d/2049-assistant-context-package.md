@@ -1,0 +1,3 @@
+## Unreleased (2026-11-09, assistant context package, #2049)
+
+- The assistant knowledge bundle is no longer embedded in the binaries. `pohunek assistant` reads it from the selected, enabled context package `pohunek.context.assistant` (`[context]` in `runtime.toml`, feature `package-context-v1`), and the launch fails with `assistant_package_missing` and a remedy when the package is absent, unselected, disabled or modified. The launch snapshot records `pohunek_version` (the launching client); the prompt names the package version. `pohunek assistant --degraded` is gone, and a remote repeat under a request id replays instead of answering `session_request_conflict`. See [runtime-packages.md](guides/runtime-packages.md) (Declaring a context package).

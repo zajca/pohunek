@@ -337,7 +337,6 @@ async fn select_package(harness: &Harness, digest: &PackageDigest) {
     assert_eq!(code, 0, "select Hermes package: {selected:#}");
 }
 
-/// Reports which package the daemon selected for the reserved `hermes` id.
 /// Installs the assistant context package by digest, as the owner does before
 /// the first `pohunek assistant`.
 async fn install_assistant_context_package(harness: &Harness, dir: &Path) {
@@ -374,6 +373,7 @@ async fn install_assistant_context_package(harness: &Harness, dir: &Path) {
     assert_eq!(code, 0, "{installed}");
 }
 
+/// Reports which package the daemon selected for the reserved `hermes` id.
 async fn selected_package(harness: &Harness, digest: &PackageDigest) {
     let (code, listed) = harness.json(&["plugin", "list"]).await;
     assert_eq!(code, 0, "{listed}");
