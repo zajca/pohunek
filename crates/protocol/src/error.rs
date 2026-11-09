@@ -1286,7 +1286,7 @@ impl ProtocolError {
     /// Raised by `task.start` and `task.continue` when a requested check is not
     /// enabled for the project or not permitted for the caller's origin, before
     /// the turn is delivered (task RFC section 12). A policy refusal of the
-    /// caller's request, like `notification_kind_disabled`. Code is stable:
+    /// caller's request. Code is stable:
     /// `task_check_not_permitted`.
     #[must_use]
     pub fn task_check_not_permitted() -> Self {

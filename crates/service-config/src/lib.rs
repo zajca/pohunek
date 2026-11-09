@@ -981,7 +981,7 @@ pub struct EventRetention {
 /// Notification timings recorded in `[notifications]`.
 ///
 /// [`ServiceConfig::new`] keeps `attention_debounce_secs` within
-/// `0..=`[`MAX_ATTENTION_DEBOUNCE_SECS`], `attention_dedupe_window_secs` within
+/// `1..=`[`MAX_ATTENTION_DEBOUNCE_SECS`], `attention_dedupe_window_secs` within
 /// `1..=`[`MAX_ATTENTION_DEDUPE_WINDOW_SECS`] and `record_ttl_secs` within
 /// [`MIN_NOTIFICATION_RECORD_TTL_SECS`]`..=`[`MAX_NOTIFICATION_RECORD_TTL_SECS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3383,7 +3383,7 @@ fn validate_notification_settings(settings: NotificationSettings) -> Result<(), 
         (
             "notifications.attention_debounce_secs",
             settings.attention_debounce_secs,
-            0,
+            1,
             MAX_ATTENTION_DEBOUNCE_SECS,
         ),
         (

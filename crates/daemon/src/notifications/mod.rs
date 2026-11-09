@@ -152,10 +152,8 @@ pub(crate) const ATTENTION_DEDUPE_KEY_PREFIX: &str = "attention";
 
 /// Prefix of the shared session turn-completion dedupe key (`turn:<session_id>`).
 ///
-/// Turn keys bound the unread inbox row for a completed provider turn. Unlike
-/// attention keys, they require a session suffix and supersede older unread turns
-/// without a time window because a newer turn completion makes the previous one
-/// stale immediately.
+/// Turn keys name the in-memory turn signal of a session. Like attention keys,
+/// they require a session suffix.
 pub(crate) const TURN_DEDUPE_KEY_PREFIX: &str = "turn";
 
 /// Secret-like metadata keys rejected before notification storage.
@@ -584,7 +582,7 @@ impl NotificationService {
 
     /// Run one retention sweep at `now`.
     ///
-    /// Removes the records of kinds the inbox no longer holds, deleted records,
+    /// Removes the records of kinds the inbox does not hold, deleted records,
     /// and resolved attention records older than the configured lifetime, then
     /// rewrites the log. A removed attention record emits
     /// `notification_deleted`; open attention records are kept.
@@ -741,6 +739,13 @@ impl NotificationService {
         record: NotificationRecord,
         minted: Instant,
     ) -> Result<NotificationCreateResult, NotificationError> {
+        if !is_attention_kind(record.kind) {
+            // Only attention kinds are ever stored.
+            return Ok(NotificationCreateResult {
+                created: false,
+                record,
+            });
+        }
         let window = self.inner.settings.attention_dedupe_window_secs;
         match self.inner.store.create_or_dedupe(record, window, minted)? {
             store::CreateOutcome::Created(record) => {
@@ -861,16 +866,16 @@ fn validate_reserved_dedupe_key(
         return Ok(());
     };
     match prefix {
-        ATTENTION_DEDUPE_KEY_PREFIX if !is_attention_kind(kind) => {
+        ATTENTION_DEDUPE_KEY_PREFIX if !is_attention_kind(kind) && !is_turn_report_kind(kind) => {
             return Err(NotificationError::InvalidDedupeKey {
                 key: dedupe_key.to_owned(),
                 reason: "attention dedupe key requires an attention notification kind",
             });
         }
-        TURN_DEDUPE_KEY_PREFIX if kind != NotificationKind::TurnCompleted => {
+        TURN_DEDUPE_KEY_PREFIX if !is_turn_report_kind(kind) => {
             return Err(NotificationError::InvalidDedupeKey {
                 key: dedupe_key.to_owned(),
-                reason: "turn dedupe key requires turn_completed kind",
+                reason: "turn dedupe key requires a turn report kind",
             });
         }
         _ => {}
@@ -976,7 +981,7 @@ fn is_secret_metadata_key(normalized: &str) -> bool {
 fn apply_status(record: &mut NotificationRecord, status: NotificationStatus, now: &str) {
     record.status = status;
     match status {
-        // `is_valid_status_transition` rejects `Unknown` before a status is applied.
+        // A record never takes `Unknown` as a status.
         NotificationStatus::Unread | NotificationStatus::Unknown => {}
         NotificationStatus::Read => record.read_at = Some(now.to_owned()),
         NotificationStatus::Acknowledged => record.acked_at = Some(now.to_owned()),
@@ -992,9 +997,7 @@ fn same_source_namespace(left: &NotificationSource, right: &NotificationSource) 
 /// Whether `kind` is an attention notification that self-resolves on resume.
 ///
 /// Only `agent_blocked` and `approval_required` represent a transient
-/// waiting-for-owner condition. Other kinds (for example `error` or
-/// `session_finished`) stay until the owner handles them explicitly, so they are
-/// never debounced or auto-resolved.
+/// waiting-for-owner condition, and only they are stored.
 pub(crate) fn is_attention_kind(kind: NotificationKind) -> bool {
     matches!(
         kind,
@@ -1002,10 +1005,19 @@ pub(crate) fn is_attention_kind(kind: NotificationKind) -> bool {
     )
 }
 
+/// Whether `kind` is a turn report (`turn_completed`, `error`): a signal for
+/// `session.wait_turn` that is never stored.
+pub(crate) fn is_turn_report_kind(kind: NotificationKind) -> bool {
+    matches!(
+        kind,
+        NotificationKind::TurnCompleted | NotificationKind::Error
+    )
+}
+
 /// Whether a create should be deferred through the notification debounce coordinator.
 ///
-/// Session attention and turn-completion creates are held briefly so owner
-/// activity can consume them before they become durable inbox rows.
+/// Session attention creates and turn signals are held briefly so owner
+/// activity can consume them before they become visible.
 pub(crate) fn is_debounced_create(kind: NotificationKind, dedupe_key: Option<&str>) -> bool {
     is_attention_kind(kind) && dedupe_key.is_some_and(is_attention_dedupe_key)
         || kind == NotificationKind::TurnCompleted && dedupe_key.is_some_and(is_turn_dedupe_key)

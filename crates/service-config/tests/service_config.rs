@@ -3283,7 +3283,14 @@ fn notification_settings_outside_their_bounds_are_refused_by_key() {
             "attention_debounce_secs = 301",
             "notifications.attention_debounce_secs",
             301,
+            1,
+            300,
+        ),
+        (
+            "attention_debounce_secs = 0",
+            "notifications.attention_debounce_secs",
             0,
+            1,
             300,
         ),
         (

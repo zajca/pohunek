@@ -735,8 +735,9 @@ The bounded N-1 rule that governs those later overlaps is the
 #### Protocol window and edge adapters
 
 A daemon of release N negotiates `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION`
-(`SUPPORTED_PROTOCOL_VERSIONS`) with the minimum one below the maximum, so it
-serves release N-1's public protocol next to its own (today `3..=4`). The Rust
+(`SUPPORTED_PROTOCOL_VERSIONS`) with the minimum normally one below the maximum, so it
+serves release N-1's public protocol next to its own (today `5..=5`, see
+"Current window" below). The Rust
 client and the CLI advertise the same window: `CLIENT_PROTOCOL_VERSIONS` is
 `SUPPORTED_PROTOCOL_VERSIONS`, so the window has one definition. A client of
 release N against a daemon that only speaks N-1 (a staggered multi-host

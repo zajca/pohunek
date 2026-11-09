@@ -625,8 +625,6 @@ struct Inner {
     flap_window_ms: Arc<AtomicU64>,
     /// Unix nanoseconds that replace the system clock for turn starts, or 0.
     wall_clock_pin: AtomicU64,
-    /// How often a held provider report was evaluated again while its turn
-    /// still worked.
     /// Turns that went idle, for the notification projector: `(session, turn)`.
     edges: mpsc::UnboundedSender<TurnEdge>,
     edge_receiver: Mutex<Option<mpsc::UnboundedReceiver<TurnEdge>>>,

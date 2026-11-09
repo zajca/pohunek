@@ -13,7 +13,7 @@ use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 /// Spawns the retention sweep.
 ///
 /// The first sweep runs immediately so an upgraded daemon removes the records
-/// the inbox no longer holds without waiting a full interval. The interval is
+/// the inbox does not hold without waiting a full interval. The interval is
 /// the service's `record_sweep_interval_secs`. The task is a driver of `tasks`:
 /// daemon shutdown cancels it and waits for an in-flight sweep, which only
 /// touches the owner-private local JSONL store.

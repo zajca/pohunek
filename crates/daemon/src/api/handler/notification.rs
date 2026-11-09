@@ -88,7 +88,7 @@ where
 /// claim for a held session becomes a turn signal for `session.wait_turn`, and
 /// the answer carries the minted record with `created: false`. Any other kind
 /// is accepted and dropped, so a hook of an earlier release never sees an
-/// error for a report this daemon no longer keeps.
+/// error for a report this daemon does not keep.
 pub(super) async fn handle_notification_create(
     request: &Request,
     notifications: Option<&NotificationService>,
@@ -379,7 +379,7 @@ async fn handle_turn_report(
         info!(
             name: "notification.dropped_kind",
             kind = kind.as_str(),
-            provider = %params.source.provider,
+            provider = %stored_provider(&params.source.provider),
             "a notification kind the inbox does not hold was accepted and dropped"
         );
     }
@@ -391,10 +391,7 @@ async fn handle_turn_report(
         if let (Some(attention), Some(session_id)) = (attention, record.session_id.clone()) {
             deferred.signal = true;
             deferred.record.hook_admitted = hook_claim;
-            deferred
-                .record
-                .dedupe_key
-                .get_or_insert_with(|| turn_dedupe_key(&session_id));
+            deferred.record.dedupe_key = Some(turn_dedupe_key(&session_id));
             attention.defer(match turn {
                 Some(turn) => deferred.for_turn(turn),
                 None => deferred,

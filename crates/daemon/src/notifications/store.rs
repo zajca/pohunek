@@ -32,6 +32,9 @@ const NOTIFICATIONS_REWRITE_NAME: &str = "notifications.jsonl.tmp";
 /// Copy of the log kept before the first rewrite by a format-3 build.
 pub(crate) const PRE_FORMAT_3_COPY_NAME: &str = "notifications.jsonl.pre-format-3";
 
+/// Temporary name of the pre-format-3 copy while it is written.
+const PRE_FORMAT_3_COPY_TEMP_NAME: &str = "notifications.jsonl.pre-format-3.tmp";
+
 /// File name of the notification format marker.
 ///
 /// A sidecar rather than a field of the action log: builds that predate it
@@ -39,7 +42,7 @@ pub(crate) const PRE_FORMAT_3_COPY_NAME: &str = "notifications.jsonl.pre-format-
 const FORMAT_FILE_NAME: &str = "format.json";
 
 /// Format of the notification action log this build writes; it reads this
-/// format and every earlier one. Format 3 no longer has a policy document.
+/// format and every earlier one. Format 3 has no policy document.
 ///
 /// Raise it, together with a snapshot in `format_guard`, when a key or enum
 /// value of `StoreAction` or `NotificationRecord` changes.
@@ -92,6 +95,9 @@ struct StoreState {
 struct ReplayState {
     records: BTreeMap<String, NotificationRecord>,
     action_count: usize,
+    /// Length of the log up to its last complete action, set when an
+    /// unterminated partial last line was ignored.
+    valid_len: Option<u64>,
 }
 
 #[cfg(test)]
@@ -153,6 +159,13 @@ impl NotificationStore {
             }
             Err(error) => return Err(error),
         };
+        if let Some(valid_len) = replayed.valid_len {
+            // An append after the partial last line would glue onto it.
+            file.set_len(valid_len)
+                .map_err(|source| NotificationError::io(&path, source))?;
+            file.sync_all()
+                .map_err(|source| NotificationError::io(&path, source))?;
+        }
         write_format_marker(&dir)?;
         Ok(Self {
             dir,
@@ -264,10 +277,10 @@ impl NotificationStore {
         })
     }
 
-    /// Removes the records that no longer belong in the store and rewrites the
+    /// Removes the records that do not belong in the store and rewrites the
     /// log atomically when there are any.
     ///
-    /// Removed: every record of a kind the inbox no longer holds, every deleted
+    /// Removed: every record of a kind the inbox does not hold, every deleted
     /// record, and every resolved attention record whose resolution is at least
     /// `ttl_secs` old at `now`. Open attention records are never removed. The
     /// replacement file is fully flushed and opened for future appends before
@@ -306,9 +319,20 @@ impl NotificationStore {
 
         let backup_path = self.dir.join(PRE_FORMAT_3_COPY_NAME);
         if !backup_path.exists() {
-            fs::copy(&self.path, &backup_path)
+            // Copied through a synced temporary file, so a crash never leaves a
+            // truncated copy that the existence check would keep.
+            let backup_temp = self.dir.join(PRE_FORMAT_3_COPY_TEMP_NAME);
+            fs::copy(&self.path, &backup_temp)
+                .map_err(|source| NotificationError::io(&backup_temp, source))?;
+            set_owner_private_file_permissions(&backup_temp)?;
+            File::open(&backup_temp)
+                .and_then(|copy| copy.sync_all())
+                .map_err(|source| NotificationError::io(&backup_temp, source))?;
+            fs::rename(&backup_temp, &backup_path)
                 .map_err(|source| NotificationError::io(&backup_path, source))?;
-            set_owner_private_file_permissions(&backup_path)?;
+            File::open(&self.dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| NotificationError::io(&self.dir, source))?;
         }
         let temp_path = self.dir.join(NOTIFICATIONS_REWRITE_NAME);
         let mut replacement = owner_private_write_options()
@@ -771,7 +795,11 @@ fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
     })?;
     let mut records = BTreeMap::new();
     let mut action_count = 0;
+    let mut valid_len = None;
+    let mut offset: u64 = 0;
     for (index, raw_line) in content.split_inclusive('\n').enumerate() {
+        let line_start = offset;
+        offset += raw_line.len() as u64;
         let line_number = index + 1;
         let terminated = raw_line.ends_with('\n');
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
@@ -791,6 +819,7 @@ fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
                     line.number = line_number,
                     "ignoring truncated trailing notification-store action"
                 );
+                valid_len = Some(line_start);
             }
             Err(err) => return Err(NotificationError::store_parse(path, line_number, err)),
         }
@@ -798,6 +827,7 @@ fn replay(path: &Path) -> Result<ReplayState, NotificationError> {
     Ok(ReplayState {
         records,
         action_count,
+        valid_len,
     })
 }
 

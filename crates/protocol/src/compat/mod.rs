@@ -26,8 +26,7 @@
 //! the callers.
 //!
 //! Observable behavior is asserted at supported boundaries only: the real
-//! client in `crates/client/tests/previous_daemon.rs` and the real daemon in
-//! `crates/daemon/tests/protocol_window.rs`.
+//! daemon in `crates/daemon/tests/protocol_window.rs`.
 
 // Rust guideline compliant 2026-10-09
 
