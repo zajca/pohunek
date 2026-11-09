@@ -2,7 +2,7 @@
 
 schema = 1
 id = "pohunek.runtime.hermes"
-version = "1.1.0"
+version = "1.2.0"
 runtime_api = 1
 requires = ["placement-v1"]
 

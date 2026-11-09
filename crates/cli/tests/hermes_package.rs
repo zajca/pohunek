@@ -92,7 +92,7 @@ const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol, and an empty co
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.1.0";
+const PACKAGE_VERSION: &str = "1.2.0";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";
@@ -2103,14 +2103,14 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
-    set_version(&mut alternate, "1.1.1");
+    set_version(&mut alternate, "1.2.1");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.1.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.2.1.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.1.1", &alternate_digest)],
+        vec![catalog_entry("1.2.1", &alternate_digest)],
     );
     update_package(&harness, &archive, &catalog, &alternate_digest).await;
     let (code, removed) = harness
@@ -2339,17 +2339,17 @@ async fn update_moves_an_install_to_the_newly_selected_package() {
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
-    set_version(&mut second, "1.1.1");
+    set_version(&mut second, "1.2.1");
     let mut skill = entry(&second, &format!("operator/{SKILL_PATH}")).to_vec();
     skill.extend_from_slice(b"\n<!-- second package version -->\n");
     replace_operator_file(&mut second, SKILL_PATH, skill.clone());
     let (bytes, second_digest) = archive_of(&second);
-    let archive = write_archive(&harness, "hermes-1.1.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.2.1.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.1.1", &second_digest)],
+        vec![catalog_entry("1.2.1", &second_digest)],
     );
     update_package(&harness, &archive, &catalog, &second_digest).await;
     let status = hermes.status(&harness).await;
@@ -3019,7 +3019,7 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
     let mut published = Vec::new();
     for (index, (name, mut entries)) in cases.into_iter().enumerate() {
         // Above the installed package version, so each case is a new version.
-        let version = format!("1.2.{index}");
+        let version = format!("1.2.{}", index + 1);
         set_version(&mut entries, &version);
         let (bytes, case_digest) = archive_of(&entries);
         let archive = write_archive(&harness, &format!("hermes-{version}.tar.zst"), &bytes);

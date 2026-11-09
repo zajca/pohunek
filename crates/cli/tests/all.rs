@@ -102,6 +102,8 @@ mod service_preflight;
 mod service_systemd;
 #[path = "service_upgrade.rs"]
 mod service_upgrade;
+#[path = "service_workflow_leftovers.rs"]
+mod service_workflow_leftovers;
 #[path = "session_background.rs"]
 mod session_background;
 #[path = "session_background_work.rs"]

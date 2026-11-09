@@ -2790,7 +2790,7 @@ jobs:
   # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,
   # builds the package with `cargo xtask package build`, installs it into a real
   # daemon with explicit-digest trust and drives a real `pi` through launch,
-  # detection, resume and fork. The model is a loopback stub: no provider, no
+  # detection and resume. The model is a loopback stub: no provider, no
   # credential and no model call. The always-running unit tests in the same
   # test binary keep the descriptor, the supported range and the lock in sync;
   # this job proves the locked release still behaves as they say.

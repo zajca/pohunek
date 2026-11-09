@@ -242,10 +242,39 @@ fn migrate_v15_to_v16(_record: &mut Map<String, Value>) {}
 /// Schema 16 to 17: a native launch spec records no fork arguments
 /// (`fork_args`) and an assigned reference no fork assignment (`assign_fork`).
 ///
-/// A record that still carries the keys is read with them ignored and written
-/// without them. A stored `info.capabilities.fork` loads as `false`. No record
-/// needs rewriting.
-fn migrate_v16_to_v17(_record: &mut Map<String, Value>) {}
+/// The step drops both keys from a resume line and from the recovery snapshot
+/// of a session line, and sets a session's `info.capabilities.fork` to
+/// `false`.
+fn migrate_v16_to_v17(record: &mut Map<String, Value>) {
+    strip_fork_launch(record.get_mut("native_launch"));
+    if let Some(Value::Object(recovery)) = record.get_mut("recovery") {
+        strip_fork_launch(recovery.get_mut("native_launch"));
+    }
+    if let Some(Value::Object(capabilities)) = record
+        .get_mut("info")
+        .and_then(Value::as_object_mut)
+        .and_then(|info| info.get_mut("capabilities"))
+    {
+        if capabilities.contains_key("fork") {
+            capabilities.insert("fork".to_owned(), Value::Bool(false));
+        }
+    }
+}
+
+/// Removes the fork keys from one native launch spec.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the argument is the Option an object lookup yields, matched once"
+)]
+fn strip_fork_launch(launch: Option<&mut Value>) {
+    let Some(Value::Object(launch)) = launch else {
+        return;
+    };
+    launch.remove("fork_args");
+    if let Some(Value::Object(assigned)) = launch.get_mut("assigned") {
+        assigned.remove("assign_fork");
+    }
+}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -51,6 +51,7 @@ pub mod settings;
 pub mod usage;
 #[cfg(target_os = "linux")]
 pub mod verify;
+mod workflow_leftovers;
 
 #[doc(inline)]
 pub use backend::Backend;
@@ -133,6 +134,7 @@ pub async fn upgrade(
 ) -> Result<report::UpgradeReport, Error> {
     let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
+    workflow_leftovers::ensure_none(&context)?;
     let from = staged_dir(&context, from)?;
     let backend = connect_installed(&context).await?;
     engine(&context, &backend, inherited)
@@ -271,6 +273,7 @@ fn discover_for_refresh(context: &Context) -> Result<Result<refresh::Discovered,
 pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
+    workflow_leftovers::ensure_none(&context)?;
     let backend = connect_installed(&context).await?;
     engine(&context, &backend, inherited)
         .uninstall(options)
@@ -300,6 +303,7 @@ pub async fn check(
 ) -> Result<report::CheckReport, Error> {
     let context = Context::resolve()?.with_preflight_budget(preflight_budget);
     let inherited = inherited_lock(&context)?;
+    workflow_leftovers::ensure_none(&context)?;
     let checked = check_local(&context, prefix, VERSION, inherited.is_some())?;
     // Install's order: the rollback of an interrupted install discovers before
     // it looks at the job, a fresh install after.

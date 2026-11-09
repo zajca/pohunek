@@ -89,7 +89,7 @@ rule. The current state of each place is stated separately.
   completed upgrade, bound to the installed version, namespace and metadata
   store). It fails closed in both directions: a missing, mismatched, unknown or
   unreadable scope, scheme, schema or ledger means not accepted, and there are
-  no reader shims. A change to the digested facts needs a new scheme name.
+  no reader shims. A change to the digested facts needs a new scheme name; a value change that can only make an acceptance fail closed (the operator accepts once more) may keep the scheme.
 - **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
   from any older kept schema, because skipping releases is normal with
   `update-pohunek`. A persisted shape change requires a schema bump and a

@@ -45,7 +45,7 @@ impl SessionRegistry {
                 session_id = %record.session_id,
                 agent = %record.info.agent,
                 reason = %reason,
-                "stored native recovery record cannot be completed; the session cannot resume or fork natively"
+                "stored native recovery record cannot be completed; the session cannot resume natively"
             );
         }
     }

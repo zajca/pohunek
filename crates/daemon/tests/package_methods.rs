@@ -4618,3 +4618,27 @@ async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_not
     drop(local);
     servers.stop().await;
 }
+
+#[tokio::test]
+async fn the_removed_methods_answer_method_not_found() {
+    let servers = spawn_servers("removed-methods").await;
+    let mut local = connect_unix(&servers.socket).await;
+    for method in [
+        "session.fork",
+        "session.runtime_inventory",
+        "session.policy.get",
+        "session.policy.set",
+        "session.idle_stop.get",
+        "session.idle_stop.set",
+        "store.rejected_list",
+        "store.rejected_set_aside",
+    ] {
+        assert_eq!(
+            refusal(&mut local, method, json!({})).await,
+            "method_not_found",
+            "{method}"
+        );
+    }
+    drop(local);
+    servers.stop().await;
+}

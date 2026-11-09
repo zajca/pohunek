@@ -1485,3 +1485,41 @@ async fn session_list_names_the_code_resume_refuses_a_damaged_package_session_wi
 
     harness.stop().await;
 }
+
+/// Commands the CLI no longer has.
+const REMOVED_COMMANDS: &[&[&str]] = &[
+    &["workflow", "list"],
+    &["session", "fork", "s-1"],
+    &["session", "runtime-inventory"],
+    &["session", "policy", "get"],
+    &["store", "rejected", "list"],
+];
+
+#[tokio::test]
+async fn the_removed_commands_are_unknown_and_a_leftover_workflow_store_does_not_stop_the_daemon() {
+    let harness = Harness::start().await;
+    for arguments in REMOVED_COMMANDS {
+        let output = harness.run(arguments).await;
+        assert!(!output.status.success(), "{arguments:?} must not run");
+        assert!(
+            stderr_text(&output).contains("unrecognized subcommand"),
+            "{arguments:?}: {}",
+            stderr_text(&output)
+        );
+    }
+
+    let state = harness.env.state_home().join("pohunek");
+    let config = harness.env.config_home().join("pohunek");
+    for leftover in [
+        state.join("workflow-plugins").join("acme"),
+        state.join("workflow-plugin-state").join("acme"),
+        config.join("workflow-plugin-config").join("acme"),
+    ] {
+        fs::create_dir_all(&leftover).expect("create a leftover workflow directory");
+        fs::write(leftover.join("record.json"), "{}").expect("write a leftover workflow record");
+    }
+    let restarted = harness.restart().await;
+    let (code, listed) = restarted.json(&["session", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    restarted.stop().await;
+}

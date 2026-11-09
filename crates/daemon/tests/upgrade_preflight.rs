@@ -1675,12 +1675,12 @@ async fn a_session_of_the_built_in_hermes_is_adopted_only_when_pinned_and_the_pa
 }
 
 /// A live session of `runtime` the v0.33.0 daemon launched from its built-in
-/// runtime that cannot resume or fork (a host profile with `[resume]
+/// runtime that cannot resume (a host profile with `[resume]
 /// resumable = false`) still depends on the runtime source: this binary ships
 /// no built-in `runtime`, so without the official package every interaction
 /// with the adopted session is refused. The preflight reports that loss
 /// instead of `adoptable`. With the package installed the session is adopted
-/// and has no resume or fork to lose.
+/// and has no resume to lose.
 async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_package(runtime: &str) {
     let recoveries = built_in_pins(runtime)
         .into_iter()
@@ -1742,10 +1742,10 @@ async fn assert_non_resumable_built_in_session_is_at_risk_only_without_the_packa
                 detail.contains(&release_install_step(runtime)),
                 "{case}: {detail}"
             );
-            // The install restores interaction; resume and fork follow only
+            // The install restores interaction; resume follows only
             // when the package honors the frozen launch.
             assert!(
-                detail.contains("resume and fork run through it when it honors the launch"),
+                detail.contains("resume runs through it when it honors the launch"),
                 "{case}: {detail}"
             );
         }

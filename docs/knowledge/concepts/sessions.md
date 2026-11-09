@@ -1292,6 +1292,13 @@ session for 30 days, keep a session whose runtime is `lost` for 90 days, and
 remove at most 25 sessions per sweep. The `lost` grace period is the longer one
 because such a session may still be recoverable with `session resume`.
 
+The file is a JSON object with the keys `enabled` (boolean), `sweep_interval_secs`,
+`terminal_ttl_secs`, `lost_ttl_secs` and `max_removals_per_sweep` (positive
+integers, each at or above the minimum the daemon enforces; the cap must be
+greater than zero), written with owner-only permissions. Unknown keys, a value
+below a minimum or a file that is not valid JSON make the daemon refuse to
+start, naming the file.
+
 `pohunek session retention sweep --dry-run` reports exactly what the current
 policy selects without touching anything; `--apply` removes the selection, and
 `--limit` lowers the cap for that one sweep. A manual sweep works whether or not

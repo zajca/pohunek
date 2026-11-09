@@ -896,7 +896,7 @@ fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
                 METADATA_STORE_REJECTED_LINES_CHECK,
                 DoctorStatus::Warn,
                 &format!(
-                    "The metadata store keeps {total} line(s) this build cannot load; {effect}."
+                    "The metadata store keeps {total} line(s) this build cannot load; {effect}. See docs/knowledge/runbooks/runtime-package-recovery.md."
                 ),
             )
         }

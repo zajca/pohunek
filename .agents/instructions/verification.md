@@ -78,7 +78,7 @@ The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/cli/tests/service_upgrade.rs`) have their real-systemd scenarios
 `#[ignore]`d on Linux, and those need
 `POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job
-`real systemd supervision` runs all nine with `--ignored --test-threads 1`
+`real systemd supervision` runs every listed suite with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
 suites at the built binaries). The `privileged_` scenarios of

@@ -57,3 +57,29 @@ fn a_schema_5_assigned_binding_migrates_and_still_resumes_with_its_assigned_laun
         .expect("the session still resumes");
     assert_eq!(resume, ["--session", source.value()]);
 }
+
+#[test]
+fn migration_drops_stored_fork_data_instead_of_keeping_it() {
+    let root = pohunek_test_support::tempdir().expect("private fixture root");
+    let path = root.path().join("metadata.jsonl");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .expect("create owner-private schema-5 store")
+        .write_all(SCHEMA_5.as_bytes())
+        .expect("write frozen schema-5 store");
+    assert!(
+        SCHEMA_5.contains("fork_args"),
+        "the frozen line carries fork data"
+    );
+
+    Store::new(path.clone())
+        .migrate_to_current()
+        .expect("migrate previous schema");
+
+    let stored = std::fs::read_to_string(&path).expect("read migrated store");
+    assert!(!stored.contains("fork_args"), "{stored}");
+    assert!(!stored.contains("assign_fork"), "{stored}");
+}
