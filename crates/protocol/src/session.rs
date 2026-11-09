@@ -1120,7 +1120,10 @@ pub struct SessionDetectionResult {
 pub struct DetectionStatus {
     /// The source of the session's current activity, as in `session.info`.
     pub state_source: Option<StateSource>,
-    /// Whether the session worker answers the program's OSC 7501 probe.
+    /// Whether the session worker answers the program's OSC 7501 probe. Not
+    /// known when `gate.reason` is `version_unknown` (a launch with an unknown
+    /// release, or a session re-attached after a daemon restart, whose worker
+    /// keeps the probe flag it was spawned with): the value then reads `false`.
     pub probe_answered: bool,
     /// Whether an authoritative OSC 7501 root record is held.
     pub record_present: bool,

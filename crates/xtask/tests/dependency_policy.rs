@@ -5,10 +5,10 @@ use pohunek_test_support::env::TestEnv;
 
 /// A `cargo` command in the scrubbed environment of `env`.
 ///
-/// The fixture resolves offline against the dependency versions already in the
-/// developer's registry cache, so the cargo and rustup homes (and a pinned
-/// toolchain) are passed on explicitly; everything else the environment drops.
-/// The homes default to `~/.cargo` and `~/.rustup` of the test process.
+/// Used for offline `cargo metadata` of the workspace: it resolves against the
+/// registry cache of the host's cargo, so the cargo and rustup homes (and a
+/// pinned toolchain) are passed on explicitly; everything else the environment
+/// drops. The homes default to `~/.cargo` and `~/.rustup` of the test process.
 fn host_cargo(env: &TestEnv) -> std::process::Command {
     let mut command = env.command("cargo");
     let host_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
