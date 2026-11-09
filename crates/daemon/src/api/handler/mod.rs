@@ -609,7 +609,7 @@ mod tests {
     use std::time::Duration;
 
     use protocol::{
-        method, DetectionRegionKind, ProtocolError, Request, RuntimeRef, SessionDetectionParams,
+        method, DetectionRegionKind, Request, RuntimeRef, SessionDetectionParams,
         SessionDetectionResult, SessionId, SessionInfo, SessionNewParams, SessionSetMetadataParams,
         SessionSetMetadataResult, SessionState, StateSource,
     };
