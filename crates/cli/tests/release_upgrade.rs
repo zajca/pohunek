@@ -261,16 +261,10 @@ const LIVE_NAME: &str = "upgrade-fake";
 /// as the current native conversation for a verified launch process.
 const NATIVE_AFTER: &str = "native-after-upgrade";
 
-/// Hook event ids of the notifications the test waits for; each carries a
-/// distinct one so the test can tell which phase delivered it. The fake agent
-/// also sends one at its first launch (`evt-before-upgrade`); the previous
-/// release's own notification hook is not accepted by its own daemon, so that
-/// one is not observable and not asserted.
+/// Hook event id the fake agent sends after the upgrade; the agent also sends
+/// one at each launch. The error hook of the agent surfaces as a `turn_error`
+/// turn event, which the test waits for.
 const EVENT_AFTER_UPGRADE: &str = "evt-after-upgrade";
-/// Prefix of the hook event id a resumed launch sends; the fake agent appends
-/// its process id, because the daemon merges notifications by event id across
-/// sessions.
-const EVENT_AFTER_RESUME: &str = "evt-after-resume-";
 
 /// Environment a child CLI receives; nothing else is inherited, so no
 /// `POHUNEK_*` input of this test reaches the daemon or the CLIs.
@@ -635,51 +629,37 @@ fn wait_native_id(cli: &Cli, id: &str, expected: &str) {
     );
 }
 
-/// The number of notifications of session `id` that mention `event`.
-fn notification_count(cli: &Cli, id: &str, event: &str) -> usize {
-    let list = cli.json(&["notifications", "list", "--session", id, "--json"]);
-    list["notifications"].as_array().map_or(0, |records| {
-        records
-            .iter()
-            .filter(|record| record.to_string().contains(event))
-            .count()
-    })
+/// Cursor of the turn events of session `id` at this moment; a wait that
+/// passes it ends only on a later event.
+fn turn_cursor(cli: &Cli, id: &str) -> String {
+    let waited = cli.json(&["session", "wait", id, "--timeout", "1s", "--json"]);
+    waited["cursor"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no turn cursor in {waited}"))
+        .to_owned()
 }
 
-/// Waits until session `id` has more than `known` notifications that mention
-/// `event`.
-fn wait_new_notification(cli: &Cli, id: &str, event: &str, known: usize) {
+/// Waits until session `id` records a `turn_error` event after `cursor`, the
+/// way an error hook of the agent surfaces.
+fn wait_turn_error(cli: &Cli, id: &str, cursor: &str) {
     poll_until(
-        &format!("a new notification {event} of {id} via {}", cli.label),
+        &format!("a turn_error event of {id} via {}", cli.label),
         || {
-            let list = cli
-                .try_json(&["notifications", "list", "--session", id, "--json"])
+            let waited = cli
+                .try_json(&[
+                    "session",
+                    "wait",
+                    id,
+                    "--until",
+                    "turn_error",
+                    "--after",
+                    cursor,
+                    "--timeout",
+                    "5s",
+                    "--json",
+                ])
                 .ok()?;
-            (list
-                .get("notifications")?
-                .as_array()?
-                .iter()
-                .filter(|record| record.to_string().contains(event))
-                .count()
-                > known)
-                .then_some(())
-        },
-    );
-}
-
-/// Waits until a notification of the session mentions the hook event id.
-fn wait_notification(cli: &Cli, id: &str, event: &str) {
-    poll_until(
-        &format!("notification {event} of {id} via {}", cli.label),
-        || {
-            let list = cli
-                .try_json(&["notifications", "list", "--session", id, "--json"])
-                .ok()?;
-            list.get("notifications")?
-                .as_array()?
-                .iter()
-                .any(|record| record.to_string().contains(event))
-                .then_some(())
+            (waited["reason"] == "event" && waited["event"]["kind"] == "turn_error").then_some(())
         },
     );
 }
@@ -2354,8 +2334,9 @@ impl Upgrade {
         input(head, id, &format!("report:{NATIVE_AFTER}"));
         wait_active_agent_id(head, id, NATIVE_AFTER);
         wait_native_id(head, id, NATIVE_AFTER);
+        let cursor = turn_cursor(head, id);
         input(head, id, &format!("stopfail:{EVENT_AFTER_UPGRADE}"));
-        wait_notification(head, id, EVENT_AFTER_UPGRADE);
+        wait_turn_error(head, id, &cursor);
     }
 
     /// A client of the previous release talks to the new daemon: reads and a
@@ -2372,7 +2353,6 @@ impl Upgrade {
             Some(after)
         );
         previous.json(&["health", "--json"]);
-        wait_notification(previous, id, EVENT_AFTER_UPGRADE);
         input(previous, id, "echo:input-from-previous-client");
         wait_screen(previous, id, "fake-agent ack input-from-previous-client");
     }
@@ -2385,15 +2365,15 @@ impl Upgrade {
     /// package its profile names.
     fn resume(&self, id: &str, name: &str, native: &str, stopped: &Runtime) -> Runtime {
         let launched = self.run.launches().len();
-        let notified = notification_count(&self.head, id, EVENT_AFTER_RESUME);
+        let cursor = turn_cursor(&self.head, id);
         self.head.json(&["session", "resume", id, "--json"]);
-        self.assert_relaunched(id, name, native, stopped, launched, notified)
+        self.assert_relaunched(id, name, native, stopped, launched, &cursor)
     }
 
-    /// Checks a relaunch of session `id` after `launched` launches and
-    /// `notified` resume notifications: a new generation of this build's
-    /// worker, launched with `--name=<name> --resume <native>`, whose hooks deliver a new
-    /// resume notification and whose store pin is the package its profile names.
+    /// Checks a relaunch of session `id` after `launched` launches and the turn
+    /// `cursor`: a new generation of this build's worker, launched with
+    /// `--name=<name> --resume <native>`, whose hooks deliver a new turn error
+    /// and whose store pin is the package its profile names.
     fn assert_relaunched(
         &self,
         id: &str,
@@ -2401,7 +2381,7 @@ impl Upgrade {
         native: &str,
         stopped: &Runtime,
         launched: usize,
-        notified: usize,
+        cursor: &str,
     ) -> Runtime {
         let head = &self.head;
         let resumed = wait_live(head, id);
@@ -2428,7 +2408,7 @@ impl Upgrade {
         });
         assert_eq!(status["active_version"], self.head_version.as_str());
         wait_native_id(head, id, native);
-        wait_new_notification(head, id, EVENT_AFTER_RESUME, notified);
+        wait_turn_error(head, id, cursor);
         assert_store_pin(
             &self.run,
             id,
