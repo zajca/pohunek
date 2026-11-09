@@ -673,11 +673,13 @@ fn a_blocked_record_beats_the_screen_and_gives_way_to_the_next_record() {
 /// The approval notice the shipped Claude manifest holds as an attention hint.
 const APPROVAL_NOTICE: &[u8] = b"\x1b]9;Approval requested\x07";
 
-/// Whether the session loop would turn the notice the last feed held into
-/// attention: it is dropped while an authoritative record is present.
-fn notice_becomes_attention(harness: &mut Harness) -> bool {
-    harness.detector.take_approval_notice()
-        && harness.detector.status(harness.now).record_state.is_none()
+/// Takes the notice the last feed held and reports whether an authoritative
+/// record is present as well; the session loop turns the notice into attention
+/// only when none is.
+fn take_notice(harness: &mut Harness) -> (bool, bool) {
+    let held = harness.detector.take_approval_notice();
+    let record_present = harness.detector.status(harness.now).record_state.is_some();
+    (held, record_present)
 }
 
 /// Distinct `blocked` states the detector published.
@@ -708,9 +710,10 @@ fn a_blocked_record_and_the_notice_in_one_chunk_are_one_attention_source_in_eith
         harness.now += STEP;
         let transitions = harness.detector.feed(harness.now, &chunk);
         harness.note(transitions);
-        let notice = notice_becomes_attention(&mut harness);
+        let (held, record_present) = take_notice(&mut harness);
         harness.settle();
-        assert!(!notice, "{name}: the record drops the notice");
+        assert!(held, "{name}: the notice is recognized");
+        assert!(record_present, "{name}: the record drops the notice");
         assert_eq!(blocked_changes(&harness), 1, "{name}");
         assert_eq!(harness.activity(), BLOCKED, "{name}");
     }
@@ -726,7 +729,7 @@ fn a_notice_after_a_blocked_record_is_dropped_by_the_record() {
     harness.now += STEP;
     let transitions = harness.detector.feed(harness.now, APPROVAL_NOTICE);
     harness.note(transitions);
-    assert!(!notice_becomes_attention(&mut harness));
+    assert_eq!(take_notice(&mut harness), (true, true));
     assert_eq!(blocked_changes(&harness), 1);
 }
 
@@ -740,12 +743,12 @@ fn a_notice_before_a_blocked_record_is_held_once_and_the_record_adds_the_blocked
     harness.now += STEP;
     let transitions = harness.detector.feed(harness.now, APPROVAL_NOTICE);
     harness.note(transitions);
-    assert!(notice_becomes_attention(&mut harness));
+    assert_eq!(take_notice(&mut harness), (true, false));
 
     harness.feed(&claude_record("blocked"));
     assert_eq!(harness.activity(), BLOCKED);
     assert_eq!(blocked_changes(&harness), 1);
-    assert!(!harness.detector.take_approval_notice());
+    assert_eq!(take_notice(&mut harness), (false, true));
 }
 
 #[test]
