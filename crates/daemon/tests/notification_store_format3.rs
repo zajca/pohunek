@@ -199,3 +199,53 @@ fn a_sweep_that_cannot_replace_the_log_leaves_it_whole_and_the_next_sweep_succee
     let reopened = NotificationService::open_with_settings(dir.path(), settings()).expect("opens");
     assert_eq!(listed_ids(&reopened), ["n-open", "n-read", "n-young"]);
 }
+
+fn attention_params(title: &str) -> protocol::NotificationCreateParams {
+    protocol::NotificationCreateParams {
+        source: protocol::NotificationSource {
+            provider: "scenario-tool".to_owned(),
+            provider_event: "PermissionRequest".to_owned(),
+            host_local_source_id: title.to_owned(),
+        },
+        kind: NotificationKind::ApprovalRequired,
+        severity: protocol::NotificationSeverity::ActionRequired,
+        title: title.to_owned(),
+        body: String::new(),
+        metadata: std::collections::BTreeMap::new(),
+        session_id: None,
+        agent_kind: None,
+        source_id: None,
+        dedupe_key: None,
+        project_id: None,
+        retryable_admission: false,
+    }
+}
+
+#[test]
+fn appends_after_a_sweep_and_after_a_partial_tail_survive_a_reopen() {
+    let dir = pohunek_test_support::tempdir_with_prefix("ph-format3-").expect("temp dir");
+    write_format_2(dir.path());
+    let service = NotificationService::open_with_settings(dir.path(), settings()).expect("opens");
+    service.run_retention_at(now()).expect("sweep");
+    service
+        .create(attention_params("after-sweep"))
+        .expect("the append handle is live after the rewrite");
+    drop(service);
+
+    // A crash during an append leaves an unterminated last line; the next
+    // append must not glue onto it.
+    let path = dir.path().join("notifications").join("notifications.jsonl");
+    let mut content = std::fs::read(&path).expect("read the log");
+    content.extend_from_slice(b"{\"action\":\"created\",\"rec");
+    std::fs::write(&path, content).expect("leave a partial tail");
+    let service = NotificationService::open_with_settings(dir.path(), settings()).expect("opens");
+    assert_eq!(listed_ids(&service).len(), 4);
+    service
+        .create(attention_params("after-partial-tail"))
+        .expect("append");
+    drop(service);
+
+    let reopened = NotificationService::open_with_settings(dir.path(), settings())
+        .expect("a log without a glued line opens");
+    assert_eq!(listed_ids(&reopened).len(), 5);
+}
