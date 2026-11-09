@@ -847,10 +847,34 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         }
         protocol::method::SESSION_INPUT => json!({"accepted": true}),
         protocol::method::HOST_INSPECT => host_capabilities(),
+        protocol::method::ASSISTANT_MATERIALIZE => assistant_materialize_result(),
         protocol::method::SESSION_RETENTION_SWEEP => retention_sweep(scenario),
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+/// The `assistant.materialize` result of the fixture daemon: a bundle
+/// directory that outlives the test binary and a valid prompt contract.
+fn assistant_materialize_result() -> Value {
+    static BUNDLE: std::sync::OnceLock<&'static Path> = std::sync::OnceLock::new();
+    let root = BUNDLE.get_or_init(|| {
+        // Leaked on purpose: the directory must outlive every test of the binary.
+        let root: &'static _ = Box::leak(Box::new(
+            pohunek_test_support::tempdir().expect("create the bundle root"),
+        ));
+        std::fs::write(root.path().join("index.md"), "# index\n").expect("write the index");
+        std::fs::write(root.path().join("snapshot.json"), "{}").expect("write the snapshot");
+        root.path()
+    });
+    json!({
+        "bundle_path": root,
+        "snapshot_path": root.join("snapshot.json"),
+        "version": "1.0.0",
+        "content_hash": "sha256:fixture",
+        "concepts": [],
+        "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
+    })
 }
 
 /// The success a daemon answers an opted-in `working` wait with when only the

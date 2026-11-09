@@ -3114,7 +3114,6 @@ async fn hermes_launches_only_from_the_installed_official_package() {
                 "assistant",
                 "--print-prompt",
                 "--no-snapshot",
-                "--degraded",
                 "--no-start-daemon",
             ])
             .await
@@ -3166,6 +3165,44 @@ async fn hermes_launches_only_from_the_installed_official_package() {
     assert_eq!(code, 1, "{refused}");
     assert_eq!(refused["err"]["code"], "package_referenced", "{refused}");
     selected_package(&harness, &digest).await;
+    // The launch reads its knowledge bundle from the assistant context package.
+    let (refused_code, no_bundle) = assistant().await;
+    assert_eq!(refused_code, 1, "{no_bundle}");
+    assert_eq!(
+        no_bundle["err"]["code"], "assistant_package_missing",
+        "the agent was selected, the bundle is what is missing: {no_bundle}"
+    );
+    let context = [
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: b"schema = 1\nid = \"pohunek.context.assistant\"\nversion = \"1.0.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n".to_vec(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bundle/index.md".to_owned(),
+            contents: b"# Index\n".to_vec(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bundle/assistant/system.md".to_owned(),
+            contents: b"---\ntype: PromptTemplate\nid: assistant/system\ntitle: Contract\ndescription: Fixture contract.\nsource_kind: manual\nintents: [help]\n---\n\n## Safety\n\n- Never print secrets.\n\n## Navigation\n\n1. Start at the index.\n".to_vec(),
+            executable: false,
+        },
+    ];
+    let (context_bytes, context_digest) = archive_of(&context);
+    let context_archive = cwd.join("assistant-context.tar.zst");
+    fs::write(&context_archive, context_bytes).expect("write the context archive");
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&context_archive),
+            "--sha256",
+            context_digest.as_str().trim_start_matches("sha256:"),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
     let (code, picked) = assistant().await;
     assert_eq!(code, 0, "{picked}");
     assert_eq!(picked["ok"]["agent"], "hermes", "{picked}");

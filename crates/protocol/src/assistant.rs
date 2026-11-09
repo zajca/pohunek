@@ -39,7 +39,7 @@ pub struct AssistantMaterializeResult {
     pub concepts: Vec<ConceptMeta>,
     /// Text of the assistant prompt contract (`assistant/system.md`) read from
     /// the bundle. Empty from a daemon that predates the package-based bundle.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_contract: String,
 }
 
