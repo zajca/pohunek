@@ -110,10 +110,33 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    gh release view "vX.Y.Z"   # confirm the tarballs + .sha256 (incl. the three pohunek-ts-*.tgz) are attached
    ```
 
-8. **Report.** State the published version/tag, the workflow conclusion
+8. **Release `pohunekd/plugin-assistant` from the new core tag.** The assistant
+   knowledge bundle ships as the context package `pohunek.context.assistant`, and
+   the plugin release workflow builds it with the `xtask` of a published core tag,
+   so this step runs after the core release is verified. In a clone of
+   `pohunekd/plugin-assistant`:
+
+   ```bash
+   scripts/assemble-bundle <checkout of the vX.Y.Z tag>   # refreshes package/bundle
+   # package/runtime.toml: version = "X.Y.Z"
+   # .github/workflows/release.yml: uses ...plugin-release.yml@vX.Y.Z and core-tag: vX.Y.Z
+   git commit -am "Release X.Y.Z" && git push origin main
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   gh run watch "$(gh run list --repo pohunekd/plugin-assistant --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+   gh release view vX.Y.Z --repo pohunekd/plugin-assistant   # archive + SHA256SUMS attached
+   ```
+
+   Verify the attestation (`gh attestation verify <archive> --repo
+   pohunekd/plugin-assistant`), then add the archive's sha256 to the core release
+   notes (`gh release edit "vX.Y.Z" --notes-file FILE`), which is where
+   `docs/install.md` ("Install the assistant package") sends operators for the
+   digest. Without this release, `pohunek assistant` answers
+   `assistant_package_missing` on every host.
+
+9. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
    the workflow failed, report why with output — a failed gate means no binary
-   was published.
+   was published. Include the plugin-assistant release and its digest.
 
 ## Constraints
 

@@ -158,8 +158,13 @@ pub(crate) struct Identity {
     pub(crate) runtime_api: u32,
 }
 
-/// Reads the identity and runtime API from the `runtime.toml` bytes `descriptor`.
-pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
+/// Reads the package id and version from the `runtime.toml` bytes `descriptor`.
+///
+/// Every package kind declares them, including a context package that serves
+/// no runtime.
+pub(crate) fn descriptor_package(
+    descriptor: &[u8],
+) -> Result<(PackageId, PackageVersion, toml::Table), XtaskError> {
     let invalid = |reason: &str| {
         XtaskError::Usage(format!("package descriptor `{DESCRIPTOR_PATH}` {reason}"))
     };
@@ -177,6 +182,15 @@ pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskEr
         .map_err(|_cause| invalid("has an invalid package `id`"))?;
     let version = PackageVersion::parse(&string(table.get("version"), "version")?)
         .map_err(|_cause| invalid("has an invalid `version`"))?;
+    Ok((package_id, version, table))
+}
+
+/// Reads the identity and runtime API from the `runtime.toml` bytes `descriptor`.
+pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
+    let invalid = |reason: &str| {
+        XtaskError::Usage(format!("package descriptor `{DESCRIPTOR_PATH}` {reason}"))
+    };
+    let (package_id, version, table) = descriptor_package(descriptor)?;
     let runtime_api = table
         .get("runtime_api")
         .and_then(toml::Value::as_integer)
@@ -187,14 +201,38 @@ pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskEr
         .get("runtime")
         .and_then(toml::Value::as_table)
         .ok_or_else(|| invalid("has no `[runtime]` table"))?;
-    let runtime_id = RuntimeId::parse(&string(runtime.get("id"), "runtime.id")?)
-        .map_err(|_cause| invalid("has an invalid `runtime.id`"))?;
+    let runtime_id = RuntimeId::parse(
+        runtime
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| invalid("has no string `runtime.id`"))?,
+    )
+    .map_err(|_cause| invalid("has an invalid `runtime.id`"))?;
     Ok(Identity {
         package_id,
         version,
         runtime_id,
         runtime_api,
     })
+}
+
+/// The package id and version the `runtime.toml` of the verified archive read
+/// from `archive` declares.
+pub(crate) fn archive_package(
+    verified: &VerifiedArchive,
+    archive: &Path,
+) -> Result<(PackageId, PackageVersion), XtaskError> {
+    let descriptor = verified
+        .entries()
+        .iter()
+        .find(|entry| entry.path == DESCRIPTOR_PATH)
+        .ok_or_else(|| {
+            XtaskError::Usage(format!(
+                "package archive `{}` has no `{DESCRIPTOR_PATH}`",
+                archive.display()
+            ))
+        })?;
+    descriptor_package(&descriptor.contents).map(|(id, version, _table)| (id, version))
 }
 
 /// The identity the `runtime.toml` of the verified archive read from

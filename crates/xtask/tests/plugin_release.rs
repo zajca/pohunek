@@ -292,6 +292,41 @@ fn build_is_deterministic_and_never_replaces_an_archive() {
 }
 
 #[test]
+fn build_archives_a_context_package_that_serves_no_runtime() {
+    let plugin = Plugin::new();
+    let package = plugin.dir("context-package");
+    fs::write(
+        package.join("runtime.toml"),
+        "schema = 1\nid = \"pohunek.context.fixture\"\nversion = \"0.2.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n",
+    )
+    .expect("write the descriptor");
+    fs::create_dir(package.join("bundle")).expect("create the bundle directory");
+    fs::write(package.join("bundle/index.md"), "# Index\n").expect("write the bundle");
+    let out = plugin.dir("context-out");
+
+    let output = plugin.xtask(&[
+        "plugin",
+        "build",
+        "--dir",
+        s(&package),
+        "--output-dir",
+        s(&out),
+    ]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let archive = out.join("pohunek.context.fixture-0.2.0.tar.zst");
+    let bytes = fs::read(&archive).expect("the archive is named by the descriptor");
+    let digest = format!("sha256:{}", hex(&Sha256::digest(&bytes)));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf-8 stdout"),
+        format!(
+            "plugin build ok: pohunek.context.fixture 0.2.0 {digest} {}\n",
+            archive.display()
+        )
+    );
+}
+
+#[test]
 fn build_refuses_unusable_inputs_without_writing() {
     let plugin = Plugin::new();
     let out = plugin.dir("out");

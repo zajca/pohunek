@@ -414,16 +414,20 @@ in [the architecture](architecture.md#runtime-packages-and-trust) and the
 package once per host that runs assistant sessions (a remote assistant reads the
 package installed on that remote host). The package is published as a release
 asset of [`pohunekd/plugin-assistant`](https://github.com/pohunekd/plugin-assistant)
-with its SHA-256 digest in the release notes; a context package installs by
-digest, never through the catalog:
+and the pohunek release notes carry its SHA-256 digest; a context package
+installs by digest, never through the catalog. Each pohunek release publishes
+the matching package right after the core release, so the package is available
+from the first pohunek release that contains the context package kind (0.41.0):
 
 ```bash
 pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
 ```
 
-The first install selects the package. Until that repository publishes its first
-release there is no archive to install, and `pohunek assistant` answers
-`assistant_package_missing` with the step to take.
+The first install selects the package. A build from `main` before that release
+has no published archive, and `pohunek assistant` answers `assistant_package_missing`
+with the step to take; build the archive from a checkout of
+[`plugin-assistant`](https://github.com/pohunekd/plugin-assistant) (its README)
+instead.
 
 After a core upgrade, move to the package version whose release notes name your
 core version with `plugin update`, which installs the new version next to the old

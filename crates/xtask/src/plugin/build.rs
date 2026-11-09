@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use package::{read_archive, Limits, PackageDigest};
 use protocol::{PackageId, PackageVersion};
 
-use crate::catalog::{archive_identity, io_error};
+use crate::catalog::{archive_package, io_error};
 use crate::plugin_index::write_new_document;
 use crate::runtime_package::{build_bytes, reject_output_inside};
 use crate::XtaskError;
@@ -62,16 +62,15 @@ pub(crate) fn build(args: &BuildArgs) -> Result<Built, XtaskError> {
     }
     let bytes = build_bytes(&args.dir, &Limits::DEFAULT)?;
     let verified = read_archive(&bytes, &Limits::DEFAULT).map_err(XtaskError::Package)?;
-    let identity = archive_identity(&verified, &args.dir)?;
-    let path = args.output_dir.join(format!(
-        "{}-{}{ARCHIVE_SUFFIX}",
-        identity.package_id, identity.version
-    ));
+    let (package_id, version) = archive_package(&verified, &args.dir)?;
+    let path = args
+        .output_dir
+        .join(format!("{package_id}-{version}{ARCHIVE_SUFFIX}"));
     reject_output_inside(&args.dir, &path)?;
     write_new_document(&path, &bytes)?;
     Ok(Built {
-        package_id: identity.package_id,
-        version: identity.version,
+        package_id,
+        version,
         digest: verified.digest().clone(),
         path: path.clone(),
     })
