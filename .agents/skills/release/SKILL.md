@@ -120,15 +120,19 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    scripts/assemble-bundle <checkout of the vX.Y.Z tag>   # refreshes package/bundle
    # package/runtime.toml: version = "X.Y.Z"
    # .github/workflows/release.yml: uses ...plugin-release.yml@vX.Y.Z and core-tag: vX.Y.Z
-   git commit -am "Release X.Y.Z" && git push origin main
+   git add -A package .github && git commit -m "Release X.Y.Z"   # new bundle pages are untracked: no `-a`
+   test -z "$(git status --porcelain)"                           # nothing may stay out of the tag
+   git push origin main
    git tag vX.Y.Z && git push origin vX.Y.Z
    gh run watch "$(gh run list --repo pohunekd/plugin-assistant --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
    gh release view vX.Y.Z --repo pohunekd/plugin-assistant   # archive + SHA256SUMS attached
    ```
 
    Verify the attestation (`gh attestation verify <archive> --repo
-   pohunekd/plugin-assistant`), then add the archive's sha256 to the core release
-   notes (`gh release edit "vX.Y.Z" --notes-file FILE`), which is where
+   pohunekd/plugin-assistant`), then append the archive's sha256 to the core release
+   notes: fetch the body first (`gh release view "vX.Y.Z" --json body --jq .body >
+   FILE`), add the digest line, and `gh release edit "vX.Y.Z" --notes-file FILE`,
+   so the folded changelog stays. The notes are where
    `docs/install.md` ("Install the assistant package") sends operators for the
    digest. Without this release, `pohunek assistant` answers
    `assistant_package_missing` on every host.
@@ -142,6 +146,8 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
 
 - Never publish from a red commit; the workflow will block it, so catch it
   locally.
-- Do not hand-edit versions or push a tag outside `scripts/release`.
+- Do not hand-edit versions or push a tag of this repository outside
+  `scripts/release`. Step 8 is the one exception: it edits and tags
+  `pohunekd/plugin-assistant`, a separate repository.
 - Verify the release actually published; never report "released" from the tag
   push alone without checking the workflow and the GitHub Release.
