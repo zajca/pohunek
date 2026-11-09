@@ -7,7 +7,7 @@
 
 schema = 1
 id = "pohunek.runtime.codex"
-version = "1.7.0"
+version = "1.8.0"
 runtime_api = 1
 requires = ["transcripts-head-paths-v1", "placement-v1", "program-status-gate-v1"]
 

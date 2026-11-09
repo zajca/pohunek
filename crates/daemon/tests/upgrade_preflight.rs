@@ -3765,7 +3765,7 @@ async fn a_stop_intent_record_is_repaired_before_its_merge() {
 #[tokio::test]
 async fn the_preflight_repair_resolves_against_the_planned_profile_text() {
     let damaged = DamagedHost::new().await;
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.4.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.5.1");
     damaged
         .catalog
         .write_release_archives(&damaged.release, 2, &[("claude", &bytes, &digest)]);

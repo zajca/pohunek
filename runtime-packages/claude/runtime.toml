@@ -6,7 +6,7 @@
 
 schema = 1
 id = "pohunek.runtime.claude"
-version = "1.4.0"
+version = "1.5.0"
 runtime_api = 1
 requires = ["naming-launch-args-v1", "placement-v1", "program-status-gate-v1"]
 
