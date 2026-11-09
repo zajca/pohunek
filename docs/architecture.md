@@ -2364,7 +2364,7 @@ never `unreachable!()`.
 | `PackageFault`, `PackageSelectionBlockReason`, `PackageInstallStatus` | display | | done |
 | `CommandExposure` | safe | read as the widest exposure (`peers`) wherever it is shown for consent | [#1690](https://github.com/zajca/pohunek/issues/1690) |
 | `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | done |
-| `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | `ProviderKind::Unknown` is never the `none` kind; an unknown `ConceptType` reaches the typed `assistant_bundle_mismatch` error | done |
+| `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | `ProviderKind::Unknown` is never the `none` kind; an unknown `ConceptType` decodes as unknown and the launch continues | done |
 | `NotificationStatus` | safe | never matches `--unread` or `--status` filters | done |
 | `NotificationKind` | safe | a record of an unknown kind is listed as `unknown` and never matches `--kind`; a policy key of an unknown kind keeps its raw string ([#1332](https://github.com/zajca/pohunek/issues/1332)) | done |
 | `ConceptIntent` | drop | an unknown element is dropped from `intents` | done |

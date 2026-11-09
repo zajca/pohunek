@@ -10,10 +10,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use knowledge::{
-    assistant_keyed_launch_id, assistant_launch_id, bundle_content_hash, bundle_index,
-    materialize as materialize_bundle, materialized_version_hash, BUNDLE_VERSION,
-};
+use knowledge::{PromptContract, POHUNEK_VERSION};
 use pohunek_client::{session_new_request_deadline, Client, ClientError, DEFAULT_REQUEST_TIMEOUT};
 use protocol::{
     method, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent, ConceptMeta,
@@ -26,7 +23,6 @@ use crate::{
     HostTransport,
 };
 
-const SNAPSHOT_FILE: &str = "snapshot.json";
 /// Assistant launch intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
@@ -67,50 +63,6 @@ impl std::fmt::Display for Intent {
     }
 }
 
-/// Local paths needed for assistant materialization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssistantPaths {
-    pub runtime_dir: PathBuf,
-    pub data_dir: PathBuf,
-    pub log_dir: PathBuf,
-    pub cache_dir: PathBuf,
-    pub config_dir: PathBuf,
-}
-
-impl AssistantPaths {
-    /// Resolve assistant paths from the process environment.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AssistantError::MissingEnv`] when the required XDG or `HOME`
-    /// environment variables are absent.
-    pub fn resolve() -> Result<Self, AssistantError> {
-        let paths = pohunek_paths::BasePaths::resolve().map_err(path_error)?;
-
-        Ok(Self {
-            runtime_dir: paths.runtime_dir,
-            data_dir: paths.data_dir,
-            log_dir: paths.log_dir,
-            cache_dir: paths.cache_dir,
-            config_dir: paths.config_dir,
-        })
-    }
-
-    /// Return the local knowledge bundle cache directory.
-    #[must_use]
-    pub fn assistant_bundle_cache_dir(&self) -> PathBuf {
-        self.cache_dir.join(pohunek_paths::KNOWLEDGE_CACHE_SUBDIR)
-    }
-
-    fn assistant_runtime_dir(&self, launch_id: &str) -> Option<PathBuf> {
-        pohunek_paths::valid_path_id(launch_id).map(|id| {
-            self.runtime_dir
-                .join(pohunek_paths::ASSISTANT_RUNTIME_SUBDIR)
-                .join(id)
-        })
-    }
-}
-
 /// Inputs for preparing and launching an assistant session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchParams {
@@ -126,7 +78,6 @@ pub struct LaunchParams {
     pub cols: u16,
     pub rows: u16,
     pub no_snapshot: bool,
-    pub degraded: bool,
     pub auto_started_daemon: bool,
     /// Caller-chosen idempotency key of the launch, to resume an earlier launch
     /// whose outcome was unknown. `None` lets a daemon that supports keys get a
@@ -248,7 +199,6 @@ pub fn select_agent(
 /// materialization, read preflight, or prompt construction fails.
 pub async fn prepare_with_options(
     config: &HostConfig,
-    paths: &AssistantPaths,
     params: LaunchParams,
     options: ConnectionOptions,
 ) -> Result<PreparedLaunch, AssistantError> {
@@ -279,43 +229,29 @@ pub async fn prepare_with_options(
         collect_snapshot(config, &mut client, &params, &selection.name)
     };
 
-    let knowledge = if params.degraded {
-        let degraded = materialize_degraded(paths, &snapshot, client_request_id.as_deref())?;
-        preflight_snapshot_readable(&degraded.snapshot_path)?;
-        PreparedKnowledge::Degraded(degraded)
-    } else if is_remote(config) {
-        PreparedKnowledge::Materialized(materialize_remote(&mut client, &snapshot).await?)
-    } else {
-        let materialized = materialize_local(paths, &snapshot, client_request_id.as_deref())?;
-        preflight_read_access(
-            &materialized.bundle_path,
-            &materialized.snapshot_path,
-            false,
-        )?;
-        PreparedKnowledge::Materialized(materialized)
-    };
-
-    let contract = embedded_contract()?;
-    let prompt = match &knowledge {
-        PreparedKnowledge::Materialized(materialized) => compose(&ComposeParams {
-            contract: &contract,
-            intent: params.intent,
-            request: params.request.as_deref(),
-            concepts: &materialized.concepts,
-            bundle_path: &materialized.bundle_path,
-            snapshot_path: &materialized.snapshot_path,
-            orientation: &orientation,
-            version: &materialized.version,
-        }),
-        PreparedKnowledge::Degraded(degraded) => compose_degraded(&ComposeDegradedParams {
-            contract: &contract,
-            intent: params.intent,
-            request: params.request.as_deref(),
-            snapshot_path: &degraded.snapshot_path,
-            orientation: &orientation,
-            version: &degraded.version,
-            bundle_version_note: &degraded.version,
-        }),
+    let materialized = materialize(
+        &mut client,
+        &snapshot,
+        client_request_id.as_deref(),
+        is_remote(config),
+    )
+    .await?;
+    let contract = prompt_contract(&materialized)?;
+    let prompt = compose(&ComposeParams {
+        contract: &contract,
+        intent: params.intent,
+        request: params.request.as_deref(),
+        concepts: &materialized.concepts,
+        bundle_path: &materialized.bundle_path,
+        snapshot_path: &materialized.snapshot_path,
+        orientation: &orientation,
+        version: &materialized.version,
+    });
+    let knowledge = KnowledgeInfo {
+        bundle_path: Some(materialized.bundle_path.clone()),
+        snapshot_path: materialized.snapshot_path.clone(),
+        version: materialized.version.clone(),
+        label: "materialized",
     };
 
     let session_params = SessionNewParams {
@@ -341,7 +277,7 @@ pub async fn prepare_with_options(
     Ok(PreparedLaunch {
         intent: params.intent,
         selection,
-        knowledge: knowledge.info(),
+        knowledge,
         prompt,
         session_params,
         snapshot_included: !params.no_snapshot,
@@ -396,10 +332,7 @@ async fn create_session(
     let Some(request_id) = params.client_request_id.as_deref() else {
         return attempt(config, params, options).await;
     };
-    let resume = ResumeHint {
-        request_id,
-        resumable: !is_remote(config),
-    };
+    let resume = ResumeHint { request_id };
     let started = tokio::time::Instant::now();
     let deadline = session_new_request_deadline(params, options.request_timeout);
     let reserve = DEFAULT_REQUEST_TIMEOUT.min(deadline / 2);
@@ -477,10 +410,6 @@ const RECORDED_CODES: [&str; 2] = [
 /// back.
 struct ResumeHint<'a> {
     request_id: &'a str,
-    /// A new process renders the same opening prompt under the id, so the daemon
-    /// replays. A remote daemon picks a different snapshot path for every launch,
-    /// so only the retry inside the launch can replay there.
-    resumable: bool,
 }
 
 impl ResumeHint<'_> {
@@ -496,7 +425,6 @@ impl ResumeHint<'_> {
         error.msg = format!("{} (request id `{}`)", error.msg, self.request_id);
         let resume = self.recover_text();
         let recorded = RECORDED_CODES.contains(&error.code.as_str());
-        let conflict = !self.resumable && error.code == protocol::SESSION_REQUEST_CONFLICT_CODE;
         error.recover = match (unknown, recorded, error.recover.take()) {
             (true, _, Some(own)) => Some(format!(
                 "{own}; if the daemon created the session anyway, {resume}"
@@ -505,11 +433,6 @@ impl ResumeHint<'_> {
             (true, _, None) | (false, true, None) => {
                 Some(format!("the daemon may have created the session: {resume}"))
             }
-            (false, false, Some(own)) if conflict => Some(format!(
-                "{own}; on a remote host a repeated launch of the same request lands here, \
-                 because its opening prompt differs: `details.session_id` names the session the \
-                 first request created, so do not start another"
-            )),
             (false, false, own) => own,
         };
         AssistantError::Protocol(error)
@@ -517,23 +440,12 @@ impl ResumeHint<'_> {
 
     fn recover_text(&self) -> String {
         let id = self.request_id;
-        if self.resumable {
-            format!(
-                "rerun the same command with `--request-id {id}` to get it back (the daemon \
-                 answers with the same session, or with `session_request_in_progress` while it \
-                 is still being created); the request, target and `--meta` flags and the agent \
-                 must be unchanged"
-            )
-        } else {
-            format!(
-                "a new launch cannot replay request id `{id}` on a remote host, because the \
-                 opening prompt names a snapshot path that host picks for every launch: if the \
-                 first request created the session, rerunning with `--request-id {id}` answers \
-                 `session_request_conflict` and its `details.session_id` names the session; \
-                 otherwise the rerun creates it. You can also look for it with `pohunek session \
-                 list`, filtered by the `--meta` key you passed"
-            )
-        }
+        format!(
+            "rerun the same command with `--request-id {id}` to get it back (the daemon \
+             answers with the same session, or with `session_request_in_progress` while it \
+             is still being created); the request, target and `--meta` flags and the agent \
+             must be unchanged"
+        )
     }
 }
 
@@ -592,11 +504,10 @@ fn generated_request_id() -> Result<String, AssistantError> {
 /// Returns [`AssistantError`] when preparation or `session.new` fails.
 pub async fn launch_with_options(
     config: &HostConfig,
-    paths: &AssistantPaths,
     params: LaunchParams,
     options: ConnectionOptions,
 ) -> Result<LaunchResult, AssistantError> {
-    let prepared = prepare_with_options(config, paths, params, options).await?;
+    let prepared = prepare_with_options(config, params, options).await?;
     start_prepared_with_options(config, prepared, options).await
 }
 
@@ -626,9 +537,6 @@ fn validate_target(config: &HostConfig, params: &LaunchParams) -> Result<(), Ass
         return Ok(());
     }
     let host = host_label(config);
-    if params.degraded {
-        return Err(AssistantError::RemoteAssistantDegradedUnsupported { host });
-    }
     if params.project.is_none() && params.repo.is_none() {
         return Err(AssistantError::RemoteAssistantTargetRequired { host });
     }
@@ -651,187 +559,34 @@ async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, Ass
     Ok(client.call::<method::HostInspect>(()).await?)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DegradedMaterializeResult {
-    snapshot_path: String,
-    version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PreparedKnowledge {
-    Materialized(AssistantMaterializeResult),
-    Degraded(DegradedMaterializeResult),
-}
-
-impl PreparedKnowledge {
-    fn info(&self) -> KnowledgeInfo {
-        match self {
-            Self::Materialized(materialized) => KnowledgeInfo {
-                bundle_path: Some(materialized.bundle_path.clone()),
-                snapshot_path: materialized.snapshot_path.clone(),
-                version: materialized.version.clone(),
-                label: "materialized",
-            },
-            Self::Degraded(degraded) => KnowledgeInfo {
-                bundle_path: None,
-                snapshot_path: degraded.snapshot_path.clone(),
-                version: degraded.version.clone(),
-                label: "degraded",
-            },
-        }
-    }
-}
-
-fn materialize_degraded(
-    paths: &AssistantPaths,
+/// Asks the daemon to resolve the assistant context package and persist the
+/// launch snapshot, and checks that the files are readable where this process
+/// runs when the daemon is local.
+async fn materialize(
+    client: &mut Client,
     snapshot: &str,
     request_id: Option<&str>,
-) -> Result<DegradedMaterializeResult, AssistantError> {
-    let runtime_dir = assistant_runtime_dir(paths, request_id)?;
-    create_private_dir_all(&runtime_dir).map_err(|err| {
-        ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
-    })?;
-    let snapshot_path = runtime_dir.join(SNAPSHOT_FILE);
-    write_snapshot(&snapshot_path, snapshot, request_id.is_some()).map_err(|err| {
-        ProtocolError::materialization_failed(
-            &snapshot_path.display().to_string(),
-            &err.to_string(),
-        )
-    })?;
-
-    Ok(DegradedMaterializeResult {
-        snapshot_path: snapshot_path.display().to_string(),
-        version: BUNDLE_VERSION.to_owned(),
-    })
-}
-
-fn materialize_local(
-    paths: &AssistantPaths,
-    snapshot: &str,
-    request_id: Option<&str>,
+    remote: bool,
 ) -> Result<AssistantMaterializeResult, AssistantError> {
-    let version_hash = materialized_version_hash();
-    let concepts: Vec<protocol::ConceptMeta> = bundle_index()
-        .map_err(|err| {
-            ProtocolError::materialization_failed("assistant bundle index", &err.to_string())
-        })?
-        .into_iter()
-        .map(Into::into)
-        .collect();
-    let bundle_path =
-        materialize_bundle(paths.cache_dir.clone(), &version_hash).map_err(|err| {
-            ProtocolError::materialization_failed(
-                &paths.assistant_bundle_cache_dir().display().to_string(),
-                &err.to_string(),
-            )
-        })?;
-    let runtime_dir = assistant_runtime_dir(paths, request_id)?;
-    create_private_dir_all(&runtime_dir).map_err(|err| {
-        ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
-    })?;
-    let snapshot_path = runtime_dir.join(SNAPSHOT_FILE);
-    write_snapshot(&snapshot_path, snapshot, request_id.is_some()).map_err(|err| {
-        ProtocolError::materialization_failed(
-            &snapshot_path.display().to_string(),
-            &err.to_string(),
-        )
-    })?;
-
-    Ok(AssistantMaterializeResult {
-        bundle_path: bundle_path.display().to_string(),
-        snapshot_path: snapshot_path.display().to_string(),
-        version: BUNDLE_VERSION.to_owned(),
-        content_hash: bundle_content_hash().to_owned(),
-        concepts,
-    })
+    let result = materialize_remote(client, snapshot, request_id).await?;
+    preflight_read_access(&result.bundle_path, &result.snapshot_path, remote)?;
+    Ok(result)
 }
 
 async fn materialize_remote(
     client: &mut Client,
     snapshot: &str,
+    request_id: Option<&str>,
 ) -> Result<AssistantMaterializeResult, AssistantError> {
     let params = AssistantMaterializeParams {
         snapshot: snapshot.to_owned(),
+        request_id: request_id.map(ToOwned::to_owned),
     };
     let result = client
         .call::<method::AssistantMaterialize>(params)
         .await
         .map_err(map_assistant_method_error)?;
-    assert_bundle_matches(&result)?;
     Ok(result)
-}
-
-/// Writes the launch snapshot to `path`.
-///
-/// A launch under a request id owns its directory: the first launch writes the
-/// snapshot and a repeat keeps it, so a repeat that the daemon refuses (another
-/// request under the same id) cannot change the file a running session reads.
-fn write_snapshot(path: &Path, snapshot: &str, keep_existing: bool) -> std::io::Result<()> {
-    if !keep_existing {
-        return std::fs::write(path, snapshot);
-    }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => std::io::Write::write_all(&mut file, snapshot.as_bytes()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-/// Creates `dir` and every missing ancestor owner-private. The runtime root
-/// is `XDG_RUNTIME_DIR/pohunek`, which the daemon refuses unless it is 0700.
-fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(PRIVATE_DIR_MODE)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(dir)
-    }
-}
-
-/// Mode of every directory a launch creates above its runtime snapshot.
-#[cfg(unix)]
-const PRIVATE_DIR_MODE: u32 = 0o700;
-
-/// The runtime directory of one local launch: unique per launch, or, under a
-/// request id, a function of it, so a launch repeated under the id renders the
-/// same snapshot path into its prompt.
-fn assistant_runtime_dir(
-    paths: &AssistantPaths,
-    request_id: Option<&str>,
-) -> Result<PathBuf, AssistantError> {
-    let version_hash = materialized_version_hash();
-    let launch_id = match request_id {
-        Some(id) => assistant_keyed_launch_id(&version_hash, id),
-        None => assistant_launch_id(&version_hash),
-    };
-    paths.assistant_runtime_dir(&launch_id).ok_or_else(|| {
-        ProtocolError::materialization_failed("assistant runtime", "invalid launch id").into()
-    })
-}
-
-fn assert_bundle_matches(result: &AssistantMaterializeResult) -> Result<(), AssistantError> {
-    let expected_hash = bundle_content_hash();
-    if result.version == BUNDLE_VERSION && result.content_hash == expected_hash {
-        Ok(())
-    } else {
-        Err(ProtocolError::assistant_bundle_mismatch(
-            BUNDLE_VERSION,
-            expected_hash,
-            &result.version,
-            &result.content_hash,
-        )
-        .into())
-    }
 }
 
 fn map_assistant_method_error(err: pohunek_client::ClientError) -> pohunek_client::ClientError {
@@ -874,13 +629,6 @@ fn preflight_read_access(
     Ok(())
 }
 
-fn preflight_snapshot_readable(snapshot_path: &str) -> Result<(), AssistantError> {
-    check_readable(
-        Path::new(snapshot_path),
-        "degraded snapshot is not readable",
-    )
-}
-
 fn check_readable(path: &Path, constraint: &str) -> Result<(), AssistantError> {
     match std::fs::File::open(path) {
         Ok(_) => Ok(()),
@@ -909,7 +657,7 @@ struct SnapshotAssistant {
     selected_project: Option<String>,
     selected_agent: String,
     auto_started_daemon: bool,
-    knowledge_bundle_version: String,
+    pohunek_version: String,
     snapshot_collected: bool,
 }
 
@@ -933,7 +681,7 @@ fn collect_snapshot(
             selected_project: params.project.clone(),
             selected_agent: selected_agent.to_owned(),
             auto_started_daemon: params.auto_started_daemon,
-            knowledge_bundle_version: BUNDLE_VERSION.to_owned(),
+            pohunek_version: POHUNEK_VERSION.to_owned(),
             snapshot_collected: true,
         },
         warnings: Vec::new(),
@@ -961,7 +709,7 @@ fn skipped_snapshot(
             selected_project: params.project.clone(),
             selected_agent: selected_agent.to_owned(),
             auto_started_daemon: params.auto_started_daemon,
-            knowledge_bundle_version: BUNDLE_VERSION.to_owned(),
+            pohunek_version: POHUNEK_VERSION.to_owned(),
             snapshot_collected: false,
         },
         warnings: vec!["snapshot collection skipped (--no-snapshot)".to_owned()],
@@ -992,22 +740,13 @@ struct ComposeParams<'a> {
     version: &'a str,
 }
 
-struct ComposeDegradedParams<'a> {
-    contract: &'a knowledge::PromptContract,
-    intent: Intent,
-    request: Option<&'a str>,
-    snapshot_path: &'a str,
-    orientation: &'a SnapshotOrientation,
-    version: &'a str,
-    bundle_version_note: &'a str,
-}
-
-/// The prompt contract as embedded in this binary.
-fn embedded_contract() -> Result<knowledge::PromptContract, AssistantError> {
-    let text = knowledge::embedded_bundle()
-        .get_text(knowledge::PROMPT_CONTRACT_PATH)
-        .ok_or_else(|| contract_error("the embedded bundle has no prompt contract"))?;
-    knowledge::PromptContract::parse(text).map_err(|error| contract_error(&error.to_string()))
+/// The prompt contract the daemon read from the assistant context package.
+fn prompt_contract(result: &AssistantMaterializeResult) -> Result<PromptContract, AssistantError> {
+    if result.prompt_contract.is_empty() {
+        return Err(ProtocolError::assistant_daemon_outdated().into());
+    }
+    PromptContract::parse(&result.prompt_contract)
+        .map_err(|error| contract_error(&error.to_string()))
 }
 
 fn contract_error(reason: &str) -> AssistantError {
@@ -1030,7 +769,7 @@ fn compose(params: &ComposeParams<'_>) -> String {
     let _ = writeln!(
         prompt,
         "You are the universal assistant for configuring, updating, troubleshooting, and \
-         explaining pohunek (version {}).\n",
+         explaining pohunek (knowledge package version {}).\n",
         params.version
     );
     write_contract_safety(&mut prompt, params.contract);
@@ -1061,33 +800,6 @@ fn compose(params: &ComposeParams<'_>) -> String {
     let _ = write!(
         prompt,
         "Follow the navigation steps, take the next concrete action, and verify changes."
-    );
-
-    prompt
-}
-
-fn compose_degraded(params: &ComposeDegradedParams<'_>) -> String {
-    let mut prompt = String::with_capacity(1024);
-
-    let _ = writeln!(prompt, "# Pohunek Assistant (degraded)\n");
-    let _ = writeln!(prompt, "## Knowledge Status");
-    let _ = writeln!(
-        prompt,
-        "knowledge: degraded for version {} (bundle version note: {}).\n",
-        params.version, params.bundle_version_note
-    );
-    write_contract_safety(&mut prompt, params.contract);
-    let _ = writeln!(prompt, "## User Intent");
-    let _ = writeln!(prompt, "intent: {}", params.intent.as_str());
-    let _ = writeln!(
-        prompt,
-        "request: {}\n",
-        params.request.unwrap_or("(none — orient and offer help)")
-    );
-    write_snapshot_section(&mut prompt, params.orientation, params.snapshot_path);
-    let _ = write!(
-        prompt,
-        "Use the launch snapshot and source tree access. Verify changes before claiming success."
     );
 
     prompt
@@ -1125,12 +837,5 @@ fn write_toc(prompt: &mut String, intent: Intent, concepts: &[ConceptMeta]) {
         for concept in concepts {
             let _ = writeln!(prompt, "- {} — {}", concept.id, concept.description);
         }
-    }
-}
-
-fn path_error(err: pohunek_paths::PathError) -> AssistantError {
-    match err {
-        pohunek_paths::PathError::MissingEnv { var } => AssistantError::MissingEnv { var },
-        source => AssistantError::Paths { source },
     }
 }

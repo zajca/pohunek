@@ -314,7 +314,7 @@ const RULES: &[Rule] = &[
         Pattern::Dir("docs/knowledge"),
         Effect::Packages(&["pohunek-knowledge", "xtask"]),
         &[Reminder::DocsCheck],
-        "knowledge bundle embedded by pohunek-knowledge's build script and read by xtask tests",
+        "knowledge bundle read at run time by the assistant and CLI test fixtures and by xtask tests",
     ),
     rule(
         Pattern::File("runtime-packages/hermes/operator.toml"),
@@ -608,7 +608,7 @@ pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
 /// leaves out (#1225).
 ///
 /// A change to `pattern` cannot behave differently on macOS: the data reaches
-/// Rust tests as `owner`'s embedded data or through its [`RULES`] readers,
+/// Rust tests as `owner`'s data or through its [`RULES`] readers,
 /// and every dependent of `owner` is a reviewed `reader`. The Linux selection
 /// still closes over all of them. A perturbed copy of the data (#1225) failed
 /// only `owner`'s own tests. `lane_neutral_readers_are_every_dependent`
@@ -627,22 +627,22 @@ pub(crate) const LANE_NEUTRAL: &[LaneNeutral] = &[LaneNeutral {
     readers: &[
         (
             "pohunek-assistant",
-            "materializes the embedded bundle and hashes it for the launch id",
+            "its tests read the repository prompt contract and use the bundle as a fixture directory",
         ),
         (
             "pohunek-daemon",
-            "materializes the embedded bundle for `assistant.materialize`",
+            "indexes and validates the bundle of the assistant package with the knowledge parsers",
         ),
         (
             "pohunek-cli",
-            "reaches the bundle through pohunek-assistant",
+            "its launch fixtures point at the bundle through pohunek-assistant",
         ),
         (
             "xtask",
             "depends on the bundle through the daemon and the CLI",
         ),
     ],
-    why: "knowledge bundle data, embedded by pohunek-knowledge's build script",
+    why: "knowledge bundle data read by test fixtures; the shipped bundle is the assistant package",
 }];
 
 /// Which caller classifies a change.

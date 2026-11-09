@@ -171,7 +171,9 @@ new daemon would refuse to start with. See the
 A host that still runs the pre-service install (a `pohunekd.service` unit with
 `pohunek-session@` template workers) is refused by the installer before
 anything changes: install release v0.40.1 first, which migrates it to the
-service-managed daemon, then run this release's installer. The whole run holds
+service-managed daemon, then run this release's installer. A pending
+`migrations/durable-session-workers.json` manifest, which only v0.40.1 imports,
+is refused the same way. The whole run holds
 the service transaction lock (`pohunek service lock`), and `pohunek service
 check` first confirms that the final install or upgrade would accept `HOME`,
 the XDG roots, the prefix, and every directory it writes. See the
@@ -404,6 +406,43 @@ with the same gap and a repair hint.
 The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).
+
+## Install the assistant package
+
+`pohunek assistant` reads its knowledge bundle from the context package
+`pohunek.context.assistant`; the daemon binaries carry no copy. Install the
+package once per host that runs assistant sessions (a remote assistant reads the
+package installed on that remote host). The package is published as a release
+asset of [`pohunekd/plugin-assistant`](https://github.com/pohunekd/plugin-assistant)
+and the pohunek release notes carry its SHA-256 digest; a context package
+installs by digest, never through the catalog. Each pohunek release publishes
+the matching package right after the core release, so the package is available
+from the first pohunek release that contains the context package kind (0.41.0):
+
+```bash
+pohunek plugin install ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
+```
+
+The first install selects the package. A build from `main` before that release
+has no published archive, and `pohunek assistant` answers `assistant_package_missing`
+with the step to take; build the archive from a checkout of
+[`plugin-assistant`](https://github.com/pohunekd/plugin-assistant) (its README)
+instead.
+
+After a core upgrade, move to the package version whose release notes name your
+core version with `plugin update`, which installs the new version next to the old
+one and selects it (a plain `plugin install` keeps the old version selected):
+
+```bash
+pohunek plugin update pohunek.context.assistant ./assistant.tar.zst --sha256 <digest-from-the-release-notes> --yes
+```
+
+`pohunek plugin list` shows the installed versions and which one is selected;
+`pohunek plugin select pohunek.context.assistant --digest <digest>` switches
+between installed versions. A package that was disabled, left unselected or
+modified is refused (`pohunek plugin doctor` names the cause). The
+[runtime packages guide](knowledge/guides/runtime-packages.md#declaring-a-context-package)
+describes the package format.
 
 ## Install the Pi runtime package from a checkout
 

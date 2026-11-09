@@ -10,12 +10,10 @@
 
 // Rust guideline compliant 2026-10-29
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use knowledge::PromptContract;
-use pohunek_assistant::launch::{
-    prepare_with_options, AssistantPaths, Intent, LaunchParams, PreparedLaunch,
-};
+use pohunek_assistant::launch::{prepare_with_options, Intent, LaunchParams, PreparedLaunch};
 use pohunek_assistant::{ConnectionOptions, HostConfig};
 use pohunek_client::protocol::{self, method, ErrorClass, ProtocolError, Request, Response};
 use pohunek_client::OriginSource;
@@ -62,6 +60,11 @@ async fn serve(stream: UnixStream) {
             method::HOST_INSPECT => {
                 Response::ok(protocol::PROTOCOL_VERSION, request.id(), capabilities())
             }
+            method::ASSISTANT_MATERIALIZE => Response::ok(
+                protocol::PROTOCOL_VERSION,
+                request.id(),
+                materialize_result(),
+            ),
             other => Response::err(
                 protocol::PROTOCOL_VERSION,
                 request.id(),
@@ -81,6 +84,29 @@ async fn serve(stream: UnixStream) {
             .await
             .expect("write the response");
     }
+}
+
+/// The bundle of the repository: a real directory with a readable `index.md`,
+/// which is all a local launch checks before it starts the agent.
+fn bundle_root() -> PathBuf {
+    pohunek_test_support::manifest_dir().join("../../docs/knowledge")
+}
+
+/// The `assistant.materialize` result of the fixture daemon: the repository's
+/// own prompt contract and a bundle directory path.
+fn materialize_result() -> Value {
+    let root = bundle_root();
+    let contract =
+        std::fs::read_to_string(pohunek_test_support::manifest_dir().join(SYSTEM_CONTRACT))
+            .expect("read the prompt contract");
+    json!({
+        "bundle_path": root,
+        "snapshot_path": root.join("index.md"),
+        "version": "1.0.0",
+        "content_hash": "sha256:fixture",
+        "concepts": [],
+        "prompt_contract": contract,
+    })
 }
 
 fn capabilities() -> Value {
@@ -115,8 +141,8 @@ fn capabilities() -> Value {
     .expect("serialize the capability snapshot")
 }
 
-/// The prepared launch of a local host, degraded or with the bundle.
-async fn prepare(degraded: bool) -> PreparedLaunch {
+/// The prepared launch of a local host.
+async fn prepare() -> PreparedLaunch {
     let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
     let socket_path = fixture.path().join("assistant.sock");
     let listener = UnixListener::bind(&socket_path).expect("bind the fixture host socket");
@@ -127,16 +153,8 @@ async fn prepare(degraded: bool) -> PreparedLaunch {
         }
     });
 
-    let root = fixture.path();
     let result = prepare_with_options(
         &HostConfig::local("test-host", Path::new(&socket_path)),
-        &AssistantPaths {
-            runtime_dir: root.join("runtime"),
-            data_dir: root.join("data"),
-            log_dir: root.join("log"),
-            cache_dir: root.join("cache"),
-            config_dir: root.join("config"),
-        },
         LaunchParams {
             intent: Intent::Help,
             request: None,
@@ -150,7 +168,6 @@ async fn prepare(degraded: bool) -> PreparedLaunch {
             cols: 80,
             rows: 24,
             no_snapshot: false,
-            degraded,
             auto_started_daemon: false,
             request_id: None,
         },
@@ -219,7 +236,7 @@ fn assert_no_live_state_claim(prompt: &str) {
 
 #[tokio::test]
 async fn the_launched_prompt_carries_every_safety_rule_and_navigation_step() {
-    let prompt = prepare(false).await.prompt;
+    let prompt = prepare().await.prompt;
 
     assert_safety_rules_rendered(&prompt);
     let steps = contract_items("Navigation");
@@ -231,13 +248,5 @@ async fn the_launched_prompt_carries_every_safety_rule_and_navigation_step() {
             "the prompt omits navigation step {numbered:?}: {prompt}"
         );
     }
-    assert_no_live_state_claim(&prompt);
-}
-
-#[tokio::test]
-async fn the_degraded_prompt_carries_every_safety_rule() {
-    let prompt = prepare(true).await.prompt;
-
-    assert_safety_rules_rendered(&prompt);
     assert_no_live_state_claim(&prompt);
 }

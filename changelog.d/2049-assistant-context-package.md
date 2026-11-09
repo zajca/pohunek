@@ -1,0 +1,4 @@
+---
+kind: changed
+---
+The assistant knowledge bundle is no longer embedded in the binaries. `pohunek assistant` and `assistant.materialize` read it from the context package `pohunek.context.assistant`, a new runtime-less package kind (`[context]`, runtime feature `package-context-v1`) that installs by digest and is served from its re-verified package root. Without the package the launch fails with `assistant_package_missing` and the install hint. `assistant.materialize` returns the prompt contract text (`prompt_contract`) and accepts an optional `request_id` that keeps the first snapshot. `pohunek assistant --degraded` is removed: a launch without the bundle would also lack the safety rules, which now come from the package. Each pohunek release publishes the package from `pohunekd/plugin-assistant` right after the core release (attested archive with `SHA256SUMS`); install it with `pohunek plugin install <archive> --sha256 <digest>`.

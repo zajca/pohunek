@@ -11,3 +11,4 @@ placement-v1 0.40.0
 checkout-trust-args-v1 0.40.0
 integration-cline-hook-v1 0.40.0
 program-status-gate-v1 0.41.0
+package-context-v1 0.41.0

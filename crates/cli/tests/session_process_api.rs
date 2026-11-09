@@ -847,10 +847,31 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         }
         protocol::method::SESSION_INPUT => json!({"accepted": true}),
         protocol::method::HOST_INSPECT => host_capabilities(),
+        protocol::method::ASSISTANT_MATERIALIZE => assistant_materialize_result(),
         protocol::method::SESSION_RETENTION_SWEEP => retention_sweep(scenario),
         method => panic!("unexpected fixture method: {method}"),
     };
     Response::ok(PROTOCOL_VERSION, request.id(), ok).expect("valid success response")
+}
+
+/// A real directory with a readable `index.md`, which is all a local launch
+/// checks before it starts the agent.
+fn bundle_root() -> PathBuf {
+    pohunek_test_support::manifest_dir().join("tests/fixtures/assistant-bundle")
+}
+
+/// The `assistant.materialize` result of the fixture daemon: a bundle
+/// directory path and a valid prompt contract.
+fn assistant_materialize_result() -> Value {
+    let root = bundle_root();
+    json!({
+        "bundle_path": root,
+        "snapshot_path": root.join("index.md"),
+        "version": "1.0.0",
+        "content_hash": "sha256:fixture",
+        "concepts": [],
+        "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
+    })
 }
 
 /// The success a daemon answers an opted-in `working` wait with when only the

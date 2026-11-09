@@ -1,70 +1,9 @@
-//! Assistant knowledge-bundle version, embed, and hash plumbing.
+//! Assistant launch-id and hash plumbing.
 
-use std::sync::OnceLock;
-
-use include_dir::{include_dir, Dir};
 use sha2::{Digest, Sha256};
 
-/// Knowledge bundle version shipped with this binary.
-pub const BUNDLE_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const EMBEDDED_BUNDLE_CONTENT_HASH: &str = env!("POHUNEK_KNOWLEDGE_CONTENT_HASH");
-
-/// Embedded assistant knowledge bundle.
-static BUNDLE: Dir<'static> = include_dir!("$OUT_DIR/knowledge-bundle");
-
-/// Crate-owned handle to the embedded assistant knowledge bundle.
-///
-/// Wraps the third-party [`include_dir::Dir`] so it never appears in this
-/// crate's public contract. Exposes only the read/extract operations consumers
-/// need; bundle walking for indexing stays crate-internal.
-#[derive(Clone, Copy, Debug)]
-pub struct EmbeddedBundle {
-    dir: &'static Dir<'static>,
-}
-
-impl EmbeddedBundle {
-    /// Extract the embedded bundle into `target`, preserving its directory tree.
-    ///
-    /// # Errors
-    ///
-    /// Returns an [`std::io::Error`] if any file or directory in the bundle
-    /// cannot be created under `target`.
-    pub fn extract(self, target: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        self.dir.extract(target)
-    }
-
-    /// Return the UTF-8 text of a bundle-relative file, if it exists and is
-    /// valid UTF-8.
-    #[must_use]
-    pub fn get_text(self, path: &str) -> Option<&'static str> {
-        self.dir
-            .get_file(path)
-            .and_then(|file| file.contents_utf8())
-    }
-
-    /// Borrow the underlying embedded directory for crate-internal walking.
-    pub(crate) fn as_dir(self) -> &'static Dir<'static> {
-        self.dir
-    }
-}
-
-/// Return the memoized content hash for the bundle bytes compiled into this
-/// crate.
-#[must_use]
-pub fn bundle_content_hash() -> &'static str {
-    static HASH: OnceLock<String> = OnceLock::new();
-    HASH.get_or_init(|| EMBEDDED_BUNDLE_CONTENT_HASH.to_owned())
-}
-
-/// Return the versioned cache directory name for the embedded bundle.
-#[must_use]
-pub fn materialized_version_hash() -> String {
-    let hash = bundle_content_hash()
-        .strip_prefix("sha256:")
-        .unwrap_or(bundle_content_hash());
-    format!("{BUNDLE_VERSION}-{hash}")
-}
+/// Pohunek version of this build; keys launch ids and the launch snapshot.
+pub const POHUNEK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Return a unique runtime launch id for one assistant materialization.
 ///
@@ -95,12 +34,6 @@ pub fn assistant_launch_id(version_hash: &str) -> String {
 pub fn assistant_keyed_launch_id(version_hash: &str, request_id: &str) -> String {
     let digest = Sha256::digest(request_id.as_bytes());
     format!("launch-{version_hash}-request-{digest:x}")
-}
-
-/// Return the embedded assistant knowledge bundle.
-#[must_use]
-pub fn embedded_bundle() -> EmbeddedBundle {
-    EmbeddedBundle { dir: &BUNDLE }
 }
 
 /// Compute a SHA-256 digest for a byte slice.

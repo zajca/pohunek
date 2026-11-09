@@ -5684,7 +5684,6 @@ async fn the_assistant_finds_no_capable_agent_without_the_official_packages() {
             "assistant",
             "--print-prompt",
             "--no-snapshot",
-            "--degraded",
             "--no-start-daemon",
         ])
         .await;

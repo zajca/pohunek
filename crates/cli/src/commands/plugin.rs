@@ -1696,7 +1696,11 @@ fn render_inspect(result: &PackageInspectResult) -> String {
     match &result.runtime {
         Some(runtime) => render_runtime_details(&mut output, runtime),
         None if result.commands_only => {
-            let _ = writeln!(output, "Runtime:     none (exports commands only)");
+            let _ = writeln!(
+                output,
+                "Runtime:     {}",
+                runtimeless_note(&result.commands)
+            );
         }
         None => {
             let _ = writeln!(output, "Runtime:     descriptor unavailable");
@@ -1728,6 +1732,16 @@ fn selection_after(
     }
 }
 
+/// What a package without a runtime exports: commands, or else a context
+/// directory.
+fn runtimeless_note(commands: &[protocol::CommandInfo]) -> &'static str {
+    if commands.is_empty() {
+        "none (exports a context directory)"
+    } else {
+        "none (exports commands only)"
+    }
+}
+
 /// The review printed before an install-like command asks for consent;
 /// `selected` is the outcome of [`selection_after`].
 fn render_install_review(preview: &PackageInstallResult, enable: bool, selected: bool) -> String {
@@ -1736,7 +1750,11 @@ fn render_install_review(preview: &PackageInstallResult, enable: bool, selected:
     match &preview.runtime {
         Some(runtime) => render_runtime_details(&mut output, runtime),
         None => {
-            let _ = writeln!(output, "Runtime:     none (exports commands only)");
+            let _ = writeln!(
+                output,
+                "Runtime:     {}",
+                runtimeless_note(&preview.commands)
+            );
         }
     }
     render_command_details(&mut output, &preview.commands);

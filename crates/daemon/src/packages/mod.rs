@@ -65,8 +65,8 @@ use self::source::{build_directory, read_archive_file, read_regular_file};
 pub use self::trust::HostTrustAnchor;
 use crate::agent::host::{
     decide_claim, descriptor_from_archive, is_reserved, may_serve_reserved, Authority,
-    ClaimRefusal, PackageDescriptor, PackageRejection, PackageReport, PackageStore,
-    RuntimeDefinition, RuntimeHost,
+    ClaimRefusal, ContextDir, ContextError, PackageDescriptor, PackageRejection, PackageReport,
+    PackageSource, PackageStore, RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
 use crate::catalog_anchor::{CatalogTrust, IndexTrust};
@@ -183,6 +183,25 @@ impl Context {
 }
 
 impl PackageService {
+    /// The verified files of the context package `id`: the selected, enabled
+    /// package of that id.
+    ///
+    /// # Errors
+    ///
+    /// The [`ContextError`] of the package source, or
+    /// [`ContextError::NotInstalled`] on a host without a package store.
+    pub async fn context_dir(&self, id: PackageId) -> Result<ContextDir, ContextError> {
+        let Some(store) = self.authority.runtimes.package_store().cloned() else {
+            return Err(ContextError::NotInstalled);
+        };
+        tokio::task::spawn_blocking(move || PackageSource::new(store).context_dir(&id))
+            .await
+            .map_err(|error| {
+                warn!(%error, "a context package lookup task failed");
+                ContextError::LookupFailed
+            })?
+    }
+
     /// Lists every installed package with its health.
     ///
     /// # Errors
@@ -889,7 +908,7 @@ fn reload_and_describe(
 fn require_commands_opt_in(candidate: &Candidate, accept: bool) -> Result<(), PackageErrorKind> {
     let declares = match candidate {
         Candidate::Runtime(prepared) => !prepared.commands.is_empty(),
-        Candidate::Commands(_) => true,
+        Candidate::Commands(prepared) => !prepared.commands.is_empty(),
     };
     if declares && !accept {
         warn!("a package that declares commands was refused: the request did not opt in");

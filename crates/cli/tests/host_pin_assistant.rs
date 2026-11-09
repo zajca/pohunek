@@ -100,9 +100,10 @@ fn result_for(request: &Request) -> Value {
         protocol::method::ASSISTANT_MATERIALIZE => json!({
             "bundle_path": "/remote/bundle",
             "snapshot_path": "/remote/snapshot.json",
-            "version": knowledge::BUNDLE_VERSION,
-            "content_hash": knowledge::bundle_content_hash(),
-            "concepts": []
+            "version": "1.0.0",
+            "content_hash": "sha256:fixture",
+            "concepts": [],
+            "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n"
         }),
         protocol::method::SESSION_NEW => session(),
         other => panic!("the assistant sent an unexpected request: {other}"),

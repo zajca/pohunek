@@ -337,6 +337,42 @@ async fn select_package(harness: &Harness, digest: &PackageDigest) {
     assert_eq!(code, 0, "select Hermes package: {selected:#}");
 }
 
+/// Installs the assistant context package by digest, as the owner does before
+/// the first `pohunek assistant`.
+async fn install_assistant_context_package(harness: &Harness, dir: &Path) {
+    let context = [
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: b"schema = 1\nid = \"pohunek.context.assistant\"\nversion = \"1.0.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n".to_vec(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bundle/index.md".to_owned(),
+            contents: b"# Index\n".to_vec(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bundle/assistant/system.md".to_owned(),
+            contents: b"---\ntype: PromptTemplate\nid: assistant/system\ntitle: Contract\ndescription: Fixture contract.\nsource_kind: manual\nintents: [help]\n---\n\n## Safety\n\n- Never print secrets.\n\n## Navigation\n\n1. Start at the index.\n".to_vec(),
+            executable: false,
+        },
+    ];
+    let (context_bytes, context_digest) = archive_of(&context);
+    let context_archive = dir.join("assistant-context.tar.zst");
+    fs::write(&context_archive, context_bytes).expect("write the context archive");
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&context_archive),
+            "--sha256",
+            context_digest.as_str().trim_start_matches("sha256:"),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+}
+
 /// Reports which package the daemon selected for the reserved `hermes` id.
 async fn selected_package(harness: &Harness, digest: &PackageDigest) {
     let (code, listed) = harness.json(&["plugin", "list"]).await;
@@ -3065,6 +3101,10 @@ const SYSTEM_PATH: &str = "/usr/bin:/bin";
 /// request launches a session pinned to the package, and the assistant picks
 /// `hermes`.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario walks the whole install, launch and uninstall refusal sequence"
+)]
 async fn hermes_launches_only_from_the_installed_official_package() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
@@ -3114,7 +3154,6 @@ async fn hermes_launches_only_from_the_installed_official_package() {
                 "assistant",
                 "--print-prompt",
                 "--no-snapshot",
-                "--degraded",
                 "--no-start-daemon",
             ])
             .await
@@ -3166,6 +3205,13 @@ async fn hermes_launches_only_from_the_installed_official_package() {
     assert_eq!(code, 1, "{refused}");
     assert_eq!(refused["err"]["code"], "package_referenced", "{refused}");
     selected_package(&harness, &digest).await;
+    // The agent is selected; the knowledge bundle comes from the context package.
+    let (_, no_bundle) = assistant().await;
+    assert_eq!(
+        no_bundle["err"]["code"], "assistant_package_missing",
+        "{no_bundle}"
+    );
+    install_assistant_context_package(&harness, &cwd).await;
     let (code, picked) = assistant().await;
     assert_eq!(code, 0, "{picked}");
     assert_eq!(picked["ok"]["agent"], "hermes", "{picked}");

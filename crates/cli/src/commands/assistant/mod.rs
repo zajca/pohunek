@@ -10,9 +10,9 @@
 //! daemon when needed.
 //!
 //! Knowledge delivery is pull-by-file: the launch never inlines bundle bodies
-//! into the prompt. For local launches the bundle is materialized in-process;
-//! for remote launches the host daemon materializes its own version-matched
-//! bundle via `assistant.materialize`.
+//! into the prompt. Every launch, local or remote, asks the daemon of the target
+//! host for the bundle of its assistant context package via
+//! `assistant.materialize`.
 
 pub(crate) mod bootstrap;
 
@@ -90,12 +90,6 @@ pub(crate) struct AssistantOptions {
     pub(crate) json: bool,
     pub(crate) print_prompt: bool,
     pub(crate) no_snapshot: bool,
-    /// When true, skip bundle materialization and the read-access preflight.
-    ///
-    /// This is the ONLY sanctioned way to launch without a readable knowledge
-    /// bundle. The default `pohunek assistant` fails rather than degrading
-    /// silently when materialization fails.
-    pub(crate) degraded: bool,
     pub(crate) no_start_daemon: bool,
 }
 
@@ -151,10 +145,8 @@ pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), Cli
     if !opts.print_prompt && matches!(remote_confirmation(&opts), ConfirmDecision::RequireYes) {
         return Err(CliError::RemoteConfirmationRequired);
     }
-    if opts.degraded {
-        return run_degraded(opts, paths).await;
-    }
-    run_full(opts, paths).await
+    let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
+    run_prepared(opts, paths, auto_started).await
 }
 
 /// Validate the launch target before any daemon connection is dialed.
@@ -162,45 +154,20 @@ pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), Cli
 /// Mirrors `session new`'s `prepare_new_args` guard (design Decision 1): a remote
 /// launch must name a `--project` (or `--repo` for first-introduction) because no
 /// local filesystem path is meaningful on another host — otherwise the remote
-/// agent would start in the daemon process's working directory. Additionally,
-/// `--degraded` is rejected for a remote host: degraded materializes the snapshot
-/// into a *local* runtime dir and embeds that path into the prompt, which a remote
-/// agent cannot read.
+/// agent would start in the daemon process's working directory.
 ///
 /// # Errors
 ///
-/// [`CliError::DegradedRemoteUnsupported`] for `--degraded` against a remote host;
 /// [`CliError::RemoteTargetRequired`] for a remote launch with neither `--project`
 /// nor `--repo`.
 fn validate_target(opts: &AssistantOptions) -> Result<(), CliError> {
     if !opts.is_remote() {
         return Ok(());
     }
-    if opts.degraded {
-        return Err(CliError::DegradedRemoteUnsupported {
-            host: opts.host.clone(),
-        });
-    }
     if opts.project.is_none() && opts.repo.is_none() {
         return Err(CliError::RemoteTargetRequired);
     }
     Ok(())
-}
-
-/// Full (non-degraded) launch: requires a readable knowledge bundle.
-async fn run_full(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError> {
-    let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
-    run_prepared(opts, paths, auto_started).await
-}
-
-/// Degraded launch: snapshot + source-map pointer only, no bundle materialization.
-///
-/// `--degraded` is the ONLY sanctioned way to launch without a readable knowledge
-/// bundle. It is an explicit opt-in — the default `run_full` path fails before
-/// session.new if the bundle is unavailable.
-async fn run_degraded(opts: AssistantOptions, paths: &Paths) -> Result<(), CliError> {
-    let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
-    run_prepared(opts, paths, auto_started).await
 }
 
 async fn run_prepared(
@@ -209,16 +176,11 @@ async fn run_prepared(
     auto_started: bool,
 ) -> Result<(), CliError> {
     let host = assistant_host_config(&opts, paths).await?;
-    let assistant_paths = assistant_paths(paths);
     let params = assistant_params(&opts, auto_started);
-    let mut prepared = core_assistant::prepare_with_options(
-        &host,
-        &assistant_paths,
-        params,
-        ConnectionOptions::default(),
-    )
-    .await
-    .map_err(core_error)?;
+    let mut prepared =
+        core_assistant::prepare_with_options(&host, params, ConnectionOptions::default())
+            .await
+            .map_err(core_error)?;
 
     if opts.print_prompt {
         print_prompt(&opts, &prepared)?;
@@ -357,18 +319,13 @@ fn emit_launch_output(
         } else {
             format!("{}/{}", opts.host, info.id.0)
         };
-        let degraded_note = if result.assistant.knowledge == "degraded" {
-            " (degraded)"
-        } else {
-            ""
-        };
         if result.replayed {
             println!(
                 "assistant session already started by an earlier request with this request \
-                 id{degraded_note}: {target}"
+                 id: {target}"
             );
         } else {
-            println!("started assistant session{degraded_note}: {target}");
+            println!("started assistant session: {target}");
         }
         if let Some(source) = &result.worktree_source {
             println!(
@@ -426,16 +383,6 @@ async fn assistant_host_config(
     }
 }
 
-fn assistant_paths(paths: &Paths) -> core_assistant::AssistantPaths {
-    core_assistant::AssistantPaths {
-        runtime_dir: paths.runtime_dir.clone(),
-        data_dir: paths.data_dir.clone(),
-        log_dir: paths.log_dir.clone(),
-        cache_dir: paths.cache_dir.clone(),
-        config_dir: paths.config_dir.clone(),
-    }
-}
-
 fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assistant::LaunchParams {
     core_assistant::LaunchParams {
         intent: core_intent(opts.intent),
@@ -452,7 +399,6 @@ fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assista
         cols: DEFAULT_COLS,
         rows: DEFAULT_ROWS,
         no_snapshot: opts.no_snapshot,
-        degraded: opts.degraded,
         auto_started_daemon: auto_started,
         request_id: opts.request_id.clone(),
     }
@@ -474,9 +420,6 @@ fn core_error(err: AssistantError) -> CliError {
         AssistantError::Protocol(source) => CliError::Protocol(source),
         AssistantError::MissingEnv { var } => CliError::MissingEnv { var },
         AssistantError::RemoteAssistantTargetRequired { .. } => CliError::RemoteTargetRequired,
-        AssistantError::RemoteAssistantDegradedUnsupported { host } => {
-            CliError::DegradedRemoteUnsupported { host }
-        }
         other @ AssistantError::Paths { .. } => CliError::Protocol(protocol::ProtocolError::new(
             protocol::ErrorClass::Runtime,
             "assistant_launch_failed",
@@ -510,17 +453,12 @@ mod tests {
             json: false,
             print_prompt: false,
             no_snapshot: false,
-            degraded: false,
             no_start_daemon: false,
         }
     }
 
     #[test]
     fn local_launches_and_targeted_remote_launches_are_allowed() {
-        let local_degraded = AssistantOptions {
-            degraded: true,
-            ..opts(LOCAL_HOST)
-        };
         let remote_project = AssistantOptions {
             project: Some("ui".to_owned()),
             ..opts("build-box")
@@ -532,7 +470,6 @@ mod tests {
         for (row, options) in [
             ("local without a target", opts(LOCAL_HOST)),
             ("empty host is local", opts("")),
-            ("local degraded", local_degraded),
             ("remote with --project", remote_project),
             ("remote with --repo", remote_repo),
         ] {
@@ -547,17 +484,5 @@ mod tests {
             matches!(err, CliError::RemoteTargetRequired),
             "expected RemoteTargetRequired, got {err:?}"
         );
-    }
-
-    #[test]
-    fn remote_degraded_is_rejected_even_with_target() {
-        let mut o = opts("build-box");
-        o.degraded = true;
-        o.project = Some("ui".to_owned());
-        let err = validate_target(&o).expect_err("remote degraded is rejected");
-        let CliError::DegradedRemoteUnsupported { host } = err else {
-            panic!("expected DegradedRemoteUnsupported, got {err:?}");
-        };
-        assert_eq!(host, "build-box");
     }
 }

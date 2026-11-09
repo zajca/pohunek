@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 pub struct AssistantMaterializeParams {
     /// Launch-metadata snapshot JSON to persist beside the materialized bundle.
     pub snapshot: String,
+    /// Caller-chosen idempotency key: a repeat under the same key keeps the
+    /// first snapshot and returns the same snapshot path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub request_id: Option<String>,
 }
 
 /// Result returned by `assistant.materialize`.
@@ -26,13 +31,21 @@ pub struct AssistantMaterializeResult {
     pub bundle_path: String,
     /// Host-local path to the persisted launch-metadata snapshot.
     pub snapshot_path: String,
-    /// Pohunek version that produced the embedded bundle.
+    /// Version of the assistant context package that holds the bundle.
     pub version: String,
-    /// Stable content hash for the materialized bundle.
+    /// Archive digest of the assistant context package.
     pub content_hash: String,
     /// Allowlisted concept metadata used by callers to build the assistant TOC.
     pub concepts: Vec<ConceptMeta>,
+    /// Text of the assistant prompt contract (`assistant/system.md`) read from
+    /// the bundle. Empty from a daemon that predates the package-based bundle.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt_contract: String,
 }
+
+/// Package id of the assistant context package that `assistant.materialize`
+/// resolves on the daemon host.
+pub const ASSISTANT_CONTEXT_PACKAGE_ID: &str = "pohunek.context.assistant";
 
 /// Public-safe concept metadata exposed through the protocol.
 ///

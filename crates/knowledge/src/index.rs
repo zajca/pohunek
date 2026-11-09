@@ -1,15 +1,14 @@
-//! Read-only metadata accessors for the embedded knowledge bundle.
+//! Read-only metadata accessors for a knowledge bundle directory.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use include_dir::{Dir, DirEntry, File};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::assistant::embedded_bundle;
 use crate::{Concept, ConceptType, Deprecation, Intent};
 
-/// Public concept metadata exposed by the embedded bundle index.
+/// Public concept metadata exposed by the bundle index.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConceptMeta {
     #[serde(rename = "type")]
@@ -27,9 +26,9 @@ pub struct ConceptMeta {
     pub deprecated: Option<Deprecation>,
 }
 
-/// Error returned when embedded concept metadata cannot be indexed.
+/// Error returned when concept metadata cannot be indexed.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
-#[error("invalid embedded knowledge concept `{}`: {message}", path.display())]
+#[error("invalid knowledge concept `{}`: {message}", path.display())]
 pub struct BundleIndexError {
     path: PathBuf,
     message: String,
@@ -65,30 +64,51 @@ impl From<Concept> for ConceptMeta {
     }
 }
 
-/// Return allowlisted metadata for concepts in the embedded knowledge bundle.
+/// Most markdown files one bundle may hold.
+const MAX_BUNDLE_FILES: usize = 4096;
+/// Largest markdown file the index reads.
+const MAX_CONCEPT_BYTES: u64 = 1024 * 1024;
+/// Deepest directory level the index descends to.
+const MAX_BUNDLE_DEPTH: usize = 16;
+
+/// Return allowlisted metadata for concepts in the bundle directory `root`.
+///
+/// Symbolic links and other non-regular entries are skipped, so the index
+/// never leaves `root`.
 ///
 /// # Errors
 ///
-/// Returns a [`BundleIndexError`] if any embedded concept file is not valid
-/// UTF-8, is missing frontmatter, or has frontmatter that fails to parse.
-pub fn bundle_index() -> Result<Vec<ConceptMeta>, BundleIndexError> {
+/// Returns a [`BundleIndexError`] if the directory cannot be read, holds more
+/// files or deeper levels than the bounds allow, or any concept file is too
+/// large, not valid UTF-8, missing frontmatter, or has frontmatter that fails
+/// to parse.
+pub fn bundle_index(root: &Path) -> Result<Vec<ConceptMeta>, BundleIndexError> {
     let mut files = Vec::new();
-    collect_markdown_files(embedded_bundle().as_dir(), &mut files);
+    collect_markdown_files(root, Path::new(""), 0, &mut files)?;
 
     let mut concepts: Vec<ConceptMeta> = files
         .into_iter()
-        .filter(|file| !is_reserved_markdown(file))
-        .map(concept_meta_from_file)
+        .filter(|relative| !is_reserved_markdown(relative))
+        .map(|relative| concept_meta_from_file(root, &relative))
         .collect::<Result<Vec<_>, _>>()?;
     concepts.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(concepts)
 }
 
-fn concept_meta_from_file(file: &File<'_>) -> Result<ConceptMeta, BundleIndexError> {
-    let content = file
-        .contents_utf8()
-        .ok_or_else(|| BundleIndexError::new(file.path(), "markdown content is not valid UTF-8"))?;
-    parse_concept_meta(file.path(), content)
+fn concept_meta_from_file(root: &Path, relative: &Path) -> Result<ConceptMeta, BundleIndexError> {
+    let path = root.join(relative);
+    let io_error = |error: std::io::Error| BundleIndexError::new(relative, error.to_string());
+    let length = fs::metadata(&path).map_err(io_error)?.len();
+    if length > MAX_CONCEPT_BYTES {
+        return Err(BundleIndexError::new(
+            relative,
+            "markdown file is too large",
+        ));
+    }
+    let content = fs::read(&path).map_err(io_error)?;
+    let content = std::str::from_utf8(&content)
+        .map_err(|_error| BundleIndexError::new(relative, "markdown content is not valid UTF-8"))?;
+    parse_concept_meta(relative, content)
 }
 
 fn parse_concept_meta(
@@ -103,23 +123,39 @@ fn parse_concept_meta(
         .map_err(|err| BundleIndexError::new(path, format!("invalid frontmatter: {err}")))
 }
 
-fn collect_markdown_files<'a>(dir: &'a Dir<'a>, files: &mut Vec<&'a File<'a>>) {
-    for entry in dir.entries() {
-        match entry {
-            DirEntry::Dir(dir) => collect_markdown_files(dir, files),
-            DirEntry::File(file) if file.path().extension().is_some_and(|ext| ext == "md") => {
-                files.push(file);
+fn collect_markdown_files(
+    root: &Path,
+    relative: &Path,
+    depth: usize,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), BundleIndexError> {
+    if depth > MAX_BUNDLE_DEPTH {
+        return Err(BundleIndexError::new(
+            relative,
+            "directory nesting is too deep",
+        ));
+    }
+    let io_error = |error: std::io::Error| BundleIndexError::new(relative, error.to_string());
+    for entry in fs::read_dir(root.join(relative)).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let child = relative.join(entry.file_name());
+        let file_type = entry.file_type().map_err(io_error)?;
+        if file_type.is_dir() {
+            collect_markdown_files(root, &child, depth + 1, files)?;
+        } else if file_type.is_file() && child.extension().is_some_and(|ext| ext == "md") {
+            if files.len() >= MAX_BUNDLE_FILES {
+                return Err(BundleIndexError::new(&child, "too many markdown files"));
             }
-            DirEntry::File(_) => {}
+            files.push(child);
         }
     }
+    Ok(())
 }
 
-/// Whether `file` is not a concept: the reserved `index.md` and `log.md`, or a
-/// log fragment, which a source bundle keeps under `log.d/` and the embedded
-/// bundle carries only inside its assembled log.
-fn is_reserved_markdown(file: &File<'_>) -> bool {
-    let path = file.path();
+/// Whether the bundle-relative `path` is not a concept: the reserved
+/// `index.md` and `log.md`, or a log fragment, which a source bundle keeps
+/// under `log.d/` and a built bundle carries only inside its assembled log.
+fn is_reserved_markdown(path: &Path) -> bool {
     path.starts_with(crate::log::FRAGMENT_DIR)
         || path
             .file_name()

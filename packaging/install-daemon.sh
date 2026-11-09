@@ -5,7 +5,8 @@
 # <prefix>/libexec/pohunek/<version>/, service.toml, the daemon job, and the
 # readiness check. This wrapper only locates the staged binaries next to it,
 # refuses a pre-service install (a `pohunekd.service` unit with template
-# workers) and picks the subcommand:
+# workers, or a pending `migrations/durable-session-workers.json` manifest)
+# and picks the subcommand:
 #
 # - `service install` while `pohunek service status --json` reports a pending
 #   install transaction: install resumes it (same version and prefix) or rolls

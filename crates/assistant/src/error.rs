@@ -21,7 +21,4 @@ pub enum AssistantError {
     /// A remote launch needs a project or repo target.
     #[error("remote assistant launch on `{host}` requires a project or repo target")]
     RemoteAssistantTargetRequired { host: String },
-    /// Degraded launches cannot run against a remote host.
-    #[error("degraded assistant launch is not supported for remote host `{host}`")]
-    RemoteAssistantDegradedUnsupported { host: String },
 }

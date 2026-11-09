@@ -823,24 +823,32 @@ impl ProtocolError {
         )
     }
 
-    /// The canonical `runtime/assistant_bundle_mismatch` error for remote
-    /// materialization that returned a bundle from a different binary build.
+    /// The canonical `runtime/assistant_package_missing` error.
     ///
-    /// Code is stable: `assistant_bundle_mismatch`.
+    /// Raised by `assistant.materialize` when the assistant context package is
+    /// not installed, not selected or disabled on the daemon host. Code is
+    /// stable: `assistant_package_missing`.
     #[must_use]
-    pub fn assistant_bundle_mismatch(
-        expected_version: &str,
-        expected_hash: &str,
-        actual_version: &str,
-        actual_hash: &str,
-    ) -> Self {
+    pub fn assistant_package_missing(package_id: &str, detail: &str, remedy: &str) -> Self {
         Self::new(
             ErrorClass::Runtime,
-            "assistant_bundle_mismatch",
-            format!(
-                "remote assistant bundle {actual_version}/{actual_hash} does not match local binary {expected_version}/{expected_hash}"
-            ),
-            Some("upgrade the older pohunek side so the CLI and daemon use the same assistant knowledge bundle".to_owned()),
+            "assistant_package_missing",
+            format!("the assistant context package `{package_id}` cannot be used: {detail}"),
+            Some(remedy.to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/assistant_daemon_outdated` error for a daemon that
+    /// answers `assistant.materialize` without the prompt contract.
+    ///
+    /// Code is stable: `assistant_daemon_outdated`.
+    #[must_use]
+    pub fn assistant_daemon_outdated() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "assistant_daemon_outdated",
+            "the daemon answered assistant.materialize without the prompt contract",
+            Some("upgrade the pohunek daemon on that host so it serves the assistant from its context package".to_owned()),
         )
     }
 

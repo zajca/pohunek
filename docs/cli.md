@@ -134,7 +134,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
-| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. |
+| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with the knowledge bundle of the assistant context package (`pohunek.context.assistant`, installed by digest; `assistant_package_missing` names the install command) + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
@@ -566,7 +566,7 @@ pohunek assistant --agent hermes "Explain the current session runtime."
 The assistant is an ordinary agent session — the same PTY, attach, and
 notification machinery — launched with a materialized offline knowledge
 bundle and a launch snapshot that holds launch metadata only (intent, request,
-selected host, project and agent, bundle version). The snapshot is not redacted
+selected host, project and agent, launching client version). The snapshot is not redacted
 and carries no live state, so keep secrets out of the request. Its
 automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 `hermes`; explicit Hermes selection still requires the supported runtime on the

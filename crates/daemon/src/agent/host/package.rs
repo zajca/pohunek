@@ -37,7 +37,9 @@ use protocol::{
 use thiserror::Error;
 
 use super::claim::is_reserved;
-use super::commands::{classify, commands_of, parse_commands_only, Exports, PackageDescriptor};
+use super::commands::{
+    classify, commands_of, parse_commands_only, parse_context_only, Exports, PackageDescriptor,
+};
 use super::definition::{
     malformed_at, DefinitionError, DefinitionInvariant, DefinitionOrigin, HandlerId,
     RuntimeDefinition, MAX_DEFINITION_BYTES,
@@ -74,6 +76,9 @@ pub enum PackageRejection {
     /// The descriptor exports commands only, so the package serves no runtime.
     #[error("the package exports no runtime")]
     RuntimeMissing,
+    /// The package exports no context files.
+    #[error("the package exports no context")]
+    ContextMissing,
     /// The descriptor is not a valid runtime definition.
     #[error("the runtime descriptor is invalid: {0}")]
     Descriptor(DefinitionError),
@@ -558,6 +563,33 @@ impl PackageStore {
         }
     }
 
+    /// The verified directory of the files a context package exports.
+    ///
+    /// The root is verified against its archive digest on this call, and the
+    /// descriptor must declare `identity` and a `[context]` export.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageRejection`] when the package is not installed, its
+    /// root fails verification, the descriptor is invalid or names another
+    /// identity, or the package exports no context
+    /// ([`PackageRejection::ContextMissing`]).
+    pub fn context_dir(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Result<std::path::PathBuf, PackageRejection> {
+        let root = self.ready_root(digest)?;
+        let descriptor = descriptor_from_files(&RootFiles(&root), digest)?;
+        if descriptor.identity() != identity {
+            return Err(PackageRejection::IdentityMismatch);
+        }
+        let dir = descriptor
+            .context_dir()
+            .ok_or(PackageRejection::ContextMissing)?;
+        Ok(root.files_path().join(dir))
+    }
+
     /// The integration handler a recorded package's descriptor names, read
     /// from a verified root without requiring the current descriptor shape.
     ///
@@ -706,6 +738,9 @@ trait PackageFiles {
 
     /// Contents of the file at `path`.
     fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError>;
+
+    /// Whether the package lists a file below the directory `dir`.
+    fn lists_under(&self, dir: &str) -> bool;
 }
 
 /// The files of a verified root; every read re-verifies the tree.
@@ -730,6 +765,14 @@ impl PackageFiles for RootFiles<'_> {
 
     fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
         self.0.read_file(path)
+    }
+
+    fn lists_under(&self, dir: &str) -> bool {
+        self.0.files().iter().any(|file| {
+            file.path
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 }
 
@@ -757,6 +800,15 @@ impl PackageFiles for ArchiveFiles<'_> {
             .find(|entry| entry.path == path)
             .map(|entry| entry.contents.clone())
             .ok_or(VerifyError::UnknownPath)
+    }
+
+    fn lists_under(&self, dir: &str) -> bool {
+        self.0.iter().any(|entry| {
+            entry
+                .path
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
     }
 }
 
@@ -818,6 +870,11 @@ fn parse_descriptor(
         Exports::CommandsOnly => {
             parse_commands_only(text, &document, &FeatureTables::PRODUCTION, executable)
         }
+        Exports::Context => {
+            parse_context_only(text, &document, &FeatureTables::PRODUCTION, |dir| {
+                files.lists_under(dir)
+            })
+        }
         Exports::Runtime => {
             let definition = RuntimeDefinition::from_toml(
                 text,
@@ -872,6 +929,38 @@ struct Loaded {
     definition: RuntimeDefinition,
 }
 
+/// The verified files of a context package.
+#[derive(Debug, Clone)]
+pub struct ContextDir {
+    /// Absolute directory of the exported files.
+    pub dir: std::path::PathBuf,
+    /// Identity of the package.
+    pub identity: PackageIdentity,
+    /// Archive digest of the package.
+    pub digest: PackageDigest,
+}
+
+/// Why a context package cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum ContextError {
+    /// No package of the id is installed and selected.
+    #[error("the context package is not installed")]
+    NotInstalled,
+    /// A package of the id is installed but none is selected.
+    #[error("the context package is installed but not selected")]
+    NotSelected,
+    /// The selected package is disabled.
+    #[error("the context package is disabled")]
+    Disabled,
+    /// The lookup task failed before it answered.
+    #[error("the context package lookup failed")]
+    LookupFailed,
+    /// The package root or descriptor cannot be used.
+    #[error("the context package cannot be used: {0}")]
+    Rejected(PackageRejection),
+}
+
 /// Supplies the runtimes of installed, enabled and selected packages.
 #[derive(Debug, Clone)]
 pub struct PackageSource {
@@ -889,6 +978,51 @@ impl PackageSource {
     #[must_use]
     pub fn store(&self) -> &PackageStore {
         &self.store
+    }
+
+    /// The verified directory of the context package `id`: the selected,
+    /// enabled package of that id.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInstalled`] without a selected package of that id,
+    /// [`ContextError::Disabled`] when it is disabled, and
+    /// [`ContextError::Rejected`] when its root, descriptor or context export
+    /// is unusable.
+    pub fn context_dir(&self, id: &protocol::PackageId) -> Result<ContextDir, ContextError> {
+        let state = self
+            .store
+            .registry_state()
+            .map_err(|error| ContextError::Rejected(PackageRejection::Registry(error)))?;
+        let record = state
+            .packages()
+            .iter()
+            .find(|record| {
+                &record.identity().id == id && state.selected(id) == Some(record.digest())
+            })
+            .ok_or_else(|| {
+                if state
+                    .packages()
+                    .iter()
+                    .any(|record| &record.identity().id == id)
+                {
+                    ContextError::NotSelected
+                } else {
+                    ContextError::NotInstalled
+                }
+            })?;
+        if !record.enabled() {
+            return Err(ContextError::Disabled);
+        }
+        let dir = self
+            .store
+            .context_dir(record.digest(), record.identity())
+            .map_err(ContextError::Rejected)?;
+        Ok(ContextDir {
+            dir,
+            identity: record.identity().clone(),
+            digest: record.digest().clone(),
+        })
     }
 
     /// Loads the definition of every selected, enabled package.

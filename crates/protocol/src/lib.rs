@@ -49,7 +49,7 @@ mod version;
 #[doc(inline)]
 pub use assistant::{
     AssistantMaterializeParams, AssistantMaterializeResult, ConceptDeprecation, ConceptIntent,
-    ConceptMeta, ConceptType,
+    ConceptMeta, ConceptType, ASSISTANT_CONTEXT_PACKAGE_ID,
 };
 #[doc(inline)]
 pub use capabilities::{AgentRuntime, HostCapabilities, HostInspectParams};

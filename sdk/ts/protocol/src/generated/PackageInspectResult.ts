@@ -23,8 +23,8 @@ export type PackageInspectResult = {
    */
   commands?: Array<CommandInfo>;
   /**
-   * Set when the descriptor loaded and exports commands only, so a missing
-   * `runtime` is not a fault. A reply without it says nothing about the
+   * Set when the descriptor loaded and exports no runtime (commands only,
+   * or a context directory), so a missing `runtime` is not a fault. A reply without it says nothing about the
    * descriptor.
    */
   commands_only?: boolean;

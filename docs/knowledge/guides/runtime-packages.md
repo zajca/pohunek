@@ -117,6 +117,7 @@ The features this core implements:
 | `checkout-trust-args-v1` | 0.40.0 | `[runtime] trusted_checkout_args`, `trusted_checkout_paths` |
 | `integration-cline-hook-v1` | 0.40.0 | `integration.handler = "cline-hook-v1"` |
 | `program-status-gate-v1` | 0.41.0 | detection manifest `[program_status] authority_from` and rule `below_authority` (no descriptor key; the package lists it so an older core refuses it) |
+| `package-context-v1` | 0.41.0 | `[context]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -867,6 +868,43 @@ expose = "peers"              # "local" (default) or "peers"
 - A runtime-only table (`[integration]`, `[launch_env]`, `[naming]`,
   `[placement]`, `[config_home]`, `[transcripts]`) next to commands without the runtime group is
   `descriptor_invalid`.
+
+## Declaring a context package
+
+A package can export a directory of files and nothing else. The daemon serves
+the directory to the one feature that names the package; the built-in assistant
+reads its knowledge bundle this way (`pohunek assistant`, package id
+`pohunek.context.assistant`).
+
+```toml
+schema = 1
+id = "pohunek.context.assistant"
+version = "1.0.0"
+runtime_api = 1
+requires = ["package-context-v1"]
+
+[context]
+dir = "bundle"   # package-relative directory that holds the files
+```
+
+- `requires = ["package-context-v1"]` is mandatory, as for commands.
+- `dir` is a normalized package-relative directory (no leading or trailing `/`,
+  no `.` or `..` component) that the manifest lists at least one file below.
+  A descriptor that combines `[context]` with a runtime group or `[commands]`
+  is `package_descriptor_invalid`.
+- The package serves no runtime and declares no command, so it installs by
+  digest (`--sha256`) or `link`, never through the catalog, needs no command
+  opt-in, and never appears among the supported agents.
+- The daemon verifies the package root against its archive digest each time it
+  resolves the files for a request, and uses only the selected, enabled package
+  of the id. The files are then read by path: a session that already started
+  keeps reading them, and uninstalling the package removes them under it (#2066).
+- For the assistant, `dir` holds `index.md`, `assistant/system.md` (the prompt
+  contract) and the concept files; the daemon answers `assistant.materialize`
+  with the directory, its concept index and the contract text, and
+  `assistant_package_missing` while no package is installed, selected and
+  enabled; its recovery names the step that fits the cause (install, select,
+  enable, or reinstall after a modified root).
 
 ## Declaring a version probe
 

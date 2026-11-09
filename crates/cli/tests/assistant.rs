@@ -48,7 +48,6 @@ fn assistant_flags_reach_the_daemon_on_default_and_intent_forms() {
         "--json",
         "--print-prompt",
         "--no-snapshot",
-        "--degraded",
         "--no-start-daemon",
         "--intent",
         "debug",
