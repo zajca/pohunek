@@ -233,9 +233,8 @@ Hard constraints, decided on purpose — respect them in every change:
   boundary: relay ACLs constrain relay actions but are not workload isolation;
   [#88](https://github.com/zajca/pohunek/issues/88) owns that later boundary.
   See the [accepted RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/team-relay-control-plane-rfc.md), especially
-  its identity, recovery, scheduling, catalog, audit, and dependency sections,
-  neither the relay binary
-  nor team mode is shipped with core.
+  its identity, recovery, scheduling, catalog, audit, and dependency sections.
+  Neither the relay binary nor team mode is shipped with core.
 - **PTY/TUI-first.** Agents run in real terminals (Codex, Claude Code, and the
   pinned local Hermes Agent runtime are first-class). Not a re-rendered control
   plane.

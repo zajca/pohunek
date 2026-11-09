@@ -59,7 +59,7 @@ The following invariants span both domains:
 | Local/direct-overlay browser client transport | External client in `zajca/pohunek-work`; the SDK ships the `WsTransport` client and a loopback test relay | Team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
 | Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v4 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay server, HTTPS auth/account/credential API, provider-neutral account linking, and credential CLI | Moved to the separate [`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay) repository; the relay CLI command group no longer exists in core | History preserved there; closed issues [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107) stay here, open follow-ups live in the relay repository |
-| Verified Keycloak-brokered social identity and bounded external eligibility | Implemented | [#92](https://github.com/zajca/pohunek/issues/92) |
+| Verified Keycloak-brokered social identity and bounded external eligibility | Implemented in `pohunekd/pohunek-relay`, not shipped with core | [#92](https://github.com/zajca/pohunek/issues/92) |
 | Host-initiated userspace WireGuard link | Accepted, not implemented | [#72](https://github.com/zajca/pohunek/issues/72) |
 | Public protocol v4 relay host link, `SessionOrigin`, and daemon share guards | Accepted, not implemented | [#70](https://github.com/zajca/pohunek/issues/70) |
 | Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
@@ -2531,6 +2531,6 @@ Integration and E2E obligations:
 | Audit | Tamper-evident considered | Plain local event log today; the durable relay audit and admission foundation lives in the relay repository |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity for parent state; hooks capture recovery identity and durable Claude/Codex subagent lifecycle |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
-| GUI | libghostty client (MVP5) + spike (MVP0) | Mesh-local browser client shipped (the browser and native desktop clients live in `zajca/pohunek-work`); the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
+| GUI | libghostty client (MVP5) + spike (MVP0) | Mesh-local browser client shipped (the browser and native desktop clients live in `zajca/pohunek-work`); the relay credential CLI lives in `pohunekd/pohunek-relay`, and the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
 | Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 and later 0.x |

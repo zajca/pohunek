@@ -1437,13 +1437,18 @@ async fn a_session_that_stops_while_blocked_resolves_its_attention_record() {
     assert_eq!(records[0]["status"], "unread");
 
     fixture.stop_all(&[&session]).await;
-    let resolved = Box::pin(wait_until("the record resolves", || async {
-        settle().await;
-        let inbox = fixture.inbox().await;
-        (inbox
-            .first()
-            .is_some_and(|record| record["status"] == "acknowledged"))
-        .then_some(inbox)
+    // Yields instead of sleeping: the paused clock would not end a sleep.
+    let resolved = Box::pin(guard("the record resolves", async {
+        loop {
+            settle().await;
+            let inbox = fixture.inbox().await;
+            if inbox
+                .first()
+                .is_some_and(|record| record["status"] == "acknowledged")
+            {
+                return inbox;
+            }
+        }
     }))
     .await;
     assert_eq!(resolved.len(), 1);
@@ -1464,13 +1469,13 @@ async fn a_session_that_fails_leaves_no_notification_record_of_any_kind() {
         )
         .await);
     let session = created["id"].as_str().expect("session id").to_owned();
-    let _inhibitor = pause_clock().await;
-
+    // The poll sleeps of `wait_until` would not end under the paused clock.
     Box::pin(wait_until("the session fails", || async {
         let info = ok(fixture.call(method::SESSION_INSPECT, json!(session)).await);
         (info["state"] == "failed").then_some(())
     }))
     .await;
+    let _inhibitor = pause_clock().await;
     tokio::time::advance(debounce() + FLUSH_SLACK).await;
     settle().await;
     assert!(

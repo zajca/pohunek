@@ -12,7 +12,10 @@ export type DetectionStatus = {
    */
   state_source: StateSource | null;
   /**
-   * Whether the session worker answers the program's OSC 7501 probe.
+   * Whether the session worker answers the program's OSC 7501 probe. Not
+   * known when `gate.reason` is `version_unknown` (a launch with an unknown
+   * release, or a session re-attached after a daemon restart, whose worker
+   * keeps the probe flag it was spawned with): the value then reads `false`.
    */
   probe_answered: boolean;
   /**
