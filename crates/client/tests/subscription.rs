@@ -290,13 +290,13 @@ async fn subscription_next_event_decodes_notification_created() {
 async fn subscription_ends_cleanly_on_an_unterminated_fragment() {
     let request = subscribe_request("subscribe-cut");
     let complete = serde_json::to_string(
-        &json!({"v": 4, "event": "agent_state", "session_id": "s-1", "activity": "working"}),
+        &json!({"v": 5, "event": "agent_state", "session_id": "s-1", "activity": "working"}),
     )
     .expect("serialize event");
     let daemon = spawn_unix_subscription_daemon_with_tail(
         response_ok_line_for(&request, json!({"subscribed": true})),
         vec![complete],
-        Some("{\"v\":4,\"event\":\"session_updated\",\"sess".to_owned()),
+        Some("{\"v\":5,\"event\":\"session_updated\",\"sess".to_owned()),
     );
     let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await

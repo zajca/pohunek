@@ -1525,17 +1525,20 @@ fn assert_typed_session_json(method: &str, ok: &Value) {
         protocol::method::SESSION_NEW | protocol::method::SESSION_INSPECT => {
             let _: protocol::SessionInfo = serde_json::from_value(ok.clone())
                 .unwrap_or_else(|error| panic!("{method} typed JSON: {error}"));
-            assert_eq!(ok["runtime"]["runtime_id"], "runtime-fixture-1");
+            assert_eq!(ok["runtime"]["worker_instance_id"], "runtime-fixture-1");
         }
         protocol::method::SESSION_LIST => {
             let _: Vec<protocol::SessionInfo> =
                 serde_json::from_value(ok.clone()).expect("typed session list JSON");
-            assert_eq!(ok[0]["runtime"]["runtime_id"], "runtime-fixture-1");
+            assert_eq!(ok[0]["runtime"]["worker_instance_id"], "runtime-fixture-1");
         }
         protocol::method::SESSION_WAIT => {
             let _: protocol::SessionWaitResult =
                 serde_json::from_value(ok.clone()).expect("typed session wait JSON");
-            assert_eq!(ok["session"]["runtime"]["runtime_id"], "runtime-fixture-1");
+            assert_eq!(
+                ok["session"]["runtime"]["worker_instance_id"],
+                "runtime-fixture-1"
+            );
         }
         protocol::method::SESSION_RESUME
         | protocol::method::SESSION_RESIZE
@@ -1560,7 +1563,10 @@ fn assert_typed_session_json(method: &str, ok: &Value) {
                 }
                 _ => unreachable!(),
             }
-            assert_eq!(ok["session"]["runtime"]["runtime_id"], "runtime-fixture-1");
+            assert_eq!(
+                ok["session"]["runtime"]["worker_instance_id"],
+                "runtime-fixture-1"
+            );
         }
         protocol::method::SESSION_SCREEN => {
             let _: protocol::SessionScreenResult =
@@ -2650,14 +2656,6 @@ fn session_retention_sweep_requires_an_explicit_mode_on_the_cli() {
     assert_cli_usage_error(
         &["session", "retention", "sweep", "--dry-run", "--apply"],
         "cannot be used with",
-    );
-}
-
-#[test]
-fn notification_retention_prune_requires_an_explicit_mode_on_the_cli() {
-    assert_cli_usage_error(
-        &["notifications", "retention", "prune"],
-        "required arguments were not provided",
     );
 }
 

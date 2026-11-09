@@ -2592,8 +2592,7 @@ fn previous_release_session_survives_the_upgrade_to_head() {
 }
 
 /// Real `--json` documents captured from the v0.33.1 and this build's CLIs
-/// (`tests/fixtures/release_upgrade`) and the recorded v0.33.0 protocol 3
-/// results.
+/// (`tests/fixtures/release_upgrade`).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2606,20 +2605,6 @@ mod tests {
     const HEAD_NOTIFICATIONS: &str =
         include_str!("fixtures/release_upgrade/head-notifications-list.json");
     const HEAD_ERROR: &str = include_str!("fixtures/release_upgrade/head-error.json");
-    const V3_RESULTS: &str = include_str!("../../protocol/tests/fixtures/compat/v3/results.json");
-
-    /// The recorded v0.33.0 result of `method`.
-    fn v3_result(method: &str) -> Value {
-        let recording: Value = serde_json::from_str(V3_RESULTS).expect("parse the v3 recording");
-        assert_eq!(recording["release"], "v0.33.0");
-        recording["entries"]
-            .as_array()
-            .expect("entries")
-            .iter()
-            .find(|entry| entry["method"] == method)
-            .unwrap_or_else(|| panic!("no recorded {method}"))["result"]
-            .clone()
-    }
 
     #[test]
     fn envelopes_of_both_releases_yield_their_payload() {
@@ -2688,16 +2673,6 @@ mod tests {
     }
 
     #[test]
-    fn the_v0_33_0_spelling_of_the_runtime_is_normalized() {
-        let recorded = v3_result("session.inspect");
-        assert!(recorded["runtime"].get("runtime_id").is_some());
-        assert!(recorded["runtime"].get("worker_instance_id").is_none());
-        let runtime = runtime(&recorded).expect("v0.33.0 runtime");
-        assert_eq!(runtime.worker_instance_id, "runtime-42");
-        assert_eq!(runtime.generation, 3);
-    }
-
-    #[test]
     fn matching_spellings_at_once_are_normalized() {
         let info = serde_json::json!({"runtime": {
             "state": "live", "runtime_generation": "1",
@@ -2717,19 +2692,5 @@ mod tests {
             "state": "live", "runtime_generation": "1",
             "worker_instance_id": "a", "runtime_id": "b"}});
         let _ = runtime(&info);
-    }
-
-    /// The other payload fields the assertions read keep their spelling in the
-    /// v0.33.0 recordings.
-    #[test]
-    fn the_other_fields_have_one_spelling_in_both_releases() {
-        let inspect = v3_result("session.inspect");
-        assert!(inspect.get("native_session_id").is_some());
-        assert!(inspect.get("active_agent_session_id").is_some());
-        assert!(v3_result("session.screen")["visible_lines"].is_array());
-        assert!(v3_result("session.input")["accepted"].is_boolean());
-        assert!(v3_result("session.stop")["stopped"].is_boolean());
-        assert!(v3_result("notification.list")["notifications"].is_array());
-        assert!(v3_result("daemon.health").get("status").is_some());
     }
 }

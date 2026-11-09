@@ -322,7 +322,7 @@ captured screen through the package manifest.
   still running or pending (Claude Code 2.1.296). A background subagent's task
   id is its `agent_id`; teammates, synchronous children and workflow agents are
   not listed by agent id. The installer registers two Stop hooks in
-  `settings.json`: the notify hook (`turn_completed`) and the state hook
+  `settings.json`: the notify hook (`turn_completed`, which the daemon turns into a wait event, not a record) and the state hook
   (`stop`), which sends each task's `id`, `type` and `status` as a
   `subagent_snapshot` claim to the worker, with three optional fields sanitized
   in the hook: `label` (from `description`, for every type; control and format

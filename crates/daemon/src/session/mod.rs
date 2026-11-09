@@ -145,11 +145,7 @@ use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
 pub use tmpdir::store_session_tmp_root;
-#[cfg(test)]
-pub(crate) use turn_events::EdgeStamp;
-pub(crate) use turn_events::{
-    rfc3339_from_nanos, TurnEdge, TurnEvents, TurnId, TurnOwner, TurnSnapshot, TurnVerdict,
-};
+pub(crate) use turn_events::{TurnEdge, TurnEvents, TurnId, TurnOwner, TurnVerdict};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 /// Time to retain a failed raw attach outcome for one control-plane lookup.
@@ -526,6 +522,10 @@ pub struct SessionRegistryConfig {
     /// `service.toml`). Defaults to
     /// [`pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE`].
     pub worker_journal_max_age: std::time::Duration,
+    /// Debounce, dedupe window and record lifetime of the notification inbox
+    /// (`[notifications]` of `service.toml`). Defaults to
+    /// [`pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS`].
+    pub notification_settings: pohunek_service_config::NotificationSettings,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
     /// `None` keeps the retention policy in memory only, which is what unit
     /// tests that never persist a policy use.
@@ -675,6 +675,7 @@ impl Default for SessionRegistryConfig {
             remote_keepalive: pohunek_service_config::DEFAULT_KEEPALIVE_TIMING,
             inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
             worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
+            notification_settings: pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS,
             retention_policy_path: None,
             log_dir: None,
             config_dir: None,
@@ -720,6 +721,9 @@ struct SessionRegistryInner {
     /// Sessions shown only by an in-memory placeholder because the write of
     /// their classification failed, with the state and reason shown.
     unpersisted_classifications: std::sync::Mutex<HashMap<String, (RuntimeState, String)>>,
+    /// Where an approval notice on a session's terminal becomes attention;
+    /// bound once by the daemon after the notification components exist.
+    approval_notice_sink: std::sync::OnceLock<crate::notifications::ApprovalNoticeSink>,
     /// The verdict read from the failed job of a session's worker whose `Lost`
     /// classification is not committed yet. Retiring the job destroys the
     /// service manager's copy, so a repeated classification takes it from here.
@@ -1041,6 +1045,11 @@ struct SessionEntry {
     /// The release the launch of this runtime generation probed; `None` for an
     /// unprobed program or a session re-attached after a daemon restart.
     runtime_version: Option<package::version_probe::ProbeVersion>,
+    /// The runtime generation in which a provider hook last spoke for this
+    /// session (an activity report or an admitted notification). An approval
+    /// notice on the terminal is ignored while it equals the current
+    /// generation, because the hook already covers the session there.
+    hook_spoke: Option<Option<protocol::RuntimeGeneration>>,
     /// Whether the session worker answers the program's OSC 7501 probe, as set
     /// when the generation launched.
     probe_answered: bool,
@@ -2571,6 +2580,7 @@ impl SessionRegistry {
                 runtime_inventory: Mutex::new(Vec::new()),
                 create_claims: std::sync::Mutex::new(HashMap::new()),
                 unpersisted_classifications: std::sync::Mutex::new(HashMap::new()),
+                approval_notice_sink: std::sync::OnceLock::new(),
                 unrecorded_exits: std::sync::Mutex::new(HashMap::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
@@ -2718,6 +2728,13 @@ impl SessionRegistry {
     #[must_use]
     pub fn config_dir(&self) -> Option<&Path> {
         self.inner.config.config_dir.as_deref()
+    }
+
+    /// Debounce, dedupe window and record lifetime the notification inbox runs
+    /// with.
+    #[must_use]
+    pub fn notification_settings(&self) -> pohunek_service_config::NotificationSettings {
+        self.inner.config.notification_settings
     }
 
     /// Size, count and age bounds the event journal is opened with.
@@ -5079,6 +5096,13 @@ impl SessionRegistry {
         );
         entry.set_activity(activity);
         entry.info.state_source = StateSource::Report;
+        entry.hook_spoke = Some(
+            entry
+                .info
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.runtime_generation),
+        );
         record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
     }
 

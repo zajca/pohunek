@@ -571,7 +571,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/notifications/mod.rs`
 - `crates/daemon/src/notifications/store.rs`
 - `crates/daemon/src/notifications/coordinator.rs`
-- `crates/daemon/src/notifications/policy.rs`
+- `crates/daemon/src/notifications/notice_sink.rs`
 - `crates/daemon/src/notifications/projector.rs`
 - `crates/daemon/src/paths.rs`
 - `crates/daemon/src/logging.rs`
@@ -778,13 +778,10 @@ Protocol contracts and transport:
 - `crates/client/src/notifications.rs`
 - `crates/client/src/transport.rs`
 - `crates/client/src/error.rs`
-- `crates/client/tests/previous_daemon.rs`
 - `sdk/ts/sdk/src/compat.ts`
-- `sdk/ts/sdk/test/previous-daemon.test.ts`
 - `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/compat/mod.rs`
-- `crates/protocol/src/compat/v3.rs`
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/decimal.rs`
 - `crates/protocol/src/limits.rs`
@@ -800,7 +797,6 @@ Protocol contracts and transport:
 - `crates/protocol/src/integration.rs`
 - `crates/protocol/src/error.rs`
 - `crates/protocol/src/version.rs`
-- `crates/protocol/tests/compat_v3.rs`
 - `crates/protocol/tests/roundtrip.rs`
 - `crates/netbird/src/lib.rs`
 - `crates/netbird/src/status.rs`

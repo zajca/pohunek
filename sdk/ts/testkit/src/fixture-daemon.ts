@@ -35,14 +35,9 @@ import {
   type NotificationId,
   type NotificationListParams,
   type NotificationListResult,
-  type NotificationPolicy,
-  type NotificationPolicyParams,
-  type NotificationPolicyResult,
   type NotificationRecord,
   type NotificationSeverity,
   type NotificationStatus,
-  type NotificationUpdateParams,
-  type NotificationUpdateResult,
   type ProjectAddParams,
   type ProjectInfo,
   type ProjectRemoveParams,
@@ -130,8 +125,8 @@ export interface FixtureHostOptions {
  *   report for a held session, or the projector's `agent_blocked`) and records
  *   it at once. The fixture applies no debounce and no drop rule, so it never
  *   drops a `turn_completed` for a session that is `working`; a scenario
- *   records only the signals the daemon would keep. `notification.create`, the
- *   notification policy, and `scenario.setAgentState` record no turn event.
+ *   records only the signals the daemon would keep. `notification.create` and
+ *   `scenario.setAgentState` record no turn event.
  * - `exited` is recorded only by `session.stop`, when the stopped state is
  *   committed, matching the daemon's record at the terminal commit.
  * - There is no waiter pool, so `session_waiter_limit_reached` never occurs,
@@ -157,7 +152,6 @@ export interface StartFixtureDaemonOptions {
   readonly host?: FixtureHostOptions;
   readonly initialSessions?: readonly SessionInfo[];
   readonly initialNotifications?: readonly NotificationRecord[];
-  readonly notificationPolicy?: NotificationPolicy;
   readonly initialProjects?: readonly FixtureProject[];
   readonly pty?: FixturePtyOptions;
   readonly turnWait?: FixtureTurnWaitOptions;
@@ -314,6 +308,10 @@ const NOTIFICATION_KINDS = [
   "error",
   "system",
 ] as const;
+const ATTENTION_NOTIFICATION_KINDS: readonly NotificationCreateParams["kind"][] = [
+  "agent_blocked",
+  "approval_required",
+];
 const NOTIFICATION_SEVERITIES = ["info", "success", "warning", "error", "action_required"] as const;
 const NOTIFICATION_STATUSES = ["unread", "read", "acknowledged", "archived", "deleted"] as const;
 const DEFAULT_NOTIFICATION_SOURCE = {
@@ -342,7 +340,6 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   /** Idempotency keys of `session.new` with the request each one created. */
   private readonly createRequests = new Map<string, { fingerprint: string; sessionId: string }>();
   private readonly notifications = new Map<string, NotificationRecord>();
-  private notificationPolicy: NotificationPolicy;
   private readonly projects = new Map<string, ProjectInfo>();
   private readonly projectWorktrees = new Map<string, ProjectWorktree[]>();
   private readonly sessionInitialAttachDimensions = new Map<string, TerminalDimensions[]>();
@@ -384,7 +381,6 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     this.commands = options.commands === undefined ? undefined : [...options.commands];
     this.hostCapabilities = cloneValue(options.host?.capabilities ?? defaultHostCapabilities(this.daemonVersion));
     this.discoveredHosts = cloneValue([...(options.host?.discoveredHosts ?? [])]);
-    this.notificationPolicy = cloneValue(options.notificationPolicy ?? defaultNotificationPolicy());
     this.pty = new FixturePtyRegistry(this, options.pty);
     this.scenario = new FixtureScenario(this);
 
@@ -561,6 +557,17 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
   public createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord {
     return this.createNotification(input, true);
+  }
+
+  public acknowledgeNotification(id: NotificationId): NotificationRecord {
+    const record = this.notifications.get(id);
+    if (record === undefined) {
+      throw new Error(`unknown fixture notification: ${id}`);
+    }
+    record.status = "acknowledged";
+    record.acked_at = timestamp();
+    this.emitNotificationUpdated(record);
+    return cloneValue(record);
   }
 
   public deleteNotification(id: NotificationId): void {
@@ -858,16 +865,8 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
         return this.handleSessionWaitTurn(request);
       case "notification.list":
         return this.handleNotificationList(request);
-      case "notification.update":
-        return this.handleNotificationUpdate(request);
       case "notification.create":
         return this.handleNotificationCreate(request);
-      case "notification.policy.get":
-        return okResponse(request.id, {
-          policy: cloneValue(this.notificationPolicy),
-        } satisfies NotificationPolicyResult);
-      case "notification.policy.set":
-        return this.handleNotificationPolicySet(request);
       case "project.list":
         return this.handleProjectList(request);
       case "project.add":
@@ -1832,19 +1831,13 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (params === undefined || !isNotificationCreateParams(params)) {
       return errResponse(request.id, invalidParams(request.method));
     }
+    if (!ATTENTION_NOTIFICATION_KINDS.includes(params.kind)) {
+      // The inbox holds attention records only; any other kind is answered but never stored.
+      const record = this.buildNotification(params);
+      return okResponse(request.id, { created: false, record } satisfies NotificationCreateResult);
+    }
     const record = this.createNotification(params, true);
     return okResponse(request.id, { created: true, record } satisfies NotificationCreateResult);
-  }
-
-  private handleNotificationPolicySet(request: ControlRequest): ControlResponse {
-    const params = readObjectParams<NotificationPolicyParams>(request);
-    if (params === undefined || !isNotificationPolicy(params.policy)) {
-      return errResponse(request.id, invalidParams(request.method));
-    }
-    this.notificationPolicy = cloneValue(params.policy);
-    return okResponse(request.id, {
-      policy: cloneValue(this.notificationPolicy),
-    } satisfies NotificationPolicyResult);
   }
 
   private handleNotificationList(request: ControlRequest): ControlResponse {
@@ -1870,24 +1863,6 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       result.next_cursor = String(cursor + limit);
     }
     return okResponse(request.id, result);
-  }
-
-  private handleNotificationUpdate(request: ControlRequest): ControlResponse {
-    const params = readObjectParams<NotificationUpdateParams>(request);
-    if (params === undefined || typeof params.id !== "string" || !isNotificationStatus(params.status)) {
-      return errResponse(request.id, invalidParams(request.method));
-    }
-    const record = this.notifications.get(params.id);
-    if (record === undefined) {
-      return errResponse(request.id, notificationNotFound(params.id));
-    }
-    if (!canTransitionNotification(record.status, params.status)) {
-      return errResponse(request.id, invalidNotificationTransition());
-    }
-
-    applyNotificationStatus(record, params.status);
-    this.emitNotificationUpdated(record);
-    return okResponse(request.id, { record: cloneValue(record) } satisfies NotificationUpdateResult);
   }
 
   private handleProjectList(request: ControlRequest): ControlResponse {
@@ -2057,7 +2032,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       : undefined;
   }
 
-  private createNotification(input: ScenarioNotificationInput, emit: boolean): NotificationRecord {
+  private buildNotification(input: ScenarioNotificationInput): NotificationRecord {
     const id = input.id ?? `${NOTIFICATION_ID_PREFIX}${this.nextNotificationId}`;
     this.nextNotificationId += 1;
     const record: NotificationRecord = {
@@ -2072,6 +2047,11 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     };
 
     copyNotificationOptionals(record, input);
+    return record;
+  }
+
+  private createNotification(input: ScenarioNotificationInput, emit: boolean): NotificationRecord {
+    const record = this.buildNotification(input);
     this.notifications.set(record.id, record);
     if (emit) {
       this.emitEvent({
@@ -2265,102 +2245,6 @@ function defaultHostCapabilities(daemonVersion: string): HostCapabilities {
     session_new_secret_env_supported: true,
     session_new_request_id_supported: true,
   };
-}
-
-function defaultNotificationPolicy(): NotificationPolicy {
-  return {
-    attention_dedupe_window_secs: 30,
-    attention_debounce_secs: 5,
-    enabled: enabledNotificationKinds(),
-    retention: {
-      sweep_interval_secs: 21_600,
-      info_ttl_secs: 259_200,
-      warning_ttl_secs: 1_209_600,
-      resolved_attention_ttl_secs: 604_800,
-      resolved_error_ttl_secs: 2_592_000,
-      archived_ttl_secs: 7_776_000,
-      compaction_min_actions: 1_000,
-    },
-  };
-}
-
-function enabledNotificationKinds(): NotificationPolicy["enabled"] {
-  return {
-    agent_blocked: true,
-    approval_required: true,
-    turn_completed: true,
-    session_finished: true,
-    error: true,
-    system: true,
-  };
-}
-
-function isNotificationPolicy(value: unknown): value is NotificationPolicy {
-  if (!isRecord(value)) {
-    return false;
-  }
-  const keys = Object.keys(value);
-  if (
-    keys.some((key) => ![
-      "attention_dedupe_window_secs",
-      "attention_debounce_secs",
-      "enabled",
-      "providers",
-      "retention",
-    ].includes(key))
-    || !isNonNegativeInteger(value["attention_dedupe_window_secs"])
-    || !isNonNegativeInteger(value["attention_debounce_secs"])
-    || !isNotificationKindPolicy(value["enabled"])
-    || !isNotificationRetentionPolicy(value["retention"])
-  ) {
-    return false;
-  }
-  const providers = value["providers"];
-  return providers === undefined || (
-    isRecord(providers)
-    && Object.entries(providers).every(([provider, policy]) => (
-      provider.length > 0 && isNotificationKindPolicy(policy)
-    ))
-  );
-}
-
-function isNotificationRetentionPolicy(
-  value: unknown,
-): value is NotificationPolicy["retention"] {
-  if (!isRecord(value)) {
-    return false;
-  }
-  const keys = [
-    "sweep_interval_secs",
-    "info_ttl_secs",
-    "warning_ttl_secs",
-    "resolved_attention_ttl_secs",
-    "resolved_error_ttl_secs",
-    "archived_ttl_secs",
-    "compaction_min_actions",
-  ];
-  return Object.keys(value).length === keys.length
-    && keys.every((key) => isPositiveInteger(value[key]));
-}
-
-function isNotificationKindPolicy(value: unknown): value is NotificationPolicy["enabled"] {
-  if (!isRecord(value)) {
-    return false;
-  }
-  const keys = [
-    "agent_blocked",
-    "approval_required",
-    "turn_completed",
-    "session_finished",
-    "error",
-    "system",
-  ];
-  return Object.keys(value).length === keys.length
-    && keys.every((key) => typeof value[key] === "boolean");
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function listen(server: Server, target: string | { readonly host: string; readonly port: number }): Promise<void> {
@@ -2763,44 +2647,6 @@ function parseCursor(cursor: string | undefined): number | undefined {
     return undefined;
   }
   return parsed;
-}
-
-function canTransitionNotification(from: NotificationStatus, to: NotificationStatus): boolean {
-  if (from === to) {
-    return true;
-  }
-  if (from === "deleted") {
-    return false;
-  }
-  switch (to) {
-    case "read":
-      return from === "unread";
-    case "acknowledged":
-      return from === "unread" || from === "read";
-    case "archived":
-      return from === "unread" || from === "read" || from === "acknowledged";
-    case "deleted":
-      return true;
-    case "unread":
-      return false;
-  }
-}
-
-function applyNotificationStatus(record: NotificationRecord, status: NotificationStatus): void {
-  record.status = status;
-  const now = timestamp();
-  if (status === "read") {
-    record.read_at = now;
-  }
-  if (status === "acknowledged") {
-    record.acked_at = now;
-  }
-  if (status === "archived") {
-    record.archived_at = now;
-  }
-  if (status === "deleted") {
-    record.deleted_at = now;
-  }
 }
 
 function copyNotificationOptionals(record: NotificationRecord, input: ScenarioNotificationInput): void {
@@ -3231,19 +3077,6 @@ function sessionNotResumable(session: SessionInfo): ProtocolError {
 
 function attachNotFound(streamId: string): ProtocolError {
   return protocolError("runtime", "attach_not_found", `attach stream is not available: ${streamId}`);
-}
-
-function notificationNotFound(notificationId: string): ProtocolError {
-  return protocolError("runtime", "notification_not_found", `notification not found: ${notificationId}`);
-}
-
-function invalidNotificationTransition(): ProtocolError {
-  return protocolError(
-    "runtime",
-    "invalid_notification_transition",
-    "invalid notification status transition",
-    "use an allowed transition: unread->read, read->acknowledged, unread->acknowledged, archive a non-deleted record, or delete a non-deleted record",
-  );
 }
 
 function invalidNotificationCursor(cursor: string): ProtocolError {

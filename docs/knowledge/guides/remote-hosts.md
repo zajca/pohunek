@@ -156,11 +156,8 @@ daemon completes reconciliation and becomes ready. After reconnection, inspect
 `runtime.state`, `worker_id`, and `worker_instance_id`; `live` with the same runtime id
 is continuity, while `lost` means the remote PTY generation is gone.
 
-Policy and retention commands can also fan out with `--all-hosts`:
-`pohunek notifications policy get --all-hosts`, policy set with `--all-hosts`,
-and retention prune with `--all-hosts`. Single-record actions use the target
-host: `host/id` overrides `--host`, while a bare id targets the selected
-`--host` or local daemon.
+`pohunek notifications list` and `watch` fan out with `--all-hosts`; there are
+no per-record actions, policy or retention commands to target a host.
 
 The assistant design keeps the same boundary. A remote assistant must use the
 bundle of the assistant context package installed on the remote host, and that

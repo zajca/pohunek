@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
-import { MIN_PROTOCOL_VERSION, PROTOCOL_VERSION } from "@pohunek/protocol";
+import { PROTOCOL_VERSION } from "@pohunek/protocol";
 import {
   CLIENT_PROTOCOL_VERSIONS,
   Client,
@@ -20,7 +20,6 @@ import { errResponseLine, okResponseLine, parseRequestLine, requestIdFromLine } 
 const REQUEST_TIMEOUT_MS = 1_000;
 const CONNECT_TIMEOUT_MS = 2_000;
 const HEALTH = { status: "ok", daemon_version: "test", protocol_version: PROTOCOL_VERSION };
-const UNINSTALL = { digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000" };
 /** Microtask turns that let the client run to its next await on a channel. */
 const SETTLE_TURNS = 64;
 
@@ -181,16 +180,6 @@ async function timeOutOneCall(client: Client, channel: FakeChannel): Promise<Cli
   return expectClientError(call);
 }
 
-/** A request whose parameters depend on the protocol version, so it probes first. */
-function uninstallRequest(): Parameters<Client["request"]>[0] {
-  return {
-    v: CLIENT_PROTOCOL_VERSIONS,
-    id: nextRequestId("package.uninstall"),
-    method: "package.uninstall",
-    params: UNINSTALL,
-  };
-}
-
 afterEach(() => {
   jest.useRealTimers();
 });
@@ -276,68 +265,6 @@ describe("a client recovers from a timed-out request", () => {
     transport.channel(1).answer(0, HEALTH);
     transport.channel(1).answer(1, HEALTH);
     expect(await Promise.all(calls)).toEqual([HEALTH, HEALTH]);
-    await client.close();
-  });
-
-  test("B5 the reopened connection learns the daemon version again", async () => {
-    jest.useFakeTimers();
-    const transport = new FakeTransport();
-    const client = await connect(transport);
-    // Connection 0 selects the current version and then the request times out.
-    const first = client.request(uninstallRequest());
-    await settle();
-    expect(transport.channel(0).methods()).toEqual(["daemon.health"]);
-    transport.channel(0).answer(0, HEALTH);
-    await settle();
-    expect(transport.channel(0).methods()).toEqual(["daemon.health", "package.uninstall"]);
-    await elapse(REQUEST_TIMEOUT_MS);
-    expect((await expectClientError(first)).kind).toBe("requestTimeout");
-
-    // The daemon restarted on the previous release, which has no such method.
-    const second = client.request(uninstallRequest());
-    await settle();
-    expect(transport.channel(1).methods()).toEqual(["daemon.health"]);
-    transport.channel(1).answer(0, { ...HEALTH, protocol_version: MIN_PROTOCOL_VERSION }, MIN_PROTOCOL_VERSION);
-
-    expect((await expectClientError(second)).kind).toBe("daemonProtocolTooOld");
-    expect(transport.channel(1).methods()).toEqual(["daemon.health"]);
-    await client.close();
-  });
-
-  test("B6 the version probe has its own budget", async () => {
-    jest.useFakeTimers();
-    const transport = new FakeTransport();
-    const client = await connect(transport);
-    const call = client.request(uninstallRequest());
-    await settle();
-    // The probe and the request each take 80% of the request timeout.
-    await elapse(REQUEST_TIMEOUT_MS * 0.8);
-    transport.channel(0).answer(0, HEALTH);
-    await settle();
-    await elapse(REQUEST_TIMEOUT_MS * 0.8);
-    transport.channel(0).answer(1, { removed: true });
-
-    expect(await call).toEqual({ removed: true });
-    await client.close();
-  });
-
-  test("B7 an unanswered probe times out the call and the next call reopens", async () => {
-    jest.useFakeTimers();
-    const transport = new FakeTransport();
-    const client = await connect(transport);
-    const call = client.request(uninstallRequest());
-    await settle();
-    await elapse(REQUEST_TIMEOUT_MS);
-    const error = await expectClientError(call);
-    expect(error.kind).toBe("requestTimeout");
-    expect(error.message).toContain("version probe");
-    expect(transport.channel(0).methods()).toEqual(["daemon.health"]);
-
-    const next = client.call("daemon.health", null);
-    await settle();
-    expect(transport.channels.length).toBe(2);
-    transport.channel(1).answer(0, HEALTH);
-    expect(await next).toEqual(HEALTH);
     await client.close();
   });
 

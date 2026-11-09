@@ -7,4 +7,5 @@ export type SessionTurnEventKind =
   | "turn_completed"
   | "agent_blocked"
   | "approval_required"
+  | "turn_error"
   | "exited";

@@ -15,29 +15,27 @@ use protocol::{
     IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
     IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
     IntegrationRecovery, IntegrationUninstallState, NotificationCreateParams,
-    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
-    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationPolicy, NotificationPolicyParams, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdatedEvent,
-    ObservationParamsError, OutputOffset, OwnerRevision, PackageBindProfileParams,
-    PackageBindStatus, PackageFault, PackageFindingKind, PackageInstallStatus, PackageOrigin,
-    PackageSelectionBlockReason, PackageTrust, PrincipalId, ProcessStartIdentity, ProjectSource,
-    ProposalExpiry, ProposalId, ProposalNonce, ProtocolError, ProtocolVersion,
-    ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence, Request,
-    Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
-    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
-    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
-    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    NotificationCreateResult, NotificationCreatedEvent, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationListParams, NotificationRecord, NotificationSeverity,
+    NotificationSource, NotificationStatus, NotificationUpdatedEvent, ObservationParamsError,
+    OutputOffset, OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault,
+    PackageFindingKind, PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason,
+    PackageTrust, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
+    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
+    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
+    RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult,
+    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
+    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
+    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -181,51 +179,6 @@ fn notification_record() -> NotificationRecord {
         turn_duration_ms: None,
         session_metadata: BTreeMap::new(),
         hook_admitted: false,
-    }
-}
-
-fn notification_kind_policy() -> NotificationKindPolicy {
-    NotificationKindPolicy::from_flags([
-        (protocol::NotificationKind::AgentBlocked, true),
-        (protocol::NotificationKind::ApprovalRequired, true),
-        (protocol::NotificationKind::TurnCompleted, false),
-        (protocol::NotificationKind::SessionFinished, false),
-        (protocol::NotificationKind::Error, true),
-        (protocol::NotificationKind::System, false),
-    ])
-}
-
-fn notification_policy() -> NotificationPolicy {
-    NotificationPolicy {
-        attention_dedupe_window_secs: 90,
-        attention_debounce_secs: 7,
-        enabled: notification_kind_policy(),
-        providers: BTreeMap::from([
-            (
-                "codex".to_owned(),
-                NotificationKindPolicy::from_flags([
-                    (protocol::NotificationKind::AgentBlocked, true),
-                    (protocol::NotificationKind::ApprovalRequired, true),
-                    (protocol::NotificationKind::TurnCompleted, false),
-                    (protocol::NotificationKind::SessionFinished, false),
-                    (protocol::NotificationKind::Error, true),
-                    (protocol::NotificationKind::System, true),
-                ]),
-            ),
-            (
-                "claude".to_owned(),
-                NotificationKindPolicy::from_flags([
-                    (protocol::NotificationKind::AgentBlocked, true),
-                    (protocol::NotificationKind::ApprovalRequired, true),
-                    (protocol::NotificationKind::TurnCompleted, true),
-                    (protocol::NotificationKind::SessionFinished, false),
-                    (protocol::NotificationKind::Error, true),
-                    (protocol::NotificationKind::System, false),
-                ]),
-            ),
-        ]),
-        retention: protocol::NotificationRetentionPolicy::default(),
-        unknown_fields: protocol::tolerant::UnknownFields::default(),
     }
 }
 
@@ -601,160 +554,6 @@ fn notification_list_params_json_shape_roundtrips() {
             "created_before": "2026-07-03T10:00:00Z",
             "limit": 50,
             "cursor": "page-2"
-        })
-    );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
-}
-
-#[test]
-fn notification_update_params_json_shape_roundtrips() {
-    let params = NotificationUpdateParams {
-        id: NotificationId("n-42".to_owned()),
-        status: NotificationStatus::Acknowledged,
-    };
-
-    let value = serde_json::to_value(&params).expect("serialize notification update params");
-    assert_eq!(
-        value,
-        json!({
-            "id": "n-42",
-            "status": "acknowledged"
-        })
-    );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
-}
-
-#[test]
-fn notification_delete_params_json_shape_roundtrips() {
-    let params = NotificationDeleteParams {
-        id: NotificationId("n-42".to_owned()),
-    };
-
-    let value = serde_json::to_value(&params).expect("serialize notification delete params");
-    assert_eq!(
-        value,
-        json!({
-            "id": "n-42"
-        })
-    );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
-}
-
-#[test]
-fn notification_policy_params_json_shape_roundtrips() {
-    let params = NotificationPolicyParams {
-        policy: notification_policy(),
-    };
-
-    let value = serde_json::to_value(&params).expect("serialize notification policy params");
-    assert_eq!(
-        value,
-        json!({
-            "policy": {
-                "attention_dedupe_window_secs": 90,
-                "attention_debounce_secs": 7,
-                "enabled": {
-                    "agent_blocked": true,
-                    "approval_required": true,
-                    "turn_completed": false,
-                    "session_finished": false,
-                    "error": true,
-                    "system": false
-                },
-                "providers": {
-                    "codex": {
-                        "agent_blocked": true,
-                        "approval_required": true,
-                        "turn_completed": false,
-                        "session_finished": false,
-                        "error": true,
-                        "system": true
-                    },
-                    "claude": {
-                        "agent_blocked": true,
-                        "approval_required": true,
-                        "turn_completed": true,
-                        "session_finished": false,
-                        "error": true,
-                        "system": false
-                    }
-                },
-                "retention": {
-                    "sweep_interval_secs": 21600,
-                    "info_ttl_secs": 259_200,
-                    "warning_ttl_secs": 1_209_600,
-                    "resolved_attention_ttl_secs": 604_800,
-                    "resolved_error_ttl_secs": 2_592_000,
-                    "archived_ttl_secs": 7_776_000,
-                    "compaction_min_actions": 1000
-                }
-            }
-        })
-    );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
-}
-
-#[test]
-fn notification_policy_defaults_attention_debounce_secs_when_field_absent() {
-    // A policy JSON persisted before the debounce field existed must still load,
-    // backfilling the default rather than failing to deserialize.
-    let value = json!({
-        "attention_dedupe_window_secs": 120,
-        "enabled": {
-            "agent_blocked": true,
-            "approval_required": true,
-            "turn_completed": false,
-            "session_finished": false,
-            "error": true,
-            "system": false
-        }
-    });
-
-    let policy: NotificationPolicy =
-        serde_json::from_value(value).expect("legacy policy without debounce field loads");
-
-    // 5 is the documented default backfilled by `default_attention_debounce_secs`.
-    assert_eq!(policy.attention_debounce_secs, 5);
-    assert_eq!(policy.attention_dedupe_window_secs, 120);
-    assert_eq!(policy.retention, NotificationRetentionPolicy::default());
-}
-
-#[test]
-fn notification_retention_policy_roundtrips_and_rejects_unknown_fields() {
-    let retention = NotificationRetentionPolicy::default();
-
-    assert_eq!(line_roundtrip(&retention), retention);
-    let mut value = serde_json::to_value(retention).expect("serialize retention policy");
-    value["future_ttl_secs"] = json!(60);
-    serde_json::from_value::<NotificationRetentionPolicy>(value)
-        .expect_err("unknown retention policy field must fail");
-}
-
-#[test]
-fn notification_retention_params_json_shape_roundtrips() {
-    let params = NotificationRetentionParams {
-        dry_run: true,
-        status: Some(NotificationStatus::Archived),
-        before: Some("2026-08-01T00:00:00Z".to_owned()),
-        limit: Some(100),
-    };
-
-    let value = serde_json::to_value(&params).expect("serialize notification retention params");
-    assert_eq!(
-        value,
-        json!({
-            "dry_run": true,
-            "status": "archived",
-            "before": "2026-08-01T00:00:00Z",
-            "limit": 100
         })
     );
 
@@ -1977,14 +1776,14 @@ fn envelopes_match_the_documented_wire_shapes() {
     .expect("valid event correlation id");
 
     let request_wire = json!({
-        "v": {"minimum": 3, "maximum": 4},
+        "v": {"minimum": 5, "maximum": 5},
         "id": "req-7f3",
         "method": "session.list",
         "params": {}
     });
-    let ok_wire = json!({"v": 4, "id": "req-7f3", "ok": {"status": "ok"}});
+    let ok_wire = json!({"v": 5, "id": "req-7f3", "ok": {"status": "ok"}});
     let err_wire = json!({
-        "v": 4,
+        "v": 5,
         "id": "req-7f3",
         "err": {
             "class": "daemon",
@@ -1993,7 +1792,7 @@ fn envelopes_match_the_documented_wire_shapes() {
         }
     });
     let event_wire = json!({
-        "v": 4,
+        "v": 5,
         "event": "agent_state",
         "id": "req-99",
         "session_id": "s-42",
@@ -2998,62 +2797,12 @@ fn native_report_rejects_unknown_or_invalid_fields_and_error_payloads_ignore_unk
         "an ignored field is not echoed back"
     );
     serde_json::from_value::<Response>(json!({
-        "v": 4,
+        "v": 5,
         "id": "req-1",
         "err": {"class":"runtime","code":"x","msg":"redacted"},
         "data_base64": "secret"
     }))
     .expect_err("unknown response field must fail");
-}
-
-#[test]
-fn notification_policy_is_strict_open_and_deterministic() {
-    let flags = json!({
-        "agent_blocked": true,
-        "approval_required": true,
-        "turn_completed": false,
-        "session_finished": false,
-        "error": true,
-        "system": false
-    });
-    serde_json::from_value::<NotificationPolicy>(json!({
-        "attention_dedupe_window_secs": 90,
-        "attention_debounce_secs": 5,
-        "enabled": flags,
-        "codex": flags,
-        "claude": flags
-    }))
-    .expect_err("legacy provider fields must fail");
-    let policy: NotificationPolicy = serde_json::from_value(json!({
-        "attention_dedupe_window_secs": 90,
-        "attention_debounce_secs": 5,
-        "enabled": flags,
-        "providers": {"zeta-agent": flags, "future-agent": flags}
-    }))
-    .expect("arbitrary provider names remain forward compatible");
-    assert_eq!(
-        policy
-            .for_provider("future-agent")
-            .get(NotificationKind::System),
-        Some(false)
-    );
-    assert_eq!(policy.for_provider("missing"), &policy.enabled);
-    let wire = serde_json::to_string(&policy).expect("serialize policy");
-    assert!(wire.find("future-agent").unwrap() < wire.find("zeta-agent").unwrap());
-
-    assert_eq!(
-        serde_json::to_string(&notification_kind_policy()).unwrap(),
-        concat!(
-            r#"{"agent_blocked":true,"approval_required":true,"turn_completed":false,"#,
-            r#""session_finished":false,"error":true,"system":false}"#
-        ),
-        "the six kinds serialize with the keys and order of the struct they replace"
-    );
-
-    let mut invalid_flags = serde_json::to_value(notification_kind_policy()).unwrap();
-    invalid_flags["future_flag"] = json!(true);
-    serde_json::from_value::<NotificationKindPolicy>(invalid_flags)
-        .expect_err("unknown notification flag must fail");
 }
 
 #[test]
@@ -3149,7 +2898,7 @@ fn m1_observation_errors_are_stable_and_payload_free() {
     assert_eq!(
         serde_json::to_value(response).expect("serialize redacted error envelope"),
         json!({
-            "v": 4,
+            "v": 5,
             "id": "req-runtime-change",
             "err": {
                 "class": "runtime",
@@ -3581,7 +3330,7 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     // A newer host may add capability fields; an older peer must still parse it.
     let raw = r#"{
         "daemon_version": "0.2.0",
-        "protocol_version": 4,
+        "protocol_version": 5,
         "supported_agents": ["shell"],
         "runtimes": [],
         "git_available": false,

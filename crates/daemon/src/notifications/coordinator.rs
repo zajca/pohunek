@@ -1,27 +1,27 @@
 //! Session notification debounce coordinator.
 //!
 //! A single async task owns the lifecycle of debounced session notifications
-//! (`agent_blocked`, `approval_required`, and session-scoped `turn_completed`)
-//! end to end and is the only place that decides whether such a notification ever
-//! becomes visible. Producers (the `notification.create` handler and the
-//! session-state projector) do not persist debounced creates directly; they mint
-//! the record, hand it to this task via a command channel, and the task holds it
-//! *pending* for the policy debounce window. If the session resumes within the
-//! window the record is dropped and nothing is ever persisted or broadcast;
-//! otherwise it is committed through the store and a `notification_created` event
-//! is emitted exactly as an immediate create would be.
+//! (`agent_blocked`, `approval_required`) and of the turn signals that feed
+//! `session.wait_turn`, end to end. It is the only place that decides whether
+//! such a notification ever becomes visible. Producers (the `notification.create`
+//! handler and the session-state projector) do not persist debounced creates
+//! directly; they mint the record, hand it to this task via a command channel,
+//! and the task holds it *pending* for the debounce window. If the session
+//! resumes within the window the record is dropped and nothing is ever persisted
+//! or broadcast; otherwise it is committed through the store and a
+//! `notification_created` event is emitted exactly as an immediate create would
+//! be.
 //!
 //! The same window decides when a session turn event is recorded for
 //! `session.wait_turn`. A pending entry therefore carries two candidates: the
-//! inbox record (only from a create the notification policy keeps) and the turn
-//! signal (only from a trusted producer: the projector, or a provider hook claim
-//! admitted for a session the registry holds). A flush commits the inbox record
-//! when there is one and records the turn event when there is a signal; a
-//! resolve inside the window drops both. A create that adds no inbox record
-//! never changes the inbox candidate or its timer, so the inbox behaves exactly
-//! as if that create never arrived. The stale-turn suppression after a resolve
-//! applies to the inbox only; a `turn_completed` signal is instead dropped at
-//! flush time while the session is working again.
+//! inbox record (an attention kind only) and the [`TurnSignal`] (only from a
+//! trusted producer: the projector, or a provider hook claim admitted for a
+//! session the registry holds). A turn end (`turn_completed`) and a turn error
+//! are signals only: they never become a record. A flush commits the inbox
+//! record when there is one and records the turn event when there is a signal;
+//! a resolve inside the window drops both. A create that adds no inbox record
+//! never changes the inbox candidate or its timer. A `turn_completed` signal that
+//! names no turn is dropped at flush time while the session is working again.
 //!
 //! Pending entries are in-memory only. A daemon restart while an entry is pending
 //! (shorter than the debounce window) drops that transient signal, which is
@@ -30,18 +30,18 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant as StdInstant};
 
 use futures::StreamExt;
-use protocol::{NotificationId, NotificationKind, NotificationRecord, SessionTurnEventKind};
+use protocol::{
+    NotificationId, NotificationKind, NotificationRecord, SessionId, SessionTurnEventKind,
+};
 use tokio::sync::mpsc;
-use tokio::time::Instant;
 use tokio_util::time::DelayQueue;
 use tracing::{debug, warn};
 
-use super::{
-    is_turn_dedupe_key, source_priority, DeferredNotification, NotificationService, SourcePriority,
-};
+use super::{source_priority, DeferredNotification, NotificationService, SourcePriority};
 use crate::session::{SessionRegistry, TurnEvents, TurnId, TurnVerdict};
 use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 use protocol::AgentActivity;
@@ -72,27 +72,14 @@ pub(crate) struct ResolveAsOf {
     /// Production of the input, on the clock other producers stamp their
     /// contributions with.
     pub(crate) minted_before: StdInstant,
-    /// Handling of the input on the coordinator's clock, the start of the
-    /// stale-stop suppression window.
-    pub(crate) monotonic: Instant,
 }
 
 impl ResolveAsOf {
-    /// The moment of this call.
-    #[cfg(test)]
-    pub(crate) fn now() -> Self {
-        Self {
-            minted_before: StdInstant::now(),
-            monotonic: Instant::now(),
-        }
-    }
-
     /// The moment `produced`, when the input was produced earlier than it is
-    /// handled. The stale-stop suppression window starts when it is handled.
+    /// handled.
     pub(crate) fn at(produced: StdInstant) -> Self {
         Self {
             minted_before: produced,
-            monotonic: Instant::now(),
         }
     }
 }
@@ -201,16 +188,31 @@ impl AttentionCoordinator {
 /// different turns are different entries and never merge.
 type PendingKey = (String, Option<TurnId>);
 
+/// A session turn event waiting for its debounce window, never serialized or
+/// stored.
+#[derive(Debug, Clone)]
+struct TurnSignal {
+    session_id: SessionId,
+    kind: SessionTurnEventKind,
+}
+
+impl TurnSignal {
+    /// The signal a record stands for, when its kind has a turn event.
+    fn of(record: &NotificationRecord) -> Option<Self> {
+        Some(Self {
+            session_id: record.session_id.clone()?,
+            kind: turn_kind(record.kind)?,
+        })
+    }
+}
+
 /// A session notification held until its debounce deadline.
 #[derive(Debug)]
 struct Pending {
-    /// Best record the notification policy keeps, committed on flush.
+    /// Best attention record, committed on flush.
     inbox: Option<NotificationRecord>,
-    /// Best trusted record, recorded as a turn event on flush.
-    signal: Option<NotificationRecord>,
-    /// How soon after its turn reached the inbox a report that names no turn
-    /// repeats it, as of the report's arrival.
-    repeat_window: Duration,
+    /// Best trusted signal, recorded as a turn event on flush.
+    signal: Option<TurnSignal>,
     /// When the newest record of a producer other than the projector was
     /// minted into this entry.
     newest_foreign: Option<StdInstant>,
@@ -225,10 +227,6 @@ struct Pending {
 /// Shortest wait before a held report is evaluated again, so a zero settle
 /// window cannot turn the wait for the end of a turn into a busy loop.
 const HELD_REPORT_RECHECK_FLOOR: Duration = Duration::from_secs(1);
-
-/// Least time within which a provider report that names no turn repeats the
-/// turn the inbox just received, whatever the debounce window.
-const REPEAT_REPORT_FLOOR: Duration = Duration::from_secs(2);
 
 /// Value stored in the [`DelayQueue`] identifying which pending entry a timer arms.
 #[derive(Debug)]
@@ -247,10 +245,12 @@ async fn run(
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
     let turns = sessions.turn_events();
-    notifications.bind_attention_window(turns.flap_window_handle());
+    turns.flap_window_handle().store(
+        notifications.settings().attention_debounce_secs * 1000,
+        Ordering::Relaxed,
+    );
     let mut queue: DelayQueue<FlushToken> = DelayQueue::new();
     let mut pending: HashMap<PendingKey, Pending> = HashMap::new();
-    let mut recently_resolved_turns: HashMap<String, Instant> = HashMap::new();
     // Global monotonic generation: never reused, so a token from a resolved and
     // re-deferred key can never be mistaken for a current entry.
     let mut generation: u64 = 0;
@@ -266,8 +266,7 @@ async fn run(
                         &mut pending,
                         &mut queue,
                         &mut generation,
-                        &mut recently_resolved_turns,
-                        (&notifications, &turns),
+                        &notifications,
                         *deferred,
                     );
                 }
@@ -275,7 +274,6 @@ async fn run(
                     resolve(
                         &mut pending,
                         &mut queue,
-                        &mut recently_resolved_turns,
                         &notifications,
                         (&sessions, &turns),
                         (&dedupe_key, as_of),
@@ -303,18 +301,18 @@ fn defer(
     pending: &mut HashMap<PendingKey, Pending>,
     queue: &mut DelayQueue<FlushToken>,
     generation: &mut u64,
-    recently_resolved_turns: &mut HashMap<String, Instant>,
-    (notifications, turns): (&NotificationService, &TurnEvents),
+    notifications: &NotificationService,
     deferred: DeferredNotification,
 ) {
     let DeferredNotification {
         record,
-        mut inbox,
+        inbox,
         signal,
         turn,
         minted,
         ..
     } = deferred;
+    let signal = signal.then(|| TurnSignal::of(&record)).flatten();
     let Some(dedupe_key) = record.dedupe_key.clone() else {
         // Debounced creates always carry a dedupe key; without one the record
         // cannot be cancelled by session activity, so surface it immediately
@@ -325,38 +323,14 @@ fn defer(
         }
         return;
     };
-    let debounce = Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
-    prune_recently_resolved_turns(recently_resolved_turns, debounce);
-    let repeat_window = (debounce * 2).max(REPEAT_REPORT_FLOOR);
-    let repeats_reported_turn = turn.is_none()
-        && record.kind == protocol::NotificationKind::TurnCompleted
-        && record
-            .session_id
-            .as_ref()
-            .is_some_and(|session_id| turns.recently_reported(session_id, repeat_window));
-    if turn.is_none()
-        && inbox
-        && record.kind == protocol::NotificationKind::TurnCompleted
-        && is_turn_dedupe_key(&dedupe_key)
-        && source_priority(&record) != SourcePriority::Projector
-        && (repeats_reported_turn
-            || recently_resolved_turns
-                .remove(&dedupe_key)
-                .is_some_and(|resolved_at| resolved_at.elapsed() <= debounce))
-    {
-        // A provider turn report that names no turn, right after the session
-        // resumed or right after its turn reached the inbox, repeats a turn
-        // the inbox already holds; it stays a turn signal.
-        inbox = false;
-    }
-    if !inbox && !signal {
+    if !inbox && signal.is_none() {
         return;
     }
+    let debounce = Duration::from_secs(notifications.settings().attention_debounce_secs);
 
     // Provider reports outrank projector reports for the same session moment, so
     // keep the higher-priority record when one is already pending; the store's
-    // dedupe remains the final authority at flush time. The inbox candidate
-    // only ever considers records the policy keeps, and a create that adds no
+    // dedupe remains the final authority at flush time. A create that adds no
     // inbox record re-arms the timer only while no inbox candidate is pending.
     // Reports of one turn merge; reports of other turns are other entries.
     let key = (dedupe_key, turn);
@@ -371,11 +345,6 @@ fn defer(
             ),
             None => (None, None, None, None),
         };
-    let signal_record = if signal {
-        Some(prefer(existing_signal, record.clone()))
-    } else {
-        existing_signal
-    };
     let (inbox_record, kept_generation) = if inbox {
         (Some(prefer(existing_inbox, record)), None)
     } else if existing_inbox.is_some() {
@@ -400,8 +369,7 @@ fn defer(
         key,
         Pending {
             inbox: inbox_record,
-            signal: signal_record,
-            repeat_window,
+            signal: signal.or(existing_signal),
             newest_foreign: existing_foreign.max(foreign_at),
             generation,
         },
@@ -431,7 +399,6 @@ fn prefer(
 async fn resolve(
     pending: &mut HashMap<PendingKey, Pending>,
     queue: &mut DelayQueue<FlushToken>,
-    recently_resolved_turns: &mut HashMap<String, Instant>,
     notifications: &NotificationService,
     (sessions, turns): (&SessionRegistry, &TurnEvents),
     (dedupe_key, as_of): (&str, Option<ResolveAsOf>),
@@ -448,11 +415,12 @@ async fn resolve(
         .collect();
     for token in closed {
         let Some(turn) = token.key.1 else { continue };
-        let Some(session_id) = pending
-            .get(&token.key)
-            .and_then(|entry| entry.signal.as_ref().or(entry.inbox.as_ref()))
-            .and_then(|record| record.session_id.clone())
-        else {
+        let Some(session_id) = pending.get(&token.key).and_then(|entry| {
+            entry
+                .signal
+                .as_ref()
+                .map(|signal| signal.session_id.clone())
+        }) else {
             continue;
         };
         let owner = sessions.turn_owner(&session_id).await;
@@ -466,28 +434,14 @@ async fn resolve(
     // A pending entry that is cancelled never becomes visible. Its DelayQueue
     // timer may still fire, but the generation guard in `flush` makes that a
     // no-op, so the token is left to expire on its own rather than tracked.
-    // The stale-turn suppression belongs to the inbox: a cancelled entry that
-    // held only a turn signal counts as no pending inbox record, so the
-    // resolve still arms the suppression for the next turn report.
     let unnamed = (dedupe_key.to_owned(), None);
     let refreshed_since = pending.get(&unnamed).is_some_and(|entry| {
         as_of
             .zip(entry.newest_foreign)
             .is_some_and(|(as_of, foreign)| foreign > as_of.minted_before)
     });
-    let removed_inbox = if refreshed_since {
-        None
-    } else {
-        pending.remove(&unnamed).and_then(|entry| entry.inbox)
-    };
-    if removed_inbox.is_none() && !refreshed_since && is_turn_dedupe_key(dedupe_key) {
-        let debounce =
-            Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs));
-        prune_recently_resolved_turns(recently_resolved_turns, debounce);
-        recently_resolved_turns.insert(
-            dedupe_key.to_owned(),
-            as_of.map_or_else(Instant::now, |as_of| as_of.monotonic),
-        );
+    if !refreshed_since {
+        pending.remove(&unnamed);
     }
     // Unify with the already-visible path: acknowledge any surfaced record
     // sharing this session's dedupe key.
@@ -498,13 +452,6 @@ async fn resolve(
             "failed to acknowledge visible session notifications on resolve"
         );
     }
-}
-
-fn prune_recently_resolved_turns(
-    recently_resolved_turns: &mut HashMap<String, Instant>,
-    debounce: Duration,
-) {
-    recently_resolved_turns.retain(|_, resolved_at| resolved_at.elapsed() <= debounce);
 }
 
 /// Commit a pending entry when its timer is still the current generation.
@@ -526,28 +473,14 @@ async fn flush(
         // surface from this stale timer.
         return;
     }
-    let Some(entry) = pending.get(&token.key) else {
-        return;
-    };
     let Some(turn) = token.key.1 else {
         let Some(entry) = pending.remove(&token.key) else {
             return;
         };
-        // A report that names no turn can outlive the flush of the stamped
-        // record of its turn (its agent left within the settle window): it
-        // then repeats that record, which it must not supersede.
-        let repeat_window = entry.repeat_window;
-        let repeats_reported_turn = entry.inbox.as_ref().is_some_and(|record| {
-            record.kind == protocol::NotificationKind::TurnCompleted
-                && source_priority(record) != SourcePriority::Projector
-                && record
-                    .session_id
-                    .as_ref()
-                    .is_some_and(|session_id| turns.recently_reported(session_id, repeat_window))
-        });
-        let inbox = entry.inbox.filter(|_| !repeats_reported_turn);
         let minted = entry.newest_foreign.unwrap_or_else(StdInstant::now);
-        let committed = inbox.and_then(|record| commit(notifications, record, minted));
+        let committed = entry
+            .inbox
+            .and_then(|record| commit(notifications, record, minted));
         if let Some(signal) = entry.signal {
             record_turn((sessions, turns), &signal, committed.as_ref(), false).await;
         }
@@ -556,12 +489,12 @@ async fn flush(
 
     // A report of a turn the daemon runs surfaces once the turn is over for
     // good, whatever the report's own age.
-    let session_id = entry
-        .signal
-        .as_ref()
-        .or(entry.inbox.as_ref())
-        .and_then(|record| record.session_id.clone());
-    let Some(session_id) = session_id else {
+    let Some(session_id) = pending.get(&token.key).and_then(|entry| {
+        entry
+            .signal
+            .as_ref()
+            .map(|signal| signal.session_id.clone())
+    }) else {
         pending.remove(&token.key);
         return;
     };
@@ -571,9 +504,8 @@ async fn flush(
             pending.remove(&token.key);
         }
         TurnVerdict::Hold(after) => {
-            turns.note_held_recheck();
             let wait = after.unwrap_or_else(|| {
-                Duration::from_secs(u64::from(notifications.policy().attention_debounce_secs))
+                Duration::from_secs(notifications.settings().attention_debounce_secs)
                     .max(HELD_REPORT_RECHECK_FLOOR)
             });
             queue.insert(
@@ -588,21 +520,13 @@ async fn flush(
             let Some(entry) = pending.remove(&token.key) else {
                 return;
             };
-            let minted = entry.newest_foreign.unwrap_or_else(StdInstant::now);
-            let committed = match entry.inbox {
-                Some(mut record) if !snapshot.inbox_reported => {
-                    DeferredNotification::stamp(&mut record, &snapshot);
-                    commit(notifications, record, minted)
-                }
-                _ => None,
-            };
             let signaled = match entry.signal {
                 Some(signal) if !snapshot.signal_reported => {
-                    record_turn((sessions, turns), &signal, committed.as_ref(), true).await
+                    record_turn((sessions, turns), &signal, None, true).await
                 }
                 _ => false,
             };
-            turns.mark_reported(&session_id, turn, committed.is_some(), signaled);
+            turns.mark_reported(&session_id, turn, signaled);
         }
     }
 }
@@ -629,43 +553,38 @@ fn commit(
 /// A `turn_completed` signal that names no turn is dropped while the session is
 /// working: it is the stale stop of an earlier turn, and the running turn
 /// reports its own stop. The event names the committed inbox record only when
-/// that record is of the same kind; a signal the policy dropped while another
-/// kind surfaced names no record. Returns whether a turn event was recorded.
+/// that record is of the same kind. Returns whether a turn event was recorded.
 async fn record_turn(
     (sessions, turns): (&SessionRegistry, &TurnEvents),
-    signal: &NotificationRecord,
+    signal: &TurnSignal,
     committed: Option<&NotificationRecord>,
     names_turn: bool,
 ) -> bool {
-    let (Some(session_id), Some(kind)) = (signal.session_id.as_ref(), turn_kind(signal.kind))
-    else {
-        return false;
-    };
-    if kind == SessionTurnEventKind::TurnCompleted
+    if signal.kind == SessionTurnEventKind::TurnCompleted
         && !names_turn
-        && sessions.current_activity(session_id).await == Some(AgentActivity::Working)
+        && sessions.current_activity(&signal.session_id).await == Some(AgentActivity::Working)
     {
         debug!(
-            session_id = %session_id.0,
+            session_id = %signal.session_id.0,
             "stale turn_completed signal dropped while the session works"
         );
         return false;
     }
     let notification_id: Option<NotificationId> = committed
-        .filter(|record| record.kind == signal.kind)
+        .filter(|record| turn_kind(record.kind) == Some(signal.kind))
         .map(|record| record.id.clone());
-    turns.record(session_id, kind, notification_id);
+    turns.record(&signal.session_id, signal.kind, notification_id);
     true
 }
 
-/// The turn event kind a debounced notification kind stands for.
+/// The turn event kind a notification kind stands for.
 fn turn_kind(kind: NotificationKind) -> Option<SessionTurnEventKind> {
     match kind {
         NotificationKind::TurnCompleted => Some(SessionTurnEventKind::TurnCompleted),
         NotificationKind::AgentBlocked => Some(SessionTurnEventKind::AgentBlocked),
         NotificationKind::ApprovalRequired => Some(SessionTurnEventKind::ApprovalRequired),
+        NotificationKind::Error => Some(SessionTurnEventKind::TurnError),
         NotificationKind::SessionFinished
-        | NotificationKind::Error
         | NotificationKind::System
         | NotificationKind::Unknown => None,
     }
@@ -686,554 +605,5 @@ fn priority_rank(record: &NotificationRecord) -> u8 {
         SourcePriority::Projector => 0,
         SourcePriority::User => 1,
         SourcePriority::Provider => 2,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use std::time::Duration;
-
-    use protocol::{
-        event, Event, NotificationCreateParams, NotificationKind, NotificationListParams,
-        NotificationRecord, NotificationSeverity, NotificationSource, NotificationStatus,
-        SessionId,
-    };
-    use tokio::sync::broadcast;
-
-    use super::{AttentionCoordinator, ResolveAsOf, StdInstant};
-    use crate::notifications::{default_policy, DeferredNotification, NotificationService};
-    use crate::session::{SessionRegistry, SessionRegistryConfig};
-    use crate::shutdown::{DaemonShutdown, DriverHandle};
-
-    /// Debounce window used by the tests, advanced past to force a flush.
-    const TEST_DEBOUNCE_SECS: u64 = 5;
-
-    fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-        // The directory lives until the test's thread ends; the path below it
-        // does not exist yet.
-        crate::test_support::thread_scoped_dir(&format!("pohunek-attention-coordinator-{tag}-"))
-            .join("data")
-    }
-
-    fn service(tag: &str) -> NotificationService {
-        NotificationService::open(&temp_data_dir(tag)).expect("open notification service")
-    }
-
-    fn enable_turn_completed(service: &NotificationService) {
-        let mut policy = default_policy();
-        policy.enabled = {
-            let mut policy = policy.enabled;
-            policy.set(protocol::NotificationKind::TurnCompleted, true);
-            policy
-        };
-        policy.providers.clear();
-        service.set_policy(policy).expect("set policy");
-    }
-
-    fn projector_params(session: &str) -> NotificationCreateParams {
-        params(
-            "pohunek",
-            "projector.agent_state",
-            "projector-s-1",
-            NotificationKind::AgentBlocked,
-            NotificationSeverity::ActionRequired,
-            session,
-        )
-    }
-
-    fn provider_params(session: &str) -> NotificationCreateParams {
-        params(
-            "codex",
-            "PermissionRequest",
-            "codex-hook-s-1",
-            NotificationKind::ApprovalRequired,
-            NotificationSeverity::ActionRequired,
-            session,
-        )
-    }
-
-    fn turn_params(session: &str) -> NotificationCreateParams {
-        let mut params = params(
-            "codex",
-            "Stop",
-            "codex-stop-s-1",
-            NotificationKind::TurnCompleted,
-            NotificationSeverity::Info,
-            session,
-        );
-        params.title = "Turn completed".to_owned();
-        params.body = "Codex completed a turn.".to_owned();
-        params.dedupe_key = Some(format!("turn:{session}"));
-        params.source_id = Some(format!("codex:{session}:stop:1"));
-        params
-    }
-
-    fn params(
-        provider: &str,
-        provider_event: &str,
-        host_local_source_id: &str,
-        kind: NotificationKind,
-        severity: NotificationSeverity,
-        session: &str,
-    ) -> NotificationCreateParams {
-        NotificationCreateParams {
-            source: NotificationSource {
-                provider: provider.to_owned(),
-                provider_event: provider_event.to_owned(),
-                host_local_source_id: host_local_source_id.to_owned(),
-            },
-            kind,
-            severity,
-            title: "Agent needs attention".to_owned(),
-            body: "The agent is waiting for the operator.".to_owned(),
-            session_id: Some(SessionId(session.to_owned())),
-            agent_kind: None,
-            source_id: Some(format!("{provider}:{session}:attention")),
-            dedupe_key: Some(format!("attention:{session}")),
-            project_id: Some("p-1".to_owned()),
-            metadata: BTreeMap::new(),
-            retryable_admission: false,
-        }
-    }
-
-    fn record(
-        service: &NotificationService,
-        params: NotificationCreateParams,
-    ) -> DeferredNotification {
-        service
-            .prepare_deferred(params)
-            .expect("prepare deferred record")
-    }
-
-    /// Spawns a coordinator over a registry that holds no session.
-    fn spawn(service: &NotificationService) -> (AttentionCoordinator, DriverHandle) {
-        AttentionCoordinator::spawn(
-            &DaemonShutdown::default(),
-            service.clone(),
-            &SessionRegistry::new(SessionRegistryConfig::default()),
-        )
-    }
-
-    fn list(service: &NotificationService) -> Vec<NotificationRecord> {
-        service
-            .list(NotificationListParams::default())
-            .expect("list notifications")
-            .notifications
-    }
-
-    /// An arrival that precedes everything the test mints from now on.
-    fn arrival_before_now() -> ResolveAsOf {
-        ResolveAsOf {
-            minted_before: StdInstant::now()
-                .checked_sub(Duration::from_secs(60))
-                .expect("a monotonic clock that has run for a minute"),
-            monotonic: tokio::time::Instant::now(),
-        }
-    }
-
-    /// An arrival that follows everything the test mints before now.
-    fn arrival_after_now() -> ResolveAsOf {
-        ResolveAsOf {
-            minted_before: StdInstant::now() + Duration::from_secs(60),
-            monotonic: tokio::time::Instant::now(),
-        }
-    }
-
-    /// Yield repeatedly so the single coordinator task drains its command channel
-    /// and re-arms its timer before the test advances the (paused) clock.
-    async fn settle() {
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-    }
-
-    /// Await a `notification_created` event, bounded so a bug fails instead of hanging.
-    async fn next_created(events: &mut broadcast::Receiver<Event>) -> Option<NotificationRecord> {
-        for _ in 0..128 {
-            match events.try_recv() {
-                Ok(event) if event.event() == event::NOTIFICATION_CREATED => {
-                    let record = serde_json::from_value::<protocol::NotificationCreatedEvent>(
-                        event.payload().clone(),
-                    )
-                    .expect("notification_created payload");
-                    return Some(record.record);
-                }
-                Ok(_) => {}
-                Err(broadcast::error::TryRecvError::Empty) => tokio::task::yield_now().await,
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn resolve_before_window_suppresses_entirely() {
-        let service = service("suppress");
-        let mut events = service.subscribe();
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, projector_params("s-1")));
-        settle().await;
-        coordinator.resolve("attention:s-1".to_owned());
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        assert!(
-            list(&service).is_empty(),
-            "a resolved-before-window attention notification must never be persisted"
-        );
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(broadcast::error::TryRecvError::Empty)
-            ),
-            "a suppressed attention notification must not broadcast any event"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn resolve_before_window_suppresses_turn_entirely() {
-        let service = service("suppress-turn");
-        enable_turn_completed(&service);
-        let mut events = service.subscribe();
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, turn_params("s-1")));
-        settle().await;
-        coordinator.resolve("turn:s-1".to_owned());
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        assert!(
-            list(&service).is_empty(),
-            "a resolved-before-window turn notification must never be persisted"
-        );
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(broadcast::error::TryRecvError::Empty)
-            ),
-            "a suppressed turn notification must not broadcast any event"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn resolve_before_defer_suppresses_delayed_turn_within_window() {
-        let service = service("resolve-before-turn");
-        enable_turn_completed(&service);
-        let mut events = service.subscribe();
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.resolve("turn:s-1".to_owned());
-        settle().await;
-        coordinator.defer(record(&service, turn_params("s-1")));
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        assert!(
-            list(&service).is_empty(),
-            "a turn deferred just after a resolve must be treated as consumed"
-        );
-        assert!(
-            matches!(
-                events.try_recv(),
-                Err(broadcast::error::TryRecvError::Empty)
-            ),
-            "a consumed delayed turn must not broadcast any event"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn no_resolve_flushes_after_window() {
-        let service = service("flush");
-        let mut events = service.subscribe();
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, provider_params("s-1")));
-        settle().await;
-        assert!(
-            list(&service).is_empty(),
-            "a deferred attention notification must not be visible before the window"
-        );
-
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        let created = next_created(&mut events)
-            .await
-            .expect("deferred attention notification flushes after the window");
-
-        assert_eq!(created.kind, NotificationKind::ApprovalRequired);
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, created.id);
-        assert_eq!(listed[0].status, NotificationStatus::Unread);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn resolve_cancels_pending_and_acks_visible() {
-        let service = service("resolve-both");
-        let (coordinator, _task) = spawn(&service);
-
-        // A provider hook already surfaced a visible attention record for s-1.
-        let visible = service
-            .create(provider_params("s-1"))
-            .expect("create visible attention record");
-        assert!(visible.created);
-
-        // A projector defer for the same session is held pending.
-        coordinator.defer(record(&service, projector_params("s-1")));
-        settle().await;
-        coordinator.resolve("attention:s-1".to_owned());
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(
-            listed.len(),
-            1,
-            "the pending record must be cancelled, leaving only the visible one"
-        );
-        assert_eq!(listed[0].id, visible.record.id);
-        assert_eq!(
-            listed[0].status,
-            NotificationStatus::Acknowledged,
-            "resolve must acknowledge the already-visible attention record"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn provider_defer_upgrades_pending_projector_record() {
-        let service = service("upgrade");
-        let mut events = service.subscribe();
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, projector_params("s-1")));
-        settle().await;
-        coordinator.defer(record(&service, provider_params("s-1")));
-        settle().await;
-
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        let created = next_created(&mut events)
-            .await
-            .expect("upgraded attention notification flushes after the window");
-
-        assert_eq!(
-            created.kind,
-            NotificationKind::ApprovalRequired,
-            "the provider record must outrank the pending projector record"
-        );
-        assert_eq!(created.source.provider, "codex");
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1, "only one record must surface for the key");
-        assert_eq!(listed[0].source.provider, "codex");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn debounce_window_is_read_from_policy() {
-        let service = service("policy-window");
-        let mut policy = service.policy();
-        policy.attention_debounce_secs = 30;
-        service.set_policy(policy).expect("set policy");
-        let mut events = service.subscribe();
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, provider_params("s-1")));
-        settle().await;
-
-        // Just before the configured 30s window: nothing flushes yet.
-        tokio::time::advance(Duration::from_secs(20)).await;
-        settle().await;
-        assert!(
-            list(&service).is_empty(),
-            "the configured 30s debounce window must not have elapsed yet"
-        );
-        assert!(matches!(
-            events.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-
-        // Past the configured window: it flushes.
-        tokio::time::advance(Duration::from_secs(11)).await;
-        let created = next_created(&mut events)
-            .await
-            .expect("flush after the configured window elapses");
-        assert_eq!(created.kind, NotificationKind::ApprovalRequired);
-    }
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_leaves_a_visible_record_other_producers_created_later() {
-        let service = service("as-of-visible-later");
-        let (coordinator, _task) = spawn(&service);
-
-        let as_of = arrival_before_now();
-        let later = service
-            .create(provider_params("s-1"))
-            .expect("create a hook record after the moment");
-        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, later.record.id);
-        assert_eq!(listed[0].status, NotificationStatus::Unread);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_acknowledges_the_records_that_existed_then() {
-        let service = service("as-of-visible-before");
-        let (coordinator, _task) = spawn(&service);
-
-        service
-            .create(provider_params("s-1"))
-            .expect("create a hook record before the moment");
-        let as_of = arrival_after_now();
-        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, NotificationStatus::Acknowledged);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_acknowledges_a_projector_record_minted_after_the_moment() {
-        let service = service("as-of-visible-projector");
-        let (coordinator, _task) = spawn(&service);
-
-        let as_of = arrival_before_now();
-        service
-            .create(projector_params("s-1"))
-            .expect("create a projector record after the moment");
-        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(
-            listed[0].status,
-            NotificationStatus::Acknowledged,
-            "the projector derives its records in input order"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_keeps_a_pending_entry_other_producers_refreshed_later() {
-        let service = service("as-of-pending-later");
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, projector_params("s-1")));
-        let as_of = arrival_before_now();
-        coordinator.defer(record(&service, provider_params("s-1")));
-        settle().await;
-        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1, "the later hook report surfaces");
-        assert_eq!(listed[0].status, NotificationStatus::Unread);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_cancels_the_pending_entries_that_existed_then() {
-        let service = service("as-of-pending-before");
-        let (coordinator, _task) = spawn(&service);
-
-        coordinator.defer(record(&service, provider_params("s-1")));
-        coordinator.defer(record(&service, projector_params("s-2")));
-        let as_of = arrival_after_now();
-        // A projector entry minted after the moment is its own earlier input's.
-        coordinator.defer(record(&service, projector_params("s-1")));
-        settle().await;
-        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1, "{listed:?}");
-        assert_eq!(listed[0].session_id, Some(SessionId("s-2".to_owned())));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_arms_the_stale_turn_suppression_at_its_moment() {
-        let service = service("as-of-suppression");
-        enable_turn_completed(&service);
-        let (coordinator, _task) = spawn(&service);
-
-        let as_of = ResolveAsOf::now();
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        coordinator.as_of(as_of).resolve("turn:s-1".to_owned());
-        settle().await;
-        coordinator.defer(record(&service, turn_params("s-1")));
-        settle().await;
-        tokio::time::advance(Duration::from_secs(TEST_DEBOUNCE_SECS + 1)).await;
-        settle().await;
-
-        assert_eq!(
-            list(&service).len(),
-            1,
-            "a window that ended before the resolve was applied suppresses nothing"
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_leaves_a_hook_report_that_upgraded_a_projector_record() {
-        let service = service("as-of-upgraded");
-        let (coordinator, _task) = spawn(&service);
-
-        service
-            .create(projector_params("s-1"))
-            .expect("create a projector record");
-        let as_of = arrival_before_now();
-        let upgraded = service
-            .create(provider_params("s-1"))
-            .expect("a hook report upgrades the projector record");
-        assert!(!upgraded.created, "the report merged into the record");
-        coordinator.as_of(as_of).resolve("attention:s-1".to_owned());
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, NotificationStatus::Unread);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_resolve_as_of_leaves_a_hook_record_that_absorbed_a_later_hook_report() {
-        let service = service("as-of-absorbed");
-        let (coordinator, _task) = spawn(&service);
-        let first_minted = StdInstant::now();
-        let arrival = ResolveAsOf {
-            minted_before: first_minted + Duration::from_secs(10),
-            monotonic: tokio::time::Instant::now(),
-        };
-
-        let first = record(&service, provider_params("s-1")).record;
-        service
-            .commit_deferred(first, first_minted)
-            .expect("commit the first report");
-        let mut later = provider_params("s-1");
-        later.source.host_local_source_id = "codex-hook-s-1-later".to_owned();
-        later.source_id = Some("codex:s-1:attention:later".to_owned());
-        let absorbed = service
-            .commit_deferred(
-                record(&service, later).record,
-                first_minted + Duration::from_secs(20),
-            )
-            .expect("commit the later report");
-        assert!(!absorbed.created, "the later report merged into the first");
-        coordinator
-            .as_of(arrival)
-            .resolve("attention:s-1".to_owned());
-        settle().await;
-
-        let listed = list(&service);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, NotificationStatus::Unread);
     }
 }

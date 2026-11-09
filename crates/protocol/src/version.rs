@@ -18,15 +18,17 @@ use crate::error::ProtocolError;
 /// containing contract explicitly permits them. A bump deletes the adapter for
 /// the version that falls out of the window and adds one for the version it
 /// leaves behind (see [`crate::compat`]).
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(4);
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(5);
 
 /// Oldest public protocol version a daemon of this build accepts.
 ///
-/// One below [`PROTOCOL_VERSION`]: the daemon serves the previous version
-/// through the shape-only adapters in [`crate::compat`]. A semantic change
-/// (new required parameter, removed method, changed error code or meaning)
-/// cannot be adapted and raises this minimum to [`PROTOCOL_VERSION`].
-pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0 - 1);
+/// Equal to [`PROTOCOL_VERSION`]: protocol 5 removed `notification.update`,
+/// `notification.delete`, `notification.policy.get`, `notification.policy.set`
+/// and `notification.retention.prune`, a semantic change no shape adapter can
+/// express, so the window holds the current version only. A client or a
+/// session hook that announces an earlier version is refused with
+/// `daemon/version_mismatch`.
+pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0);
 
 /// Inclusive public protocol range of this build: the window.
 ///

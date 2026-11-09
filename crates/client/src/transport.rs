@@ -3552,7 +3552,8 @@ mod tests {
         .expect("connect remote");
         // The connection froze on the current version with an earlier reply.
         client.selected_version = Some(PROTOCOL_VERSION);
-        let previous = protocol::MIN_PROTOCOL_VERSION;
+        let previous = protocol::ProtocolVersion::new(PROTOCOL_VERSION.get() - 1)
+            .expect("nonzero previous version");
         let request = Request::new("request-1", "session.list", serde_json::json!({}))
             .expect("request")
             .with_exact_version(previous);
@@ -3584,7 +3585,9 @@ mod tests {
             let (stream, _) = listener.accept().await.expect("accept client");
             let mut stream = BufReader::new(stream);
             let mut requests = Vec::new();
-            for version in [protocol::PROTOCOL_VERSION, protocol::MIN_PROTOCOL_VERSION] {
+            let previous = protocol::ProtocolVersion::new(protocol::PROTOCOL_VERSION.get() - 1)
+                .expect("nonzero previous version");
+            for version in [protocol::PROTOCOL_VERSION, previous] {
                 let mut line = String::new();
                 stream.read_line(&mut line).await.expect("read request");
                 let request: Request = serde_json::from_str(&line).expect("decode request");

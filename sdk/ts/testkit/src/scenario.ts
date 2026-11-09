@@ -50,6 +50,7 @@ export interface ScenarioBackend {
     notificationId?: NotificationId,
   ): SessionTurnEvent;
   createScenarioNotification(input: ScenarioNotificationInput): NotificationRecord;
+  acknowledgeNotification(id: NotificationId): NotificationRecord;
   deleteNotification(id: NotificationId): void;
   initialAttachDimensions(sessionId: SessionId): ReadonlyArray<TerminalDimensions>;
   inputs(sessionId: SessionId): ReadonlyArray<Uint8Array>;
@@ -113,6 +114,11 @@ export class FixtureScenario {
 
   public createNotification(input: ScenarioNotificationInput): NotificationRecord {
     return this.backend.createScenarioNotification(input);
+  }
+
+  /** Marks a fixture attention record acknowledged and emits `notification_updated` to subscribers. */
+  public acknowledgeNotification(id: NotificationId): NotificationRecord {
+    return this.backend.acknowledgeNotification(id);
   }
 
   /** Removes a fixture notification and emits `notification_deleted` to subscribers. */

@@ -5720,19 +5720,13 @@ fn announced_retry_policy() -> crate::integration::reporter_retry_tests::Policy 
 
 /// The real Claude notification hook runs against a served daemon whose
 /// session worker is away: the first delivery is refused, the worker comes back
-/// while the hook retries, and exactly one notification is recorded.
+/// while the hook retries, and exactly one report is accepted.
 #[tokio::test]
 async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     let released = ReleasedWorker::built_in(RuntimeId::CLAUDE, "alias-retry-e2e").await;
     let dir = crate::test_support::scoped_dir("ph-alias-retry-e2e-");
     let notifications = crate::notifications::NotificationService::open(&dir.join("data"))
         .expect("notification service");
-    let mut policy = crate::notifications::default_policy();
-    policy.enabled.set(protocol::NotificationKind::System, true);
-    policy.providers.clear();
-    notifications
-        .set_policy(policy)
-        .expect("enable system notifications");
     let (attention, _attention_task) = crate::notifications::AttentionCoordinator::spawn(
         &crate::shutdown::DaemonShutdown::default(),
         notifications.clone(),
@@ -5787,12 +5781,18 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     released.reconnect().await;
     hook.await.expect("the hook script finishes");
 
+    // The report is a kind the inbox does not hold: the daemon accepts it once
+    // and stores nothing.
+    let dropped = logs
+        .text()
+        .matches("a notification kind the inbox does not hold was accepted and dropped")
+        .count();
+    assert_eq!(dropped, 1, "one accepted report: {}", logs.text());
     let recorded = notifications
         .list(protocol::NotificationListParams::default())
         .expect("list notifications")
         .notifications;
-    assert_eq!(recorded.len(), 1, "one record: {recorded:?}");
-    assert_eq!(recorded[0].session_id.as_ref(), Some(&released.id));
+    assert!(recorded.is_empty(), "nothing is stored: {recorded:?}");
 
     let _ = stop.send(());
     serving.await.expect("the server stops");

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { PROTOCOL_VERSION, type HostCapabilities, type SessionNewParams } from "@pohunek/protocol";
-import { Client, ClientError, CompatError, connectTcp, downgradeRequestParams } from "@pohunek/sdk";
+import { Client, ClientError, connectTcp } from "@pohunek/sdk";
 import {
   minimalSessionInfo,
   okResponseLine,
@@ -142,15 +142,5 @@ describe("session.new client_request_id against a mock daemon", () => {
     expect((await methodsSeen(daemon, 1)).map((request) => request["method"])).toEqual(["session.new"]);
     await daemon.expectNoRequest(SETTLE_MS);
     await client.close();
-  });
-});
-
-describe("session.new client_request_id against the previous protocol", () => {
-  test("the version adapter refuses the key instead of dropping it", () => {
-    expect(() => downgradeRequestParams(3, "session.new", newParams())).toThrow(CompatError);
-    const plain = { agent: "codex", cols: 80, rows: 24 };
-    expect(downgradeRequestParams(3, "session.new", plain)).toEqual(plain);
-    const nulled = { ...plain, client_request_id: null };
-    expect(downgradeRequestParams(3, "session.new", nulled)).toEqual(nulled);
   });
 });

@@ -111,7 +111,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek session retention sweep [--dry-run \| --apply] [--limit <n>] [--json]` | Run one retention sweep now with the stored policy TTLs: `--dry-run` reports the selected sessions, `--apply` removes them with their owned worktrees, never beyond the policy's per-sweep cap. |
 | `pohunek session detection <target>` | Show which source decided the activity (`state_source`, the OSC 7501 record, the release gate, probe answer and last evidence age) and preview the active detection manifest regions; `--json` also lists every supported region kind and the `status` object. |
 | `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `worker_instance_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. A stopped or finished session answers `session_terminal_unavailable`. |
-| `pohunek session wait <target>...` | Wait for the next turn event (`turn_completed`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions on one host: `--until`, `--after <cursor>`, `--timeout <duration>`; this is the mode with no flags. Any legacy flag (`--state`, `--activity`, the `--after-*` cursors, the runtime identity, `--timeout-ms`) selects a single-target long-poll of up to 8000 ms for explicit predicates. In the legacy mode, a wait the daemon ended for a reason this client does not know exits non-zero with `session_wait_reason_unknown`, because the client cannot tell whether the condition matched. |
+| `pohunek session wait <target>...` | Wait for the next turn event (`turn_completed`, `turn_error`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions on one host: `--until`, `--after <cursor>`, `--timeout <duration>`; this is the mode with no flags. Any legacy flag (`--state`, `--activity`, the `--after-*` cursors, the runtime identity, `--timeout-ms`) selects a single-target long-poll of up to 8000 ms for explicit predicates. In the legacy mode, a wait the daemon ended for a reason this client does not know exits non-zero with `session_wait_reason_unknown`, because the client cannot tell whether the condition matched. |
 | `pohunek session resume <target>` | Relaunch a stopped or lost session from its captured native reference. A session launched from a host profile relaunches only while the profile still has the revision frozen into the session; an edited or legacy profile fails with `agent_profile_changed` and a deleted one with `agent_profile_missing`. An adopted built-in session resumes without the flag when the profile differs from the frozen one only by its `package` and `digest` keys, the pin `plugin profile migrate` writes. `--accept-profile-change` relaunches under the current profile and freezes its revision; the local daemon honors it, a remote host refuses it with `agent_profile_change_local_only`. A resume of a lost runtime proves the previous runtime ended first (job retirement and a marker sweep), so the CLI waits for the daemon's own result instead of the 5 s default and returns as soon as the daemon answers; after 5 s of waiting, human output prints a notice on stderr. The deadline is a bound, not a delay: it is the longest the daemon's validated settings allow, 110 minutes at the maximum 10 minutes per step and about 2 minutes with the installed defaults (30 s job exit, 5 s sweep grace, 10 s worker connect, 45 s worker initialization). A refusal for unreadable-marker processes lists them. If the deadline still elapses, the error is `session_resume_outcome_unknown`, not `request_timeout`: the resume may still complete, so run `session inspect` before retrying. |
 | `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
 | `pohunek session rename / stop / rm` | Rename, stop, or evict a session. `stop` waits for the daemon's own result (up to 90 minutes) instead of the 5 s default and `rm` likewise (up to 110 minutes: the stop budget plus the worktree hooks at their 5 minute timeout); after 5 s of waiting, human output prints a notice on stderr, never with `--json`. A deadline that elapses is `session_stop_outcome_unknown` (run `session inspect`; repeating a stop is harmless) or `session_remove_outcome_unknown` (run `session list` before retrying). A worker that stops answering a removal's stop ends the removal with `worker_operation_failed` after the daemon's own bound, while a stop ends such a worker through the service manager; a stop or removal refused with `session_runtime_reconnecting` is retried. Once a stop or an exit is committed, the daemon acknowledges the worker, which exits, and retires the generation's supervisor job; the stopped session keeps no process. A stop the worker refuses leaves the session running and monitored, with the stop intent still pending. A stop whose worker ended the session but whose terminal commit fails (a store outage) returns that error the same way: the session stays monitored with the stop intent pending, and the daemon commits `stopped` as soon as the store accepts the write. `stop` and `rm` refuse locally with `session_runtime_state_unknown`, before sending a request, when the daemon reports a runtime state this client does not know. |
@@ -122,10 +122,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek host governance inspect <host>` | Read the safe stable host identity and local governance state; `--json` preserves explicit absence and canonical revisions. It does not mutate enrollment or ownership. |
 | `pohunek host command run <host> <package> <command> [--timeout-ms <MS>] [--max-output-bytes <N>] [--json]` | Run one command an installed package declared (see [Runtime Packages](knowledge/guides/runtime-packages.md#calling-a-command)) on a named host, `local` or an overlay peer, once. The program and its arguments are fixed by the descriptor the owner consented to at install: the CLI has no argument, environment, working-directory or stdin option, and clap refuses anything after the command name. Success prints the program's stdout byte for byte and exits 0; `--json` prints the full reply (`package`, `command`, `digest`, `output`, `duration_ms`). `--timeout-ms` and `--max-output-bytes` (at least 1) lower the daemon's ceilings of 60000 ms and 128 KiB; a larger value is lowered to the ceiling. An error prints its fixed text and hint on stderr (nothing on stdout), or the typed error with `--json`, and exits with the status of its class: `40` `command_unsupported` (the daemon predates the method), `41` `command_package_not_installed`, `42` `command_not_selected`, `43` `command_package_disabled`, `44` `command_not_declared`, `45` `command_not_exposed` (a `local` command called over the overlay), `46` `command_busy`, `47` `command_failed` (the program's own status or signal is in `err.details.process_exit` and on stderr, never in the exit status), `48` `command_timed_out`, `49` `command_output_too_large`, `50` `command_output_not_utf8`, `51` `command_unavailable`, `52` any other `command_*` code (a newer daemon's error this CLI does not know; read `err.code` under `--json`). Any other failure (unreachable host, transport error) exits 1 and a usage error 2. |
 | `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session and package candidates. |
-| `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
-| `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
-| `pohunek notifications policy get [--all-hosts] [--json]` | Show the notification policy. |
-| `pohunek notifications policy / retention` | Per-kind policy for the default flags or any runtime id (`--provider default\|<runtime-id>`; `default` is always the base flags, even if a runtime is named `default`), retention pruning (`--dry-run` / `--apply`). |
+| `pohunek notifications list / watch` | Inspect or stream the attention inbox (`agent_blocked`, `approval_required`); `--all-hosts` fans out. A turn end is not a notification: use `pohunek session wait`. |
 | `pohunek integration install` | Install Codex/Claude hooks into the runtime's own config home, one host profile's home (`--profile NAME`) or every distinct home (`--all-profiles`), or install a selected Hermes profile's managed plugin from the installed Hermes package with explicit access mode and host allowlist. |
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
@@ -451,11 +448,13 @@ const client = await connectLocal(socketPath, {
 A manager agent that starts sessions and follows them waits for turn events
 instead of polling. A turn event is a finished turn (`turn_completed`), an agent
 blocked on the owner (`agent_blocked`), a pending approval
-(`approval_required`), or the session entering `stopped`, `done`, or `failed`
+(`approval_required`), a turn that ended in an error (`turn_error`, reported by
+a provider hook), or the session entering `stopped`, `done`, or `failed`
 (`exited`); a session whose runtime was lost with an observed end enters
-`failed`, so it records `exited` and ends the wait. Events are recorded whatever the notification policy keeps in the
-inbox. `turn_completed`, `agent_blocked`, and `approval_required` are recorded
-when the attention debounce window (`attention_debounce_secs`, 5 seconds by
+`failed`, so it records `exited` and ends the wait. A turn end and a turn error create no notification record, while an
+`agent_blocked` or `approval_required` event also names its inbox record.
+`turn_completed`, `turn_error`, `agent_blocked`, and `approval_required` are
+recorded when the attention debounce window (`attention_debounce_secs`, 5 seconds by
 default) after the agent's report ends, so a stop followed at once by resumed
 work is not a finished turn; `exited` is recorded at once. Every result carries
 the next cursor; pass it as `--after` so the next wait returns only events
@@ -477,7 +476,7 @@ usually with `reason: timeout`, but it can also return an `event` (handle it) or
 pohunek session wait s-01J00000000000000000000000 --timeout 1ms --json
 pohunek session input s-01J00000000000000000000000 --stdin --json < prompt.txt
 pohunek session wait s-01J00000000000000000000000 s-01J00000000000000000000001 \
-  --until turn_completed,agent_blocked,approval_required,exited \
+  --until turn_completed,turn_error,agent_blocked,approval_required,exited \
   --after <cursor> --timeout 5m --json
 # the cursor of that result covers the finished turn: chain the next prompt from it
 ```
@@ -487,7 +486,7 @@ host, or the command fails as a usage error before any request (run one wait
 per host). Targets may be ids, `host/id`, or display names; an exact id is
 confirmed with an id-filtered `session.list`, and only a display name reads the
 full list. `--until` takes a
-comma list or a repeated flag and defaults to all four kinds. `--timeout` needs a
+comma list or a repeated flag and defaults to every kind. `--timeout` needs a
 unit (`ms`, `s`, `m`, or `h`, for example `90s` or `5m`); without it the daemon
 default applies (5 minutes unless `service.toml` `[waits]` sets another), and a
 value above the daemon ceiling (30 minutes by default) fails with
@@ -496,7 +495,7 @@ value above the daemon ceiling (30 minutes by default) fails with
 
 `--json` prints the daemon result as one document: `reason` (`event`,
 `timeout`, `cursor_reset`, or `targets_ended`), the `event` (`session_id`,
-`kind`, `at`, and `notification_id` when the inbox kept a record), the next
+`kind`, `at`, and `notification_id` when the event names an attention record), the next
 `cursor`, and `progress` for every target. The human form prints the event as
 `<session> <kind> <at>` or the bare reason, then one `progress:` line per target
 (`<session> <state> <activity> output_advanced=<bool> last_output_at=<time>
@@ -516,8 +515,8 @@ inspect it. `cursor_reset` means the cursor came from another daemon instance
 (for example before a restart) or is older than the retained events: events in
 between are not reported, so take the fresh cursor and inspect the sessions.
 `targets_ended` means every target is terminal and nothing newer is pending.
-To stream instead of wait, use `notifications watch --session <id> --kind
-<kind> --unread`, which follows only the inbox records the policy keeps.
+To stream attention instead of waiting, use `notifications watch --session <id>
+--kind agent_blocked --unread`.
 
 The legacy single-target predicate wait stays available unchanged: any of
 `--state`, `--activity`, `--after-updated-at`, `--after-terminal-watermark`,
@@ -529,27 +528,23 @@ it with `--until`, `--after`, or `--timeout` is a usage error.
 
 ```bash
 pohunek notifications list --unread
-pohunek notifications ack buildbox/n-42
-pohunek notifications policy set --provider default --kind turn_completed --enabled
-pohunek notifications policy set --provider pi --kind agent_blocked --disabled
-pohunek notifications retention prune --status archived --before 2026-06-01T00:00:00Z --apply
+pohunek notifications list --kind approval_required --all-hosts
 
-# follow new finished turns of one session
-pohunek notifications watch --session s-01J00000000000000000000000 --kind turn_completed --unread --json
+# follow new attention of one session
+pohunek notifications watch --session s-01J00000000000000000000000 --kind agent_blocked --unread --json
 ```
 
-The daemon itself reports each finished turn of a session (activity `working`
-to `idle`) as a `turn_completed` once the attention debounce window passes
-without the session working again, whether or not the runtime has a managed
-hook. A turn opens on a `working` the daemon infers from terminal output only
-after input reached the runtime; agent reports always open one. The record carries `turn_started_at`, `turn_duration_ms` and
-`session_metadata` (the session's metadata when the turn ended, kept after
-`session rm`), which `--json` prints. The kind is disabled for the inbox by
-default, so a manager enables it first (the `policy set` line above).
+The inbox holds attention only: `agent_blocked` and `approval_required`. A
+record resolves (`acknowledged`) when the session works again or ends, and a
+resolved record is removed after `record_ttl_secs` (14 days; the `[notifications]`
+table of `service.toml` also sets `attention_debounce_secs`,
+`attention_dedupe_window_secs` and `record_sweep_interval_secs`). There is no
+command to read, acknowledge, archive or delete a record. `--kind` accepts the
+two attention kinds only; a finished turn is a `session wait` event.
 
 `notifications watch` filters with `--session`, `--kind`, and `--status`
 (`--unread` is `--status unread`) apply client-side to the record each create
-or update event carries, so an update that marks an earlier finish
+or update event carries, so an update that marks an earlier record
 `acknowledged` does not pass `--unread`. While any filter is set, delete events
 are dropped, because they carry only the notification id; for the same reason
 `--status deleted` is refused.

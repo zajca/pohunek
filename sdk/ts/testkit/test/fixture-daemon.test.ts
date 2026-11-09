@@ -911,15 +911,6 @@ describe("@pohunek/testkit fixture daemon", () => {
       }
       expect(overflowError.message).toContain("exceeds u64");
 
-      const currentPolicy = await client.call("notification.policy.get", null);
-      const futurePolicy = { ...currentPolicy.policy.enabled, system: false };
-      const updatedPolicy = await client.call("notification.policy.set", {
-        policy: {
-          ...currentPolicy.policy,
-          providers: { ...currentPolicy.policy.providers, "future-agent": futurePolicy },
-        },
-      });
-      expect(updatedPolicy.policy.providers?.["future-agent"]).toEqual(futurePolicy);
       await client.close();
     } finally {
       await daemon.close();
@@ -969,17 +960,26 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(listed.notifications.length).toBe(1);
       expect(listed.notifications[0]?.id).toBe(created.id);
 
-      const updated = await client.call("notification.update", {
-        id: created.id,
-        status: "read",
-      });
-      expect(updated.record.status).toBe("read");
+      const acknowledged = daemon.scenario.acknowledgeNotification(created.id);
+      expect(acknowledged.status).toBe("acknowledged");
       const updatedEvent = await nextEvent(subscription);
       expect(updatedEvent.event).toBe("notification_updated");
       if (updatedEvent.event === "notification_updated") {
         expect(updatedEvent.record.id).toBe(created.id);
-        expect(updatedEvent.record.status).toBe("read");
+        expect(updatedEvent.record.status).toBe("acknowledged");
       }
+
+      const notStored = await client.call("notification.create", {
+        source: { provider: "codex", provider_event: "turn_completed", host_local_source_id: "hook-testkit-2" },
+        kind: "turn_completed",
+        severity: "info",
+        title: "Turn completed",
+        body: "Codex finished a turn.",
+      });
+      expect(notStored.created).toBe(false);
+      expect((await client.call("notification.list", {})).notifications.map((record) => record.id)).toEqual([
+        created.id,
+      ]);
 
       daemon.scenario.deleteNotification(created.id);
       const deletedEvent = await nextEvent(subscription);

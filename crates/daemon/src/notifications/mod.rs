@@ -1,7 +1,7 @@
 //! Durable daemon notification service.
 
 mod coordinator;
-mod policy;
+mod notice_sink;
 mod projector;
 mod retention;
 mod store;
@@ -9,37 +9,30 @@ mod store;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
+use pohunek_service_config::{NotificationSettings, DEFAULT_NOTIFICATION_SETTINGS};
 use protocol::{
     event, ErrorClass, Event, NotificationCreateParams, NotificationCreateResult,
-    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
-    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationListParams,
-    NotificationListResult, NotificationPolicy, NotificationRecord, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, NotificationUpdatedEvent, ProtocolError,
+    NotificationCreatedEvent, NotificationDeletedEvent, NotificationId, NotificationKind,
+    NotificationListParams, NotificationListResult, NotificationRecord, NotificationSource,
+    NotificationStatus, NotificationUpdatedEvent, ProtocolError,
 };
 use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
 
-use crate::session::{rfc3339_from_nanos, TurnId, TurnSnapshot};
+use crate::session::TurnId;
 
 #[doc(inline)]
 pub use coordinator::AttentionCoordinator;
 pub(crate) use coordinator::ResolveAsOf;
-pub(crate) use policy::complete_kind_flags;
 #[doc(inline)]
-pub use policy::{
-    default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEBOUNCE_SECS,
-    DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS,
-};
+pub use notice_sink::ApprovalNoticeSink;
 #[doc(inline)]
 pub use projector::{attention_dedupe_key, spawn_projector, turn_dedupe_key};
-#[cfg(test)]
-pub(crate) use projector::{resync_with_fresh_state, SEED_RETRY_DELAY};
 #[doc(inline)]
 pub use retention::spawn_notification_retention;
 #[doc(inline)]
@@ -49,8 +42,8 @@ pub(crate) use store::NotificationStore;
 
 /// A session notification prepared for the debounce coordinator.
 ///
-/// `inbox` says whether the notification policy keeps the record. `signal` says
-/// whether the record also stands for a session turn event for
+/// `inbox` says whether the record is an attention record the store takes.
+/// `signal` says whether the record also stands for a session turn event for
 /// `session.wait_turn`, which is recorded regardless of the inbox; only the
 /// projector and admitted provider hook claims for a session the registry holds
 /// set it.
@@ -58,8 +51,8 @@ pub(crate) use store::NotificationStore;
 pub(crate) struct DeferredNotification {
     /// Validated record with its id minted.
     pub(crate) record: NotificationRecord,
-    /// Whether the policy keeps the record in the inbox. An unavailable store
-    /// keeps nothing.
+    /// Whether the record is kept in the inbox: an attention kind and a store
+    /// that is in use.
     pub(crate) inbox: bool,
     /// Why the store cannot take the record; the turn signal is still delivered.
     pub(crate) unavailable: Option<String>,
@@ -83,25 +76,15 @@ impl DeferredNotification {
         self
     }
 
-    /// Stamps the record with the turn it reports, as the daemon saw it end.
-    pub(crate) fn stamp(record: &mut NotificationRecord, turn: &TurnSnapshot) {
-        record.turn_started_at = turn.started_nanos.and_then(rfc3339_from_nanos);
-        record.turn_duration_ms = turn
-            .length
-            .and_then(|length| u64::try_from(length.as_millis()).ok());
-        record.session_metadata = turn.metadata.clone();
-    }
-
-    /// The error an immediate create of this record reports, when the store
-    /// cannot take it or the policy drops it.
-    pub(crate) fn policy_refusal(&self) -> Option<NotificationError> {
-        if let Some(reason) = &self.unavailable {
-            return Some(NotificationError::unavailable(reason.clone()));
+    /// The error an immediate create of an attention record reports when the
+    /// store cannot take it.
+    pub(crate) fn store_refusal(&self) -> Option<NotificationError> {
+        if !is_attention_kind(self.record.kind) {
+            return None;
         }
-        (!self.inbox).then(|| NotificationError::KindDisabled {
-            provider: self.record.source.provider.clone(),
-            kind: self.record.kind,
-        })
+        self.unavailable
+            .as_ref()
+            .map(|reason| NotificationError::unavailable(reason.clone()))
     }
 }
 
@@ -235,40 +218,12 @@ pub enum NotificationError {
         source: serde_json::Error,
     },
 
-    /// The durable policy file could not be parsed.
-    #[error("notification policy parse error at {path}: {source}")]
-    PolicyParse {
-        /// Path being parsed.
-        path: PathBuf,
-        /// Parse failure.
-        #[source]
-        source: serde_json::Error,
-    },
-
     /// This build does not use the notification store, so notifications are
     /// unavailable until the store is readable again.
     #[error("notifications are unavailable: {reason}")]
     Unavailable {
         /// Why the store is not used.
         reason: String,
-    },
-
-    /// A requested notification does not exist.
-    #[error("notification not found: {}", id.0)]
-    NotFound {
-        /// Missing notification id.
-        id: NotificationId,
-    },
-
-    /// A requested lifecycle transition is not allowed.
-    #[error("invalid notification status transition for {id:?}: {from:?} -> {to:?}")]
-    InvalidTransition {
-        /// Notification being updated.
-        id: NotificationId,
-        /// Current status.
-        from: NotificationStatus,
-        /// Requested status.
-        to: NotificationStatus,
     },
 
     /// A metadata key is not safe to store.
@@ -296,15 +251,6 @@ pub enum NotificationError {
         reason: &'static str,
     },
 
-    /// Notification policy disables the requested kind for this producer.
-    #[error("notification kind {} is disabled for provider `{provider}`", kind.as_str())]
-    KindDisabled {
-        /// Normalized producer provider name.
-        provider: String,
-        /// Rejected notification kind.
-        kind: NotificationKind,
-    },
-
     /// A timestamp parameter or stored timestamp was not RFC3339.
     #[error("invalid notification timestamp `{value}`: {source}")]
     InvalidTimestamp {
@@ -329,15 +275,6 @@ pub enum NotificationError {
         /// Rejected cursor.
         cursor: String,
     },
-
-    /// A notification policy contains an unusable retention value.
-    #[error("invalid notification policy field `{field}`: {reason}")]
-    InvalidPolicy {
-        /// Rejected policy field.
-        field: &'static str,
-        /// Stable explanation.
-        reason: &'static str,
-    },
 }
 
 impl NotificationError {
@@ -348,7 +285,6 @@ impl NotificationError {
             Self::StoreIo { .. }
             | Self::Serialize { .. }
             | Self::StoreParse { .. }
-            | Self::PolicyParse { .. }
             | Self::TimestampFormat { .. } => ProtocolError::new(
                 ErrorClass::Runtime,
                 "notification_store_error",
@@ -361,21 +297,6 @@ impl NotificationError {
                 self.to_string(),
                 Some(
                     "upgrade pohunek to a build that reads this notification store, or move the notifications directory aside to start a new one; the existing files were not changed"
-                        .to_owned(),
-                ),
-            ),
-            Self::NotFound { .. } => ProtocolError::new(
-                ErrorClass::Runtime,
-                "notification_not_found",
-                self.to_string(),
-                None,
-            ),
-            Self::InvalidTransition { .. } => ProtocolError::new(
-                ErrorClass::Runtime,
-                "invalid_notification_transition",
-                self.to_string(),
-                Some(
-                    "use an allowed transition: unread->read, read->acknowledged, unread->acknowledged, archive a non-deleted record, or delete a non-deleted record"
                         .to_owned(),
                 ),
             ),
@@ -399,13 +320,10 @@ impl NotificationError {
                 "invalid_notification_dedupe_key",
                 self.to_string(),
                 Some(
-                    "send attention:<session_id> only for attention notifications and turn:<session_id> only for turn_completed, with a matching session_id"
+                    "send attention:<session_id> only for attention notifications and turn:<session_id> only for turn reports, with a matching session_id"
                         .to_owned(),
                 ),
             ),
-            Self::KindDisabled { provider, kind } => {
-                ProtocolError::notification_kind_disabled(provider, kind.as_str())
-            }
             Self::InvalidTimestamp { .. } => ProtocolError::new(
                 ErrorClass::Runtime,
                 "invalid_notification_timestamp",
@@ -417,12 +335,6 @@ impl NotificationError {
                 "invalid_notification_cursor",
                 self.to_string(),
                 None,
-            ),
-            Self::InvalidPolicy { .. } => ProtocolError::new(
-                ErrorClass::Runtime,
-                "invalid_notification_policy",
-                self.to_string(),
-                Some("set every retention duration and compaction threshold above zero".to_owned()),
             ),
         }
     }
@@ -437,11 +349,6 @@ impl NotificationError {
     #[must_use]
     pub fn is_invalid_session_id(&self) -> bool {
         matches!(self, Self::InvalidSessionId { .. })
-    }
-
-    #[cfg(test)]
-    fn is_invalid_dedupe_key(&self) -> bool {
-        matches!(self, Self::InvalidDedupeKey { .. })
     }
 
     pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
@@ -472,13 +379,15 @@ impl NotificationError {
             reason: reason.into(),
         }
     }
+}
 
-    pub(crate) fn policy_parse(path: impl Into<PathBuf>, source: serde_json::Error) -> Self {
-        Self::PolicyParse {
-            path: path.into(),
-            source,
-        }
-    }
+/// Outcome of one retention sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionOutcome {
+    /// Records removed from the store.
+    pub removed: usize,
+    /// Removed records announced with `notification_deleted`.
+    pub announced: usize,
 }
 
 /// Daemon-facing notification API.
@@ -490,87 +399,14 @@ pub struct NotificationService {
 #[derive(Debug)]
 struct NotificationServiceInner {
     store: NotificationStore,
-    policy: RwLock<NotificationPolicy>,
-    /// Milliseconds of the debounce window, kept equal to the policy for the
-    /// consumer that bound it.
-    attention_window: RwLock<Option<Arc<AtomicU64>>>,
+    settings: NotificationSettings,
     events: broadcast::Sender<Event>,
     next_id: AtomicU64,
-    /// The projector epoch seeds that still fail on purpose.
-    #[cfg(test)]
-    projector_seed_fault: std::sync::Mutex<Option<ProjectorSeedFault>>,
-    /// Holds the projector epoch seeds in their blocking call.
-    #[cfg(test)]
-    projector_seed_hold: std::sync::Mutex<Option<Arc<SeedHoldState>>>,
-}
-
-/// A test's grip on the projector's epoch seeds: each one stays in its
-/// blocking call until [`SeedHold::release`].
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct SeedHold {
-    state: Arc<SeedHoldState>,
-}
-
-/// A hold that is dropped releases its seeds, so a test that ends early does
-/// not leave a blocking thread parked.
-#[cfg(test)]
-impl Drop for SeedHold {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct SeedHoldState {
-    released: std::sync::Mutex<bool>,
-    released_changed: std::sync::Condvar,
-    entered: tokio::sync::Notify,
-    failed: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-impl SeedHold {
-    /// Completes once a seed is held in its blocking call.
-    pub(crate) async fn entered(&self) {
-        self.state.entered.notified().await;
-    }
-
-    /// Lets the held seeds go on.
-    pub(crate) fn release(&self) {
-        *self
-            .state
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        self.state.released_changed.notify_all();
-    }
-
-    /// Completes once the projector took a failed seed and deferred its input.
-    pub(crate) async fn failed(&self) {
-        self.state.failed.notified().await;
-    }
-}
-
-/// Seeds of the projector that fail on purpose: those of one session, or of
-/// every session.
-#[cfg(test)]
-#[derive(Debug)]
-struct ProjectorSeedFault {
-    session_id: Option<String>,
-    remaining: usize,
-}
-
-/// Outcome of one daemon-owned notification maintenance sweep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AutoRetentionResult {
-    pub(crate) pruned: usize,
-    pub(crate) compacted: bool,
 }
 
 impl NotificationService {
-    /// Open the durable notification service under `data_dir`.
+    /// Open the durable notification service under `data_dir` with the
+    /// documented default settings.
     ///
     /// The store path is `<data_dir>/notifications/notifications.jsonl`.
     ///
@@ -579,35 +415,27 @@ impl NotificationService {
     /// Returns a [`NotificationError`] when the store cannot be opened or
     /// replayed.
     pub fn open(data_dir: &Path) -> Result<Self, NotificationError> {
-        Self::open_with_policy(data_dir, default_policy())
+        Self::open_with_settings(data_dir, DEFAULT_NOTIFICATION_SETTINGS)
     }
 
-    /// Open the service with an explicit initial policy.
+    /// Open the service with explicit settings.
     ///
     /// # Errors
     ///
     /// Returns a [`NotificationError`] when the store cannot be opened or
     /// replayed.
-    pub fn open_with_policy(
+    pub fn open_with_settings(
         data_dir: &Path,
-        policy: NotificationPolicy,
+        settings: NotificationSettings,
     ) -> Result<Self, NotificationError> {
         let store = NotificationStore::open(data_dir)?;
-        let mut policy = store.load_policy(policy)?;
-        validate_policy(&policy)?;
-        complete_kind_flags(&mut policy);
         let (events, _) = broadcast::channel(NOTIFICATION_EVENT_CAPACITY);
         Ok(Self {
             inner: Arc::new(NotificationServiceInner {
                 store,
-                policy: RwLock::new(policy),
-                attention_window: RwLock::new(None),
+                settings,
                 events,
                 next_id: AtomicU64::new(1),
-                #[cfg(test)]
-                projector_seed_fault: std::sync::Mutex::new(None),
-                #[cfg(test)]
-                projector_seed_hold: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -623,111 +451,7 @@ impl NotificationService {
     /// timestamp.
     #[must_use]
     pub(crate) fn source_id_suffixes(&self, provider: &str, prefix: &str) -> Vec<(String, String)> {
-        #[cfg(test)]
-        self.hold_injected_seed();
-        #[cfg(test)]
-        if self.injected_seed_failure(prefix) {
-            // A panic in the blocking read is the failure the projector's seed
-            // can meet; `resume_unwind` skips the panic hook's output.
-            std::panic::resume_unwind(Box::new("injected projector seed failure"));
-        }
         self.inner.store.source_id_suffixes(provider, prefix)
-    }
-
-    /// Makes the next `count` projector epoch seeds of `session_id` (of every
-    /// session when `None`) fail, replacing an earlier fault.
-    #[cfg(test)]
-    pub(crate) fn fail_projector_seeds(&self, session_id: Option<&str>, count: usize) {
-        *self
-            .inner
-            .projector_seed_fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ProjectorSeedFault {
-            session_id: session_id.map(str::to_owned),
-            remaining: count,
-        });
-    }
-
-    /// Makes the projector epoch seeds wait in their blocking call until the
-    /// returned hold is released.
-    #[cfg(test)]
-    pub(crate) fn hold_projector_seeds(&self) -> SeedHold {
-        let state = Arc::new(SeedHoldState::default());
-        *self
-            .inner
-            .projector_seed_hold
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&state));
-        SeedHold { state }
-    }
-
-    #[cfg(test)]
-    fn current_seed_hold(&self) -> Option<Arc<SeedHoldState>> {
-        self.inner
-            .projector_seed_hold
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    #[cfg(test)]
-    fn hold_injected_seed(&self) {
-        let Some(hold) = self.current_seed_hold() else {
-            return;
-        };
-        hold.entered.notify_one();
-        let released = hold
-            .released
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (_released, timeout) = hold
-            .released_changed
-            .wait_timeout_while(
-                released,
-                pohunek_test_support::wait::HANG_GUARD,
-                |released| !*released,
-            )
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            !timeout.timed_out(),
-            "the held projector seed was never released"
-        );
-    }
-
-    /// Reports that the projector took a failed seed.
-    #[cfg(test)]
-    pub(crate) fn note_projector_seed_failed(&self) {
-        if let Some(hold) = self.current_seed_hold() {
-            hold.failed.notify_one();
-        }
-    }
-
-    /// Whether the seed that reads `prefix` is one the test made fail, which
-    /// uses up one of the fault's failures.
-    #[cfg(test)]
-    fn injected_seed_failure(&self, prefix: &str) -> bool {
-        let mut fault = self
-            .inner
-            .projector_seed_fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(fault) = fault.as_mut() else {
-            return false;
-        };
-        if fault
-            .session_id
-            .as_deref()
-            .is_some_and(|id| !prefix.contains(id))
-        {
-            return false;
-        }
-        match fault.remaining.checked_sub(1) {
-            Some(remaining) => {
-                fault.remaining = remaining;
-                true
-            }
-            None => false,
-        }
     }
 
     /// Whether an unread `agent_blocked` or `approval_required` record carries
@@ -816,60 +540,10 @@ impl NotificationService {
             || self.inner.store.has_active_attention(session_id)
     }
 
-    /// Update a notification lifecycle status.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`NotificationError`] when the id is unknown or the store cannot
-    /// append the update.
-    pub fn update(
-        &self,
-        params: NotificationUpdateParams,
-    ) -> Result<NotificationUpdateResult, NotificationError> {
-        let now = timestamp_now();
-        let outcome = self
-            .inner
-            .store
-            .update_transition(params.id, params.status, &now)?;
-        let record = match outcome {
-            store::UpdateOutcome::Deleted(record) => {
-                self.emit_deleted(&record.id);
-                record
-            }
-            store::UpdateOutcome::Updated(record) => {
-                self.emit_updated(&record);
-                record
-            }
-        };
-        Ok(NotificationUpdateResult { record })
-    }
-
-    /// Logically delete a notification.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`NotificationError`] when the store cannot append the delete.
-    pub fn delete(
-        &self,
-        params: NotificationDeleteParams,
-    ) -> Result<NotificationDeleteResult, NotificationError> {
-        let id = params.id;
-        let now = timestamp_now();
-        let Some(record) = self.inner.store.delete_transition(&id, &now)? else {
-            return Ok(NotificationDeleteResult { id, deleted: false });
-        };
-        self.emit_deleted(&record.id);
-        Ok(NotificationDeleteResult {
-            id: record.id,
-            deleted: true,
-        })
-    }
-
     /// Acknowledge active session notifications for `dedupe_key`.
     ///
-    /// Called when a session resumes active work so `agent_blocked`,
-    /// `approval_required`, and session-scoped `turn_completed` notifications
-    /// stop lingering as unread. Emits `notification_updated` for each
+    /// Called when a session resumes active work so `agent_blocked` and
+    /// `approval_required` notifications stop lingering as unread. Emits `notification_updated` for each
     /// acknowledged record and returns them; a dedupe key with no active matching
     /// notification is a no-op.
     ///
@@ -902,135 +576,42 @@ impl NotificationService {
         self.inner.store.ensure_available()
     }
 
-    /// Return the current notification policy.
+    /// The debounce, dedupe and retention settings of this service.
     #[must_use]
-    pub fn policy(&self) -> NotificationPolicy {
-        self.inner
-            .policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+    pub fn settings(&self) -> NotificationSettings {
+        self.inner.settings
     }
 
-    /// Replace the notification policy.
-    pub fn set_policy(&self, mut policy: NotificationPolicy) -> Result<(), NotificationError> {
-        validate_policy(&policy)?;
-        complete_kind_flags(&mut policy);
-        let mut guard = self
-            .inner
-            .policy
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.inner.store.write_policy(&policy)?;
-        *guard = policy;
-        self.publish_attention_window(&guard);
-        Ok(())
-    }
-
-    /// Keeps `window` (milliseconds) equal to the policy's debounce window,
-    /// from now on and at every policy change.
-    pub(crate) fn bind_attention_window(&self, window: Arc<AtomicU64>) {
-        let policy = self.policy();
-        *self
-            .inner
-            .attention_window
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(window);
-        self.publish_attention_window(&policy);
-    }
-
-    fn publish_attention_window(&self, policy: &NotificationPolicy) {
-        if let Some(window) = self
-            .inner
-            .attention_window
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            window.store(
-                u64::from(policy.attention_debounce_secs) * 1000,
-                Ordering::Relaxed,
-            );
-        }
-    }
-
-    /// Explicitly prune records matched by retention parameters.
+    /// Run one retention sweep at `now`.
+    ///
+    /// Removes the records of kinds the inbox no longer holds, deleted records,
+    /// and resolved attention records older than the configured lifetime, then
+    /// rewrites the log. A removed attention record emits
+    /// `notification_deleted`; open attention records are kept.
     ///
     /// # Errors
     ///
-    /// Returns a [`NotificationError`] when timestamp filters are invalid or the
-    /// store cannot append a delete.
-    pub fn prune_retention(
-        &self,
-        params: &NotificationRetentionParams,
-    ) -> Result<NotificationRetentionResult, NotificationError> {
-        self.inner.store.ensure_available()?;
-        let records = self.inner.store.all();
-        let ids = policy::records_matching_retention(&records, params)?;
-        if params.dry_run {
-            return Ok(NotificationRetentionResult {
-                dry_run: true,
-                pruned: ids,
-            });
-        }
-        for id in &ids {
-            let _ = self.delete(NotificationDeleteParams { id: id.clone() })?;
-        }
-        let _ = self
-            .inner
-            .store
-            .compact_if_needed(self.policy().retention.compaction_min_actions)?;
-        Ok(NotificationRetentionResult {
-            dry_run: false,
-            pruned: ids,
-        })
-    }
-
-    /// Run one automatic retention and compaction sweep at `now`.
-    ///
-    /// Active action-required and error records are retained. Each expired
-    /// record emits the normal deletion event before the append-only store is
-    /// compacted when its configured action threshold is reached.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotificationError`] when timestamp parsing, deletion, or
-    /// physical compaction fails.
-    pub(crate) fn run_auto_retention_at(
+    /// Returns a [`NotificationError`] when a timestamp cannot be read or the
+    /// rewrite fails; the previous log is intact then.
+    pub fn run_retention_at(
         &self,
         now: OffsetDateTime,
-    ) -> Result<AutoRetentionResult, NotificationError> {
-        let policy = self.policy();
-        let ids = policy::records_matching_auto_retention(
-            &self.inner.store.all(),
-            &policy.retention,
-            now,
-        )?;
-        let deleted_at = now
-            .format(&Rfc3339)
-            .map_err(|source| NotificationError::TimestampFormat { source })?;
-        let mut pruned = 0;
-        for id in &ids {
-            let Some(record) = self.inner.store.delete_transition(id, &deleted_at)? else {
-                continue;
-            };
-            self.emit_deleted(&record.id);
-            pruned += 1;
-        }
-        let compacted = self
+    ) -> Result<RetentionOutcome, NotificationError> {
+        let removed = self
             .inner
             .store
-            .compact_if_needed(policy.retention.compaction_min_actions)?;
-        Ok(AutoRetentionResult { pruned, compacted })
-    }
-
-    #[cfg(test)]
-    fn create_at(
-        &self,
-        params: NotificationCreateParams,
-        created_at: &str,
-    ) -> Result<NotificationCreateResult, NotificationError> {
-        self.create_with_metadata_at(params, created_at.to_owned())
+            .sweep(now, self.inner.settings.record_ttl_secs)?;
+        let mut deleted = 0;
+        for record in &removed {
+            if is_attention_kind(record.kind) && record.status != NotificationStatus::Deleted {
+                self.emit_deleted(&record.id);
+                deleted += 1;
+            }
+        }
+        Ok(RetentionOutcome {
+            removed: removed.len(),
+            announced: deleted,
+        })
     }
 
     /// Build a normalized, validated notification record without persisting it.
@@ -1038,9 +619,8 @@ impl NotificationService {
     /// Mints the id now so the `notification.create` response can return it, but
     /// the caller (the debounce coordinator) holds the record pending and commits
     /// it later via [`Self::commit_deferred`]. Performs no store I/O. A kind the
-    /// policy disables is not an error here: the result says the inbox drops it
-    /// (see [`DeferredNotification::policy_refusal`]). The result is not a turn
-    /// signal until the caller marks it as one.
+    /// inbox does not hold is not an error here: the result says the inbox drops
+    /// it. The result is not a turn signal until the caller marks it as one.
     ///
     /// # Errors
     ///
@@ -1086,18 +666,17 @@ impl NotificationService {
         created_at: String,
     ) -> Result<NotificationRecord, NotificationError> {
         let prepared = self.prepare_record(params, created_at)?;
-        match prepared.policy_refusal() {
+        match prepared.store_refusal() {
             Some(refusal) => Err(refusal),
             None => Ok(prepared.record),
         }
     }
 
-    /// Validates and assembles a record, reporting whether the policy keeps it.
+    /// Validates and assembles a record, reporting whether the inbox keeps it.
     ///
     /// Session id and reserved dedupe key validation fail for every record. A
-    /// record the policy drops never reaches the store, so its metadata is
-    /// validated only for a kept record and is otherwise left empty, and the
-    /// caller reports the policy refusal for it.
+    /// record the inbox does not hold never reaches the store, so its metadata
+    /// is validated only for a kept record and is otherwise left empty.
     fn prepare_record(
         &self,
         params: NotificationCreateParams,
@@ -1115,9 +694,7 @@ impl NotificationService {
             params.kind,
             params.dedupe_key.as_deref(),
         )?;
-        let policy = self.policy();
-        let inbox = unavailable.is_none()
-            && policy_enables_kind(&policy, &params.source.provider, params.kind);
+        let inbox = unavailable.is_none() && is_attention_kind(params.kind);
         params.metadata = if inbox {
             validate_metadata(&params.metadata)?
         } else {
@@ -1164,62 +741,27 @@ impl NotificationService {
         record: NotificationRecord,
         minted: Instant,
     ) -> Result<NotificationCreateResult, NotificationError> {
-        let window = self.policy().attention_dedupe_window_secs;
-        match self
-            .inner
-            .store
-            .create_or_dedupe(record, u64::from(window), minted)?
-        {
+        let window = self.inner.settings.attention_dedupe_window_secs;
+        match self.inner.store.create_or_dedupe(record, window, minted)? {
             store::CreateOutcome::Created(record) => {
                 self.emit_created(&record);
-                self.emit_turn_supersedes_for_attention(&record)?;
                 Ok(NotificationCreateResult {
                     created: true,
                     record,
                 })
             }
-            store::CreateOutcome::CreatedWithUpdates { record, updated } => {
-                for record in &updated {
-                    self.emit_updated(record);
-                }
-                self.emit_turn_supersedes_for_attention(&record)?;
-                self.emit_created(&record);
-                Ok(NotificationCreateResult {
-                    created: true,
-                    record,
-                })
-            }
-            store::CreateOutcome::Existing(record) => {
-                self.emit_turn_supersedes_for_attention(&record)?;
-                Ok(NotificationCreateResult {
-                    created: false,
-                    record,
-                })
-            }
+            store::CreateOutcome::Existing(record) => Ok(NotificationCreateResult {
+                created: false,
+                record,
+            }),
             store::CreateOutcome::Updated(record) => {
                 self.emit_updated(&record);
-                self.emit_turn_supersedes_for_attention(&record)?;
                 Ok(NotificationCreateResult {
                     created: false,
                     record,
                 })
             }
         }
-    }
-
-    fn emit_turn_supersedes_for_attention(
-        &self,
-        record: &NotificationRecord,
-    ) -> Result<(), NotificationError> {
-        let now = timestamp_now();
-        let updated = self
-            .inner
-            .store
-            .supersede_turns_for_attention(record, &now)?;
-        for record in &updated {
-            self.emit_updated(record);
-        }
-        Ok(())
     }
 
     fn next_id(&self) -> NotificationId {
@@ -1443,23 +985,6 @@ fn apply_status(record: &mut NotificationRecord, status: NotificationStatus, now
     }
 }
 
-fn is_valid_status_transition(from: NotificationStatus, to: NotificationStatus) -> bool {
-    if to == NotificationStatus::Deleted {
-        return from != NotificationStatus::Deleted;
-    }
-    if to == NotificationStatus::Archived {
-        return matches!(
-            from,
-            NotificationStatus::Unread
-                | NotificationStatus::Read
-                | NotificationStatus::Acknowledged
-        );
-    }
-    (from == NotificationStatus::Unread && to == NotificationStatus::Read)
-        || (from == NotificationStatus::Read && to == NotificationStatus::Acknowledged)
-        || (from == NotificationStatus::Unread && to == NotificationStatus::Acknowledged)
-}
-
 fn same_source_namespace(left: &NotificationSource, right: &NotificationSource) -> bool {
     left.provider == right.provider && left.provider_event == right.provider_event
 }
@@ -1554,38 +1079,6 @@ fn inside_attention_window(
     Ok(seconds <= window_secs)
 }
 
-fn validate_policy(policy: &NotificationPolicy) -> Result<(), NotificationError> {
-    let retention = &policy.retention;
-    let values = [
-        (
-            "retention.sweep_interval_secs",
-            retention.sweep_interval_secs,
-        ),
-        ("retention.info_ttl_secs", retention.info_ttl_secs),
-        ("retention.warning_ttl_secs", retention.warning_ttl_secs),
-        (
-            "retention.resolved_attention_ttl_secs",
-            retention.resolved_attention_ttl_secs,
-        ),
-        (
-            "retention.resolved_error_ttl_secs",
-            retention.resolved_error_ttl_secs,
-        ),
-        ("retention.archived_ttl_secs", retention.archived_ttl_secs),
-        (
-            "retention.compaction_min_actions",
-            retention.compaction_min_actions,
-        ),
-    ];
-    if let Some((field, _)) = values.into_iter().find(|(_, value)| *value == 0) {
-        return Err(NotificationError::InvalidPolicy {
-            field,
-            reason: "value must be greater than zero",
-        });
-    }
-    Ok(())
-}
-
 pub(crate) fn parse_timestamp(value: &str) -> Result<OffsetDateTime, NotificationError> {
     OffsetDateTime::parse(value, &Rfc3339).map_err(|source| NotificationError::InvalidTimestamp {
         value: value.to_owned(),
@@ -1597,1150 +1090,4 @@ fn timestamp_now() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use std::sync::{Arc, Barrier};
-
-    use protocol::{
-        event, ErrorClass, NotificationCreateParams, NotificationDeleteParams, NotificationKind,
-        NotificationKindPolicy, NotificationListParams, NotificationRetentionParams,
-        NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-        SessionId,
-    };
-
-    use super::{parse_timestamp, policy::default_policy, NotificationError, NotificationService};
-
-    fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-        // The directory lives until the test's thread ends; the path below it
-        // does not exist yet.
-        crate::test_support::thread_scoped_dir(&format!("pohunek-notifications-service-{tag}-"))
-            .join("data")
-    }
-
-    fn projector_params(
-        kind: NotificationKind,
-        source_id: Option<&str>,
-    ) -> NotificationCreateParams {
-        params(
-            "pohunek",
-            "projector.agent_state",
-            "projector-s-1",
-            kind,
-            NotificationSeverity::Warning,
-            source_id,
-            Some("session:s-1:attention"),
-        )
-    }
-
-    fn provider_params(
-        kind: NotificationKind,
-        source_id: Option<&str>,
-    ) -> NotificationCreateParams {
-        params(
-            "codex",
-            "PermissionRequest",
-            "codex-hook-s-1",
-            kind,
-            NotificationSeverity::ActionRequired,
-            source_id,
-            Some("session:s-1:attention"),
-        )
-    }
-
-    fn params(
-        provider: &str,
-        provider_event: &str,
-        host_local_source_id: &str,
-        kind: NotificationKind,
-        severity: NotificationSeverity,
-        source_id: Option<&str>,
-        dedupe_key: Option<&str>,
-    ) -> NotificationCreateParams {
-        NotificationCreateParams {
-            source: NotificationSource {
-                provider: provider.to_owned(),
-                provider_event: provider_event.to_owned(),
-                host_local_source_id: host_local_source_id.to_owned(),
-            },
-            kind,
-            severity,
-            title: "Agent needs attention".to_owned(),
-            body: "The agent is waiting for the operator.".to_owned(),
-            session_id: Some(SessionId("s-1".to_owned())),
-            agent_kind: None,
-            source_id: source_id.map(str::to_owned),
-            dedupe_key: dedupe_key.map(str::to_owned),
-            project_id: Some("p-1".to_owned()),
-            metadata: BTreeMap::new(),
-            retryable_admission: false,
-        }
-    }
-
-    fn metadata(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
-        entries
-            .iter()
-            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-            .collect()
-    }
-
-    fn assert_no_controls(value: &str) {
-        assert!(
-            !value.chars().any(char::is_control),
-            "stored notification text must not contain control characters: {value:?}"
-        );
-    }
-
-    fn all_kinds_enabled_policy() -> NotificationKindPolicy {
-        NotificationKindPolicy::from_flags([
-            (protocol::NotificationKind::AgentBlocked, true),
-            (protocol::NotificationKind::ApprovalRequired, true),
-            (protocol::NotificationKind::TurnCompleted, true),
-            (protocol::NotificationKind::SessionFinished, true),
-            (protocol::NotificationKind::Error, true),
-            (protocol::NotificationKind::System, true),
-        ])
-    }
-
-    fn only_turn_completed_disabled_policy() -> NotificationKindPolicy {
-        {
-            let mut policy = all_kinds_enabled_policy();
-            policy.set(protocol::NotificationKind::TurnCompleted, false);
-            policy
-        }
-    }
-
-    fn enable_all_kinds(service: &NotificationService) {
-        let mut policy = default_policy();
-        policy.enabled = all_kinds_enabled_policy();
-        policy.providers.clear();
-        service.set_policy(policy).expect("set policy");
-    }
-
-    fn provider_turn_params(session_id: &str, source_id: &str) -> NotificationCreateParams {
-        let mut params = params(
-            "codex",
-            "Stop",
-            source_id,
-            NotificationKind::TurnCompleted,
-            NotificationSeverity::Info,
-            Some(source_id),
-            Some(&format!("turn:{session_id}")),
-        );
-        params.session_id = Some(SessionId(session_id.to_owned()));
-        params.body = "Codex completed a turn.".to_owned();
-        params.title = "Codex turn completed".to_owned();
-        params
-    }
-
-    fn assert_notification_kind_disabled(err: &super::NotificationError) {
-        let protocol = err.to_protocol_error();
-        assert_eq!(protocol.class, ErrorClass::Runtime);
-        assert_eq!(protocol.code, "notification_kind_disabled");
-    }
-
-    fn assert_invalid_session_id(err: &super::NotificationError) {
-        let protocol = err.to_protocol_error();
-        assert_eq!(protocol.class, ErrorClass::Runtime);
-        assert_eq!(protocol.code, "invalid_notification_session_id");
-    }
-
-    fn assert_invalid_dedupe_key(err: &super::NotificationError) {
-        let protocol = err.to_protocol_error();
-        assert_eq!(protocol.class, ErrorClass::Runtime);
-        assert_eq!(protocol.code, "invalid_notification_dedupe_key");
-    }
-
-    #[test]
-    fn create_is_idempotent_for_matching_source_namespace_and_source_id() {
-        let service = NotificationService::open(&temp_data_dir("source-id")).expect("open service");
-        let first = service
-            .create(projector_params(
-                NotificationKind::AgentBlocked,
-                Some("same-source"),
-            ))
-            .expect("first create");
-        let second = service
-            .create(projector_params(
-                NotificationKind::AgentBlocked,
-                Some("same-source"),
-            ))
-            .expect("second create");
-
-        assert!(first.created);
-        assert!(!second.created);
-        assert_eq!(first.record.id, second.record.id);
-    }
-
-    #[test]
-    fn create_preserves_same_source_id_in_different_source_namespaces() {
-        let service =
-            NotificationService::open(&temp_data_dir("source-namespace")).expect("open service");
-        let first = service
-            .create(params(
-                "codex",
-                "PermissionRequest",
-                "codex-1",
-                NotificationKind::ApprovalRequired,
-                NotificationSeverity::ActionRequired,
-                Some("same-source"),
-                None,
-            ))
-            .expect("first create");
-        let second = service
-            .create(params(
-                "claude",
-                "Notification.permission_prompt",
-                "claude-1",
-                NotificationKind::ApprovalRequired,
-                NotificationSeverity::ActionRequired,
-                Some("same-source"),
-                None,
-            ))
-            .expect("second create");
-
-        assert!(first.created);
-        assert!(second.created);
-        assert_ne!(first.record.id, second.record.id);
-    }
-
-    #[test]
-    fn create_rejects_session_id_with_control_characters() {
-        let service =
-            NotificationService::open(&temp_data_dir("session-id-control")).expect("open service");
-        let mut params = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
-        params.session_id = Some(SessionId("s-1\ns-2".to_owned()));
-
-        let err = service
-            .create(params)
-            .expect_err("control characters in session_id must fail");
-
-        assert_invalid_session_id(&err);
-        assert!(
-            service
-                .list(NotificationListParams::default())
-                .expect("list notifications")
-                .notifications
-                .is_empty(),
-            "invalid session_id must not append a record"
-        );
-    }
-
-    #[test]
-    fn create_rejects_oversized_session_id() {
-        let service = NotificationService::open(&temp_data_dir("session-id-oversized"))
-            .expect("open service");
-        let mut params = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
-        // One byte above the existing 512-byte id-kind native session reference cap.
-        params.session_id = Some(SessionId("s".repeat(513)));
-
-        let err = service
-            .create(params)
-            .expect_err("oversized session_id must fail");
-
-        assert_invalid_session_id(&err);
-    }
-
-    #[test]
-    fn create_rejects_misused_reserved_dedupe_keys_without_appending() {
-        let service =
-            NotificationService::open(&temp_data_dir("dedupe-reserved")).expect("open service");
-        enable_all_kinds(&service);
-        let mut session_mismatch = provider_turn_params("s-1", "codex:s-1:stop:1");
-        session_mismatch.dedupe_key = Some("turn:s-2".to_owned());
-        let mut without_session = provider_turn_params("s-1", "codex:s-1:stop:2");
-        without_session.session_id = None;
-        let mut wrong_kind = provider_params(NotificationKind::Error, Some("provider-error"));
-        wrong_kind.dedupe_key = Some("attention:s-1".to_owned());
-
-        for (case, params) in [
-            ("the key names another session", session_mismatch),
-            ("the record has no session id", without_session),
-            ("an attention key on a non-attention kind", wrong_kind),
-        ] {
-            let err = service
-                .create(params)
-                .expect_err("a misused reserved dedupe key must fail");
-
-            assert!(err.is_invalid_dedupe_key(), "{case}: {err:?}");
-            assert_invalid_dedupe_key(&err);
-        }
-        assert!(
-            service
-                .list(NotificationListParams::default())
-                .expect("list notifications")
-                .notifications
-                .is_empty(),
-            "a rejected create must not append a record"
-        );
-    }
-
-    #[test]
-    fn provider_hook_upgrades_projector_notification_inside_attention_window() {
-        let service =
-            NotificationService::open(&temp_data_dir("provider-upgrade")).expect("open service");
-        let projector = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("projector-1")),
-                "2026-07-03T10:00:00Z",
-            )
-            .expect("projector create");
-        let provider = service
-            .create_at(
-                provider_params(NotificationKind::ApprovalRequired, Some("provider-1")),
-                "2026-07-03T10:00:30Z",
-            )
-            .expect("provider create");
-
-        assert!(!provider.created);
-        assert_eq!(projector.record.id, provider.record.id);
-        assert_eq!(provider.record.kind, NotificationKind::ApprovalRequired);
-        assert_eq!(provider.record.source.provider, "codex");
-        assert_eq!(provider.record.superseded_by, None);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_create_with_same_dedupe_key_produces_one_visible_record() {
-        let service = Arc::new(
-            NotificationService::open(&temp_data_dir("concurrent-dedupe")).expect("open service"),
-        );
-        let task_count = 32_usize;
-        let barrier = Arc::new(Barrier::new(task_count + 1));
-        let mut handles = Vec::with_capacity(task_count);
-        for index in 0..task_count {
-            let service = Arc::clone(&service);
-            let barrier = Arc::clone(&barrier);
-            handles.push(tokio::task::spawn_blocking(move || {
-                let mut params = provider_params(NotificationKind::ApprovalRequired, None);
-                params.source.host_local_source_id = format!("hook-{index}");
-                params.dedupe_key = Some("session:s-1:concurrent-attention".to_owned());
-                barrier.wait();
-                service.create(params)
-            }));
-        }
-        barrier.wait();
-
-        let mut results = Vec::with_capacity(task_count);
-        for handle in handles {
-            results.push(
-                handle
-                    .await
-                    .expect("create task completed")
-                    .expect("create succeeds"),
-            );
-        }
-
-        let created_count = results.iter().filter(|result| result.created).count();
-        assert_eq!(
-            created_count, 1,
-            "exactly one concurrent create may append the visible record"
-        );
-        assert_eq!(
-            results.iter().filter(|result| !result.created).count(),
-            task_count - 1
-        );
-
-        let listed = service
-            .list(NotificationListParams::default())
-            .expect("list notifications");
-        assert_eq!(listed.notifications.len(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_delete_wins_over_stale_read_updates_after_replay() {
-        const UPDATE_TASKS: usize = 64;
-        const ATTEMPTS: usize = 16;
-
-        for attempt in 0..ATTEMPTS {
-            let data_dir = temp_data_dir(&format!("delete-read-race-{attempt}"));
-            let service = Arc::new(NotificationService::open(&data_dir).expect("open service"));
-            let created = service
-                .create(provider_params(
-                    NotificationKind::ApprovalRequired,
-                    Some(&format!("delete-read-race-{attempt}")),
-                ))
-                .expect("create notification");
-            let id = created.record.id.clone();
-            let task_count = UPDATE_TASKS + 1;
-            let barrier = Arc::new(Barrier::new(task_count + 1));
-            let mut update_handles = Vec::with_capacity(UPDATE_TASKS);
-
-            for _ in 0..UPDATE_TASKS {
-                let service = Arc::clone(&service);
-                let barrier = Arc::clone(&barrier);
-                let id = id.clone();
-                update_handles.push(tokio::task::spawn_blocking(move || {
-                    barrier.wait();
-                    service.update(NotificationUpdateParams {
-                        id,
-                        status: NotificationStatus::Read,
-                    })
-                }));
-            }
-
-            let delete_handle = {
-                let service = Arc::clone(&service);
-                let barrier = Arc::clone(&barrier);
-                let id = id.clone();
-                tokio::task::spawn_blocking(move || {
-                    barrier.wait();
-                    service.delete(NotificationDeleteParams { id })
-                })
-            };
-            barrier.wait();
-
-            for handle in update_handles {
-                match handle.await.expect("update task completed") {
-                    Ok(result) => assert_eq!(result.record.status, NotificationStatus::Read),
-                    Err(NotificationError::InvalidTransition { from, to, .. }) => {
-                        assert!(
-                            matches!(from, NotificationStatus::Read | NotificationStatus::Deleted),
-                            "unexpected read-race source status: {from:?}"
-                        );
-                        assert_eq!(to, NotificationStatus::Read);
-                    }
-                    Err(err) => panic!("unexpected update error: {err:?}"),
-                }
-            }
-            let delete_result = delete_handle
-                .await
-                .expect("delete task completed")
-                .expect("delete succeeds");
-            assert!(delete_result.deleted, "delete must win attempt {attempt}");
-
-            let reopened = NotificationService::open(&data_dir).expect("reopen service");
-            let deleted = reopened
-                .list(NotificationListParams {
-                    status: Some(NotificationStatus::Deleted),
-                    ..NotificationListParams::default()
-                })
-                .expect("list deleted notifications");
-            assert_eq!(
-                deleted.notifications.len(),
-                1,
-                "delete must be the terminal replayed state on attempt {attempt}"
-            );
-            assert_eq!(deleted.notifications[0].id, id);
-            assert_eq!(deleted.notifications[0].status, NotificationStatus::Deleted);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_delete_and_ack_yield_terminal_delete_or_typed_update_error() {
-        const UPDATE_TASKS: usize = 64;
-        const ATTEMPTS: usize = 16;
-
-        for attempt in 0..ATTEMPTS {
-            let data_dir = temp_data_dir(&format!("delete-ack-race-{attempt}"));
-            let service = Arc::new(NotificationService::open(&data_dir).expect("open service"));
-            let created = service
-                .create(provider_params(
-                    NotificationKind::ApprovalRequired,
-                    Some(&format!("delete-ack-race-{attempt}")),
-                ))
-                .expect("create notification");
-            let id = created.record.id.clone();
-            service
-                .update(NotificationUpdateParams {
-                    id: id.clone(),
-                    status: NotificationStatus::Read,
-                })
-                .expect("mark notification read before ack race");
-
-            let task_count = UPDATE_TASKS + 1;
-            let barrier = Arc::new(Barrier::new(task_count + 1));
-            let mut update_handles = Vec::with_capacity(UPDATE_TASKS);
-            for _ in 0..UPDATE_TASKS {
-                let service = Arc::clone(&service);
-                let barrier = Arc::clone(&barrier);
-                let id = id.clone();
-                update_handles.push(tokio::task::spawn_blocking(move || {
-                    barrier.wait();
-                    service.update(NotificationUpdateParams {
-                        id,
-                        status: NotificationStatus::Acknowledged,
-                    })
-                }));
-            }
-
-            let delete_handle = {
-                let service = Arc::clone(&service);
-                let barrier = Arc::clone(&barrier);
-                let id = id.clone();
-                tokio::task::spawn_blocking(move || {
-                    barrier.wait();
-                    service.delete(NotificationDeleteParams { id })
-                })
-            };
-            barrier.wait();
-
-            for handle in update_handles {
-                match handle.await.expect("update task completed") {
-                    Ok(result) => {
-                        assert_eq!(result.record.status, NotificationStatus::Acknowledged);
-                    }
-                    Err(NotificationError::InvalidTransition { from, to, .. }) => {
-                        assert!(
-                            matches!(
-                                from,
-                                NotificationStatus::Acknowledged | NotificationStatus::Deleted
-                            ),
-                            "unexpected ack-race source status: {from:?}"
-                        );
-                        assert_eq!(to, NotificationStatus::Acknowledged);
-                    }
-                    Err(err) => panic!("unexpected update error: {err:?}"),
-                }
-            }
-            let delete_result = delete_handle
-                .await
-                .expect("delete task completed")
-                .expect("delete succeeds");
-            assert!(delete_result.deleted, "delete must win attempt {attempt}");
-
-            let reopened = NotificationService::open(&data_dir).expect("reopen service");
-            let deleted = reopened
-                .list(NotificationListParams {
-                    status: Some(NotificationStatus::Deleted),
-                    ..NotificationListParams::default()
-                })
-                .expect("list deleted notifications");
-            assert_eq!(
-                deleted.notifications.len(),
-                1,
-                "acked update must not resurrect deleted notification on attempt {attempt}"
-            );
-            assert_eq!(deleted.notifications[0].id, id);
-            assert_eq!(deleted.notifications[0].status, NotificationStatus::Deleted);
-        }
-    }
-
-    #[test]
-    fn projector_create_is_suppressed_by_existing_provider_inside_attention_window() {
-        let service = NotificationService::open(&temp_data_dir("projector-suppressed"))
-            .expect("open service");
-        let provider = service
-            .create_at(
-                provider_params(NotificationKind::ApprovalRequired, Some("provider-1")),
-                "2026-07-03T10:00:00Z",
-            )
-            .expect("provider create");
-        let projector = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("projector-1")),
-                "2026-07-03T10:00:30Z",
-            )
-            .expect("projector create");
-
-        assert!(provider.created);
-        assert!(!projector.created);
-        assert_eq!(provider.record.id, projector.record.id);
-        assert_eq!(projector.record.kind, NotificationKind::ApprovalRequired);
-    }
-
-    #[test]
-    fn attention_create_supersedes_unread_turn_twin() {
-        let service = NotificationService::open(&temp_data_dir("attention-supersedes-turn"))
-            .expect("open service");
-        enable_all_kinds(&service);
-        let turn = service
-            .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
-            .expect("turn create");
-        let mut attention = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
-        attention.dedupe_key = Some("attention:s-1".to_owned());
-
-        let approval = service.create(attention).expect("attention create");
-
-        assert!(turn.created);
-        assert!(approval.created);
-        let records: BTreeMap<String, protocol::NotificationRecord> = service
-            .list(NotificationListParams::default())
-            .expect("list notifications")
-            .notifications
-            .into_iter()
-            .map(|record| (record.id.0.clone(), record))
-            .collect();
-        assert_eq!(
-            records[&turn.record.id.0].status,
-            NotificationStatus::Acknowledged
-        );
-        assert_eq!(
-            records[&turn.record.id.0].superseded_by,
-            Some(approval.record.id.clone())
-        );
-        assert_eq!(
-            records[&approval.record.id.0].status,
-            NotificationStatus::Unread
-        );
-    }
-
-    #[test]
-    fn second_turn_emits_supersede_update_before_replacement_create() {
-        let service =
-            NotificationService::open(&temp_data_dir("turn-event-order")).expect("open service");
-        enable_all_kinds(&service);
-        let mut events = service.subscribe();
-        let first = service
-            .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
-            .expect("first turn create");
-        let first_event = events.try_recv().expect("first create event");
-        assert_eq!(first_event.event(), event::NOTIFICATION_CREATED);
-
-        let second = service
-            .create(provider_turn_params("s-1", "codex:s-1:stop:2"))
-            .expect("second turn create");
-
-        let update_event = events.try_recv().expect("supersede update event");
-        assert_eq!(update_event.event(), event::NOTIFICATION_UPDATED);
-        let updated = serde_json::from_value::<protocol::NotificationUpdatedEvent>(
-            update_event.payload().clone(),
-        )
-        .expect("updated payload");
-        assert_eq!(updated.record.id, first.record.id);
-        assert_eq!(updated.record.superseded_by, Some(second.record.id.clone()));
-
-        let create_event = events.try_recv().expect("replacement create event");
-        assert_eq!(create_event.event(), event::NOTIFICATION_CREATED);
-        let created = serde_json::from_value::<protocol::NotificationCreatedEvent>(
-            create_event.payload().clone(),
-        )
-        .expect("created payload");
-        assert_eq!(created.record.id, second.record.id);
-    }
-
-    #[test]
-    fn acknowledged_attention_duplicate_does_not_supersede_later_turn() {
-        let service = NotificationService::open(&temp_data_dir("acked-attention-no-turn-collapse"))
-            .expect("open service");
-        enable_all_kinds(&service);
-        let mut attention = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
-        attention.dedupe_key = Some("attention:s-1".to_owned());
-        let approval = service.create(attention.clone()).expect("attention create");
-        service
-            .update(NotificationUpdateParams {
-                id: approval.record.id,
-                status: NotificationStatus::Acknowledged,
-            })
-            .expect("ack attention");
-        let turn = service
-            .create(provider_turn_params("s-1", "codex:s-1:stop:1"))
-            .expect("turn create");
-
-        let duplicate = service
-            .create(attention)
-            .expect("duplicate attention returns existing");
-
-        assert!(!duplicate.created);
-        assert_eq!(duplicate.record.status, NotificationStatus::Acknowledged);
-        let records: BTreeMap<String, protocol::NotificationRecord> = service
-            .list(NotificationListParams::default())
-            .expect("list notifications")
-            .notifications
-            .into_iter()
-            .map(|record| (record.id.0.clone(), record))
-            .collect();
-        assert_eq!(
-            records[&turn.record.id.0].status,
-            NotificationStatus::Unread,
-            "an inactive attention duplicate must not consume a later turn"
-        );
-        assert_eq!(records[&turn.record.id.0].superseded_by, None);
-    }
-
-    #[test]
-    fn acknowledged_attention_does_not_suppress_fresh_attention_create() {
-        let service = NotificationService::open(&temp_data_dir("acked-attention-fresh-create"))
-            .expect("open service");
-        let mut first = provider_params(NotificationKind::ApprovalRequired, Some("provider-1"));
-        first.dedupe_key = Some("attention:s-1".to_owned());
-        let approval = service.create(first).expect("first attention create");
-        service
-            .update(NotificationUpdateParams {
-                id: approval.record.id.clone(),
-                status: NotificationStatus::Acknowledged,
-            })
-            .expect("ack attention");
-
-        let mut second = provider_params(NotificationKind::ApprovalRequired, Some("provider-2"));
-        second.source.host_local_source_id = "codex-hook-s-2".to_owned();
-        second.dedupe_key = Some("attention:s-1".to_owned());
-        let fresh = service
-            .create(second)
-            .expect("fresh attention create after acknowledged record");
-
-        assert!(fresh.created);
-        assert_ne!(fresh.record.id, approval.record.id);
-        let records = service
-            .list(NotificationListParams::default())
-            .expect("list notifications")
-            .notifications;
-        assert_eq!(records.len(), 2);
-        assert!(records.iter().any(|record| record.id == approval.record.id
-            && record.status == NotificationStatus::Acknowledged));
-        assert!(records
-            .iter()
-            .any(|record| record.id == fresh.record.id
-                && record.status == NotificationStatus::Unread));
-    }
-
-    #[test]
-    fn metadata_rejects_secret_like_keys_case_insensitively() {
-        let service = NotificationService::open(&temp_data_dir("metadata")).expect("open service");
-        for key in [
-            "token",
-            "secret",
-            "password",
-            "api_key",
-            "access_token",
-            "authorization",
-            "cookie",
-        ] {
-            let mut params = projector_params(NotificationKind::AgentBlocked, None);
-            params.metadata = BTreeMap::from([(key.to_ascii_uppercase(), "redacted".to_owned())]);
-            let err = service
-                .create(params)
-                .expect_err("secret-like key must fail");
-            assert!(err.is_invalid_metadata_key());
-        }
-    }
-
-    #[test]
-    fn metadata_rejects_unallowlisted_keys() {
-        let service =
-            NotificationService::open(&temp_data_dir("metadata-disallowed")).expect("open service");
-        let mut params = projector_params(NotificationKind::AgentBlocked, None);
-        params.metadata = metadata(&[("unsupported", "value")]);
-
-        let err = service
-            .create(params)
-            .expect_err("unallowlisted key must fail");
-
-        assert!(err.is_invalid_metadata_key());
-    }
-
-    #[test]
-    fn metadata_enforces_entry_and_value_bounds() {
-        let service =
-            NotificationService::open(&temp_data_dir("metadata-bounds")).expect("open service");
-        let mut too_many = projector_params(NotificationKind::AgentBlocked, None);
-        too_many.metadata = metadata(&[
-            ("action_url", "https://example.invalid/action"),
-            ("detail_url", "https://example.invalid/detail"),
-            ("provider", "codex"),
-            ("provider_event", "PermissionRequest"),
-            ("reason", "approval"),
-            ("summary", "summary"),
-            ("hook_event_id", "hook-1"),
-            ("matcher", "permission_prompt"),
-            ("tool_name", "shell"),
-        ]);
-        assert!(
-            too_many.metadata.len() > super::MAX_METADATA_ENTRIES,
-            "test must exceed metadata entry bound"
-        );
-        let err = service
-            .create(too_many)
-            .expect_err("too many metadata entries must fail");
-        assert!(err.is_invalid_metadata_key());
-
-        let mut oversized = projector_params(NotificationKind::AgentBlocked, None);
-        oversized.metadata = BTreeMap::from([(
-            "summary".to_owned(),
-            "x".repeat(super::MAX_METADATA_VALUE_CHARS + 1),
-        )]);
-        let err = service
-            .create(oversized)
-            .expect_err("oversized metadata value must fail");
-        assert!(err.is_invalid_metadata_key());
-    }
-
-    #[test]
-    fn metadata_is_sanitized_persisted_and_replayed() {
-        let data_dir = temp_data_dir("metadata-replay");
-        let service = NotificationService::open(&data_dir).expect("open service");
-        let mut params = projector_params(NotificationKind::AgentBlocked, None);
-        params.metadata = metadata(&[
-            ("provider", "codex\u{1b}"),
-            ("reason", "approval\u{7}\nneeded"),
-        ]);
-
-        let created = service.create(params).expect("create");
-
-        assert_eq!(
-            created.record.metadata,
-            metadata(&[("provider", "codex"), ("reason", "approval needed")])
-        );
-
-        let reopened = NotificationService::open(&data_dir).expect("reopen service");
-        let listed = reopened
-            .list(NotificationListParams::default())
-            .expect("list notifications");
-        assert_eq!(listed.notifications.len(), 1);
-        assert_eq!(listed.notifications[0].metadata, created.record.metadata);
-    }
-
-    #[test]
-    fn title_and_body_are_normalized_before_storage() {
-        let service = NotificationService::open(&temp_data_dir("normalize")).expect("open service");
-        let mut params = projector_params(NotificationKind::AgentBlocked, None);
-        params.title = "  Agent\nneeds\tattention  ".to_owned();
-        params.body = "  Body line  ".repeat(10_000);
-
-        let created = service.create(params).expect("create");
-
-        assert_eq!(created.record.title, "Agent needs attention");
-        assert!(created.record.body.len() <= super::MAX_BODY_CHARS);
-    }
-
-    #[test]
-    fn user_controlled_strings_strip_control_characters_before_storage() {
-        let service =
-            NotificationService::open(&temp_data_dir("strip-controls")).expect("open service");
-        let mut params = projector_params(NotificationKind::AgentBlocked, None);
-        params.source.provider = "cod\u{1b}ex".to_owned();
-        params.source.provider_event = "Permission\u{7}Request".to_owned();
-        params.source.host_local_source_id = "hook\u{1b}[0m-1".to_owned();
-        params.title = "\u{1b}[31m Agent\nneeds\u{7} attention".to_owned();
-        params.body = "Body\u{1b}[0m\nline\u{7}".to_owned();
-        params.source_id = Some("source\u{1b}-1".to_owned());
-        params.dedupe_key = Some("dedupe\u{7}-1".to_owned());
-        params.project_id = Some("project\u{1b}-1".to_owned());
-        params.metadata = metadata(&[("summary", "Summary\u{1b}[0m\nline\u{7}")]);
-
-        let created = service.create(params).expect("create");
-
-        assert_no_controls(&created.record.source.provider);
-        assert_no_controls(&created.record.source.provider_event);
-        assert_no_controls(&created.record.source.host_local_source_id);
-        assert_no_controls(&created.record.title);
-        assert_no_controls(&created.record.body);
-        assert_no_controls(created.record.source_id.as_deref().expect("source id"));
-        assert_no_controls(created.record.dedupe_key.as_deref().expect("dedupe key"));
-        assert_no_controls(created.record.project_id.as_deref().expect("project id"));
-        assert_no_controls(
-            created
-                .record
-                .metadata
-                .get("summary")
-                .expect("summary metadata"),
-        );
-    }
-
-    #[test]
-    fn create_rejects_policy_disabled_kind_without_appending() {
-        let service =
-            NotificationService::open(&temp_data_dir("policy-disabled")).expect("open service");
-        let params = provider_params(NotificationKind::TurnCompleted, Some("turn-1"));
-
-        let err = service
-            .create(params)
-            .expect_err("turn_completed is disabled by default");
-
-        assert_notification_kind_disabled(&err);
-        assert!(
-            service
-                .list(NotificationListParams::default())
-                .expect("list notifications")
-                .notifications
-                .is_empty(),
-            "disabled kind must not append a record"
-        );
-    }
-
-    #[test]
-    fn create_respects_provider_specific_policy_override() {
-        let service = NotificationService::open(&temp_data_dir("policy-provider-override"))
-            .expect("open service");
-        let mut policy = service.policy();
-        policy.enabled = only_turn_completed_disabled_policy();
-        policy
-            .providers
-            .insert("codex".to_owned(), all_kinds_enabled_policy());
-        service.set_policy(policy).expect("set policy");
-
-        let codex_result = service
-            .create(provider_params(
-                NotificationKind::TurnCompleted,
-                Some("codex-turn"),
-            ))
-            .expect("codex override enables turn_completed");
-        let claude_err = service
-            .create(params(
-                "claude",
-                "Stop",
-                "claude-hook-s-1",
-                NotificationKind::TurnCompleted,
-                NotificationSeverity::Info,
-                Some("claude-turn"),
-                None,
-            ))
-            .expect_err("default policy still disables claude turn_completed");
-
-        assert!(codex_result.created);
-        assert_notification_kind_disabled(&claude_err);
-    }
-
-    #[test]
-    fn policy_set_takes_effect_for_subsequent_creates() {
-        let service =
-            NotificationService::open(&temp_data_dir("policy-set-live")).expect("open service");
-        let mut disabled = service.policy();
-        disabled.enabled = only_turn_completed_disabled_policy();
-        disabled.providers.clear();
-        service.set_policy(disabled).expect("set disabled policy");
-
-        let disabled_err = service
-            .create(provider_params(
-                NotificationKind::TurnCompleted,
-                Some("turn-disabled"),
-            ))
-            .expect_err("turn_completed disabled");
-        assert_notification_kind_disabled(&disabled_err);
-
-        let mut enabled = service.policy();
-        enabled.enabled = all_kinds_enabled_policy();
-        service.set_policy(enabled).expect("set enabled policy");
-        let created = service
-            .create(provider_params(
-                NotificationKind::TurnCompleted,
-                Some("turn-enabled"),
-            ))
-            .expect("turn_completed enabled");
-        assert!(created.created);
-
-        let mut disabled_again = service.policy();
-        disabled_again.enabled = only_turn_completed_disabled_policy();
-        service
-            .set_policy(disabled_again)
-            .expect("set disabled policy again");
-        let disabled_again_err = service
-            .create(provider_params(
-                NotificationKind::TurnCompleted,
-                Some("turn-disabled-again"),
-            ))
-            .expect_err("turn_completed disabled again");
-        assert_notification_kind_disabled(&disabled_again_err);
-    }
-
-    #[test]
-    fn configured_attention_window_controls_cross_producer_dedupe() {
-        let service =
-            NotificationService::open(&temp_data_dir("configured-window")).expect("open service");
-        let mut policy = service.policy();
-        policy.attention_dedupe_window_secs = 10;
-        service.set_policy(policy).expect("set policy");
-
-        let first = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("projector-1")),
-                "2026-07-03T10:00:00Z",
-            )
-            .expect("first create");
-        let second = service
-            .create_at(
-                provider_params(NotificationKind::ApprovalRequired, Some("provider-1")),
-                "2026-07-03T10:00:11Z",
-            )
-            .expect("second create");
-
-        assert!(first.created);
-        assert!(second.created);
-        assert_ne!(first.record.id, second.record.id);
-    }
-
-    #[test]
-    fn policy_changes_are_persisted_across_reopen() {
-        let data_dir = temp_data_dir("policy-reopen");
-        let service = NotificationService::open(&data_dir).expect("open service");
-        let policy = protocol::NotificationPolicy {
-            attention_dedupe_window_secs: 42,
-            attention_debounce_secs: 3,
-            enabled: NotificationKindPolicy::from_flags([
-                (protocol::NotificationKind::AgentBlocked, true),
-                (protocol::NotificationKind::ApprovalRequired, true),
-                (protocol::NotificationKind::TurnCompleted, true),
-                (protocol::NotificationKind::SessionFinished, true),
-                (protocol::NotificationKind::Error, true),
-                (protocol::NotificationKind::System, true),
-            ]),
-            providers: BTreeMap::new(),
-            retention: protocol::NotificationRetentionPolicy::default(),
-            unknown_fields: protocol::tolerant::UnknownFields::default(),
-        };
-
-        service.set_policy(policy.clone()).expect("set policy");
-
-        let reopened = NotificationService::open(&data_dir).expect("reopen service");
-        assert_eq!(reopened.policy(), policy);
-    }
-
-    #[test]
-    fn automatic_retention_prunes_quiet_activity_but_keeps_unresolved_errors() {
-        let service =
-            NotificationService::open(&temp_data_dir("automatic-retention")).expect("open service");
-        let mut policy = service.policy();
-        policy.enabled = all_kinds_enabled_policy();
-        policy.providers.clear();
-        policy.retention.info_ttl_secs = 60;
-        policy.retention.compaction_min_actions = 1;
-        service.set_policy(policy).expect("set retention policy");
-
-        let info = service
-            .create_at(
-                params(
-                    "pohunek",
-                    "activity",
-                    "info-1",
-                    NotificationKind::System,
-                    NotificationSeverity::Info,
-                    Some("info-1"),
-                    None,
-                ),
-                "2026-01-01T00:00:00Z",
-            )
-            .expect("create info activity");
-        let error = service
-            .create_at(
-                params(
-                    "pohunek",
-                    "error",
-                    "error-1",
-                    NotificationKind::Error,
-                    NotificationSeverity::Error,
-                    Some("error-1"),
-                    None,
-                ),
-                "2026-01-01T00:00:00Z",
-            )
-            .expect("create error activity");
-
-        let result = service
-            .run_auto_retention_at(
-                parse_timestamp("2026-01-01T00:02:00Z").expect("valid sweep timestamp"),
-            )
-            .expect("run automatic retention");
-        let remaining = service
-            .list(NotificationListParams::default())
-            .expect("list remaining activity")
-            .notifications;
-
-        assert_eq!(result.pruned, 1);
-        assert!(result.compacted);
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, error.record.id);
-        assert_ne!(remaining[0].id, info.record.id);
-    }
-
-    #[test]
-    fn policy_rejects_zero_retention_values() {
-        let service =
-            NotificationService::open(&temp_data_dir("invalid-retention")).expect("open service");
-        let mut policy = service.policy();
-        policy.retention.sweep_interval_secs = 0;
-
-        let error = service
-            .set_policy(policy)
-            .expect_err("reject zero interval");
-
-        assert!(matches!(
-            error,
-            NotificationError::InvalidPolicy {
-                field: "retention.sweep_interval_secs",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn prune_retention_dry_run_skips_deleted_when_status_is_unfiltered() {
-        let service =
-            NotificationService::open(&temp_data_dir("retention-dry-run")).expect("open service");
-        let old_archived = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("old-archived")),
-                "2026-07-01T00:00:00Z",
-            )
-            .expect("create old archived");
-        service
-            .update(NotificationUpdateParams {
-                id: old_archived.record.id.clone(),
-                status: NotificationStatus::Archived,
-            })
-            .expect("archive old record");
-        let old_deleted = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("old-deleted")),
-                "2026-07-01T01:00:00Z",
-            )
-            .expect("create old deleted");
-        service
-            .delete(NotificationDeleteParams {
-                id: old_deleted.record.id.clone(),
-            })
-            .expect("delete old record");
-
-        let result = service
-            .prune_retention(&NotificationRetentionParams {
-                dry_run: true,
-                status: None,
-                before: Some("2026-07-03T00:00:00Z".to_owned()),
-                limit: None,
-            })
-            .expect("dry-run prune");
-
-        assert_eq!(result.pruned, vec![old_archived.record.id]);
-        assert!(result.dry_run);
-    }
-
-    #[test]
-    fn prune_retention_apply_deletes_matched_records() {
-        let service =
-            NotificationService::open(&temp_data_dir("retention-apply")).expect("open service");
-        let old_archived = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("old-archived")),
-                "2026-07-01T00:00:00Z",
-            )
-            .expect("create old archived");
-        service
-            .update(NotificationUpdateParams {
-                id: old_archived.record.id.clone(),
-                status: NotificationStatus::Archived,
-            })
-            .expect("archive old record");
-        let new_archived = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("new-archived")),
-                "2026-07-04T00:00:00Z",
-            )
-            .expect("create new archived");
-        service
-            .update(NotificationUpdateParams {
-                id: new_archived.record.id.clone(),
-                status: NotificationStatus::Archived,
-            })
-            .expect("archive new record");
-
-        let result = service
-            .prune_retention(&NotificationRetentionParams {
-                dry_run: false,
-                status: Some(NotificationStatus::Archived),
-                before: Some("2026-07-03T00:00:00Z".to_owned()),
-                limit: None,
-            })
-            .expect("apply prune");
-
-        assert_eq!(result.pruned, vec![old_archived.record.id.clone()]);
-        assert!(!result.dry_run);
-        let deleted = service
-            .list(NotificationListParams {
-                status: Some(NotificationStatus::Deleted),
-                ..NotificationListParams::default()
-            })
-            .expect("list deleted");
-        assert_eq!(deleted.notifications[0].id, old_archived.record.id);
-    }
 }

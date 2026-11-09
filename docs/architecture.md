@@ -790,7 +790,7 @@ Two rules keep the window bounded:
   subscriber by the adapter's known-event and known-value lists.
 - **New-in-N rule.** A method added after the previous release has no
   previous-release fixture and no older shape to translate to. It goes on the
-  adapter's `INTRODUCED_METHODS` list (`crates/protocol/src/compat/v3.rs`), and a
+  adapter's `INTRODUCED_METHODS` list, and a
   connection of the older version gets `method_not_found` for it; its results
   are never translated or sent. A client of release N refuses such a method
   before sending it to an N-1 daemon, with the typed
@@ -807,13 +807,18 @@ Golden fixtures for every method and event family live under
 `crates/protocol/tests/fixtures/compat/v<N-1>/`; consumer recordings (CLI,
 TypeScript SDK, Hermes plugin, managed hooks) live under
 `crates/daemon/tests/fixtures/compat/v<N-1>/consumers/`. They are serialized or
-recorded by the previous release's own code, never written by hand;
-`generator/golden_v3.rs.txt` shows how to regenerate them from a checkout of the
-previous tag. `crates/protocol/tests/compat_v3.rs` fails when a method or event
-has no fixture, when a current type stops decoding a renamed fixture, or when the
-adapter and an independent blind rename of the fixture disagree. The real-daemon
-test `crates/daemon/tests/protocol_window.rs` replays the recordings and checks
-the per-connection shapes.
+recorded by the previous release's own code, never written by hand. The
+real-daemon test `crates/daemon/tests/protocol_window.rs` checks the
+per-connection shapes of the window.
+
+**Current window.** Protocol 5 removed the notification update, delete, policy
+and retention methods, a semantic change, so `MIN_PROTOCOL_VERSION` equals
+`PROTOCOL_VERSION` (5) and the window holds one version. No adapter, fixture or
+recording exists for protocol 3 or 4, and `crates/protocol/src/compat` keeps its
+entry points (every older version fails with `UnsupportedVersion`) so the next
+bump that brings an N-1 adapter changes no caller. The break is announced in the
+release notes: sessions launched under protocol 4 must be relaunched because
+their hooks announce protocol 4 for life.
 
 The accepted relay path is a coordinated public protocol v4 cutover owned by
 [#70](https://github.com/zajca/pohunek/issues/70). Inside userspace WireGuard,
@@ -1963,13 +1968,8 @@ Durability tiers (honest about limits):
    not run, an inspection or signal error and a signalled process that still
    runs keep the loss unproven, so `session.resume` still makes its own
    confirmed sweep. Clients show one derived state for a lost runtime,
-   `crashed` (proven or not), with the readable cause of the loss; the
-   notification projector reports a proven loss as one `Error` "Session
-   crashed" and an unproven one as "Session runtime lost", once per loss
-   (a report counts until the runtime answers again, also across daemon
-   restarts and a start that could not classify the record; a runtime that
-   answers again and is lost again within its generation is reported again),
-   with the cause in the body and in the metadata. Startup reconciliation
+   `crashed` (proven or not), with the readable cause of the loss; no
+   notification record is derived for it. Startup reconciliation
    re-examines every stored record, so a record committed by an earlier release
    as `running` with a lost runtime is re-classified by its call site's proof;
    a worker that answers again re-adopts the session as `running`. A `failed`
@@ -2050,8 +2050,7 @@ Runtime state under the user data directory:
   metadata.jsonl           # logical sessions, worktrees, and projects (0600)
   metadata.rejected.jsonl  # rejected store lines set aside, with audit records (0600)
   notifications/
-    notifications.jsonl    # durable notification action log (0600)
-    policy.json             # notification, retention, and compaction policy (0600)
+    notifications.jsonl    # durable attention-notification action log (0600)
     format.json             # notification store format marker (0600)
   events/                  # local bounded event journal (audit/debug, not replicated)
   worktrees/               # managed git worktrees
@@ -2136,13 +2135,18 @@ adopted only if scale or query needs justify it; the schema is sketched in
 `docs/plan-phase-1.md` ("Deferred: SQLite Schema").
 
 The notification store is a separate owner-private append-only JSONL action
-log. A daemon-owned maintenance task applies policy TTLs to quiet, resolved, and
-archived records; unread/read action-required and error records are never
-age-pruned. Once the configured action threshold is reached, maintenance writes
-one current action per non-deleted record to a fully flushed temporary file,
-opens it for future appends, atomically renames it over the old log, and syncs
-the parent directory. A crash therefore leaves either the old replayable log or
-the complete compacted log, never a partially replaced store.
+log of attention records (format 3, no policy document). A daemon-owned sweep
+(`[notifications]` `record_sweep_interval_secs`, once at start) removes the
+records of kinds the inbox no longer holds and the resolved records older than
+`record_ttl_secs`; open attention records never expire. The sweep copies the log
+once to `notifications.jsonl.pre-format-3`, writes the retained records to a
+fully flushed temporary file, opens it for future appends, atomically renames it
+over the old log, and syncs the parent directory. A crash therefore leaves
+either the old replayable log or the complete new log, never a partially
+replaced store. Turn ends and turn errors never enter it: the attention
+coordinator records them as `TurnSignal`s in the in-memory turn journal behind
+`session.wait_turn`, and a terminal approval notice reaches the coordinator
+through a late-bound sink on the session registry.
 
 Secrets are never written to the metadata stores, the event log, or session
 metadata. They
@@ -2366,7 +2370,7 @@ never `unreachable!()`.
 | `PackageFindingKind` | display | the finding is kept, so the doctor exit stays non-zero | done |
 | `NotificationSeverity`, `ProjectSource`, `ProviderKind`, `PromptLayer`, `ConceptType`, `QuarantineReason` | display | `ProviderKind::Unknown` is never the `none` kind; an unknown `ConceptType` decodes as unknown and the launch continues | done |
 | `NotificationStatus` | safe | never matches `--unread` or `--status` filters | done |
-| `NotificationKind` | safe | a record of an unknown kind is listed as `unknown` and never matches `--kind`; a policy key of an unknown kind keeps its raw string ([#1332](https://github.com/zajca/pohunek/issues/1332)) | done |
+| `NotificationKind` | safe | a record of an unknown kind is listed as `unknown` and never matches `--kind`; the daemon never emits `turn_completed`, `session_finished`, `error` or `system`, which only older records and clients carry | done |
 | `ConceptIntent` | drop | an unknown element is dropped from `intents` | done |
 | `SessionWarningKind` | drop | own mechanism | done |
 | `SessionState` | bump-only | drives live and terminal decisions; no safe default | |
@@ -2410,30 +2414,16 @@ Each protocol type has one field policy, kept in the table of
   params that deny unknown keys (including the `runtime` identity nested in
   `session.output` and `session.wait` params, which has its own strict decode).
 - **scoped**: a type the daemon persists or accepts as params and a client
-  reads (and, for the policies, sends back) (`SessionCapabilities`, `SessionRetentionPolicy`,
-  `NotificationPolicy`, `NotificationRetentionPolicy`, `NotificationKindPolicy`).
+  reads (and, for the policies, sends back) (`SessionCapabilities`, `SessionRetentionPolicy`).
   It carries one hidden
   `UnknownFields` member (`protocol::tolerant::UnknownFields`, skipped in the
   generated TypeScript). A plain decode, which is the daemon's, refuses an
   unknown key as strictly as `deny_unknown_fields`, so the store, the policy
   files and params stay strict. A decode inside `protocol::tolerant` keeps the
-  keys and serialization writes them back, so `notifications policy set`
-  returns every key it decoded and never resets a
-  setting it does not know. An empty member serializes nothing, so the store
-  shape, `policy.json` and every recorded document keep their bytes. `--json`
-  prints the kept keys of a scoped type. `NotificationKindPolicy` is a map from
-  the wire name of a `NotificationKind` to a boolean, not a struct: the keys it
-  keeps are the kinds this build does not know. A kind the document leaves out
-  stays out on the client round trip, and the daemon applies its default for
-  that kind when it reads such a document and completes the policy it loaded, so
-  `notification.policy.get` returns every kind; `notification.policy.set` stores and
-  returns the policy complete, with that default filled in, so a daemon of the
-  earlier release, which requires every flag, reads what this one wrote. The six current kinds serialize in declaration order, exactly
-  the bytes of the struct it replaces, so neither the notification format nor
-  the protocol changes. A new `NotificationKind` value changes the persisted
-  policy shape, so the format guard fails until a new notification format exists
-  (format 3), and it needs the same release rule as any new enum value: a client of an
-  earlier release is strict for it.
+  keys and serialization writes them back, so a client that reads such a
+  document, changes one value and sends it on returns every key it decoded. An
+  empty member serializes nothing, so the store shape and every recorded
+  document keep their bytes. `--json` prints the kept keys of a scoped type.
 - **lenient**: the type carries no `deny_unknown_fields` and no hand-written
   refusal, so both decodes ignore an unknown key. Most param, result and event
   types are lenient; a daemon does not refuse a key of that kind in params, so

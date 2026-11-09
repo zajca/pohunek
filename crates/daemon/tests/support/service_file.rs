@@ -62,6 +62,7 @@ pub(crate) fn write_service_file(
         event_retention: DEFAULT_EVENT_RETENTION,
         inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
         worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
+        notifications: pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS,
         open_files: OPEN_FILES,
     })
     .expect("valid service configuration");

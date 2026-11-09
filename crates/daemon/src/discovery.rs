@@ -140,7 +140,7 @@ fn clamp_to_window(asked: ProtocolVersionRange) -> Option<ProtocolVersionRange> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{HostClass, CLIENT_PROTOCOL_VERSIONS, CURRENT_PROTOCOL_VERSIONS};
+    use protocol::{HostClass, CURRENT_PROTOCOL_VERSIONS};
 
     #[tokio::test]
     async fn fresh_cache_is_served_without_refresh() {
@@ -169,20 +169,6 @@ mod tests {
                 .await
                 .expect("cached records"),
             records
-        );
-        // A snapshot classified for one range is not served to another.
-        assert!(cache
-            .cache
-            .lock()
-            .await
-            .get(&CLIENT_PROTOCOL_VERSIONS)
-            .is_none());
-        assert_eq!(
-            cache
-                .records(false, CLIENT_PROTOCOL_VERSIONS)
-                .await
-                .expect("refreshed for the other range"),
-            Vec::new()
         );
     }
 

@@ -52,66 +52,44 @@ shipped SDK API and do not imply that the team relay has shipped.
 
 ## Compatibility Model
 
-The current public protocol version is `4` (`PROTOCOL_VERSION`). A daemon of this
-build accepts the inclusive range `3..=4` (`SUPPORTED_PROTOCOL_VERSIONS`): its own
-version and the previous one, which it serves through shape-only edge adapters.
-The Rust client, the CLI and the TypeScript SDK of this build advertise the same
-window (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`), so they also
-talk to a daemon of the previous release
-([#527](https://github.com/zajca/pohunek/issues/527)).
+The current public protocol version is `5` (`PROTOCOL_VERSION`). A daemon of this
+build accepts exactly that version (`SUPPORTED_PROTOCOL_VERSIONS` is `5..=5`,
+`MIN_PROTOCOL_VERSION` is `5`). The Rust client, the CLI and the TypeScript SDK
+of this build advertise the same window (`CLIENT_PROTOCOL_VERSIONS`).
+
+**Announced break (protocol 5).** Protocol 5 removed `notification.update`,
+`notification.delete`, `notification.policy.get`, `notification.policy.set` and
+`notification.retention.prune` and the error code `notification_kind_disabled`,
+which no shape adapter can express, so it raised the accepted minimum instead of
+adding an adapter. A daemon, CLI, SDK and plugin of protocol 5 must be upgraded
+together, and a client or hook that announces protocol 3 or 4 receives
+`daemon/version_mismatch`. A session launched before the upgrade carries
+`POHUNEK_PROTOCOL_VERSION=4` for its life, so its managed hooks are refused
+until the session is relaunched; their attention reports are lost meanwhile.
+Run `pohunek service upgrade`, then relaunch the sessions that should keep
+reporting.
+
 Requests carry `v: {minimum, maximum}`. The first valid response selects the
 highest overlapping version as an integer `v`, and that selection is fixed for the
-lifetime of the connection. Subscription events use the same selected version and
-are shaped for it. A non-overlapping range returns `daemon/version_mismatch`.
+lifetime of the connection. Subscription events use the same selected version.
+A non-overlapping range returns `daemon/version_mismatch`.
 `daemon.health` and `host.inspect` report the version negotiated for the asking
 connection in `protocol_version`.
 
-A protocol 3 connection is answered `method_not_found` for any method added after
-protocol 3 (today the `package.*` methods), and never receives their results.
-The `session.list` predicates `metadata_eq`, `metadata_has` and `spawned_by` are also
-current-protocol-only request shapes. Because an older daemon knows the method
-but cannot apply these predicates, current Rust and TypeScript clients probe
-the negotiated version and return `daemon/daemon_protocol_too_old` before
-sending the filtered request.
+The `session.list` predicates `metadata_eq`, `metadata_has` and `spawned_by` are
+available to every client of the window. The CLI exposes them as repeatable
+`session list --meta-eq key=value` and `--meta-has key` options and
+`--spawned-by <session-id>`. They combine with `--filter` and each other using
+AND semantics; equality splits at the first `=` and opaque keys or values may
+be empty.
 
-The CLI exposes the metadata predicates as repeatable `session list --meta-eq
-key=value` and `--meta-has key` options and the spawner predicate as
-`--spawned-by <session-id>`. They combine with `--filter` and each
-other using AND semantics; equality splits at the first `=` and opaque keys or
-values may be empty. A CLI targeting a protocol-3 daemon fails before sending
-a metadata-filtered request, while an unfiltered `session list` remains
-available.
-
-A Rust client, CLI or TypeScript SDK client whose connection selected protocol 3 (a daemon of the previous
-release, typically on another host) translates in the opposite direction through the
-same adapter: it sends requests in the protocol 3 spelling (`runtime_id`, pinned to
-`v: {3,3}`) and hands its caller the current shape of every result and event, so
-`--json` output and `Subscription::next_line` never carry `runtime_id`. A request
-whose shape depends on the version first sends `daemon.health` on the connection,
-offering only the versions the request itself allows; a connection whose selected
-version lies outside the request's own range fails client-side before anything is
-sent (`daemon_protocol_too_old` below the range, `version_mismatch` above it).
-After a version is selected every request is pinned to it, except `host.discover`
-(`RANGE_FORWARDING_METHODS`): the daemon classifies peers for the range the request
-advertised, so the client keeps its whole window on it and a protocol 3 peer stays
-`reachable_daemon` however many requests the connection has already served. A
-method added after protocol 3 is refused before it is sent, with the typed
-`daemon/daemon_protocol_too_old` error. Its message names the host, the protocol the
-daemon runs and the protocol the method needs ("host 'netbird:build-2' runs protocol 3,
-but package.list needs protocol 4"); its `recover` hint says to upgrade pohunek on
-that host. A payload that cannot be translated is refused with
-`daemon/version_translation_failed`. A runtime reference that is not one of the
-protocol 3 agent kinds (`shell`, `codex`, `claude`, `hermes`) is not checked on the
-client: the protocol 3 daemon answers it with its own typed
-`agent_kind_unsupported`.
-
-The window is bounded. Adapters translate shape only (renames and moved fields,
-and withholding events and enum values the older version never defined). A
-semantic change (a new required parameter, a removed method or event, a changed
-error code or meaning) cannot be adapted: it raises the accepted minimum as well
-and is announced as a break in the release notes. The next protocol bump deletes
-the oldest adapter, so each release accepts exactly its predecessor and no more.
-See `docs/architecture.md` "Protocol versioning".
+The window is bounded. When a later bump adds a previous version to it, the
+adapters translate shape only (renames and moved fields, and withholding events
+and enum values the older version never defined). A semantic change (a new
+required parameter, a removed method or event, a changed error code or meaning)
+cannot be adapted: it raises the accepted minimum as well and is announced as a
+break in the release notes, as protocol 5 did. See `docs/architecture.md`
+"Protocol versioning".
 
 Within one protocol version a daemon of a newer build can answer with an enum
 value an older Rust client does not know. The Rust client and the CLI decode
@@ -123,55 +101,16 @@ and rejects it in params. The TypeScript types do not list the variant. The
 per-enum policy is in `docs/architecture.md` "Unknown enum values from a newer
 daemon".
 
-Protocol v3 is the coordinated overlay-routing boundary. It changes
-`HostRecord.address` to an optional IP-only value and adds required `port` and
-`overlay` fields plus optional `peer_id`. Every daemon and bundled client must
-be upgraded together; no v2 compatibility shim is provided.
+Protocol v3 was the coordinated overlay-routing boundary (`HostRecord.address`
+became an optional IP-only value with required `port` and `overlay`), and
+protocol v4 renamed the public worker instance identifier from `runtime_id` to
+`worker_instance_id` (`RuntimeId` keeps its agent-runtime meaning). Neither
+spelling of an earlier version is accepted any more.
 
-The former exact integer request envelope is deliberately rejected. The
-historical protocol-v2 transition was the one-time move from integer-v1 to
-range negotiation; it provided no v1 envelope or notification-policy shim.
-The protocol-v3 transition likewise required a coordinated upgrade from v2.
-
-Protocol v4 renames the public worker instance identifier from `runtime_id` to
-`worker_instance_id` on `SessionRuntimeIdentity` (and therefore the flat
-`runtime_id` of the output, screen and read results and the `runtime` objects of
-their params), `SessionRuntime`, `RuntimeInventoryEntry`,
-`SessionReportNativeIdParams`, and `SessionNativeRecoveredEvent` (including
-`previous_runtime_id`, now `previous_worker_instance_id`). `RuntimeId` keeps its
-agent-runtime meaning. Protocol 4 has no `runtime_id` alias for the worker
-instance. A v3 client that sends its range `3..=3` to a v4 daemon is served by
-the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
-requests (a request that already carries the v4 spelling is `bad_request`) and
-answers, and streams events, in the `runtime_id` spelling, withholding warning
-kinds and events v3 never defined (a v3 connection never receives a
-`native_recovery` session warning; v4 connections do). The `background_state`
-event is withheld from v3 connections, and `SessionInfo.background` is removed
-from the session objects a v3 connection receives, so a v3 client sees no
-background snapshot. `SessionInfo.capability_refusals` and `SessionRuntime.exit` are removed from
-them as well. A client whose range does not overlap the window
-receives `daemon/version_mismatch` before any method runs; a client of this build
-negotiates v3 and translates as described above. The window covers
-the public daemon protocol and the Hermes CLI tool path: the CLI's `--json`
-envelope reports its actual `3..=4` window and its session summaries carry
-both `worker_instance_id` and the v3 `runtime_id` spelling. Other typed CLI
-results retain their current shape. Its observation
-commands accept the old `--runtime-id` spelling as a hidden alias while v3
-remains in the window. A v0.33.0 Hermes plugin whose policy pins `3..=3` can
-therefore keep using tools, including timed-out start recovery, without
-rewriting its owner policy. A policy outside the window fails closed with
-`pohunek_cli_incompatible`; `integration update --agent hermes` refreshes
-the plugin assets and policy explicitly. A client and a
-daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` and `prompt_accepted` hook requests are additive to the private
-worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=16`; an asset of
-an earlier version still sends the old key, which the daemon accepts only from a
-session whose launch baked protocol 3 (and an earlier notification hook still
-sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
-rejects its notifications), so `integration.status` reports it
-`outdated` and `integration.doctor` as an asset finding until it is reinstalled.
+worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=16` and send the `{minimum, maximum}` range of the protocol their session launched with; the installed v16 hooks keep working unchanged on protocol 5 sessions.
 
 Clients should call `daemon.health` after opening a control connection to learn
 the daemon build version and protocol version, but `daemon.health` is not a
@@ -182,17 +121,11 @@ Within a negotiated public version, additive changes do not require a bump only
 where the containing contract is explicitly open. New methods and error codes
 are additive; older daemons return `daemon/method_not_found` for unknown
 methods. Optional fields retain their documented omission behavior. Envelope,
-observation, native-report, capability, and notification-policy objects are
-strict: the daemon rejects unknown fields in them. A client keeps the unknown
-keys of the session capabilities and the
-notification policy (with its `retention`) it reads, and sends the notification policy
-back. The per-kind flags of `NotificationPolicy` are a map from
-`NotificationKind` to boolean: the generated `NotificationKindPolicy` TypeScript
-type has an optional key per kind, because a daemon that predates a kind omits
-it, and a client keeps the kinds it does not know and sends them back.
-Changing their accepted shape requires the appropriate negotiated-version
-treatment. `RuntimeRef` values and provider-policy map
-keys are deliberately open value namespaces, not open object shapes.
+observation, native-report, and capability objects are strict: the daemon
+rejects unknown fields in them. A client keeps the unknown keys of the session
+capabilities it reads. Changing their accepted shape requires the appropriate
+negotiated-version treatment. `RuntimeRef` values are deliberately an open
+value namespace, not an open object shape.
 
 Non-additive wire changes require a protocol version bump. Examples: changing a
 required field name or type, removing a field, changing enum string values,
@@ -391,7 +324,7 @@ All params and result type names below refer to structs exported by
 | `session.read` | `SessionReadParams` | `SessionReadResult` | Reads bounded text from the current rendered terminal without attaching. `lines` accepts `1..=1,000`, defaults to that ceiling, and keeps the newest rendered rows. The complete serialized result is capped by `MAX_SESSION_READ_RESPONSE_BYTES`; byte truncation keeps the newest UTF-8 text and sets `truncated`. ANSI is a reserved request value that v2 always rejects. A `source_used` a newer daemon defines reads as `unknown` on the Rust client and the CLI; `source` in params stays strict, so `unknown` is `bad_request`. |
 | `session.output` | `SessionOutputParams` | `SessionOutputResult` | Reads a newest retained tail or continues from an exact runtime-scoped output cursor. A request with `wait_ms` uses a dedicated connection with bounded-wait headroom, and is answered with `daemon_shutting_down` when daemon shutdown starts during the wait. |
 | `session.wait` | `SessionWaitParams` | `SessionWaitResult` | Performs one bounded long poll for state, activity, metadata, terminal, output, or runtime change. It always uses a dedicated connection, and it is answered with `daemon_shutting_down` when daemon shutdown starts during the wait. A `reason` a newer daemon defines reads as `unknown` on the Rust client; `pohunek session wait` exits non-zero with `session_wait_reason_unknown` (under `--json` the error document is the only output), because it cannot say whether the condition matched. |
-| `session.wait_turn` | `SessionWaitTurnParams` | `SessionWaitTurnResult` | Waits for the next turn event (`turn_completed`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions after an opaque cursor, bounded by an agent-chosen timeout under a daemon ceiling; a timeout returns per-session progress. It always uses a dedicated connection. New in protocol 4: a protocol 3 client or daemon does not define it. See [Turn Waits](#turn-waits). A `reason` a newer daemon defines reads as `unknown` on the Rust client and the CLI; the result keeps its cursor and progress, so chained waits continue. |
+| `session.wait_turn` | `SessionWaitTurnParams` | `SessionWaitTurnResult` | Waits for the next turn event (`turn_completed`, `turn_error`, `agent_blocked`, `approval_required`, `exited`) of one or more sessions after an opaque cursor, bounded by an agent-chosen timeout under a daemon ceiling; a timeout returns per-session progress. It always uses a dedicated connection. New in protocol 4: a protocol 3 client or daemon does not define it. See [Turn Waits](#turn-waits). A `reason` a newer daemon defines reads as `unknown` on the Rust client and the CLI; the result keeps its cursor and progress, so chained waits continue. |
 | `session.report_agent` | `SessionReportAgentParams` | `SessionReportAgentResult` | Hook callback for nested agents running inside an existing session. It records an active-agent claim, optional process binding (`pid`, confirmed by an optional `pid_start_identity`), and optional active native metadata without changing launch identity or resume binding; ignored reports return `recorded: false`. Claims are reconciled with process facts and can be auto-released when no live backing process remains. Accepts the optional `retryable_admission` flag described under Retryable admission. |
 | `session.release_agent` | `SessionReleaseAgentParams` | `SessionReleaseAgentResult` | Hook callback that clears a matching active nested-agent report and restores the session's default detector identity. Claude `SessionEnd` hooks use this as the clean-exit fast path; non-current releases return `released: false`; process-backed auto-release uses the same clear path. Accepts the optional `retryable_admission` flag described under Retryable admission. |
 | `session.report_native_id` | `SessionReportNativeIdParams` | `SessionReportNativeIdResult` | Hardened public fallback for launch-agent resume metadata. Reports are runtime- and process-bound, ordered, expiring, and provider-matched; ignored reports return `recorded: false`. The caller is attested with its kernel peer credentials before any session state is read: only the session's PTY root itself is admitted, and a caller that fails the attestation (a remote connection, a descendant of the root, another user, or a root whose session uses the `identity-v1` schema) gets the error `native_report_unattested` (see the native-id report attestation rules below the schema section). The owner-private worker claim path is preferred. This is not the nested-agent active identity callback. Accepts the optional `retryable_admission` flag described under Retryable admission. |
@@ -405,13 +338,8 @@ All params and result type names below refer to structs exported by
 | `integration.uninstall` | `IntegrationUninstallParams` (`agent` required) | `IntegrationUninstallResult` | Removes exactly the assets and registrations the installer owns for Codex and Claude, as one rollback-protected transaction under the installer lock: registration first, then Codex trust records, then marker-carrying scripts. User hooks, the Codex hooks feature flag, the hooks directory, and the lock file are left alone; a symlink, directory, FIFO, or unmarked file at a managed script path is preserved and reported in `preserved_paths`. Each report carries `state` (`removed` or `not_installed`), `removed_paths`, `updated_paths`, `preserved_paths`, and `cleanup_incomplete` (quarantined originals whose deletion did not finish after the removal committed). `agent` names the one agent to remove and is required: a missing agent, unknown fields, and `null` params return `bad_request`, so removal never widens to every agent and a failure cannot leave one agent removed without a report. `profile` selects one profile's config home and `all_profiles` every distinct home of that agent, one transaction per home with failures listed in `failed` and no atomicity across homes (local-only; see "Config homes and host profiles"); an absent `agent` is still `bad_request` with either. Ownership is judged on the inode that is deleted, and a provider file whose content, mode, or inode changed since it was read is a collision. The same re-verification runs before any rollback, so a file another writer changed is kept there too rather than replaced by the original. Every rollback or cleanup outcome that leaves data in quarantine is reported with its true path, as `integration_recovery_required` during a rollback and as `cleanup_incomplete` after commit. A registration file the removal wrote that another writer changed before the scripts are removed, or before the removal completes, is also a collision: it is re-verified (inode, mode, complete content), the other version is kept, and the removed scripts are moved back. Collisions, interrupted rollbacks, and concurrent installers return `integration_destination_collision`, `integration_recovery_required`, and `integration_install_in_progress`. |
 | `integration.doctor` | `IntegrationDoctorParams` or `null` | `IntegrationDoctorResult` | Read-only diagnosis of the managed Codex and Claude hooks: per agent `ok`, the status report (absent while an operation is running), and findings with a stable snake_case `code`, `severity` (`info` or `error`), `summary`, and `remediation`. A code or severity a newer daemon defines reads as `unknown` on the Rust client and the CLI, which render it as such and re-emit `"unknown"` under `--json`; the exit status stays driven by `ok`. Only the absence expected of a not-installed integration is informational: an unsafe, symlinked, or group-writable config path is an error even when nothing is installed. Codes cover absent agents and hooks, config-root, asset, registration, provider-config, and Codex feature/trust drift, `displaced_original_left_behind` (a quarantined original from an earlier install or removal remains in the agent config directory) and `quarantine_scan_incomplete` (the bounded scan could not cover every entry, so it is an error and the diagnosis is never clean), and `operation_in_progress` (info: another install, uninstall, or doctor holds the installer lock, so nothing is read or scanned for that agent, `status` is absent, and the doctor stays `ok`; the doctor takes the lock non-blocking without creating the file and holds it for its whole inspection, so an installer arriving meanwhile gets `integration_install_in_progress`), `unsafe_installer_lock` (error: the lock file is not a regular owner-private file, so every install and uninstall fails), `install_drift`, and three informational `python3` notes that never fail the doctor or change its exit code, because the daemon cannot know the agent's `PATH`: `hook_runtime_python_found` (the first executable `python3` behind an absolute entry of the daemon's own `PATH`), `hook_runtime_missing` (none found; relative and empty entries are skipped), and `hook_runtime_macos_shim` (the first one is the `/usr/bin/python3` stub, recognized through any alias, with no Command Line Tools or Xcode behind it); the probe never runs an interpreter and the remediation is to verify `python3` on the agent's `PATH`, and `hook_socket_path_invalid` (daemon or worker socket path over the platform limit). The runtime notes apply only to an agent whose hooks are installed. `null` selects every runtime the daemon serves through a daemon-run hook handler; unknown fields return `bad_request`. `profile` and `all_profiles` diagnose profile config homes (local-only; see "Config homes and host profiles"); each diagnosis carries `home`, and the recovery commands in its findings name `--profile` for a profile's home. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Resolves the selected, enabled context package `pohunek.context.assistant` on the daemon host and persists the launch snapshot beside it. The result carries the package root's bundle directory (`bundle_path`), the package version and digest (`version`, `content_hash`), the concept index and the text of the prompt contract (`prompt_contract`, empty from a daemon that predates the package-based bundle). An optional `request_id` makes the snapshot path a function of the id and keeps the first snapshot. Without the package the method answers `assistant_package_missing`. A concept `type` a newer daemon defines reads as `unknown` on the Rust client; an `intents` element it defines is dropped. |
-| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. Accepts the optional `retryable_admission` flag described under Retryable admission. |
-| `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
-| `notification.update` | `NotificationUpdateParams` | `NotificationUpdateResult` | Updates one record's lifecycle status. Allowed transitions are `unread -> read`, `read -> acknowledged`, `unread -> acknowledged`, `unread/read/acknowledged -> archived`, and any non-deleted status to deleted. |
-| `notification.delete` | `NotificationDeleteParams` | `NotificationDeleteResult` | Logically deletes one record. Unknown or already-deleted ids return `deleted: false`. |
-| `notification.policy.get` | `null` | `NotificationPolicyResult` | Reads the daemon's notification policy. Non-null params are `daemon/bad_request`. |
-| `notification.policy.set` | `NotificationPolicyParams` | `NotificationPolicyResult` | Validates, replaces, and persists the daemon notification and automatic-retention policy at `<data_dir>/notifications/policy.json`. |
-| `notification.retention.prune` | `NotificationRetentionParams` or `null` | `NotificationRetentionResult` | Explicitly deletes records selected by retention filters, or reports matches when `dry_run` is true. Applied pruning may also compact the action log at the policy threshold. |
+| `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local attention notification. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see Notification lifecycle. `turn_completed`, `error` and every other kind are accepted and not stored (`created: false`); an admitted hook report becomes a turn event. Accepts the optional `retryable_admission` flag described under Retryable admission. |
+| `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists attention records with exact-match filters and cursor pagination. |
 | `project.list` | `ProjectListParams` or `null` | `Vec<ProjectInfo>` | Lists known projects on the target host. A `source` a newer daemon defines reads as `unknown` on the Rust client and the CLI; `--filter source=` still accepts only `auto` and `manual`. |
 | `project.add` | `ProjectAddParams` | `ProjectInfo` | Registers a host-local git project path. |
 | `project.show` | `ProjectShowParams` | `ProjectShowResult` | Shows a project plus live worktree state. Each `ProjectWorktree` reports `owned` when pohunek created it; `owner_session_id` names the session it was created for and stays after that session stops; `session_id` names a live (non-terminal) session running in it. Each of the two ids is omitted, never `null`, when it does not apply: `owner_session_id` on a worktree pohunek does not own, `session_id` when no live session runs there. Clients older than `owner_session_id` ignore it. |
@@ -445,7 +373,7 @@ daemon method in this API version. It returns `daemon/method_not_found`.
 flag instead of assuming that a reachable daemon or an attach-capable session
 supports every observation method. A daemon that predates `session.wait_turn`
 omits `session_wait_turn_supported`, which decodes as `false`; it answers the
-method itself with `daemon/method_not_found` when it speaks protocol 4. A daemon that predates the `cwd` behavior of `session.new` omits `session_new_cwd_supported`, which decodes as `false`; a daemon that predates `branch_source` and `on_diverged` omits `session_new_branch_source_supported` likewise; a daemon that predates `input_ack_timeout_ms` omits `session_new_input_ack_supported` likewise; a daemon that predates `secret_env` omits `session_new_secret_env_supported` likewise; a daemon that predates `client_request_id` omits `session_new_request_id_supported` likewise and drops the key; a daemon that predates package commands omits `package_install_commands_supported` likewise and rejects `accept_commands`; a daemon that predates installs by plugin index omits `package_install_index_supported` likewise and rejects the `index` trust kind, which a client therefore sends only when the flag is `true` (the daemon reports it only when the channel file beside its trust anchor is loaded); a daemon that predates the expected pin of `package.bind_profile` omits `package_bind_profile_expected_supported` likewise and rejects `expected_previous`. Its `runtimes` entries
+method itself with `daemon/method_not_found` when it predates the method. A daemon that predates the `cwd` behavior of `session.new` omits `session_new_cwd_supported`, which decodes as `false`; a daemon that predates `branch_source` and `on_diverged` omits `session_new_branch_source_supported` likewise; a daemon that predates `input_ack_timeout_ms` omits `session_new_input_ack_supported` likewise; a daemon that predates `secret_env` omits `session_new_secret_env_supported` likewise; a daemon that predates `client_request_id` omits `session_new_request_id_supported` likewise and drops the key; a daemon that predates package commands omits `package_install_commands_supported` likewise and rejects `accept_commands`; a daemon that predates installs by plugin index omits `package_install_index_supported` likewise and rejects the `index` trust kind, which a client therefore sends only when the flag is `true` (the daemon reports it only when the channel file beside its trust anchor is loaded); a daemon that predates the expected pin of `package.bind_profile` omits `package_bind_profile_expected_supported` likewise and rejects `expected_previous`. Its `runtimes` entries
 are live host-local probes: `agent` is the selected profile or base name and
 optional `agent_base` is the `RuntimeRef` of the runtime behind it. Optional
 `version` and `supported` are a provider policy, not generic availability:
@@ -1112,8 +1040,7 @@ carries it as `placement` (`SessionPlacement`: `outcome`, an open string with
 the documented values `clean`, `escaped` and `unobservable`, and `processes`,
 `{pid, comm}` ordered by pid and bounded at 8, empty unless `escaped`); the field
 is absent for a session whose runtime declares no placement, a session that is
-not live, and every list entry, stored record and event, and protocol 3
-connections never receive it. `unobservable` means the host withheld the PTY
+not live, and every list entry, stored record and event never receive it. `unobservable` means the host withheld the PTY
 child's session or the process table, so the generation is not reported clean.
 `daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
 naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`
@@ -1457,7 +1384,7 @@ retry the report) on all four methods. A schema denial keeps today's answer
 field, so it stays final. Without the field nothing changes: the full wait and
 the old answers. The field is additive and omitted when false. Because
 `session.report_native_id` rejects unknown fields and both daemon generations
-speak protocol 4, the protocol version cannot gate it: a daemon sets
+speak protocol 5, the protocol version cannot gate it: a daemon sets
 `POHUNEK_HOOK_ADMISSION_RETRY=1` in the environment of every session it
 launches (new and resumed), and a reporter sends the field only when
 that is set, so a session launched by an older daemon never sends it. A session
@@ -1765,7 +1692,7 @@ Important fields:
   operation name the same reason. A frozen
   `false` capability carries no reason. Stored records, events and other
   results never carry the field. The object is open: clients ignore operations
-  they do not know. Protocol 3 connections never receive it. Human
+  they do not know. Human
   `session list` output adds a `refused <id>: resume=<code>` line,
   and `session inspect` a `capability_refusals` row.
 - `name`: optional owner-set display name; absent means the session is shown by
@@ -1890,7 +1817,7 @@ Important fields:
   cleared when the runtime becomes anything else (a stop the user requested
   ends the runtime `terminal`, without an exit). It is diagnostic: it does not
   change `state` or the proof of the loss, and an unproven loss records it too.
-  Peers on protocol 3 never see it, and a 0.35 client ignores it.
+  A 0.35 client ignores it.
   `loss_cause` (optional, an open string) says why a `lost` runtime has no
   manager verdict: `user_manager_lost` (the journal named the user service
   manager that held the worker, and that process is gone within the same
@@ -1901,7 +1828,7 @@ Important fields:
   It is set only while `exit` is absent, kept while the runtime stays `lost`,
   cleared with `exit`, and absent when the journal proves neither (a worker
   that was not a unit of a user manager, an older worker, or an unreadable
-  manager identity). Peers on protocol 3 never see it. Daemon
+  manager identity). Daemon
   reconnection preserves both identities;
   explicit native recovery changes them. A `lost` runtime whose end the daemon
   observed (the worker's job ended and was retired, a host restart, or an
@@ -1999,8 +1926,7 @@ Important fields:
   terminal open past the stop deadline, or past the drain window after the
   root exited on its own, so output written after the close is not retained,
   while the exit is exact. The runtime ends this way only after the worker
-  swept the runtime's marked processes, as described for `session.stop`. It is
-  additive in protocol 4; the protocol 3 adapter drops it.
+  swept the runtime's marked processes, as described for `session.stop`. 
 - `metadata`: owner-controlled strings; must not contain secrets. The daemon
   treats every key opaquely; clients own the convention. One such
   client-defined convention is the `link.*` key family (`link.provider`,
@@ -2023,8 +1949,7 @@ Important fields:
   and reported as received; the pair is a reference and is never resolved
   against the sessions of this daemon. The link is host-recorded attribution, not a security
   boundary: a process of the same user can omit the origin variables, and then no
-  spawner is recorded. It is additive in protocol 4; the protocol 3 adapter drops
-  it.
+  spawner is recorded.
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
 
@@ -2448,7 +2373,7 @@ returned cursor and branch on the reason. The CLI form is `pohunek session wait
 ```json
 {
   "session_ids": ["s-41", "s-42"],
-  "until": ["turn_completed", "agent_blocked", "approval_required", "exited"],
+  "until": ["turn_completed", "turn_error", "agent_blocked", "approval_required", "exited"],
   "after": "t1.17.1791800000000000000.d-4242-1791799000000000000-0",
   "timeout_ms": 300000
 }
@@ -2457,7 +2382,7 @@ returned cursor and branch on the reason. The CLI form is `pohunek session wait
 | Param | Type | Notes |
 |---|---|---|
 | `session_ids` | `SessionId[]` | Required, 1 to `MAX_SESSION_WAIT_TURN_TARGETS` (32), no repeats. Every target must exist when the call starts, or it fails with `session_not_found` before taking a waiter slot. |
-| `until` | `SessionTurnEventKind[]` | Required, non-empty, no repeats: `turn_completed`, `agent_blocked`, `approval_required`, `exited`. |
+| `until` | `SessionTurnEventKind[]` | Required, non-empty, no repeats: `turn_completed`, `turn_error`, `agent_blocked`, `approval_required`, `exited`. |
 | `after` | opaque string, optional | The `cursor` of an earlier result; 1 to `MAX_SESSION_TURN_CURSOR_BYTES` (256) printable ASCII bytes. |
 | `timeout_ms` | `u32`, optional | Non-zero. Omitted means the daemon default (5 minutes unless `service.toml` `[waits]` `turn_default_ms` sets another). Above the daemon ceiling (`turn_max_ms`, 30 minutes by default) the call fails with `session_wait_limit_exceeded`; it is never clamped. |
 
@@ -2504,7 +2429,7 @@ call sends no heartbeat frames; the result is the only response line.
 | Result field | Type | Notes |
 |---|---|---|
 | `reason` | `SessionWaitTurnReason` | `event`, `timeout`, `cursor_reset`, or `targets_ended`. |
-| `event` | `SessionTurnEvent`, optional | Present exactly when `reason` is `event`: `session_id`, `kind`, `at` (RFC 3339 time the daemon recorded the event, after any debounce), and `notification_id` when the notification policy kept an inbox record for the same event. |
+| `event` | `SessionTurnEvent`, optional | Present exactly when `reason` is `event`: `session_id`, `kind`, `at` (RFC 3339 time the daemon recorded the event, after any debounce), and `notification_id` for an `agent_blocked` or `approval_required` event whose attention record the inbox holds. `turn_completed` and `turn_error` never name a record. |
 | `cursor` | opaque string | Pass it as `after` to the next wait. |
 | `progress` | `SessionTurnProgress[]` | One entry per target, in request order, in every result. |
 
@@ -2513,7 +2438,7 @@ Each progress entry carries `state`, `activity` (omitted when unknown),
 none), `output_advanced` (output arrived after the cursor was issued, or after
 the call started without a cursor), and `turn_started_at` (the last transition
 into `working` this daemon observed, omitted when none; after a resumed turn it
-can be later than the `turn_started_at` of the turn's notification). A timeout with
+can be later than the start of the turn). A timeout with
 `output_advanced: true` and `activity: "working"` reads as "still working, wait
 again"; a long-quiet `last_output_at` reads as "stuck or waiting on an empty
 prompt, investigate".
@@ -2542,23 +2467,22 @@ daemon restart.
 
 Event sources:
 
-- `turn_completed`, `agent_blocked`, and `approval_required` come from two
-  trusted producers only: provider hook reports through `notification.create`
-  with the `turn:<session_id>` or `attention:<session_id>` dedupe key, from a
-  provider with a hook schema (Claude, Codex, Hermes, Muse) or a held
-  session's own runtime whose report the session's runtime admits, for a session
-  this daemon holds (the worker relays its hook socket reports the same way);
-  and the daemon projector's `agent_blocked` for a detected blocked activity and
-  its `turn_completed` for a session whose activity goes from `working` to
-  `idle`. A create from any other producer, or from a hook provider for a
-  session whose launch is still in flight, is handled by the inbox only and
-  records no turn event; a hook-provider create for any other session the
-  daemon does not hold is refused with `hook_not_admitted` (see hook
-  admission above). Trusted signals are recorded whether or
-  not the notification policy keeps an inbox record. With the default policy,
-  `turn_completed` is disabled for the inbox, so `notification.create` still
-  answers `notification_kind_disabled` and no record is listed, yet the turn
-  event is recorded and completes waits.
+- `turn_completed`, `turn_error`, `agent_blocked`, and `approval_required` come
+  from two trusted producers only: provider hook reports through
+  `notification.create` from a provider with a hook schema (Claude, Codex,
+  Hermes, Muse) or a held session's own runtime whose report the session's
+  runtime admits, for a session this daemon holds (the worker relays its hook
+  socket reports the same way); and the daemon projector's `agent_blocked` for
+  a detected blocked activity and its `turn_completed` for a session whose
+  activity goes from `working` to `idle`. A hook report of kind `turn_completed`
+  becomes a `turn_completed` event, one of kind `error` (Claude `StopFailure`,
+  Hermes) a `turn_error` event, and an `agent_blocked` or `approval_required`
+  report an event of that kind. A create from any other producer, or from a
+  hook provider for a session whose launch is still in flight, records no turn
+  event; a hook-provider create for any other session the daemon does not hold
+  is refused with `hook_not_admitted` (see hook admission above). No turn
+  report is stored: `notification.create` answers `created: false` and
+  `notification.list` never shows one.
 - They follow the attention debounce: an event is recorded when
   `attention_debounce_secs` (5 seconds by default) has passed since the last
   signal for the same session and kind, so it arrives no earlier than that
@@ -2567,8 +2491,9 @@ Event sources:
   work or ends inside the window. A `turn_completed` report that names no turn
   is dropped when the session is `working` when its window ends: that is the
   stale stop of an earlier turn, and the running turn reports its own stop. A
-  report of a turn the daemon runs is held until that turn is over. A turn that starts
-  and stops within the window (a short turn) is recorded once, after its stop.
+  report of a turn the daemon runs is held until that turn is over. A turn that
+  starts and stops within the window (a short turn) is recorded once, after its
+  stop.
 - A turn ends, for the projector, when activity goes `working` to `idle`; a
   turn that ends `blocked`, an idle that no `working` preceded (start-up, an
   empty prompt) and a session whose runtime was replaced mid-turn report no
@@ -2582,15 +2507,14 @@ Event sources:
   banner, or the repaint of a resumed or re-adopted session, is no turn: a
   resume, replacement or re-adoption starts without any evidence. A report
   of `working` opens its turn with or without evidence. Output without
-  evidence still continues a turn that is settling or waiting for approval. The report is held for the debounce window, so an idle that
-  lasts less than `attention_debounce_secs` before the session works again
-  reports nothing. A hook `Stop` and the projector's idle edge of one turn are
-  one inbox record; a hook report that arrives after its turn was reported, within
-  twice `attention_debounce_secs` (at least 2 seconds) of the record reaching the
-  inbox, adds no second record, though a waiting `session.wait_turn` may see one more turn
+  evidence still continues a turn that is settling or waiting for approval. The
+  report is held for the debounce window, so an idle that lasts less than
+  `attention_debounce_secs` before the session works again reports nothing. A
+  hook `Stop` and the projector's idle edge of one turn may each record a
+  `turn_completed` event, so a waiting `session.wait_turn` may see one more turn
   event. A daemon restart during a turn, or during the window, can lose that
   turn's report. A runtime without managed hooks (a shell, Hermes without its
-  plugin) now completes `until: ["turn_completed"]` waits too.
+  plugin) completes `until: ["turn_completed"]` waits too.
 - `exited` is recorded when a session the daemon holds moves from a running
   state into a terminal lifecycle state, at the moment the terminal state
   becomes visible; a wait that sees every target terminal therefore already
@@ -2612,10 +2536,7 @@ default); the timeout stays the release bound for a client that pipelines
 another request line behind the wait. `session.wait` is a
 separate method with its own 8,000 ms limit.
 
-A protocol 3 connection does not define the method: the daemon answers
-`method_not_found`, and a current SDK client fails with
-`daemon/daemon_protocol_too_old` before sending it. A protocol 4 daemon of an
-earlier release answers `daemon/method_not_found`.
+A daemon of an earlier release answers `daemon/method_not_found`.
 
 ### Active-Agent Hook Payloads
 
@@ -3360,10 +3281,9 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `session.report_agent` accepts the nested agent `source`, `agent`, optional
 `activity`, optional `seq`, optional `pid`, and optional active native metadata.
 `seq` is a decimal string. A session keeps the protocol version of its launch
-(`POHUNEK_PROTOCOL_VERSION`), so a session launched under protocol 3 keeps
-reporting after a daemon upgrade: its hooks send the range `3..=3` and spell the
-worker instance key `runtime_id` in `session.report_native_id`, which the
-daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
+(`POHUNEK_PROTOCOL_VERSION`), so a session launched under protocol 4 stops
+reporting after a daemon upgrade to protocol 5 (its hooks announce `4..=4` and
+are refused) until it is relaunched. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
 `POHUNEK_INTEGRATION_VERSION=16`, run their interpreter in isolated mode (`-I`,
@@ -3475,10 +3395,7 @@ Metadata predicates combine with each other and all other session predicates
 using AND semantics. The daemon applies the same key and value validation used
 by `session.set_metadata`; it does not interpret or normalize either string.
 They filter the sessions returned by the existing list operation without
-changing its visibility or response constraints. A protocol-3 client cannot
-express these filters. A current Rust or TypeScript SDK returns
-`daemon/daemon_protocol_too_old` for a protocol-3 daemon before it can send a
-request whose metadata predicates compatibility translation would drop.
+changing its visibility or response constraints. 
 
 ### `NotificationRecord`
 
@@ -3488,10 +3405,12 @@ Important fields:
 - `source`: sanitized producer identity with `provider`, `provider_event`, and
   `host_local_source_id`. Provider hooks use `codex` or `claude`; daemon
   projectors use `pohunek`.
-- `kind`: `agent_blocked`, `approval_required`, `turn_completed`,
-  `session_finished`, `error`, or `system`.
+- `kind`: `agent_blocked` or `approval_required`. The wire enum also decodes
+  `turn_completed`, `session_finished`, `error` and `system`, which earlier
+  releases stored; the daemon never creates or lists them.
 - `severity`: `info`, `success`, `warning`, `error`, or `action_required`.
-- `status`: `unread`, `read`, `acknowledged`, `archived`, or `deleted`.
+- `status`: `unread` or `acknowledged`. The enum also decodes `read`,
+  `archived` and `deleted` from earlier releases; the daemon never emits them.
   A `severity` or `status` a newer daemon defines reads as `unknown` on the Rust
   client and the CLI, so `notifications watch` keeps streaming past such a
   record; an `unknown` status matches neither `--unread` nor `--status`. The daemon never
@@ -3524,41 +3443,24 @@ Important fields:
   release lists (a manual `pohunek integration install` is needed only for
   homes the upgrade plan does not list).
 - `dedupe_key`: optional source-independent id for one logical event. Session
-  attention notifications use `attention:<session_id>`; session turn-completion
-  notifications use `turn:<session_id>`.
-- `read_at`, `acked_at`, `archived_at`, `deleted_at`: lifecycle timestamps set
-  by status transitions.
+  attention notifications use `attention:<session_id>`. `turn:<session_id>` is
+  reserved for the turn reports of installed hooks, which are not stored.
+- `acked_at`: set when the record resolves. `read_at`, `archived_at` and
+  `deleted_at` only appear on records an earlier release wrote.
 - `hook_admitted`: optional boolean, omitted when false. `true` when the daemon
   admitted the create as a hook claim of its session's runtime (see the source
   ranking below). Older clients ignore it. The notification store records this
   with format 2; a daemon reads format 1 stores unchanged, ranks their
   records without the key by provider name, and rewrites the marker to 2.
-- `turn_started_at`, `turn_duration_ms`, `session_metadata`: optional, on a
-  `turn_completed` that the daemon stamps: the projector's, and a provider hook
-  report that attaches to a turn the session's current agent runs.
-  `turn_started_at` is the daemon's clock reading of the turn's first transition
-  into `working`; a turn that waited in `blocked` and resumed, or went `idle`
-  and worked again within the settle window, is still one turn.
-  `turn_duration_ms` runs from it to the moment the session left `working`, on
-  the monotonic clock; `session_metadata` is a verbatim copy of the session's
-  owner-set metadata at that moment, kept after the session is removed. The
-  daemon gives every turn an identity of its own and decides which turn a
-  report ends: the projector's report names its turn, and a provider hook
-  report (which carries no identity) attaches to the newest turn of the
-  current agent that can still end. Such a report is held, and evaluated again
-  every window, until its turn is over for good, so one turn is one record.
-  A turn whose agent or runtime leaves while it works, that ends `blocked`, or
-  whose session ends is never reported; a turn that had already gone idle when
-  its agent or runtime left is reported as it ended. A hook report that
-  attaches to no turn (a turn the daemon did not observe) carries none of these fields. A producer cannot send
-  these fields: `notification.create` ignores them.
-- `superseded_by`: optional replacement link. Older unread `turn_completed`
-  records are acknowledged with `superseded_by` pointing at the newer turn or
-  attention record that made them stale.
+- `turn_started_at`, `turn_duration_ms`, `session_metadata`: optional, only on
+  a `turn_completed` record an earlier release wrote. They are not produced
+  any more and a producer cannot send them.
+- `superseded_by`: optional replacement link on records an earlier release
+  wrote.
 
 A notification store this build cannot use safely (`notifications/format.json`
-names a newer format or cannot be read, an action line cannot be decoded, or
-`policy.json` is rejected) does not stop the daemon. Every notification RPC then
+names a newer format or cannot be read, or an action line cannot be decoded)
+does not stop the daemon. Every notification RPC then
 answers the `daemon` error `notifications_unavailable` with a recovery hint (a
 create with an invalid session id or reserved dedupe key reports that validation
 error first), the
@@ -3567,8 +3469,8 @@ write nor compact until a build that reads the store runs or the `notifications`
 directory is moved aside. A hook or projector turn report is refused the same way, but its turn
 signal still reaches `session.wait_turn`.
 
-`notification.list` sorts by `created_at` descending, then `id`, and omits
-deleted records by default. `NotificationListParams` can filter by status, kind,
+`notification.list` sorts by `created_at` descending, then `id`, and returns
+attention records only. `NotificationListParams` can filter by status, kind,
 severity, provider, session id, and creation time range, plus `limit` and
 `cursor`.
 A result whose records do not fit one control line answers
@@ -3583,97 +3485,40 @@ release sends a line longer than the control-line limit instead, which ends
 the connection; the listing then starts again from the first page at half the
 size on a new connection, so no cursor crosses connections.
 
-### `NotificationPolicy`
+### Notification lifecycle
 
-Important fields:
+The inbox holds attention only. A turn end (`turn_completed`) and a turn error
+(`error`) are turn signals for `session.wait_turn`, never records. The daemon
+does not derive `session_finished`, `error` or `system` records from session
+state either; `session list` shows the state.
 
-- `attention_dedupe_window_secs`: window for source-independent attention
-  dedupe. The default is 120 seconds.
-- `attention_debounce_secs`: shared window a deferred session attention or
-  turn-completion notification is held pending before it is allowed to surface.
-  The default is 5 seconds. Additive: a policy JSON written before this field
-  existed loads the default.
-- `enabled`: base per-kind flags used when a provider has no explicit entry.
-- `providers`: optional deterministically ordered object mapping provider wire
-  names to complete per-kind overrides. Missing keys fall back to `enabled`.
-  The default policy has no overrides, and an empty map is omitted on the wire.
-- `retention`: automatic daemon-owned cleanup and physical-compaction settings.
-  Persisted policies without this additive field receive the defaults.
+The notification timings are the optional `[notifications]` table of
+`service.toml`, read at start:
 
-For example, a policy with one operator-set override that enables
-`turn_completed` for the `pi` runtime:
+- `attention_dedupe_window_secs` (default 120): window within which a provider
+  hook and the daemon projector reporting the same attention moment collapse
+  into one record.
+- `attention_debounce_secs` (default 5): how long a session attention or turn
+  signal is held before it may surface.
+- `record_ttl_secs` (default 1209600, 14 days): a resolved (`acknowledged`)
+  record is removed this long after it resolved. Open records never expire.
+- `record_sweep_interval_secs` (default 3600): the interval of the retention
+  sweep, which also runs once at start.
 
-```json
-{
-  "attention_dedupe_window_secs": 120,
-  "attention_debounce_secs": 5,
-  "enabled": {
-    "agent_blocked": true,
-    "approval_required": true,
-    "turn_completed": false,
-    "session_finished": false,
-    "error": true,
-    "system": false
-  },
-  "providers": {
-    "pi": {
-      "agent_blocked": true,
-      "approval_required": true,
-      "turn_completed": true,
-      "session_finished": false,
-      "error": true,
-      "system": false
-    }
-  },
-  "retention": {
-    "sweep_interval_secs": 21600,
-    "info_ttl_secs": 259200,
-    "warning_ttl_secs": 1209600,
-    "resolved_attention_ttl_secs": 604800,
-    "resolved_error_ttl_secs": 2592000,
-    "archived_ttl_secs": 7776000,
-    "compaction_min_actions": 1000
-  }
-}
-```
+The sweep rewrites `notifications.jsonl` through a temporary file and an
+atomic rename, so a crash leaves the old or the new file whole. It removes
+every record of a kind the inbox no longer holds and every deleted record
+besides the expired resolved ones, and copies the old log once to
+`notifications.jsonl.pre-format-3` first. Format 3 no longer has a
+`policy.json`; the file of an earlier release is ignored. Each removed
+attention record emits `notification_deleted`.
 
-Provider names are open strings so adding a provider does not change this wire
-shape. The former fixed `codex` / `claude` fields are not accepted and have no
-compatibility shim.
-
-Default policy enables `agent_blocked`, `approval_required`, and `error`.
-`turn_completed`, `session_finished`, and `system` are implemented but disabled
-by default. The daemon emits one `turn_completed` per finished turn of every
-session, so enabling it (`notifications policy set`) is meant for managers and
-dashboards, not for interactive inboxes; with the kind disabled, the turn is
-still recorded for `session.wait_turn`. The default policy has no per-provider entries, so every provider,
-whatever runtime it names, uses `enabled` until an override is set for it. A
-policy file the daemon already persisted is loaded as written, including any
-per-provider entries it holds; those overrides keep shadowing `enabled` for
-their providers, so change them with `policy set --provider <runtime-id>` to
-the wanted value.
-
-Every retention duration and `compaction_min_actions` must be greater than zero.
-The daemon runs one sweep at startup and then every `sweep_interval_secs` using
-the current policy. Informational/success, warning, acknowledged attention,
-acknowledged error, and archived records use their respective TTLs. Unread or
-read action-required and error records are never deleted automatically. After
-eligible records receive normal deletion events, the store atomically rewrites
-the action log to one current action per non-deleted record once the configured
-action threshold is reached. Deleted daemon-projected terminal notifications
-also keep bounded, invisible replay evidence: at most one deleted snapshot per
-terminal kind (`error`, `session_finished`) for each durable session's current
-runtime generation. This prevents restart replay from recreating an owner-deleted
-terminal notification. The next eligible compaction removes that evidence after
-the source session is removed or advances generation. If session metadata is
-unreadable, rejected, or has a torn final record, compaction keeps every terminal
-tombstone rather than guessing which sources are absent, while still compacting
-other action history. It logs this condition once per store instance; the normal
-per-generation bound resumes once the metadata can be read completely.
-
-Policy is enforced daemon-side for all notification producers. If a producer
-creates a disabled kind, `notification.create` returns
-`runtime/notification_kind_disabled`.
+`notification.create` accepts every kind. An attention kind follows the rules
+below. `turn_completed` and `error` from an admitted hook claim of a held
+session become turn signals; the answer carries the minted record with
+`created: false` and nothing is stored. Any other kind is accepted and dropped
+the same way, so a hook of an earlier release never sees an error for a report
+the daemon no longer keeps.
 
 A record ranks as a provider hook when the daemon admitted its create as a hook
 claim (the record's `hook_admitted`, below), or when its `provider` is an
@@ -3705,69 +3550,48 @@ answers `created: true` with a minted id; the dedupe happens when the debounce
 flush commits the record. A provider hook record then upgrades an existing
 projector attention record in place and emits `notification_updated`. A
 projector record for a key that already has a provider-backed record is
-dropped. Provider hooks of equal rank dedupe against each other: a `hermes` or
-`shell` record for a key that already has a provider-backed record inside the
-window (from the same or another hook provider) is dropped. A dropped record
-never persists and emits no event, so its minted id is never listed,
-`notification.update` on it returns `notification_not_found`, and
-`notification.delete` returns `deleted: false`.
+dropped. Provider hooks of equal rank dedupe against each other. A dropped
+record never persists and emits no event, so its minted id is never listed.
 User/external sources do not automatically supersede provider records. While
 records for one session key are held pending in the debounce window, the
 higher-ranked record is kept and an equal-ranked later record replaces the
 earlier one, so a provider hook report pending beside a user report is the one
 committed.
 
-`turn:<session_id>` has different semantics: it is not time-window deduped. A
-new unread `turn_completed` for the same session acknowledges any older unread
-turn immediately and sets the older record's `superseded_by` to the newer id;
-each turn keeps its own record, and the record of a finished turn is
-acknowledged when the next turn starts. Reports of one turn are merged while
-pending and add nothing once the turn was reported; reports of different turns
-are never merged. A provider report that names no turn right after the
-session's turn reached the inbox, within that repeat window, does not add a second inbox record.
-The older record remains in history but disappears from default unread inbox
-views. When an attention record for the same session becomes visible, it
-acknowledges any unread `turn:<session_id>` twin with `superseded_by` pointing at
-the attention record because `agent_blocked`/`approval_required` subsumes "the
-turn completed and is waiting".
-
-When a session enters `working`, or reaches a terminal lifecycle state, the daemon resolves both
-`attention:<session_id>` and `turn:<session_id>`. Pending records with those
-keys are dropped before they ever persist, and already-visible unread/read
-matching records are acknowledged with `notification_updated`. An `idle`
-observation alone does not resolve attention because a live approval prompt can
-be technically idle while still requiring owner input.
+When a session enters `working`, or reaches a terminal lifecycle state, the
+daemon resolves `attention:<session_id>` and `turn:<session_id>`. Pending
+records and signals with those keys are dropped before they ever persist, and
+already-visible unread matching records are acknowledged with
+`notification_updated`. An `idle` observation alone does not resolve attention
+because a live approval prompt can be technically idle while still requiring
+owner input.
 
 #### Session notification debounce
 
-`agent_blocked`, `approval_required`, and session-scoped `turn_completed` are
-held pending rather than persisted immediately when they carry
-`attention:<session_id>` or `turn:<session_id>`. The daemon mints the
+`agent_blocked` and `approval_required` are held pending rather than persisted
+immediately when they carry `attention:<session_id>`. The daemon mints the
 notification id and returns `notification.create` result `created: true` with
 the full record, but the record is not written to the store and does not appear
 in `notification.list` until it flushes. No `notification_created` event is
-emitted for a pending record. A `turn_completed` record is stamped with
-`turn_started_at`, `turn_duration_ms` and `session_metadata` when it flushes, so
-the record in the `notification.create` result does not carry them; the one in
-`notification.list` and the events does.
+emitted for a pending record. A turn signal is held the same way.
 
 The daemon holds the pending record for `attention_debounce_secs`. If the
 session enters `working` or reaches a terminal lifecycle state within that
-window, the pending record is dropped entirely: nothing is ever persisted, and no event fires. Only if the
-window elapses with the session signal still outstanding does the daemon commit
-the record through the store and emit `notification_created`, exactly as an
-immediate create would. Debounce does not apply to `session_finished`, `error`,
-or `system`.
+window, the pending record is dropped entirely: nothing is ever persisted, and
+no event fires. Only if the window elapses with the signal still outstanding
+does the daemon commit the record through the store and emit
+`notification_created`, exactly as an immediate create would.
 
-`attention_dedupe_window_secs` and `attention_debounce_secs` are independent and
-answer different questions:
+#### Terminal approval notices
 
-- `attention_dedupe_window_secs` controls whether two producers reporting the
-  *same* attention moment (a provider hook and the daemon projector) collapse
-  into one record instead of two.
-- `attention_debounce_secs` controls *whether and when* a pending session
-  notification is allowed to surface at all, regardless of how many producers
-  reported it.
+A terminal notice that starts with `Approval requested` (`OSC 9`, `OSC 777
+notify`, or a complete `OSC 99` title or body) is a fallback attention source.
+The daemon creates one `approval_required` record with the shared
+`attention:<session_id>` key and the `terminal_notice` reason, held in the
+debounce window, unless an authoritative OSC 7501 program-status record is held
+or a provider hook already spoke for the session in its current runtime
+generation. A notice never changes the session's activity, and no other notice
+text produces a record.
 
 ### Provider Notification Hooks
 
@@ -4209,7 +4033,9 @@ and `StopFailure`. `Notification` matcher values map as follows:
 while the normal `idle_prompt` creates no notification. `auth_success`,
 `elicitation_complete`, and `elicitation_response` create `system`. The
 notification hook's `Stop` creates `turn_completed`; `StopFailure` creates
-`error`. The separate state hook entry on `Stop` creates no notification; it
+`error`. The daemon stores neither `system`, `turn_completed` nor `error`: a
+`Stop` becomes a `turn_completed` turn event and a `StopFailure` a `turn_error`
+turn event for `session.wait_turn`. The separate state hook entry on `Stop` creates no notification; it
 sends only the subagent snapshot to the worker and has no daemon fallback.
 
 When `POHUNEK_SESSION_ID` is valid, the managed hooks add
@@ -4680,10 +4506,8 @@ printf '%s' 'Why does attach fail on my laptop?' \
 pohunek session list --meta-eq launch=7f3a9c --json
 ```
 
-A protocol-3 host keeps the metadata but refuses metadata filters with
-`daemon_protocol_too_old` before the request is sent. On such a host, list
-without the filter (`pohunek session list --json`) and match each session's
-`metadata` instead.
+A host whose daemon predates the filters refuses them; list without the filter
+(`pohunek session list --json`) and match each session's `metadata` instead.
 
 How to read the result:
 
@@ -4813,21 +4637,6 @@ The CLI exposes durable notifications through `pohunek notifications`:
   `--unread`) filter client-side on the record each create or update event
   carries; while any filter is set, `notification_deleted` events are dropped
   because they carry only the notification id.
-- `pohunek notifications read|ack|archive|delete <target>`: update one record.
-  Targets accept bare `id` or `host/id`; an explicit target host overrides
-  `--host`.
-- `pohunek notifications policy get|set`: read policy or toggle one
-  provider/kind flag. `set` accepts `--provider default|<runtime-id>`, where
-  `default` selects the base `enabled` flags and any valid runtime id, installed
-  or not, selects that provider's override (seeded from `enabled`). `default`
-  is a keyword, so it shadows a runtime literally named `default`, whose
-  override can be set only through `notification.policy.set`. `set` also takes
-  `--kind <kind>` and exactly one of `--enabled` or `--disabled`.
-- `pohunek notifications retention prune`: explicitly prune records selected by
-  `--status`, `--before`, and `--limit`, with exactly one of `--dry-run` or
-  `--apply`. Automatic age-based retention runs independently in the daemon
-  from the persisted policy returned by `policy get`.
-
 Commands that support `--all-hosts` render per-host successes and structured
 per-host errors. Cross-host notification aggregation is client-side; no central
 notification server is introduced.
@@ -4960,7 +4769,7 @@ TypeScript SDK, and `subscribe` is also called by the CLI (`pohunek subscribe`,
   `crates/protocol/tests/host_record_previous.rs`.
 - `host.resolve`: socket-level coverage in `crates/daemon/tests/host_resolve.rs`
   (peer and pinned-route answers, `local` names, the typed errors, and
-  `method_not_found` over the overlay listener) and the protocol 3 refusal in
+  `method_not_found` over the overlay listener) and the version-window refusal in
   `crates/daemon/tests/protocol_window.rs`; the TypeScript SDK side is covered by
   `sdk/ts/sdk/test/host-resolution.test.ts` and, against a real daemon,
   `sdk/ts/sdk/test/host-resolution.e2e.test.ts`.
@@ -5305,15 +5114,6 @@ Request APIs:
   `notification.create`.
 - `Client::list_notifications(NotificationListParams)`: calls
   `notification.list`.
-- `Client::update_notification(NotificationUpdateParams)`: calls
-  `notification.update`.
-- `Client::delete_notification(NotificationDeleteParams)`: calls
-  `notification.delete`.
-- `Client::get_notification_policy()`: calls `notification.policy.get`.
-- `Client::set_notification_policy(NotificationPolicyParams)`: calls
-  `notification.policy.set`.
-- `Client::prune_notifications(NotificationRetentionParams)`: calls
-  `notification.retention.prune`.
 
 SDK error mapping preserves daemon protocol errors and adds host/transport
 context for local and remote failures. Use `ClientError::to_protocol_error()` to

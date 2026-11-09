@@ -35,8 +35,8 @@ function isLocalHost(host: string): boolean {
  * route is resolved by the daemon on `socketPath` with the rules of the CLI and
  * the Rust client: this machine's own overlay name is `local`, a name that this
  * machine and a peer share is `overlay_host_ambiguous`, and a peer is returned
- * with a `pinnedRoute` that keeps selecting it. Fails with
- * `daemon_protocol_too_old` against a daemon of the previous protocol version.
+ * with a `pinnedRoute` that keeps selecting it. A daemon outside
+ * the protocol window fails the call with `version_mismatch`.
  */
 export async function resolveHost(
   route: string,

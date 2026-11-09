@@ -22,19 +22,19 @@ use protocol::compat::{introduced_methods, renamed_keys, RANGE_FORWARDING_METHOD
 use protocol::{
     event, method, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundItem,
     BackgroundKind, BackgroundRevision, BackgroundStatus, CwdSource, Event, NotificationId,
-    NotificationKind, NotificationKindPolicy, NotificationPolicy, NotificationRecord,
-    NotificationSeverity, NotificationSource, NotificationStatus, OutputOffset, ProtocolError,
-    Request, Response, RuntimeGeneration, RuntimeRef, SessionBackground, SessionCapabilities,
-    SessionEvent, SessionId, SessionInfo, SessionListFilter, SessionListParams, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionRuntimeIdentity, SessionScreenParams,
-    SessionScreenResult, SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, SpawnedBy, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, TerminalCursor, TerminalDimensions, TerminalWatermark,
-    CLIENT_PROTOCOL_VERSIONS, MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS,
-    MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS,
-    MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
+    NotificationStatus, OutputOffset, ProtocolError, Request, Response, RuntimeGeneration,
+    RuntimeRef, SessionBackground, SessionCapabilities, SessionEvent, SessionId, SessionInfo,
+    SessionListFilter, SessionListParams, SessionOutputGap, SessionOutputParams,
+    SessionOutputResult, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
+    SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, SpawnedBy, StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision,
+    TerminalCursor, TerminalDimensions, TerminalWatermark, CLIENT_PROTOCOL_VERSIONS,
+    MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS, MAX_CONTROL_LINE_BYTES,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_TURN_CURSOR_BYTES,
+    MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS,
+    MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -634,10 +634,6 @@ fn wait_fixtures(
 
 fn model_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError> {
     Ok(vec![
-        fixture(
-            "notification-policy-provider-keyed.json",
-            &notification_policy(),
-        )?,
         fixture("session-info-full.json", &values.session_full)?,
         fixture("session-info-minimal.json", &values.session_minimal)?,
         fixture(
@@ -664,36 +660,6 @@ fn model_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskErro
             },
         )?,
     ])
-}
-
-fn notification_policy() -> NotificationPolicy {
-    let enabled = NotificationKindPolicy::from_flags([
-        (protocol::NotificationKind::AgentBlocked, true),
-        (protocol::NotificationKind::ApprovalRequired, true),
-        (protocol::NotificationKind::TurnCompleted, true),
-        (protocol::NotificationKind::SessionFinished, true),
-        (protocol::NotificationKind::Error, true),
-        (protocol::NotificationKind::System, true),
-    ]);
-    let mut providers = BTreeMap::new();
-    providers.insert("codex".to_owned(), {
-        let mut policy = enabled.clone();
-        policy.set(protocol::NotificationKind::TurnCompleted, false);
-        policy
-    });
-    providers.insert("future-agent".to_owned(), {
-        let mut policy = enabled.clone();
-        policy.set(protocol::NotificationKind::System, false);
-        policy
-    });
-    NotificationPolicy {
-        attention_dedupe_window_secs: 30,
-        attention_debounce_secs: 5,
-        enabled,
-        providers,
-        retention: protocol::NotificationRetentionPolicy::default(),
-        unknown_fields: protocol::tolerant::UnknownFields::default(),
-    }
 }
 
 fn fixture<T>(file_name: &'static str, value: &T) -> Result<NamedFixture, XtaskError>

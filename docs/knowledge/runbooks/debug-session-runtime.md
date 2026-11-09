@@ -677,7 +677,8 @@ seconds by default) after the last stop or attention report, and later when
 reports repeat. A `turn_completed` whose window ends while the session is
 `working` is a stale stop and never fires; a short turn still fires once after
 its stop. A `notification.create` from a producer without a hook schema, or for
-a session this daemon does not hold, never produces a turn event.
+a session this daemon does not hold, never produces a turn event. A `turn_error`
+event comes from a hook `error` report (Claude `StopFailure`, Hermes).
 `pohunek session wait <target>...` without legacy flags is the CLI form of
 this method: a `cli_usage` failure saying the targets must be on one host means
 the targets name different hosts (run one wait per host), and one saying the

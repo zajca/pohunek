@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, type HostResolution } from "@pohunek/protocol";
+import { PROTOCOL_VERSION, type HostResolution } from "@pohunek/protocol";
 import { ClientError, attachRaw, connectHost, resolveHost } from "@pohunek/sdk";
 import {
   errResponseLine,
@@ -36,27 +36,12 @@ function keepOpen(line: (requestLine: string) => string): ScriptStep {
   return { kind: "delay", ms: 0, line };
 }
 
-/** The version probe a client sends before a method newer than protocol 3. */
-function healthReply(): ScriptStep {
-  return keepOpen((requestLine) =>
-    okResponseLine(requestIdFromLine(requestLine), {
-      status: "ok",
-      daemon_version: "local",
-      protocol_version: PROTOCOL_VERSION,
-    }),
-  );
-}
-
 function resolveReplies(resolution: HostResolution): ScriptStep[] {
-  return [
-    healthReply(),
-    keepOpen((requestLine) => okResponseLine(requestIdFromLine(requestLine), resolution)),
-  ];
+  return [keepOpen((requestLine) => okResponseLine(requestIdFromLine(requestLine), resolution))];
 }
 
-/** Consumes the version probe and returns the `host.resolve` request that follows. */
+/** Returns the next `host.resolve` request the daemon received. */
 async function nextResolveRequest(daemon: MockDaemon): Promise<Record<string, unknown>> {
-  expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
   return parseRequestLine(await daemon.nextRequest());
 }
 
@@ -154,7 +139,6 @@ describe("host resolution through the local daemon", () => {
   ] as const) {
     test(`the daemon's ${code} error keeps its code, message and hint`, async () => {
       const daemon = await startUnixDaemon([
-        healthReply(),
         keepOpen((requestLine) =>
           errResponseLine(requestIdFromLine(requestLine), {
             class: "discovery",
@@ -179,31 +163,6 @@ describe("host resolution through the local daemon", () => {
       }
     });
   }
-
-  test("a daemon of the previous protocol version refuses it as too old", async () => {
-    const daemon = await startUnixDaemon([
-      {
-        kind: "reply",
-        line: (requestLine) =>
-          JSON.stringify({
-            v: MIN_PROTOCOL_VERSION,
-            id: requestIdFromLine(requestLine),
-            ok: { status: "ok", daemon_version: "0.0.0", protocol_version: MIN_PROTOCOL_VERSION },
-          }),
-      },
-    ]);
-    try {
-      const error = await failure(resolveHost(PEER_ROUTE, unixPath(daemon)));
-
-      expect(error.kind).toBe("daemonProtocolTooOld");
-      expect(error.code).toBe("daemon_protocol_too_old");
-      // Only the version probe reached the daemon.
-      expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
-      await daemon.expectNoRequest(NO_REQUEST_WINDOW_MS);
-    } finally {
-      await daemon.close();
-    }
-  });
 });
 
 describe("connecting by host route", () => {
@@ -215,7 +174,7 @@ describe("connecting by host route", () => {
           okResponseLine(requestIdFromLine(requestLine), {
             status: "ok",
             daemon_version: "peer",
-            protocol_version: 4,
+            protocol_version: PROTOCOL_VERSION,
           }),
       },
     ]);
@@ -244,7 +203,7 @@ describe("connecting by host route", () => {
           okResponseLine(requestIdFromLine(requestLine), {
             status: "ok",
             daemon_version: "local",
-            protocol_version: 4,
+            protocol_version: PROTOCOL_VERSION,
           }),
       },
     ]);
@@ -311,7 +270,6 @@ describe("connecting by host route", () => {
   test("a failed resolution connects to nothing", async () => {
     const peer = await startTcpDaemon([]);
     const local = await startUnixDaemon([
-      healthReply(),
       keepOpen((requestLine) =>
         errResponseLine(requestIdFromLine(requestLine), {
           class: "discovery",
