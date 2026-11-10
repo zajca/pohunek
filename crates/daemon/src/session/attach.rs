@@ -193,6 +193,19 @@ impl SessionRegistry {
         })
     }
 
+    /// The session an attach stream belongs to, while the stream is pending or active.
+    pub async fn attach_session_id(&self, stream_id: &str) -> Option<SessionId> {
+        if let Some(active) = self.inner.active_attaches.lock().await.get(stream_id) {
+            return Some(active.session_id.clone());
+        }
+        self.inner
+            .pending_attaches
+            .lock()
+            .await
+            .get(stream_id)
+            .map(|pending| pending.session_id.clone())
+    }
+
     /// Cancel an active raw attach stream. Unknown streams are a no-op.
     pub async fn detach(&self, stream_id: &str) -> protocol::SessionDetachResult {
         let cancel = {

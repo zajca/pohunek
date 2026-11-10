@@ -816,6 +816,267 @@ async fn attach_over_tcp_round_trips_and_detach_keeps_session_running() {
     let _ = handle.await;
 }
 
+/// The audit lines written for the connection whose peer is `peer`.
+fn audit_lines(peer: &str) -> Vec<String> {
+    captured_log_lines("audit.session_change")
+        .into_iter()
+        .filter(|line| line.contains(peer))
+        .collect()
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one session walks every audited request kind against a single daemon and log"
+)]
+async fn session_changing_requests_are_audited_without_input_text() {
+    const INPUT_SENTINEL: &str = "SENTINEL-INPUT-7f3a91";
+    const KEYS_SENTINEL: &str = "SENTINEL-KEYS-5c2e08";
+    capture_daemon_log();
+    let (addr, socket, shutdown, handle) =
+        spawn_dual_servers("remote-audit", "0.0.0", shell_config()).await;
+
+    let mut control = connect_tcp(addr).await;
+    let peer = control
+        .get_ref()
+        .local_addr()
+        .expect("control connection address")
+        .to_string();
+    let created = create_session(&mut control, &socket).await;
+    let id = created.id.0.clone();
+
+    // Accepted input: one entry naming transport, peer, kind, session, outcome.
+    input_session(
+        &mut control,
+        &created.id,
+        &format!("echo {INPUT_SENTINEL}\n"),
+    )
+    .await;
+    // Refused input to a session that does not exist.
+    let unknown = Request::make(
+        "session-input-unknown",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: SessionId("no-such-session".to_owned()),
+            text: INPUT_SENTINEL.to_owned(),
+            wait: None,
+        })
+        .expect("serialize input params"),
+    );
+    exchange(&mut control, &unknown)
+        .await
+        .result()
+        .expect_err("input to an unknown session is refused");
+    // A read-only request is not audited.
+    inspect_session(&mut control, &created.id).await;
+
+    // Keys on the attach stream: one entry when the stream is opened.
+    let attach = attach_session(&mut control, &created.id).await;
+    let mut raw = open_attach_stream_tcp(addr, &attach.stream_id).await;
+    let raw_peer = raw
+        .local_addr()
+        .expect("attach connection address")
+        .to_string();
+    raw.write_all(format!("echo {KEYS_SENTINEL}\n").as_bytes())
+        .await
+        .expect("write keys over the attach stream");
+    read_until_marker(&mut raw, KEYS_SENTINEL.as_bytes()).await;
+    assert!(
+        detach_stream(&mut control, &attach.stream_id)
+            .await
+            .detached
+    );
+    // A detach never takes its session from a field the caller adds.
+    let forged = Request::make(
+        "forged-detach",
+        method::SESSION_DETACH,
+        serde_json::json!({ "stream_id": "no-such-stream", "session_id": "forged-session" }),
+    );
+    ok_payload(exchange(&mut control, &forged).await);
+
+    // Refused lifecycle requests are audited with the session they named.
+    for (id, kind) in [
+        ("refused-resume", method::SESSION_RESUME),
+        ("refused-remove", method::SESSION_REMOVE),
+        (
+            "refused-remove-accepting",
+            method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+        ),
+    ] {
+        let refused = Request::make(id, kind, serde_json::json!("ghost-session"));
+        exchange(&mut control, &refused)
+            .await
+            .result()
+            .expect_err("a request for an unknown session is refused");
+    }
+
+    // The origin markers a caller declares are logged as claimed, not attested.
+    let claimed = Request::make(
+        "session-input-claimed",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "true\n".to_owned(),
+            wait: None,
+        })
+        .expect("serialize input params"),
+    )
+    .with_origin(
+        Some(SessionId("s-claimed-origin".to_owned())),
+        Some("daemon-claimed-origin".to_owned()),
+    )
+    .expect("valid origin markers");
+    ok_payload(exchange(&mut control, &claimed).await);
+
+    // An attach stream that cannot be redeemed is audited as a refused request.
+    let mut bogus = open_attach_stream_tcp(addr, "no-such-stream-id").await;
+    let bogus_peer = bogus
+        .local_addr()
+        .expect("attach connection address")
+        .to_string();
+    assert_raw_stream_closes(&mut bogus).await;
+
+    let stop_req = Request::make(
+        "session-stop-audit",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    ok_payload(exchange(&mut control, &stop_req).await);
+
+    let lines = audit_lines(&peer);
+    let entry = |kind: &str| -> Vec<&String> {
+        lines
+            .iter()
+            .filter(|line| line.contains(&format!("kind={kind} ")))
+            .collect()
+    };
+    let new_entries = entry("session.new");
+    assert_eq!(new_entries.len(), 1, "{lines:?}");
+    assert!(
+        new_entries[0].contains(&id),
+        "new entry names the created session"
+    );
+    let input_entries = entry("session.input");
+    assert_eq!(input_entries.len(), 3, "{lines:?}");
+    for line in &input_entries {
+        assert!(line.contains("transport=remote"), "{line}");
+        assert!(line.contains(&peer), "{line}");
+    }
+    assert!(input_entries[0].contains(&id) && input_entries[0].contains("outcome=ok"));
+    assert!(
+        input_entries[1].contains("no-such-session") && input_entries[1].contains("outcome=error"),
+        "{}",
+        input_entries[1]
+    );
+    assert!(
+        input_entries[2].contains("claimed_origin_session=\"s-claimed-origin\"")
+            && input_entries[2].contains("claimed_origin_daemon=\"daemon-claimed-origin\""),
+        "{}",
+        input_entries[2]
+    );
+    let refused = audit_lines(&bogus_peer);
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(refused[0].contains("kind=attach.stream") && refused[0].contains("outcome=error"));
+    let detach_entries = entry("session.detach");
+    assert_eq!(detach_entries.len(), 2, "{lines:?}");
+    assert!(
+        detach_entries[0].contains(&id) && detach_entries[0].contains("outcome=ok"),
+        "a detach entry names the session of the stream: {}",
+        detach_entries[0]
+    );
+    assert!(
+        !captured_log_lines("audit.session_change")
+            .iter()
+            .any(|line| line.contains("forged-session")),
+        "a detach entry names no session the caller invented"
+    );
+    for kind in [
+        "session.resume",
+        "session.remove",
+        "session.remove_accepting_unconfirmed",
+    ] {
+        let refused = entry(kind);
+        assert_eq!(refused.len(), 1, "{kind}: {lines:?}");
+        assert!(
+            refused[0].contains("session=\"ghost-session\"")
+                && refused[0].contains("outcome=error"),
+            "{}",
+            refused[0]
+        );
+    }
+    assert_eq!(entry("session.stop").len(), 1, "{lines:?}");
+    assert!(
+        entry("session.inspect").is_empty(),
+        "read-only requests are not audited"
+    );
+    let attach_entries = audit_lines(&raw_peer);
+    assert_eq!(attach_entries.len(), 1, "{attach_entries:?}");
+    assert!(attach_entries[0].contains("kind=attach.stream"));
+    assert!(attach_entries[0].contains("transport=remote"));
+    assert!(attach_entries[0].contains(&id) && attach_entries[0].contains("outcome=ok"));
+
+    // Neither the input text nor the keys appear anywhere in the daemon's log.
+    let log = captured_log_lines("").join("\n");
+    assert!(
+        !log.contains(INPUT_SENTINEL),
+        "input text leaked into the log"
+    );
+    assert!(!log.contains(KEYS_SENTINEL), "keys leaked into the log");
+    assert!(
+        !log.contains(&attach.stream_id),
+        "the attach stream id leaked into the log"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// The same input over the local socket is audited as a local request.
+#[tokio::test]
+async fn local_session_changing_requests_are_audited_with_the_peer_process() {
+    capture_daemon_log();
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers("local-audit", "0.0.0", shell_config()).await;
+
+    let mut local = connect_unix(&socket).await;
+    let local_session = create_session(&mut local, &socket).await;
+    input_session(&mut local, &local_session.id, "true\n").await;
+    let local_entry = captured_log_lines("audit.session_change")
+        .into_iter()
+        .filter(|line| line.contains("kind=session.input") && line.contains(&local_session.id.0))
+        .collect::<Vec<_>>();
+    assert_eq!(local_entry.len(), 1, "{local_entry:?}");
+    assert!(local_entry[0].contains("transport=local"));
+    assert!(local_entry[0].contains(&format!("pid={}", std::process::id())));
+    assert!(local_entry[0].contains(&format!("uid={}", rustix::process::geteuid().as_raw())));
+
+    let refused = Request::make(
+        "local-refused-input",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: SessionId("local-ghost".to_owned()),
+            text: "true\n".to_owned(),
+            wait: None,
+        })
+        .expect("serialize input params"),
+    );
+    exchange(&mut local, &refused)
+        .await
+        .result()
+        .expect_err("input to an unknown session is refused");
+    let refused_entry = captured_log_lines("audit.session_change")
+        .into_iter()
+        .filter(|line| line.contains("local-ghost"))
+        .collect::<Vec<_>>();
+    assert_eq!(refused_entry.len(), 1, "{refused_entry:?}");
+    assert!(
+        refused_entry[0].contains("transport=local") && refused_entry[0].contains("outcome=error")
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 #[tokio::test]
 async fn host_inspect_over_tcp_returns_capabilities() {
     let (addr, _socket, shutdown, handle) = spawn_dual_servers_serving_official_runtimes(

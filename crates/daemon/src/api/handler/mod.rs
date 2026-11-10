@@ -35,11 +35,13 @@ use protocol::{
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 use pohunek_client::OverlayRegistry;
 
+use super::audit;
 use crate::discovery::DiscoveryCache;
 use crate::governance::HostGovernanceService;
 use crate::notifications::{AttentionCoordinator, NotificationService};
@@ -93,6 +95,10 @@ pub struct DaemonState {
     /// Set per accepted Unix connection. `None` on every other state, so a
     /// caller without an attested peer is refused where one is required.
     pub control_peer: Option<Arc<ControlPeer>>,
+    /// The overlay address of the one remote connection this state serves.
+    ///
+    /// Set per accepted remote connection; `None` on every other state.
+    pub remote_peer: Option<SocketAddr>,
     /// Runs package commands. States that serve one daemon share one service,
     /// so its limits hold across transports.
     pub package_commands: PackageCommandService,
@@ -166,6 +172,7 @@ impl DaemonState {
             overlay_source,
             transport: ControlTransport::default(),
             control_peer: None,
+            remote_peer: None,
             package_commands,
         }
     }
@@ -186,6 +193,14 @@ impl DaemonState {
     pub fn with_transport(mut self, transport: ControlTransport) -> Self {
         self.transport = transport;
         self.control_peer = None;
+        self.remote_peer = None;
+        self
+    }
+
+    /// Attach the overlay address of one accepted remote connection.
+    #[must_use]
+    pub fn with_remote_peer(mut self, peer: SocketAddr) -> Self {
+        self.remote_peer = Some(peer);
         self
     }
 
@@ -285,7 +300,23 @@ pub(crate) async fn dispatch_line(
         }
     };
 
+    // A detach request names only the stream; its session is read before the
+    // request ends the stream.
+    let detached_session = if request.method() == method::SESSION_DETACH {
+        match serde_json::from_value::<protocol::SessionDetachParams>(request.params().clone()) {
+            Ok(params) => state.sessions.attach_session_id(&params.stream_id).await,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let resp = handle_request(&request, state).await;
+    audit::record_request(
+        &request,
+        &resp,
+        state,
+        detached_session.as_ref().map(|id| id.0.as_str()),
+    );
     if request.method() == method::SUBSCRIBE && resp.is_ok() {
         let version = resp.version();
         return Dispatch::Subscribe(serialize_response(&resp), version);

@@ -110,6 +110,13 @@ impl ControlPeer {
         })
     }
 
+    /// The kernel-attested process id and user id of the peer, for the audit log.
+    #[must_use]
+    pub(crate) fn audit_identity(&self) -> (u32, u32) {
+        let snapshot = self.binding.snapshot();
+        (snapshot.pid, snapshot.uid)
+    }
+
     /// Requires the caller to be the process `params` names, as the daemon's user.
     ///
     /// The kernel peer is re-read here, so a socket handed to another process

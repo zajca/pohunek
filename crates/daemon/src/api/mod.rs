@@ -23,6 +23,7 @@
 //! Attach streaming uses a separate connection: the first line carries an attach
 //! prelude, then the connection switches from newline JSON to raw PTY bytes.
 
+mod audit;
 mod connections;
 mod handler;
 mod hangup;
@@ -541,7 +542,7 @@ impl RemoteServer {
                         Ok((stream, peer)) => {
                             info!(peer = %peer, "remote control connection accepted");
                             keepalive::apply(&stream, peer, keepalive);
-                            let state = state.clone();
+                            let state = state.clone().with_remote_peer(peer);
                             connections.spawn(Some(peer.to_string()), |connection| async move {
                                 if let Err(err) =
                                     Box::pin(serve_connection(stream, state, connection)).await
@@ -694,7 +695,7 @@ where
                     framed,
                     state.sessions.clone(),
                     stream_id,
-                    (hangup, &connection),
+                    (hangup, &connection, audit::Caller::of(&state)),
                 )
                 .await?;
                 return Ok(());
@@ -954,7 +955,7 @@ async fn run_attach_connection<S>(
     mut framed: Framed<S, LinesCodec>,
     registry: SessionRegistry,
     stream_id: String,
-    (hangup, connection): (Option<HangupWatch>, &Connection),
+    (hangup, connection, caller): (Option<HangupWatch>, &Connection, audit::Caller),
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -963,6 +964,7 @@ where
     let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
+            audit::record_attach(caller, None, Some(err.code.as_str()));
             // An attach connection starts with a prelude that carries no version
             // range and no request precedes it, so nothing is negotiated for it
             // and the daemon's current version is the only honest stamp.
@@ -976,6 +978,7 @@ where
         }
     };
 
+    audit::record_attach(caller, Some(attach.session_id.0.as_str()), None);
     connection.set_state(ConnectionState::Attach(attach.session_id.clone()));
     let parts = framed.into_parts();
     let mut stream = parts.io;
