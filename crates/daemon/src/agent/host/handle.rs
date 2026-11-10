@@ -404,18 +404,18 @@ impl RuntimeHost {
             return Ok(());
         };
         match store.is_revoked(package_digest, package) {
-            Ok(false) => Ok(()),
+            // A digest the registry does not record (a planned release
+            // package, or one removed since) has no catalog-authorized record
+            // to revoke; its own resolution judges it.
+            Ok(false)
+            | Err(
+                super::package::PackageRejection::NotRegistered
+                | super::package::PackageRejection::IdentityMismatch,
+            ) => Ok(()),
             Ok(true) => Err(refuse(
                 definition.runtime_id(),
                 &super::package::PackageRejection::Revoked,
             )),
-            // A digest the registry does not record (a planned release
-            // package, or one removed since) has no catalog-authorized record
-            // to revoke; its own resolution judges it.
-            Err(
-                super::package::PackageRejection::NotRegistered
-                | super::package::PackageRejection::IdentityMismatch,
-            ) => Ok(()),
             Err(reason) => Err(refuse(definition.runtime_id(), &reason)),
         }
     }

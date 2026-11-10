@@ -142,13 +142,14 @@ impl SessionRegistry {
             let mut verdicts: Vec<(PackageDigest, bool)> = Vec::new();
             let mut revoked = Vec::new();
             for (id, package, digest) in pinned {
-                let verdict = match verdicts.iter().find(|(known, _)| *known == digest) {
-                    Some((_, verdict)) => *verdict,
-                    None => {
-                        let verdict = store.is_revoked(&digest, &package) == Ok(true);
-                        verdicts.push((digest.clone(), verdict));
-                        verdict
-                    }
+                let verdict = if let Some((_, verdict)) =
+                    verdicts.iter().find(|(known, _)| *known == digest)
+                {
+                    *verdict
+                } else {
+                    let verdict = store.is_revoked(&digest, &package) == Ok(true);
+                    verdicts.push((digest.clone(), verdict));
+                    verdict
                 };
                 if verdict {
                     revoked.push((id, package, digest));

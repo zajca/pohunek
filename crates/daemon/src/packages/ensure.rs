@@ -594,6 +594,23 @@ impl Computed {
     }
 }
 
+/// The registry record and the persisted catalog trust state, or the empty
+/// state without a package store.
+fn read_trust_state(
+    existing: Option<&PackageStore>,
+) -> Result<(Option<RegistryState>, CatalogState, RevokedDigests), EnsureError> {
+    let Some(store) = existing else {
+        return Ok((None, CatalogState::default(), RevokedDigests::default()));
+    };
+    let registry = store.registry();
+    let failed = |error: package::registry::RegistryError| EnsureError::Registry(error.to_string());
+    Ok((
+        Some(registry.state().map_err(failed)?),
+        registry.catalog_state().map_err(failed)?,
+        registry.revoked_digests().map_err(failed)?,
+    ))
+}
+
 /// Reads the sources and plans every change, without writing.
 fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError> {
     let launch = match &inputs.environment {
@@ -626,25 +643,7 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
     let profiles = ProfileRegistry::with_runtimes(Some(inputs.profiles_dir.clone()), host.clone());
     // Without a package store nothing is installed, so the registry is absent
     // rather than empty: the planner then treats every package as not present.
-    let (state, catalog_state, revoked) = match &existing {
-        Some(store) => (
-            Some(
-                store
-                    .registry()
-                    .state()
-                    .map_err(|error| EnsureError::Registry(error.to_string()))?,
-            ),
-            store
-                .registry()
-                .catalog_state()
-                .map_err(|error| EnsureError::Registry(error.to_string()))?,
-            store
-                .registry()
-                .revoked_digests()
-                .map_err(|error| EnsureError::Registry(error.to_string()))?,
-        ),
-        None => (None, CatalogState::default(), RevokedDigests::default()),
-    };
+    let (state, catalog_state, revoked) = read_trust_state(existing.as_ref())?;
     let planning = existing.clone().map(|store| Context {
         store,
         runtimes: host.clone(),
