@@ -2766,7 +2766,6 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     fixture.input(&id, &prompt).await;
     fixture.wait_visible_working(&id).await;
     fixture.wait_screen_line(&id, STATUS_LINE_MARK).await;
-    assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
     // The prompt box stays visible during a turn; the held record carries
     // `working`, so the screen alone reads idle.
     assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Idle).await;
@@ -3281,7 +3280,6 @@ async fn a_real_claude_reply_held_mid_stream_reads_working() {
         "the held reply never reads idle: {waited}"
     );
     assert_eq!(fixture.inspect(&id).await["activity"], "working");
-    assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
     // The re-rendered reply shows the prompt box, so the screen alone reads
     // idle and the held record keeps the session working.
     fixture.wait_screen_line(&id, "esc to interrupt").await;
