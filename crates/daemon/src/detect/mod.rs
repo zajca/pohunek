@@ -2747,9 +2747,8 @@ mod tests {
     }
 
     /// Source of a Claude manifest whose title and spinner rules read a running
-    /// turn from the output itself: the frozen manifest of release 0.34.2. The
-    /// shipped Claude manifest has no such rule, since its records carry the
-    /// turn.
+    /// turn from the output itself: the frozen manifest of release 0.34.2, whose
+    /// title and spinner rules are not gated.
     const SCREEN_WORKING_MANIFEST: &str =
         include_str!("../../../../compat/claude/builtin-v0.34/detect.toml");
 

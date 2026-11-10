@@ -178,7 +178,8 @@ screens in `compat/claude/screens/named/`):
   the title, with no glyph, so the title carries no state; the program-status
   records and the screen carry it, as they do for the plain title `Claude Code`.
   `named_screens_are_classified_like_unnamed_ones` pins that a named screen reads
-  as an idle prompt box, whatever its title.
+  as its unnamed counterpart (an idle prompt box, a working stream), whatever its
+  title.
 - Detection: Claude draws the name into the title, the rule label and the
   collision banner. The manifest has no title rule, so a name that starts with a
   turn glyph (`◐ deploy`) reads no state. The daemon keeps the name its launch
@@ -282,8 +283,9 @@ also ran against the npm install. The darwin-arm64 executable of the same releas
 captured screen through the package manifest.
 
 - The working and idle states are read from the program-status records; the
-  screen adds the dialogs (`blocked`, priority 840 and above) and the prompt
-  box, which reads idle before the first record.
+  screen adds the dialogs (`blocked`, priority 840 and above), the status line
+  and the turn footer (`working`, only while no record is held) and the prompt
+  box, which reads idle.
 - Claude runs a hook command as `/bin/sh -c <command>`. Where `/bin/sh` is dash
   (Debian, Ubuntu, so the hosted CI runner) the shell stays between Claude and
   the reporter script, so the script's `$PPID` is that shell and the worker
@@ -389,7 +391,9 @@ Every supported Claude Code (2.1.309 and newer) reports its root state as OSC
 answers the probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in
 with `[program_status] app = "claude-code"`, `answer_probe = true` and
 `authority_from = "2.1.309"`, the package's floor: the session worker answers
-the probe, and the daemon holds the root record of every supported release.
+the probe, and the daemon holds the root record of every supported release it launched itself; a session
+re-attached after a daemon restart has an unknown release, its gate stays
+closed and it reads the screen only until it is relaunched.
 
 - Mapping: `working` reads working, `blocked` (`kind=permission` or
   `question`) reads blocked, `done`, `idle` and `error` read idle. All are
@@ -399,8 +403,8 @@ the probe, and the daemon holds the root record of every supported release.
 - A held record outranks the screen. Two working screen rules, `live_status_spinner`
   (the status line of a turn) and `live_turn_footer` (`esc to interrupt`), are
   marked `below_authority` and serve only while no record is held: before the
-  first record and after a lag resync, a detector reconfigure or an adoption
-  dropped it. They keep a turn that is running at that moment working until the
+  first record and after a lag resync or a detector reconfigure dropped it, and
+  for a session re-attached after a daemon restart. They keep a turn that is running at that moment working until the
   next record arrives (`a_lag_resync_mid_turn_keeps_the_turn_working`,
   `a_reconfigure_mid_turn_keeps_the_turn_working`). The prompt box rule
   (`live_prompt_box`) reads idle from the screen, also while a turn runs, because
@@ -490,16 +494,19 @@ locked native binary (`claude/versions/<release>` plus a launcher symlink).
 ## Detection beyond the built-in manifest
 
 The package manifest adds these rules to the v0.34.2 built-in one (#613) and drops
-the rules that read a running turn from the title or the status line, which
-every supported Claude replaces with its records. Each addition is backed by
+the title rules and the completed-turn rule, which every supported Claude
+replaces with its records; the status line and the turn footer stay as the
+working rules for a session with no held record. Each addition is backed by
 screens or process forms captured from a real Claude and by a package test that
 fails without the rule.
 
-- **Dropped rules.** `osc_title_working`, `osc_title_idle`,
-  `live_status_spinner` and `completed_turn_status` are absent
+- **Dropped rules.** `osc_title_working`, `osc_title_idle` and
+  `completed_turn_status` are absent
   (`the_package_manifest_file_is_the_golden_manifest_with_the_613_rules`).
-  A streaming reply therefore reads idle on the screen alone and working
-  through the held record (`a_real_claude_reply_held_mid_stream_reads_working`).
+- **Turn footer.** `live_turn_footer` (`esc to interrupt`, below the prompt
+  box) reads a streaming reply working, where Claude has removed the status
+  line, while no record is held; a held record outranks it
+  (`a_real_claude_reply_held_mid_stream_reads_working`).
 - **Wrapped selection forms.** `live_blocked_form` separates the words of its
   hints by any whitespace, so the question form reads `blocked` at 30 and 40
   columns, where its footer wraps (`Enter to select · ↑/↓ to` /

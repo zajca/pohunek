@@ -1252,8 +1252,9 @@ the screen rules stay the fallback.
   adoption it is restored only when the retained output still covers it. Until
   the next record the manifest's `below_authority` screen rules read the turn
   (Claude's status line and `esc to interrupt` footer), so a turn running when a
-  lag resync, a reconfigure or an adoption dropped the record keeps reading
-  working.
+  lag resync or a reconfigure dropped the record keeps reading working. A session
+  re-attached after a daemon restart has an unknown release, a closed gate and
+  no records, and reads the screen only.
 - **Readiness.** Initial-input readiness and the idle barrier ignore the record:
   they evaluate the screen winner alone, so a record never releases or holds a
   prompt.

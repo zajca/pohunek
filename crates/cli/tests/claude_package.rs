@@ -3259,8 +3259,8 @@ async fn a_held_working_record_does_not_outlive_a_killed_claude() {
 /// A reply held mid-stream: Claude draws the first paragraph and removes the
 /// status line, its `working` record stays held and the footer reads `esc to
 /// interrupt`. The daemon keeps the session working for the whole watch while
-/// the package manifest reads the live screen as the idle prompt box. The turn finishes
-/// once the stream gate opens.
+/// the package manifest reads the live screen working through the turn footer. The
+/// turn finishes once the stream gate opens.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
 async fn a_real_claude_reply_held_mid_stream_reads_working() {
