@@ -4189,10 +4189,15 @@ impl SessionRegistry {
         let launch_name =
             super::launch_input::launch_name(pinned.as_deref(), record.info.name.as_deref());
         default_detector_config.launch_name.clone_from(&launch_name);
-        // The release is not stored: a reattached session has an unknown
-        // release, so a runtime that declares `authority_from` reads the screen
-        // until the session is launched again.
-        let runtime_version = None;
+        // The release is not stored. Every launch the package accepted ran at or
+        // above its minimum, so that bound stands in for the release: a gate
+        // whose `authority_from` is at or below the minimum is open, and the
+        // records stay authoritative across a daemon restart.
+        let runtime_version = pinned
+            .as_deref()
+            .and_then(RuntimeDefinition::version_probe_policy)
+            .map(package::version_probe::VersionProbePolicy::min);
+        default_detector_config.runtime_version = runtime_version;
         let probe_answered_at_reattach = default_detector_config.answers_program_status_probe();
         let mut restored_detector_config = self
             .active_agent_detector_config(&record.info, pinned.as_ref(), active_agent.as_ref())

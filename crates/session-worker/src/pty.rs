@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -242,6 +243,7 @@ pub struct PtyOwner {
     exit_rx: watch::Receiver<Option<RootObservation>>,
     output: OutputHub,
     output_order: Arc<Mutex<()>>,
+    withheld_probe_replies: Arc<AtomicU64>,
     output_reader: Arc<Mutex<Box<dyn Read + Send>>>,
     output_readiness: Arc<OutputReadiness>,
     tty_name: Arc<PathBuf>,
@@ -510,6 +512,10 @@ impl PtyOwner {
                 })?,
             )
         };
+        let withheld_probe_replies = probe_filter.as_ref().map_or_else(
+            || Arc::new(AtomicU64::new(0)),
+            ForegroundProbeFilter::withheld,
+        );
         // Armed before the reader starts, so the first probe is never missed.
         let probe_replies = probe_runtime
             .as_ref()
@@ -662,6 +668,7 @@ impl PtyOwner {
             exit_rx,
             output,
             output_order,
+            withheld_probe_replies,
             output_reader,
             output_readiness,
             tty_name,
@@ -684,6 +691,13 @@ impl PtyOwner {
     #[must_use]
     pub fn answers_program_status_probe(&self) -> bool {
         self.output.answers_probes()
+    }
+
+    /// How many probe replies the foreground filter refused so far. A probe
+    /// the filter refuses is counted after its decision is final.
+    #[must_use]
+    pub fn withheld_probe_replies(&self) -> u64 {
+        self.withheld_probe_replies.load(AtomicOrdering::Acquire)
     }
 
     /// Returns the retained root and process-group identity.

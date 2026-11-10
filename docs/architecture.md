@@ -1212,9 +1212,11 @@ the screen rules stay the fallback.
   or with the release unknown, a record that arrives anyway is ignored and the
   title and screen rules decide. A launch below or with an unknown release gets
   no probe answer from the worker. A session re-attached after a daemon restart
-  has an unknown release; its worker keeps the probe flag it was spawned with,
-  so it may still answer the probe while its records are ignored; no evidence leaves the
-  activity unset, never idle. A manifest without `authority_from` is
+  has no stored release: the daemon takes the minimum of the runtime's version
+  range as its lower bound, which opens a gate whose `authority_from` is at or
+  below it, and its worker keeps the probe flag it was spawned with. With the
+  release unknown and no lower bound, no evidence leaves the activity unset,
+  never idle. A manifest without `authority_from` is
   authoritative for every release, and an agent of another runtime than the
   session's own (a Codex started below a shell) is not gated. Each gate
   evaluation is logged as `session.program_status.gate`.
@@ -1253,8 +1255,8 @@ the screen rules stay the fallback.
   the next record the manifest's `below_authority` screen rules read the turn
   (Claude's status line and `esc to interrupt` footer), so a turn running when a
   lag resync or a reconfigure dropped the record keeps reading working. A session
-  re-attached after a daemon restart has an unknown release, a closed gate and
-  no records, and reads the screen only.
+  re-attached after a daemon restart restores the record from the retained output
+  and keeps the gate open.
 - **Readiness.** Initial-input readiness and the idle barrier ignore the record:
   they evaluate the screen winner alone, so a record never releases or holds a
   prompt.

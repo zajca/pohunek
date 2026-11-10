@@ -337,56 +337,61 @@ async fn a_listed_foreground_program_is_answered_without_the_session_opting_in()
     assert_eq!(dump(&output, 1), REPLY_HEX);
 }
 
-#[tokio::test]
-async fn an_unlisted_foreground_program_is_never_answered() {
-    let cwd = tempdir().expect("temp dir");
-    // Raw mode with a read that returns after a second without input: a reply
-    // the worker wrote would be queued within milliseconds of the probe and
-    // read here, so the program reads nothing only when none was written.
-    let script = format!(
-        "stty -echo raw min 0 time 10; printf '{PROBE_ST}'; \
-         got=$(dd bs=1 count={REPLY_BYTES} 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); \
-         printf 'GOT:%s:ENDGOT' \"$got\""
-    );
-    let pty = spawn_listing(
-        &script,
-        cwd.path(),
-        false,
-        &listed(r"^/usr/bin/listed-only"),
-    );
+/// Waits until the worker has refused `count` probe replies.
+async fn withheld_until(pty: &PtyOwner, count: u64) {
+    tokio::time::timeout(OUTPUT_WAIT, async {
+        while pty.withheld_probe_replies() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {count} refused replies"));
+}
 
-    let output = output_until(&pty, ":ENDGOT").await;
+/// Runs `script` that prints a probe, waits for one typed byte and reports the
+/// first byte it reads. The byte is typed once the worker has refused the
+/// reply, so a reply the worker wrote would be read before it.
+async fn first_byte_after_a_refused_probe(script_head: &str, foreground: &[ProcessPatterns]) {
+    let cwd = tempdir().expect("temp dir");
+    let script = format!(
+        "{script_head}stty -echo raw; printf '{PROBE_ST}'; printf READY; \
+         first=$(head -c 1 | od -An -v -tx1 | tr -d ' \\n'); printf 'FIRST:%s:ENDFIRST' \"$first\""
+    );
+    let pty = spawn_listing(&script, cwd.path(), false, foreground);
+
+    output_until(&pty, "READY").await;
+    withheld_until(&pty, 1).await;
+    write_stream(&pty, b"Z").await;
+    let output = output_until(&pty, ":ENDFIRST").await;
 
     assert!(
-        output.contains("GOT::ENDGOT"),
-        "nothing may be written to an unlisted program: {output:?}"
+        output.contains("FIRST:5a:ENDFIRST"),
+        "the first byte the program reads is the typed `Z`, not a reply: {output:?}"
     );
 }
 
-/// The hex a program prints after it probed with a listed `sleep` running in
-/// the background of its shell, with or without job control. A read that
-/// returns after a second without input bounds the wait for a reply.
-async fn probe_with_a_listed_background_job(job_control: bool) -> String {
+#[tokio::test]
+async fn an_unlisted_foreground_program_is_never_answered() {
+    first_byte_after_a_refused_probe("", &listed(r"^/usr/bin/listed-only")).await;
+}
+
+/// Without job control a background job shares the foreground group of its
+/// shell, so its listed program is answered.
+#[tokio::test]
+async fn a_listed_job_sharing_the_foreground_group_of_a_shell_without_job_control_is_answered() {
     let cwd = tempdir().expect("temp dir");
-    let monitor = if job_control { "set -m; " } else { "" };
     let script = format!(
-        "{monitor}sleep 1234 & stty -echo raw min 0 time 10; printf '{PROBE_ST}'; \
-         got=$(dd bs=1 count={REPLY_BYTES} 2>/dev/null | od -An -v -tx1 | tr -d ' \\n'); \
-         printf 'GOT:%s:ENDGOT' \"$got\"; kill %1 2>/dev/null; kill $! 2>/dev/null"
+        "sleep 1234 & stty raw -echo; printf '{PROBE_ST}'; {} kill $! 2>/dev/null",
+        read_dump(1, REPLY_BYTES)
     );
     let pty = spawn_listing(&script, cwd.path(), false, &listed(r"^sleep 1234"));
-    let output = output_until(&pty, ":ENDGOT").await;
-    let from = output.find("GOT:").expect("the dump") + "GOT:".len();
-    let end = output[from..].find(":ENDGOT").expect("the dump end");
-    output[from..from + end].to_owned()
+
+    let output = output_until(&pty, ":END1").await;
+
+    assert_eq!(dump(&output, 1), REPLY_HEX);
 }
 
 #[tokio::test]
 async fn a_listed_job_in_the_background_of_a_job_control_shell_is_not_answered() {
-    assert_eq!(probe_with_a_listed_background_job(true).await, "");
-}
-
-#[tokio::test]
-async fn a_listed_job_sharing_the_foreground_group_of_a_shell_without_job_control_is_answered() {
-    assert_eq!(probe_with_a_listed_background_job(false).await, REPLY_HEX);
+    first_byte_after_a_refused_probe("set -m; sleep 1234 & ", &listed(r"^sleep 1234")).await;
 }

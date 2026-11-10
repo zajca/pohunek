@@ -391,9 +391,11 @@ Every supported Claude Code (2.1.309 and newer) reports its root state as OSC
 answers the probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in
 with `[program_status] app = "claude-code"`, `answer_probe = true` and
 `authority_from = "2.1.309"`, the package's floor: the session worker answers
-the probe, and the daemon holds the root record of every supported release it launched itself; a session
-re-attached after a daemon restart has an unknown release, its gate stays
-closed and it reads the screen only until it is relaunched.
+the probe, and the daemon holds the root record of every supported release.
+A session re-attached after a daemon restart has no stored release; the
+daemon takes the package minimum (2.1.309) as its lower bound, so the gate is
+open and the records stay authoritative
+(`a_session_reattached_after_a_daemon_restart_keeps_reading_its_records`).
 
 - Mapping: `working` reads working, `blocked` (`kind=permission` or
   `question`) reads blocked, `done`, `idle` and `error` read idle. All are
@@ -403,9 +405,9 @@ closed and it reads the screen only until it is relaunched.
 - A held record outranks the screen. Two working screen rules, `live_status_spinner`
   (the status line of a turn) and `live_turn_footer` (`esc to interrupt`), are
   marked `below_authority` and serve only while no record is held: before the
-  first record and after a lag resync or a detector reconfigure dropped it, and
-  for a session re-attached after a daemon restart. They keep a turn that is running at that moment working until the
-  next record arrives (`a_lag_resync_mid_turn_keeps_the_turn_working`,
+  first record and after a lag resync or a detector reconfigure dropped it. They
+  keep a turn that is running at that moment working until the next record
+  arrives (`a_lag_resync_mid_turn_keeps_the_turn_working`,
   `a_reconfigure_mid_turn_keeps_the_turn_working`). The prompt box rule
   (`live_prompt_box`) reads idle from the screen, also while a turn runs, because
   the prompt box stays visible; the working rules outrank it. The
