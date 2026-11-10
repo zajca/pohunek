@@ -139,6 +139,11 @@ const RELEASE_RUNTIME_DIR: &str = "runtime";
 /// required.
 const RUNTIME_RANGE_RELEASE: &str = "0.35.2";
 
+/// The first release that speaks protocol 5, whose daemon refuses clients and
+/// session hooks of protocol 4. A previous release below it is refused by this
+/// build; from it on the previous release's clients and hooks are admitted.
+const PROTOCOL_5_RELEASE: &str = "0.41.0";
+
 /// Version the head's xtask gives the downgrade package it writes for the
 /// downgrade guard (`DOWNGRADE_VERSION` in `crates/xtask/src/test_runtime.rs`).
 const DOWNGRADE_VERSION: &str = "0.0.1";
@@ -1582,6 +1587,9 @@ struct Upgrade {
     /// Whether the previous release predates `RUNTIME_RANGE_RELEASE`, so its
     /// official packages carry the narrower ranges.
     previous_predates_ranges: bool,
+    /// Whether the previous release predates `PROTOCOL_5_RELEASE`, so this
+    /// build's daemon refuses its clients and the hooks of its workers.
+    previous_predates_protocol_5: bool,
     /// The live session of the Claude profile; the upgrade adopts it.
     id: String,
     /// The stopped session of the Claude profile; it resumes onto its pin.
@@ -1614,9 +1622,13 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
     let previous_predates_ranges =
         release_order(core_version(&previous_version), RUNTIME_RANGE_RELEASE)
             == std::cmp::Ordering::Less;
+    let previous_predates_protocol_5 =
+        release_order(core_version(&previous_version), PROTOCOL_5_RELEASE)
+            == std::cmp::Ordering::Less;
     eprintln!(
         "upgrade {previous_version} -> {head_version} (runtime range release: {head_is_release}, \
-         previous predates it: {previous_predates_ranges})"
+         previous predates it: {previous_predates_ranges}, previous predates protocol 5: \
+         {previous_predates_protocol_5})"
     );
     let release = run.head_dir.join(RELEASE_RUNTIME_DIR);
     assert!(
@@ -1683,6 +1695,7 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Before) {
         start,
         head_is_release,
         previous_predates_ranges,
+        previous_predates_protocol_5,
     };
     let before = Before {
         live: sessions.live,
@@ -2371,9 +2384,10 @@ impl Upgrade {
     }
 
     /// `screen` and `input` reach the adopted worker through the new daemon.
-    /// The adopted worker still runs the previous release's hooks, which
-    /// announce protocol 4, so this build's daemon refuses their report until
-    /// the session relaunches.
+    /// The adopted worker still runs the previous release's hooks. When the
+    /// previous release announces protocol 4, this build's daemon refuses
+    /// their report until the session relaunches; from protocol 5 on the
+    /// report is admitted and surfaces as a turn event.
     fn assert_session_works(&self) {
         let (head, id) = (&self.head, &self.id);
         wait_screen(head, id, "fake-agent ready");
@@ -2390,13 +2404,24 @@ impl Upgrade {
             id,
             &format!("fake-agent notified {EVENT_AFTER_UPGRADE}"),
         );
-        assert_no_turn_error(head, id, &cursor);
+        if self.previous_predates_protocol_5 {
+            assert_no_turn_error(head, id, &cursor);
+        } else {
+            wait_turn_error(head, id, &cursor);
+        }
     }
 
-    /// A client of the previous release gets a clear protocol refusal on
-    /// reads and writes alike: the window is protocol 5 only.
+    /// A client of a previous release below protocol 5 gets a clear protocol
+    /// refusal on reads and writes alike: the window is protocol 5 only. A
+    /// previous release that speaks protocol 5 reads through its own client.
     fn assert_previous_client_refused(&self) {
         let (previous, id) = (&self.previous, &self.id);
+        if !self.previous_predates_protocol_5 {
+            previous.json(&["session", "list", "--json"]);
+            previous.json(&["session", "inspect", id, "--json"]);
+            previous.json(&["health", "--json"]);
+            return;
+        }
         assert_refused_as_version_mismatch(previous, &["session", "list", "--json"]);
         assert_refused_as_version_mismatch(previous, &["session", "inspect", id, "--json"]);
         assert_refused_as_version_mismatch(previous, &["health", "--json"]);
@@ -2519,8 +2544,13 @@ impl Upgrade {
         self.assert_package_served(CODEX_PACKAGE_ID, self.profile_digest(CODEX_PACKAGE_ID));
     }
 
-    /// The previous release's client cannot create a session either.
+    /// The client of a previous release below protocol 5 cannot create a
+    /// session either; a protocol 5 client is not refused, so nothing is
+    /// asserted for it.
     fn assert_previous_client_cannot_create(&self) {
+        if !self.previous_predates_protocol_5 {
+            return;
+        }
         let cwd = self.run.home.display().to_string();
         assert_refused_as_version_mismatch(
             &self.previous,
