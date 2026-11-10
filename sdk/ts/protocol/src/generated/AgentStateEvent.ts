@@ -2,6 +2,7 @@
 
 import type { ActivityRevision } from "./ActivityRevision";
 import type { AgentActivity } from "./AgentActivity";
+import type { BlockedKind } from "./BlockedKind";
 import type { SessionId } from "./SessionId";
 import type { SessionRuntimeIdentity } from "./SessionRuntimeIdentity";
 import type { StateSource } from "./StateSource";
@@ -22,6 +23,11 @@ export type AgentStateEvent = {
    * Signal source that produced the activity value.
    */
   source: StateSource;
+  /**
+   * What the agent waits for, when `activity` is `blocked` and the agent
+   * reported a kind.
+   */
+  blocked_kind?: BlockedKind;
   /**
    * Runtime that produced this activity transition.
    */

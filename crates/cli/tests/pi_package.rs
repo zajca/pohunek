@@ -696,6 +696,7 @@ fn every_captured_screen_is_classified_by_screen_evidence() {
             vec![pohunek_daemon::detect::ActivityTransition {
                 activity: expected,
                 source: StateSource::Screen,
+                blocked_kind: None,
             }],
             "{screen}"
         );

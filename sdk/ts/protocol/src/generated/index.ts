@@ -18,6 +18,7 @@ export type { BackgroundRevision } from "./BackgroundRevision";
 export type { BackgroundStateEvent } from "./BackgroundStateEvent";
 export type { BackgroundStatus } from "./BackgroundStatus";
 export type { BindingProvenance } from "./BindingProvenance";
+export type { BlockedKind } from "./BlockedKind";
 export type { BranchSource } from "./BranchSource";
 export type { CommandExposure } from "./CommandExposure";
 export type { CommandInfo } from "./CommandInfo";

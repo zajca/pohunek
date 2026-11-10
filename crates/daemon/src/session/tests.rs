@@ -2027,6 +2027,7 @@ fn transition(activity: AgentActivity) -> ActivityTransition {
     ActivityTransition {
         activity,
         source: protocol::StateSource::Process,
+        blocked_kind: None,
     }
 }
 
@@ -3500,6 +3501,7 @@ async fn working_seen_from_another_source_keeps_the_running_turn() {
             ActivityTransition {
                 activity: AgentActivity::Working,
                 source: protocol::StateSource::Screen,
+                blocked_kind: None,
             },
         )
         .await;
@@ -3509,6 +3511,7 @@ async fn working_seen_from_another_source_keeps_the_running_turn() {
             ActivityTransition {
                 activity: AgentActivity::Idle,
                 source: protocol::StateSource::Screen,
+                blocked_kind: None,
             },
         )
         .await;
@@ -7527,6 +7530,7 @@ async fn a_transition_computed_before_the_agent_left_is_dropped() {
     let held = ActivityTransition {
         activity: AgentActivity::Working,
         source: protocol::StateSource::OscProgress,
+        blocked_kind: None,
     };
     observe_codex(&registry, &inspector, &created, None).await;
     let after_exit = generation(&registry).await;

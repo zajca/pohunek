@@ -6,8 +6,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant as StdInstant};
 
 use protocol::{
-    event, AgentActivity, Event, NotificationCreateParams, NotificationKind, NotificationSeverity,
-    NotificationSource, RuntimeRef, RuntimeState, SessionId, SessionInfo, SessionState,
+    event, AgentActivity, BlockedKind, Event, NotificationCreateParams, NotificationKind,
+    NotificationSeverity, NotificationSource, RuntimeRef, RuntimeState, SessionId, SessionInfo,
+    SessionState, StateSource,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -288,6 +289,8 @@ fn stopped_subject(event: &Event) -> Option<SessionId> {
 #[derive(Debug, Default)]
 struct ProjectorState {
     activity_by_session: HashMap<SessionId, AgentActivity>,
+    /// The kind the last blocked reading of a session carried.
+    blocked_kind_by_session: HashMap<SessionId, Option<BlockedKind>>,
     lifecycle_by_session: HashMap<SessionId, SessionState>,
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
     /// Sessions whose transition epochs continue from the store's records.
@@ -607,8 +610,12 @@ impl ProjectorState {
         match event.event() {
             event::AGENT_STATE => {
                 if let Some(payload) = parse_projector_payload::<AgentStatePayload>(event) {
+                    let origin = ActivityOrigin {
+                        source: Some(payload.source),
+                        blocked_kind: payload.blocked_kind,
+                    };
                     return self
-                        .pending_activity(attention, &payload.session_id, payload.activity)
+                        .pending_activity(attention, &payload.session_id, payload.activity, origin)
                         .into_iter()
                         .collect();
                 }
@@ -639,9 +646,18 @@ impl ProjectorState {
     ) -> Vec<PendingNotification> {
         let mut pending = Vec::new();
         if let Some(activity) = session.activity {
-            pending.extend(self.pending_activity(attention, &session.id, activity));
+            pending.extend(self.pending_activity(
+                attention,
+                &session.id,
+                activity,
+                ActivityOrigin {
+                    source: Some(session.state_source),
+                    blocked_kind: None,
+                },
+            ));
         } else {
             self.activity_by_session.remove(&session.id);
+            self.blocked_kind_by_session.remove(&session.id);
         }
         if session.state == SessionState::Stopped {
             self.handle_explicit_stop(attention, session);
@@ -656,16 +672,16 @@ impl ProjectorState {
         attention: &AttentionCoordinator,
         session_id: &SessionId,
         activity: AgentActivity,
+        origin: ActivityOrigin,
     ) -> Option<PendingNotification> {
         let previous = self
             .activity_by_session
             .insert(session_id.clone(), activity);
-        // Active work proves that a prior waiting condition has ended. Idle does
-        // not: an approval prompt may be technically idle while still requiring
-        // owner input. Resolve only on the transition edge into `Working`; the
-        // terminal lifecycle paths below resolve stale attention separately.
-        // Do not gate on a previous blocked observation because provider hooks
-        // can create attention without the detector seeing that edge first.
+        // Active work proves that a prior waiting condition has ended. Resolve on
+        // the transition edge into `Working`; the terminal lifecycle paths below
+        // resolve stale attention separately. Do not gate on a previous blocked
+        // observation because provider hooks can create attention without the
+        // detector seeing that edge first.
         if activity == AgentActivity::Working {
             self.blocked_replay_candidates.remove(session_id);
             if previous != Some(AgentActivity::Working) {
@@ -674,22 +690,56 @@ impl ProjectorState {
                 attention.resolve(attention_dedupe_key(session_id));
             }
         }
-        if activity != AgentActivity::Blocked || previous == Some(AgentActivity::Blocked) {
+        // Idle from the program's status channel (`OscProgress`, normally a 7501 record)
+        // right after `blocked` means the dialog closed (Esc, a denial, an
+        // auto-denial). An idle read from the screen or the title does not
+        // resolve: an approval prompt can read idle there while it still waits.
+        if activity == AgentActivity::Idle
+            && previous == Some(AgentActivity::Blocked)
+            && origin.source == Some(StateSource::OscProgress)
+        {
+            self.blocked_replay_candidates.remove(session_id);
+            attention.resolve(attention_dedupe_key(session_id));
+        }
+        // A blocked reading without a kind keeps the kind already derived.
+        let kind_before = if activity == AgentActivity::Blocked {
+            if previous == Some(AgentActivity::Blocked) && origin.blocked_kind.is_none() {
+                self.blocked_kind_by_session.get(session_id).copied()
+            } else {
+                self.blocked_kind_by_session
+                    .insert(session_id.clone(), origin.blocked_kind)
+            }
+        } else {
+            self.blocked_kind_by_session.remove(session_id);
+            None
+        };
+        // A blocked reading that names a different kind than the one derived
+        // replaces that attention record.
+        let kind_changed = previous == Some(AgentActivity::Blocked)
+            && origin.blocked_kind.is_some()
+            && kind_before.flatten() != origin.blocked_kind;
+        if activity != AgentActivity::Blocked
+            || (previous == Some(AgentActivity::Blocked) && !kind_changed)
+        {
             return None;
+        }
+        if kind_changed {
+            attention.resolve(attention_dedupe_key(session_id));
         }
         // A daemon process replays the blocked state of a session that was
         // blocked before it started; an unread record already surfaces it.
         if self.blocked_replay_candidates.remove(session_id) {
             return None;
         }
+        let wait = BlockedWait::of(origin.blocked_kind);
         self.prepare_derived(DerivedNotification {
             session_id: session_id.clone(),
-            kind: NotificationKind::AgentBlocked,
+            kind: wait.kind,
             severity: NotificationSeverity::ActionRequired,
             source_event: event::AGENT_STATE,
-            title: "Agent needs attention".to_owned(),
-            body: format!("Session {} is waiting for owner attention.", session_id.0),
-            metadata: BTreeMap::from([("reason".to_owned(), "blocked".to_owned())]),
+            title: wait.title.to_owned(),
+            body: format!("Session {} {}.", session_id.0, wait.body),
+            metadata: BTreeMap::from([("reason".to_owned(), wait.reason.to_owned())]),
             agent_kind: None,
             project_id: None,
             dedupe_key: Some(attention_dedupe_key(session_id)),
@@ -718,6 +768,7 @@ impl ProjectorState {
         if ended {
             resolve_session_notifications(attention, &session.id);
             self.activity_by_session.remove(&session.id);
+            self.blocked_kind_by_session.remove(&session.id);
             self.blocked_replay_candidates.remove(&session.id);
         }
     }
@@ -980,6 +1031,57 @@ struct DerivedNotification {
 struct AgentStatePayload {
     session_id: SessionId,
     activity: AgentActivity,
+    source: StateSource,
+    #[serde(default)]
+    blocked_kind: Option<BlockedKind>,
+}
+
+/// Where an activity reading came from; a session snapshot carries neither field.
+#[derive(Debug, Default, Clone, Copy)]
+struct ActivityOrigin {
+    source: Option<StateSource>,
+    blocked_kind: Option<BlockedKind>,
+}
+
+/// The notification a blocked agent maps to, by what it reports waiting for.
+///
+/// The body never carries the program's own text: that text is not trusted.
+struct BlockedWait {
+    kind: NotificationKind,
+    reason: &'static str,
+    title: &'static str,
+    body: &'static str,
+}
+
+impl BlockedWait {
+    fn of(kind: Option<BlockedKind>) -> Self {
+        match kind {
+            Some(BlockedKind::Permission) => Self {
+                kind: NotificationKind::ApprovalRequired,
+                reason: "permission",
+                title: "Agent approval required",
+                body: "is waiting for approval",
+            },
+            Some(BlockedKind::Question) => Self {
+                kind: NotificationKind::AgentBlocked,
+                reason: "question",
+                title: "Agent needs attention",
+                body: "is waiting for an answer",
+            },
+            Some(BlockedKind::Auth) => Self {
+                kind: NotificationKind::AgentBlocked,
+                reason: "auth",
+                title: "Agent needs attention",
+                body: "is waiting for authentication",
+            },
+            Some(BlockedKind::Unknown) | None => Self {
+                kind: NotificationKind::AgentBlocked,
+                reason: "blocked",
+                title: "Agent needs attention",
+                body: "is waiting for owner attention",
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

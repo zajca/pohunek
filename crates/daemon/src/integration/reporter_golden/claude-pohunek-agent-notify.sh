@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=16
+# POHUNEK_INTEGRATION_VERSION=17
 #
 # Claude notification hook. Fire-and-forget: any missing handshake env, missing
 # python3, invalid input, or socket failure is a silent no-op (exit 0) so the
@@ -12,10 +12,9 @@
 set -eu
 
 action="${1:-}"
-matcher="${2:-}"
 
 case "$action" in
-  notification|stop|stop_failure) ;;
+  stop|stop_failure) ;;
   *) exit 0 ;;
 esac
 
@@ -58,7 +57,6 @@ head -c "$MAX_HOOK_INPUT_BYTES" >"$hook_input_file" 2>/dev/null || true
 POHUNEK_HOOK_INPUT_FILE="$hook_input_file" \
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
-POHUNEK_HOOK_MATCHER="$matcher" \
 python3 -I - >/dev/null 2>&1 <<'PY' || exit 0
 import hashlib
 import json
@@ -92,44 +90,6 @@ SECRET_MARKERS = (
     "xox",
 )
 
-NOTIFICATION_MATCHERS = {
-    "permission_prompt": {
-        "kind": "approval_required",
-        "severity": "action_required",
-        "title": "Claude approval required",
-        "body": "Claude is waiting for approval.",
-        "attention": True,
-    },
-    "elicitation_dialog": {
-        "kind": "approval_required",
-        "severity": "action_required",
-        "title": "Claude response required",
-        "body": "Claude is waiting for approval.",
-        "attention": True,
-    },
-    "auth_success": {
-        "kind": "system",
-        "severity": "success",
-        "title": "Claude authentication succeeded",
-        "body": "Claude reported successful authentication.",
-        "attention": False,
-    },
-    "elicitation_complete": {
-        "kind": "system",
-        "severity": "info",
-        "title": "Claude elicitation completed",
-        "body": "Claude completed an elicitation flow.",
-        "attention": False,
-    },
-    "elicitation_response": {
-        "kind": "system",
-        "severity": "info",
-        "title": "Claude elicitation response",
-        "body": "Claude received an elicitation response.",
-        "attention": False,
-    },
-}
-
 EVENTS = {
     "stop": {
         "provider_event": "Stop",
@@ -137,8 +97,6 @@ EVENTS = {
         "severity": "info",
         "title": "Claude turn completed",
         "body": "Claude completed an agent turn.",
-        "attention": False,
-        "matcher": None,
     },
     "stop_failure": {
         "provider_event": "StopFailure",
@@ -146,8 +104,6 @@ EVENTS = {
         "severity": "error",
         "title": "Claude stop hook failed",
         "body": "Claude reported a stop hook failure.",
-        "attention": False,
-        "matcher": None,
     },
 }
 
@@ -200,10 +156,6 @@ def safe_session_id(value):
     if any(ch not in SAFE_ID_CHARS for ch in value):
         return None
     return value
-
-
-def safe_matcher(value):
-    return value if value in NOTIFICATION_MATCHERS else None
 
 
 def hook_event_id(hook_input):
@@ -383,23 +335,9 @@ try:
 except ValueError:
     protocol_version = None
 
-event = None
-matcher = None
-if action == "notification":
-    matcher = safe_matcher(os.environ.get("POHUNEK_HOOK_MATCHER"))
-    if matcher is None:
-        matcher = safe_matcher(hook_input.get("matcher"))
-    if matcher is None:
-        matcher = safe_matcher(hook_input.get("type"))
-    if matcher is None:
-        raise SystemExit(0)
-    event = dict(NOTIFICATION_MATCHERS[matcher])
-    event["provider_event"] = f"Notification.{matcher}"
-    event["matcher"] = matcher
-else:
-    event = EVENTS.get(action)
-    if event is None:
-        raise SystemExit(0)
+event = EVENTS.get(action)
+if event is None:
+    raise SystemExit(0)
 
 event_id = hook_event_id(hook_input)
 provider_event = event["provider_event"]
@@ -409,8 +347,6 @@ metadata = {
     "provider_event": provider_event,
     "hook_event_id": event_id,
 }
-if event["matcher"]:
-    metadata["matcher"] = event["matcher"]
 params = {
     "source": {
         "provider": AGENT,
@@ -428,9 +364,7 @@ params = {
 }
 if session_id:
     params["session_id"] = session_id
-if session_id and event["attention"]:
-    params["dedupe_key"] = f"attention:{session_id}"
-elif session_id and event["kind"] == "turn_completed":
+if session_id and event["kind"] == "turn_completed":
     params["dedupe_key"] = f"turn:{session_id}"
 
 # The worker forwards this value as the request sequence of a short-lived hook

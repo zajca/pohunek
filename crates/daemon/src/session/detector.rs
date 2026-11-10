@@ -475,7 +475,12 @@ impl SessionRegistry {
             if !self.has_evidence_waiter(id)
                 && entry.info.activity == Some(transition.activity)
                 && entry.info.state_source == transition.source
-                && activity_already_recorded(entry, transition.activity, transition.source)
+                && activity_already_recorded(
+                    entry,
+                    transition.activity,
+                    transition.source,
+                    transition.blocked_kind,
+                )
             {
                 // A turn that gave its input evidence back opens here.
                 if transition.activity == AgentActivity::Working {
@@ -506,6 +511,7 @@ impl SessionRegistry {
                 entry,
                 transition.activity,
                 transition.source,
+                transition.blocked_kind,
                 &activity_epoch,
             );
             let rescan = (transition.activity == AgentActivity::Working)

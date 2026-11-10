@@ -8,7 +8,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use protocol::{AgentActivity, DetectionRegionPreview, ProtocolError, RuntimeRef, StateSource};
+use protocol::{
+    AgentActivity, BlockedKind, DetectionRegionPreview, ProtocolError, RuntimeRef, StateSource,
+};
 
 use crate::agent::host::{InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::procwatch::ProcessFact;
@@ -27,7 +29,9 @@ pub use osc::{OscEvidence, OscParser, ProgressReport, ProgressState};
 // The VT screen model lives in `pohunek-terminal` so the daemon and CLI share
 // one implementation instead of drifting copies.
 use package::version_probe::ProbeVersion;
-use pohunek_terminal::{ProgramState, ProgramStatusRecord, ProgramStatusReport};
+use pohunek_terminal::{
+    BlockedKind as RecordKind, ProgramState, ProgramStatusRecord, ProgramStatusReport,
+};
 pub use pohunek_terminal::{ScreenObservation, ScreenRegion, ScreenTracker};
 
 const ESC: u8 = 0x1b;
@@ -1358,6 +1362,7 @@ fn manifest_hit(
         evidence: ActivityEvidence {
             activity: matched.activity,
             source,
+            blocked_kind: None,
         },
         visible_blocker: matched.visible_blocker,
         overrides_program_status: matched.overrides_program_status,
@@ -1442,10 +1447,15 @@ fn overlay_program_status(
     let Some(record) = record else {
         return screen;
     };
+    let blocked_kind = match record.state {
+        ProgramState::Blocked(kind) => kind.map(blocked_kind_of),
+        _ => None,
+    };
     let from_record = |activity, visible_blocker| ManifestEvidenceHit {
         evidence: ActivityEvidence {
             activity,
             source: StateSource::OscProgress,
+            blocked_kind,
         },
         visible_blocker,
         overrides_program_status: false,
@@ -1455,15 +1465,20 @@ fn overlay_program_status(
         // A dialog on the screen is the more specific evidence of the same
         // state, so the screen is the reported source when both say blocked; a
         // title blocker is not a dialog and the record stays the source.
-        ProgramState::Blocked(_) => Some(
-            screen
-                .filter(|hit| {
-                    hit.evidence.activity == AgentActivity::Blocked
-                        && hit.visible_blocker
-                        && hit.evidence.source == StateSource::Screen
-                })
-                .unwrap_or_else(|| from_record(AgentActivity::Blocked, true)),
-        ),
+        ProgramState::Blocked(_) => {
+            let dialog = screen.filter(|hit| {
+                hit.evidence.activity == AgentActivity::Blocked
+                    && hit.visible_blocker
+                    && hit.evidence.source == StateSource::Screen
+            });
+            Some(match dialog {
+                Some(mut hit) => {
+                    hit.evidence.blocked_kind = blocked_kind;
+                    hit
+                }
+                None => from_record(AgentActivity::Blocked, true),
+            })
+        }
         state => {
             if let Some(hit) = screen.filter(|hit| {
                 (hit.evidence.activity == AgentActivity::Blocked && hit.visible_blocker)
@@ -1476,6 +1491,15 @@ fn overlay_program_status(
                 _ => from_record(AgentActivity::Idle, false),
             })
         }
+    }
+}
+
+/// The protocol spelling of a record's blocked kind.
+fn blocked_kind_of(kind: RecordKind) -> BlockedKind {
+    match kind {
+        RecordKind::Permission => BlockedKind::Permission,
+        RecordKind::Question => BlockedKind::Question,
+        RecordKind::Auth => BlockedKind::Auth,
     }
 }
 
@@ -1697,7 +1721,11 @@ mod tests {
     }
 
     fn transition(activity: AgentActivity, source: StateSource) -> ActivityTransition {
-        ActivityTransition { activity, source }
+        ActivityTransition {
+            activity,
+            source,
+            blocked_kind: None,
+        }
     }
 
     fn manifest(source: &str) -> Manifest {

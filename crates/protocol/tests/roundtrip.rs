@@ -7,8 +7,8 @@ use proptest::prelude::*;
 use protocol::{
     event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, ApprovalKeyReference,
     AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, BackgroundItem,
-    BackgroundKind, BackgroundRevision, BackgroundStatus, ConceptDeprecation, ConceptIntent,
-    ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
+    BackgroundKind, BackgroundRevision, BackgroundStatus, BlockedKind, ConceptDeprecation,
+    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
     DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
     EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin, HostApprovalSignature,
     HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
@@ -4877,6 +4877,16 @@ fn session_snapshot_display_enums_are_tolerant_only_on_the_client() {
         unknown_wire: "unknown",
     }
     .check("AgentActivity");
+    TolerantEnum {
+        known: vec![
+            ("permission", BlockedKind::Permission),
+            ("question", BlockedKind::Question),
+            ("auth", BlockedKind::Auth),
+        ],
+        unknown: BlockedKind::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("BlockedKind");
     TolerantEnum {
         known: vec![
             ("osc_title", StateSource::OscTitle),

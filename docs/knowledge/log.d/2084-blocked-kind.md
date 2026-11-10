@@ -1,0 +1,3 @@
+## Unreleased (2026-11-10, Claude attention from the 7501 kind, #2084)
+
+- `agent_state` events carry an optional `blocked_kind` (`permission`, `question`, `auth`) taken from the OSC 7501 `blocked` record, and the notification projector derives the attention record from it: `permission` is `approval_required`, `question` (AskUserQuestion, MCP elicitation) and `auth` are `agent_blocked` with `reason=question` / `reason=auth`. The Claude integration registers no `Notification` hook any more (integration version 17); reinstalling strips the earlier registrations. A record that leaves `blocked` for `idle` or `done` resolves the attention record. See [Claude package](guides/claude-package.md#program-status-osc-7501) and the `agent_state` event in `docs/public-api.md`.

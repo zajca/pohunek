@@ -16,7 +16,7 @@ use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
 use pohunek_worker_protocol::LaunchProcess;
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundStateEvent,
-    CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
+    BlockedKind, CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
     RuntimeInventoryEntry, RuntimeRef, RuntimeState, SessionAttachParams, SessionEvent, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter,
     SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
@@ -1238,6 +1238,7 @@ struct PromptAcceptance {
 struct ActivityEvidence {
     activity: AgentActivity,
     source: StateSource,
+    blocked_kind: Option<BlockedKind>,
     runtime: SessionRuntimeIdentity,
     activity_epoch: String,
     revision: ActivityRevision,
@@ -1250,6 +1251,7 @@ impl ActivityEvidence {
             session_id,
             activity: self.activity,
             source: self.source,
+            blocked_kind: self.blocked_kind,
             runtime: Some(self.runtime.clone()),
             activity_epoch: Some(self.activity_epoch.clone()),
             revision: Some(self.revision),
@@ -1285,17 +1287,21 @@ fn live_runtime_identity(entry: &SessionEntry) -> Option<SessionRuntimeIdentity>
 }
 
 /// Whether the newest activity evidence of the live runtime already states
-/// `activity` from `source`.
+/// `activity` from `source` with the same blocked kind.
 fn activity_already_recorded(
     entry: &SessionEntry,
     activity: AgentActivity,
     source: StateSource,
+    blocked_kind: Option<BlockedKind>,
 ) -> bool {
     let Some(runtime) = live_runtime_identity(entry) else {
         return false;
     };
     entry.activity_evidence.back().is_some_and(|latest| {
-        latest.activity == activity && latest.source == source && latest.runtime == runtime
+        latest.activity == activity
+            && latest.source == source
+            && latest.blocked_kind == blocked_kind
+            && latest.runtime == runtime
     })
 }
 
@@ -1303,6 +1309,7 @@ fn record_activity_evidence(
     entry: &mut SessionEntry,
     activity: AgentActivity,
     source: StateSource,
+    blocked_kind: Option<BlockedKind>,
     activity_epoch: &str,
 ) -> Option<ActivityEvidence> {
     entry.activity_revision = entry
@@ -1313,6 +1320,7 @@ fn record_activity_evidence(
     let evidence = ActivityEvidence {
         activity,
         source,
+        blocked_kind,
         runtime,
         activity_epoch: activity_epoch.to_owned(),
         revision: ActivityRevision::new(entry.activity_revision),
@@ -5109,7 +5117,7 @@ impl SessionRegistry {
                 .as_ref()
                 .map(|runtime| runtime.runtime_generation),
         });
-        record_activity_evidence(entry, activity, StateSource::Report, activity_epoch)
+        record_activity_evidence(entry, activity, StateSource::Report, None, activity_epoch)
     }
 
     /// Record the active nested agent currently owning a live session.

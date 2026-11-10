@@ -397,11 +397,23 @@ daemon takes the package minimum (2.1.309) as its lower bound, so the gate is
 open and the records stay authoritative
 (`a_session_reattached_after_a_daemon_restart_keeps_reading_its_records`).
 
-- Mapping: `working` reads working, `blocked` (`kind=permission` or
-  `question`) reads blocked, `done`, `idle` and `error` read idle. All are
+- Mapping: `working` reads working, `blocked` (`kind=permission`, `question`
+  or `auth`) reads blocked, `done`, `idle` and `error` read idle. All are
   reported as `state_source = osc_progress`; a visible dialog over a `blocked`
   record is reported as `screen`. Records of background agents carry
   an `id=` and are ignored by the detector.
+- Attention: the `kind` of the `blocked` record travels as
+  `agent_state.blocked_kind` (also when a screen dialog is the reported source)
+  and picks the attention record: `permission` (a tool call, a plan approval, a
+  safety check) is `approval_required`, `question` (an AskUserQuestion, an MCP
+  elicitation; verified with Claude Code 2.1.322) and `auth` are
+  `agent_blocked` with `reason=question` / `reason=auth`, and a dialog with no
+  record (folder trust, theme, login method) is `agent_blocked` with
+  `reason=blocked`. A record that goes from `blocked` to `idle` or `done` (Esc, a
+  denial, the automatic denial of a safety check) resolves the attention
+  record (`a_blocked_record_followed_by_an_idle_record_resolves_the_attention`).
+  The integration registers no `Notification` hook; `pohunek integration
+  install` strips the ones an earlier release wrote.
 - A held record outranks the screen. Two working screen rules, `live_status_spinner`
   (the status line of a turn) and `live_turn_footer` (`esc to interrupt`), are
   marked `below_authority` and serve only while no record is held: before the

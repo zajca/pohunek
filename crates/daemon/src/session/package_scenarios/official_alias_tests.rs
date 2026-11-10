@@ -5781,13 +5781,10 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     released.reconnect().await;
     hook.await.expect("the hook script finishes");
 
-    // The report is a kind the inbox does not hold: the daemon accepts it once
-    // and stores nothing.
-    let dropped = logs
-        .text()
-        .matches("a notification kind the inbox does not hold was accepted and dropped")
-        .count();
-    assert_eq!(dropped, 1, "one accepted report: {}", logs.text());
+    // The report is a turn signal, not an inbox record: the first attempt is
+    // refused while the worker is away and the retry is accepted.
+    let attempts = logs.text().matches("method=notification.create").count();
+    assert_eq!(attempts, 2, "refused once, then accepted: {}", logs.text());
     let recorded = notifications
         .list(protocol::NotificationListParams::default())
         .expect("list notifications")

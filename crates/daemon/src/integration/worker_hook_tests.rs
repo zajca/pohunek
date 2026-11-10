@@ -396,8 +396,8 @@ const REPLY_DELAY_PAST_HOOK_TIMEOUT: Duration = Duration::from_millis(1_200);
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notification() {
     let delivery = deliver(
-        "claude",
-        "notification permission_prompt",
+        "codex",
+        "permission_request",
         protocol::PROTOCOL_VERSION.get(),
         REPLY_DELAY_PAST_HOOK_TIMEOUT,
         2,
@@ -441,7 +441,7 @@ async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notificatio
 async fn notify_hook_delivers_through_the_worker_socket_to_a_created_notification() {
     let current = protocol::PROTOCOL_VERSION.get();
     let (request, reply, session) =
-        deliver_through_worker("claude", "notification permission_prompt", current).await;
+        deliver_through_worker("codex", "permission_request", current).await;
     assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
     assert!(
         request["id"]
@@ -451,7 +451,7 @@ async fn notify_hook_delivers_through_the_worker_socket_to_a_created_notificatio
     );
     assert_eq!(request["params"]["session_id"], json!(session));
     assert_eq!(reply["ok"]["created"], json!(true), "{reply}");
-    assert_eq!(reply["ok"]["record"]["agent_kind"], json!("claude"));
+    assert_eq!(reply["ok"]["record"]["agent_kind"], json!("codex"));
     assert_eq!(reply["ok"]["record"]["session_id"], json!(session));
 }
 
@@ -553,8 +553,8 @@ async fn notify_hook_falls_back_to_the_daemon_when_the_worker_refuses_or_is_abse
         let (requests, _) = run_hook_with_worker_reply(
             name,
             reply,
-            "claude",
-            &["notification", "permission_prompt"],
+            "codex",
+            &["permission_request"],
             protocol::PROTOCOL_VERSION.get(),
         )
         .await;
@@ -562,7 +562,7 @@ async fn notify_hook_falls_back_to_the_daemon_when_the_worker_refuses_or_is_abse
         assert!(
             requests[0]["id"]
                 .as_str()
-                .is_some_and(|id| id.starts_with("hook:claude:")),
+                .is_some_and(|id| id.starts_with("hook:codex:")),
             "{name}: the hook dials the daemon itself: {}",
             requests[0]
         );
