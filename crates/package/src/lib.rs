@@ -75,6 +75,8 @@ mod hash;
 #[cfg(unix)]
 mod index_state;
 #[cfg(unix)]
+pub mod revoked_digests;
+#[cfg(unix)]
 pub mod install;
 #[cfg(unix)]
 mod layout;
