@@ -18,13 +18,13 @@ fn content_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
-/// Whether setting the line aside may drop the pin of a live runtime's root.
+/// Whether the line may hold the pin of a live runtime's root.
 ///
 /// A line that is not a JSON object names no state at all, so it may be any
 /// record, including a live session; the upgrade preflight counts only lines
-/// it can read, but dropping a pin consents to more than that. A `resume`
+/// it can read, but removing the line by hand drops more than that. A `resume`
 /// line holds no session state, yet its pin is unreadable and the session it
-/// resumes may be running, so it needs the same consent.
+/// resumes may be running, so it counts the same.
 fn may_be_live(line: &RejectedLine) -> bool {
     line.may_own_runtime
         || (line.kind.as_deref() == Some("resume") && line.pin_unreadable())
@@ -51,9 +51,8 @@ fn bounded(reason: &str) -> &str {
 ///
 /// # Errors
 ///
-/// Returns an error when a rejected line cannot be located. A caller that
-/// drops lines from the store must not go on, because a line it cannot number
-/// is one it would drop without a record.
+/// Returns an error when a rejected line cannot be located, because a line
+/// that cannot be numbered cannot be listed for the operator.
 fn numbered(content: &str, rejected: Vec<RejectedLine>) -> io::Result<Vec<(u32, RejectedLine)>> {
     let expected = rejected.len();
     let mut pending = rejected.into_iter().peekable();

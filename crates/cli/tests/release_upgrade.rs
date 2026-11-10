@@ -233,7 +233,7 @@ const PROFILE: &str = "fake-claude";
 /// stopped session reports its own native id, which no live session reports.
 const STOPPED_PROFILE: &str = "stopped-claude";
 
-/// Host profile used only for the previous client's initial-input create.
+/// Host profile of the sessions the previous client creates after the upgrade.
 const SILENT_PROFILE: &str = "silent-claude";
 
 /// Host profile of the Codex agent, launched after the upgrade.
