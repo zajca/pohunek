@@ -318,7 +318,8 @@ fn refuse_unless_installable(plan: &EnsureReport, runtime: &RuntimeId) -> Result
 }
 
 /// Whether the apply changed exactly the packages and profiles the plan
-/// showed and left the catalog trust state the plan said it would record.
+/// showed, with the catalog trust state the plan showed (`record` becomes
+/// `recorded`, any other state stays).
 fn matches_preview(plan: &EnsureReport, applied: &EnsureReport) -> bool {
     let packages = |report: &EnsureReport, status: PackageStatus| -> BTreeSet<(String, String)> {
         report

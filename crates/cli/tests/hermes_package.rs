@@ -3607,7 +3607,7 @@ fn an_apply_that_leaves_another_catalog_state_than_previewed_is_incomplete() {
         let daemon = release.join("pohunekd");
         let real = release.join("pohunekd.real");
         fs::rename(&daemon, &real).expect("move the daemon aside");
-        fs::write(
+        write_executable(
             &daemon,
             "#!/bin/sh\nreal=\"${0%/*}/pohunekd.real\"\n\
              case \"$*\" in\n\
@@ -3617,7 +3617,6 @@ fn an_apply_that_leaves_another_catalog_state_than_previewed_is_incomplete() {
              esac\n",
         )
         .expect("write the wrapper");
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).expect("executable");
     });
 
     let output = install_release(&env, &release, &["--yes"]);
