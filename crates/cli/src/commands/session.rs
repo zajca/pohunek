@@ -2868,6 +2868,7 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::Hook => "hook",
         SessionWarningKind::NativeRecovery => "native_recovery",
         SessionWarningKind::BranchAheadOfRemote => "branch_ahead_of_remote",
+        SessionWarningKind::PackageRevoked => "package_revoked",
         SessionWarningKind::Unknown => "unknown",
     }
 }

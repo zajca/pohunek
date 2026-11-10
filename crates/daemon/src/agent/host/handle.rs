@@ -382,6 +382,37 @@ impl RuntimeHost {
             .map_err(|reason| refuse(definition.runtime_id(), &reason))
     }
 
+    /// Checks that `definition`, resolved to relaunch a stored session, is not
+    /// a package a recorded catalog revoked.
+    ///
+    /// A live session keeps resolving through its pin; only a relaunch calls
+    /// this. A built-in definition always passes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `package_revoked` for a revoked digest and
+    /// `runtime_incompatible` when the revocation set cannot be read.
+    pub fn ensure_not_revoked(&self, definition: &RuntimeDefinition) -> Result<(), ProtocolError> {
+        let BindingProvenance::Package {
+            package,
+            package_digest,
+        } = &definition.binding().provenance
+        else {
+            return Ok(());
+        };
+        let Some(store) = self.package_store() else {
+            return Ok(());
+        };
+        match store.is_revoked(package_digest, package) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(refuse(
+                definition.runtime_id(),
+                &super::package::PackageRejection::Revoked,
+            )),
+            Err(reason) => Err(refuse(definition.runtime_id(), &reason)),
+        }
+    }
+
     /// Resolves the definition a session frozen with `pin` may launch from.
     ///
     /// A package pin is resolved from exactly its package digest, never from

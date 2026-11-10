@@ -20,6 +20,7 @@ pub(super) fn fault_of(rejection: &PackageRejection) -> Option<PackageFault> {
     match rejection {
         PackageRejection::NotRegistered
         | PackageRejection::Disabled
+        | PackageRejection::Revoked
         | PackageRejection::RuntimeMissing => None,
         PackageRejection::IdentityMismatch => Some(PackageFault::IdentityMismatch),
         PackageRejection::Root(error) => Some(root_fault(*error)),

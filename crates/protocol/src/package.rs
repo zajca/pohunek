@@ -166,6 +166,11 @@ pub struct PackageInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub selection_blocked: Option<PackageSelectionBlock>,
+    /// Whether a recorded catalog revoked the digest of this official package.
+    /// A revoked package serves no fresh launch, resume or selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub revoked: bool,
 }
 
 /// What a package's runtime descriptor declares, for review before and after
@@ -627,6 +632,10 @@ pub enum PackageFindingKind {
     /// reference uses an incompatible version of the same package; see
     /// `blocked_by`.
     SelectionBlocked,
+    /// An installed official package carries a digest that a recorded catalog
+    /// revoked. It serves no fresh launch, resume or selection; sessions that
+    /// already run from it keep running.
+    Revoked,
     /// A value a newer daemon sent that this build does not know. Only the
     /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
     /// rejects the value and the daemon never holds or emits one.
@@ -760,6 +769,10 @@ pub enum PackageErrorKind {
     /// `accept_commands`, so the client may not be able to show them for
     /// consent.
     CommandsClientUnsupported,
+    /// A recorded catalog revoked the package digest, so it serves no fresh
+    /// launch, resume or selection until the operator selects another
+    /// version.
+    Revoked,
 }
 
 impl PackageErrorKind {
@@ -797,6 +810,7 @@ impl PackageErrorKind {
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
+            Self::Revoked => "package_revoked",
         }
     }
 
@@ -862,6 +876,7 @@ impl PackageErrorKind {
             Self::CommandsClientUnsupported => {
                 "the package exports commands and this client did not opt in to reviewing them"
             }
+            Self::Revoked => "a recorded package catalog revoked this package digest",
         }
     }
 
@@ -913,6 +928,9 @@ impl PackageErrorKind {
             }
             Self::CommandsClientUnsupported => {
                 "upgrade the pohunek CLI or SDK to a release that shows package commands for consent"
+            }
+            Self::Revoked => {
+                "select another installed version with `pohunek plugin select`, or install a release that carries a new package"
             }
         }
     }
@@ -1043,6 +1061,7 @@ mod tests {
             PackageErrorKind::IntegrationIncompatible,
             PackageErrorKind::RuntimeFeatureUnsupported,
             PackageErrorKind::CommandsClientUnsupported,
+            PackageErrorKind::Revoked,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

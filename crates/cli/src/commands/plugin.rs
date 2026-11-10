@@ -1531,6 +1531,9 @@ pub(super) fn state_label(info: &PackageInfo) -> String {
     if info.selection_blocked.is_some() {
         parts.push("selection blocked");
     }
+    if info.revoked {
+        parts.push("revoked");
+    }
     parts.join(" ")
 }
 
@@ -1914,6 +1917,7 @@ fn render_doctor(result: &PackageDoctorResult) -> String {
                 PackageFindingKind::Fault => finding.fault.map_or("fault", fault_label).to_owned(),
                 PackageFindingKind::Unknown => "unknown".to_owned(),
                 PackageFindingKind::UnregisteredRoot => "unregistered root".to_owned(),
+                PackageFindingKind::Revoked => "revoked".to_owned(),
                 PackageFindingKind::PinnedNotInstalled => "pinned but not installed".to_owned(),
                 PackageFindingKind::SelectionBlocked => finding.blocked_by.as_ref().map_or_else(
                     || "selection blocked".to_owned(),
@@ -1938,8 +1942,20 @@ fn render_doctor(result: &PackageDoctorResult) -> String {
         result.findings.len(),
         result.generation
     );
+    if result
+        .findings
+        .iter()
+        .any(|finding| finding.kind == PackageFindingKind::Revoked)
+    {
+        output.push_str(REVOKED_HINT);
+    }
     output
 }
+
+/// Printed under a doctor table that lists a revoked package.
+const REVOKED_HINT: &str = "A revoked package serves no fresh launch, resume or selection; \
+sessions already running from it keep running. Select another installed version with \
+`pohunek plugin select`, or install a release that carries a new package.\n";
 
 #[cfg(test)]
 mod tests {
@@ -1971,6 +1987,7 @@ mod tests {
             fault: None,
             referenced: false,
             selection_blocked: None,
+            revoked: false,
         }
     }
 

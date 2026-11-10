@@ -1737,12 +1737,17 @@ pub(super) fn recovery_definition_memo(
 ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
     let runtimes = profiles.runtimes();
     if let Some(adopter) = resolutions.adopter(runtimes, binding) {
-        if newer_adoption_holds(profiles, binding, &adopter) {
+        // A revoked adopter is skipped: the session's own frozen digest is
+        // judged next, and a revocation of either refuses the relaunch.
+        if newer_adoption_holds(profiles, binding, &adopter)
+            && runtimes.ensure_not_revoked(&adopter).is_ok()
+        {
             return Ok(adopter);
         }
     }
     let definition = resolutions.pinned(runtimes, binding)?;
     recovery_contract(binding, &definition)?;
+    runtimes.ensure_not_revoked(&definition)?;
     Ok(definition)
 }
 

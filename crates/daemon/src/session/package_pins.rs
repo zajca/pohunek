@@ -93,6 +93,62 @@ impl SessionRegistry {
         Ok(ConfigHomes::new(self.inner.profiles.clone(), base))
     }
 
+    /// Adds a `package_revoked` warning to each of `sessions` launched from a
+    /// package digest that a recorded catalog revoked.
+    ///
+    /// The check reads the registry and the revocation file, so it runs on a
+    /// blocking thread. A store that cannot be read leaves the sessions
+    /// unflagged; the launch gates refuse on their own.
+    pub(super) async fn flag_revoked_packages(&self, sessions: &mut [protocol::SessionInfo]) {
+        let Some(store) = self.inner.profiles.runtimes().package_store().cloned() else {
+            return;
+        };
+        let pinned: Vec<(SessionId, protocol::PackageIdentity, PackageDigest)> = {
+            let entries = self.inner.sessions.lock().await;
+            sessions
+                .iter()
+                .filter_map(|info| {
+                    let entry = entries.get(&info.id)?;
+                    match &entry.snapshot.launch_binding.binding()?.provenance {
+                        BindingProvenance::Package {
+                            package,
+                            package_digest,
+                        } => Some((info.id.clone(), package.clone(), package_digest.clone())),
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        if pinned.is_empty() {
+            return;
+        }
+        let revoked = tokio::task::spawn_blocking(move || {
+            pinned
+                .into_iter()
+                .filter(|(_, package, digest)| store.is_revoked(digest, package) == Ok(true))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "the revoked package check of the session list did not finish");
+            Vec::new()
+        });
+        for (id, _, digest) in revoked {
+            let Some(info) = sessions.iter_mut().find(|info| info.id == id) else {
+                continue;
+            };
+            info.warnings
+                .retain(|warning| warning.kind != protocol::SessionWarningKind::PackageRevoked);
+            info.warnings.push(protocol::SessionWarning {
+                kind: protocol::SessionWarningKind::PackageRevoked,
+                message: "the package this session runs from was revoked by a recorded catalog; \
+                          a running session keeps running but cannot be resumed from this digest"
+                    .to_owned(),
+                detail: Some(digest.to_string()),
+            });
+        }
+    }
+
     /// Re-derives the pinned definition and the running detector configuration
     /// of each live session launched from a built-in runtime an official
     /// package may adopt, after the runtime registry was rebuilt.
