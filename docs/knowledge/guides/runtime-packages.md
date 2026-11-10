@@ -1145,7 +1145,12 @@ read counts as incompatible.
   running; `session list` flags it with a `hook` warning (`detail` `package_revoked digest=<digest>`) and `plugin
   doctor` reports the package as `revoked`. Packages installed by explicit
   digest or linked are not affected. `integration doctor --agent hermes`
-  reports the revoked Hermes package in its `asset_source` check.
+  reports the revoked Hermes package in its `asset_source` check. `plugin doctor`
+  lists the sessions that still run from a revoked digest, and an unreadable
+  `revoked-digests.json` fails it with `package_revocations_unreadable` (fix the
+  file's mode or owner, or restore a copy; removing it forgets revocations that
+  no later catalog repeats). The upgrade preflight reports a stopped or live
+  session on a revoked digest as `already_not_resumable` (`package_revoked`).
 - The state is derived at each call from the registry and the sessions, never
   stored, so a daemon restart recomputes it. It clears when the last reference
   to the old version is gone (stop and remove the sessions, unpin or rebind the

@@ -2245,7 +2245,7 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
 }
 
 /// Wire code of the error resume answers for a revoked package digest.
-const PACKAGE_REVOKED_CODE: &str = "package_revoked";
+const PACKAGE_REVOKED_CODE: &str = protocol::PackageErrorKind::Revoked.code();
 
 /// The session's launch pin must name a runtime source the new daemon serves:
 /// resume resolves exactly that source, and nothing else stands in.

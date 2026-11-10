@@ -951,7 +951,7 @@ impl PackageErrorKind {
                 "select another installed version with `pohunek plugin select`, or install a release that carries a new package"
             }
             Self::RevocationsUnreadable => {
-                "stop the daemon, keep a copy of `revoked-digests.json` in the plugin root, remove it, start the daemon and install the release catalog again to record the revocations anew"
+                "fix the mode or owner of `revoked-digests.json` in the plugin root, or restore a copy of it, then retry; removing the file forgets revocations that no later catalog repeats"
             }
         }
     }

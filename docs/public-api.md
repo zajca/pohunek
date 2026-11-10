@@ -684,7 +684,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_source_unreadable` | `runtime` | The archive file, package directory or catalog could not be read or is not an absolute path. |
 | `package_untrusted` | `runtime` | The trust does not authorize the archive, including a catalog-trusted archive that exports commands only (a catalog entry binds a runtime id). |
 | `package_revoked` | `runtime` | A recorded catalog revoked the package digest. `session.new`, `session.resume`, a relaunch, `package.select`, `package.set_enabled` (enable) and `package.bind_profile` refuse it, and `package.install --catalog` refuses a revoked digest even when a later catalog lists it. The `recover` text names `pohunek plugin select`. Nothing is changed and the selection is never moved on its own. |
-| `package_revocations_unreadable` | `runtime` | The recorded revoked package digests (`revoked-digests.json`) cannot be read: official packages are refused, catalogs cannot be recorded and `package.doctor` fails with this code. The `recover` text names the repair; the daemon never replaces the file. |
+| `package_revocations_unreadable` | `runtime` | The recorded revoked package digests (`revoked-digests.json`) cannot be read: official packages are refused, catalogs cannot be recorded and `package.doctor` fails with this code. The `recover` text names the repair (fix the file's mode or owner, or restore a copy; removing it forgets revocations that no later catalog repeats); the daemon never replaces the file. |
 | `package_commands_client_unsupported` | `runtime` | The descriptor declares `[commands]` and the request did not set `accept_commands`; nothing was recorded, a dry run included. |
 | `official_trust_unavailable` | `configuration` | The host has no catalog trust anchor, so an official package cannot be authorized. |
 | `official_trust_anchor_invalid` | `configuration` | The host's catalog trust anchor exists but cannot be trusted (unsafe location, permissions or ownership, or invalid content), so an official package cannot be authorized. |
@@ -3175,7 +3175,7 @@ startup, `acceptance_scope`: `v1:` and a SHA-256 digest of the facts a durable
 acceptance stays bound to; it is absent for every other verdict and a reader
 treats an absent or unknown scope as not accepted), `stopped_sessions` (the
 same verdicts, plus `already_not_resumable`, for sessions whose runtime has ended
-but that keep native resume; at risk under the same flag), `runtimes` (absent when the release carries no
+but that keep native resume; at risk under the same flag; a session, live or stopped, whose launch package digest a recorded catalog revoked gets `already_not_resumable` with code `package_revoked`, because resume refuses it on the running release too), `runtimes` (absent when the release carries no
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
 plan with `packages`, `profiles`, `integrations` and `refusals`), and
 `unmanaged_workers` (ids of live worker journals the store has no record of; the

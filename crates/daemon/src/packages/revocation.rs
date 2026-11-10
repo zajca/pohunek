@@ -37,8 +37,9 @@ pub(super) fn is_revoked(revoked: &RevokedDigests, record: &PackageRecord) -> bo
 ///
 /// # Errors
 ///
-/// Returns [`PackageErrorKind::Revoked`] for a revoked digest and the registry
-/// kind when the revocation file cannot be read.
+/// Returns [`PackageErrorKind::Revoked`] for a revoked digest and
+/// [`PackageErrorKind::RevocationsUnreadable`] when the revocation file cannot
+/// be read.
 pub(super) fn require_not_revoked(
     context: &Context,
     state: &RegistryState,

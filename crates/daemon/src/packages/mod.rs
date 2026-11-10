@@ -263,7 +263,9 @@ impl PackageService {
     ///
     /// # Errors
     ///
-    /// Returns the [`PackageErrorKind`] of a registry that cannot be read.
+    /// Returns the [`PackageErrorKind`] of a registry that cannot be read, and
+    /// [`PackageErrorKind::RevocationsUnreadable`] when the file of revoked
+    /// digests cannot be.
     pub async fn package_doctor(
         &self,
         filter: Option<PackageId>,
