@@ -7,4 +7,5 @@ export type PackageFindingKind =
   | "fault"
   | "unregistered_root"
   | "pinned_not_installed"
-  | "selection_blocked";
+  | "selection_blocked"
+  | "revoked";

@@ -169,7 +169,7 @@ pub struct PackageInfo {
     /// Whether a recorded catalog revoked the digest of this official package.
     /// A revoked package serves no fresh launch, resume or selection.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    #[cfg_attr(feature = "ts", ts(optional))]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<bool>"))]
     pub revoked: bool,
 }
 

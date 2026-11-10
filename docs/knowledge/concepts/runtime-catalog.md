@@ -49,7 +49,10 @@ the registry and the CLI are separate layers.
   high-water mark (`Registry::record_catalog` persists it together with the
   accumulated revoked key ids in `catalog-state.json`, and
   `Registry::catalog_state` reads them back); a lower sequence is rejected, an equal one is accepted so an
-  installed catalog can be re-verified. `expires_at` bounds how long a frozen
+  installed catalog can be re-verified. The catalog's `revoked_digests` are
+  persisted in `revoked-digests.json` by the same call, so an installed
+  official package a later catalog revokes is refused at launch, resume,
+  select and pin (`package_revoked`) while running sessions keep running. `expires_at` bounds how long a frozen
   catalog is honored.
 
 ## Document format

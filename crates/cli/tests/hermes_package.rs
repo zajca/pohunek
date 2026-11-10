@@ -2268,6 +2268,74 @@ async fn assert_damaged_roots_are_refused(
     }
 }
 
+/// A later catalog that revokes the selected Hermes digest is learned offline
+/// of the daemon's launch path too: the operator source refuses the revoked
+/// package with a hint that names `plugin select`, and nothing is selected on
+/// its own.
+#[tokio::test]
+async fn a_later_catalog_that_revokes_the_selected_package_refuses_the_operator_source() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    hermes.install(&harness).await;
+
+    let mut alternate = package_entries();
+    set_version(&mut alternate, "1.3.1");
+    let (bytes, alternate_digest) = archive_of(&alternate);
+    let archive = write_archive(&harness, "hermes-1.3.1.tar.zst", &bytes);
+    let mut revoking = catalog_of(
+        2,
+        WINDOW_END,
+        vec![catalog_entry("1.3.1", &alternate_digest)],
+    );
+    revoking.revoked_digests = vec![digest.clone()];
+    let catalog = harness.env.root().join("runtime-catalog-revoking.json");
+    fs::write(&catalog, signed(&key, revoking)).expect("write the revoking catalog");
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&archive),
+            "--catalog",
+            path_str(&catalog),
+            "--no-enable",
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "record the revoking catalog: {installed:#}");
+
+    assert_source_findings(
+        &harness,
+        &hermes,
+        true,
+        Some("hermes_package_revoked"),
+        "revoked selected package",
+    )
+    .await;
+    let refused = hermes
+        .refuses_install_and_update(&harness, "hermes_package_revoked", "revoked package")
+        .await;
+    assert_eq!(refused["class"], "configuration", "{refused:#}");
+    assert_source_hint(&harness, &hermes, "hermes_package_revoked").await;
+
+    let (code, doctor) = harness.json(&["plugin", "doctor"]).await;
+    assert_eq!(code, 1, "a doctor with findings exits 1: {doctor:#}");
+    assert!(
+        doctor["ok"]["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|finding| finding["kind"] == "revoked" && finding["digest"] == digest.as_str()),
+        "plugin doctor reports the revoked package: {doctor:#}"
+    );
+    let (code, refused_select) = harness
+        .json(&["plugin", "select", PACKAGE_ID, "--digest", digest.as_str()])
+        .await;
+    assert_ne!(code, 0, "{refused_select:#}");
+    assert_eq!(refused_select["err"]["code"], "package_revoked");
+}
+
 /// Losing the recorded package keeps status informative, refuses update, and allows uninstall.
 #[tokio::test]
 async fn losing_the_recorded_package_refuses_update_without_mutation() {

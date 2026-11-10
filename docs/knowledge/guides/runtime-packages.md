@@ -1134,6 +1134,18 @@ read counts as incompatible.
 - The selected version keeps serving fresh launches and nothing falls back to
   another package. A pinned profile or session still resolves from exactly its
   digest.
+- **Revoked digests.** When a later signed catalog revokes the digest of an
+  installed official package (the catalog is recorded by `plugin install
+  --release`, `plugin update --catalog`, setup or upgrade), the package is
+  refused for fresh launches (a pinned profile included), resume and relaunch of
+  stored sessions, `plugin select`, enabling and `plugin profile bind` with
+  `package_revoked`. The selection is never moved on its own: run `pohunek
+  plugin select` for another installed version, or install a release that
+  carries a new package. A session already running from the digest keeps
+  running; `session list` flags it with a `package_revoked` warning and `plugin
+  doctor` reports the package as `revoked`. Packages installed by explicit
+  digest or linked are not affected. `integration doctor --agent hermes`
+  reports the revoked Hermes package in its `asset_source` check.
 - The state is derived at each call from the registry and the sessions, never
   stored, so a daemon restart recomputes it. It clears when the last reference
   to the old version is gone (stop and remove the sessions, unpin or rebind the
