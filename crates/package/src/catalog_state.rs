@@ -108,6 +108,8 @@ impl Registry {
     ///
     /// Under the registry lock the high-water mark becomes the larger of the
     /// stored one and the catalog sequence and the revoked key ids are united.
+    /// The catalog's revoked package digests join the set of
+    /// [`Registry::revoked_digests`], which is written before the state file.
     /// A catalog with a sequence below the stored mark changes nothing, and a
     /// merge that changes nothing writes nothing.
     ///
@@ -115,15 +117,20 @@ impl Registry {
     ///
     /// Returns [`RegistryError::Busy`] while another writer holds the lock,
     /// the read errors of [`Registry::catalog_state`] (a damaged file is never
-    /// replaced) and [`RegistryError::TooManyRevokedKeys`] when the union
-    /// would exceed [`MAX_REVOKED_KEYS`] ids; the file is unchanged on every
-    /// error except [`RegistryError::CommitUncertain`].
+    /// replaced), the same read errors of [`Registry::revoked_digests`],
+    /// [`RegistryError::TooManyRevokedKeys`] when the union would exceed
+    /// [`MAX_REVOKED_KEYS`] ids and [`RegistryError::TooManyRevokedDigests`]
+    /// when the digest union would exceed the digest cap; both files are
+    /// unchanged on those errors. A failed write of the state file after the
+    /// digests file was written leaves the digests recorded, which only
+    /// tightens trust.
     pub fn record_catalog(
         &self,
         verified: &VerifiedCatalog,
     ) -> Result<CatalogState, RegistryError> {
         let _lock = self.acquire_lock()?;
         self.remove_stale_temporary(CATALOG_STATE_TEMP_NAME)?;
+        self.remove_stale_revoked_digests_temporary()?;
         let current = self.catalog_state()?;
         if current
             .high_water
@@ -131,6 +138,7 @@ impl Registry {
         {
             return Ok(current);
         }
+        let revoked = self.revoked_digests()?;
         let mut merged = current.clone();
         merged.high_water = Some(current.high_water.map_or(verified.sequence(), |stored| {
             stored.max(verified.sequence())
@@ -140,6 +148,13 @@ impl Registry {
             .extend(verified.revoked_key_ids().iter().cloned());
         if merged.revoked_key_ids.len() > MAX_REVOKED_KEYS {
             return Err(RegistryError::TooManyRevokedKeys);
+        }
+        let united = revoked.united_with(verified)?;
+        // The digests are written first: a crash between the two writes then
+        // leaves a revocation recorded under the old watermark, and the same
+        // catalog records again, while the reverse order could lose it.
+        if let Some(united) = &united {
+            self.write_revoked_digests(united)?;
         }
         if merged == current {
             return Ok(current);

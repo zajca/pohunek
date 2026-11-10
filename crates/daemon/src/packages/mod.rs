@@ -26,6 +26,7 @@ pub(crate) mod ensure;
 mod error;
 mod fault;
 mod retention;
+mod revocation;
 mod selection;
 mod source;
 mod trust;
@@ -262,16 +263,21 @@ impl PackageService {
     ///
     /// # Errors
     ///
-    /// Returns the [`PackageErrorKind`] of a registry that cannot be read.
+    /// Returns the [`PackageErrorKind`] of a registry that cannot be read, and
+    /// [`PackageErrorKind::RevocationsUnreadable`] when the file of revoked
+    /// digests cannot be.
     pub async fn package_doctor(
         &self,
         filter: Option<PackageId>,
     ) -> Result<PackageDoctorResult, PackageErrorKind> {
         let context = self.authority.context()?;
         let retained = self.retained().await?;
-        blocking(move || {
+        let mut result = blocking(move || {
             let state = read_state(&context)?;
             let report = context.runtimes.package_report();
+            // An unreadable revocation file is a doctor error of its own: it
+            // refuses every catalog-authorized package.
+            revocation::revoked_set(&context)?;
             let mut findings = Vec::new();
             for record in state.packages() {
                 if filter
@@ -289,6 +295,18 @@ impl PackageService {
                         fault: None,
                         referenced: info.referenced,
                         blocked_by: Some(block.retained),
+                        running_sessions: Vec::new(),
+                    });
+                }
+                if info.revoked {
+                    findings.push(PackageFinding {
+                        kind: PackageFindingKind::Revoked,
+                        digest: info.digest.clone(),
+                        package: Some(info.package.clone()),
+                        fault: None,
+                        referenced: info.referenced,
+                        blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
                 if let Some(fault) = info.fault {
@@ -299,6 +317,7 @@ impl PackageService {
                         fault: Some(fault),
                         referenced: info.referenced,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
             }
@@ -317,6 +336,7 @@ impl PackageService {
                         fault: None,
                         referenced,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
                 for digest in retained
@@ -331,6 +351,7 @@ impl PackageService {
                         fault: None,
                         referenced: true,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
             }
@@ -339,7 +360,33 @@ impl PackageService {
                 findings,
             })
         })
-        .await
+        .await?;
+        self.attach_running_sessions(&mut result).await;
+        Ok(result)
+    }
+
+    /// Names, on each `revoked` finding, the sessions that still run from its
+    /// digest.
+    async fn attach_running_sessions(&self, result: &mut PackageDoctorResult) {
+        let revoked: Vec<PackageDigest> = result
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == PackageFindingKind::Revoked)
+            .map(|finding| finding.digest.clone())
+            .collect();
+        if revoked.is_empty() {
+            return;
+        }
+        let running = self.sessions.running_on_packages(&revoked).await;
+        for finding in &mut result.findings {
+            if finding.kind == PackageFindingKind::Revoked {
+                finding.running_sessions = running
+                    .iter()
+                    .filter(|(digest, _)| *digest == finding.digest)
+                    .map(|(_, id)| id.clone())
+                    .collect();
+            }
+        }
     }
 
     /// Runs one package mutation in a task of its own under the exclusive
@@ -461,6 +508,7 @@ impl PackageService {
         self.package_transaction(move |context, retained| {
             if params.enabled {
                 prove_loadable(context, &params.digest)?;
+                revocation::require_not_revoked(context, &read_state(context)?, &params.digest)?;
             } else {
                 read_state(context)?
                     .package(&params.digest)
@@ -495,6 +543,7 @@ impl PackageService {
             let integration = prove_loadable(context, &params.digest)?
                 .as_ref()
                 .map_or(Integration::Known(None), declared_by);
+            revocation::require_not_revoked(context, &read_state(context)?, &params.digest)?;
             ensure_selectable(context, retained, &params.digest, &integration)?;
             context
                 .store
@@ -772,6 +821,13 @@ fn inspect_record(
             }
             Err(rejection) => (None, fault_of(&rejection), None),
         };
+    let revoked = match revocation::revoked_set(context) {
+        Ok(set) => revocation::is_revoked(&set, record),
+        Err(kind) => {
+            warn!(?kind, "the revoked package digests cannot be read");
+            false
+        }
+    };
     Inspected {
         info: PackageInfo {
             digest: digest.clone(),
@@ -784,6 +840,7 @@ fn inspect_record(
             fault,
             referenced: retained.known().contains(digest),
             selection_blocked,
+            revoked,
         },
         runtime,
         commands,
@@ -936,8 +993,14 @@ fn prepare_archive(
                 .registry()
                 .catalog_state()
                 .map_err(|error| registry_kind(&error))?;
-            prepare_official(anchor, &state, path, catalog_path)
-                .map(|prepared| Candidate::Runtime(Box::new(prepared)))
+            let prepared = prepare_official(anchor, &state, path, catalog_path)?;
+            // A digest an earlier catalog revoked stays revoked when a later
+            // catalog lists it again.
+            if revocation::revoked_set(context)?.contains(&prepared.digest) {
+                warn!("a package archive was refused: a recorded catalog revoked its digest");
+                return Err(PackageErrorKind::Revoked);
+            }
+            Ok(Candidate::Runtime(Box::new(prepared)))
         }
         PackageTrust::Index { index_path } => {
             let (anchor, endorser) = context.index_endorser()?;
@@ -948,7 +1011,7 @@ fn prepare_archive(
             let index_state = registry
                 .index_state()
                 .map_err(|error| registry_kind(&error))?;
-            prepare_indexed(
+            let prepared = prepare_indexed(
                 &IndexTrustInputs {
                     anchor,
                     endorser,
@@ -957,8 +1020,12 @@ fn prepare_archive(
                 },
                 path,
                 index_path,
-            )
-            .map(|prepared| Candidate::Runtime(Box::new(prepared)))
+            )?;
+            if revocation::revoked_set(context)?.contains(&prepared.digest) {
+                warn!("a package archive was refused: a recorded catalog revoked its digest");
+                return Err(PackageErrorKind::Revoked);
+            }
+            Ok(Candidate::Runtime(Box::new(prepared)))
         }
     }
 }
@@ -1343,6 +1410,7 @@ fn install_package(
                 installed_at_unix_seconds: now,
                 runtime_id: runtime.as_ref().map(|runtime| runtime.runtime_id.clone()),
                 fault: None,
+                revoked: false,
                 selection_blocked: held_back.map(|retained| PackageSelectionBlock {
                     reason: protocol::PackageSelectionBlockReason::IncompatibleWithRetained,
                     retained,

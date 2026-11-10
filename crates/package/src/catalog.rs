@@ -1138,6 +1138,13 @@ impl VerifiedCatalog {
         &self.revoked_key_ids
     }
 
+    /// Every package digest this catalog revokes; the caller persists them so
+    /// a later catalog that omits one does not resurrect it.
+    #[must_use]
+    pub fn revoked_digests(&self) -> &BTreeSet<PackageDigest> {
+        &self.revoked_digests
+    }
+
     /// Whether this catalog revokes `digest`.
     #[must_use]
     pub fn is_digest_revoked(&self, digest: &PackageDigest) -> bool {

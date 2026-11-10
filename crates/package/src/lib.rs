@@ -83,6 +83,8 @@ pub mod manifest;
 #[cfg(unix)]
 pub mod registry;
 #[cfg(unix)]
+pub mod revoked_digests;
+#[cfg(unix)]
 pub mod verify;
 
 pub use anchor::{

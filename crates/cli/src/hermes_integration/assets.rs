@@ -202,7 +202,8 @@ pub(crate) fn version_policy(descriptor: &[u8]) -> Result<VersionProbePolicy, Er
 ///
 /// Returns [`Error::PackageNotInstalled`] when no Hermes package is installed,
 /// [`Error::PackageRegistryUnreadable`] when the registry cannot be opened or
-/// read safely, [`Error::PackageNotSelected`] when a Hermes package is
+/// read safely, [`Error::PackageRevoked`] when a recorded catalog revoked the
+/// selected digest, [`Error::PackageNotSelected`] when a Hermes package is
 /// installed but no enabled official version is selected, and
 /// [`Error::InvalidAsset`] when the selected package fails verification or
 /// the closed sidecar contract.
@@ -231,6 +232,12 @@ pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Resul
         .ok_or(Error::PackageRegistryUnreadable)?;
     if !record.enabled() || record.source() != PackageSource::Official {
         return Err(Error::PackageNotSelected);
+    }
+    let revoked = registry
+        .revoked_digests()
+        .map_err(|_| Error::PackageRegistryUnreadable)?;
+    if revoked.contains(selected) {
+        return Err(Error::PackageRevoked);
     }
     let verified = registry.verify(selected).map_err(|error| match error {
         RegistryError::RootInvalid(_) => Error::InvalidAsset,

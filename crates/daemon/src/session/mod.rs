@@ -5672,6 +5672,7 @@ impl SessionRegistry {
     pub async fn list(&self) -> Vec<SessionInfo> {
         let mut sessions = self.list_raw().await;
         self.enrich_project_labels(&mut sessions).await;
+        self.flag_revoked_packages(&mut sessions).await;
         sessions
     }
 

@@ -465,9 +465,11 @@ Shared payloads:
   descriptor), `origin` (`official`, `explicit_digest` or `link`), `enabled`,
   `selected`, `installed_at_unix_seconds`, optional `runtime_id`, optional
   `fault`, `referenced` (a live, lost or resumable session or a host
-  profile pins the digest) and optional `selection_blocked`
+  profile pins the digest), optional `selection_blocked`
   (`{reason, retained}`: why an installed, unselected package cannot be
-  selected yet; see "Compatibility-gated selection" below).
+  selected yet; see "Compatibility-gated selection" below) and `revoked`
+  (omitted when false: a recorded catalog revoked the digest of this official
+  package; see "Revoked package digests" below).
 - `PackageFault`: `root_missing`, `root_modified`, `root_unsafe`,
   `root_unreadable`, `descriptor_missing`, `descriptor_invalid`,
   `identity_mismatch`, `runtime_not_claimable`, `runtime_conflict`. `fault` is
@@ -507,7 +509,7 @@ Shared payloads:
 |---|---|---|---|
 | `package.list` | `null` | `{generation, packages[]}` | `generation` counts committed registry changes. |
 | `package.inspect` | `{digest}` | `{package, runtime?, commands?, commands_only?}` | `runtime` is absent when the descriptor cannot be loaded and for a package that exports commands only. `commands` lists the exported `CommandInfo` (name, program, arguments, exposure) and is absent when there are none or the descriptor cannot be loaded, so an owner can review the exposure after install. `commands_only` is `true` when the descriptor loaded and exports commands only; a reply without it says nothing about the descriptor, so a client reads a missing `runtime` as "descriptor unavailable" and never infers a commands-only package. An older daemon omits both fields. |
-| `package.doctor` | `{package?}` or `null` | `{generation, findings[]}` | `package` restricts the report to one package id. A finding is `{kind, digest, package?, fault?, referenced}`; `kind` is `fault`, `unregistered_root` (a root on disk without a record; installing the same archive again adopts it after verification), `pinned_not_installed` (a session or host profile pins a digest the registry does not record) or `selection_blocked` (an installed, unselected package that cannot be selected until a retained reference to an incompatible version of the same package is gone; `blocked_by` is that digest). A finding carries `blocked_by?` besides the fields above. An empty list means everything verified. |
+| `package.doctor` | `{package?}` or `null` | `{generation, findings[]}` | `package` restricts the report to one package id. A finding is `{kind, digest, package?, fault?, referenced}`; `kind` is `fault`, `unregistered_root` (a root on disk without a record; installing the same archive again adopts it after verification), `pinned_not_installed` (a session or host profile pins a digest the registry does not record), `selection_blocked` (an installed, unselected package that cannot be selected until a retained reference to an incompatible version of the same package is gone; `blocked_by` is that digest) or `revoked` (an installed official package whose digest a recorded catalog revoked; `referenced` tells whether a session or profile still pins it, and `running_sessions` lists the sessions that still run from it, omitted when empty). An unreadable revocation file makes `package.doctor` fail with `package_revocations_unreadable`. A finding carries `blocked_by?` besides the fields above. An empty list means everything verified. |
 | `package.install` | `{archive_path, trust, enable, select, dry_run, accept_commands?}` | `{status, package, runtime?, commands?, reloaded}` | All parameters except `accept_commands` are required. `runtime` is absent for a package that exports commands only (it serves no runtime and cannot be launched as a session); `commands` lists the exported `CommandInfo` and is absent when there are none. `accept_commands` (default `false`, omitted when `false`) is the client's statement that it shows every exported command for consent: a descriptor that declares `[commands]` (command-only or together with a runtime) is refused with `package_commands_client_unsupported` before anything is written, a dry run included, unless it is `true`. Send it only when `host.inspect` reports `package_install_commands_supported`; an older daemon rejects the unknown parameter. A catalog-trusted archive must export a runtime: a package that exports commands only is refused with `package_untrusted`, because a catalog entry binds a runtime id, and an official package that declares commands is refused the same way until the release install paths show commands for consent. An index-trusted archive follows the same rules and is installed with the `official` origin; the daemon verifies the index (signature, freshness, the per-host sequence and revocation marks it persists before the install, and the key ids revoked by the anchor, by catalogs and by earlier indexes), looks the raw archive digest up in it before decompressing anything, and then requires the entry to bind package id `pohunek.runtime.<runtime_id>`, runtime id and version and to list this platform and a core range that admits this core. Refusals: no channel file beside the anchor is `official_trust_unavailable`; a channel that cannot be trusted is `official_trust_anchor_invalid`; an unreadable or oversized index file is `package_source_unreadable`; an index or entry that fails verification, an unlisted digest, or a package that declares commands is `package_untrusted`; the runtime ids `shell`, `codex`, `claude`, `hermes` and `pi` are `package_runtime_not_claimable`; an unusable or excluding core range or an unlisted platform is `package_incompatible`. `archive_path` is absolute on the daemon host. `status` is `preview` (dry run, nothing changed), `installed`, `already_installed` (recorded with a verified root) or `root_restored` (recorded, root was missing and extracted again). A package that is already recorded keeps its recorded `enabled`, `selected` and origin: `enable`, `select` and `trust` apply to a new record only. With `select: true`, a package whose integration is incompatible with a retained version of the same package is still installed, but unselected: the call succeeds with `package.selected: false` and `package.selection_blocked` set (a dry run reports the same). |
 | `package.link` | `{directory, dry_run, accept_commands?}` | `{status, package, runtime?, commands?, reloaded}` | Copies the directory into content-addressed storage and installs it disabled and unselected; the daemon never loads the directory itself. `accept_commands` works as for `package.install`. |
 | `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
@@ -544,6 +546,26 @@ request) instead of pinning the version that was just replaced; a digest a host
 profile pins launches whatever is selected. While an unreadable `metadata.jsonl`
 line may pin a package, every installed version counts as retained, including
 the pin a `package.bind_profile` rebind replaces.
+
+Revoked package digests. Every successful `Registry::record_catalog` (a
+`package.install` with catalog trust, `pohunekd ensure-official-runtimes`, and
+through it `plugin install --release`) adds the `revoked_digests` of the
+catalog to `<plugins>/revoked-digests.json`, a file of its own beside
+`catalog-state.json` (schema 1, accumulate-only, `0600`, at most 16384 digests;
+`catalog-state.json` keeps its schema, so a release without this file still
+reads the registry after a rollback, and does not enforce the set). The
+revocation applies to catalog-authorized (`official`) packages only; a package
+installed by explicit digest or linked is the owner's own trust decision. A
+catalog that omits a digest an earlier one revoked does not resurrect it, and a
+replayed older catalog changes nothing. A revoked digest serves no fresh
+launch (`session.new`, a host profile pinned to it included), no resume or
+relaunch of a stored session, no `package.select`, no enabling and no
+`package.bind_profile`: each fails with `package_revoked`, and the selection is
+never moved to another version on its own. A session already running from the
+digest keeps running and stays controllable; `session.list` flags it with a
+`hook` warning whose `detail` starts with `package_revoked` and `package.doctor` reports the package as
+`revoked`. A revocation file that cannot be read fails closed for official
+packages (`runtime_incompatible` at launch) and is never replaced.
 
 Install and link validate the package in memory before anything is extracted:
 `runtime.toml` is parsed from the verified archive, and the package identity
@@ -661,6 +683,8 @@ Errors use the error contract below. Every code has fixed message and
 | `package_archive_invalid` | `runtime` | The archive is not a valid canonical package archive, breaks a limit or has another digest than the trust names. |
 | `package_source_unreadable` | `runtime` | The archive file, package directory or catalog could not be read or is not an absolute path. |
 | `package_untrusted` | `runtime` | The trust does not authorize the archive, including a catalog-trusted archive that exports commands only (a catalog entry binds a runtime id). |
+| `package_revoked` | `runtime` | A recorded catalog revoked the package digest. `session.new`, `session.resume`, a relaunch, `package.select`, `package.set_enabled` (enable) and `package.bind_profile` refuse it, and `package.install --catalog` refuses a revoked digest even when a later catalog lists it. The `recover` text names `pohunek plugin select`. Nothing is changed and the selection is never moved on its own. |
+| `package_revocations_unreadable` | `runtime` | The recorded revoked package digests (`revoked-digests.json`) cannot be read: official packages are refused, catalogs cannot be recorded and `package.doctor` fails with this code. The `recover` text names the repair (fix the file's mode or owner, or restore a copy; removing it forgets revocations that no later catalog repeats); the daemon never replaces the file. |
 | `package_commands_client_unsupported` | `runtime` | The descriptor declares `[commands]` and the request did not set `accept_commands`; nothing was recorded, a dry run included. |
 | `official_trust_unavailable` | `configuration` | The host has no catalog trust anchor, so an official package cannot be authorized. |
 | `official_trust_anchor_invalid` | `configuration` | The host's catalog trust anchor exists but cannot be trusted (unsafe location, permissions or ownership, or invalid content), so an official package cannot be authorized. |
@@ -1913,6 +1937,10 @@ Important fields:
   `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup,
   and `branch_ahead_of_remote` for a `branch_source: "remote"` session whose
   local branch is ahead of `origin` (`detail` is `local=<commit> remote=<commit>`).
+  `session.list` (not the stored record) adds a `hook`-kind warning to a
+  session launched from a package digest that a recorded catalog revoked; its
+  `detail` is `package_revoked digest=<digest>`. The session keeps running and stays controllable, but cannot be
+  resumed or relaunched from the digest.
   `base_branch_fallback` marks a requested base branch that was not used
   because the session's `branch` already existed locally at another commit and
   was checked out as it is, with `detail` naming both commits. A requested base
@@ -3147,7 +3175,7 @@ startup, `acceptance_scope`: `v1:` and a SHA-256 digest of the facts a durable
 acceptance stays bound to; it is absent for every other verdict and a reader
 treats an absent or unknown scope as not accepted), `stopped_sessions` (the
 same verdicts, plus `already_not_resumable`, for sessions whose runtime has ended
-but that keep native resume; at risk under the same flag), `runtimes` (absent when the release carries no
+but that keep native resume; at risk under the same flag; a session, live or stopped, whose launch package digest a recorded catalog revoked gets `already_not_resumable` with code `package_revoked`, because resume refuses it on the running release too), `runtimes` (absent when the release carries no
 `runtime/` tree; otherwise the `EnsureReport` of the release's official runtime
 plan with `packages`, `profiles`, `integrations` and `refusals`), and
 `unmanaged_workers` (ids of live worker journals the store has no record of; the

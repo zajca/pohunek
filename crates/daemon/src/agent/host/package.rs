@@ -91,6 +91,10 @@ pub enum PackageRejection {
     /// The registry could not be read or verified.
     #[error("the package registry failed: {0}")]
     Registry(RegistryError),
+    /// A recorded catalog revoked the digest of this catalog-authorized
+    /// package, so it serves no fresh launch, resume or selection.
+    #[error("a recorded catalog revoked the package digest")]
+    Revoked,
 }
 
 impl PackageRejection {
@@ -122,6 +126,7 @@ impl PackageRejection {
             Self::NotRegistered | Self::Disabled => {
                 ProtocolError::runtime_not_installed(runtime_id)
             }
+            Self::Revoked => ProtocolError::from(protocol::PackageErrorKind::Revoked),
             _ => ProtocolError::runtime_incompatible(runtime_id),
         }
     }
@@ -344,7 +349,57 @@ impl PackageStore {
         if !record.enabled() {
             return Err(PackageRejection::Disabled);
         }
+        self.ensure_not_revoked(&record)?;
         self.ready_root(digest).map(|_root| ())
+    }
+
+    /// Refuses a catalog-authorized package whose digest a recorded catalog
+    /// revoked.
+    ///
+    /// Packages the owner trusts by explicit digest or by link are not
+    /// subject to a catalog's revocations. A revocation set that cannot be
+    /// read refuses every catalog-authorized package: enforcement fails
+    /// closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageRejection::Revoked`] for a revoked digest and
+    /// [`PackageRejection::Registry`] when the set cannot be read.
+    pub fn ensure_not_revoked(
+        &self,
+        record: &package::registry::PackageRecord,
+    ) -> Result<(), PackageRejection> {
+        if record.source() != package::registry::PackageSource::Official {
+            return Ok(());
+        }
+        let revoked = self
+            .registry
+            .revoked_digests()
+            .map_err(PackageRejection::Registry)?;
+        if revoked.contains(record.digest()) {
+            Err(PackageRejection::Revoked)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether `digest` is revoked for the record installed under `identity`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::ensure_not_revoked`] other than the revocation
+    /// itself, and the record errors of [`Self::verify_launchable`].
+    pub fn is_revoked(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Result<bool, PackageRejection> {
+        let record = self.record(digest, identity)?;
+        match self.ensure_not_revoked(&record) {
+            Ok(()) => Ok(false),
+            Err(PackageRejection::Revoked) => Ok(true),
+            Err(other) => Err(other),
+        }
     }
 
     /// Whether the registry records `digest` under `identity`, enabled or not.

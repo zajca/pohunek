@@ -7269,6 +7269,36 @@ fn a_release_catalog_that_revokes_the_package_digest_is_refused() {
     host.assert_nothing_installed();
 }
 
+/// The release step records the catalog it installs from, including the
+/// package digests the catalog revokes, so a later launch of an installed
+/// package with such a digest is refused.
+#[test]
+fn a_recorded_release_catalog_persists_the_digests_it_revokes() {
+    let host = Host::without_service();
+    let key = test_key();
+    let revoked = PackageDigest::parse(&format!("sha256:{}", "e".repeat(64))).expect("digest");
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, Vec::new()),
+        &[REQUESTED],
+        1,
+        WINDOW_END,
+        |catalog| catalog.revoked_digests.push(revoked.clone()),
+    );
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(report.catalog, CatalogStatus::Recorded);
+    assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+    let registry =
+        package::registry::Registry::open_at(&host.plugins_dir(), package::Limits::DEFAULT)
+            .expect("the registry the step created");
+    assert!(registry
+        .revoked_digests()
+        .expect("revoked digests")
+        .contains(&revoked));
+}
+
 /// A daemon that holds the instance lock owns the registry: the request is
 /// refused and nothing is written.
 #[test]

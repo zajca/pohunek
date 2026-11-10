@@ -120,6 +120,7 @@ fn resolve_target(
         return Err(PackageErrorKind::ProfileTargetInvalid);
     }
     prove_loadable(context, &chosen.info.digest)?;
+    super::revocation::require_not_revoked(context, &state, &chosen.info.digest)?;
     let runtime = chosen
         .runtime
         .clone()

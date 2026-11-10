@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+    SessionId,
 };
 
 /// How an installed package was authorized.
@@ -133,6 +134,10 @@ pub struct PackageSelectionBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageInfo.ts"))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the wire form reports independent facts about one installed package"
+)]
 pub struct PackageInfo {
     /// Digest of the package archive, its content address.
     pub digest: PackageDigest,
@@ -166,6 +171,11 @@ pub struct PackageInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub selection_blocked: Option<PackageSelectionBlock>,
+    /// Whether a recorded catalog revoked the digest of this official package.
+    /// A revoked package serves no fresh launch, resume or selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<bool>"))]
+    pub revoked: bool,
 }
 
 /// What a package's runtime descriptor declares, for review before and after
@@ -627,6 +637,10 @@ pub enum PackageFindingKind {
     /// reference uses an incompatible version of the same package; see
     /// `blocked_by`.
     SelectionBlocked,
+    /// An installed official package carries a digest that a recorded catalog
+    /// revoked. It serves no fresh launch, resume or selection; sessions that
+    /// already run from it keep running.
+    Revoked,
     /// A value a newer daemon sent that this build does not know. Only the
     /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
     /// rejects the value and the daemon never holds or emits one.
@@ -663,6 +677,11 @@ pub struct PackageFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_by: Option<PackageDigest>,
+    /// The sessions that still run from the digest of a
+    /// [`PackageFindingKind::Revoked`] finding; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<Vec<SessionId>>"))]
+    pub running_sessions: Vec<SessionId>,
 }
 
 /// Result of `package.doctor`.
@@ -760,6 +779,14 @@ pub enum PackageErrorKind {
     /// `accept_commands`, so the client may not be able to show them for
     /// consent.
     CommandsClientUnsupported,
+    /// A recorded catalog revoked the package digest, so it serves no fresh
+    /// launch, resume or selection until the operator selects another
+    /// version.
+    Revoked,
+    /// The file of recorded revoked package digests cannot be read, so
+    /// catalog-authorized packages are refused and no catalog can be recorded
+    /// until it is repaired.
+    RevocationsUnreadable,
 }
 
 impl PackageErrorKind {
@@ -797,6 +824,8 @@ impl PackageErrorKind {
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
+            Self::Revoked => "package_revoked",
+            Self::RevocationsUnreadable => "package_revocations_unreadable",
         }
     }
 
@@ -862,6 +891,10 @@ impl PackageErrorKind {
             Self::CommandsClientUnsupported => {
                 "the package exports commands and this client did not opt in to reviewing them"
             }
+            Self::Revoked => "a recorded package catalog revoked this package digest",
+            Self::RevocationsUnreadable => {
+                "the recorded revoked package digests cannot be read, so catalog-authorized packages are refused"
+            }
         }
     }
 
@@ -913,6 +946,12 @@ impl PackageErrorKind {
             }
             Self::CommandsClientUnsupported => {
                 "upgrade the pohunek CLI or SDK to a release that shows package commands for consent"
+            }
+            Self::Revoked => {
+                "select another installed version with `pohunek plugin select`, or install a release that carries a new package"
+            }
+            Self::RevocationsUnreadable => {
+                "fix the mode or owner of `revoked-digests.json` in the plugin root, or restore a copy of it, then retry; removing the file forgets revocations that no later catalog repeats"
             }
         }
     }
@@ -1043,6 +1082,8 @@ mod tests {
             PackageErrorKind::IntegrationIncompatible,
             PackageErrorKind::RuntimeFeatureUnsupported,
             PackageErrorKind::CommandsClientUnsupported,
+            PackageErrorKind::Revoked,
+            PackageErrorKind::RevocationsUnreadable,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

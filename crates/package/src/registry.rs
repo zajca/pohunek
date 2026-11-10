@@ -350,6 +350,11 @@ pub enum RegistryError {
     /// persisted revoked key ids; nothing was written.
     #[error("the catalog state would exceed the revoked key limit")]
     TooManyRevokedKeys,
+    /// Recording the catalog would exceed
+    /// [`crate::revoked_digests::MAX_REVOKED_DIGESTS_TOTAL`] persisted revoked package digests;
+    /// nothing was written.
+    #[error("the catalog state would exceed the revoked digest limit")]
+    TooManyRevokedDigests,
     /// The registry holds [`MAX_PACKAGES`] packages.
     #[error("the registry holds the maximum number of packages")]
     TooManyPackages,

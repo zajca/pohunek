@@ -1021,6 +1021,7 @@ mod tests {
             fault: None,
             referenced: false,
             selection_blocked: None,
+            revoked: false,
         }
     }
 

@@ -385,6 +385,18 @@ stored mark and the catalog sequence and revoked key ids are united (at most
 changes nothing and a merge that changes nothing writes nothing. A corrupt or
 unknown-schema file is a typed error and is never replaced.
 
+The revoked package digests of the recorded catalogs live in
+`revoked-digests.json` (schema 1, unknown fields denied, `0600`, sorted unique
+`revoked_digests`, at most `MAX_REVOKED_DIGESTS_TOTAL` = 16384, at most 2 MiB),
+a sibling of `catalog-state.json` so that file keeps its schema and a rollback
+still reads it. `revoked_digests()` reads the set without the lock;
+`record_catalog` unites the catalog's digests with it under the same lock and
+writes the digests file before `catalog-state.json`, so a crash between the
+two writes never loses a revocation. An equal-sequence catalog with new digests
+is recorded; a lower sequence changes nothing; a union above the cap is
+`TooManyRevokedDigests` and writes nothing; a damaged file is a typed error and
+is never replaced.
+
 ### Index state
 
 The plugin index verifier has its own state file, `index-state.json` (schema 1,

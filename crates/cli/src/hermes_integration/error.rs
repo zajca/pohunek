@@ -67,6 +67,9 @@ pub(crate) enum Error {
     /// A Hermes package is installed, but no enabled official version is selected.
     #[error("no enabled official Hermes package is selected")]
     PackageNotSelected,
+    /// A recorded catalog revoked the selected official Hermes package digest.
+    #[error("the selected Hermes package was revoked by a recorded catalog")]
+    PackageRevoked,
     /// A directory exists but was not created by this lifecycle.
     #[error("Hermes plugin directory is not owned by Pohunek")]
     Collision,
@@ -143,6 +146,9 @@ impl Error {
             }
             Self::PackageNotSelected => {
                 "enable and select an official `pohunek.runtime.hermes` version with `pohunek plugin enable` and `pohunek plugin select`, or install one from its signed catalog"
+            }
+            Self::PackageRevoked => {
+                "select another installed `pohunek.runtime.hermes` version with `pohunek plugin select`, or install a release that carries a new package"
             }
             Self::Collision => "choose a profile without an unrelated `pohunek` plugin",
             Self::InvalidMarker => "repair or manually preserve the affected plugin directory",

@@ -56,4 +56,9 @@ export type PackageInfo = {
    * and never serves a fresh launch while this is present.
    */
   selection_blocked?: PackageSelectionBlock;
+  /**
+   * Whether a recorded catalog revoked the digest of this official package.
+   * A revoked package serves no fresh launch, resume or selection.
+   */
+  revoked?: boolean;
 };

@@ -61,6 +61,7 @@ pub(super) fn rejection_kind(rejection: &PackageRejection) -> PackageErrorKind {
         PackageRejection::ReservedRuntimeId => PackageErrorKind::RuntimeNotClaimable,
         PackageRejection::RuntimeIdConflict => PackageErrorKind::RuntimeConflict,
         PackageRejection::Registry(error) => registry_kind(error),
+        PackageRejection::Revoked => PackageErrorKind::Revoked,
         // A disabled package is not an install failure, and an unknown
         // rejection fails closed.
         _ => PackageErrorKind::RegistryFailed,

@@ -48,6 +48,7 @@ fn info(id: &str, digest: &str, runtime: Option<&str>) -> PackageInfo {
         fault: None,
         referenced: false,
         selection_blocked: None,
+        revoked: false,
     }
 }
 
