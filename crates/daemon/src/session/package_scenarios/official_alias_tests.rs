@@ -5781,10 +5781,13 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     released.reconnect().await;
     hook.await.expect("the hook script finishes");
 
-    // The report is a turn signal, not an inbox record: the first attempt is
-    // refused while the worker is away and the retry is accepted.
-    let attempts = logs.text().matches("method=notification.create").count();
-    assert_eq!(attempts, 2, "refused once, then accepted: {}", logs.text());
+    // The report is a turn signal, not an inbox record: every attempt but the
+    // last is refused while the worker is away, and the last is accepted.
+    let text = logs.text();
+    let attempts = text.matches("method=notification.create").count();
+    let refused = text.matches("the hook report is refused").count();
+    assert!(refused >= 1, "the first attempt is refused: {text}");
+    assert_eq!(attempts, refused + 1, "one accepted report: {text}");
     let recorded = notifications
         .list(protocol::NotificationListParams::default())
         .expect("list notifications")

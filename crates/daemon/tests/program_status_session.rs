@@ -158,6 +158,9 @@ run() {{
     a) emit 'blocked:kind=auth' ;;
     n) emit blocked ;;
     i) emit idle ;;
+    k) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n' ;;
+    P) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit 'blocked:kind=permission' ;;
+    y) printf '\033[2J\033[H'; box ;;
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
@@ -1340,14 +1343,12 @@ async fn a_blocked_records_kind_chooses_the_attention_record() {
     assert_eq!(first.kind, NotificationKind::AgentBlocked);
     command(&fixture, b'b');
     wait_until("the permission record to replace the question", || async {
-        attention
-            .records(&created.id)
+        let records = attention.records(&created.id);
+        let unread: Vec<_> = records
             .iter()
-            .any(|record| {
-                record.kind == NotificationKind::ApprovalRequired
-                    && record.status == NotificationStatus::Unread
-            })
-            .then_some(())
+            .filter(|record| record.status == NotificationStatus::Unread)
+            .collect();
+        (unread.len() == 1 && unread[0].kind == NotificationKind::ApprovalRequired).then_some(())
     })
     .await;
     fixture
@@ -1394,5 +1395,85 @@ async fn a_blocked_record_followed_by_an_idle_record_resolves_the_attention() {
         .stop(&created.id)
         .await
         .expect("stop the session");
+    attention.end().await;
+}
+
+/// A screen dialog that wins over a held `blocked` record carries the record's
+/// kind: a permission prompt the screen rules read is still an approval.
+#[tokio::test]
+async fn a_screen_dialog_over_a_permission_record_is_an_approval() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'P');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::ApprovalRequired);
+    assert_eq!(
+        record.metadata.get("reason").map(String::as_str),
+        Some("permission")
+    );
+    assert_eq!(attention.records(&created.id).len(), 1);
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// A dialog only the screen saw is not closed by a later idle record: the
+/// attention record stays unread. A second session's blocked record fences the
+/// projector, which handles the events of all sessions in order.
+#[tokio::test]
+async fn an_idle_record_after_a_screen_only_dialog_leaves_the_attention_open() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'k');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::AgentBlocked);
+
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    let fence = fixture.start("fake-reply-stdin").await;
+    fixture
+        .wait_activity(&fence.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    fixture
+        .input(&fence.id, "b", AgentActivity::Blocked)
+        .await
+        .expect("input until blocked");
+    attention.first_record(&fence.id).await;
+
+    let records = attention.records(&created.id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, NotificationStatus::Unread);
+
+    for id in [&created.id, &fence.id] {
+        fixture.registry.stop(id).await.expect("stop the session");
+    }
     attention.end().await;
 }

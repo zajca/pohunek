@@ -167,7 +167,8 @@ reserved, so either way of installing serves it.
   so the model, session, tree, fork and settings selectors (opened by the
   owner, asking nothing) match no rule and keep the byte-activity fallback,
   which publishes `working` from process output until the editor returns. A blocked session raises the "Agent needs attention"
-  notification and the `agent_blocked` turn event, and ends `session wait
+  notification and the `agent_blocked` turn event (an `approval_required` record
+  and turn event when the record reports `kind=permission`), and ends `session wait
   --activity blocked`. The package's unrestricted input policy still accepts a
   plain `session input` while Pi is blocked (and Pi's submit delay rules out
   the waited form), so an orchestrator waits for `idle` or `blocked` before it

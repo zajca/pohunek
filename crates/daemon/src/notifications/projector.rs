@@ -291,6 +291,10 @@ struct ProjectorState {
     activity_by_session: HashMap<SessionId, AgentActivity>,
     /// The kind the last blocked reading of a session carried.
     blocked_kind_by_session: HashMap<SessionId, Option<BlockedKind>>,
+    /// Sessions whose current blocked state is backed by the program's own
+    /// status record (it came from `OscProgress` or named a kind), not by a
+    /// screen or title reading alone.
+    record_backed_blocks: HashSet<SessionId>,
     lifecycle_by_session: HashMap<SessionId, SessionState>,
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
     /// Sessions whose transition epochs continue from the store's records.
@@ -658,6 +662,7 @@ impl ProjectorState {
         } else {
             self.activity_by_session.remove(&session.id);
             self.blocked_kind_by_session.remove(&session.id);
+            self.record_backed_blocks.remove(&session.id);
         }
         if session.state == SessionState::Stopped {
             self.handle_explicit_stop(attention, session);
@@ -690,16 +695,28 @@ impl ProjectorState {
                 attention.resolve(attention_dedupe_key(session_id));
             }
         }
-        // Idle from the program's status channel (`OscProgress`, normally a 7501 record)
-        // right after `blocked` means the dialog closed (Esc, a denial, an
-        // auto-denial). An idle read from the screen or the title does not
-        // resolve: an approval prompt can read idle there while it still waits.
+        // Idle from the program's status channel (`OscProgress`, normally a 7501
+        // record) right after a record-backed `blocked` means the dialog closed
+        // (Esc, a denial, an auto-denial). An idle read from the screen or the
+        // title does not resolve, and neither does an idle record that follows
+        // a dialog only the screen saw: that dialog can still be waiting.
+        let record_backed = self.record_backed_blocks.contains(session_id);
         if activity == AgentActivity::Idle
             && previous == Some(AgentActivity::Blocked)
             && origin.source == Some(StateSource::OscProgress)
+            && record_backed
         {
             self.blocked_replay_candidates.remove(session_id);
             attention.resolve(attention_dedupe_key(session_id));
+        }
+        if activity == AgentActivity::Blocked {
+            if origin.source == Some(StateSource::OscProgress) || origin.blocked_kind.is_some() {
+                self.record_backed_blocks.insert(session_id.clone());
+            } else if previous != Some(AgentActivity::Blocked) {
+                self.record_backed_blocks.remove(session_id);
+            }
+        } else {
+            self.record_backed_blocks.remove(session_id);
         }
         // A blocked reading without a kind keeps the kind already derived.
         let kind_before = if activity == AgentActivity::Blocked {
@@ -769,6 +786,7 @@ impl ProjectorState {
             resolve_session_notifications(attention, &session.id);
             self.activity_by_session.remove(&session.id);
             self.blocked_kind_by_session.remove(&session.id);
+            self.record_backed_blocks.remove(&session.id);
             self.blocked_replay_candidates.remove(&session.id);
         }
     }
