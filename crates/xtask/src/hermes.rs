@@ -942,6 +942,9 @@ struct PohunekDoctorCheck {
     code: String,
     status: String,
     recovery_hint: String,
+    /// A finding that does not fail the check.
+    #[serde(default, rename = "note")]
+    _note: Option<String>,
 }
 
 #[derive(Debug)]
