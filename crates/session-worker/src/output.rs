@@ -283,6 +283,14 @@ impl OutputHub {
             .is_some_and(|responder| !responder.conditional)
     }
 
+    /// How many probe replies the foreground filter refused so far.
+    pub(crate) fn withheld_probe_replies(&self) -> u64 {
+        lock(&self.inner)
+            .probe
+            .as_ref()
+            .map_or(0, |responder| responder.replies.withheld())
+    }
+
     /// Atomically snapshots retained output and registers a live subscriber.
     ///
     /// # Errors

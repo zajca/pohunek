@@ -28,6 +28,8 @@ use crate::input::{InputFragment, WriteCoordinator};
 pub(crate) struct ProbeReplies {
     pending: AtomicBool,
     closed: AtomicBool,
+    /// Replies the foreground filter refused.
+    withheld: AtomicU64,
     wake: Notify,
 }
 
@@ -36,6 +38,16 @@ impl ProbeReplies {
     pub(crate) fn queue(&self) {
         self.pending.store(true, Ordering::Release);
         self.wake.notify_one();
+    }
+
+    /// Counts one refused reply, after its decision is final.
+    pub(crate) fn note_withheld(&self) {
+        self.withheld.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many replies the foreground filter refused so far.
+    pub(crate) fn withheld(&self) -> u64 {
+        self.withheld.load(Ordering::Acquire)
     }
 
     /// Ends the queue; a waiting task observes it and stops.
@@ -78,8 +90,6 @@ pub(crate) struct ForegroundProbeFilter {
     /// The PTY's root process, known once the child is spawned.
     root_pid: Option<Pid>,
     inspector: Arc<HostInspector>,
-    /// Replies the filter refused, readable through [`Self::withheld`].
-    withheld: Arc<AtomicU64>,
 }
 
 impl ForegroundProbeFilter {
@@ -98,15 +108,7 @@ impl ForegroundProbeFilter {
             programs,
             root_pid: None,
             inspector: Arc::new(HostInspector::new()),
-            withheld: Arc::new(AtomicU64::new(0)),
         })
-    }
-
-    /// The count of replies the filter refused. It rises once the decision is
-    /// final, so a reader that sees it risen knows no reply was written for
-    /// that probe.
-    pub(crate) fn withheld(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.withheld)
     }
 
     /// Binds the filter to the PTY whose root process is `root_pid`.
@@ -176,7 +178,7 @@ pub(crate) async fn answer_probes(
                 .unwrap_or(false);
             if !allowed {
                 replies.take();
-                filter.withheld.fetch_add(1, Ordering::Release);
+                replies.note_withheld();
                 event!(
                     name: "worker.probe.reply.withheld",
                     Level::DEBUG,
