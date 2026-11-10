@@ -6885,11 +6885,19 @@ mod tests {
             "elicitation_complete",
             "elicitation_response",
         ] {
-            let (status, stdout, stderr, requests) = run_notification_asset(
+            // An ignored action exits before it reads stdin, so the write of
+            // the input may meet a closed pipe.
+            let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
                 "claude",
                 &["notification", matcher],
-                &json!({"hook_event_id": format!("evt-{matcher}")}),
+                json!({"hook_event_id": format!("evt-{matcher}")})
+                    .to_string()
+                    .as_bytes(),
                 true,
+                NotificationRunOptions {
+                    allow_broken_pipe: true,
+                    ..NotificationRunOptions::default()
+                },
             );
 
             assert!(status.success(), "hook exited with {status}: {stderr}");
