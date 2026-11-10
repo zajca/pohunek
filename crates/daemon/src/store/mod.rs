@@ -84,7 +84,6 @@ mod legacy_binding_tests;
 
 pub(crate) use dry_run::{DryRun, DryRunState};
 pub(crate) use legacy_binding::RecoveryOutcome;
-pub use rejected::SetAsideError;
 pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
 
 #[cfg(unix)]

@@ -654,7 +654,8 @@ fn a_blocked_record_beats_the_screen_and_gives_way_to_the_next_record() {
     }
 }
 
-/// The approval notice the shipped Claude manifest holds as an attention hint.
+/// An OSC 9 "approval requested" notice. The detector holds every such notice
+/// (OSC 9/777/99) as an attention hint, whatever the active manifest.
 const APPROVAL_NOTICE: &[u8] = b"\x1b]9;Approval requested\x07";
 
 /// Takes the notice the last feed held and reports whether an authoritative

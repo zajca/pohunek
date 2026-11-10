@@ -168,7 +168,8 @@ the package with `pohunek plugin install --catalog`, and fails hard if an
 executable is missing, the daemon does not start or stop cleanly,
 install/status/doctor/uninstall fails, or an installed-state result does not
 report the package and its digest as the plugin's provenance. It never
-downloads runtime dependencies or contacts a model/provider.
+downloads runtime dependencies or contacts a model/provider. The release
+workflow performs this check for every daemon target before publication.
 
 `packaging/smoke-hermes-plugin-release --no-daemon /abs/sealed-release-dir
 /abs/pinned/hermes` smokes the CLI-only host route instead: the directory is an
@@ -177,6 +178,7 @@ extracted daemon archive that is sealed (MANIFEST) and carries
 that trusts the catalog. No daemon starts; the script runs `pohunek plugin
 install --release <dir> --runtime hermes --yes --json` in place, requires the
 `offline` route and the package digest, requires that no daemon socket or
-service file appears, and then runs the same integration lifecycle. The release
-workflow performs this check for every daemon target before publication; repeat
-it manually when validating a downloaded archive or local canary.
+service file appears, and then runs the same integration lifecycle. The
+no-daemon form runs in the `hermes-compatibility-macos` CI job on a sealed copy
+with a throwaway catalog; repeat it manually when validating a downloaded
+archive or local canary.

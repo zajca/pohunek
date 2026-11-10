@@ -2413,13 +2413,16 @@ impl Upgrade {
 
     /// A client of a previous release below protocol 5 gets a clear protocol
     /// refusal on reads and writes alike: the window is protocol 5 only. A
-    /// previous release that speaks protocol 5 reads through its own client.
+    /// previous release that speaks protocol 5 reads and writes through its
+    /// own client.
     fn assert_previous_client_refused(&self) {
         let (previous, id) = (&self.previous, &self.id);
         if !self.previous_predates_protocol_5 {
             previous.json(&["session", "list", "--json"]);
             previous.json(&["session", "inspect", id, "--json"]);
             previous.json(&["health", "--json"]);
+            input(previous, id, "echo:input-from-previous-client");
+            wait_screen(&self.head, id, "fake-agent ack input-from-previous-client");
             return;
         }
         assert_refused_as_version_mismatch(previous, &["session", "list", "--json"]);
@@ -2545,13 +2548,20 @@ impl Upgrade {
     }
 
     /// The client of a previous release below protocol 5 cannot create a
-    /// session either; a protocol 5 client is not refused, so nothing is
-    /// asserted for it.
+    /// session either; a protocol 5 client creates one that this build's
+    /// daemon launches.
     fn assert_previous_client_cannot_create(&self) {
+        let cwd = self.run.home.display().to_string();
         if !self.previous_predates_protocol_5 {
+            let created = new_session(
+                &self.previous,
+                SILENT_PROFILE,
+                "upgrade-previous-create",
+                &cwd,
+            );
+            wait_live(&self.head, &created);
             return;
         }
-        let cwd = self.run.home.display().to_string();
         assert_refused_as_version_mismatch(
             &self.previous,
             &[

@@ -186,34 +186,6 @@ fn writes_produce_the_bytes_of_the_daemon_before_the_snapshot() {
 }
 
 #[test]
-fn a_set_aside_line_is_not_written_back() {
-    let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let (store, path) = golden_input(root.path());
-    let session = fixture_session(&store);
-    store.record_session(&session).expect("write the session");
-    let hash = {
-        use sha2::{Digest as _, Sha256};
-        format!("{:x}", Sha256::digest(CORRUPT_LINE.as_bytes()))
-    };
-
-    store
-        .set_aside_rejected(&hash, true)
-        .expect("set the corrupt line aside");
-    store.record_session(&session).expect("write the session");
-
-    let stored = std::fs::read_to_string(&path).expect("read the store");
-    assert!(!stored.contains(CORRUPT_LINE), "the line stays out");
-    assert_eq!(
-        stored.lines().count(),
-        3,
-        "the project, the session and the other line"
-    );
-    let quarantine = std::fs::read_to_string(root.path().join("metadata.rejected.jsonl"))
-        .expect("read the quarantine file");
-    assert!(quarantine.contains("not json at all"));
-}
-
-#[test]
 fn another_handle_sees_the_writes_of_the_first() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
     let (store, path) = migrated_store(root.path());

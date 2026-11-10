@@ -3428,6 +3428,7 @@ fn doctor_notes_a_selected_package_that_is_not_the_one_this_release_ships() {
 
     let document = json_of(&doctor);
     assert_eq!(check(&document["ok"], "asset_source").0, "pass");
+    assert_eq!(document["ok"]["doctor"]["ok"], true, "{document:#}");
     let note = note_of(&document["ok"], "asset_source").expect("a version note");
     assert!(
         note.contains("plugin install --release") && note.contains("integration update"),

@@ -324,7 +324,7 @@ where
             if dropped.len() > answered.get() {
                 answered.set(dropped.len());
                 eprintln!(
-                    "resending {hook} for {what} after a dropped report: {}",
+                    "resending {hook} for {what} after a dropped report (a hint, it may be the identity report and not the snapshot): {}",
                     dropped.last().expect("a dropped report")
                 );
                 send_hook(harness, id, hook).await;

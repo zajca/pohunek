@@ -157,8 +157,9 @@ impl Host {
         }
     }
 
-    /// A previous schema-4 installation, as the release before the input
-    /// write stall bound wrote it, with the given `[waits]` values.
+    /// A schema-4 file standing in for an installation that predates the
+    /// input write stall bound, with the given `[waits]` values. Schema 4 was
+    /// never released on its own.
     fn schema_four_with_waits(default_ms: u64, max_ms: u64) -> Self {
         Self {
             template: SCHEMA_THREE_TEMPLATE,
@@ -167,8 +168,9 @@ impl Host {
         }
     }
 
-    /// A previous schema-5 installation, as the release before `[hooks]`
-    /// wrote it, with the given `[waits]` values.
+    /// A schema-5 file standing in for an installation that predates
+    /// `[hooks]`, with the given `[waits]` values. Schema 5 was never
+    /// released on its own.
     fn schema_five_with_waits(default_ms: u64, max_ms: u64) -> Self {
         Self {
             template: SCHEMA_THREE_TEMPLATE,

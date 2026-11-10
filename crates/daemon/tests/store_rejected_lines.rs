@@ -390,73 +390,8 @@ fn only_a_line_that_may_pin_a_package_makes_the_pinned_set_incomplete() {
     );
 }
 
-/// Quarantine file the daemon writes next to the store.
-const QUARANTINE_NAME: &str = "metadata.rejected.jsonl";
-
-#[test]
-fn setting_a_line_aside_keeps_every_other_record_and_a_failed_quarantine_keeps_the_line() {
-    let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let (store, path) = fixture_store(root.path());
-    let rejected = [newer_session_line(&path), CORRUPT_LINE.to_owned()];
-    let mut content = std::fs::read_to_string(&path).expect("read current store");
-    for line in &rejected {
-        content.push_str(line);
-        content.push('\n');
-    }
-    std::fs::write(&path, &content).expect("append the rejected lines");
-    let hash = |text: &str| {
-        use sha2::{Digest as _, Sha256};
-        format!("{:x}", Sha256::digest(text.as_bytes()))
-    };
-
-    // A quarantine path that cannot be written leaves the store as it was.
-    let quarantine = root.path().join(QUARANTINE_NAME);
-    std::fs::create_dir(&quarantine).expect("block the quarantine path");
-    let failed = store
-        .set_aside_rejected(&hash(&rejected[1]), true)
-        .expect_err("the quarantine file cannot be written");
-    assert!(matches!(
-        failed,
-        pohunek_daemon::store::SetAsideError::Failed(_)
-    ));
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("read store"),
-        content,
-        "a failed quarantine leaves the store untouched"
-    );
-    std::fs::remove_dir(&quarantine).expect("unblock the quarantine path");
-
-    // The parsed record and the other rejected line survive in order.
-    let moved = store
-        .set_aside_rejected(&hash(&rejected[1]), true)
-        .expect("set the corrupt line aside");
-    assert_eq!(moved.lines, [3]);
-    let lines = store_lines(&path);
-    assert_eq!(lines.len(), 2, "the session and the other rejected line");
-    assert_eq!(lines[1], rejected[0]);
-    assert_eq!(
-        store.load_sessions().expect("load sessions")[0].session_id,
-        FIXTURE_SESSION
-    );
-    let quarantined = std::fs::read_to_string(&quarantine).expect("read the quarantine file");
-    let record: serde_json::Value =
-        serde_json::from_str(quarantined.trim_end()).expect("one audit record");
-    assert_eq!(record["text"], CORRUPT_LINE);
-    assert_eq!(record["line"], 3);
-    assert_eq!(record["content_hash"], hash(CORRUPT_LINE));
-    assert_eq!(record["accepted_pin_loss"], true);
-    assert_eq!(
-        std::fs::metadata(&quarantine)
-            .expect("quarantine metadata")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-}
-
 #[tokio::test]
-async fn the_daemon_doctor_reports_rejected_lines_and_clears_once_they_are_set_aside() {
+async fn the_daemon_doctor_reports_rejected_lines_and_clears_once_an_operator_removes_them() {
     let env = TestEnv::new().expect("create short test environment");
     let line = rejected_session_line();
     let layout = Layout::new(&env, &format!("{line}\n"));
@@ -493,23 +428,22 @@ async fn the_daemon_doctor_reports_rejected_lines_and_clears_once_they_are_set_a
     daemon.kill().await.expect("stop daemon");
     let _ = daemon.wait().await;
 
-    // The line is set aside through the store boundary while no daemon holds the store.
-    let content_hash = {
-        use sha2::{Digest as _, Sha256};
-        format!("{:x}", Sha256::digest(line.as_bytes()))
-    };
+    // The manual recovery: with no daemon holding the store, the operator
+    // moves the line out of it.
     let store = Store::new(layout.store.clone());
     assert_eq!(
         store.rejected_lines().expect("list rejected lines").len(),
         1
     );
-    store
-        .set_aside_rejected(&content_hash, true)
-        .expect("set the line aside");
-    assert!(
-        layout.store.with_file_name(QUARANTINE_NAME).exists(),
-        "the line is in the quarantine file"
-    );
+    let content = std::fs::read_to_string(&layout.store).expect("read the store");
+    let remaining = content
+        .lines()
+        .filter(|stored| *stored != line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&layout.store, remaining).expect("remove the rejected line");
+    assert!(store.rejected_lines().expect("list").is_empty());
 
     let mut daemon = daemon_command(&env, &layout)
         .stderr(Stdio::null())
