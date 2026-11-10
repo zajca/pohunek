@@ -125,7 +125,7 @@ pub(crate) struct Run<'a> {
 impl<'a> Run<'a> {
     pub(crate) fn notify(agent: &'a str, stdin: &'a str) -> Self {
         let args: &[&str] = if agent == "claude" {
-            &["notification", "auth_success"]
+            &["stop"]
         } else {
             &["permission_request"]
         };

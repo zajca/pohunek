@@ -382,7 +382,7 @@ fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
         (
             CLAUDE_NOTIFY_HOOK_ASSET.as_str(),
             ScriptRole::Notify,
-            vec!["notification", "stop", "stop_failure"],
+            vec!["stop", "stop_failure"],
         ),
         (
             CODEX_NOTIFY_HOOK_ASSET.as_str(),

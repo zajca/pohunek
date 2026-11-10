@@ -19,18 +19,21 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pohunek_daemon::notifications::{spawn_projector, AttentionCoordinator, NotificationService};
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_daemon::shutdown::{DaemonShutdown, DriverHandle};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
-    AgentActivity, SessionId, SessionInfo, SessionInputParams, SessionInputWait, SessionNewParams,
-    StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
+    AgentActivity, NotificationKind, NotificationListParams, NotificationRecord,
+    NotificationStatus, SessionId, SessionInfo, SessionInputParams, SessionInputWait,
+    SessionNewParams, StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 /// `session.detection` as a client that predates the program-status region
@@ -91,7 +94,9 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// worker's reply) before it draws a Claude prompt box. A command read from the
 /// terminal (`stdin` source) runs on Enter, as a submitted prompt does; one
 /// read from the `cmd` FIFO (`fifo` source) runs at once. The commands: `g`
-/// reports working, `d` done, `b` blocked and `q` exits; `t` is a turn that
+/// reports working, `d` done, `i` idle, `b`, `u` and `a` blocked for a
+/// permission, a question and an authentication, `n` blocked without a kind and
+/// `q` exits; `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
 /// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
@@ -149,6 +154,13 @@ run() {{
     g) emit working ;;
     d) emit done ;;
     b) emit 'blocked:kind=permission' ;;
+    u) emit 'blocked:kind=question' ;;
+    a) emit 'blocked:kind=auth' ;;
+    n) emit blocked ;;
+    i) emit idle ;;
+    k) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n' ;;
+    P) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit 'blocked:kind=permission' ;;
+    y) printf '\033[2J\033[H'; box ;;
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
@@ -1213,4 +1225,255 @@ async fn an_unlisted_program_started_below_a_shell_gets_no_probe_reply() {
         .stop(&created.id)
         .await
         .expect("stop the session");
+}
+
+/// The notification projector over an inbox that surfaces attention at once.
+struct Attention {
+    notifications: NotificationService,
+    projector: DriverHandle,
+    _coordinator: DriverHandle,
+}
+
+impl Attention {
+    fn start(fixture: &Fixture) -> Self {
+        let notifications = NotificationService::open_with_settings(
+            &fixture.env.root().join("daemon-data"),
+            pohunek_service_config::NotificationSettings {
+                attention_debounce_secs: 0,
+                ..pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS
+            },
+        )
+        .expect("open the notification inbox");
+        let tasks = DaemonShutdown::default();
+        let (coordinator, attention) =
+            AttentionCoordinator::spawn(&tasks, notifications.clone(), &fixture.registry);
+        let projector = spawn_projector(
+            &tasks,
+            &fixture.registry,
+            notifications.clone(),
+            coordinator,
+        );
+        fixture.registry.spawn_agent_state_hooks();
+        Self {
+            notifications,
+            projector,
+            _coordinator: attention,
+        }
+    }
+
+    fn records(&self, id: &SessionId) -> Vec<NotificationRecord> {
+        self.notifications
+            .list(NotificationListParams {
+                session_id: Some(id.clone()),
+                ..NotificationListParams::default()
+            })
+            .expect("list the notifications")
+            .notifications
+    }
+
+    /// Waits for the session's first attention record.
+    async fn first_record(&self, id: &SessionId) -> NotificationRecord {
+        wait_until("the attention record", || async {
+            self.records(id).into_iter().next()
+        })
+        .await
+    }
+
+    async fn end(self) {
+        self.projector.stop().await;
+    }
+}
+
+/// The kind of a blocked record picks the attention record: a permission is an
+/// approval, a question and an authentication are `agent_blocked` with their
+/// reason, and a record without a kind keeps the generic reason. Each wait
+/// yields exactly one record.
+#[tokio::test]
+async fn a_blocked_records_kind_chooses_the_attention_record() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    for (byte, kind, reason) in [
+        (b'b', NotificationKind::ApprovalRequired, "permission"),
+        (b'u', NotificationKind::AgentBlocked, "question"),
+        (b'a', NotificationKind::AgentBlocked, "auth"),
+        (b'n', NotificationKind::AgentBlocked, "blocked"),
+    ] {
+        let created = fixture.start("fake-reply-fifo").await;
+        fixture
+            .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+            .await;
+        command(&fixture, byte);
+        fixture
+            .wait_activity(
+                &created.id,
+                (AgentActivity::Blocked, StateSource::OscProgress),
+            )
+            .await;
+
+        let record = attention.first_record(&created.id).await;
+        assert_eq!(record.kind, kind, "{reason}");
+        assert_eq!(
+            record.metadata.get("reason").map(String::as_str),
+            Some(reason)
+        );
+        assert_eq!(record.status, NotificationStatus::Unread, "{reason}");
+        assert_eq!(
+            attention.records(&created.id).len(),
+            1,
+            "{reason}: one record"
+        );
+
+        fixture
+            .registry
+            .stop(&created.id)
+            .await
+            .expect("stop the session");
+    }
+
+    // A blocked reading that names another kind replaces the record.
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'u');
+    let first = attention.first_record(&created.id).await;
+    assert_eq!(first.kind, NotificationKind::AgentBlocked);
+    command(&fixture, b'b');
+    wait_until("the permission record to replace the question", || async {
+        let records = attention.records(&created.id);
+        let unread: Vec<_> = records
+            .iter()
+            .filter(|record| record.status == NotificationStatus::Unread)
+            .collect();
+        (unread.len() == 1 && unread[0].kind == NotificationKind::ApprovalRequired).then_some(())
+    })
+    .await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// Regression: a blocked record followed by an idle record (Esc, a denial, an
+/// auto-denial) closes the attention record instead of leaving it unread until
+/// the next turn.
+#[tokio::test]
+async fn a_blocked_record_followed_by_an_idle_record_resolves_the_attention() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'b');
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.status, NotificationStatus::Unread);
+
+    command(&fixture, b'i');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    wait_until("the attention record to resolve", || async {
+        attention
+            .records(&created.id)
+            .iter()
+            .all(|record| record.status != NotificationStatus::Unread)
+            .then_some(())
+    })
+    .await;
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// A screen dialog that wins over a held `blocked` record carries the record's
+/// kind: a permission prompt the screen rules read is still an approval.
+#[tokio::test]
+async fn a_screen_dialog_over_a_permission_record_is_an_approval() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'P');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::ApprovalRequired);
+    assert_eq!(
+        record.metadata.get("reason").map(String::as_str),
+        Some("permission")
+    );
+    assert_eq!(attention.records(&created.id).len(), 1);
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// A dialog only the screen saw is not closed by a later idle record: the
+/// attention record stays unread. A second session's blocked record fences the
+/// projector, which handles the events of all sessions in order.
+#[tokio::test]
+async fn an_idle_record_after_a_screen_only_dialog_leaves_the_attention_open() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'k');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::AgentBlocked);
+
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    let fence = fixture.start("fake-reply-stdin").await;
+    fixture
+        .wait_activity(&fence.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    fixture
+        .input(&fence.id, "b", AgentActivity::Blocked)
+        .await
+        .expect("input until blocked");
+    attention.first_record(&fence.id).await;
+
+    let records = attention.records(&created.id);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, NotificationStatus::Unread);
+
+    for id in [&created.id, &fence.id] {
+        fixture.registry.stop(id).await.expect("stop the session");
+    }
+    attention.end().await;
 }

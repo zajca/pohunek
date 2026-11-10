@@ -42,6 +42,29 @@ pub enum AgentActivity {
 
 crate::tolerant_enum!(AgentActivity);
 
+/// What a blocked agent waits for, as the agent reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "BlockedKind.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum BlockedKind {
+    /// A permission prompt: a tool call, a plan or a safety check awaits approval.
+    Permission,
+    /// A question to the owner, including an MCP elicitation.
+    Question,
+    /// An authentication step.
+    Auth,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(BlockedKind);
+
 /// Lifecycle of one provider-managed subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3299,6 +3322,11 @@ pub struct AgentStateEvent {
     pub activity: AgentActivity,
     /// Signal source that produced the activity value.
     pub source: StateSource,
+    /// What the agent waits for, when `activity` is `blocked` and the agent
+    /// reported a kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub blocked_kind: Option<BlockedKind>,
     /// Runtime that produced this activity transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -4041,6 +4069,7 @@ mod tests {
             session_id: SessionId("s-1".to_owned()),
             activity: AgentActivity::Working,
             source: StateSource::Report,
+            blocked_kind: None,
             runtime: Some(
                 SessionRuntimeIdentity::new("runtime-1", RuntimeGeneration::new(2))
                     .expect("valid runtime identity"),

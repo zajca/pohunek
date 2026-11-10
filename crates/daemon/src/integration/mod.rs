@@ -233,8 +233,6 @@ const SUBAGENT_STOP_EVENT: &str = "SubagentStop";
 const CODEX_PERMISSION_REQUEST_EVENT: &str = "PermissionRequest";
 /// Codex lifecycle event fired when a turn completes.
 const CODEX_STOP_EVENT: &str = "Stop";
-/// Claude event family for interactive notifications.
-const CLAUDE_NOTIFICATION_EVENT: &str = "Notification";
 /// Claude event fired when a turn completes.
 const CLAUDE_STOP_EVENT: &str = "Stop";
 /// Claude event that runs before each submitted prompt is sent to the model.
@@ -261,14 +259,17 @@ const CODEX_MANAGED_TRUST_EVENTS: &[&str] = &[
 ];
 /// Action argument passed to notification hook scripts for approval prompts.
 const PERMISSION_REQUEST_ACTION: &str = "permission_request";
-/// Action argument passed to notification hook scripts for notifications.
+/// Action argument of the retired Claude `Notification` hook, kept to
+/// recognise the commands the installer strips.
 const NOTIFICATION_ACTION: &str = "notification";
 /// Action argument passed to notification hook scripts for turn completion.
 const STOP_ACTION: &str = "stop";
 /// Action argument passed to notification hook scripts for stop failures.
 const STOP_FAILURE_ACTION: &str = "stop_failure";
-/// Claude `Notification` matchers that map to durable notifications.
-const CLAUDE_NOTIFICATION_MATCHERS: &[&str] = &[
+/// Claude `Notification` matchers whose commands the installer owns for
+/// removal only. It strips their commands from Claude's settings and registers none: the 7501
+/// status record reports every wait, with its kind.
+const CLAUDE_RETIRED_NOTIFICATION_MATCHERS: &[&str] = &[
     "permission_prompt",
     "elicitation_dialog",
     "auth_success",
@@ -1265,13 +1266,6 @@ fn inspect_claude_registration(
             trust_event: None,
         },
     ];
-    specs.extend(CLAUDE_NOTIFICATION_MATCHERS.iter().map(|matcher| HookSpec {
-        label: format!("Claude Notification ({matcher})"),
-        event: CLAUDE_NOTIFICATION_EVENT,
-        command: hook_command_with_args(notify_path, &[NOTIFICATION_ACTION, matcher]),
-        matcher: Some(matcher),
-        trust_event: None,
-    }));
     specs.extend([
         HookSpec {
             label: "Claude Stop".to_owned(),
@@ -2035,14 +2029,6 @@ fn merge_claude_hooks(
     for (event, action) in CLAUDE_STATE_HOOKS {
         ensure_command_hook(hooks, event, &hook_command(hook_path, action), Some("*"))?;
     }
-    for matcher in CLAUDE_NOTIFICATION_MATCHERS {
-        ensure_command_hook(
-            hooks,
-            CLAUDE_NOTIFICATION_EVENT,
-            &hook_command_with_args(notify_hook_path, &[NOTIFICATION_ACTION, matcher]),
-            Some(matcher),
-        )?;
-    }
     ensure_command_hook(
         hooks,
         CLAUDE_STOP_EVENT,
@@ -2583,7 +2569,7 @@ fn script_action(role: ScriptRole, argument: &str) -> Option<HookAction> {
             _ => None,
         },
         ScriptRole::Notify => match argument {
-            PERMISSION_REQUEST_ACTION | NOTIFICATION_ACTION | STOP_ACTION | STOP_FAILURE_ACTION => {
+            PERMISSION_REQUEST_ACTION | STOP_ACTION | STOP_FAILURE_ACTION => {
                 Some(HookAction::Notification)
             }
             _ => None,
@@ -2718,9 +2704,12 @@ fn claude_state_hook_commands(hook_path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The commands the installer owns for the Claude notify script: the current
+/// registrations and the retired `Notification` ones, so a reinstall removes
+/// the latter.
 fn claude_notify_hook_commands(notify_hook_path: &Path) -> Vec<String> {
-    let mut commands = Vec::with_capacity(CLAUDE_NOTIFICATION_MATCHERS.len() + 2);
-    for matcher in CLAUDE_NOTIFICATION_MATCHERS {
+    let mut commands = Vec::with_capacity(CLAUDE_RETIRED_NOTIFICATION_MATCHERS.len() + 2);
+    for matcher in CLAUDE_RETIRED_NOTIFICATION_MATCHERS {
         commands.push(hook_command_with_args(
             notify_hook_path,
             &[NOTIFICATION_ACTION, matcher],
@@ -3460,7 +3449,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Version header every managed state hook asset carries.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=16";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=17";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4154,7 +4143,7 @@ mod tests {
     fn notification_hooks_drop_hostile_session_id_before_wire() {
         for (agent, args) in [
             ("codex", vec!["permission_request"]),
-            ("claude", vec!["notification", "permission_prompt"]),
+            ("claude", vec!["stop"]),
         ] {
             let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
                 agent,
@@ -4227,7 +4216,7 @@ mod tests {
         let input = large_json_input();
         for (agent, args) in [
             ("codex", vec!["permission_request"]),
-            ("claude", vec!["notification", "permission_prompt"]),
+            ("claude", vec!["stop"]),
         ] {
             let (status, stdout, stderr, requests, bytes_written) = run_notification_asset_custom(
                 agent,
@@ -4258,7 +4247,7 @@ mod tests {
     fn notification_hooks_silence_mktemp_failure() {
         for (agent, args) in [
             ("codex", vec!["permission_request"]),
-            ("claude", vec!["notification", "permission_prompt"]),
+            ("claude", vec!["stop"]),
         ] {
             let temp = scoped_dir(&format!("{agent}-broken-tmpdir"));
             let missing_tmpdir = temp.join("missing");
@@ -6684,17 +6673,10 @@ mod tests {
             commands.contains(&user_command),
             "user hook mentioning the managed path must survive reinstall: {commands:?}"
         );
-        let managed_command = format!(
-            "sh {} notification permission_prompt",
-            shell_single_quote(&notify_path.display().to_string())
-        );
         assert_eq!(
-            commands
-                .iter()
-                .filter(|command| *command == &managed_command)
-                .count(),
+            commands.len(),
             1,
-            "genuine managed hook must remain idempotent: {commands:?}"
+            "the installer registers no Notification hook: {commands:?}"
         );
     }
 
@@ -6799,32 +6781,9 @@ mod tests {
                 .iter()
                 .filter(|command| command.contains("pohunek-agent-notify.sh"))
                 .count(),
-            5,
-            "reinstall must keep one notification hook per matcher"
+            0,
+            "the installer registers no Notification hook"
         );
-        for matcher in [
-            "permission_prompt",
-            "elicitation_dialog",
-            "auth_success",
-            "elicitation_complete",
-            "elicitation_response",
-        ] {
-            let commands = matcher_commands(&settings, "Notification", matcher);
-            assert_eq!(
-                commands
-                    .iter()
-                    .filter(|command| command.contains("pohunek-agent-notify.sh"))
-                    .count(),
-                1,
-                "one Pohunek Notification hook for {matcher}"
-            );
-            assert!(
-                commands
-                    .iter()
-                    .any(|command| command.contains("pohunek-agent-notify.sh")),
-                "Notification command for {matcher}: {commands:?}"
-            );
-        }
         for event in ["Stop", "StopFailure"] {
             let commands = command_hooks(&settings, event);
             assert_eq!(
@@ -6917,54 +6876,96 @@ mod tests {
     }
 
     #[test]
-    fn claude_notification_hook_maps_matchers() {
-        for (matcher, kind, severity, dedupe_key) in [
-            (
-                "permission_prompt",
-                "approval_required",
-                "action_required",
-                Some("attention:session-123"),
-            ),
-            (
-                "elicitation_dialog",
-                "approval_required",
-                "action_required",
-                Some("attention:session-123"),
-            ),
-            ("auth_success", "system", "success", None),
-            ("elicitation_complete", "system", "info", None),
-            ("elicitation_response", "system", "info", None),
+    fn claude_notify_script_ignores_the_retired_notification_action() {
+        for matcher in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
         ] {
-            let (_stdout, _stderr, request) = captured_notification_request(
+            // An ignored action exits before it reads stdin, so the write of
+            // the input may meet a closed pipe.
+            let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
                 "claude",
                 &["notification", matcher],
-                &json!({"hook_event_id": format!("evt-{matcher}")}),
+                json!({"hook_event_id": format!("evt-{matcher}")})
+                    .to_string()
+                    .as_bytes(),
+                true,
+                NotificationRunOptions {
+                    allow_broken_pipe: true,
+                    ..NotificationRunOptions::default()
+                },
             );
-            assert_notification_payload(
-                &request,
-                "claude",
-                &format!("Notification.{matcher}"),
-                kind,
-                severity,
-                Some(matcher),
-                dedupe_key,
-            );
+
+            assert!(status.success(), "hook exited with {status}: {stderr}");
+            assert!(stdout.is_empty(), "hook must not print stdout");
+            assert!(stderr.is_empty(), "hook must not print stderr");
+            assert!(requests.is_empty(), "{matcher} must create no notification");
         }
     }
 
     #[test]
-    fn claude_idle_prompt_does_not_create_an_attention_notification() {
-        let (status, stdout, stderr, requests) = run_notification_asset(
-            "claude",
-            &["notification", "idle_prompt"],
-            &json!({"hook_event_id": "evt-idle"}),
-            true,
-        );
+    fn install_claude_over_the_earlier_notification_registrations_strips_them() {
+        let claude_dir = scoped_dir("claude-retired-notification");
+        let notify_path = claude_dir.join("hooks/pohunek-agent-notify.sh");
+        let settings_path = claude_dir.join("settings.json");
+        let user_command = "echo user-permission".to_owned();
+        let mut notification_entries = vec![json!({
+            "matcher": "permission_prompt",
+            "hooks": [{ "type": "command", "command": user_command }]
+        })];
+        // The 0.41 registrations, spelled out as they appear in its settings file.
+        for matcher in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
+        ] {
+            notification_entries.push(json!({
+                "matcher": matcher,
+                "hooks": [{
+                    "type": "command",
+                    "command": format!(
+                        "sh {} notification {matcher}",
+                        shell_single_quote(&notify_path.display().to_string())
+                    ),
+                    "timeout": HOOK_TIMEOUT_SECS
+                }]
+            }));
+        }
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": { "Notification": notification_entries }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
 
-        assert!(status.success(), "hook exited with {status}: {stderr}");
-        assert!(stdout.is_empty(), "hook must not print stdout");
-        assert!(stderr.is_empty(), "hook must not print stderr");
-        assert!(requests.is_empty(), "idle prompt must remain quiet");
+        install_claude(&claude_dir).expect("install claude");
+        install_claude(&claude_dir).expect("reinstall claude");
+
+        let settings = read_json(&settings_path);
+        let commands = command_hooks(&settings, "Notification");
+        assert_eq!(
+            commands,
+            vec![user_command],
+            "only the user's Notification hook remains"
+        );
+        for event in ["Stop", "StopFailure"] {
+            assert_eq!(
+                command_hooks(&settings, event)
+                    .iter()
+                    .filter(|command| command.contains("pohunek-agent-notify.sh"))
+                    .count(),
+                1,
+                "one Pohunek {event} hook"
+            );
+        }
     }
 
     #[test]
@@ -7066,7 +7067,7 @@ mod tests {
     fn notification_hooks_exit_zero_when_socket_unavailable() {
         for (agent, args) in [
             ("codex", vec!["permission_request"]),
-            ("claude", vec!["notification", "permission_prompt"]),
+            ("claude", vec!["stop"]),
         ] {
             let (status, stdout, stderr, requests) =
                 run_notification_asset(agent, &args, &json!({}), false);

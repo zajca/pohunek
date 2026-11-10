@@ -110,7 +110,7 @@ spelling of an earlier version is accepted any more.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` and `prompt_accepted` hook requests are additive to the private
-worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=16` and send the `{minimum, maximum}` range of the protocol their session launched with; the installed v16 hooks keep working unchanged on protocol 5 sessions.
+worker protocol, so a worker that predates them simply refuses them. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=17` and send the `{minimum, maximum}` range of the protocol their session launched with; installed hooks of an earlier version keep working unchanged on protocol 5 sessions.
 
 Clients should call `daemon.health` after opening a control connection to learn
 the daemon build version and protocol version, but `daemon.health` is not a
@@ -3322,7 +3322,7 @@ reporting after a daemon upgrade to protocol 5 (its hooks announce `4..=4` and
 are refused) until it is relaunched. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=16`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=17`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
@@ -3598,9 +3598,16 @@ When a session enters `working`, or reaches a terminal lifecycle state, the
 daemon resolves `attention:<session_id>` and `turn:<session_id>`. Pending
 records and signals with those keys are dropped before they ever persist, and
 already-visible unread matching records are acknowledged with
-`notification_updated`. An `idle` observation alone does not resolve attention
-because a live approval prompt can be technically idle while still requiring
-owner input.
+`notification_updated`. An `idle` observation from the screen or the title does
+not resolve attention, because a live approval prompt can be technically idle
+while still requiring owner input. An `idle` observation from the program's
+status channel (`state_source` `osc_progress`, which an OSC 7501 record
+reports) that follows a `blocked` one does: the dialog closed (Esc, a denial,
+an automatic denial). A `blocked` reading that names a different kind than the
+one already derived replaces the attention record. A `blocked` record that names no kind, under a dialog the screen
+rules also read, is not told apart from a dialog only the screen saw, so an
+`idle` record after it leaves the attention record open until the session
+works again.
 
 #### Session notification debounce
 
@@ -4063,13 +4070,13 @@ Codex notification support requires modern lifecycle hooks for
 `hooks.json` and records trust metadata in `config.toml`; the legacy Codex
 `notify` key is not used and is not sufficient for approval notifications.
 
-Claude notification support requires hook events for `Notification`, `Stop`,
-and `StopFailure`. `Notification` matcher values map as follows:
-`permission_prompt` and `elicitation_dialog` create `approval_required`,
-while the normal `idle_prompt` creates no notification. `auth_success`,
-`elicitation_complete`, and `elicitation_response` create `system`. The
+Claude notification support requires hook events for `Stop` and `StopFailure`.
+The installer registers no `Notification` hook: Claude Code reports every wait
+through its OSC 7501 status record, and the daemon derives the attention record
+from the record's `kind` (see [Agent state events](#events)); the installer
+strips the `Notification` registrations of earlier releases on reinstall. The
 notification hook's `Stop` creates `turn_completed`; `StopFailure` creates
-`error`. The daemon stores neither `system`, `turn_completed` nor `error`: a
+`error`. The daemon stores neither `turn_completed` nor `error`: a
 `Stop` becomes a `turn_completed` turn event and a `StopFailure` a `turn_error`
 turn event for `session.wait_turn`. The separate state hook entry on `Stop` creates no notification; it
 sends only the subagent snapshot to the worker and has no daemon fallback.
@@ -4341,7 +4348,7 @@ The daemon then writes these events:
 | `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically; it re-checks a conflict whose record names a worker generation in the background, and `session.stop` can end one whose recorded identity the journal proves. |
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
 | `session_native_recovered` | `{session: SessionInfo, previous_worker_instance_id?: string, worker_instance_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_worker_instance_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `worker_instance_id`. |
-| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. The daemon emits it only when the activity or its source changes: an idle session produces no further `agent_state` events and its `revision` stays fixed. While a `session.input` request with a `wait` is waiting on a session, the daemon also restates that session's unchanged activity as a new revision about every 800 ms, so the wait sees evidence newer than its boundary. `session.wait` and `session.output` read current state and do not trigger it. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
+| `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, blocked_kind?: BlockedKind, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. The daemon emits it only when the activity, its source or its `blocked_kind` changes: an idle session produces no further `agent_state` events and its `revision` stays fixed. While a `session.input` request with a `wait` is waiting on a session, the daemon also restates that session's unchanged activity as a new revision about every 800 ms, so the wait sees evidence newer than its boundary. `session.wait` and `session.output` read current state and do not trigger it. `source` may be `report` when a hook report supplied explicit active-agent state. `blocked_kind` (`permission`, `question` or `auth`; additive and optional) is present on a `blocked` event whose OSC 7501 status record names what the program waits for, also when a screen dialog is the reported source; the notification projector maps `permission` to an `approval_required` record (`reason=permission`), `question` (an AskUserQuestion, an MCP elicitation) to `agent_blocked` with `reason=question`, `auth` to `agent_blocked` with `reason=auth`, and an event without a kind to `agent_blocked` with `reason=blocked`. The record body is generic and never carries the program's own text. A client that predates the field ignores it; a kind a newer daemon defines reads as `unknown` on the Rust client. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
 | `subagent_state` | `{session_id: SessionId, subagent: SubagentInfo, runtime?: SessionRuntimeIdentity}` | One provider-managed subagent changed. Current daemons emit `runtime`; clients ignore an event without a runtime identity or whose runtime id/generation does not match the session snapshot, then apply only a newer decimal-string `subagent.revision` for the same provider/id. A newer revision may move a terminal subagent back to `running`, so a terminal lifecycle is not final. `session.list` and `session.inspect` remain the reconnect seed through `SessionInfo.subagents`. |
 | `background_state` | `{session_id: SessionId, background: SessionBackground \| null, runtime?: SessionRuntimeIdentity}` | The session's background-task snapshot changed. `background: null` clears it: the runtime ended, or the reporting Claude process exited, released its session (except for `/clear`) or started or resumed one, or another agent process started a session. Current daemons emit `runtime`; clients accept the event only when its runtime id and generation match the current session snapshot, the same rule as `subagent_state`. `session.list` and `session.inspect` seed the snapshot through `SessionInfo.background` after reconnect. This event is withheld from protocol 3 subscribers. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |

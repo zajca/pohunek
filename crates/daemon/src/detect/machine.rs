@@ -1,17 +1,21 @@
 use std::time::{Duration, Instant};
 
-use protocol::{AgentActivity, StateSource};
+use protocol::{AgentActivity, BlockedKind, StateSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivityEvidence {
     pub activity: AgentActivity,
     pub source: StateSource,
+    /// What a blocked agent waits for, when its status record says so.
+    pub blocked_kind: Option<BlockedKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivityTransition {
     pub activity: AgentActivity,
     pub source: StateSource,
+    /// What a blocked agent waits for, when its status record says so.
+    pub blocked_kind: Option<BlockedKind>,
 }
 
 /// Tuning for the debounced detection state machine.
@@ -132,6 +136,7 @@ impl StateMachine {
             ActivityTransition {
                 activity: AgentActivity::Working,
                 source: StateSource::Process,
+                blocked_kind: None,
             },
         )
     }
@@ -319,6 +324,7 @@ impl From<ActivityEvidence> for ActivityTransition {
         Self {
             activity: evidence.activity,
             source: evidence.source,
+            blocked_kind: evidence.blocked_kind,
         }
     }
 }
@@ -374,11 +380,19 @@ mod tests {
     }
 
     fn transition(activity: AgentActivity, source: StateSource) -> ActivityTransition {
-        ActivityTransition { activity, source }
+        ActivityTransition {
+            activity,
+            source,
+            blocked_kind: None,
+        }
     }
 
     fn evidence(activity: AgentActivity, source: StateSource) -> ActivityEvidence {
-        ActivityEvidence { activity, source }
+        ActivityEvidence {
+            activity,
+            source,
+            blocked_kind: None,
+        }
     }
 
     #[test]

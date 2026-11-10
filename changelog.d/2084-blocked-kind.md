@@ -1,0 +1,4 @@
+---
+kind: changed
+---
+The attention record of a session whose program reports OSC 7501 records (Claude Code, Codex, Pi) comes from the record's `blocked` kind, and a Claude session no longer uses the `Notification` hook: `agent_state` events carry an optional `blocked_kind` (`permission`, `question`, `auth`), a permission prompt is one `approval_required` record, and a Codex or Pi dialog that reports `kind=permission` is now an `approval_required` record where it was `agent_blocked`, and a Claude AskUserQuestion or MCP elicitation is now an `agent_blocked` record with `reason=question` (it was `approval_required`). A `blocked` record followed by `idle` or `done` (Esc, a denial, an automatic denial) resolves the attention record. The Claude integration (version 17) registers no `Notification` hook, and `pohunek integration install` removes the ones an earlier release wrote; run it, or `pohunek service upgrade`, to refresh the hooks.

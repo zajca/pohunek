@@ -477,6 +477,7 @@ fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError
                     session_id: SessionId(SESSION_FIXTURE_ID.to_owned()),
                     activity: AgentActivity::Blocked,
                     source: StateSource::Report,
+                    blocked_kind: None,
                     runtime: Some(
                         SessionRuntimeIdentity::new("runtime-fixture-1", RuntimeGeneration::new(3))
                             .expect("fixture runtime identity is valid"),

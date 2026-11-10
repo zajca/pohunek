@@ -33,7 +33,7 @@ v3 spelled it `runtime_id`. The daemon translates that spelling for protocol 3
 clients only; a v4 client or hook never sends it. Do not downgrade one peer
 independently: a v3 client is served by a v4 daemon, a v4 CLI or
 SDK client works against a v3 daemon. Managed Codex and Claude hook assets carry
-`POHUNEK_INTEGRATION_VERSION=16`. `pohunek service upgrade` reinstalls the
+`POHUNEK_INTEGRATION_VERSION=17`. `pohunek service upgrade` reinstalls the
 ones it lists and reports each result; follow "Managed hook assets after an
 upgrade" below for every other install. An older hook still sends the old
 key, which the daemon accepts only inside a session whose launch baked protocol
