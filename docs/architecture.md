@@ -566,9 +566,17 @@ daemon sets `answers_program_status_probe` in `Initialize` (an additive field: a
 worker that predates it ignores it and never answers). The daemon derives the
 flag from the manifest of the resolved launch, the profile's override manifest
 when there is one: it is true only when that manifest declares
-`[program_status]` with `answer_probe = true`. A shell session, Hermes, Codex
-(which never queries) and every manifest without the key behave exactly as
-before, and `cat` of a file that holds a probe types nothing into a shell. The
+`[program_status]` with `answer_probe = true`. A session whose own manifest
+does not answer (a shell) answers the probe only for a program that runs in the
+PTY foreground: the daemon lists in the additive `Initialize` field
+`probe_foreground_programs` the `[process]` matchers of every installed runtime
+that sets `answer_probe`, and when a probe is about to be answered the worker
+matches the members of the terminal's foreground process group against them
+with the same `ProcessMatchers` the daemon's process scan uses. A failed lookup
+or no match answers nothing; a worker that predates the field answers nothing
+below a shell. Hermes, Codex (which never queries) and every manifest without
+the key behave exactly as before, and `cat` of a file that holds a probe types
+nothing into a shell. The
 reply is the fixed `ESC ] 7501 ; ? ESC \`, which carries no CR or LF. The reader
 thread never writes: the output hub queues one coalescing reply token before it
 fans a chunk out, and a dedicated task writes the reply through the write

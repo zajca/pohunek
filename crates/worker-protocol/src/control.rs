@@ -640,6 +640,42 @@ impl<'de> Deserialize<'de> for InputPolicy {
     }
 }
 
+/// Most programs one launch plan may list in
+/// [`Initialize::probe_foreground_programs`].
+pub const MAX_PROBE_FOREGROUND_PROGRAMS: usize = 16;
+
+/// Most patterns per list of one [`ProcessPatterns`].
+pub const MAX_PROCESS_PATTERNS: usize = 16;
+
+/// Longest single pattern of a [`ProcessPatterns`], in bytes.
+pub const MAX_PROCESS_PATTERN_BYTES: usize = 4096;
+
+/// Regular-expression sources that recognise one program: any `comm` pattern
+/// matching the kernel task name, or any `cmdline` pattern matching the
+/// argument vector joined with spaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessPatterns {
+    /// Patterns for the kernel task command name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comm: Vec<String>,
+    /// Patterns for the joined argument vector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cmdline: Vec<String>,
+}
+
+impl ProcessPatterns {
+    /// Whether the entry stays within the wire bounds.
+    #[must_use]
+    pub fn within_bounds(&self) -> bool {
+        [&self.comm, &self.cmdline].into_iter().all(|list| {
+            list.len() <= MAX_PROCESS_PATTERNS
+                && list.iter().all(|pattern| {
+                    !pattern.is_empty() && pattern.len() <= MAX_PROCESS_PATTERN_BYTES
+                })
+        })
+    }
+}
+
 /// Supplies the one-shot worker launch plan.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initialize {
@@ -694,6 +730,16 @@ pub struct Initialize {
     /// `false`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub answers_program_status_probe: bool,
+    /// Programs whose OSC 7501 probe the worker answers while they run in the
+    /// PTY foreground, for a session whose own runtime does not answer it (a
+    /// shell below which an agent is started by hand).
+    ///
+    /// The worker answers a probe only when the foreground process group's
+    /// leader matches one entry at the moment the probe arrives. A peer that
+    /// predates the field ignores it and answers nothing here; an absent field
+    /// means no entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub probe_foreground_programs: Vec<ProcessPatterns>,
     /// Milliseconds between the worker's placement escape checks of this
     /// runtime, or absent to run none.
     ///
@@ -734,6 +780,10 @@ impl Debug for Initialize {
             .field(
                 "answers_program_status_probe",
                 &self.answers_program_status_probe,
+            )
+            .field(
+                "probe_foreground_programs",
+                &self.probe_foreground_programs.len(),
             )
             .field(
                 "placement_check_interval_ms",
@@ -1664,6 +1714,7 @@ mod tests {
             public_protocol_version: 1,
             hook_schema: None,
             answers_program_status_probe: false,
+            probe_foreground_programs: Vec::new(),
             placement_check_interval_ms: None,
         }
     }

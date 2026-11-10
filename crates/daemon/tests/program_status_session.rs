@@ -75,6 +75,11 @@ const TEST_ROWS: u16 = 24;
 const APP: &str = "fake";
 /// The reply the worker writes for an answered probe, as hex.
 const REPLY_HEX: &str = "1b5d373530313b3f1b5c";
+/// Byte length of the reply.
+const REPLY_BYTES: usize = 10;
+/// Interval of the process scan that recognises a program started below a
+/// shell.
+const PROCWATCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Bound of a wait that must be satisfied by the stand-in agent.
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 
@@ -188,9 +193,23 @@ impl Fixture {
 
     /// A fixture whose manifest declares `authority_from`.
     async fn gated(answer_probe: bool, authority_from: Option<&str>) -> Self {
+        Self::hosting(answer_probe, authority_from, |_env, _scratch| {
+            ShellCommand::new("/bin/sh", ["-c", "sleep 600"])
+        })
+        .await
+    }
+
+    /// A fixture whose `shell` sessions run the command `shell` builds from the
+    /// test environment and the scratch directory.
+    async fn hosting(
+        answer_probe: bool,
+        authority_from: Option<&str>,
+        shell: impl FnOnce(&TestEnv, &Path) -> ShellCommand,
+    ) -> Self {
         let env = TestEnv::new().expect("create the test environment");
         let scratch = env.cwd().join("scratch");
         std::fs::create_dir(&scratch).expect("create the scratch directory");
+        let shell_command = shell(&env, &scratch);
         let agents = env.root().join("agents");
         std::fs::create_dir_all(agents.join("manifests")).expect("create the agents directory");
         std::fs::write(
@@ -241,7 +260,8 @@ impl Fixture {
         };
         let mut config = catalog.configure(
             SessionRegistryConfig {
-                shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 600"]),
+                shell_command,
+                procwatch_poll: PROCWATCH_POLL,
                 agents_dir: Some(agents),
                 host_state_dir: Some(env.root().join("host-state")),
                 ..SessionRegistryConfig::default()
@@ -806,6 +826,133 @@ async fn a_release_at_or_above_authority_from_answers_the_probe_and_reads_record
     assert_eq!(status.gate.authority_from.as_deref(), Some("0.0.1"));
     assert!(status.gate.runtime_version.is_some());
     assert!(status.last_evidence_age_ms.is_some());
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// Name of the stand-in the nested scenarios run: a copy of the shell whose
+/// kernel task name is the official Claude package's.
+const NESTED_CLAUDE: &str = "claude";
+/// Name of a stand-in no installed runtime recognises.
+const NESTED_UNLISTED: &str = "unlisted-agent";
+
+/// The probing program of the nested scenarios: it prints the probe, records
+/// the first bytes that reach it, and then reports the record the byte `g`,
+/// `b` or `d` asks for.
+const NESTED_PROBER: &str = r#"
+stty raw -echo
+printf '\033]7501;?\033\\'
+head -c "$1" | od -An -v -tx1 | tr -d ' \n' > "$2/first.hex"
+emit() { printf '\033]7501;state=%s:app=claude-code\033\\' "$1"; }
+emit idle
+while :; do
+  c=$(head -c 1)
+  case "$c" in
+    g) emit working ;;
+    b) emit 'blocked:kind=permission' ;;
+    d) emit done ;;
+  esac
+done
+"#;
+
+/// A shell session that starts `program` below its root process.
+async fn nested_fixture(program: &'static str, first_bytes: usize) -> Fixture {
+    Fixture::hosting(true, None, move |env, scratch| {
+        let bin = env.root().join("nested-bin");
+        std::fs::create_dir_all(&bin).expect("create the stand-in directory");
+        let stand_in = bin.join(program);
+        std::fs::copy("/bin/sh", &stand_in).expect("copy the shell as the stand-in");
+        let script = bin.join("prober.sh");
+        std::fs::write(&script, NESTED_PROBER).expect("write the probing program");
+        let command = format!(
+            "{} {} {first_bytes} {}; sleep 600",
+            stand_in.display(),
+            script.display(),
+            scratch.display()
+        );
+        ShellCommand::new("/bin/sh", ["-c", command.as_str()])
+    })
+    .await
+}
+
+/// A Claude started below a shell session gets the worker's reply to its probe
+/// and its records drive the session's activity, though the shell session's own
+/// runtime answers no probe.
+#[tokio::test]
+async fn a_claude_started_below_a_shell_is_answered_and_its_records_drive_the_activity() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = nested_fixture(NESTED_CLAUDE, REPLY_BYTES).await;
+    let created = fixture.start("shell").await;
+
+    let reply = wait_until("the nested Claude to record the worker's reply", || async {
+        read_trimmed(&fixture.scratch_file("first.hex"))
+    })
+    .await;
+    assert_eq!(reply, REPLY_HEX);
+    // The records the program sent before the process scan recognised it were
+    // dropped with the shell's detector; the ones after the swap are held.
+    wait_until(
+        "the process scan to recognise the nested Claude",
+        || async {
+            let info = fixture.registry.inspect(&created.id).await.ok()?;
+            (info.active_agent.as_deref() == Some("claude")).then_some(())
+        },
+    )
+    .await;
+    for (byte, expected) in [
+        (b'g', AgentActivity::Working),
+        (b'b', AgentActivity::Blocked),
+        (b'd', AgentActivity::Idle),
+    ] {
+        fixture
+            .registry
+            .input(SessionInputParams {
+                session_id: created.id.clone(),
+                text: String::from(char::from(byte)),
+                wait: None,
+            })
+            .await
+            .expect("type a command byte");
+        fixture
+            .wait_activity(&created.id, (expected, StateSource::OscProgress))
+            .await;
+    }
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A program no installed runtime recognises gets no reply to its probe, so
+/// the first bytes it reads are the ones typed at it.
+#[tokio::test]
+async fn an_unlisted_program_started_below_a_shell_gets_no_probe_reply() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = nested_fixture(NESTED_UNLISTED, 1).await;
+    let created = fixture.start("shell").await;
+
+    fixture
+        .registry
+        .input(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "x".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("type a byte");
+    let first = wait_until("the program to record its first byte", || async {
+        read_trimmed(&fixture.scratch_file("first.hex"))
+    })
+    .await;
+    assert_eq!(first, "78", "the first byte is the typed `x`, not a reply");
     fixture
         .registry
         .stop(&created.id)

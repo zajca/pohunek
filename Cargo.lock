@@ -1925,6 +1925,7 @@ dependencies = [
  "pohunek-paths",
  "pohunek-test-support",
  "portable-pty",
+ "regex",
  "rustix",
  "sha2",
  "tempfile",

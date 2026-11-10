@@ -261,18 +261,26 @@ impl OutputHub {
     /// Starts queueing a reply for every answerable OSC 7501 probe.
     ///
     /// Call it before the first output is pushed, so no probe is missed.
-    pub(crate) fn answer_probes(&self) -> Arc<ProbeReplies> {
+    ///
+    /// `conditional` marks a responder that answers only some programs; the
+    /// terminal's own reply is then not the worker's to drop.
+    pub(crate) fn answer_probes(&self, conditional: bool) -> Arc<ProbeReplies> {
         let replies = Arc::new(ProbeReplies::default());
         lock(&self.inner).probe = Some(ProbeResponder {
             guard: ProbeGuard::default(),
             replies: Arc::clone(&replies),
+            conditional,
         });
         replies
     }
 
-    /// Whether [`Self::answer_probes`] armed the probe responder.
+    /// Whether [`Self::answer_probes`] armed a responder that answers every
+    /// probe, so it is the only responder of the PTY.
     pub(crate) fn answers_probes(&self) -> bool {
-        lock(&self.inner).probe.is_some()
+        lock(&self.inner)
+            .probe
+            .as_ref()
+            .is_some_and(|responder| !responder.conditional)
     }
 
     /// Atomically snapshots retained output and registers a live subscriber.
@@ -437,6 +445,8 @@ struct HubState {
 struct ProbeResponder {
     guard: ProbeGuard,
     replies: Arc<ProbeReplies>,
+    /// Whether the replies are written only for listed foreground programs.
+    conditional: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

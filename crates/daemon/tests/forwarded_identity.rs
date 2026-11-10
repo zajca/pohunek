@@ -180,6 +180,7 @@ impl Fixture {
             public_protocol_version: 8,
             hook_schema: Some(HOOK_SCHEMA.to_owned()),
             answers_program_status_probe: false,
+            probe_foreground_programs: Vec::new(),
             placement_check_interval_ms: None,
         }
     }

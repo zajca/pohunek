@@ -415,8 +415,18 @@ restart.
   [Session name](#session-name)), and the manifest reads no state from a title.
   Without a record (a probe that is not answered, or a profile that turns the
   records off) detection is screen-only: dialogs read blocked and the prompt box
-  reads idle. A Claude started inside a shell session is
-  screen-only because the shell session's manifest does not answer the probe.
+  reads idle.
+- A Claude a person starts by hand inside a shell session gets the same
+  records: the shell session's worker answers the probe while a process of the
+  PTY foreground group matches this manifest's `[process]` matchers (the
+  daemon passes the matchers of every installed runtime with `answer_probe` in
+  `Initialize.probe_foreground_programs`), and the daemon's process scan swaps
+  the detector to this manifest. The records Claude sends before that scan
+  recognises it are dropped; the next one is held. A worker spawned by a daemon
+  that predates the field answers nothing below a shell, so such a session
+  keeps reading idle during a turn until it is relaunched
+  (`a_claude_started_below_a_shell_is_answered_and_its_records_drive_the_activity`,
+  `an_unlisted_program_started_below_a_shell_gets_no_probe_reply`).
 - The captured record sequences are `compat/claude/screens/<state>.program-status`
   (one ordered root record per line), recorded from the real agent by the
   capture scenarios; `the_captured_program_status_sequences_follow_the_claude_turn_lifecycle`
@@ -515,10 +525,10 @@ fails without the rule.
 Limits that remain:
 
 - A running turn is only visible through the held `working` record. With the
-  records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), for a Claude started
-  inside a shell session (its worker answers no probe) and after a detector
-  reconfigure or a daemon-restart reattach until the next record, the session
-  reads idle during a turn.
+  records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), after a detector
+  reconfigure or a daemon-restart reattach until the next record, and below a
+  shell whose worker predates the probe foreground list, the session reads idle
+  during a turn.
 - The theme picker and the login method list were captured at 100 columns
   only; the rules separate their words by any whitespace for narrower
   terminals, which no capture confirms.

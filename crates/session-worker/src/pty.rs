@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use pohunek_platform::process::{HostInspector, ProcessInspector};
+use pohunek_worker_protocol::ProcessPatterns;
 use portable_pty::{native_pty_system, Child as PtyChild, MasterPty, PtySize};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fd::{BorrowedFd, OwnedFd};
@@ -26,6 +27,7 @@ use tracing::{event, Level};
 use crate::child_spawn;
 use crate::input::InputWriter;
 use crate::output::OutputCompletion;
+use crate::probe::ForegroundProbeFilter;
 use crate::{OutputEvent, OutputHub, OutputSubscriber, RingError, WriteCoordinator};
 
 /// Blocking PTY read size.
@@ -437,8 +439,10 @@ impl PtyOwner {
         input_dedup_entries: usize,
         input_stall: Option<Duration>,
         answers_program_status_probe: bool,
+        probe_foreground_programs: &[ProcessPatterns],
     ) -> Result<Self, PtyError> {
-        let probe_runtime = if answers_program_status_probe {
+        let probe_runtime = if answers_program_status_probe || !probe_foreground_programs.is_empty()
+        {
             Some(tokio::runtime::Handle::try_current().map_err(|source| {
                 PtyError::Io(io::Error::other(format!(
                     "answering the program status probe needs a tokio runtime: {source}"
@@ -495,8 +499,21 @@ impl PtyOwner {
         let input = WriteCoordinator::new(writer, input_dedup_entries, input_stall)
             .map_err(|source| PtyError::Io(io::Error::other(source)))?;
         let output = OutputHub::new(history_bytes, subscriber_bytes, command.rows, command.cols)?;
+        let probe_filter = if answers_program_status_probe || probe_foreground_programs.is_empty() {
+            None
+        } else {
+            Some(
+                ForegroundProbeFilter::new(probe_foreground_programs).map_err(|message| {
+                    PtyError::Io(io::Error::other(format!(
+                        "invalid probe foreground program pattern: {message}"
+                    )))
+                })?,
+            )
+        };
         // Armed before the reader starts, so the first probe is never missed.
-        let probe_replies = probe_runtime.as_ref().map(|_| output.answer_probes());
+        let probe_replies = probe_runtime
+            .as_ref()
+            .map(|_| output.answer_probes(!answers_program_status_probe));
         let output_order = Arc::new(Mutex::new(()));
 
         let child = child_spawn::spawn_pty_child(&command, &tty_name)
@@ -624,7 +641,11 @@ impl PtyOwner {
             }
         };
         if let (Some(runtime), Some(replies)) = (probe_runtime, probe_replies) {
-            runtime.spawn(crate::probe::answer_probes(replies, input.clone()));
+            runtime.spawn(crate::probe::answer_probes(
+                replies,
+                input.clone(),
+                probe_filter.map(|filter| Arc::new(filter.bound_to(pid))),
+            ));
         }
         startup.commit();
         // The worker's slave descriptor closes only after the reader is released.
@@ -2288,6 +2309,7 @@ mod tests {
             config.input_dedup_entries,
             config.input_stall,
             config.answer_program_status_probe,
+            &config.probe_foreground_programs,
         )
         .expect("spawn PTY")
     }

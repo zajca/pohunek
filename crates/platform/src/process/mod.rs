@@ -24,6 +24,11 @@ use std::time::Duration;
 
 use crate::supervisor::Namespace;
 
+mod matchers;
+
+#[doc(inline)]
+pub use matchers::ProcessMatchers;
+
 #[cfg(target_os = "linux")]
 mod linux;
 

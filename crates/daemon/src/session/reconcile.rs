@@ -9391,6 +9391,7 @@ while os.getppid() == parent:
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
                 answers_program_status_probe: false,
+                probe_foreground_programs: Vec::new(),
                 placement_check_interval_ms: None,
             })
             .await
@@ -9800,6 +9801,7 @@ while os.getppid() == parent:
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-v1".to_owned()),
                 answers_program_status_probe: false,
+                probe_foreground_programs: Vec::new(),
                 placement_check_interval_ms: None,
             })
             .await
@@ -10845,6 +10847,7 @@ while os.getppid() == parent:
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: Some("identity-subagent-v1".to_owned()),
                 answers_program_status_probe: false,
+                probe_foreground_programs: Vec::new(),
                 placement_check_interval_ms: None,
             })
             .await

@@ -62,12 +62,13 @@ pub use control::{
     EscapedProcess, EventKind, ExitStatus, ForwardedActiveRelease, ForwardedActiveReport,
     IdentityRejectReason, Initialize, InitializeLimits, InputFragment, InputPlan, InputPolicy,
     InspectSnapshot, LaunchIdentity, OutputGap, PlacementOutcome, PlacementReport, ProcessIdentity,
-    ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference, ReportedSession,
-    ReportedSessionKind, RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope,
-    StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
+    ProcessPatterns, ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference,
+    ReportedSession, ReportedSessionKind, RequestKind, ResizeRequest, ResponseKind, RuntimePhase,
+    RuntimeScope, StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
     BACKGROUND_AGENT_TYPE_MAX_BYTES, BACKGROUND_LABEL_MAX_BYTES, BACKGROUND_MAX_ITEMS,
     BACKGROUND_PROGRAM_MAX_BYTES, BACKGROUND_TASK_ID_MAX_BYTES, BACKGROUND_TASK_STATUS_MAX_BYTES,
-    BACKGROUND_TASK_TYPE_MAX_BYTES,
+    BACKGROUND_TASK_TYPE_MAX_BYTES, MAX_PROBE_FOREGROUND_PROGRAMS, MAX_PROCESS_PATTERNS,
+    MAX_PROCESS_PATTERN_BYTES,
 };
 #[doc(inline)]
 pub use data::{

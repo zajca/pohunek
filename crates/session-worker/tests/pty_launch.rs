@@ -66,6 +66,7 @@ fn spawn(command: Command) -> Result<PtyOwner, PtyError> {
         config.input_dedup_entries,
         config.input_stall,
         config.answer_program_status_probe,
+        &config.probe_foreground_programs,
     )
 }
 

@@ -1045,8 +1045,10 @@ first input keeps doing so.
 other app, records without an app and records of children (an `id=` pair) are
 ignored. `answer_probe = true` makes the session worker answer the program's
 `ESC ] 7501 ; ? ESC \` probe, which programs such as Claude Code and Pi wait
-for before they report; leave it off for a program that reports without a probe
-(Codex). A rule may set `overrides_program_status = true`: while a record is held
+for before they report, also when a person starts the program by hand below a
+shell session (the worker answers only while a process of the PTY foreground
+group matches the runtime's `[process]` matchers); leave it off for a program
+that reports without a probe (Codex). A rule may set `overrides_program_status = true`: while a record is held
 it is evaluated like any other rule and, as the screen winner, beats a
 non-blocked record (for a state the program reports misleadingly); with no
 record held it is skipped, so the screen reads as it would without the rule

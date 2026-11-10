@@ -5,7 +5,7 @@
 #[doc(inline)]
 pub use pohunek_platform::process::{
     Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
-    ProcessInspector, StartIdentity,
+    ProcessInspector, ProcessMatchers, StartIdentity,
 };
 
 #[cfg(test)]

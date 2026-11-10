@@ -8,6 +8,7 @@ description = "Shared operating-system contracts for Pohunek host processes."
 
 [dependencies]
 pohunek-paths.workspace = true
+regex.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

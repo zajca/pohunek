@@ -1313,6 +1313,45 @@ impl SessionRegistry {
         }
     }
 
+    /// The programs whose OSC 7501 probe the worker answers while they run in
+    /// the PTY foreground of a session that does not answer it itself: every
+    /// installed runtime that opts in with `answer_probe`, identified by the
+    /// same `[process]` matchers that find an agent below a shell.
+    fn probe_foreground_programs(
+        &self,
+    ) -> Result<Vec<pohunek_worker_protocol::ProcessPatterns>, ProtocolError> {
+        let programs: Vec<_> = self
+            .inner
+            .profiles
+            .runtimes()
+            .registry()
+            .definitions()
+            .filter(|definition| {
+                definition
+                    .manifest()
+                    .program_status()
+                    .is_some_and(crate::detect::ProgramStatusConfig::answer_probe)
+            })
+            .filter_map(|definition| definition.manifest().process_matchers())
+            .filter(|matchers| !matchers.is_empty())
+            .map(|matchers| pohunek_worker_protocol::ProcessPatterns {
+                comm: matchers.comm_patterns().map(str::to_owned).collect(),
+                cmdline: matchers.cmdline_patterns().map(str::to_owned).collect(),
+            })
+            .collect();
+        if programs.len() > pohunek_worker_protocol::MAX_PROBE_FOREGROUND_PROGRAMS
+            || !programs
+                .iter()
+                .all(pohunek_worker_protocol::ProcessPatterns::within_bounds)
+        {
+            return Err(runtime_error(
+                "worker_initialize_invalid",
+                "the installed runtimes exceed the probe foreground program bounds".to_owned(),
+            ));
+        }
+        Ok(programs)
+    }
+
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -1398,6 +1437,7 @@ impl SessionRegistry {
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
                 hook_schema: hook_schema.map(|schema| schema.id.to_owned()),
                 answers_program_status_probe,
+                probe_foreground_programs: self.probe_foreground_programs()?,
                 placement_check_interval_ms: placement_check
                     .map(|interval| u64::try_from(interval.as_millis()))
                     .transpose()

@@ -468,6 +468,84 @@ fn launched_evidence(
     (evidence, detector.input_ready())
 }
 
+/// What a detector launched as `launch_name` reads from a terminal title alone.
+fn title_only_activity(
+    definition: &RuntimeDefinition,
+    launch_name: Option<&str>,
+    title: &str,
+) -> Option<AgentActivity> {
+    let started = Instant::now();
+    let mut detector = detector_launched_as(definition, launch_name, started, 80);
+    detector
+        .feed(started, format!("\x1b]2;{title}\x07").as_bytes())
+        .iter()
+        .rfind(|transition| transition.source == StateSource::OscTitle)
+        .map(|transition| transition.activity)
+}
+
+/// The launch-name discount over a manifest with title rules (the frozen
+/// manifest of release 0.34.2; the shipped one has none): a title that only
+/// echoes the name the launch gave the agent reports no state, so a name
+/// spelling the title marker of a running turn neither makes an idle prompt
+/// read `working` nor masks a dialog. Only the title is withheld; the screen is
+/// read as it is.
+#[test]
+fn a_title_echoing_the_launch_name_reports_no_state() {
+    let definition = golden_definition();
+    let marker = "\u{280b} deploy";
+    let idle = load_frame_from(
+        &screens_directory().join(NAMED_SCREENS_DIR),
+        "idle",
+        "idle",
+        DEFAULT_COLUMNS,
+    );
+
+    let (read, _) = launched_evidence(
+        &definition,
+        Some(marker),
+        Some(marker),
+        &idle.rows,
+        idle.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Idle, StateSource::Screen)));
+    let (read, _) = launched_evidence(&definition, None, Some(marker), &idle.rows, idle.columns);
+    assert_eq!(read, Some((AgentActivity::Working, StateSource::OscTitle)));
+
+    // The preview keeps the raw title the discount withholds from evaluation.
+    let started = Instant::now();
+    let mut detector = detector_launched_as(&definition, Some(marker), started, idle.columns);
+    detector.feed(started, &frame_bytes(Some(marker), &idle.rows));
+    let title_preview = detector
+        .region_previews()
+        .into_iter()
+        .find(|preview| preview.region == "osc_title")
+        .expect("the manifest requires the osc_title region");
+    assert_eq!(title_preview.text, marker);
+
+    let approval = load_frame("approval", "approval", DEFAULT_COLUMNS);
+    let (read, _) = launched_evidence(
+        &definition,
+        Some(marker),
+        Some(marker),
+        &approval.rows,
+        approval.columns,
+    );
+    assert_eq!(read, Some((AgentActivity::Blocked, StateSource::Screen)));
+
+    // A collision rename `<name>-<adjective>-<noun>` is the same echo; a longer
+    // word that merely starts with the name is not.
+    for (title, echoed) in [
+        ("\u{280b} deploy-iterative-muffin", true),
+        ("\u{280b} deployment", false),
+    ] {
+        assert_eq!(
+            title_only_activity(&definition, Some(marker), title).is_none(),
+            echoed,
+            "{title}"
+        );
+    }
+}
+
 /// The screen regions are not filtered: a name holding the words of a dialog
 /// is drawn into the rule label, and the dialog rule matches it. This is the
 /// residual the guide documents (`dynamic_workflow_prompt`).

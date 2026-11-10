@@ -182,6 +182,8 @@ pub struct WorkerConfig {
     pub input_stall: Option<Duration>,
     /// Whether the worker answers the child's OSC 7501 program-status probe.
     pub answer_program_status_probe: bool,
+    /// Programs whose probe is answered while they run in the PTY foreground.
+    pub probe_foreground_programs: Vec<pohunek_worker_protocol::ProcessPatterns>,
     /// Grace period between soft and hard stop.
     pub stop_grace: Duration,
     /// How long after the hard stop the root's death is awaited before the
@@ -236,6 +238,7 @@ impl WorkerConfig {
             input_dedup_entries: DEFAULT_INPUT_DEDUP_ENTRIES,
             input_stall: None,
             answer_program_status_probe: false,
+            probe_foreground_programs: Vec::new(),
             stop_grace: DEFAULT_STOP_GRACE,
             kill_reap_deadline: DEFAULT_KILL_REAP_DEADLINE,
             post_exit_drain_timeout: DEFAULT_POST_EXIT_DRAIN_TIMEOUT,

@@ -233,7 +233,7 @@ fn at_the_gate_a_release_answers_the_probe_and_reads_the_record() {
 }
 
 #[test]
-fn an_open_gate_retires_the_screen_rules_marked_below_authority() {
+fn a_held_record_outranks_a_working_screen_rule() {
     let mut harness = Harness::synthetic(Some("2.0.0"));
     harness.feed(&screen(&["synth is working", "synth ready"]));
     assert_eq!(
