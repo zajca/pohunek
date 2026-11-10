@@ -31,9 +31,22 @@ pub(crate) fn write_service_file(
     runtime_root: &Path,
     allowlist: &[String],
 ) {
+    write_service_file_at(path, prefix, state_root, runtime_root, allowlist, "0.34.2");
+}
+
+/// [`write_service_file`] for an installation whose active version is
+/// `active_version`.
+pub(crate) fn write_service_file_at(
+    path: &Path,
+    prefix: &Path,
+    state_root: &Path,
+    runtime_root: &Path,
+    allowlist: &[String],
+    active_version: &str,
+) {
     let config = ServiceConfig::new(ConfigSpec {
         prefix: prefix.to_path_buf(),
-        active_version: "0.34.2".to_owned(),
+        active_version: active_version.to_owned(),
         uid: nix::unistd::Uid::effective().as_raw(),
         state_root: state_root.to_path_buf(),
         runtime_root: runtime_root.to_path_buf(),

@@ -531,7 +531,7 @@ fn release_for_fresh_host(
 ///
 /// A refresh record is resolved by its own command; uninstall would remove the
 /// whole installation, so it is no rollback for it.
-fn pending_blocked_detail(pending: &service::report::PendingReport) -> String {
+pub(crate) fn pending_blocked_detail(pending: &service::report::PendingReport) -> String {
     if pending.operation == "refresh_path" {
         format!(
             "an interrupted search-path refresh of version {} stopped after step {}; \

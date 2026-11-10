@@ -2225,9 +2225,10 @@ jobs:
             --package "${{ steps.package.outputs.archive }}"
 
       # The test daemon spawns the session worker found beside the test
-      # profile, so it is built from this checkout before the real session.
-      - name: Build the session worker
-        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+      # profile, and the release-install scenarios stage the daemon and the
+      # worker as a sealed archive, so both are built from this checkout.
+      - name: Build the session worker and the daemon
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond -p pohunek-daemon --bin pohunekd
 
       # The gate wrote into the stage it used; the session runs on a fresh
       # restore of the untouched copy at the same absolute path.
@@ -3326,9 +3327,10 @@ jobs:
             "${{ steps.hermes.outputs.bin }}"
 
       # The test daemon spawns the session worker found beside the test
-      # profile, so it is built from this checkout before the real session.
-      - name: Build the session worker
-        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+      # profile, and the release-install scenarios stage the daemon and the
+      # worker as a sealed archive, so both are built from this checkout.
+      - name: Build the session worker and the daemon
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond -p pohunek-daemon --bin pohunekd
 
       # The previous step wrote into the stage it used; the next one runs on
       # a fresh restore of the untouched copy at the same absolute path.

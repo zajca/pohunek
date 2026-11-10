@@ -16,15 +16,21 @@ use std::fmt::Write as _;
 use std::io::{self, IsTerminal as _};
 use std::path::Path;
 
+use std::collections::BTreeSet;
+
 use pohunek_service_config::runtimes::{
-    EnsureReport, Gap, PackageAction, PackageStatus, Refusal, RELEASE_RUNTIME_DIR,
+    CatalogStatus, EnsureReport, Gap, PackageAction, PackageStatus, ProfileAction, Refusal,
+    CODE_DAEMON_RUNNING, CODE_GAP_AGENT_NOT_ON_PATH, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST,
+    RELEASE_RUNTIME_DIR,
 };
 use protocol::{PackageTrust, RuntimeId};
 use serde::Serialize;
 
 use super::{canonical_path, connect_ingest, ingest_package, Ingest, InstallArgs, Source};
 use crate::commands::render_json;
-use crate::commands::setup_host::{confirm, refusal_text, verify_sealed_archive};
+use crate::commands::setup_host::{
+    confirm, pending_blocked_detail, refusal_text, verify_sealed_archive,
+};
 use crate::error::CliError;
 use crate::service::runtimes::DaemonRuntimes;
 use crate::service::{layout, Context, VERSION};
@@ -51,8 +57,25 @@ struct ReleaseInstall {
     route: &'static str,
     /// The release directory the package came from.
     release: String,
+    /// The plan the consent covered.
+    preview: Preview,
     /// The packages the step installed or found present.
     packages: Vec<PackageAction>,
+    /// The host profiles the step pinned or left.
+    profiles: Vec<ProfileAction>,
+    /// What the step reports without refusing.
+    gaps: Vec<Gap>,
+}
+
+/// Everything the apply may change, as the dry run reports it.
+#[derive(Debug, Serialize)]
+struct Preview {
+    /// Packages the step installs or finds present.
+    packages: Vec<PackageAction>,
+    /// Host profiles the step binds or repins.
+    profiles: Vec<ProfileAction>,
+    /// The catalog trust state the step records.
+    catalog: CatalogStatus,
     /// What the step reports without refusing.
     gaps: Vec<Gap>,
 }
@@ -120,14 +143,17 @@ fn no_daemon(source: &io::Error) -> bool {
     )
 }
 
-/// The install on a host without a daemon.
-async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<(), CliError> {
+/// The release in `dir`, once nothing else owns the package registry and the
+/// archive is sealed, intact and of this CLI's version.
+async fn verified_release(
+    context: &Context,
+    dir: &Path,
+) -> Result<layout::VerifiedVersionDir, CliError> {
     let blocked = |detail: String| CliError::ReleaseInstallBlocked { detail };
-    if !args.yes && (args.json || !io::stdin().is_terminal()) {
-        return Err(CliError::ReleaseInstallConsentRequired);
+    let status = crate::service::installed_facts(context)?;
+    if let Some(pending) = &status.pending_transaction {
+        return Err(blocked(pending_blocked_detail(pending)));
     }
-    let context = Context::resolve().map_err(|error| blocked(error.to_string()))?;
-    let status = crate::service::installed_facts(&context)?;
     if status.installed && status.active_version.as_deref() != Some(VERSION) {
         return Err(blocked(format!(
             "the installed service runs version {}, this pohunek is {VERSION}; run \
@@ -157,6 +183,17 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
                  archive of the same version"
             ))
         })?;
+    Ok(verified)
+}
+
+/// The install on a host without a daemon.
+async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<(), CliError> {
+    let blocked = |detail: String| CliError::ReleaseInstallBlocked { detail };
+    if !args.yes && (args.json || !io::stdin().is_terminal()) {
+        return Err(CliError::ReleaseInstallConsentRequired);
+    }
+    let context = Context::resolve().map_err(|error| blocked(error.to_string()))?;
+    let verified = verified_release(&context, dir).await?;
     let search_path = std::env::var("PATH").map_err(|_unset| {
         blocked(
             "PATH is not set to valid UTF-8, so the release step cannot judge the agent".to_owned(),
@@ -171,6 +208,7 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
     if !plan.refusals.is_empty() {
         return Err(blocked(refusal_text(&plan.refusals)));
     }
+    refuse_unless_installable(&plan, runtime)?;
     if !args.json {
         print!("{}", render(&plan, "plan"));
     }
@@ -183,7 +221,24 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
         .map_err(|error| CliError::ReleaseInstallIncomplete {
             detail: error.to_string(),
         })?;
+    if applied
+        .refusals
+        .iter()
+        .any(|refusal| refusal.code == CODE_DAEMON_RUNNING)
+    {
+        return Err(blocked(format!(
+            "{}; stop the daemon, or install over its socket once it answers, then re-run",
+            refusal_text(&applied.refusals)
+        )));
+    }
     ensure_no_refusal(&applied.refusals)?;
+    if !matches_preview(&plan, &applied) {
+        return Err(CliError::ReleaseInstallIncomplete {
+            detail: "the apply changed packages or profiles other than the previewed ones; \
+                     inspect `pohunek plugin list` and the host profiles"
+                .to_owned(),
+        });
+    }
     let verdict = steps
         .run_requested(&context, &verified, true, &search_path, requested)
         .await
@@ -203,7 +258,14 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
         let result = ReleaseInstall {
             route: ROUTE_OFFLINE,
             release: dir.display().to_string(),
+            preview: Preview {
+                packages: plan.packages,
+                profiles: plan.profiles,
+                catalog: plan.catalog,
+                gaps: plan.gaps,
+            },
             packages: verdict.packages,
+            profiles: applied.profiles,
             gaps: verdict.gaps,
         };
         print!("{}", render_json(&result)?);
@@ -211,6 +273,75 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
         print!("{}", render(&verdict, "installed"));
     }
     Ok(())
+}
+
+/// Refuses, before any consent, a plan that would not leave the requested
+/// runtime installed and selected: the release's package is kept behind an
+/// installed one (for example the same version under another digest).
+fn refuse_unless_installable(plan: &EnsureReport, runtime: &RuntimeId) -> Result<(), CliError> {
+    let installable = plan.packages.iter().any(|package| {
+        package.runtime == runtime.as_str()
+            && matches!(
+                package.status,
+                PackageStatus::Install | PackageStatus::Present
+            )
+    });
+    if installable {
+        return Ok(());
+    }
+    let reasons: Vec<String> = plan
+        .gaps
+        .iter()
+        .filter(|gap| gap.runtime == runtime.as_str() && gap.code != CODE_GAP_AGENT_NOT_ON_PATH)
+        .map(|gap| format!("{} ({})", gap.detail, gap.code))
+        .collect();
+    let same_version = plan.gaps.iter().any(|gap| {
+        gap.runtime == runtime.as_str() && gap.code == CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST
+    });
+    let next = if same_version {
+        "use a release whose package has a new version"
+    } else {
+        "resolve the reported condition, then re-run"
+    };
+    Err(CliError::ReleaseInstallBlocked {
+        detail: format!(
+            "this release would not install `{runtime}`: {}; {next}",
+            if reasons.is_empty() {
+                "an installed package is kept".to_owned()
+            } else {
+                reasons.join("; ")
+            }
+        ),
+    })
+}
+
+/// Whether the apply changed exactly the packages and profiles the plan
+/// showed.
+fn matches_preview(plan: &EnsureReport, applied: &EnsureReport) -> bool {
+    let packages = |report: &EnsureReport, status: PackageStatus| -> BTreeSet<(String, String)> {
+        report
+            .packages
+            .iter()
+            .filter(|package| package.status == status)
+            .map(|package| (package.runtime.clone(), package.digest.clone()))
+            .collect()
+    };
+    let profiles = |report: &EnsureReport, applied: bool| -> BTreeSet<(String, String)> {
+        report
+            .profiles
+            .iter()
+            .filter(|profile| {
+                if applied {
+                    profile.status.is_applied()
+                } else {
+                    profile.status.is_pending()
+                }
+            })
+            .map(|profile| (profile.name.clone(), profile.digest.clone()))
+            .collect()
+    };
+    packages(plan, PackageStatus::Install) == packages(applied, PackageStatus::Installed)
+        && profiles(plan, false) == profiles(applied, true)
 }
 
 /// Fails an apply or a verdict that carries refusals.
@@ -240,6 +371,27 @@ fn render(report: &EnsureReport, heading: &str) -> String {
                 .unwrap_or_default()
         );
     }
+    for profile in &report.profiles {
+        let _ = writeln!(
+            text,
+            "{heading}: profile {} ({}) -> {}  {}",
+            profile.name,
+            profile.base,
+            profile.digest,
+            serde_json::to_value(profile.status)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        );
+    }
+    let _ = writeln!(
+        text,
+        "{heading}: catalog trust state {}",
+        serde_json::to_value(report.catalog)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default()
+    );
     for gap in &report.gaps {
         let _ = writeln!(text, "gap: {}: {} ({})", gap.runtime, gap.detail, gap.code);
     }

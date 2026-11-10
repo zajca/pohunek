@@ -42,6 +42,8 @@ mod hermes_provider;
 mod interpreter;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
+#[path = "../../daemon/tests/support/service_file.rs"]
+mod service_file;
 #[path = "support/setup_release.rs"]
 mod setup_release;
 #[path = "support/worker_identity_answers.rs"]
@@ -94,7 +96,7 @@ const PACKAGE_ACTIVE_TURN_PROMPT: &str = "# Hermes staff symbol, and an empty co
 const PACKAGE_ID: &str = "pohunek.runtime.hermes";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.2.0";
+const PACKAGE_VERSION: &str = "1.3.0";
 
 /// Profile that pins the runtime package in the installation scenario.
 const PROFILE: &str = "hermes-package-test";
@@ -2141,14 +2143,14 @@ async fn an_unusable_selection_without_an_install_is_a_typed_source_error() {
     let hermes = HermesFixture::new(&harness.env);
 
     let mut alternate = package_entries();
-    set_version(&mut alternate, "1.2.1");
+    set_version(&mut alternate, "1.3.1");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.2.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.3.1.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.2.1", &alternate_digest)],
+        vec![catalog_entry("1.3.1", &alternate_digest)],
     );
     update_package(&harness, &archive, &catalog, &alternate_digest).await;
     let (code, removed) = harness
@@ -2377,17 +2379,17 @@ async fn update_moves_an_install_to_the_newly_selected_package() {
     assert_eq!(hermes.status(&harness).await["outdated"], false);
 
     let mut second = package_entries();
-    set_version(&mut second, "1.2.1");
+    set_version(&mut second, "1.3.1");
     let mut skill = entry(&second, &format!("operator/{SKILL_PATH}")).to_vec();
     skill.extend_from_slice(b"\n<!-- second package version -->\n");
     replace_operator_file(&mut second, SKILL_PATH, skill.clone());
     let (bytes, second_digest) = archive_of(&second);
-    let archive = write_archive(&harness, "hermes-1.2.1.tar.zst", &bytes);
+    let archive = write_archive(&harness, "hermes-1.3.1.tar.zst", &bytes);
     let catalog = write_catalog(
         &harness,
         &key,
         2,
-        vec![catalog_entry("1.2.1", &second_digest)],
+        vec![catalog_entry("1.3.1", &second_digest)],
     );
     update_package(&harness, &archive, &catalog, &second_digest).await;
     let status = hermes.status(&harness).await;
@@ -3057,7 +3059,7 @@ async fn sidecar_violations_in_a_signed_package_fail_install() {
     let mut published = Vec::new();
     for (index, (name, mut entries)) in cases.into_iter().enumerate() {
         // Above the installed package version, so each case is a new version.
-        let version = format!("1.2.{}", index + 1);
+        let version = format!("1.3.{}", index + 1);
         set_version(&mut entries, &version);
         let (bytes, case_digest) = archive_of(&entries);
         let archive = write_archive(&harness, &format!("hermes-{version}.tar.zst"), &bytes);
@@ -3457,4 +3459,240 @@ async fn a_running_daemon_installs_the_release_package_over_its_rpc() {
             .any(|record| record.identity().id.as_str() == PACKAGE_ID),
         "the daemon recorded the package"
     );
+}
+
+/// Replaces the staged release with one whose Hermes package is the
+/// fixture package at `version` (a different archive than the built one) under
+/// a catalog at sequence 2.
+fn second_release(env: &TestEnv, key: &ed25519_dalek::SigningKey, version: &str) -> PathBuf {
+    fs::remove_dir_all(env.root().join(RELEASE_DIR)).expect("remove the first release");
+    let version = version.to_owned();
+    sealed_release(env, key, move |release| {
+        let mut entries = package_entries();
+        if version != PACKAGE_VERSION {
+            set_version(&mut entries, &version);
+        }
+        let (bytes, digest) = archive_of(&entries);
+        fs::write(release.join("runtime/packages/hermes.tar.zst"), bytes).expect("archive");
+        let catalog = catalog_of(2, WINDOW_END, vec![catalog_entry(&version, &digest)]);
+        fs::write(
+            release.join("runtime/runtime-catalog.json"),
+            signed(key, catalog),
+        )
+        .expect("catalog");
+    })
+}
+
+/// The same version under another digest than the installed one is refused
+/// before consent, naming the real next step, and changes nothing.
+#[test]
+fn a_release_with_the_installed_version_under_another_digest_is_refused_before_consent() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let key = test_key();
+    let first = sealed_release(&env, &key, |_| {});
+    assert!(install_release(&env, &first, &["--yes"]).status.success());
+    let registry =
+        fs::read(env.state_home().join("pohunek/plugins/registry.json")).expect("registry");
+    let second = second_release(&env, &key, PACKAGE_VERSION);
+
+    let output = install_release(&env, &second, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
+    let message = error["msg"].as_str().expect("message");
+    assert!(
+        message.contains("plugin_update_same_version_other_digest")
+            && message.contains("new version"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read(env.state_home().join("pohunek/plugins/registry.json")).expect("registry"),
+        registry
+    );
+}
+
+/// The next release's package is installed beside the old one and selected.
+#[test]
+fn a_release_with_a_newer_package_version_installs_beside_the_old_one() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let key = test_key();
+    let first = sealed_release(&env, &key, |_| {});
+    assert!(install_release(&env, &first, &["--yes"]).status.success());
+    let second = second_release(&env, &key, "1.4.0");
+
+    let output = install_release(&env, &second, &["--yes"]);
+
+    assert!(output.status.success(), "{}", json_of(&output));
+    let document = json_of(&output);
+    assert_eq!(document["ok"]["packages"][0]["version"], "1.4.0");
+    assert_eq!(
+        document["ok"]["preview"]["packages"][0]["status"],
+        "install"
+    );
+    let registry = fs::read_to_string(env.state_home().join("pohunek/plugins/registry.json"))
+        .expect("registry");
+    assert!(
+        registry.contains("1.3.0") && registry.contains("1.4.0"),
+        "{registry}"
+    );
+}
+
+/// An unpinned official profile is bound by the same step; the preview in
+/// the result names it before the apply.
+#[test]
+fn the_release_install_previews_and_reports_the_profile_pin_it_applies() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let profiles = env.config_home().join("pohunek/agents");
+    fs::create_dir_all(&profiles).expect("profiles directory");
+    fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700)).expect("owner-only");
+    let profile = profiles.join("hermes-official.toml");
+    fs::write(&profile, "base = \"hermes\"\n").expect("profile");
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).expect("owner-only");
+    let release = sealed_release(&env, &test_key(), |_| {});
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(output.status.success(), "{}", json_of(&output));
+    let document = json_of(&output);
+    assert_eq!(
+        document["ok"]["preview"]["profiles"][0]["name"],
+        "hermes-official"
+    );
+    assert_eq!(document["ok"]["preview"]["profiles"][0]["status"], "bind");
+    assert_eq!(document["ok"]["profiles"][0]["status"], "bound");
+    assert!(fs::read_to_string(&profile)
+        .expect("profile")
+        .contains("digest"));
+}
+
+/// A daemon that holds the instance lock without answering its socket owns
+/// the registry: the apply is refused as a blocked install, not as an
+/// incomplete one, and nothing is written.
+#[test]
+fn a_held_daemon_lock_blocks_the_offline_release_install() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |_| {});
+    let runtime = env.runtime_dir().join("pohunek");
+    fs::create_dir_all(&runtime).expect("runtime directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).expect("owner-only");
+    let _running = pohunek_daemon::lock::InstanceLock::acquire(&runtime.join("daemon.lock"))
+        .expect("a daemon holds the instance lock");
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("holds the instance lock")),
+        "{error:#}"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// Writes the installed `service.toml` of a service at `version`.
+fn write_installed_service(env: &TestEnv, version: &str) -> PathBuf {
+    let config = env.config_home().join("pohunek");
+    fs::create_dir_all(&config).expect("config directory");
+    let path = config.join("service.toml");
+    for root in [
+        env.state_home().join("pohunek"),
+        env.runtime_dir().join("pohunek"),
+    ] {
+        fs::create_dir_all(&root).expect("service root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("owner-only");
+    }
+    service_file::write_service_file_at(
+        &path,
+        env.root(),
+        &env.state_home().join("pohunek"),
+        &env.runtime_dir().join("pohunek"),
+        &["PATH".to_owned()],
+        version,
+    );
+    path
+}
+
+/// A service of another version owns the registry through its own release:
+/// the offline install is refused before anything runs.
+#[test]
+fn an_installed_service_of_another_version_blocks_the_offline_release_install() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |_| {});
+    write_installed_service(&env, "0.0.1");
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("service runs version 0.0.1")),
+        "{error:#}"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// A stopped service of this version installs the package offline and its
+/// service file is left as it was.
+#[test]
+fn a_stopped_service_of_this_version_installs_the_release_package_offline() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |_| {});
+    let service = write_installed_service(&env, env!("CARGO_PKG_VERSION"));
+    let before = fs::read(&service).expect("service file");
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(output.status.success(), "{}", json_of(&output));
+    assert_eq!(json_of(&output)["ok"]["route"], "offline");
+    assert_eq!(fs::read(&service).expect("service file"), before);
+}
+
+/// A pending service transaction stops the install before anything runs.
+#[test]
+fn a_pending_service_transaction_blocks_the_offline_release_install() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |_| {});
+    let state = env.state_home().join("pohunek");
+    fs::create_dir_all(&state).expect("state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("owner-only state");
+    let record = pohunek_cli::service::record::Record {
+        schema_version: pohunek_cli::service::record::SCHEMA_VERSION,
+        operation: pohunek_cli::service::record::Operation::Install,
+        version: "9.9.9-pending".to_owned(),
+        prefix: env.home().join(".local"),
+        previous_version: None,
+        version_dir_preexisted: false,
+        config_backup: None,
+        step: pohunek_cli::service::record::Step::Started,
+        rolling_back: false,
+        runtime_stop: false,
+        runtime_backup: None,
+        launchd_default_path: None,
+        launchd_boot_identity: None,
+        accepted_risks: None,
+        refresh: None,
+    };
+    pohunek_cli::service::record::Store::new(state)
+        .save(&record)
+        .expect("record the pending transaction");
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("interrupted install")),
+        "{error:#}"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
 }

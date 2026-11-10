@@ -7318,7 +7318,7 @@ fn a_requested_runtime_with_the_same_version_under_another_digest_keeps_the_sele
     host.publish(&[REQUESTED]);
     host.request(false, &[REQUESTED]);
     let (bytes, digest) =
-        official_runtimes::variant_archive_with_program(REQUESTED, "1.2.0", "hermes-alt");
+        official_runtimes::variant_archive_with_program(REQUESTED, "1.3.0", "hermes-alt");
     host.publish_archives(2, &[(REQUESTED, &bytes, &digest)]);
 
     let report = host.request(false, &[REQUESTED]);
@@ -7432,7 +7432,7 @@ fn a_newer_release_installs_beside_the_old_package_and_selects_it() {
     host.publish(&[REQUESTED]);
     let first = host.request(false, &[REQUESTED]);
     let old_digest = first.packages[0].digest.clone();
-    let (bytes, digest) = official_runtimes::variant_archive(REQUESTED, "1.3.0");
+    let (bytes, digest) = official_runtimes::variant_archive(REQUESTED, "1.4.0");
     host.publish_archives(2, &[(REQUESTED, &bytes, &digest)]);
 
     let upgraded = host.request(false, &[REQUESTED]);
