@@ -104,6 +104,9 @@ pub struct EnsureInputs {
     /// Conditions an apply reports as gaps instead of refusing them; a
     /// detecting plan reports every such condition as a gap already.
     pub accepted_gaps: Vec<AcceptedGap>,
+    /// Runtimes the operator asked for by id; each is planned from the release
+    /// whether or not the host uses it.
+    pub requested: Vec<RuntimeId>,
 }
 
 /// A failure that stops the step before a report exists.
@@ -223,6 +226,12 @@ impl Uses {
             .or_insert_with(|| (runtime.clone(), Vec::new()));
         if !entry.1.contains(&reason) {
             entry.1.push(reason);
+        }
+    }
+
+    fn add_all(&mut self, runtimes: &[RuntimeId], reason: UseReason) {
+        for runtime in runtimes {
+            self.add(runtime, reason);
         }
     }
 
@@ -658,9 +667,8 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         pinned,
         official,
     } = gather(inputs, launch, &profiles, &managed, &mut report)?;
-    for runtime in &managed {
-        uses.add(runtime, UseReason::Installed);
-    }
+    uses.add_all(&managed, UseReason::Installed);
+    uses.add_all(&inputs.requested, UseReason::Requested);
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
     if detect {
@@ -1342,10 +1350,28 @@ fn plan_packages(
             None => plan_installed(plan, runtime, reasons, report, false),
         };
         if let Some(entry) = entry {
+            report_requested_off_path(report, &entry);
             planned.push(entry);
         }
     }
     Ok(planned)
+}
+
+/// A requested runtime is installed whether or not its agent is installed, so
+/// a program that is off the search path is reported as a gap and never drops
+/// the runtime. A detecting plan reports it through its own search-path gate.
+fn report_requested_off_path(report: &mut Report, entry: &Planned) {
+    if report.detect || !entry.reasons.contains(&UseReason::Requested) {
+        return;
+    }
+    let program = entry.definition.program().as_str();
+    if ValidatedLaunchProgram::resolve(program).is_none() {
+        report.gap(
+            entry.runtime.as_str(),
+            CODE_GAP_AGENT_NOT_ON_PATH,
+            &format!("`{program}` is not on the search path; put the agent on it to launch it"),
+        );
+    }
 }
 
 /// Plans a runtime over the installed package that serves it, which keeps
@@ -3110,7 +3136,7 @@ fn follow_up(
                 record.runtime.as_ref() == Some(blocked.runtime)
                     && record.pin.as_ref() != Some(removed)
             }),
-            UseReason::Detected | UseReason::Installed => false,
+            UseReason::Detected | UseReason::Installed | UseReason::Requested => false,
         });
         let detected_only = reasons
             .iter()

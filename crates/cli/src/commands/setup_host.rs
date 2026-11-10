@@ -531,7 +531,7 @@ fn release_for_fresh_host(
 ///
 /// A refresh record is resolved by its own command; uninstall would remove the
 /// whole installation, so it is no rollback for it.
-fn pending_blocked_detail(pending: &service::report::PendingReport) -> String {
+pub(crate) fn pending_blocked_detail(pending: &service::report::PendingReport) -> String {
     if pending.operation == "refresh_path" {
         format!(
             "an interrupted search-path refresh of version {} stopped after step {}; \
@@ -1435,7 +1435,10 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
 /// archive is refused or the verifier cannot run. A directory that is not a
 /// sealed archive returns `None`.
-async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<Option<SealedRelease>, CliError> {
+pub(crate) async fn verify_sealed_archive(
+    staged: &Path,
+    uid: u32,
+) -> Result<Option<SealedRelease>, CliError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let blocked = |detail: String| CliError::SetupBlocked { detail };
@@ -1572,7 +1575,7 @@ fn installed_version_dir(
 /// # Errors
 ///
 /// Returns [`CliError::Io`] when the answer cannot be read.
-fn confirm() -> Result<bool, CliError> {
+pub(crate) fn confirm() -> Result<bool, CliError> {
     let mut stderr = io::stderr();
     write!(stderr, "{CONFIRM_PROMPT}")?;
     stderr.flush()?;
@@ -1611,7 +1614,7 @@ fn wire_name<T: Serialize>(value: &T) -> String {
 }
 
 /// The refusals of a plan, one per line.
-fn refusal_text(refusals: &[Refusal]) -> String {
+pub(crate) fn refusal_text(refusals: &[Refusal]) -> String {
     refusals
         .iter()
         .map(|refusal| format!("{}: {}", refusal.subject, refusal.detail))

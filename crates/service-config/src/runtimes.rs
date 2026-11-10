@@ -36,6 +36,14 @@ pub const DETECT_FLAG: &str = "--detect";
 /// [`DETECT_FLAG`], whose plan reports every such condition as a gap already.
 pub const ACCEPT_GAP_FLAG: &str = "--accept-gap";
 
+/// Flag after [`ENSURE_RUNTIMES_ARG`] and an optional [`DRY_RUN_FLAG`] whose
+/// value is a runtime id the step must install from the release even when
+/// nothing on the host uses it yet ([`UseReason::Requested`]). The flag
+/// repeats once per runtime. With it, an apply without an installed
+/// `service.toml` uses the launch environment of a fresh `service install`;
+/// a runtime the release catalog does not list for this platform is a refusal.
+pub const RUNTIME_FLAG: &str = "--runtime";
+
 /// A condition the plan and the apply report as a gap instead of refusing it:
 /// the refusal the step would report for one runtime. The code is the
 /// refusal's, which differs from the code of the gap the condition becomes
@@ -206,6 +214,8 @@ pub enum UseReason {
     /// An official package of it that is not reserved (Pi) is installed,
     /// selected and enabled, so the step keeps it current.
     Installed,
+    /// The operator named it with [`RUNTIME_FLAG`].
+    Requested,
 }
 
 /// A condition `--detect` reports without refusing the plan.

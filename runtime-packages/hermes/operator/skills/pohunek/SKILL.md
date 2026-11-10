@@ -51,7 +51,9 @@ report the same code in `package_source_error`, and `doctor` fails its
 `asset_source` check with that code's recovery hint:
 
 - `hermes_package_not_installed`: no Hermes package is installed. Install the
-  official package from its signed catalog, then retry. `integration uninstall`
+  official package from its signed catalog, then retry. On a host without a
+  local daemon, `pohunek plugin install --release <extracted daemon archive>
+  --runtime hermes --yes` installs it without a service. `integration uninstall`
   needs no package.
 - `hermes_package_not_selected`: a Hermes package is installed, but no enabled,
   catalog-authorized version is selected. Enable and select the intended

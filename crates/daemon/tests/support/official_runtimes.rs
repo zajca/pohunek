@@ -568,7 +568,7 @@ fn archive_of(directory: &Path, runtime: &str) -> (Vec<u8>, PackageDigest) {
 
 /// The catalog entry authorizing the archive `bytes` of `runtime` for the
 /// host platform, with the package identity its descriptor declares.
-fn catalog_entry(runtime: &str, bytes: &[u8], digest: &PackageDigest) -> CatalogEntry {
+pub(crate) fn catalog_entry(runtime: &str, bytes: &[u8], digest: &PackageDigest) -> CatalogEntry {
     let archive = read_archive(bytes, &Limits::DEFAULT).expect("the official archive reads");
     let definition = definition_from_archive(archive.entries(), digest)
         .unwrap_or_else(|error| panic!("the {runtime} package parses: {error:?}"));
