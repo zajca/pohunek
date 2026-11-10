@@ -79,7 +79,9 @@ use pohunek_service_config::preflight::{
 use pohunek_service_config::runtimes::{
     AcceptedGap, CatalogStatus, EnsureReport, Refusal, ACCEPT_GAP_FLAG, CODE_DAEMON_RUNNING,
     DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    RUNTIME_FLAG,
 };
+use protocol::RuntimeId;
 use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming, RUNTIME_DROP_BOUND};
 
 /// File name of the unified logical-session metadata store under the data dir.
@@ -255,13 +257,16 @@ async fn daemon_main() -> ExitCode {
         .skip(1)
         .eq([OsString::from(ENSURE_RUNTIMES_ARG)])
     {
-        return print_ensure_runtimes(false, Vec::new());
+        return print_ensure_runtimes(false, Vec::new(), Vec::new());
     }
     if arguments.first() == Some(&OsString::from(ENSURE_RUNTIMES_ARG))
-        && arguments[1..].contains(&OsString::from(ACCEPT_GAP_FLAG))
+        && (arguments[1..].contains(&OsString::from(ACCEPT_GAP_FLAG))
+            || arguments[1..].contains(&OsString::from(RUNTIME_FLAG)))
     {
-        return match parse_accepted_gaps(&arguments[1..]) {
-            Ok((dry_run, accepted)) => print_ensure_runtimes(dry_run, accepted),
+        return match parse_ensure_options(&arguments[1..]) {
+            Ok((dry_run, accepted, requested)) => {
+                print_ensure_runtimes(dry_run, accepted, requested)
+            }
             Err(error) => {
                 eprintln!("pohunekd: {ENSURE_RUNTIMES_ARG}: {error}");
                 ExitCode::FAILURE
@@ -272,7 +277,7 @@ async fn daemon_main() -> ExitCode {
         OsString::from(ENSURE_RUNTIMES_ARG),
         OsString::from(DRY_RUN_FLAG),
     ]) {
-        return print_ensure_runtimes(true, Vec::new());
+        return print_ensure_runtimes(true, Vec::new(), Vec::new());
     }
     if std::env::args_os().skip(1).eq([
         OsString::from(ENSURE_RUNTIMES_ARG),
@@ -392,14 +397,15 @@ fn print_upgrade_preflight(
 /// The launch environment the installed daemon's `service.toml` configures,
 /// read as daemon startup reads it, or the reason it cannot be read.
 ///
-/// With `detect`, a host without an installed service file is planned with the
-/// environment `service install` gives its daemon: the default allowlist over
-/// the process environment. Setup previews before it installs the service, so
-/// that host is the normal case for the detection plan. Any other failure stays
-/// a refusal.
-fn launch_environment(paths: &Paths, detect: bool) -> Result<LaunchEnvironment, String> {
+/// With `lenient` (the detection plan, or a run that requests runtimes), a host
+/// without an installed service file is planned with the environment `service
+/// install` gives its daemon: the default allowlist over the process
+/// environment. Setup previews before it installs the service, and a CLI-only
+/// host never installs one, so that host is the normal case there. Any other
+/// failure stays a refusal.
+fn launch_environment(paths: &Paths, lenient: bool) -> Result<LaunchEnvironment, String> {
     let path = paths.config_dir.join(pohunek_service_config::FILE_NAME);
-    if detect {
+    if lenient {
         return LaunchEnvironment::from_service_file_if_present(&path, EnvironmentSource::Process)
             .map(|environment| environment.unwrap_or_else(LaunchEnvironment::subprocess_default));
     }
@@ -416,44 +422,60 @@ fn release_runtime_dir() -> Result<PathBuf, String> {
 }
 
 /// Prints the offline runtime step's report as JSON, or its failure on stderr.
-fn print_ensure_runtimes(dry_run: bool, accepted_gaps: Vec<AcceptedGap>) -> ExitCode {
-    print_ensure_report(ensure_runtimes(dry_run, false, accepted_gaps))
+fn print_ensure_runtimes(
+    dry_run: bool,
+    accepted_gaps: Vec<AcceptedGap>,
+    requested: Vec<RuntimeId>,
+) -> ExitCode {
+    print_ensure_report(ensure_runtimes(dry_run, false, accepted_gaps, requested))
 }
 
 /// Parses the arguments after `ensure-official-runtimes` of a run that
-/// accepts gaps: an optional [`DRY_RUN_FLAG`], then [`ACCEPT_GAP_FLAG`] with a
-/// `<runtime>:<code>` value, repeated. Returns whether the run is a dry run
-/// and the accepted gaps. Anything else is an error, so a mistyped flag never
-/// starts the daemon.
-fn parse_accepted_gaps(arguments: &[OsString]) -> Result<(bool, Vec<AcceptedGap>), String> {
+/// accepts gaps or requests runtimes: an optional [`DRY_RUN_FLAG`], then any
+/// number of [`ACCEPT_GAP_FLAG`] (`<runtime>:<code>`) and [`RUNTIME_FLAG`]
+/// (`<runtime id>`) pairs. Returns whether the run is a dry run, the accepted
+/// gaps and the requested runtimes. Anything else is an error, so a mistyped
+/// flag never starts the daemon.
+fn parse_ensure_options(
+    arguments: &[OsString],
+) -> Result<(bool, Vec<AcceptedGap>, Vec<RuntimeId>), String> {
     let mut accepted = Vec::new();
+    let mut requested: Vec<RuntimeId> = Vec::new();
     let dry_run = arguments.first().map(OsString::as_os_str) == Some(OsStr::new(DRY_RUN_FLAG));
     let mut rest = arguments[usize::from(dry_run)..].iter();
     while let Some(flag) = rest.next() {
-        if flag.as_os_str() != OsStr::new(ACCEPT_GAP_FLAG) {
+        let mut value = |name: &str| {
+            rest.next()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| format!("{name} needs a value"))
+        };
+        if flag.as_os_str() == OsStr::new(ACCEPT_GAP_FLAG) {
+            let value = value(ACCEPT_GAP_FLAG)?;
+            accepted.push(AcceptedGap::from_arg(value).ok_or_else(|| {
+                format!("{ACCEPT_GAP_FLAG} takes <runtime>:<code>, not `{value}`")
+            })?);
+        } else if flag.as_os_str() == OsStr::new(RUNTIME_FLAG) {
+            let value = value(RUNTIME_FLAG)?;
+            let runtime = RuntimeId::parse(value)
+                .map_err(|_| format!("{RUNTIME_FLAG} takes a runtime id, not `{value}`"))?;
+            if !requested.contains(&runtime) {
+                requested.push(runtime);
+            }
+        } else {
             return Err(format!(
-                "{ACCEPT_GAP_FLAG} <runtime>:<code> is the only argument a run takes with it, \
-                 after an optional {DRY_RUN_FLAG}, not {}",
+                "{ACCEPT_GAP_FLAG} <runtime>:<code> and {RUNTIME_FLAG} <runtime id> are the only \
+                 arguments a run takes with them, after an optional {DRY_RUN_FLAG}, not {}",
                 flag.to_string_lossy()
             ));
         }
-        let value = rest
-            .next()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| format!("{ACCEPT_GAP_FLAG} needs a <runtime>:<code> value"))?;
-        accepted.push(
-            AcceptedGap::from_arg(value).ok_or_else(|| {
-                format!("{ACCEPT_GAP_FLAG} takes <runtime>:<code>, not `{value}`")
-            })?,
-        );
     }
-    Ok((dry_run, accepted))
+    Ok((dry_run, accepted, requested))
 }
 
 /// Prints the detection plan of the runtime step as JSON, or its failure on
 /// stderr. The plan changes nothing.
 fn print_ensure_runtimes_detect() -> ExitCode {
-    print_ensure_report(ensure_runtimes(true, true, Vec::new()))
+    print_ensure_report(ensure_runtimes(true, true, Vec::new(), Vec::new()))
 }
 
 fn print_ensure_report(report: Result<EnsureReport, String>) -> ExitCode {
@@ -482,6 +504,7 @@ fn ensure_runtimes(
     dry_run: bool,
     detect: bool,
     accepted_gaps: Vec<AcceptedGap>,
+    requested: Vec<RuntimeId>,
 ) -> Result<EnsureReport, String> {
     let paths = Paths::resolve().map_err(|error| error.to_string())?;
     let release_dir = release_runtime_dir()?;
@@ -493,8 +516,9 @@ fn ensure_runtimes(
         catalog_trust: CatalogTrust::load_beside_executable(),
         dry_run,
         daemon_version: DAEMON_VERSION.to_owned(),
-        environment: launch_environment(&paths, detect),
+        environment: launch_environment(&paths, detect || !requested.is_empty()),
         accepted_gaps,
+        requested,
     };
     if detect {
         return detect_official_runtimes(&inputs)

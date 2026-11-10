@@ -17,6 +17,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+use ed25519_dalek::SigningKey;
 use official_runtimes::OfficialCatalog;
 use package::PackageDigest;
 use package::ANCHOR_FILE_NAME;
@@ -33,8 +34,12 @@ use pohunek_service_config::runtimes::{
     CODE_PINNED_TO_NON_OFFICIAL_PACKAGE, CODE_PINNED_TO_OTHER_PACKAGE, CODE_PINNED_VERSION_UNKNOWN,
     CODE_PROFILE_NOT_MIGRATABLE, CODE_RELEASE_CATALOG_UNAVAILABLE, CODE_SERVICE_CONFIG_UNREADABLE,
     DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
+    RUNTIME_FLAG,
 };
 use pohunek_test_support::bin_exe;
+use pohunek_test_support::catalog::{
+    anchor_with, catalog_of, key_id, root_of, signed, test_key, WINDOW_END, WINDOW_START,
+};
 use pohunek_test_support::env::TestEnv;
 use protocol::{PackageErrorKind, ProtocolError};
 
@@ -6936,4 +6941,492 @@ fn a_detection_with_an_unsafe_anchor_directory_names_the_anchor_fault() {
         !detail.contains("install the release again"),
         "an anchor fault is not cured by reinstalling: {detail}"
     );
+}
+
+// --- A CLI-only host requests a runtime by id (`--runtime`) ---
+
+/// The runtime a CLI-only host installs from the release.
+const REQUESTED: &str = "hermes";
+
+impl Host {
+    /// Runs the step requesting `runtimes` and returns its raw output.
+    fn raw_request(&self, dry_run: bool, runtimes: &[&str]) -> Output {
+        let extra: Vec<&str> = runtimes
+            .iter()
+            .flat_map(|runtime| [RUNTIME_FLAG, *runtime])
+            .collect();
+        self.raw_step_with(dry_run, &extra)
+    }
+
+    /// Runs the step requesting `runtimes`, which must exit successfully.
+    fn request(&self, dry_run: bool, runtimes: &[&str]) -> EnsureReport {
+        let output = self.raw_request(dry_run, runtimes);
+        assert!(
+            output.status.success(),
+            "the step exits 0, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("the step prints its report as JSON")
+    }
+
+    /// Publishes a release of `runtimes` signed by `key`, with the anchor
+    /// bytes `anchor`, whose catalog is `shape(catalog)`.
+    fn publish_signed(
+        &self,
+        key: &SigningKey,
+        anchor: Vec<u8>,
+        runtimes: &[&str],
+        sequence: u64,
+        expires_at: u64,
+        shape: impl FnOnce(&mut package::Catalog),
+    ) {
+        fs::write(self.binary_dir().join(ANCHOR_FILE_NAME), anchor).expect("write the anchor");
+        let packages = self.release_dir().join("packages");
+        fs::create_dir_all(&packages).expect("the packages directory");
+        let entries = runtimes
+            .iter()
+            .map(|runtime| {
+                let (bytes, digest) = official_runtimes::built_archive(runtime);
+                fs::write(packages.join(format!("{runtime}.tar.zst")), &bytes)
+                    .expect("write the archive");
+                official_runtimes::catalog_entry(runtime, &bytes, &digest)
+            })
+            .collect();
+        let mut catalog = catalog_of(sequence, expires_at, entries);
+        shape(&mut catalog);
+        fs::write(
+            self.release_dir().join("runtime-catalog.json"),
+            signed(key, catalog),
+        )
+        .expect("write the catalog");
+    }
+
+    /// Nothing of the package store exists, as before any install.
+    fn assert_nothing_installed(&self) {
+        assert!(!self.plugins_dir().exists(), "no package store is created");
+    }
+}
+
+/// A CLI-only home has no `service.toml` and no daemon; the requested runtime
+/// is installed from the release, enabled and selected, and a repeat finds it
+/// present. A dry run creates nothing.
+#[test]
+fn a_cli_only_host_installs_the_requested_runtime_without_a_service_file() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+
+    let plan = host.request(true, &[REQUESTED]);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(plan.packages.len(), 1);
+    assert_eq!(plan.packages[0].runtime, REQUESTED);
+    assert_eq!(plan.packages[0].status, PackageStatus::Install);
+    assert_eq!(plan.packages[0].reasons, [UseReason::Requested]);
+    host.assert_nothing_installed();
+
+    let applied = host.request(false, &[REQUESTED]);
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.catalog, CatalogStatus::Recorded);
+    assert_eq!(applied.packages.len(), 1);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+    assert!(host.registry_path().exists());
+    assert!(host.catalog_state_path().exists());
+    assert!(
+        !host.service_path().exists(),
+        "the step never writes a service file"
+    );
+
+    let repeat = host.request(false, &[REQUESTED]);
+    assert!(repeat.refusals.is_empty(), "{:?}", repeat.refusals);
+    assert_eq!(repeat.packages[0].status, PackageStatus::Present);
+    assert_eq!(repeat.catalog, CatalogStatus::Current);
+}
+
+/// The request replaces neither the missing-service refusal of a plain run
+/// nor the unreadable-service refusal.
+#[test]
+fn a_malformed_service_file_still_refuses_a_requested_runtime() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let path = host.service_path();
+    fs::create_dir_all(path.parent().expect("config dir")).expect("config dir");
+    fs::write(&path, "not = [valid").expect("write a malformed service file");
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_SERVICE_CONFIG_UNREADABLE]);
+    host.assert_nothing_installed();
+}
+
+/// A request for a runtime the catalog does not list for this platform is a
+/// refusal that changes nothing.
+#[test]
+fn a_requested_runtime_the_release_does_not_list_is_refused() {
+    let host = Host::without_service();
+    host.publish(&["claude"]);
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(
+        refusal_codes(&report),
+        [CODE_PACKAGE_UNAVAILABLE_FOR_PLATFORM]
+    );
+    assert_eq!(report.refusals[0].subject, REQUESTED);
+    host.assert_nothing_installed();
+}
+
+/// A mistyped runtime id is a usage error before anything runs.
+#[test]
+fn a_malformed_runtime_flag_is_a_usage_error_and_changes_nothing() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+
+    for extra in [
+        vec![RUNTIME_FLAG],
+        vec![RUNTIME_FLAG, "Not A Runtime"],
+        vec![RUNTIME_FLAG, REQUESTED, "--unknown"],
+    ] {
+        let output = host.raw_step_with(false, &extra);
+        assert!(!output.status.success(), "{extra:?}");
+    }
+    host.assert_nothing_installed();
+}
+
+/// Altered archive bytes are not listed by the catalog digest, so the step
+/// refuses before decompressing and records nothing.
+#[test]
+fn an_altered_release_archive_is_refused_and_nothing_is_recorded() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let archive = host
+        .release_dir()
+        .join("packages")
+        .join(format!("{REQUESTED}.tar.zst"));
+    let mut bytes = fs::read(&archive).expect("the archive");
+    bytes.push(0);
+    fs::write(&archive, bytes).expect("alter the archive");
+
+    let plan = host.request(true, &[REQUESTED]);
+    let applied = host.request(false, &[REQUESTED]);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), ["official_package_archive_invalid"]);
+        assert_eq!(report.refusals[0].subject, REQUESTED);
+    }
+    host.assert_nothing_installed();
+}
+
+/// A catalog whose bytes were altered fails its signature, so the release is
+/// unusable and the requested runtime is refused.
+#[test]
+fn an_altered_release_catalog_is_refused_and_nothing_is_recorded() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let catalog = host.release_dir().join("runtime-catalog.json");
+    let text = fs::read_to_string(&catalog).expect("the catalog");
+    fs::write(&catalog, text.replacen("\"sequence\": 1", "\"sequence\": 9", 1))
+        .expect("alter the catalog");
+    assert_ne!(
+        fs::read_to_string(&catalog).expect("the catalog"),
+        text,
+        "the fixture alters the catalog"
+    );
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_RELEASE_CATALOG_UNAVAILABLE]);
+    host.assert_nothing_installed();
+}
+
+/// A catalog older than the accepted high-water mark is not used, so a
+/// package that is not installed yet is refused and the state stays.
+#[test]
+fn a_release_catalog_older_than_an_accepted_one_refuses_a_new_request() {
+    let host = Host::without_service();
+    host.publish_at(&["claude"], 2);
+    host.request(false, &["claude"]);
+    let recorded = fs::read(host.catalog_state_path()).expect("the catalog state");
+
+    host.publish_at(&[REQUESTED], 1);
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_RELEASE_CATALOG_UNAVAILABLE]);
+    assert_eq!(
+        fs::read(host.catalog_state_path()).expect("the catalog state"),
+        recorded
+    );
+}
+
+/// An expired catalog is not used.
+#[test]
+fn an_expired_release_catalog_is_refused() {
+    let host = Host::without_service();
+    let key = test_key();
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, Vec::new()),
+        &[REQUESTED],
+        1,
+        WINDOW_START + 1,
+        |_| {},
+    );
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_RELEASE_CATALOG_UNAVAILABLE]);
+    host.assert_nothing_installed();
+}
+
+/// A catalog signed by a key the anchor revokes is not used.
+#[test]
+fn a_release_catalog_signed_by_a_key_the_anchor_revokes_is_refused() {
+    let host = Host::without_service();
+    let key = test_key();
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, vec![key_id(&key)]),
+        &[REQUESTED],
+        1,
+        WINDOW_END,
+        |_| {},
+    );
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_RELEASE_CATALOG_UNAVAILABLE]);
+    host.assert_nothing_installed();
+}
+
+/// A key revoked by an earlier accepted catalog stays revoked: a later
+/// catalog signed by it is not used.
+#[test]
+fn a_key_revoked_by_an_earlier_catalog_cannot_sign_a_later_one() {
+    let host = Host::without_service();
+    let first = test_key();
+    let second = test_key();
+    let anchor = package::AnchorFile::new(
+        vec![
+            root_of(&first, WINDOW_START, WINDOW_END),
+            root_of(&second, WINDOW_START, WINDOW_END),
+        ],
+        Vec::new(),
+    )
+    .expect("anchor")
+    .to_bytes()
+    .expect("anchor bytes");
+    let revoked = key_id(&second);
+    host.publish_signed(&first, anchor.clone(), &["claude"], 1, WINDOW_END, |catalog| {
+        catalog.revoked_key_ids.push(revoked);
+    });
+    let accepted = host.request(false, &["claude"]);
+    assert!(accepted.refusals.is_empty(), "{:?}", accepted.refusals);
+
+    host.publish_signed(&second, anchor, &[REQUESTED], 2, WINDOW_END, |_| {});
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_RELEASE_CATALOG_UNAVAILABLE]);
+    assert!(
+        report
+            .packages
+            .iter()
+            .all(|package| package.runtime != REQUESTED),
+        "{:?}",
+        report.packages
+    );
+}
+
+/// A catalog that lists a package digest as revoked authorizes nothing.
+#[test]
+fn a_release_catalog_that_revokes_the_package_digest_is_refused() {
+    let host = Host::without_service();
+    let key = test_key();
+    let (_, digest) = official_runtimes::built_archive(REQUESTED);
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, Vec::new()),
+        &[REQUESTED],
+        1,
+        WINDOW_END,
+        |catalog| catalog.revoked_digests.push(digest),
+    );
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_RELEASE_CATALOG_UNAVAILABLE]);
+    host.assert_nothing_installed();
+}
+
+/// A daemon that holds the instance lock owns the registry: the request is
+/// refused and nothing is written.
+#[test]
+fn a_held_daemon_lock_refuses_a_requested_runtime_on_a_cli_only_host() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let runtime_app = host.env.runtime_dir().join(APP_DIR);
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&runtime_app)
+        .expect("the runtime directory");
+    let _running = InstanceLock::acquire(&runtime_app.join(INSTANCE_LOCK_NAME))
+        .expect("a daemon holds the instance lock");
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert_eq!(refusal_codes(&report), [CODE_DAEMON_RUNNING]);
+    host.assert_nothing_installed();
+}
+
+/// The Linux runtime lock needs `XDG_RUNTIME_DIR`; without it the step fails
+/// fast and names the variable.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_missing_runtime_directory_variable_fails_fast_and_names_it() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let mut command = host.env.command(&host.binary);
+    command
+        .args([ENSURE_RUNTIMES_ARG, RUNTIME_FLAG, REQUESTED])
+        .env_remove("XDG_RUNTIME_DIR");
+
+    let output = command.output().expect("run the daemon binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("XDG_RUNTIME_DIR"), "{stderr}");
+    host.assert_nothing_installed();
+}
+
+/// A release that carries the same version under another digest than the
+/// installed one keeps the selection and reports the gap, as for any
+/// installed package.
+#[test]
+fn a_requested_runtime_with_the_same_version_under_another_digest_keeps_the_selection() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    host.request(false, &[REQUESTED]);
+    let (bytes, digest) =
+        official_runtimes::variant_archive_with_program(REQUESTED, "1.2.0", "hermes-alt");
+    host.publish_archives(2, &[(REQUESTED, &bytes, &digest)]);
+
+    let report = host.request(false, &[REQUESTED]);
+
+    assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+    assert_eq!(report.packages[0].status, PackageStatus::Kept);
+    assert!(
+        gap_codes(&report).contains(&(REQUESTED, CODE_GAP_UPDATE_SAME_VERSION_OTHER_DIGEST)),
+        "{:?}",
+        report.gaps
+    );
+}
+
+/// An installed (stopped) daemon's service file is read as before: the request
+/// installs next to it.
+#[test]
+fn a_requested_runtime_installs_beside_an_installed_service_file() {
+    let host = Host::new();
+    host.publish(&[REQUESTED]);
+
+    let applied = host.request(false, &[REQUESTED]);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+    assert!(host.service_path().exists());
+}
+
+/// Control for the catalog refusals above: a release signed by a fresh key,
+/// valid for its window and carrying no revocation, installs. Each refusal
+/// differs from this fixture by one parameter.
+#[test]
+fn a_release_signed_by_a_fresh_trusted_key_installs_the_requested_runtime() {
+    let host = Host::without_service();
+    let key = test_key();
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, Vec::new()),
+        &[REQUESTED],
+        1,
+        WINDOW_END,
+        |_| {},
+    );
+
+    let applied = host.request(false, &[REQUESTED]);
+
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(applied.packages[0].status, PackageStatus::Installed);
+}
+
+/// A requested runtime whose agent is not on the search path is still
+/// installed; the missing program is a gap and not a refusal.
+#[test]
+fn a_requested_runtime_whose_agent_is_not_on_the_search_path_is_installed_with_a_gap() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+
+    let mut command = host.env.command(&host.binary);
+    command
+        .args([ENSURE_RUNTIMES_ARG, RUNTIME_FLAG, REQUESTED])
+        .env("PATH", host.env.root().join("empty-path"));
+    let output = command.output().expect("run the daemon binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: EnsureReport = serde_json::from_slice(&output.stdout).expect("the report");
+
+    assert!(report.refusals.is_empty(), "{:?}", report.refusals);
+    assert_eq!(report.packages[0].status, PackageStatus::Installed);
+    assert_eq!(
+        gap_codes(&report),
+        [(REQUESTED, CODE_GAP_AGENT_NOT_ON_PATH)]
+    );
+}
+
+/// A service installed after the request runs the plain step under the same
+/// locks: it reads the one registry, plans nothing for a runtime no profile
+/// uses, and leaves the recorded package and the trust state as they are.
+#[test]
+fn a_service_installed_after_the_request_leaves_the_recorded_package_alone() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let requested = host.request(false, &[REQUESTED]);
+    let registry = fs::read(host.registry_path()).expect("the registry");
+    let state = fs::read(host.catalog_state_path()).expect("the catalog state");
+    host.write_service(&default_allowlist());
+
+    let plain = host.step(false);
+
+    assert!(plain.refusals.is_empty(), "{:?}", plain.refusals);
+    assert!(plain.packages.is_empty(), "{:?}", plain.packages);
+    assert_eq!(
+        fs::read(host.registry_path()).expect("the registry"),
+        registry
+    );
+    assert_eq!(
+        fs::read(host.catalog_state_path()).expect("the catalog state"),
+        state
+    );
+    let again = host.request(false, &[REQUESTED]);
+    assert_eq!(again.packages[0].status, PackageStatus::Present);
+    assert_eq!(again.packages[0].digest, requested.packages[0].digest);
+}
+
+/// The next release's package is installed beside the old one and selected;
+/// the old one stays installed for `plugin select`.
+#[test]
+fn a_newer_release_installs_beside_the_old_package_and_selects_it() {
+    let host = Host::without_service();
+    host.publish(&[REQUESTED]);
+    let first = host.request(false, &[REQUESTED]);
+    let old_digest = first.packages[0].digest.clone();
+    let (bytes, digest) = official_runtimes::variant_archive(REQUESTED, "1.3.0");
+    host.publish_archives(2, &[(REQUESTED, &bytes, &digest)]);
+
+    let upgraded = host.request(false, &[REQUESTED]);
+
+    assert!(upgraded.refusals.is_empty(), "{:?}", upgraded.refusals);
+    assert_eq!(upgraded.packages[0].status, PackageStatus::Installed);
+    assert_eq!(upgraded.packages[0].digest, digest.to_string());
+    let registry = fs::read_to_string(host.registry_path()).expect("the registry");
+    assert!(registry.contains(&old_digest), "the old version is retained");
+    assert!(registry.contains(digest.as_str()), "the new one is recorded");
 }

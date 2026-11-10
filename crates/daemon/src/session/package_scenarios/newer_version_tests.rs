@@ -870,6 +870,7 @@ fn apply_release_step(
         daemon_version: crate::DAEMON_VERSION.to_owned(),
         environment: Ok(test_launch_environment()),
         accepted_gaps: Vec::new(),
+        requested: Vec::new(),
     })
     .expect("the release step applies")
 }
@@ -1059,6 +1060,7 @@ async fn assert_release_record(tag: &str, source: package::registry::PackageSour
         daemon_version: crate::DAEMON_VERSION.to_owned(),
         environment: Ok(test_launch_environment()),
         accepted_gaps: Vec::new(),
+        requested: Vec::new(),
     });
     let restarted = restart(&session.fixture).await;
     let resumed = restarted

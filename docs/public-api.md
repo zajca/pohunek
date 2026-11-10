@@ -2917,7 +2917,7 @@ for an official version of the same package. `integrations` lists the config hom
 into: without `--detect`, the homes that already hold hooks; with `--detect`, each
 existing home of a planned runtime whose hooks the setup installs, whether or not
 hooks are present yet (Pi declares none). Each distinct home appears once. `reason`
-values are `profile`, `session`, `integration`, `detected` and `installed`. Two codes name a
+values are `profile`, `session`, `integration`, `detected`, `installed` and `requested`. Two codes name a
 runtime the catalog lists more than once for this platform: `official_package_listed_more_than_once`
 (a profile, a session or an integration uses the runtime, so the
 plan without `--detect` refuses it with this code and `--detect` lists it as a gap) and
@@ -2930,6 +2930,17 @@ passes the `official_package_unavailable_for_platform` gaps its preview showed t
 installs the service, so the service installs and the runtime stays a gap, while a used
 runtime the catalog lists more than once still stops setup before any change. The report layout
 stays at `report_version` 1.
+
+`--runtime <id>` (repeatable, after an optional `--dry-run`, a usage error with `--detect`) names a
+runtime the step installs from the release whether or not the host uses it, with the reason
+`requested`. It is how a host without a service installs a package: without an installed
+`service.toml` an apply uses the launch environment `service install` gives its daemon, as
+`--dry-run --detect` does, and an existing `service.toml` that is unreadable still refuses. A runtime
+the release catalog does not list for this platform is the refusal
+`official_package_unavailable_for_platform`. A requested runtime whose program is not on the search
+path is installed and reported as the gap `agent_not_on_search_path`. The locks, the catalog checks
+and the install order are those of every other run, so a running daemon still refuses the apply with
+`daemon_running`.
 
 <a id="disabled-release-package-case-table"></a>
 **Disabled release package: case table**
