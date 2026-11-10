@@ -237,17 +237,99 @@ async fn send_hook(harness: &Harness, id: &str, hook: &str) {
     assert_eq!(code, 0, "{sent}");
 }
 
-/// How long a hook may stay unobserved before [`send_hook_until_inspected`] sends it again.
-///
-/// The installed state hook is best effort: it gives the worker one 0.5 s
-/// socket exchange and drops the report on a timeout, so a loaded host can lose
-/// a single send. Each Stop fixture carries the whole task list, so a repeat
-/// only replaces the snapshot with the same one.
-const HOOK_RESEND_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// Trace reasons that start with this prefix name a report the state hook
+/// could not hand to the worker (`worker_timeout`, `worker_closed`, ...).
+const WORKER_ROUTE_REASON_PREFIX: &str = "worker_";
 
-/// Sends `hook` and waits for the session's `inspect` document to satisfy
-/// `ready`, sending the hook again every [`HOOK_RESEND_AFTER`] while it does
-/// not. Returns the document that satisfied `ready`.
+/// Trace lines of the state hooks that `id` ran for `action` and that name a
+/// report dropped on the worker route.
+///
+/// The hook is best effort by design: it gives the worker one 0.5 s socket
+/// exchange, drops the report on a failure and records why in the hook trace
+/// (`pohunek-hooks.jsonl` below the worker's state directory).
+fn dropped_worker_reports(harness: &Harness, id: &str, action: &str) -> Vec<Value> {
+    let mut traces = Vec::new();
+    trace_files_under(&harness.env.root().join("worker"), &mut traces);
+    traces
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|line| {
+            line["session"] == id
+                && line["action"] == action
+                && line["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with(WORKER_ROUTE_REASON_PREFIX))
+        })
+        .collect()
+}
+
+fn trace_files_under(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            trace_files_under(&path, found);
+        } else if path.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new(pohunek_logging::config::HOOK_TRACE_FILE_NAME)
+        }) {
+            found.push(path);
+        }
+    }
+}
+
+/// Sends `hook` and returns what `poll` yields once it is `Some`. The hook is
+/// sent again only when the hook trace records a new report of this session
+/// and action dropped on the worker route, and each resend is logged with the
+/// trace line that caused it. Without such a line the wait runs into the hang
+/// guard, so a snapshot that is lost for any other reason still fails the test.
+///
+/// A resent Stop carries the same task list: the items stay the same, the
+/// snapshot's revision and observed time advance, and the daemon applies it
+/// again.
+async fn send_hook_until<T, Fut>(
+    harness: &Harness,
+    id: &str,
+    hook: &str,
+    what: &str,
+    mut poll: impl FnMut() -> Fut,
+) -> T
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let action = hook.split(':').next().expect("a hook names its action");
+    send_hook(harness, id, hook).await;
+    let answered = std::cell::Cell::new(0_usize);
+    let answered = &answered;
+    wait_until(what, || {
+        let next = poll();
+        let dropped = dropped_worker_reports(harness, id, action);
+        async move {
+            if let Some(value) = next.await {
+                return Some(value);
+            }
+            if dropped.len() > answered.get() {
+                answered.set(dropped.len());
+                eprintln!(
+                    "resending {hook} for {what} after a dropped report: {}",
+                    dropped.last().expect("a dropped report")
+                );
+                send_hook(harness, id, hook).await;
+            }
+            None
+        }
+    })
+    .await
+}
+
+/// [`send_hook_until`] for a wait on the session's `inspect` document:
+/// returns the first document `ready` accepts.
 async fn send_hook_until_inspected(
     harness: &Harness,
     id: &str,
@@ -255,18 +337,9 @@ async fn send_hook_until_inspected(
     what: &str,
     ready: impl Fn(&Value) -> bool,
 ) -> Value {
-    send_hook(harness, id, hook).await;
-    let last_sent = std::cell::Cell::new(std::time::Instant::now());
-    wait_until(what, || async {
+    send_hook_until(harness, id, hook, what, || async {
         let info = inspect(harness, id).await;
-        if ready(&info) {
-            return Some(info);
-        }
-        if last_sent.get().elapsed() >= HOOK_RESEND_AFTER {
-            send_hook(harness, id, hook).await;
-            last_sent.set(std::time::Instant::now());
-        }
-        None
+        ready(&info).then_some(info)
     })
     .await
 }
@@ -413,14 +486,17 @@ async fn a_turn_end_snapshot_is_listed_and_streamed_for_the_live_runtime() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    let info = wait_until("the first background snapshot", || async {
-        let info = inspect(&harness, &id).await;
-        info["background"]["items"]
-            .as_array()
-            .is_some_and(|items| items.len() == 3)
-            .then_some(info)
-    })
+    let info = send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the first background snapshot",
+        |info| {
+            info["background"]["items"]
+                .as_array()
+                .is_some_and(|items| items.len() == 3)
+        },
+    )
     .await;
     let background = &info["background"];
     assert_eq!(item(background, "agent-1")["kind"], "subagent");
@@ -513,22 +589,29 @@ async fn a_changed_task_set_gives_a_new_revision_and_keeps_first_seen() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    let first = wait_until("the first snapshot", || async {
-        let background = inspect(&harness, &id).await["background"].clone();
-        background["items"]
-            .as_array()
-            .is_some_and(|items| items.len() == 3)
-            .then_some(background)
-    })
-    .await;
+    let first = send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the first snapshot",
+        |info| {
+            info["background"]["items"]
+                .as_array()
+                .is_some_and(|items| items.len() == 3)
+        },
+    )
+    .await["background"]
+        .clone();
 
-    send_hook(&harness, &id, "stop:stop-two").await;
-    let second = wait_until("the second snapshot", || async {
-        let background = inspect(&harness, &id).await["background"].clone();
-        (revision(&background) > revision(&first)).then_some(background)
-    })
-    .await;
+    let second = send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-two",
+        "the second snapshot",
+        |info| revision(&info["background"]) > revision(&first),
+    )
+    .await["background"]
+        .clone();
     assert!(revision(&second) > revision(&first), "{second}");
     let ids: Vec<&str> = second["items"]
         .as_array()
@@ -569,11 +652,13 @@ async fn ending_the_agent_clears_the_background_and_publishes_null() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    let held = wait_until("the snapshot before the agent ends", || async {
-        let info = inspect(&harness, &id).await;
-        info["background"].is_object().then_some(info)
-    })
+    let held = send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the snapshot before the agent ends",
+        |info| info["background"].is_object(),
+    )
     .await;
     wait_for_background_state(&collected, &id, "the snapshot event", Value::is_object).await;
 
@@ -712,12 +797,15 @@ async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
     let harness = start_serving_claude(true).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    let held = wait_until("the snapshot before the restart", || async {
-        let background = inspect(&harness, &id).await["background"].clone();
-        background.is_object().then_some(background)
-    })
-    .await;
+    let held = send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the snapshot before the restart",
+        |info| info["background"].is_object(),
+    )
+    .await["background"]
+        .clone();
 
     let root = harness.env.root().to_path_buf();
     let surviving = harness.shut_down().await;
@@ -739,12 +827,13 @@ async fn a_worker_lost_while_the_daemon_is_down_leaves_no_background() {
     let harness = start_serving_claude(true).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    wait_until("the snapshot before the daemon stops", || async {
-        inspect(&harness, &id).await["background"]
-            .is_object()
-            .then_some(())
-    })
+    send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the snapshot before the daemon stops",
+        |info| info["background"].is_object(),
+    )
     .await;
 
     let pid = worker_pid(&harness, &id).await;
