@@ -3,10 +3,9 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::procwatch::ProcessFact;
+pub use crate::procwatch::ProcessMatchers;
 use package::version_probe::ProbeVersion;
 use protocol::AgentActivity;
-use regex::Regex;
 
 mod error;
 mod matcher;
@@ -284,38 +283,6 @@ impl ProgramStatusConfig {
     }
 }
 
-/// Process-level matchers compiled from a manifest `[process]` section.
-#[derive(Debug, Clone)]
-pub struct ProcessMatchers {
-    comm: Vec<Regex>,
-    cmdline: Vec<Regex>,
-}
-
-impl ProcessMatchers {
-    pub(super) fn new(comm: Vec<Regex>, cmdline: Vec<Regex>) -> Self {
-        Self { comm, cmdline }
-    }
-
-    /// Returns whether process facts match this manifest.
-    ///
-    /// Matching is an OR: any `comm` regex matching the task command name, or any
-    /// `cmdline` regex matching argv joined with spaces, is enough. An empty
-    /// `[process]` section never matches.
-    #[must_use]
-    pub fn matches(&self, fact: &ProcessFact) -> bool {
-        self.comm.iter().any(|regex| regex.is_match(&fact.comm))
-            || (!self.cmdline.is_empty()
-                && self
-                    .cmdline
-                    .iter()
-                    .any(|regex| regex.is_match(&fact.cmdline.join(" "))))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.comm.is_empty() && self.cmdline.is_empty()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestMatch {
     pub rule_id: String,
@@ -464,6 +431,7 @@ impl MatchContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::procwatch::ProcessFact;
 
     #[test]
     fn highest_priority_matching_rule_wins() {

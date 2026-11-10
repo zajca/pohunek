@@ -915,7 +915,7 @@ A descriptor names the supported release range with `version_probe` in
 - `semver-v1` when it prints exactly `MAJOR.MINOR.PATCH` (Pi).
 - `semver-line-v1` with a `line` template when the release sits inside fixed
   text: `line = "codex-cli {version}"` for `codex-cli 0.160.0`,
-  `line = "{version} (Claude Code)"` for `2.1.289 (Claude Code)`,
+  `line = "{version} (Claude Code)"` for `2.1.309 (Claude Code)`,
   `line = "Hermes Agent v{version} {annotation}"` for
   `Hermes Agent v0.20.0 (2026.8.3)`.
 
@@ -1045,8 +1045,10 @@ first input keeps doing so.
 other app, records without an app and records of children (an `id=` pair) are
 ignored. `answer_probe = true` makes the session worker answer the program's
 `ESC ] 7501 ; ? ESC \` probe, which programs such as Claude Code and Pi wait
-for before they report; leave it off for a program that reports without a probe
-(Codex). A rule may set `overrides_program_status = true`: while a record is held
+for before they report, also when a person starts the program by hand below a
+shell session (the worker answers only while a process of the PTY foreground
+group matches the runtime's `[process]` matchers); leave it off for a program
+that reports without a probe (Codex). A rule may set `overrides_program_status = true`: while a record is held
 it is evaluated like any other rule and, as the screen winner, beats a
 non-blocked record (for a state the program reports misleadingly); with no
 record held it is skipped, so the screen reads as it would without the rule

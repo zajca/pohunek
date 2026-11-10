@@ -214,6 +214,7 @@ fn initialize(
         public_protocol_version,
         hook_schema: Some(hook_schema.to_owned()),
         answers_program_status_probe: false,
+        probe_foreground_programs: Vec::new(),
         placement_check_interval_ms: None,
     }
 }

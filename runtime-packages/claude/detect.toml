@@ -23,31 +23,18 @@ cmdline = [
 ]
 
 # Claude Code reports its root state as OSC 7501 records once the session
-# worker answers its `ESC ] 7501 ; ? ST` probe. The records are authoritative
-# from `authority_from`; below it, or for an unprobed release, the worker does
-# not answer the probe and the title and screen rules decide. The working and
-# idle screen rules marked `below_authority` serve those releases only and are
-# skipped once the gate is open; the prompt-box rule still decides input
-# readiness. The record outranks stale
-# screen evidence; a visible dialog still wins (see the program-status layer in
-# docs/architecture.md). Background agents report as `id=` records, which are
-# ignored.
+# worker answers its `ESC ] 7501 ; ? ST` probe. Every supported release reports
+# them, so a held record is authoritative: it outranks stale screen evidence,
+# and a visible dialog still wins (see the program-status layer in
+# docs/architecture.md). While no record is held (before the first one, and
+# after a lag resync or a reconfigure dropped it) the two working
+# rules marked `below_authority` read a running turn from the screen; a held
+# record skips them. The prompt-box rule decides input readiness. Background
+# agents report as `id=` records, which are ignored.
 [program_status]
 app = "claude-code"
 answer_probe = true
 authority_from = "2.1.309"
-
-# Claude Code 2.1.289 leads its title with `◐`/`◑`, alternating every 960 ms
-# while a turn runs, and with `✳` while it waits. 2.1.309 sets the plain title
-# `Claude Code` once the probe is answered, so this rule and `osc_title_idle`
-# serve a Claude that sets state titles. The braille range is the working title
-# of the herdr manifest this one is ported from.
-[[rules]]
-id = "osc_title_working"
-state = "working"
-priority = 1100
-region = "osc_title"
-regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 
 # Live status spinner rendered above the prompt box while a turn runs, e.g.
 # "✻ Noodling… (12s · ↓ 1.2k tokens)", "✻ Herding… (3s · thinking with high
@@ -56,11 +43,11 @@ regex = ['^[\x{2800}-\x{28FF}\x{25D0}\x{25D1}] ']
 # start of one that the terminal width cut, "(1…"), so a transcript bullet such
 # as "* Then it waits… (see below)" is not a spinner. A parenthesis that opens
 # with anything but a digit, a unit or the cut mark is not read as a timer.
-# The prompt box (`❯`) stays visible during work in current Claude Code TUIs, so without this rule every screen render matches `live_prompt_box`
-# and the published activity flaps to idle between OSC title updates. Must
-# outrank `live_prompt_box` (950) and stay below `live_blocked_form` (980).
-# Dialog markers are excluded so a visible approval prompt keeps winning as
-# blocked even if a stale spinner line is still on screen.
+# The prompt box (`❯`) stays visible during work, so without this rule every
+# screen render matches `live_prompt_box` and a turn reads idle while no record
+# is held. Must outrank `live_prompt_box` (950) and stay below
+# `live_blocked_form` (980). Dialog markers are excluded so a visible approval
+# prompt keeps winning as blocked.
 [[rules]]
 id = "live_status_spinner"
 state = "working"
@@ -75,10 +62,8 @@ not = { any = [
 
 # The footer below a running turn's prompt box reads `esc to interrupt`; a
 # waiting prompt's footer reads `? for shortcuts`. A streaming reply hides the
-# status line, so this footer is the screen's working evidence then. At 30
-# columns and fewer the footer is cut before the hint and only the title
-# speaks for the turn. Same priority and dialog exclusions as
-# `live_status_spinner`.
+# status line, so this footer is the screen's working evidence then. Same
+# priority and dialog exclusions as `live_status_spinner`.
 [[rules]]
 id = "live_turn_footer"
 state = "working"
@@ -170,7 +155,6 @@ regex = [
 id = "live_prompt_box"
 state = "idle"
 priority = 950
-below_authority = true
 region = "prompt_box_body"
 line_regex = ['^\s*❯']
 not = { any = [
@@ -180,18 +164,6 @@ not = { any = [
   { contains = ["arrow keys to navigate"] },
   { contains = ["↑/↓ to navigate"] },
 ] }
-
-# A completed turn leaves a status line immediately above the restored prompt
-# box. This precise region confirms idle without scanning transcript history.
-# Claude 2.1.x appends the local clock time the turn ended, e.g.
-# `✻ Brewed for 7s · done 3:34 PM`; its format follows the host locale.
-[[rules]]
-id = "completed_turn_status"
-state = "idle"
-priority = 955
-below_authority = true
-region = "last_non_empty_above_prompt_box"
-line_regex = ['^[·✢✳✶✻✽*] \S.* for [0-9]+(?:\.[0-9]+)?s(?: · done [^·]+)?$']
 
 [[rules]]
 id = "bash_permission_prompt"
@@ -250,13 +222,6 @@ any = [
 not = { any = [
   { regex = ['(?m)^\s*❯\s*$'] },
 ] }
-
-[[rules]]
-id = "osc_title_idle"
-state = "idle"
-priority = 250
-region = "osc_title"
-regex = ['^\x{2733} ']
 
 [[rules]]
 id = "osc_progress_idle"

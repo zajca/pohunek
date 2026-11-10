@@ -2280,6 +2280,37 @@ async fn a_probe_the_agent_fails_or_cannot_run_loses_the_recovery_resume_would_r
     }
 }
 
+/// A stopped Claude session whose installed `claude` is below the package's
+/// floor cannot resume, so the upgrade names the lost recovery and the way out.
+#[tokio::test]
+async fn a_claude_below_the_package_floor_loses_the_recovery_resume_would_refuse() {
+    let host = Host::serving().await;
+    let old = host.agent_path().join("claude-2-1-300");
+    fs::write(
+        &old,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '2.1.300 (Claude Code)'; exit 0; fi\nexit 1\n",
+    )
+    .expect("write the old agent");
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o700)).expect("make it executable");
+    let mut line = built_in_session_line("claude");
+    let [_, (_, Some(binding))] = built_in_pins("claude") else {
+        panic!("the built-in pin is declared");
+    };
+    pin_recovery(&mut line, binding);
+    line["recovery"]["program"] = json!(old.to_string_lossy());
+    host.write_store(&[line]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+
+    let report = host.report();
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::WouldLoseRecovery, CODE_AGENT_RUNTIME_UNSUPPORTED),
+        "{:?}",
+        report.sessions
+    );
+}
+
 #[test]
 fn a_release_plan_over_a_store_the_daemon_refuses_is_a_plan_refusal() {
     let host = Host::new();
@@ -3765,7 +3796,7 @@ async fn a_stop_intent_record_is_repaired_before_its_merge() {
 #[tokio::test]
 async fn the_preflight_repair_resolves_against_the_planned_profile_text() {
     let damaged = DamagedHost::new().await;
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "1.5.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0.1");
     damaged
         .catalog
         .write_release_archives(&damaged.release, 2, &[("claude", &bytes, &digest)]);

@@ -75,6 +75,11 @@ const TEST_ROWS: u16 = 24;
 const APP: &str = "fake";
 /// The reply the worker writes for an answered probe, as hex.
 const REPLY_HEX: &str = "1b5d373530313b3f1b5c";
+/// Byte length of the reply.
+const REPLY_BYTES: usize = 10;
+/// Interval of the process scan that recognises a program started below a
+/// shell.
+const PROCWATCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// Bound of a wait that must be satisfied by the stand-in agent.
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 
@@ -165,7 +170,8 @@ done
 }
 
 /// The shipped Claude manifest with its `[program_status]` table replaced by one
-/// that sets `answer_probe` as the scenario needs.
+/// that sets `answer_probe` and the given `authority_from`; without one the
+/// manifest has no gate and its `below_authority` rules are dropped.
 fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String {
     let mut in_table = false;
     let shipped =
@@ -196,9 +202,106 @@ fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String
     format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n{gate}")
 }
 
+/// Writes the override manifest, the stand-in agent and its profiles below
+/// `env` and returns the scratch directory the agent reports into.
+fn prepare_agents(env: &TestEnv, answer_probe: bool, authority_from: Option<&str>) -> PathBuf {
+    let scratch = env.cwd().join("scratch");
+    std::fs::create_dir(&scratch).expect("create the scratch directory");
+    let agents = env.root().join("agents");
+    std::fs::create_dir_all(agents.join("manifests")).expect("create the agents directory");
+    std::fs::write(
+        agents.join("manifests/fake.toml"),
+        opted_in_manifest(answer_probe, authority_from),
+    )
+    .expect("write the override manifest");
+    let program = env.root().join("fake-agent");
+    std::fs::write(&program, agent_script()).expect("write the stand-in agent");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in agent executable");
+    for (name, mode, source) in [
+        ("fake-reply-stdin", "reply", "stdin"),
+        ("fake-reply-fifo", "reply", "fifo"),
+        ("fake-silent", "silent", "stdin"),
+        ("fake-recording", "recording", "stdin"),
+        ("fake-screen", "screen", "fifo"),
+    ] {
+        std::fs::write(
+            agents.join(format!("{name}.toml")),
+            format!(
+                "base = \"claude\"\n{}program = \"{}\"\nargs = [\"{mode}\", \"{}\", \"{source}\"]\nmanifest = \"fake\"\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
+                official_runtimes::profile_pin("claude"),
+                program.display(),
+                scratch.display()
+            ),
+        )
+        .expect("write the profile");
+    }
+    let fifo = scratch.join("cmd");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo")
+            .success(),
+        "create the command FIFO"
+    );
+    scratch
+}
+
+/// A production registry over `env`. Its workers belong to `launcher`; a
+/// `store_path` makes the sessions survive a registry that is built again over
+/// the same environment, which finds the official packages the first one
+/// installed (`install` is false for it).
+async fn registry_over(
+    env: &TestEnv,
+    shell_command: ShellCommand,
+    store_path: Option<PathBuf>,
+    launcher: Arc<SubprocessWorkerLauncher>,
+    install: bool,
+) -> SessionRegistry {
+    let catalog = official_runtimes::OfficialCatalog::new();
+    let worker_environment = SubprocessWorkerEnvironment {
+        runtime_home: env.runtime_dir().to_path_buf(),
+        state_home: env.state_home().to_path_buf(),
+        data_home: env.data_home().to_path_buf(),
+        config_home: env.config_home().to_path_buf(),
+        cache_home: env.cache_home().to_path_buf(),
+        home: env.home().to_path_buf(),
+        daemon_socket: env.root().join("daemon.sock"),
+    };
+    let mut config = catalog.configure(
+        SessionRegistryConfig {
+            shell_command,
+            procwatch_poll: PROCWATCH_POLL,
+            agents_dir: Some(env.root().join("agents")),
+            host_state_dir: Some(env.root().join("host-state")),
+            store_path,
+            ..SessionRegistryConfig::default()
+        },
+        env.state_home().join("pohunek/plugins"),
+    );
+    config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
+    config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
+    config.supervision = Some(
+        worker_environment
+            .supervision(worker_binary())
+            .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
+    );
+    let registry = SessionRegistry::new_production_with_inspector(
+        config,
+        launcher,
+        Arc::new(HostInspector::new()),
+    )
+    .expect("the production registry opens the plugin root");
+    if install {
+        catalog.install(&registry, env.root()).await;
+    }
+    registry
+}
+
 /// One worker-backed registry with the stand-in agent installed as a profile.
 struct Fixture {
-    env: TestEnv,
+    env: Arc<TestEnv>,
     registry: SessionRegistry,
     scratch: PathBuf,
 }
@@ -210,83 +313,32 @@ impl Fixture {
 
     /// A fixture whose manifest declares `authority_from`.
     async fn gated(answer_probe: bool, authority_from: Option<&str>) -> Self {
-        let env = TestEnv::new().expect("create the test environment");
-        let scratch = env.cwd().join("scratch");
-        std::fs::create_dir(&scratch).expect("create the scratch directory");
-        let agents = env.root().join("agents");
-        std::fs::create_dir_all(agents.join("manifests")).expect("create the agents directory");
-        std::fs::write(
-            agents.join("manifests/fake.toml"),
-            opted_in_manifest(answer_probe, authority_from),
-        )
-        .expect("write the override manifest");
-        let program = env.root().join("fake-agent");
-        std::fs::write(&program, agent_script()).expect("write the stand-in agent");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stand-in agent executable");
-        for (name, mode, source) in [
-            ("fake-reply-stdin", "reply", "stdin"),
-            ("fake-reply-fifo", "reply", "fifo"),
-            ("fake-silent", "silent", "stdin"),
-            ("fake-recording", "recording", "stdin"),
-            ("fake-screen", "screen", "fifo"),
-        ] {
-            std::fs::write(
-                agents.join(format!("{name}.toml")),
-                format!(
-                    "base = \"claude\"\n{}program = \"{}\"\nargs = [\"{mode}\", \"{}\", \"{source}\"]\nmanifest = \"fake\"\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
-                    official_runtimes::profile_pin("claude"),
-                    program.display(),
-                    scratch.display()
-                ),
-            )
-            .expect("write the profile");
-        }
-        let fifo = scratch.join("cmd");
-        assert!(
-            std::process::Command::new("mkfifo")
-                .arg(&fifo)
-                .status()
-                .expect("run mkfifo")
-                .success(),
-            "create the command FIFO"
-        );
+        Self::hosting(answer_probe, authority_from, |_env, _scratch| {
+            ShellCommand::new("/bin/sh", ["-c", "sleep 600"])
+        })
+        .await
+    }
 
-        let catalog = official_runtimes::OfficialCatalog::new();
-        let worker_environment = SubprocessWorkerEnvironment {
-            runtime_home: env.runtime_dir().to_path_buf(),
-            state_home: env.state_home().to_path_buf(),
-            data_home: env.data_home().to_path_buf(),
-            config_home: env.config_home().to_path_buf(),
-            cache_home: env.cache_home().to_path_buf(),
-            home: env.home().to_path_buf(),
-            daemon_socket: env.root().join("daemon.sock"),
-        };
-        let mut config = catalog.configure(
-            SessionRegistryConfig {
-                shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 600"]),
-                agents_dir: Some(agents),
-                host_state_dir: Some(env.root().join("host-state")),
-                ..SessionRegistryConfig::default()
-            },
-            env.state_home().join("pohunek/plugins"),
-        );
-        config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
-        config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-        config.supervision = Some(
-            worker_environment
-                .supervision(worker_binary())
-                .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
-        );
-        let registry = SessionRegistry::new_production_with_inspector(
-            config,
+    /// A fixture whose `shell` sessions run the command `shell` builds from the
+    /// test environment and the scratch directory.
+    async fn hosting(
+        answer_probe: bool,
+        authority_from: Option<&str>,
+        shell: impl FnOnce(&TestEnv, &Path) -> ShellCommand,
+    ) -> Self {
+        let env = TestEnv::new().expect("create the test environment");
+        let scratch = prepare_agents(&env, answer_probe, authority_from);
+        let shell_command = shell(&env, &scratch);
+        let registry = registry_over(
+            &env,
+            shell_command,
+            None,
             Arc::new(SubprocessWorkerLauncher::new()),
-            Arc::new(HostInspector::new()),
+            true,
         )
-        .expect("the production registry opens the plugin root");
-        catalog.install(&registry, env.root()).await;
+        .await;
         Self {
-            env,
+            env: Arc::new(env),
             registry,
             scratch,
         }
@@ -722,39 +774,6 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
         .expect("stop the session");
 }
 
-/// A status line whose timer the terminal width cut reads working from the
-/// screen alone; a transcript bullet that only looks like one reads idle.
-#[tokio::test]
-async fn a_width_cut_status_line_reads_working_and_a_lookalike_bullet_reads_idle() {
-    if !pohunek_test_support::process_env::in_own_process() {
-        return;
-    }
-    let fixture = Fixture::new(false).await;
-    let created = fixture.start("fake-screen").await;
-    fixture
-        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
-        .await;
-
-    for (shown, reads) in [
-        (b's', AgentActivity::Working),
-        (b'b', AgentActivity::Idle),
-        (b'w', AgentActivity::Working),
-        (b'n', AgentActivity::Idle),
-        (b's', AgentActivity::Working),
-        (b'k', AgentActivity::Idle),
-    ] {
-        command(&fixture, shown);
-        fixture
-            .wait_activity(&created.id, (reads, StateSource::Screen))
-            .await;
-    }
-    fixture
-        .registry
-        .stop(&created.id)
-        .await
-        .expect("stop the session");
-}
-
 /// The `agent.state` events received so far.
 fn agent_states(
     events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
@@ -862,6 +881,333 @@ async fn a_release_at_or_above_authority_from_answers_the_probe_and_reads_record
     assert_eq!(status.gate.authority_from.as_deref(), Some("0.0.1"));
     assert!(status.gate.runtime_version.is_some());
     assert!(status.last_evidence_age_ms.is_some());
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// Name of the stand-in the nested scenarios run: a copy of the shell whose
+/// kernel task name is the official Claude package's.
+const NESTED_CLAUDE: &str = "claude";
+/// Name of a stand-in no installed runtime recognises.
+const NESTED_UNLISTED: &str = "unlisted-agent";
+
+/// The probing program of the nested scenarios: it prints the probe, records
+/// the first bytes that reach it, and then reports the record the byte `g`,
+/// `b` or `d` asks for.
+const NESTED_PROBER: &str = r#"
+stty raw -echo
+printf '\033]7501;?\033\\'
+: > "$2/probed"
+head -c "$1" | od -An -v -tx1 | tr -d ' \n' > "$2/first.hex"
+emit() { printf '\033]7501;state=%s:app=claude-code\033\\' "$1"; }
+emit idle
+while :; do
+  c=$(head -c 1)
+  case "$c" in
+    g) emit working ;;
+    b) emit 'blocked:kind=permission' ;;
+    d) emit done ;;
+  esac
+done
+"#;
+
+/// A shell session that starts `program` below its root process.
+async fn nested_fixture(program: &'static str, first_bytes: usize) -> Fixture {
+    Fixture::hosting(true, None, move |env, scratch| {
+        let bin = env.root().join("nested-bin");
+        std::fs::create_dir_all(&bin).expect("create the stand-in directory");
+        let stand_in = bin.join(program);
+        std::fs::copy("/bin/sh", &stand_in).expect("copy the shell as the stand-in");
+        let script = bin.join("prober.sh");
+        std::fs::write(&script, NESTED_PROBER).expect("write the probing program");
+        let command = format!(
+            "{} {} {first_bytes} {}; sleep 600",
+            stand_in.display(),
+            script.display(),
+            scratch.display()
+        );
+        ShellCommand::new("/bin/sh", ["-c", command.as_str()])
+    })
+    .await
+}
+
+/// The kernel name of the stand-in Claude whose profile does not opt in.
+const OPTED_OUT_CLAUDE: &str = "claude";
+
+/// A Claude session whose own manifest does not opt in gets no reply to its
+/// probe, although its process matches the `[process]` matchers the worker
+/// lists for a shell session: the session's own runtime is left out of the list.
+#[tokio::test]
+async fn a_claude_session_whose_manifest_does_not_opt_in_is_never_answered() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let env = TestEnv::new().expect("create the test environment");
+    let scratch = prepare_agents(&env, false, None);
+    let program = env.root().join(OPTED_OUT_CLAUDE);
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n{}stty raw -echo\nprintf '\\033]7501;?\\033\\\\'\n: > \"$1/probed\"\n\
+             head -c 1 | od -An -v -tx1 | tr -d ' \\n' > \"$1/first.hex\"\nsleep 600\n",
+            official_runtimes::sh_version_answer("claude")
+        ),
+    )
+    .expect("write the stand-in Claude");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the stand-in executable");
+    std::fs::write(
+        env.root().join("agents/fake-opted-out.toml"),
+        format!(
+            "base = \"claude\"\n{}program = \"{}\"\nargs = [\"{}\"]\nmanifest = \"fake\"\n\n[env]\nPATH = \"/usr/bin:/bin\"\n",
+            official_runtimes::profile_pin("claude"),
+            program.display(),
+            scratch.display()
+        ),
+    )
+    .expect("write the profile");
+    let registry = registry_over(
+        &env,
+        ShellCommand::new("/bin/sh", ["-c", "sleep 600"]),
+        None,
+        Arc::new(SubprocessWorkerLauncher::new()),
+        true,
+    )
+    .await;
+    let fixture = Fixture {
+        env: Arc::new(env),
+        registry,
+        scratch,
+    };
+    let created = fixture.start("fake-opted-out").await;
+
+    wait_until("the program to print its probe", || async {
+        fixture.scratch_file("probed").exists().then_some(())
+    })
+    .await;
+    fixture
+        .registry
+        .input(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "x".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("type a byte");
+    let first = wait_until("the program to record its first byte", || async {
+        read_trimmed(&fixture.scratch_file("first.hex"))
+    })
+    .await;
+    assert_eq!(first, "78", "the first byte is the typed `x`, not a reply");
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// The Claude floor, which the stand-in agent's manifest names as its
+/// `authority_from`.
+const CLAUDE_FLOOR: &str = "2.1.309";
+
+/// A session re-attached by a restarted daemon has no stored release, yet its
+/// records stay authoritative: the held `working` record is restored from the
+/// retained output and the next record moves the activity.
+#[tokio::test]
+async fn a_session_reattached_after_a_daemon_restart_keeps_reading_its_records() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let env = Arc::new(TestEnv::new().expect("create the test environment"));
+    let scratch = prepare_agents(&env, true, Some(CLAUDE_FLOOR));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new());
+    let store = Some(env.state_home().join("metadata.jsonl"));
+    let hosted = |registry| Fixture {
+        env: Arc::clone(&env),
+        registry,
+        scratch: scratch.clone(),
+    };
+    let shell = || ShellCommand::new("/bin/sh", ["-c", "sleep 600"]);
+
+    // The first daemon runs on a runtime of its own that ends with it, which
+    // releases the worker lease as a daemon process exit does.
+    let id = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("first daemon runtime");
+                runtime.block_on(async {
+                    let registry =
+                        registry_over(&env, shell(), store.clone(), Arc::clone(&launcher), true)
+                            .await;
+                    let first = hosted(registry);
+                    let created = first.start("fake-reply-fifo").await;
+                    first
+                        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+                        .await;
+                    command(&first, b'g');
+                    first
+                        .wait_activity(
+                            &created.id,
+                            (AgentActivity::Working, StateSource::OscProgress),
+                        )
+                        .await;
+                    first.registry.begin_daemon_shutdown();
+                    created.id
+                })
+            })
+            .join()
+            .expect("first daemon thread")
+    });
+
+    let restarted = hosted(registry_over(&env, shell(), store, launcher, false).await);
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("the restarted daemon adopts the worker");
+    restarted
+        .wait_activity(&id, (AgentActivity::Working, StateSource::OscProgress))
+        .await;
+    let status = restarted
+        .registry
+        .detection(&id)
+        .await
+        .expect("session.detection")
+        .status
+        .expect("the daemon reports the detection status");
+    assert!(status.gate.declared && status.gate.open, "{status:?}");
+
+    command(&restarted, b'd');
+    restarted
+        .wait_activity(&id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    restarted
+        .registry
+        .stop(&id)
+        .await
+        .expect("stop the session");
+}
+
+/// A status line whose timer the terminal width cut reads working from the
+/// screen alone; a transcript bullet that only looks like one reads idle.
+#[tokio::test]
+async fn a_width_cut_status_line_reads_working_and_a_lookalike_bullet_reads_idle() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(false).await;
+    let created = fixture.start("fake-screen").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+
+    for (shown, reads) in [
+        (b's', AgentActivity::Working),
+        (b'b', AgentActivity::Idle),
+        (b'w', AgentActivity::Working),
+        (b'n', AgentActivity::Idle),
+        (b's', AgentActivity::Working),
+        (b'k', AgentActivity::Idle),
+    ] {
+        command(&fixture, shown);
+        fixture
+            .wait_activity(&created.id, (reads, StateSource::Screen))
+            .await;
+    }
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A Claude started below a shell session gets the worker's reply to its probe
+/// and its records drive the session's activity, though the shell session's own
+/// runtime answers no probe.
+#[tokio::test]
+async fn a_claude_started_below_a_shell_is_answered_and_its_records_drive_the_activity() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = nested_fixture(NESTED_CLAUDE, REPLY_BYTES).await;
+    let created = fixture.start("shell").await;
+
+    let reply = wait_until("the nested Claude to record the worker's reply", || async {
+        read_trimmed(&fixture.scratch_file("first.hex"))
+    })
+    .await;
+    assert_eq!(reply, REPLY_HEX);
+    // The records the program sent before the process scan recognised it were
+    // dropped with the shell's detector; the ones after the swap are held.
+    wait_until(
+        "the process scan to recognise the nested Claude",
+        || async {
+            let info = fixture.registry.inspect(&created.id).await.ok()?;
+            (info.active_agent.as_deref() == Some("claude")).then_some(())
+        },
+    )
+    .await;
+    for (byte, expected) in [
+        (b'g', AgentActivity::Working),
+        (b'b', AgentActivity::Blocked),
+        (b'd', AgentActivity::Idle),
+    ] {
+        fixture
+            .registry
+            .input(SessionInputParams {
+                session_id: created.id.clone(),
+                text: String::from(char::from(byte)),
+                wait: None,
+            })
+            .await
+            .expect("type a command byte");
+        fixture
+            .wait_activity(&created.id, (expected, StateSource::OscProgress))
+            .await;
+    }
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A program no installed runtime recognises gets no reply to its probe, so
+/// the first bytes it reads are the ones typed at it.
+#[tokio::test]
+async fn an_unlisted_program_started_below_a_shell_gets_no_probe_reply() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = nested_fixture(NESTED_UNLISTED, 1).await;
+    let created = fixture.start("shell").await;
+
+    // Type only once the program has printed its probe in raw mode, so a reply
+    // would be the first byte it reads.
+    wait_until("the program to print its probe", || async {
+        fixture.scratch_file("probed").exists().then_some(())
+    })
+    .await;
+    fixture
+        .registry
+        .input(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "x".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("type a byte");
+    let first = wait_until("the program to record its first byte", || async {
+        read_trimmed(&fixture.scratch_file("first.hex"))
+    })
+    .await;
+    assert_eq!(first, "78", "the first byte is the typed `x`, not a reply");
     fixture
         .registry
         .stop(&created.id)

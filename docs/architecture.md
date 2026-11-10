@@ -566,9 +566,19 @@ daemon sets `answers_program_status_probe` in `Initialize` (an additive field: a
 worker that predates it ignores it and never answers). The daemon derives the
 flag from the manifest of the resolved launch, the profile's override manifest
 when there is one: it is true only when that manifest declares
-`[program_status]` with `answer_probe = true`. A shell session, Hermes, Codex
-(which never queries) and every manifest without the key behave exactly as
-before, and `cat` of a file that holds a probe types nothing into a shell. The
+`[program_status]` with `answer_probe = true`. A session whose own manifest
+does not answer (a shell) answers the probe only for a program that runs in the
+PTY foreground: the daemon lists in the additive `Initialize` field
+`probe_foreground_programs` the `[process]` matchers of every installed runtime
+that sets `answer_probe`, and when a probe is about to be answered the worker
+matches the members of the terminal's foreground process group against them
+with the same `ProcessMatchers` the daemon's process scan uses. A failed lookup
+or no match answers nothing; a worker that predates the field answers nothing
+below a shell. Hermes, Codex (which never queries) and every manifest without
+the key behave exactly as before; a session whose own runtime is listed never
+uses the foreground list, so a manifest override without the key stays silent.
+Where the shell has no job control the background and foreground programs share
+one process group, and a probe printed by any of them is answered. The
 reply is the fixed `ESC ] 7501 ; ? ESC \`, which carries no CR or LF. The reader
 thread never writes: the output hub queues one coalescing reply token before it
 fans a chunk out, and a dedicated task writes the reply through the write
@@ -1017,14 +1027,17 @@ onto both the Unix socket and the overlay TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
 
-While a worker answers the 7501 probe, it is the only responder for its PTY: it
-drops every complete `ESC ] 7501 ; ? ... (BEL | ESC \)` reply found inside one
+While a worker answers every 7501 probe of its session's own runtime, it is the
+only responder for its PTY: it drops every complete `ESC ] 7501 ; ? ... (BEL | ESC \)` reply found inside one
 attach input frame, keeping the rest of the frame in order. A reply split across
 frames passes through, which is harmless to the probing programs (they swallow
 an unexpected reply). The client's DA1 and every other reply are forwarded
 unchanged, and the control-plane `session.input` is not filtered. When a held
 paced input plan delays the worker's reply past the client's DA1, the program
-reads "no 7501" for that process and falls back to its screen output.
+reads "no 7501" for that process and falls back to its screen output. A shell
+session's worker answers only a probe of a listed foreground program and does
+not drop the attached terminal's reply, so a program started below a shell can
+read two replies, which it swallows.
 
 If the private worker stream reports a typed failure, the daemon closes the raw
 pipe and retains that sanitized failure in a short-lived bounded result mailbox.
@@ -1199,9 +1212,11 @@ the screen rules stay the fallback.
   or with the release unknown, a record that arrives anyway is ignored and the
   title and screen rules decide. A launch below or with an unknown release gets
   no probe answer from the worker. A session re-attached after a daemon restart
-  has an unknown release; its worker keeps the probe flag it was spawned with,
-  so it may still answer the probe while its records are ignored; no evidence leaves the
-  activity unset, never idle. A manifest without `authority_from` is
+  has no stored release: the daemon takes the minimum of the runtime's version
+  range as its lower bound, which opens a gate whose `authority_from` is at or
+  below it, and its worker keeps the probe flag it was spawned with. With the
+  release unknown and no lower bound, no evidence leaves the activity unset,
+  never idle. A manifest without `authority_from` is
   authoritative for every release, and an agent of another runtime than the
   session's own (a Codex started below a shell) is not gated. Each gate
   evaluation is logged as `session.program_status.gate`.
@@ -1236,7 +1251,13 @@ the screen rules stay the fallback.
   detector reconfigure (an agent switch, a nested agent's exit, a report, a
   package refresh), with a lag resync, and with the runtime generation (a new
   detector holds none). It is not persisted and not in `SessionInfo`. After an
-  adoption it is restored only when the retained output still covers it.
+  adoption it is restored only when the retained output still covers it. Until
+  the next record the manifest's `below_authority` screen rules read the turn
+  (Claude's status line and `esc to interrupt` footer), so a turn running when a
+  lag resync or a reconfigure dropped the record keeps reading working. A session
+  re-attached after a daemon restart keeps the gate open when the runtime's
+  version minimum reaches `authority_from` (Claude, Codex), and the record is
+  restored when the retained output still covers it.
 - **Readiness.** Initial-input readiness and the idle barrier ignore the record:
   they evaluate the screen winner alone, so a record never releases or holds a
   prompt.

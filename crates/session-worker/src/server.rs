@@ -1477,11 +1477,13 @@ async fn initialize_request(
         input_dedup_entries: dedup_entries,
         input_stall: Some(Duration::from_millis(initialize.input_policy.stall_ms())),
         answer_program_status_probe: initialize.answers_program_status_probe,
+        probe_foreground_programs: initialize.probe_foreground_programs.clone(),
         stop_grace,
         kill_reap_deadline,
         terminal_retention: retention,
         ..shared.config.clone()
     };
+    validate_probe_foreground_programs(&initialize.probe_foreground_programs)?;
     effective_config
         .validate()
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
@@ -1594,6 +1596,25 @@ async fn pause_after_starting(shared: &Shared) {
     }
 }
 
+/// Rejects a launch plan whose probe foreground programs exceed the wire
+/// bounds.
+fn validate_probe_foreground_programs(
+    programs: &[pohunek_worker_protocol::ProcessPatterns],
+) -> Result<(), ControlError> {
+    if programs.len() > pohunek_worker_protocol::MAX_PROBE_FOREGROUND_PROGRAMS
+        || !programs
+            .iter()
+            .all(pohunek_worker_protocol::ProcessPatterns::within_bounds)
+    {
+        return Err(control_error(
+            ControlCode::InvalidRequest,
+            "probe foreground programs exceed the protocol bounds",
+            false,
+        ));
+    }
+    Ok(())
+}
+
 fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, PtyError> {
     PtyOwner::spawn(
         command,
@@ -1602,6 +1623,7 @@ fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, PtyErr
         config.input_dedup_entries,
         config.input_stall,
         config.answer_program_status_probe,
+        &config.probe_foreground_programs,
     )
 }
 
@@ -9666,6 +9688,7 @@ mod tests {
             config.input_dedup_entries,
             config.input_stall,
             config.answer_program_status_probe,
+            &config.probe_foreground_programs,
         )
         .expect("spawn PTY");
         let mut subscriber = pty.subscribe_output(Some(0)).expect("subscribe output");
@@ -11597,6 +11620,7 @@ mod tests {
             public_protocol_version: 7,
             hook_schema: None,
             answers_program_status_probe: false,
+            probe_foreground_programs: Vec::new(),
             placement_check_interval_ms: None,
             input_policy: protocol::InputPolicy::new(500).expect("input policy"),
         }

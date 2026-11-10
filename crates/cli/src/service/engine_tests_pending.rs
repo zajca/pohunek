@@ -157,7 +157,7 @@ async fn a_resumed_stale_path_refusal_names_the_rollback_before_refresh_path() {
     std::fs::write(stale.join("claude"), "2.1.288\n").expect("stale claude");
     harness.install(V1).await.expect("install");
     harness.context = discovering(&harness.context, &harness.root, "shell-b", &profile);
-    std::fs::write(profile.join("claude"), "2.1.302\n").expect("profile claude");
+    std::fs::write(profile.join("claude"), "2.1.320\n").expect("profile claude");
     let mut engine = harness.engine();
     engine.interrupt_after = Some(Step::Definition);
     engine

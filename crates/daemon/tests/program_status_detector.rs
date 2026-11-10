@@ -581,22 +581,6 @@ fn titled(title: &str, rows: &[&str]) -> Vec<u8> {
     frame(Some(title), rows)
 }
 
-/// A Claude screen whose only working evidence is a markdown bullet that the
-/// spinner rule reads as a live status line.
-fn claude_stale_spinner() -> Vec<u8> {
-    let rule = "\u{2500}".repeat(40);
-    frame(
-        None,
-        &[
-            "* Waiting\u{2026}",
-            &rule,
-            "\u{276f} ",
-            &rule,
-            "  ? for shortcuts",
-        ],
-    )
-}
-
 #[test]
 fn a_working_record_beats_an_idle_screen_and_a_screen_only_chunk_cannot_undo_it() {
     let mut harness = Harness::claude();
@@ -749,26 +733,6 @@ fn a_notice_before_a_blocked_record_is_held_once_and_the_record_adds_the_blocked
     assert_eq!(harness.activity(), BLOCKED);
     assert_eq!(blocked_changes(&harness), 1);
     assert_eq!(take_notice(&mut harness), (false, true));
-}
-
-#[test]
-fn an_idle_record_beats_a_stale_working_screen_winner() {
-    let mut harness = Harness::claude();
-    harness.feed(&claude_stale_spinner());
-    assert_eq!(
-        harness.activity(),
-        Some((AgentActivity::Working, StateSource::Screen)),
-        "without a record the bullet reads as a live spinner"
-    );
-
-    for state in ["idle", "done", "error"] {
-        let mut harness = Harness::claude();
-        harness.feed(&claude_stale_spinner());
-        harness.feed(&claude_record(state));
-        harness.feed(&claude_stale_spinner());
-
-        assert_eq!(harness.activity(), IDLE, "{state}");
-    }
 }
 
 #[test]
@@ -1226,23 +1190,6 @@ fn a_working_and_a_done_record_in_one_chunk_still_yield_working_evidence() {
         harness.activity(),
         IDLE,
         "the chunk-end record confirms idle"
-    );
-}
-
-#[test]
-fn a_held_idle_record_suppresses_a_stale_spinner_latch() {
-    let mut harness = Harness::claude();
-    harness.feed(&captured("claude", "idle"));
-    harness.feed(&claude_record("idle"));
-
-    let chunk = [claude_stale_spinner(), captured("claude", "idle")].concat();
-    let transitions = harness.feed_raw(&chunk);
-
-    assert!(
-        transitions
-            .iter()
-            .all(|transition| transition.activity != AgentActivity::Working),
-        "no latched working over a held idle record: {transitions:?}"
     );
 }
 

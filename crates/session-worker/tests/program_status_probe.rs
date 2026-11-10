@@ -14,6 +14,7 @@ use pohunek_session_worker::{
     Command, InputFragment, InputPlan, OutputEvent, PtyOwner, WorkerConfig,
 };
 use pohunek_test_support::tempdir;
+use pohunek_worker_protocol::ProcessPatterns;
 
 /// Upper bound for any single wait on child output.
 const OUTPUT_WAIT: Duration = Duration::from_secs(10);
@@ -39,6 +40,17 @@ const WRITE_STARTED_ECHO: usize = 512;
 const PLAN_HOLD: Duration = Duration::from_secs(3600);
 
 fn spawn(script: &str, cwd: &Path, answers_probe: bool) -> PtyOwner {
+    spawn_listing(script, cwd, answers_probe, &[])
+}
+
+/// Spawns `script` in a session that answers a probe only for the programs
+/// `foreground` lists.
+fn spawn_listing(
+    script: &str,
+    cwd: &Path,
+    answers_probe: bool,
+    foreground: &[ProcessPatterns],
+) -> PtyOwner {
     let config = WorkerConfig::new();
     PtyOwner::spawn(
         Command {
@@ -54,6 +66,7 @@ fn spawn(script: &str, cwd: &Path, answers_probe: bool) -> PtyOwner {
         config.input_dedup_entries,
         Some(INPUT_STALL),
         answers_probe,
+        foreground,
     )
     .expect("spawn PTY")
 }
@@ -300,4 +313,89 @@ async fn a_probe_reply_stuck_behind_a_full_pty_never_blocks_output() {
     let output = output_until(&pty, ":END1").await;
 
     assert_eq!(dump(&output, 1), REPLY_HEX);
+}
+
+/// The foreground program of these scenarios is the `/bin/sh -c <script>` root.
+fn listed(cmdline: &str) -> Vec<ProcessPatterns> {
+    vec![ProcessPatterns {
+        comm: Vec::new(),
+        cmdline: vec![cmdline.to_owned()],
+    }]
+}
+
+#[tokio::test]
+async fn a_listed_foreground_program_is_answered_without_the_session_opting_in() {
+    let cwd = tempdir().expect("temp dir");
+    let script = format!(
+        "stty raw -echo; printf '{PROBE_ST}'; {}",
+        read_dump(1, REPLY_BYTES)
+    );
+    let pty = spawn_listing(&script, cwd.path(), false, &listed(r"^/bin/sh -c "));
+
+    let output = output_until(&pty, ":END1").await;
+
+    assert_eq!(dump(&output, 1), REPLY_HEX);
+}
+
+/// Waits until the worker has refused `count` probe replies.
+async fn withheld_until(pty: &PtyOwner, count: u64) {
+    tokio::time::timeout(OUTPUT_WAIT, async {
+        while pty.withheld_probe_replies() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {count} refused replies"));
+}
+
+/// Runs `script` that prints a probe, waits for one typed byte and reports the
+/// first byte it reads. The byte is typed once the worker has refused the
+/// reply, so a reply the worker wrote would be read before it.
+async fn first_byte_after_a_refused_probe(script_head: &str, foreground: &[ProcessPatterns]) {
+    let cwd = tempdir().expect("temp dir");
+    let script = format!(
+        "{script_head}stty -echo raw; printf '{PROBE_ST}'; printf READY; \
+         first=$(head -c 1 | od -An -v -tx1 | tr -d ' \\n'); printf 'FIRST:%s:ENDFIRST' \"$first\""
+    );
+    let pty = spawn_listing(&script, cwd.path(), false, foreground);
+
+    output_until(&pty, "READY").await;
+    withheld_until(&pty, 1).await;
+    write_stream(&pty, b"Z").await;
+    let output = output_until(&pty, ":ENDFIRST").await;
+
+    assert!(
+        output.contains("FIRST:5a:ENDFIRST"),
+        "the first byte the program reads is the typed `Z`, not a reply: {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unlisted_foreground_program_is_never_answered() {
+    first_byte_after_a_refused_probe("", &listed(r"^/usr/bin/listed-only")).await;
+}
+
+/// Without job control a background job shares the foreground group of its
+/// shell, so its listed program is answered.
+#[tokio::test]
+async fn a_listed_job_sharing_the_foreground_group_of_a_shell_without_job_control_is_answered() {
+    let cwd = tempdir().expect("temp dir");
+    let script = format!(
+        "sleep 1234 & stty raw -echo; printf '{PROBE_ST}'; {} kill $! 2>/dev/null",
+        read_dump(1, REPLY_BYTES)
+    );
+    let pty = spawn_listing(&script, cwd.path(), false, &listed(r"^sleep 1234"));
+
+    let output = output_until(&pty, ":END1").await;
+
+    assert_eq!(dump(&output, 1), REPLY_HEX);
+}
+
+#[tokio::test]
+async fn a_listed_job_in_the_background_of_a_job_control_shell_is_not_answered() {
+    first_byte_after_a_refused_probe(
+        "set -m; sleep 1234 & trap 'kill %1' EXIT; ",
+        &listed(r"^sleep 1234"),
+    )
+    .await;
 }

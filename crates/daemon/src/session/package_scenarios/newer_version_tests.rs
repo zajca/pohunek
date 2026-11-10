@@ -60,11 +60,11 @@ struct Kind {
 
 const CLAUDE: Kind = Kind {
     runtime: RuntimeId::CLAUDE,
-    old_version: "1.0.1",
+    old_version: "2.0.1",
     old_below: "2.2.0",
-    new_version: "1.0.2",
+    new_version: "2.0.2",
     new_below: "3.0.0",
-    in_both: "2.1.300",
+    in_both: "2.1.320",
     only_new: "2.2.5",
     version_line: "{version} (Claude Code)",
     home_env: "CLAUDE_CONFIG_DIR",

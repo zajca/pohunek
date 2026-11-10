@@ -1150,7 +1150,8 @@ pub struct AuthorityGate {
     /// Whether the runtime release is known and at or above it.
     pub open: bool,
     pub reason: AuthorityGateReason,
-    /// The release the session's launch probed.
+    /// The release the session's launch probed. A session re-attached after a daemon
+    /// restart carries the lowest release its package accepts, when that opens the gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub runtime_version: Option<String>,

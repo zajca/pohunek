@@ -2,7 +2,7 @@
 type: Guide
 id: guide/claude-package
 title: Claude Code runtime package
-description: The official Claude Code runtime package source (Claude Code 2.x from 2.1.289, verified on 2.1.309), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
+description: The official Claude Code runtime package source (Claude Code 2.x from 2.1.309, verified on 2.1.309), the only source of the claude runtime, what it declares, how its detection differs from the built-in Claude runtime of release 0.34.2, what was verified against a real Claude Code, and the detection limits that remain.
 source_kind: manual
 intents: [setup, update, debug, help]
 ---
@@ -83,18 +83,18 @@ On a host without the package nothing serves `claude`:
 
 ## What the package declares
 
-The package is version `1.5.0`. Every descriptor fact below equals the
+The package is version `2.0.0`. Every descriptor fact below equals the
 built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
 except the version probe, the transcript tree (`[transcripts]`), the input
 readiness (`[input] ready`) and the session name arguments (`[naming]`), which
 that descriptor does not declare. The
 detection manifest is the v0.34.2 built-in one
-plus the rules of #613 ([below](#detection-beyond-the-built-in-manifest)). The
-package tests
+plus the rules of #613 and without the rules that the OSC 7501 records make
+redundant ([below](#detection-beyond-the-built-in-manifest)). The package tests
 compare the package with golden copies of that descriptor and its detection
 manifest in `compat/claude/builtin-v0.34/` (`runtime.toml`, `detect.toml`):
-the manifest may differ only by the enumerated #613 changes, and only the
-enumerated captured frames may read differently.
+the manifest may differ only by the enumerated #613 changes and the enumerated
+dropped rules.
 
 - Launch: `claude` with the first prompt as a trailing positional argument.
   Claude's Ink input takes text without bracketed paste; the submit key is a
@@ -114,14 +114,16 @@ enumerated captured frames may read differently.
   (such as `live_prompt_box`) launches with bracketed-paste readiness instead,
   and `pohunek doctor` warns about it.
 - Version: `version_probe = { parser = "semver-line-v1", args = ["--version"],
-  min = "2.1.289", below = "3.0.0", line = "{version} (Claude Code)" }`.
+  min = "2.1.309", below = "3.0.0", line = "{version} (Claude Code)" }`.
   `claude --version` prints `2.1.309 (Claude Code)` on standard output; any
   other wording, a pre-release or trailing text is unsupported. The lower bound
-  is the previous verified release, whose captures stay in the repository; it
-  launches screen-only because it emits no program-status records. The upper
+  is the first release that reports program-status records: an older Claude is
+  refused at launch and resume with `agent_runtime_unsupported`, and a stopped
+  session whose installed Claude is older is reported `WouldLoseRecovery` by the
+  upgrade preflight. The upper
   bound is the next major release, as for the other packages, because hosts
   update Claude Code independently of pohunek. Claude Code ships patch releases
-  almost daily, so only 2.1.309 and 2.1.289 were exercised; other 2.x releases
+  almost daily, so only 2.1.309 was exercised; other 2.x releases
   are accepted by policy, not verified. Moving `min` is a lock and descriptor change made together after a
   real-Claude run of the new release.
 - Session name: `requires = ["naming-launch-args-v1"]` and `[naming] launch_args
@@ -164,36 +166,31 @@ resume arguments and the prompt; a session without a name passes none.
 They are rendered at each launch and never stored, so a resume carries the name
 the session has now.
 
-Recorded on Claude Code 2.1.289 (the lock minimum) and 2.1.309 (the lock), real
-binaries from the npm packages in throwaway pohunek sessions (hermetic home,
-loopback Messages stub, dummy key; scenario
-`a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork`, screens in
-`compat/claude/screens/named/` and `n-1/named/`):
+Recorded on Claude Code 2.1.309 (the lock), a real binary from the npm package
+in throwaway pohunek sessions (hermetic home, loopback Messages stub, dummy key;
+scenario `a_real_claude_carries_the_pohunek_name_at_launch_and_resume`,
+screens in `compat/claude/screens/named/`):
 
-- Both releases accept the joined form for a plain name and for `--help`: the
-  process runs `--name=alpha` / `--name=--help` and reaches the idle prompt box.
+- Claude accepts the joined form for a plain name and for `--help`: the process
+  runs `--name=alpha` / `--name=--help` and reaches the idle prompt box.
 - Claude shows the name as the label of the rule above the prompt box
-  (`──── alpha ─`) and in the terminal title. 2.1.289 keeps its state glyph in
-  the title (`✳ alpha` idle, `◐ alpha` while a turn runs), so the title rules
-  still read the state. 2.1.309 sets the bare name (`alpha`) as the title, with
-  no glyph, so the title carries no state; the program-status records and the
-  screen carry it, as they do for the plain title `Claude Code`.
+  (`──── alpha ─`) and in the terminal title. It sets the bare name (`alpha`) as
+  the title, with no glyph, so the title carries no state; the program-status
+  records and the screen carry it, as they do for the plain title `Claude Code`.
   `named_screens_are_classified_like_unnamed_ones` pins that a named screen reads
-  exactly as its unnamed counterpart on both releases.
+  as its unnamed counterpart (an idle prompt box, a working stream), whatever its
+  title.
 - Detection: Claude draws the name into the title, the rule label and the
-  collision banner. On 2.1.309 the title is the bare name, so a name that starts
-  with a turn glyph (`◐ deploy`) would match the `◐`/`◑` title rule. The daemon
-  keeps the name its launch gave Claude (`[naming]`) and withholds an OSC title
-  that equals it, or starts with it followed by `-` (Claude's rename of a
-  colliding name, `alpha-iterative-muffin`), from manifest evaluation; the raw title
-  stays in `session.detection` previews. The comparison is against the whole
-  title, so 2.1.289, which puts its own glyph first (`◐ alpha`, `✳ ◐ deploy`),
-  keeps its title rules. A `session rename` does not relaunch Claude, so the
+  collision banner. The manifest has no title rule, so a name that starts with a
+  turn glyph (`◐ deploy`) reads no state. The daemon keeps the name its launch
+  gave Claude (`[naming]`) and withholds an OSC title that equals it, or starts
+  with it followed by `-` (Claude's rename of a colliding name,
+  `alpha-iterative-muffin`), from manifest evaluation for the runtimes whose
+  manifests have title rules; the raw title stays in `session.detection`
+  previews. A `session rename` does not relaunch Claude, so the
   daemon keeps the launch name until the next resume, which launches under the
   current name; a daemon restart takes the session's current name.
-  `a_title_echoing_the_launch_name_reports_no_state` and
-  `a_glyph_led_title_still_reads_working_for_a_named_session` pin both
-  releases, and `a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`
+  `a_session_name_spelling_a_detection_marker_leaves_an_idle_session_idle`
   runs real Claude, also with an initial input.
 - Detection limit: the screen regions are not filtered, because a name equal
   to a real dialog footer would hide the real dialog. A name that holds both
@@ -264,10 +261,8 @@ every test except the first-run capture runs without egress.
 
 ## Verified against a real Claude Code 2.1.309
 
-The locked release is 2.1.309; the screens of the previous verified release,
-2.1.289, stay in `compat/claude/screens/n-1/` and the screen scenarios that read a title or compare goldens run
-over them as well as over the current set. The text below describes the captures of the locked release
-unless it names 2.1.289.
+The locked release is 2.1.309, the oldest supported release; its captures are
+the only screen set in `compat/claude/screens/`.
 
 The screens in `compat/claude/screens/` (named screens at 100 columns, widths 20
 to 200 in `widths/`, each with the OSC title Claude had set in a `.title` file)
@@ -287,12 +282,10 @@ native executable of 2.1.309 from the distribution package, byte-identical
 also ran against the npm install. The darwin-arm64 executable of the same release is pinned by its own SHA-256 and runs in the aarch64-apple-darwin release-evidence row; the screen captures were not repeated on macOS. `crates/cli/tests/claude_package.rs` classifies every
 captured screen through the package manifest.
 
-- The idle, working and blocked states are read from the program-status
-  records and the screen, and without records also from the title. Release
-  2.1.289, which emits no records, keeps its idle title (`✳ Claude Code`) while
-  an approval or question dialog is open, and the screen rules (`blocked`,
-  priority 840 and above) win over it; while a turn runs its title alternates
-  `◐ Claude Code` and `◑ Claude Code` every 960 ms (captured in `n-1/`).
+- The working and idle states are read from the program-status records; the
+  screen adds the dialogs (`blocked`, priority 840 and above), the status line
+  and the turn footer (`working`, only while no record is held) and the prompt
+  box, which reads idle.
 - Claude runs a hook command as `/bin/sh -c <command>`. Where `/bin/sh` is dash
   (Debian, Ubuntu, so the hosted CI runner) the shell stays between Claude and
   the reporter script, so the script's `$PPID` is that shell and the worker
@@ -393,28 +386,33 @@ captured screen through the package manifest.
 
 ## Program status (OSC 7501)
 
-Claude Code 2.1.309 and newer report their root state as OSC 7501 records
-(`ESC ] 7501 ; state=<state>:app=claude-code ST`) once the terminal answers the
-probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in with
-`[program_status] app = "claude-code"`, `answer_probe = true`,
-`authority_from = "2.1.309"`: the session worker answers the probe, and the
-daemon holds the root record, only when the `claude --version` the session's
-launch probed is at or above the gate. Below it (Claude 2.1.289 and older) or
-with the release unknown the worker answers no probe, a record is ignored and
-detection is screen-and-title only.
+Every supported Claude Code (2.1.309 and newer) reports its root state as OSC
+7501 records (`ESC ] 7501 ; state=<state>:app=claude-code ST`) once the terminal
+answers the probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in
+with `[program_status] app = "claude-code"`, `answer_probe = true` and
+`authority_from = "2.1.309"`, the package's floor: the session worker answers
+the probe, and the daemon holds the root record of every supported release.
+A session re-attached after a daemon restart has no stored release; the
+daemon takes the package minimum (2.1.309) as its lower bound, so the gate is
+open and the records stay authoritative
+(`a_session_reattached_after_a_daemon_restart_keeps_reading_its_records`).
 
 - Mapping: `working` reads working, `blocked` (`kind=permission` or
   `question`) reads blocked, `done`, `idle` and `error` read idle. All are
   reported as `state_source = osc_progress`; a visible dialog over a `blocked`
   record is reported as `screen`. Records of background agents carry
   an `id=` and are ignored by the detector.
-- From the gate, the working and idle screen rules (`live_status_spinner`,
-  `live_turn_footer`, `live_prompt_box`, `completed_turn_status`) are marked
-  `below_authority`: from the gate, while a record is held, they do not decide
-  the activity and the record does; with no record held (before the first one,
-  after a clear) they apply as before. The
-  dialog and blocked rules, the title rules and every rule for a release below
-  the gate are unchanged, and the prompt box still decides input readiness.
+- A held record outranks the screen. Two working screen rules, `live_status_spinner`
+  (the status line of a turn) and `live_turn_footer` (`esc to interrupt`), are
+  marked `below_authority` and serve only while no record is held: before the
+  first record and after a lag resync or a detector reconfigure dropped it. They
+  keep a turn that is running at that moment working until the next record
+  arrives (`a_lag_resync_mid_turn_keeps_the_turn_working`,
+  `a_reconfigure_mid_turn_keeps_the_turn_working`). The prompt box rule
+  (`live_prompt_box`) reads idle from the screen, also while a turn runs, because
+  the prompt box stays visible; the working rules outrank it. The
+  `osc_progress_idle` rule keeps reading an idle progress state. The manifest
+  has no title rule.
 - A visible dialog on the screen always wins over a record that is not
   `blocked`: the folder trust, theme, login, API-key and permission dialogs stay
   blocked, whatever a (forged or stale) record says. The API-key dialog is read
@@ -422,13 +420,23 @@ detection is screen-and-title only.
 - A held record ends with a root `state=clear`, with any detector
   reconfiguration (a nested agent exiting, a package refresh) and with the
   runtime. Initial-input readiness ignores the record: the prompt box decides.
-- With the probe answered Claude 2.1.309 sets the plain title `Claude Code` in
+- With the probe answered Claude sets the plain title `Claude Code` in
   every state (the session name when the session is named, see
-  [Session name](#session-name)), so the title rules read nothing from it. Without a record
-  (Claude 2.1.289, which sets the state titles, or a probe that is not
-  answered) detection is screen-only; the 2.1.289 screens in `n-1/` keep the
-  title rules evidenced. A Claude started inside a shell session is
-  screen-only because the shell session's manifest does not answer the probe.
+  [Session name](#session-name)), and the manifest reads no state from a title.
+  Without a record (a probe that is not answered, or a profile that turns the
+  records off) detection is screen-only: dialogs read blocked, the status line
+  and the turn footer read working, and the prompt box reads idle.
+- A Claude a person starts by hand inside a shell session gets the same
+  records: the shell session's worker answers the probe while a process of the
+  PTY foreground group matches this manifest's `[process]` matchers (the
+  daemon passes the matchers of every installed runtime with `answer_probe` in
+  `Initialize.probe_foreground_programs`), and the daemon's process scan swaps
+  the detector to this manifest. The records Claude sends before that scan
+  recognises it are dropped; the next one is held. A worker spawned by a daemon
+  that predates the field answers nothing below a shell, so such a session
+  reads a turn only from its status line and footer until it is relaunched
+  (`a_claude_started_below_a_shell_is_answered_and_its_records_drive_the_activity`,
+  `an_unlisted_program_started_below_a_shell_gets_no_probe_reply`).
 - The captured record sequences are `compat/claude/screens/<state>.program-status`
   (one ordered root record per line), recorded from the real agent by the
   capture scenarios; `the_captured_program_status_sequences_follow_the_claude_turn_lifecycle`
@@ -487,22 +495,20 @@ locked native binary (`claude/versions/<release>` plus a launcher symlink).
 
 ## Detection beyond the built-in manifest
 
-The package manifest adds these rules to the v0.34.2 built-in one (#613). Each is
-backed by screens or process forms captured from 2.1.289 and by a package test
-that fails without the rule.
+The package manifest adds these rules to the v0.34.2 built-in one (#613) and drops
+the title rules and the completed-turn rule, which every supported Claude
+replaces with its records; the status line and the turn footer stay as the
+working rules for a session with no held record. Each addition is backed by
+screens or process forms captured from a real Claude and by a package test that
+fails without the rule.
 
-- **Running-turn title.** `osc_title_working` also takes `◐` and `◑`, the
-  glyphs 2.1.289 alternates before its title while a turn runs
-  (`the_title_reads_idle_for_the_asterisk_and_working_for_the_turn_glyphs`).
-  The title outranks the screen whenever it changes.
-- **Running-turn footer.** A streaming reply hides the status line, and the
-  daemon evaluates the title only when it changes, so a reply re-rendered
-  between two title changes would read idle through the visible prompt box.
-  The footer below the prompt box reads `esc to interrupt` while a turn runs
-  (`? for shortcuts` while Claude waits); `live_turn_footer` reads it as
-  `working` at the priority and with the dialog exclusions of the status-line
-  rule (`a_streaming_reply_reads_working_from_its_title_and_turn_footer`,
-  `a_real_claude_reply_held_mid_stream_reads_working`).
+- **Dropped rules.** `osc_title_working`, `osc_title_idle` and
+  `completed_turn_status` are absent
+  (`the_package_manifest_file_is_the_golden_manifest_with_the_613_rules`).
+- **Turn footer.** `live_turn_footer` (`esc to interrupt`, below the prompt
+  box) reads a streaming reply working, where Claude has removed the status
+  line, while no record is held; a held record outranks it
+  (`a_real_claude_reply_held_mid_stream_reads_working`).
 - **Wrapped selection forms.** `live_blocked_form` separates the words of its
   hints by any whitespace, so the question form reads `blocked` at 30 and 40
   columns, where its footer wraps (`Enter to select · ↑/↓ to` /
@@ -517,9 +523,6 @@ that fails without the rule.
   Claude draws these dialogs; a transcript that quotes them sits above the
   prompt box's rules, so the screen keeps reading idle or working
   (`quoted_dialog_text_in_the_transcript_is_not_a_dialog`).
-- **Completed-turn line.** `completed_turn_status` takes the ` · done <time>`
-  2.1.289 appends (`✻ Brewed for 7s · done 3:34 PM`; the clock follows the host
-  locale).
 - **Process forms.** The npm package's executable `bin/claude.exe` runs as kernel
   name `claude.exe` with a command line ending in `claude.exe`; both matchers
   accept it, and the real launch test requires the launched process to match
@@ -534,22 +537,19 @@ that fails without the rule.
 
 Limits that remain:
 
-- At 30 columns and fewer the footer is cut before `esc to interrupt` (`⏸ manual
-  mode on · esc to…`), so a streaming reply re-rendered there reads idle on the
-  screen alone; the held `working` record keeps the session working.
-- Under a terminal multiplexer (`TMUX`, `STY` or `ZELLIJ` in Claude's
-  environment) 2.1.289 keeps the static `✳` title during a turn (its
-  `tengu_static_title_under_mux` switch, on by default); the screen rules are
-  then the only working evidence. Not exercised in a real run.
-- At 20 and 30 columns the completed-turn line wraps before ` · done`, so the
-  prompt box alone reads idle there.
+- Without a held record a turn is read from the status line or the footer only.
+  With the records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), and below a
+  shell whose worker predates the probe foreground list, that is the whole
+  detection. At 30 columns and fewer the footer is cut before its hint and a
+  turn without a record reads idle; between a lag resync or a reconfigure and
+  the next record a narrow terminal can read idle in the same way.
 - The theme picker and the login method list were captured at 100 columns
   only; the rules separate their words by any whitespace for narrower
   terminals, which no capture confirms.
 
 ## Not verified
 
-Releases other than 2.1.309 and 2.1.289 (the range above the lock is a policy, not a
+Releases other than 2.1.309 (the range above the lock is a policy, not a
 verification), the Homebrew and apt installs (the npm install and the distribution package ship the
 same binary), macOS and Windows, a real login or a real model, plan mode,
 compaction, MCP and other dialogs, the `PermissionRequest` hook, terminals
@@ -664,6 +664,7 @@ established by the network namespace, not by Claude's own switches.
 Update procedure for a new Claude Code release: install it, rerun the
 real-Claude tests (the SessionStart, resume and UserPromptSubmit scenarios
 on both the npm and the native layout first), recapture the screens and the
-`.program-status` sequences, move the previous captures to `screens/n-1/`
-(deleting the older set), move the lock (release, SHA-256), raise the
-descriptor's `min` to the previous release and bump the package `version`.
+`.program-status` sequences, replace the captures in `screens/`,
+move the lock (release, SHA-256), raise the descriptor's `min` only when the
+older release lost a fact the package relies on, and bump the package
+`version` (a major bump when `min` rises).
