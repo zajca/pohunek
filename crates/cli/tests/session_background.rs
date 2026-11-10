@@ -290,6 +290,10 @@ fn trace_files_under(dir: &Path, found: &mut Vec<PathBuf>) {
 /// trace line that caused it. Without such a line the wait runs into the hang
 /// guard, so a snapshot that is lost for any other reason still fails the test.
 ///
+/// Only waits that tolerate a snapshot applied twice use it: the hook may have
+/// been applied before its exchange timed out, and the repeat then advances
+/// the revision and emits one more `background_state`.
+///
 /// A resent Stop carries the same task list: the items stay the same, the
 /// snapshot's revision and observed time advance, and the daemon applies it
 /// again.
@@ -304,8 +308,8 @@ where
     Fut: std::future::Future<Output = Option<T>>,
 {
     let action = hook.split(':').next().expect("a hook names its action");
+    let answered = std::cell::Cell::new(dropped_worker_reports(harness, id, action).len());
     send_hook(harness, id, hook).await;
-    let answered = std::cell::Cell::new(0_usize);
     let answered = &answered;
     wait_until(what, || {
         let next = poll();
@@ -486,17 +490,14 @@ async fn a_turn_end_snapshot_is_listed_and_streamed_for_the_live_runtime() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    let info = send_hook_until_inspected(
-        &harness,
-        &id,
-        "stop:stop-one",
-        "the first background snapshot",
-        |info| {
-            info["background"]["items"]
-                .as_array()
-                .is_some_and(|items| items.len() == 3)
-        },
-    )
+    send_hook(&harness, &id, "stop:stop-one").await;
+    let info = wait_until("the first background snapshot", || async {
+        let info = inspect(&harness, &id).await;
+        info["background"]["items"]
+            .as_array()
+            .is_some_and(|items| items.len() == 3)
+            .then_some(info)
+    })
     .await;
     let background = &info["background"];
     assert_eq!(item(background, "agent-1")["kind"], "subagent");
@@ -589,29 +590,22 @@ async fn a_changed_task_set_gives_a_new_revision_and_keeps_first_seen() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    let first = send_hook_until_inspected(
-        &harness,
-        &id,
-        "stop:stop-one",
-        "the first snapshot",
-        |info| {
-            info["background"]["items"]
-                .as_array()
-                .is_some_and(|items| items.len() == 3)
-        },
-    )
-    .await["background"]
-        .clone();
+    send_hook(&harness, &id, "stop:stop-one").await;
+    let first = wait_until("the first snapshot", || async {
+        let background = inspect(&harness, &id).await["background"].clone();
+        background["items"]
+            .as_array()
+            .is_some_and(|items| items.len() == 3)
+            .then_some(background)
+    })
+    .await;
 
-    let second = send_hook_until_inspected(
-        &harness,
-        &id,
-        "stop:stop-two",
-        "the second snapshot",
-        |info| revision(&info["background"]) > revision(&first),
-    )
-    .await["background"]
-        .clone();
+    send_hook(&harness, &id, "stop:stop-two").await;
+    let second = wait_until("the second snapshot", || async {
+        let background = inspect(&harness, &id).await["background"].clone();
+        (revision(&background) > revision(&first)).then_some(background)
+    })
+    .await;
     assert!(revision(&second) > revision(&first), "{second}");
     let ids: Vec<&str> = second["items"]
         .as_array()

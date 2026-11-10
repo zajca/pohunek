@@ -1013,7 +1013,7 @@ fn attach_input_frame(attach: &DataStream, sequence: u32, text: &str) -> DataFra
 const RESYNC_TRACE_FRAMES: usize = 12;
 
 /// What the client that resumed reading has seen of the gap, the repaint and
-/// the live output, reported when the wait for the echo times out.
+/// the live output, reported when the wait for the reply times out.
 #[derive(Default)]
 struct ResyncProgress {
     frames: u64,
@@ -1106,7 +1106,7 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
 
     // Reading resumes: the lost output is reported as a gap that a repaint
     // follows, and live output continues after it. The repaint is over once a
-    // live `Output` frame carrying the echo of a fresh keystroke arrives.
+    // live `Output` frame carrying the reply to a fresh keystroke arrives.
     let mut progress = ResyncProgress::default();
     let resynced = tokio::time::timeout(DEADLINE, async {
         loop {
