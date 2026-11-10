@@ -575,8 +575,10 @@ matches the members of the terminal's foreground process group against them
 with the same `ProcessMatchers` the daemon's process scan uses. A failed lookup
 or no match answers nothing; a worker that predates the field answers nothing
 below a shell. Hermes, Codex (which never queries) and every manifest without
-the key behave exactly as before, and `cat` of a file that holds a probe types
-nothing into a shell. The
+the key behave exactly as before; a session whose own runtime is listed never
+uses the foreground list, so a manifest override without the key stays silent.
+Where the shell has no job control the background and foreground programs share
+one process group, and a probe printed by any of them is answered. The
 reply is the fixed `ESC ] 7501 ; ? ESC \`, which carries no CR or LF. The reader
 thread never writes: the output hub queues one coalescing reply token before it
 fans a chunk out, and a dedicated task writes the reply through the write

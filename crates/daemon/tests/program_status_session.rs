@@ -845,6 +845,7 @@ const NESTED_UNLISTED: &str = "unlisted-agent";
 const NESTED_PROBER: &str = r#"
 stty raw -echo
 printf '\033]7501;?\033\\'
+: > "$2/probed"
 head -c "$1" | od -An -v -tx1 | tr -d ' \n' > "$2/first.hex"
 emit() { printf '\033]7501;state=%s:app=claude-code\033\\' "$1"; }
 emit idle
@@ -939,6 +940,12 @@ async fn an_unlisted_program_started_below_a_shell_gets_no_probe_reply() {
     let fixture = nested_fixture(NESTED_UNLISTED, 1).await;
     let created = fixture.start("shell").await;
 
+    // Type only once the program has printed its probe in raw mode, so a reply
+    // would be the first byte it reads.
+    wait_until("the program to print its probe", || async {
+        fixture.scratch_file("probed").exists().then_some(())
+    })
+    .await;
     fixture
         .registry
         .input(SessionInputParams {

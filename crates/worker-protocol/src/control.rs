@@ -650,6 +650,10 @@ pub const MAX_PROCESS_PATTERNS: usize = 16;
 /// Longest single pattern of a [`ProcessPatterns`], in bytes.
 pub const MAX_PROCESS_PATTERN_BYTES: usize = 4096;
 
+/// Most pattern bytes of one entry, keeping 16 entries (even JSON-escaped)
+/// well inside one control line.
+pub const MAX_PROCESS_PATTERN_TOTAL_BYTES: usize = 16 * 1024;
+
 /// Regular-expression sources that recognise one program: any `comm` pattern
 /// matching the kernel task name, or any `cmdline` pattern matching the
 /// argument vector joined with spaces.
@@ -667,12 +671,14 @@ impl ProcessPatterns {
     /// Whether the entry stays within the wire bounds.
     #[must_use]
     pub fn within_bounds(&self) -> bool {
-        [&self.comm, &self.cmdline].into_iter().all(|list| {
-            list.len() <= MAX_PROCESS_PATTERNS
-                && list.iter().all(|pattern| {
-                    !pattern.is_empty() && pattern.len() <= MAX_PROCESS_PATTERN_BYTES
-                })
-        })
+        let total: usize = self.comm.iter().chain(&self.cmdline).map(String::len).sum();
+        total <= MAX_PROCESS_PATTERN_TOTAL_BYTES
+            && [&self.comm, &self.cmdline].into_iter().all(|list| {
+                list.len() <= MAX_PROCESS_PATTERNS
+                    && list.iter().all(|pattern| {
+                        !pattern.is_empty() && pattern.len() <= MAX_PROCESS_PATTERN_BYTES
+                    })
+            })
     }
 }
 
@@ -734,8 +740,9 @@ pub struct Initialize {
     /// PTY foreground, for a session whose own runtime does not answer it (a
     /// shell below which an agent is started by hand).
     ///
-    /// The worker answers a probe only when the foreground process group's
-    /// leader matches one entry at the moment the probe arrives. A peer that
+    /// The worker answers a probe only when a member of the PTY foreground
+    /// process group (or the root process) matches one entry when the reply
+    /// is written. A peer that
     /// predates the field ignores it and answers nothing here; an absent field
     /// means no entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -168,7 +168,7 @@ the session has now.
 
 Recorded on Claude Code 2.1.309 (the lock), a real binary from the npm package
 in throwaway pohunek sessions (hermetic home, loopback Messages stub, dummy key;
-scenario `a_real_claude_carries_the_pohunek_name_at_launch_resume_and_fork`,
+scenario `a_real_claude_carries_the_pohunek_name_at_launch_and_resume`,
 screens in `compat/claude/screens/named/`):
 
 - Claude accepts the joined form for a plain name and for `--help`: the process
