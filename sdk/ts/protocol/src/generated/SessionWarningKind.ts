@@ -14,5 +14,4 @@ export type SessionWarningKind =
   | "setup_script"
   | "hook"
   | "native_recovery"
-  | "branch_ahead_of_remote"
-  | "package_revoked";
+  | "branch_ahead_of_remote";
