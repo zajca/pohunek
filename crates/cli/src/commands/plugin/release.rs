@@ -127,8 +127,20 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
         return Err(CliError::ReleaseInstallConsentRequired);
     }
     let context = Context::resolve().map_err(|error| blocked(error.to_string()))?;
+    let status = crate::service::installed_facts(&context)?;
+    if status.installed && status.active_version.as_deref() != Some(VERSION) {
+        return Err(blocked(format!(
+            "the installed service runs version {}, this pohunek is {VERSION}; run \
+             `pohunek service upgrade` first, so one release owns the package registry",
+            status.active_version.as_deref().unwrap_or("unknown")
+        )));
+    }
     let sealed = verify_sealed_archive(dir, context.uid())
-        .await?
+        .await
+        .map_err(|error| match error {
+            CliError::SetupBlocked { detail } => blocked(detail),
+            other => other,
+        })?
         .ok_or_else(|| {
             blocked(format!(
                 "{} is not an extracted daemon archive: it has neither a MANIFEST nor a \

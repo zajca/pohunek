@@ -3332,10 +3332,12 @@ fn an_offline_release_install_without_consent_changes_nothing() {
 fn an_altered_package_archive_is_refused_by_the_release_daemon() {
     let env = TestEnv::new().expect("hermetic test environment");
     let release = sealed_release(&env, &test_key(), |release| {
+        // A well-formed archive the catalog does not list.
         let archive = release.join("runtime/packages/hermes.tar.zst");
-        let mut bytes = fs::read(&archive).expect("the archive");
-        bytes.push(0);
-        fs::write(&archive, bytes).expect("alter the archive");
+        let mut entries = package_entries();
+        set_version(&mut entries, "1.9.0");
+        let (bytes, _digest) = archive_of(&entries);
+        fs::write(&archive, bytes).expect("swap in an unlisted archive");
     });
 
     let output = install_release(&env, &release, &["--yes"]);
@@ -3346,7 +3348,7 @@ fn an_altered_package_archive_is_refused_by_the_release_daemon() {
     assert!(
         error["msg"]
             .as_str()
-            .is_some_and(|msg| msg.contains("hermes")),
+            .is_some_and(|msg| msg.contains("hermes") && msg.contains("package_untrusted")),
         "{error:#}"
     );
     assert!(!env.state_home().join("pohunek/plugins").exists());
@@ -3386,7 +3388,7 @@ fn a_package_archive_altered_after_sealing_is_refused_before_anything_runs() {
 
     assert!(!output.status.success());
     let error = json_of(&output)["err"].clone();
-    assert_eq!(error["code"], "setup_blocked", "{error:#}");
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
     assert!(
         error["msg"]
             .as_str()

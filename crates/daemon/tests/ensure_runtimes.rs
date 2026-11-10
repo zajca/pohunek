@@ -7101,9 +7101,8 @@ fn an_altered_release_archive_is_refused_and_nothing_is_recorded() {
         .release_dir()
         .join("packages")
         .join(format!("{REQUESTED}.tar.zst"));
-    let mut bytes = fs::read(&archive).expect("the archive");
-    bytes.push(0);
-    fs::write(&archive, bytes).expect("alter the archive");
+    let (other, _) = official_runtimes::variant_archive(REQUESTED, "1.9.0");
+    fs::write(&archive, other).expect("swap in a well-formed unlisted archive");
 
     let plan = host.request(true, &[REQUESTED]);
     let applied = host.request(false, &[REQUESTED]);
@@ -7111,6 +7110,11 @@ fn an_altered_release_archive_is_refused_and_nothing_is_recorded() {
     for report in [&plan, &applied] {
         assert_eq!(refusal_codes(report), ["official_package_archive_invalid"]);
         assert_eq!(report.refusals[0].subject, REQUESTED);
+        assert!(
+            report.refusals[0].detail.contains("package_untrusted"),
+            "{:?}",
+            report.refusals
+        );
     }
     host.assert_nothing_installed();
 }
