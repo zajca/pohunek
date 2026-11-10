@@ -2824,6 +2824,9 @@ pub enum SessionWarningKind {
     /// proceeds and the worktree is kept. The failing event name + reason ride in
     /// the warning's `message`/`detail`, not the kind (a **unit** variant, so the
     /// enum stays `Copy` and serializes to the bare string `"hook"`).
+    /// `session.list` also uses it, without storing it, for a session launched
+    /// from a package digest that a recorded catalog revoked: the `detail`
+    /// then starts with `package_revoked digest=`.
     Hook,
     /// The session's stored native recovery record could not be completed
     /// after an upgrade, so it cannot resume natively. The session

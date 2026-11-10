@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId,
+    SessionId,
 };
 
 /// How an installed package was authorized.
@@ -676,6 +677,11 @@ pub struct PackageFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_by: Option<PackageDigest>,
+    /// The sessions that still run from the digest of a
+    /// [`PackageFindingKind::Revoked`] finding; empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<Vec<SessionId>>"))]
+    pub running_sessions: Vec<SessionId>,
 }
 
 /// Result of `package.doctor`.
@@ -777,6 +783,10 @@ pub enum PackageErrorKind {
     /// launch, resume or selection until the operator selects another
     /// version.
     Revoked,
+    /// The file of recorded revoked package digests cannot be read, so
+    /// catalog-authorized packages are refused and no catalog can be recorded
+    /// until it is repaired.
+    RevocationsUnreadable,
 }
 
 impl PackageErrorKind {
@@ -815,6 +825,7 @@ impl PackageErrorKind {
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
             Self::Revoked => "package_revoked",
+            Self::RevocationsUnreadable => "package_revocations_unreadable",
         }
     }
 
@@ -881,6 +892,9 @@ impl PackageErrorKind {
                 "the package exports commands and this client did not opt in to reviewing them"
             }
             Self::Revoked => "a recorded package catalog revoked this package digest",
+            Self::RevocationsUnreadable => {
+                "the recorded revoked package digests cannot be read, so catalog-authorized packages are refused"
+            }
         }
     }
 
@@ -935,6 +949,9 @@ impl PackageErrorKind {
             }
             Self::Revoked => {
                 "select another installed version with `pohunek plugin select`, or install a release that carries a new package"
+            }
+            Self::RevocationsUnreadable => {
+                "stop the daemon, keep a copy of `revoked-digests.json` in the plugin root, remove it, start the daemon and install the release catalog again to record the revocations anew"
             }
         }
     }
@@ -1066,6 +1083,7 @@ mod tests {
             PackageErrorKind::RuntimeFeatureUnsupported,
             PackageErrorKind::CommandsClientUnsupported,
             PackageErrorKind::Revoked,
+            PackageErrorKind::RevocationsUnreadable,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

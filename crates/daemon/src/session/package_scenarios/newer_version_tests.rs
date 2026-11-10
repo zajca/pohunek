@@ -1503,3 +1503,45 @@ async fn listing_package_pinned_sessions_costs_the_same_as_listing_one() {
     );
     assert_eq!(store.cached_definitions(), cached);
 }
+
+/// A stopped session whose package digest a later catalog revoked is refused
+/// by resume on the running release, so the upgrade preflight reports it as
+/// already not resumable, not as a recovery the upgrade would lose.
+#[tokio::test]
+async fn a_stopped_session_on_a_revoked_digest_is_already_not_resumable_in_the_preflight() {
+    let old = CLAUDE.older();
+    let session = stopped_on("revoked-preflight", &CLAUDE, &old, CLAUDE.old_version).await;
+    let new = CLAUDE.newer();
+    let mut body = catalog(
+        6,
+        vec![entry(
+            &new,
+            &CLAUDE.package_id(),
+            CLAUDE.runtime,
+            CLAUDE.new_version,
+        )],
+    );
+    body.revoked_digests = vec![old.digest.clone()];
+    let document = signed_by(&signing_key("root"), body);
+    session
+        .fixture
+        .registry
+        .packages()
+        .package_install(catalog_install(&session.fixture, &new, &document, false))
+        .await
+        .expect("record the revoking catalog");
+
+    let (verdict, code) = stopped_verdict(&session.fixture, &session.store_path, &session.id);
+
+    assert_eq!(
+        (verdict, code.as_str()),
+        (Verdict::AlreadyNotResumable, "package_revoked")
+    );
+    let refused = session
+        .fixture
+        .registry
+        .resume(&session.id)
+        .await
+        .expect_err("resume refuses the revoked digest");
+    assert_eq!(refused.code, "package_revoked");
+}

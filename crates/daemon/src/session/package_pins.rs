@@ -107,6 +107,29 @@ impl SessionRegistry {
         Ok(ConfigHomes::new(self.inner.profiles.clone(), base))
     }
 
+    /// The sessions that may still own a live runtime launched from one of
+    /// `digests`, as `(digest, session)` pairs.
+    pub(crate) async fn running_on_packages(
+        &self,
+        digests: &[PackageDigest],
+    ) -> Vec<(PackageDigest, SessionId)> {
+        let entries = self.inner.sessions.lock().await;
+        entries
+            .iter()
+            .filter(|(_, entry)| entry.info.may_own_runtime())
+            .filter_map(
+                |(id, entry)| match &entry.snapshot.launch_binding.binding()?.provenance {
+                    BindingProvenance::Package { package_digest, .. }
+                        if digests.contains(package_digest) =>
+                    {
+                        Some((package_digest.clone(), id.clone()))
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
     /// Adds a `package_revoked` warning to each of `sessions` launched from a
     /// package digest that a recorded catalog revoked.
     ///

@@ -1942,11 +1942,27 @@ fn render_doctor(result: &PackageDoctorResult) -> String {
         result.findings.len(),
         result.generation
     );
-    if result
-        .findings
-        .iter()
-        .any(|finding| finding.kind == PackageFindingKind::Revoked)
-    {
+    let mut revoked = false;
+    for finding in &result.findings {
+        if finding.kind != PackageFindingKind::Revoked {
+            continue;
+        }
+        revoked = true;
+        if !finding.running_sessions.is_empty() {
+            let ids: Vec<&str> = finding
+                .running_sessions
+                .iter()
+                .map(|id| id.0.as_str())
+                .collect();
+            let _ = writeln!(
+                output,
+                "Revoked {} still runs: {}",
+                short_digest(&finding.digest),
+                ids.join(", ")
+            );
+        }
+    }
+    if revoked {
         output.push_str(REVOKED_HINT);
     }
     output
@@ -2407,6 +2423,7 @@ mod tests {
                 fault: None,
                 referenced: false,
                 blocked_by: Some(PackageDigest::parse(DIGEST_A).expect("digest")),
+                running_sessions: Vec::new(),
             }],
         });
         assert!(

@@ -270,9 +270,12 @@ impl PackageService {
     ) -> Result<PackageDoctorResult, PackageErrorKind> {
         let context = self.authority.context()?;
         let retained = self.retained().await?;
-        blocking(move || {
+        let mut result = blocking(move || {
             let state = read_state(&context)?;
             let report = context.runtimes.package_report();
+            // An unreadable revocation file is a doctor error of its own: it
+            // refuses every catalog-authorized package.
+            revocation::revoked_set(&context)?;
             let mut findings = Vec::new();
             for record in state.packages() {
                 if filter
@@ -290,6 +293,7 @@ impl PackageService {
                         fault: None,
                         referenced: info.referenced,
                         blocked_by: Some(block.retained),
+                        running_sessions: Vec::new(),
                     });
                 }
                 if info.revoked {
@@ -300,6 +304,7 @@ impl PackageService {
                         fault: None,
                         referenced: info.referenced,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
                 if let Some(fault) = info.fault {
@@ -310,6 +315,7 @@ impl PackageService {
                         fault: Some(fault),
                         referenced: info.referenced,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
             }
@@ -328,6 +334,7 @@ impl PackageService {
                         fault: None,
                         referenced,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
                 for digest in retained
@@ -342,6 +349,7 @@ impl PackageService {
                         fault: None,
                         referenced: true,
                         blocked_by: None,
+                        running_sessions: Vec::new(),
                     });
                 }
             }
@@ -350,7 +358,33 @@ impl PackageService {
                 findings,
             })
         })
-        .await
+        .await?;
+        self.attach_running_sessions(&mut result).await;
+        Ok(result)
+    }
+
+    /// Names, on each `revoked` finding, the sessions that still run from its
+    /// digest.
+    async fn attach_running_sessions(&self, result: &mut PackageDoctorResult) {
+        let revoked: Vec<PackageDigest> = result
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == PackageFindingKind::Revoked)
+            .map(|finding| finding.digest.clone())
+            .collect();
+        if revoked.is_empty() {
+            return;
+        }
+        let running = self.sessions.running_on_packages(&revoked).await;
+        for finding in &mut result.findings {
+            if finding.kind == PackageFindingKind::Revoked {
+                finding.running_sessions = running
+                    .iter()
+                    .filter(|(digest, _)| *digest == finding.digest)
+                    .map(|(_, id)| id.clone())
+                    .collect();
+            }
+        }
     }
 
     /// Runs one package mutation in a task of its own under the exclusive

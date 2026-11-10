@@ -53,6 +53,9 @@ report the same code in `package_source_error`, and `doctor` fails its
   operator sidecar contract, such as an unlisted, missing, or altered operator
   file, or a policy-path placeholder that is absent or repeated. Verify it with
   `pohunek plugin doctor` and reinstall it from its signed catalog.
+- `hermes_package_revoked`: a recorded signed catalog revoked the selected
+  Hermes package digest. Select another installed version with `pohunek plugin
+  select`, or install a release that carries a new package.
 - `hermes_package_registry_unreadable`: the runtime package registry cannot be
   read safely. Run `pohunek plugin doctor` and repair the registry.
 

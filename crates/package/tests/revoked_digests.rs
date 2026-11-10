@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-11-10
 
 //! Behavioural tests of the persisted revoked package digests.
 //!

@@ -9,7 +9,6 @@ use package::PackageDigest;
 use protocol::PackageErrorKind;
 use tracing::warn;
 
-use super::error::registry_kind;
 use super::Context;
 
 /// The digests recorded catalogs revoked.
@@ -18,11 +17,10 @@ use super::Context;
 ///
 /// Returns the kind of a revocation file that cannot be read.
 pub(super) fn revoked_set(context: &Context) -> Result<RevokedDigests, PackageErrorKind> {
-    context
-        .store
-        .registry()
-        .revoked_digests()
-        .map_err(|error| registry_kind(&error))
+    context.store.registry().revoked_digests().map_err(|error| {
+        warn!(%error, "the recorded revoked package digests cannot be read");
+        PackageErrorKind::RevocationsUnreadable
+    })
 }
 
 /// Whether `record` is a catalog-authorized package whose digest `revoked`

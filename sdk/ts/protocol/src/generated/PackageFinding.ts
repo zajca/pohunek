@@ -4,6 +4,7 @@ import type { PackageDigest } from "./PackageDigest";
 import type { PackageFault } from "./PackageFault";
 import type { PackageFindingKind } from "./PackageFindingKind";
 import type { PackageIdentity } from "./PackageIdentity";
+import type { SessionId } from "./SessionId";
 
 /**
  * One doctor finding.
@@ -35,4 +36,9 @@ export type PackageFinding = {
    * waits on.
    */
   blocked_by?: PackageDigest;
+  /**
+   * The sessions that still run from the digest of a
+   * [`PackageFindingKind::Revoked`] finding; empty otherwise.
+   */
+  running_sessions?: Array<SessionId>;
 };

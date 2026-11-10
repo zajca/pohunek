@@ -2329,6 +2329,12 @@ async fn a_later_catalog_that_revokes_the_selected_package_refuses_the_operator_
             .any(|finding| finding["kind"] == "revoked" && finding["digest"] == digest.as_str()),
         "plugin doctor reports the revoked package: {doctor:#}"
     );
+    let text = harness.run(&["plugin", "doctor"]).await;
+    let text = String::from_utf8_lossy(&text.stdout).into_owned();
+    assert!(
+        text.contains("revoked") && text.contains("pohunek plugin select"),
+        "the doctor table names the recovery for the only installed version: {text}"
+    );
     let (code, refused_select) = harness
         .json(&["plugin", "select", PACKAGE_ID, "--digest", digest.as_str()])
         .await;

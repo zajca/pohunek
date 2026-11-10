@@ -194,6 +194,23 @@ async fn a_live_session_keeps_running_is_flagged_and_cannot_be_resumed_from_a_re
         session.can_stop(),
         "the session still runs and stays controllable"
     );
+    let doctor = official
+        .fixture
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
+    let finding = doctor
+        .findings
+        .iter()
+        .find(|finding| finding.kind == PackageFindingKind::Revoked)
+        .expect("the revoked finding");
+    assert_eq!(
+        finding.running_sessions,
+        std::slice::from_ref(&created.id),
+        "the doctor names the session that still runs from the digest"
+    );
 
     official
         .fixture
@@ -208,6 +225,21 @@ async fn a_live_session_keeps_running_is_flagged_and_cannot_be_resumed_from_a_re
         .await
         .expect_err("a stopped session does not resume from a revoked digest");
     assert_eq!(refused.code, "package_revoked");
+    let after = official
+        .fixture
+        .registry
+        .packages()
+        .package_doctor(None)
+        .await
+        .expect("doctor");
+    assert!(
+        after
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == PackageFindingKind::Revoked)
+            .all(|finding| finding.running_sessions.is_empty()),
+        "a stopped session no longer runs from the digest"
+    );
 }
 
 #[tokio::test]
@@ -367,6 +399,16 @@ async fn an_unreadable_revocation_file_refuses_official_launches() {
         .await
         .expect_err("enforcement fails closed");
     assert_eq!(refused.code, "runtime_incompatible");
+    assert_eq!(
+        official
+            .fixture
+            .registry
+            .packages()
+            .package_doctor(None)
+            .await
+            .expect_err("the doctor reports the unreadable file"),
+        PackageErrorKind::RevocationsUnreadable
+    );
     assert_eq!(
         std::fs::read(plugins.join("revoked-digests.json")).expect("read"),
         b"{ not json",

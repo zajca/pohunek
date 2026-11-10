@@ -2244,6 +2244,9 @@ fn judge_runtime_source(candidate: &SessionRecord, runtimes: &RuntimeHost) -> Op
     ))
 }
 
+/// Wire code of the error resume answers for a revoked package digest.
+const PACKAGE_REVOKED_CODE: &str = "package_revoked";
+
 /// The session's launch pin must name a runtime source the new daemon serves:
 /// resume resolves exactly that source, and nothing else stands in.
 ///
@@ -2262,6 +2265,18 @@ fn judge_pin(candidate: &SessionRecord, profiles: &ProfileRegistry) -> Option<Ju
     let Err(error) = recovery_definition(profiles, binding) else {
         return None;
     };
+    if error.code == PACKAGE_REVOKED_CODE {
+        // Resume refuses a revoked digest on the running release too, so the
+        // upgrade loses no recovery.
+        return Some((
+            Verdict::AlreadyNotResumable,
+            error.code.clone(),
+            "resume refuses the session because a recorded catalog revoked the package digest \
+             it was launched from, on the running release too; continue in a new session \
+             after selecting another version with `pohunek plugin select`"
+                .to_owned(),
+        ));
+    }
     let runtime = binding.agent_base.as_wire();
     Some((
         Verdict::WouldLoseRecovery,
