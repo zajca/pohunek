@@ -317,6 +317,11 @@ const RULES: &[Rule] = &[
         "knowledge bundle read at run time by the assistant and CLI test fixtures and by xtask tests",
     ),
     rule(
+        Pattern::File("runtime-packages/hermes/runtime.toml"),
+        Effect::Packages(&["pohunek-cli"]),
+        "Hermes package descriptor whose version pohunek-cli embeds to judge the selected package",
+    ),
+    rule(
         Pattern::File("runtime-packages/hermes/operator.toml"),
         Effect::Packages(&["pohunek-cli"]),
         "Hermes operator manifest rendered as the package fixture bundle by pohunek-cli's Hermes integration tests",

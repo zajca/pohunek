@@ -25,6 +25,9 @@ use super::target::ResolvedTarget;
 const MAX_POLICY_BYTES: usize = 64 * 1024;
 /// Recovery for managed assets that differ from their marker or fail to import.
 const ASSET_INTEGRITY_HINT: &str = "replace the managed plugin assets from the selected source with `pohunek integration update --agent hermes`, adding `--confirm-modified` when status reports `modified=true`";
+/// Note on `asset_source` when the selected package is not the version this
+/// pohunek release ships.
+const PACKAGE_VERSION_NOTE: &str = "the selected Hermes package is not the version this pohunek release ships; install the matching one with `pohunek plugin install --release <extracted daemon archive of this version> --runtime hermes --yes`, then run `pohunek integration update --agent hermes`";
 /// Recovery for modified managed assets while no usable source can replace them.
 const ASSET_INTEGRITY_SOURCE_HINT: &str = "restore the Hermes operator source as the `asset_source` check describes, then replace the managed plugin assets with `pohunek integration update --agent hermes --confirm-modified`";
 /// The installed probe accepts only the seven contract-defined lifecycle hooks.
@@ -70,6 +73,9 @@ pub(crate) struct Check {
     pub(crate) status: Status,
     /// Stable operator recovery hint with no paths or subprocess content.
     pub(crate) recovery_hint: &'static str,
+    /// A finding that does not fail the check, absent when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<&'static str>,
 }
 
 /// The outcome state for one doctor check.
@@ -90,6 +96,7 @@ impl Check {
             code,
             status: Status::Pass,
             recovery_hint: "none",
+            note: None,
         }
     }
 
@@ -98,6 +105,7 @@ impl Check {
             code,
             status: Status::Fail,
             recovery_hint,
+            note: None,
         }
     }
 
@@ -106,6 +114,7 @@ impl Check {
             code,
             status: Status::NotRun,
             recovery_hint: "repair prerequisite checks before retrying",
+            note: None,
         }
     }
 }
@@ -254,6 +263,10 @@ pub(crate) fn diagnose(
     }
     if let Some(error) = &package_source_error {
         set_fail(&mut checks, "asset_source", error.recovery_hint());
+    } else if let Ok(bundle) = source {
+        if assets::differs_from_shipped(bundle) {
+            set_note(&mut checks, "asset_source", PACKAGE_VERSION_NOTE);
+        }
     }
 
     let ready_for_probe = is_pass(&checks, "hermes_version")
@@ -426,6 +439,15 @@ fn set_pass(checks: &mut [Check], code: &str) {
 fn set_fail(checks: &mut [Check], code: &str, recovery_hint: &'static str) {
     if let Some(check) = checks.iter_mut().find(|check| check.code == code) {
         *check = Check::fail(check.code, recovery_hint);
+    }
+}
+
+fn set_note(checks: &mut [Check], code: &str, note: &'static str) {
+    if let Some(check) = checks
+        .iter_mut()
+        .find(|check| check.code == code && check.status == Status::Pass)
+    {
+        check.note = Some(note);
     }
 }
 

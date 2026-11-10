@@ -149,4 +149,56 @@ if run_smoke "$(release empty-assets ok)" "$safe_temp_parent" "$safe_temp_parent
   exit 1
 fi
 
+# The no-daemon form installs from the release's own runtime/ and starts no
+# daemon. Each case gets a release directory that carries the package, the
+# catalog and the anchor.
+offline_release() {
+  local directory
+  directory="$(release "$1" ok)"
+  mkdir -p "$directory/runtime/packages"
+  cp "$inputs/hermes.tar.zst" "$directory/runtime/packages/hermes.tar.zst"
+  cp "$inputs/runtime-catalog.json" "$directory/runtime/runtime-catalog.json"
+  cp "$inputs/runtime-catalog-anchor.json" "$directory/runtime-catalog-anchor.json"
+  printf '%s\n' "$directory"
+}
+
+run_offline() {
+  "$smoke" --no-daemon "$1" "$fixture_root/smoke-hermes" \
+    --temp-parent-primary "$safe_temp_parent" \
+    --temp-parent-fallback "$safe_temp_parent"
+}
+
+output="$(run_offline "$(offline_release ok)")"
+if [[ "$output" != *"Hermes release-plugin smoke passed."* ]]; then
+  printf '%s\n' 'the no-daemon smoke did not report success' >&2
+  exit 1
+fi
+if [[ -n "$(find "$safe_temp_parent" -mindepth 1 -maxdepth 1 -name 'pohunek-hermes-release.*' -print)" ]]; then
+  printf '%s\n' 'the no-daemon smoke left its private root behind' >&2
+  exit 1
+fi
+
+# expect_offline_failure <message> <mode>: the no-daemon smoke fails with the message.
+expect_offline_failure() {
+  if run_offline "$(offline_release "$2")" >/dev/null 2>"$test_root/offline-stderr"; then
+    printf 'no-daemon smoke unexpectedly passed, expected: %s\n' "$1" >&2
+    exit 1
+  fi
+  if ! grep -Fq -- "$1" "$test_root/offline-stderr"; then
+    printf 'no-daemon smoke failed without %s:\n' "$1" >&2
+    cat "$test_root/offline-stderr" >&2
+    exit 1
+  fi
+}
+expect_offline_failure 'did not take the offline route' daemon-route
+expect_offline_failure 'reported source=embedded' embedded
+
+# A release without the Hermes package is refused before anything runs.
+no_package="$(offline_release ok)"
+rm -f "$no_package/runtime/packages/hermes.tar.zst"
+if run_offline "$no_package" >/dev/null 2>&1; then
+  printf '%s\n' 'a release without the Hermes package unexpectedly passed' >&2
+  exit 1
+fi
+
 printf '%s\n' 'controlled Hermes release-plugin smoke passed'

@@ -761,7 +761,9 @@ source-locked Hermes runtime without provider credentials, extracts each daemon
 archive, builds the Hermes runtime package from `runtime-packages/hermes` with
 `scripts/build-hermes-package`, runs the model-free compatibility gate against
 the extracted binaries and that package, and executes the packaged smoke
-script. The smoke takes the extracted daemon archive, the package archive, a
+script (the `--no-daemon <sealed release dir> <hermes>` form instead smokes the
+CLI-only install of a sealed archive that carries its own `runtime/`). The smoke
+takes the extracted daemon archive, the package archive, a
 signed catalog that authorizes it, and the anchor that trusts the catalog's
 signer; these archives are smoked before assembly adds the signed release
 catalog and the packages, so `cargo xtask hermes

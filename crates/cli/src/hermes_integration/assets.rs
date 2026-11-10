@@ -115,6 +115,8 @@ pub(crate) struct Bundle {
     pub(crate) package_id: String,
     /// Package archive digest as lowercase hex, without the `sha256:` prefix.
     pub(crate) package_digest: String,
+    /// Version of the selected package, as its registry record names it.
+    pub(crate) package_version: String,
     /// The supported Hermes releases and version grammar the package's
     /// descriptor declares, the range the daemon's launch gate applies too.
     pub(crate) version_probe: VersionProbePolicy,
@@ -129,6 +131,29 @@ pub(crate) const VERSION_ARGS: [&str; 1] = ["--version"];
 
 /// Path of the runtime descriptor inside a runtime package.
 pub(crate) const RUNTIME_DESCRIPTOR_PATH: &str = "runtime.toml";
+
+/// The descriptor of the Hermes package this CLI's release ships.
+const SHIPPED_DESCRIPTOR: &str = include_str!("../../../../runtime-packages/hermes/runtime.toml");
+
+/// The top-level package version of a runtime descriptor.
+#[derive(Deserialize)]
+struct DescriptorVersion {
+    version: String,
+}
+
+/// The version of the Hermes package this CLI's release ships, or `None` when
+/// the embedded descriptor carries no version.
+pub(crate) fn shipped_package_version() -> Option<String> {
+    toml::from_str::<DescriptorVersion>(SHIPPED_DESCRIPTOR)
+        .ok()
+        .map(|descriptor| descriptor.version)
+}
+
+/// Whether `bundle` comes from another package version than the one this CLI's
+/// release ships.
+pub(crate) fn differs_from_shipped(bundle: &Bundle) -> bool {
+    shipped_package_version().is_some_and(|shipped| shipped != bundle.package_version)
+}
 
 /// The part of a runtime descriptor the version gate reads.
 #[derive(Deserialize)]
@@ -249,6 +274,7 @@ pub(crate) fn selected_bundle(registry_path: &Path, policy_path: &Path) -> Resul
             .to_string()
             .trim_start_matches("sha256:")
             .to_owned(),
+        package_version: record.identity().version.to_string(),
         version_probe,
     })
 }

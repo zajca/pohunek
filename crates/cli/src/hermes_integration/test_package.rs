@@ -44,6 +44,7 @@ pub(crate) fn bundle(policy_path: &Path) -> Result<Bundle, Error> {
         manifest_sha256: assets::checksum(&manifest),
         package_id: PACKAGE_ID.to_owned(),
         package_digest: FIXTURE_DIGEST.to_owned(),
+        package_version: assets::shipped_package_version().ok_or(Error::InvalidAsset)?,
         version_probe: version_policy()?,
     })
 }

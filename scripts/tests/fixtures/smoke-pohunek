@@ -6,6 +6,9 @@
 #   wrong-digest  reports another package digest
 #   wrong-layout  installs the plugin below the wrong directory
 #   empty-assets  installs empty plugin files
+#   daemon-route  `plugin install --release` reports the daemon route
+# `plugin install --release <dir> --runtime hermes --yes --json` is the
+# CLI-only route: it needs no daemon and reads the package from the release.
 set -euo pipefail
 
 mode=ok
@@ -31,6 +34,20 @@ envelope() {
   printf '{\n  "cli_version": "controlled",\n  "protocol": {\n    "minimum": 2,\n    "maximum": 2\n  },\n  "ok": %s\n}\n' "$1"
 }
 
+if [[ "${1:-}" == plugin && "${2:-}" == install && "${3:-}" == --release ]]; then
+  [[ "$#" -eq 8 && -d "$4" && "$5" == --runtime && "$6" == hermes && "$7" == --yes && "$8" == --json ]] || exit 92
+  package="$4/runtime/packages/hermes.tar.zst"
+  test -f "$package" && test -f "$4/runtime/runtime-catalog.json" || exit 95
+  digest="sha256:$(sha256_of "$package")"
+  printf '%s\n' "$digest" > "$installed"
+  route=offline
+  if [[ "$mode" == daemon-route ]]; then
+    route=daemon
+  fi
+  envelope "{ \"route\": \"$route\", \"packages\": [ { \"runtime\": \"hermes\", \"status\": \"present\", \"digest\": \"$digest\" } ] }"
+  exit 0
+fi
+
 if [[ "${1:-}" == plugin ]]; then
   test -e "$ready" || exit 1
   case "${2:-}" in
@@ -53,7 +70,7 @@ fi
 if [[ "$#" -lt 2 || "$1" != "integration" ]]; then
   exit 92
 fi
-test -e "$ready" || exit 1
+test -e "$ready" || test -e "$installed" || exit 1
 
 current="$HERMES_HOME"
 while true; do

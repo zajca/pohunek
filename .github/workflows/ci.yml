@@ -3326,6 +3326,32 @@ jobs:
             "${{ steps.package.outputs.dir }}/trust/runtime-catalog-anchor.json" \
             "${{ steps.hermes.outputs.bin }}"
 
+      # The CLI-only host route: a sealed copy of the archive that carries the
+      # package, its throwaway catalog and the anchor that trusts it, installed
+      # with no daemon running.
+      - name: Smoke packaged plugin installation without a daemon
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          packaged_dir="${{ steps.packaged.outputs.dir }}"
+          trust_dir="${{ steps.package.outputs.dir }}/trust"
+          sealed="$RUNNER_TEMP/packaged-pohunek-sealed"
+          rm -rf "$sealed"
+          cp -R "$packaged_dir" "$sealed"
+          mkdir -p "$sealed/runtime/packages"
+          cp "${{ steps.package.outputs.dir }}/hermes.tar.zst" "$sealed/runtime/packages/hermes.tar.zst"
+          cp "$trust_dir/runtime-catalog.json" "$sealed/runtime/runtime-catalog.json"
+          cp "$trust_dir/runtime-catalog-anchor.json" "$sealed/runtime-catalog-anchor.json"
+          chmod 0644 "$sealed/runtime/packages/hermes.tar.zst" "$sealed/runtime/runtime-catalog.json" "$sealed/runtime-catalog-anchor.json"
+          component="$(awk '$1 == "component" { print $2 }' "$sealed/MANIFEST")"
+          version="$(awk '$1 == "version" { print $2 }' "$sealed/MANIFEST")"
+          target="$(awk '$1 == "target" { print $2 }' "$sealed/MANIFEST")"
+          signing="$(awk '$1 == "signing" { print $2 }' "$sealed/MANIFEST")"
+          minimum="$(awk '$1 == "minimum-macos" { print $2 }' "$sealed/MANIFEST")"
+          sh packaging/write-manifest "$sealed" "$component" "$version" "$target" "$signing" $minimum
+          "$sealed/packaging/smoke-hermes-plugin-release" --no-daemon "$sealed" \
+            "${{ steps.hermes.outputs.bin }}"
+
       # The test daemon spawns the session worker found beside the test
       # profile, and the release-install scenarios stage the daemon and the
       # worker as a sealed archive, so both are built from this checkout.

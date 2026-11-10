@@ -3309,6 +3309,56 @@ fn a_cli_only_host_installs_the_release_package_and_the_integration_uses_it() {
         .output()
         .expect("run the pohunek binary");
     assert_eq!(check(&json_of(&doctor)["ok"], "asset_source").0, "pass");
+    assert!(
+        note_of(&json_of(&doctor)["ok"], "asset_source").is_none(),
+        "the package this release ships raises no version note"
+    );
+}
+
+/// The `note` of the doctor check `code`, when it carries one.
+fn note_of<'a>(envelope: &'a Value, code: &str) -> Option<&'a str> {
+    envelope["doctor"]["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|entry| entry["code"] == code)
+        .and_then(|entry| entry["note"].as_str())
+}
+
+/// A host whose installed Hermes package is not the version this release
+/// ships (a CLI upgraded without the matching package) passes `asset_source`
+/// with a note that names the recovery, and the doctor stays `ok`.
+#[test]
+fn doctor_notes_a_selected_package_that_is_not_the_one_this_release_ships() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let hermes = HermesFixture::new(&env);
+    let key = test_key();
+    // `second_release` replaces the staged release, so stage the first one.
+    sealed_release(&env, &key, |_| {});
+    let release = second_release(&env, &key, "1.2.9");
+    assert!(install_release(&env, &release, &["--yes"]).status.success());
+    let installed = env
+        .command(bin_exe("pohunek"))
+        .args(hermes.install_args())
+        .arg("--json")
+        .output()
+        .expect("run the pohunek binary");
+    assert!(installed.status.success(), "{}", json_of(&installed));
+
+    let doctor = env
+        .command(bin_exe("pohunek"))
+        .args(hermes.args("doctor"))
+        .arg("--json")
+        .output()
+        .expect("run the pohunek binary");
+
+    let document = json_of(&doctor);
+    assert_eq!(check(&document["ok"], "asset_source").0, "pass");
+    let note = note_of(&document["ok"], "asset_source").expect("a version note");
+    assert!(
+        note.contains("plugin install --release") && note.contains("integration update"),
+        "{note}"
+    );
 }
 
 /// Without `--yes` and without a terminal the run is refused before anything

@@ -111,6 +111,7 @@ edit plugin files, Hermes YAML, or the policy by hand.
 | Version, CLI compatibility, tool, skill, or hook registration | Install matching binaries, then run `integration update` for the same target. |
 | Ownership, checksum, policy permission, stale stage, or stale backup | Preserve the finding, review the selected target, then run `integration update`; use `--confirm-modified` only after verifying intentional changes. |
 | Plugin not enabled | Run `integration update`; it uses the supported Hermes plugin command rather than editing general YAML. |
+| `asset_source` passes with a `note` about the package version | The selected Hermes package is not the version this pohunek release ships. Run `pohunek plugin install --release <extracted daemon archive of this version> --runtime hermes --yes`, then `pohunek integration update --agent hermes`. The check and `ok` are unaffected. |
 | `asset_source` fails with `hermes_package_not_installed` | Install the official Hermes package from its signed catalog (on a host without a local daemon: `pohunek plugin install --release <extracted daemon archive> --runtime hermes --yes`), then run `integration update`. An install whose `provenance` is `embedded` came from an older CLI's compiled copy; it is never migrated automatically, `integration uninstall` removes it without the package, and `integration update` after the package install rewrites it with `source=package`. |
 | Host or access-mode denial | Change the explicit policy through `integration update`, not via a tool or a file edit. |
 | Output gap or runtime change | Discard the stale cursor; read a fresh screen/newest tail and continue only with returned runtime coordinates. |
@@ -167,6 +168,15 @@ the package with `pohunek plugin install --catalog`, and fails hard if an
 executable is missing, the daemon does not start or stop cleanly,
 install/status/doctor/uninstall fails, or an installed-state result does not
 report the package and its digest as the plugin's provenance. It never
-downloads runtime dependencies or contacts a model/provider. The release
+downloads runtime dependencies or contacts a model/provider.
+
+`packaging/smoke-hermes-plugin-release --no-daemon /abs/sealed-release-dir
+/abs/pinned/hermes` smokes the CLI-only host route instead: the directory is an
+extracted daemon archive that is sealed (MANIFEST) and carries
+`runtime/packages/hermes.tar.zst`, `runtime/runtime-catalog.json` and the anchor
+that trusts the catalog. No daemon starts; the script runs `pohunek plugin
+install --release <dir> --runtime hermes --yes --json` in place, requires the
+`offline` route and the package digest, requires that no daemon socket or
+service file appears, and then runs the same integration lifecycle. The release
 workflow performs this check for every daemon target before publication; repeat
 it manually when validating a downloaded archive or local canary.
