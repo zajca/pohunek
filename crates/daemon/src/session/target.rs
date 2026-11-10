@@ -1322,6 +1322,7 @@ impl SessionRegistry {
         own_runtime: &RuntimeRef,
     ) -> Vec<pohunek_worker_protocol::ProcessPatterns> {
         let mut programs = Vec::new();
+        let mut serialized = 0_usize;
         for definition in self.inner.profiles.runtimes().registry().definitions() {
             // A runtime that answers for itself needs no foreground match, and
             // a session of that runtime whose manifest opts out must stay silent.
@@ -1344,8 +1345,11 @@ impl SessionRegistry {
                 cmdline: matchers.cmdline_patterns().map(str::to_owned).collect(),
             };
             // An oversized entry costs only that runtime its nested answers.
+            let size = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len());
             if !entry.within_bounds()
                 || programs.len() >= pohunek_worker_protocol::MAX_PROBE_FOREGROUND_PROGRAMS
+                || serialized.saturating_add(size)
+                    > pohunek_worker_protocol::MAX_PROBE_FOREGROUND_JSON_BYTES
             {
                 tracing::warn!(
                     runtime = definition.runtime_id().as_str(),
@@ -1353,6 +1357,7 @@ impl SessionRegistry {
                 );
                 continue;
             }
+            serialized += size;
             programs.push(entry);
         }
         programs

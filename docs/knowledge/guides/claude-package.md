@@ -387,22 +387,26 @@ captured screen through the package manifest.
 Every supported Claude Code (2.1.309 and newer) reports its root state as OSC
 7501 records (`ESC ] 7501 ; state=<state>:app=claude-code ST`) once the terminal
 answers the probe `ESC ] 7501 ; ? ST` with the same bytes. The manifest opts in
-with `[program_status] app = "claude-code"`, `answer_probe = true` and declares
-no `authority_from`: the session worker answers the probe, and the daemon holds
-the root record, for every release, also one that is unknown after a daemon
-restart.
+with `[program_status] app = "claude-code"`, `answer_probe = true` and
+`authority_from = "2.1.309"`, the package's floor: the session worker answers
+the probe, and the daemon holds the root record of every supported release.
 
 - Mapping: `working` reads working, `blocked` (`kind=permission` or
   `question`) reads blocked, `done`, `idle` and `error` read idle. All are
   reported as `state_source = osc_progress`; a visible dialog over a `blocked`
   record is reported as `screen`. Records of background agents carry
   an `id=` and are ignored by the detector.
-- The manifest has no working screen rule and no title rule: a running turn is
-  only ever read from a held `working` record. The prompt box rule
-  (`live_prompt_box`) reads idle from the screen, also while a turn runs,
-  because the prompt box stays visible; a held record outranks it, and it
-  decides input readiness and the activity before the first record and after a
-  clear. The `osc_progress_idle` rule keeps reading an idle progress state.
+- A held record outranks the screen. Two working screen rules, `live_status_spinner`
+  (the status line of a turn) and `live_turn_footer` (`esc to interrupt`), are
+  marked `below_authority` and serve only while no record is held: before the
+  first record and after a lag resync, a detector reconfigure or an adoption
+  dropped it. They keep a turn that is running at that moment working until the
+  next record arrives (`a_lag_resync_mid_turn_keeps_the_turn_working`,
+  `a_reconfigure_mid_turn_keeps_the_turn_working`). The prompt box rule
+  (`live_prompt_box`) reads idle from the screen, also while a turn runs, because
+  the prompt box stays visible; the working rules outrank it. The
+  `osc_progress_idle` rule keeps reading an idle progress state. The manifest
+  has no title rule.
 - A visible dialog on the screen always wins over a record that is not
   `blocked`: the folder trust, theme, login, API-key and permission dialogs stay
   blocked, whatever a (forged or stale) record says. The API-key dialog is read
@@ -414,8 +418,8 @@ restart.
   every state (the session name when the session is named, see
   [Session name](#session-name)), and the manifest reads no state from a title.
   Without a record (a probe that is not answered, or a profile that turns the
-  records off) detection is screen-only: dialogs read blocked and the prompt box
-  reads idle.
+  records off) detection is screen-only: dialogs read blocked, the status line
+  and the turn footer read working, and the prompt box reads idle.
 - A Claude a person starts by hand inside a shell session gets the same
   records: the shell session's worker answers the probe while a process of the
   PTY foreground group matches this manifest's `[process]` matchers (the
@@ -424,7 +428,7 @@ restart.
   the detector to this manifest. The records Claude sends before that scan
   recognises it are dropped; the next one is held. A worker spawned by a daemon
   that predates the field answers nothing below a shell, so such a session
-  keeps reading idle during a turn until it is relaunched
+  reads a turn only from its status line and footer until it is relaunched
   (`a_claude_started_below_a_shell_is_answered_and_its_records_drive_the_activity`,
   `an_unlisted_program_started_below_a_shell_gets_no_probe_reply`).
 - The captured record sequences are `compat/claude/screens/<state>.program-status`
@@ -524,11 +528,12 @@ fails without the rule.
 
 Limits that remain:
 
-- A running turn is only visible through the held `working` record. With the
-  records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), after a detector
-  reconfigure or a daemon-restart reattach until the next record, and below a
-  shell whose worker predates the probe foreground list, the session reads idle
-  during a turn.
+- Without a held record a turn is read from the status line or the footer only.
+  With the records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), and below a
+  shell whose worker predates the probe foreground list, that is the whole
+  detection. At 30 columns and fewer the footer is cut before its hint and a
+  turn without a record reads idle; between a lag resync or a reconfigure and
+  the next record a narrow terminal can read idle in the same way.
 - The theme picker and the login method list were captured at 100 columns
   only; the rules separate their words by any whitespace for narrower
   terminals, which no capture confirms.

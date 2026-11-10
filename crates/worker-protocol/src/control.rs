@@ -650,9 +650,14 @@ pub const MAX_PROCESS_PATTERNS: usize = 16;
 /// Longest single pattern of a [`ProcessPatterns`], in bytes.
 pub const MAX_PROCESS_PATTERN_BYTES: usize = 4096;
 
-/// Most pattern bytes of one entry, keeping 16 entries (even JSON-escaped)
-/// well inside one control line.
+/// Most pattern bytes of one entry. The daemon also bounds the serialized
+/// size of the whole list by [`MAX_PROBE_FOREGROUND_JSON_BYTES`], since escaped
+/// control characters take up to six bytes each on the wire.
 pub const MAX_PROCESS_PATTERN_TOTAL_BYTES: usize = 16 * 1024;
+
+/// Most serialized bytes of the whole `probe_foreground_programs` list, which
+/// leaves the rest of `Initialize` room inside one control line.
+pub const MAX_PROBE_FOREGROUND_JSON_BYTES: usize = 256 * 1024;
 
 /// Regular-expression sources that recognise one program: any `comm` pattern
 /// matching the kernel task name, or any `cmdline` pattern matching the

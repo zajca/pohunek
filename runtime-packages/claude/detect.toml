@@ -24,13 +24,57 @@ cmdline = [
 
 # Claude Code reports its root state as OSC 7501 records once the session
 # worker answers its `ESC ] 7501 ; ? ST` probe. Every supported release reports
-# them, so the records are authoritative: they outrank stale screen evidence,
+# them, so a held record is authoritative: it outranks stale screen evidence,
 # and a visible dialog still wins (see the program-status layer in
-# docs/architecture.md). The prompt-box rule decides input readiness before the
-# first record. Background agents report as `id=` records, which are ignored.
+# docs/architecture.md). While no record is held (before the first one, and
+# after a lag resync, a reconfigure or an adoption dropped it) the two working
+# rules marked `below_authority` read a running turn from the screen; a held
+# record skips them. The prompt-box rule decides input readiness. Background
+# agents report as `id=` records, which are ignored.
 [program_status]
 app = "claude-code"
 answer_probe = true
+authority_from = "2.1.309"
+
+# Live status spinner rendered above the prompt box while a turn runs, e.g.
+# "✻ Noodling… (12s · ↓ 1.2k tokens)", "✻ Herding… (3s · thinking with high
+# effort)" or a bare "* Jiving…" at the start of a turn. The line is one verb
+# with an optional timer, or a longer message with an elapsed-time timer (or the
+# start of one that the terminal width cut, "(1…"), so a transcript bullet such
+# as "* Then it waits… (see below)" is not a spinner. A parenthesis that opens
+# with anything but a digit, a unit or the cut mark is not read as a timer.
+# The prompt box (`❯`) stays visible during work, so without this rule every
+# screen render matches `live_prompt_box` and a turn reads idle while no record
+# is held. Must outrank `live_prompt_box` (950) and stay below
+# `live_blocked_form` (980). Dialog markers are excluded so a visible approval
+# prompt keeps winning as blocked.
+[[rules]]
+id = "live_status_spinner"
+state = "working"
+priority = 960
+below_authority = true
+region = "whole_recent"
+line_regex = ['^[·✢✳✶✻✽*] (?:[\p{L}\x27’-]+…|\S[^…]*… \((?:[0-9]+[smh]\b.*|[0-9]*[smh]?…))$']
+not = { any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["esc to cancel"] },
+] }
+
+# The footer below a running turn's prompt box reads `esc to interrupt`; a
+# waiting prompt's footer reads `? for shortcuts`. A streaming reply hides the
+# status line, so this footer is the screen's working evidence then. Same
+# priority and dialog exclusions as `live_status_spinner`.
+[[rules]]
+id = "live_turn_footer"
+state = "working"
+priority = 960
+below_authority = true
+region = "after_last_horizontal_rule"
+contains = ["esc to interrupt"]
+not = { any = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["esc to cancel"] },
+] }
 
 # Selection form footer, e.g. `Enter to select · ↑/↓ to navigate · Esc to
 # cancel`. Narrow terminals wrap it between any two words, so words are

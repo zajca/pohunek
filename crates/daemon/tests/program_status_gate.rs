@@ -271,12 +271,11 @@ fn an_unknown_release_closes_the_gate_and_never_defaults_to_idle() {
 }
 
 #[test]
-fn the_claude_manifest_declares_no_gate_so_its_records_are_authoritative_for_every_release() {
-    for version in [Some("2.1.309"), Some("2.2.0"), None] {
+fn the_claude_gate_opens_at_the_floor_and_an_unknown_release_stays_screen_only() {
+    for version in [Some("2.1.309"), Some("2.2.0")] {
         let config = config("claude", version, InputReadiness::ScreenIdle);
         let gate = config.authority_gate();
-        assert!(!gate.declared, "{version:?}");
-        assert_eq!(gate.reason, GateReason::NotDeclared, "{version:?}");
+        assert!(gate.declared && gate.open, "{version:?}");
         assert!(config.answers_program_status_probe(), "{version:?}");
 
         let mut harness = Harness::new(config);
@@ -284,6 +283,10 @@ fn the_claude_manifest_declares_no_gate_so_its_records_are_authoritative_for_eve
         assert!(harness.record_held(), "{version:?}");
         assert_eq!(harness.activity(), WORKING_RECORD, "{version:?}");
     }
+
+    let unknown = config("claude", None, InputReadiness::ScreenIdle);
+    assert_eq!(unknown.authority_gate().reason, GateReason::VersionUnknown);
+    assert!(!unknown.answers_program_status_probe());
 }
 
 #[test]
@@ -309,7 +312,7 @@ fn a_visible_dialog_beats_a_blocked_record_and_is_attributed_to_the_screen() {
 
 #[test]
 fn a_blocked_record_without_a_dialog_reports_the_record() {
-    let mut harness = Harness::claude(None);
+    let mut harness = Harness::claude(Some("2.1.309"));
     harness.feed(&captured("claude", "idle"));
     harness.feed(&record("claude-code", "blocked"));
     assert_eq!(
@@ -320,7 +323,7 @@ fn a_blocked_record_without_a_dialog_reports_the_record() {
 
 #[test]
 fn a_claude_dialog_capture_beats_a_held_record() {
-    let mut harness = Harness::claude(None);
+    let mut harness = Harness::claude(Some("2.1.309"));
     harness.feed(&record("claude-code", "working"));
     harness.feed(&captured("claude", "trust"));
     assert_eq!(

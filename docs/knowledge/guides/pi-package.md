@@ -83,7 +83,8 @@ reserved, so either way of installing serves it.
 - Known limits: a dialog drawn with `ctx.ui.custom()` has no screen rule and
   reads as Pi's record says (working during a run); the branch-summary busy
   border reads `idle`, as Pi declares it; `error` reads as `idle`; a Pi nested
-  under a shell session gets no probe reply and stays screen-only; a profile
+  under a shell session is answered by the worker that lists Pi's `[process]`
+  matchers, and stays screen-only below a worker that predates that list; a profile
   that sets `PI_PROGRAM_STATUS=0` also gives screen-only detection. A client's
   own reply to the probe can reach Pi before the worker's reply when the worker
   has to wait behind a paced input; Pi then reads "no program status" for that

@@ -1027,14 +1027,17 @@ onto both the Unix socket and the overlay TCP transport. Multiple clients may
 attach to one session; resize policy when sizes differ is defined by the daemon
 (last attach wins, with explicit resize control available).
 
-While a worker answers the 7501 probe, it is the only responder for its PTY: it
-drops every complete `ESC ] 7501 ; ? ... (BEL | ESC \)` reply found inside one
+While a worker answers every 7501 probe of its session's own runtime, it is the
+only responder for its PTY: it drops every complete `ESC ] 7501 ; ? ... (BEL | ESC \)` reply found inside one
 attach input frame, keeping the rest of the frame in order. A reply split across
 frames passes through, which is harmless to the probing programs (they swallow
 an unexpected reply). The client's DA1 and every other reply are forwarded
 unchanged, and the control-plane `session.input` is not filtered. When a held
 paced input plan delays the worker's reply past the client's DA1, the program
-reads "no 7501" for that process and falls back to its screen output.
+reads "no 7501" for that process and falls back to its screen output. A shell
+session's worker answers only a probe of a listed foreground program and does
+not drop the attached terminal's reply, so a program started below a shell can
+read two replies, which it swallows.
 
 If the private worker stream reports a typed failure, the daemon closes the raw
 pipe and retains that sanitized failure in a short-lived bounded result mailbox.
@@ -1246,7 +1249,11 @@ the screen rules stay the fallback.
   detector reconfigure (an agent switch, a nested agent's exit, a report, a
   package refresh), with a lag resync, and with the runtime generation (a new
   detector holds none). It is not persisted and not in `SessionInfo`. After an
-  adoption it is restored only when the retained output still covers it.
+  adoption it is restored only when the retained output still covers it. Until
+  the next record the manifest's `below_authority` screen rules read the turn
+  (Claude's status line and `esc to interrupt` footer), so a turn running when a
+  lag resync, a reconfigure or an adoption dropped the record keeps reading
+  working.
 - **Readiness.** Initial-input readiness and the idle barrier ignore the record:
   they evaluate the screen winner alone, so a record never releases or holds a
   prompt.

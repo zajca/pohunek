@@ -1,8 +1,8 @@
 //! The screen rules that OSC 7501 records cover.
 //!
-//! Claude's records are authoritative for every supported release, so its
-//! manifest has no working screen rule: a running turn comes from the held
-//! record, a dialog from the screen. The scenarios replay the screens and record sequences
+//! A held record outranks Claude's working screen rules; they read a running
+//! turn only while no record is held, after a lag resync, a reconfigure or an
+//! adoption dropped it. The scenarios replay the screens and record sequences
 //! captured from the real agents (`compat/*/screens`).
 
 // Rust guideline compliant 2026-06-26
@@ -39,11 +39,11 @@ struct Harness {
 }
 
 impl Harness {
-    fn new(runtime: &str, version: &str, readiness: InputReadiness) -> Self {
+    fn config(runtime: &str, version: &str, readiness: InputReadiness) -> DetectorConfig {
         let manifest =
             Manifest::parse_str(&read(&format!("runtime-packages/{runtime}/detect.toml")))
                 .expect("the shipped manifest parses");
-        let config = DetectorConfig {
+        DetectorConfig {
             launch_name: None,
             runtime_version: Some(ProbeVersion::parse(version).expect("version")),
             gate_waived: false,
@@ -56,7 +56,11 @@ impl Harness {
             },
             manifest: Some(Arc::new(manifest)),
             input_readiness: readiness,
-        };
+        }
+    }
+
+    fn new(runtime: &str, version: &str, readiness: InputReadiness) -> Self {
+        let config = Self::config(runtime, version, readiness);
         let now = Instant::now();
         let mut detector = Detector::new(ROWS, COLUMNS, now, config);
         detector.finish_initial_input();
@@ -157,23 +161,80 @@ fn claude_reads_every_capture_with_its_record_and_every_dialog_from_the_screen()
 }
 
 #[test]
-fn claude_without_a_held_record_reads_the_prompt_box_as_idle() {
-    // Before the first record, and after a clear or a lag resync, the screen
-    // decides: a running turn shows the prompt box too, so it reads idle until
-    // the next record.
-    for name in ["idle", "working_early", "working_stream", "idle_after_turn"] {
+fn claude_without_a_held_record_reads_a_running_turn_from_the_screen() {
+    for (name, meant) in [
+        ("idle", AgentActivity::Idle),
+        ("working_early", AgentActivity::Working),
+        ("working_stream", AgentActivity::Working),
+        ("idle_after_turn", AgentActivity::Idle),
+    ] {
         let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
         harness.feed(&captured("claude", "", name));
-        assert_eq!(harness.activity(), Some(AgentActivity::Idle), "{name}");
+        assert_eq!(harness.activity(), Some(meant), "{name}");
     }
+}
 
+#[test]
+fn a_held_record_outranks_the_working_screen_rules() {
     let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
     harness.feed(&captured("claude", "", "working_early"));
+    harness.feed(b"\x1b]7501;state=idle:app=claude-code\x1b\\");
+    assert_eq!(harness.activity(), Some(AgentActivity::Idle));
     harness.feed(b"\x1b]7501;state=working:app=claude-code\x1b\\");
+    harness.feed(&captured("claude", "", "idle_after_turn"));
     assert_eq!(harness.activity(), Some(AgentActivity::Working));
     harness.feed(b"\x1b]7501;state=clear\x1b\\");
     harness.feed(&captured("claude", "", "idle_after_turn"));
     assert_eq!(harness.activity(), Some(AgentActivity::Idle));
+}
+
+/// A turn that is running when the held record is dropped keeps reading
+/// working from the repainted screen; it never reads idle in between.
+#[test]
+fn a_lag_resync_mid_turn_keeps_the_turn_working() {
+    let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
+    harness.feed(&captured("claude", "", "working_early"));
+    harness.feed(b"\x1b]7501;state=working:app=claude-code\x1b\\");
+    assert_eq!(harness.activity(), Some(AgentActivity::Working));
+
+    let before = harness.transitions.len();
+    harness.detector.resync_after_lag();
+    harness.feed(&captured("claude", "", "working_stream"));
+    assert_eq!(harness.activity(), Some(AgentActivity::Working));
+    assert!(
+        harness.transitions[before..]
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Idle),
+        "the turn never reads idle: {:?}",
+        &harness.transitions[before..]
+    );
+
+    // The next record takes over again.
+    harness.feed(b"\x1b]7501;state=done:app=claude-code\x1b\\");
+    harness.feed(&captured("claude", "", "idle_after_turn"));
+    assert_eq!(harness.activity(), Some(AgentActivity::Idle));
+}
+
+#[test]
+fn a_reconfigure_mid_turn_keeps_the_turn_working() {
+    let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
+    harness.feed(&captured("claude", "", "working_early"));
+    harness.feed(b"\x1b]7501;state=working:app=claude-code\x1b\\");
+    assert_eq!(harness.activity(), Some(AgentActivity::Working));
+
+    let before = harness.transitions.len();
+    harness.now += STEP;
+    let config = Harness::config("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
+    harness.detector.reconfigure(harness.now, config);
+    harness.feed(&captured("claude", "", "working_stream"));
+    assert_eq!(harness.activity(), Some(AgentActivity::Working));
+    assert!(
+        harness.transitions[before..]
+            .iter()
+            .all(|transition| transition.activity != AgentActivity::Idle),
+        "the turn never reads idle: {:?}",
+        &harness.transitions[before..]
+    );
 }
 
 #[test]
