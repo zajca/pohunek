@@ -2058,7 +2058,7 @@ impl Fixture {
     }
 
     /// Waits until the session reports `working` on the strength of what Claude
-    /// shows or reports (the screen, the 2.1.289 running-turn title or a
+    /// shows or reports (the screen or a
     /// program-status record), not the byte-activity fallback.
     async fn wait_visible_working(&self, id: &str) -> Value {
         wait_until(
@@ -2689,7 +2689,9 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     fixture.wait_visible_working(&id).await;
     fixture.wait_screen_line(&id, STATUS_LINE_MARK).await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
-    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Working).await;
+    // The prompt box stays visible during a turn; the held record carries
+    // `working`, so the screen alone reads idle.
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Idle).await;
     let (_title, rows) = fixture.screen(&id).await;
     assert!(
         !rows
@@ -3147,8 +3149,8 @@ async fn a_held_working_record_does_not_outlive_a_killed_claude() {
 
 /// A reply held mid-stream: Claude draws the first paragraph and removes the
 /// status line, its `working` record stays held and the footer reads `esc to
-/// interrupt`. The daemon keeps the session working for the whole watch and
-/// the package manifest reads the live screen as working. The turn finishes
+/// interrupt`. The daemon keeps the session working for the whole watch while
+/// the package manifest reads the live screen as the idle prompt box. The turn finishes
 /// once the stream gate opens.
 #[tokio::test]
 #[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
@@ -3202,9 +3204,10 @@ async fn a_real_claude_reply_held_mid_stream_reads_working() {
     );
     assert_eq!(fixture.inspect(&id).await["activity"], "working");
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
-    // The turn footer, not the title, makes the re-rendered reply working.
+    // The re-rendered reply shows the prompt box, so the screen alone reads
+    // idle and the held record keeps the session working.
     fixture.wait_screen_line(&id, "esc to interrupt").await;
-    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Working).await;
+    assert_screen_alone_reads(&fixture, &package, &id, AgentActivity::Idle).await;
 
     fixture.stub.open_stream_gate();
     fixture
@@ -4492,7 +4495,8 @@ async fn the_package_version_probe_refuses_an_unsupported_claude_and_starts_the_
     let root = fixture.harness.env.root().to_path_buf();
     let release = locked_release();
     let unsupported = [
-        banner_of("2.1.288"),
+        banner_of("2.1.308"),
+        banner_of("2.1.300"),
         banner_of("3.0.0"),
         format!("{release}-rc.1 (Claude Code)"),
         format!("Claude Code {release}"),

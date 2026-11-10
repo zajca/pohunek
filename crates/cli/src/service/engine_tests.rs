@@ -7953,7 +7953,7 @@ struct RuntimeOnPathPreflight {
 
 impl RuntimeOnPathPreflight {
     /// The lowest `claude` version the release accepts, as `[major, minor, patch]`.
-    const REQUIRED: [u64; 3] = [2, 1, 289];
+    const REQUIRED: [u64; 3] = [2, 1, 309];
 
     fn version_on(search_path: &str) -> Option<[u64; 3]> {
         search_path.split(':').find_map(|dir| {
@@ -7994,7 +7994,7 @@ impl AdoptionPreflight for RuntimeOnPathPreflight {
 
 /// Installs with a login shell that reports a store-style directory holding
 /// `claude` 2.1.288, then upgrades with a login shell that reports the
-/// profile's directory holding `claude` 2.1.302, under the version-aware
+/// profile's directory holding `claude` 2.1.320, under the version-aware
 /// preflight. Returns the harness and the refusal of the first upgrade.
 async fn stale_store_path_refusal() -> (Harness, std::path::PathBuf, std::path::PathBuf, Error) {
     let mut harness = Harness::new();
@@ -8004,7 +8004,7 @@ async fn stale_store_path_refusal() -> (Harness, std::path::PathBuf, std::path::
     std::fs::write(stale.join("claude"), "2.1.288\n").expect("stale claude");
     harness.install(V1).await.expect("install");
     harness.context = discovering(&harness.context, &harness.root, "shell-b", &profile);
-    std::fs::write(profile.join("claude"), "2.1.302\n").expect("profile claude");
+    std::fs::write(profile.join("claude"), "2.1.320\n").expect("profile claude");
     let error = harness
         .engine()
         .with_adoption_preflight(Box::new(RuntimeOnPathPreflight::default()))

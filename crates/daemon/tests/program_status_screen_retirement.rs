@@ -2,8 +2,7 @@
 //!
 //! Claude's records are authoritative for every supported release, so its
 //! manifest has no working screen rule: a running turn comes from the held
-//! record, a dialog from the screen. Codex keeps screen rules that an open
-//! release gate skips. The scenarios replay the screens and record sequences
+//! record, a dialog from the screen. The scenarios replay the screens and record sequences
 //! captured from the real agents (`compat/*/screens`).
 
 // Rust guideline compliant 2026-06-26

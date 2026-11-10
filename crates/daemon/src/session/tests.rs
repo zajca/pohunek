@@ -31357,8 +31357,8 @@ import time
 time.sleep(60)
 "#;
 
-/// Registry whose `fast-turn` agent runs [`FAST_TURN_TUI`] under the Claude
-/// manifest; `trigger` is `-` for a stdin-driven turn or a fifo path.
+/// Registry whose `fast-turn` agent runs [`FAST_TURN_TUI`] under the frozen
+/// 0.34.2 Claude manifest; `trigger` is `-` for a stdin-driven turn or a fifo path.
 #[cfg(unix)]
 async fn fast_turn_session(tag: &str, trigger: &str) -> (SessionRegistry, SessionId) {
     let root = temp_dir(tag);

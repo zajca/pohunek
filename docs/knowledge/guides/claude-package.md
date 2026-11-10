@@ -178,7 +178,7 @@ screens in `compat/claude/screens/named/`):
   the title, with no glyph, so the title carries no state; the program-status
   records and the screen carry it, as they do for the plain title `Claude Code`.
   `named_screens_are_classified_like_unnamed_ones` pins that a named screen reads
-  exactly as its unnamed counterpart.
+  as an idle prompt box, whatever its title.
 - Detection: Claude draws the name into the title, the rule label and the
   collision banner. The manifest has no title rule, so a name that starts with a
   turn glyph (`◐ deploy`) reads no state. The daemon keeps the name its launch
@@ -514,9 +514,11 @@ fails without the rule.
 
 Limits that remain:
 
-- A running turn is only visible through the held `working` record; with the
-  records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`) the session reads idle
-  during a turn.
+- A running turn is only visible through the held `working` record. With the
+  records off (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`), for a Claude started
+  inside a shell session (its worker answers no probe) and after a detector
+  reconfigure or a daemon-restart reattach until the next record, the session
+  reads idle during a turn.
 - The theme picker and the login method list were captured at 100 columns
   only; the rules separate their words by any whitespace for narrower
   terminals, which no capture confirms.
