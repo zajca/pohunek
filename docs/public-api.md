@@ -3604,7 +3604,10 @@ while still requiring owner input. An `idle` observation from the program's
 status channel (`state_source` `osc_progress`, which an OSC 7501 record
 reports) that follows a `blocked` one does: the dialog closed (Esc, a denial,
 an automatic denial). A `blocked` reading that names a different kind than the
-one already derived replaces the attention record.
+one already derived replaces the attention record. A `blocked` record that names no kind, under a dialog the screen
+rules also read, is not told apart from a dialog only the screen saw, so an
+`idle` record after it leaves the attention record open until the session
+works again.
 
 #### Session notification debounce
 
