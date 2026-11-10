@@ -1435,7 +1435,7 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
 /// archive is refused or the verifier cannot run. A directory that is not a
 /// sealed archive returns `None`.
-async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<Option<SealedRelease>, CliError> {
+pub(crate) async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<Option<SealedRelease>, CliError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let blocked = |detail: String| CliError::SetupBlocked { detail };
@@ -1572,7 +1572,7 @@ fn installed_version_dir(
 /// # Errors
 ///
 /// Returns [`CliError::Io`] when the answer cannot be read.
-fn confirm() -> Result<bool, CliError> {
+pub(crate) fn confirm() -> Result<bool, CliError> {
     let mut stderr = io::stderr();
     write!(stderr, "{CONFIRM_PROMPT}")?;
     stderr.flush()?;
@@ -1611,7 +1611,7 @@ fn wire_name<T: Serialize>(value: &T) -> String {
 }
 
 /// The refusals of a plan, one per line.
-fn refusal_text(refusals: &[Refusal]) -> String {
+pub(crate) fn refusal_text(refusals: &[Refusal]) -> String {
     refusals
         .iter()
         .map(|refusal| format!("{}: {}", refusal.subject, refusal.detail))

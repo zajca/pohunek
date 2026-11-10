@@ -25,7 +25,7 @@ use protocol::{
     PackageInstallResult, PackageInstallStatus, PackageLinkParams, PackageListResult,
     PackageOrigin, PackageRuntimeInfo, PackageSelectParams, PackageSelectionBlockReason,
     PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
-    PackageVersion,
+    PackageVersion, RuntimeId,
 };
 
 use crate::client::Client;
@@ -35,6 +35,8 @@ use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::{is_local_host, LOCAL_HOST};
+
+mod release;
 
 /// Prefix every package digest carries on the wire.
 const DIGEST_PREFIX: &str = "sha256:";
@@ -248,8 +250,29 @@ pub(crate) struct InstallArgs {
     /// A package archive to install (with `--sha256`, `--catalog` or
     /// `--index`), or `<package-id>[@<version>]` to install through the
     /// plugin index.
-    #[arg(value_name = "SOURCE", value_hint = ValueHint::AnyPath)]
-    source: String,
+    #[arg(
+        value_name = "SOURCE",
+        value_hint = ValueHint::AnyPath,
+        required_unless_present = "release",
+        conflicts_with = "release"
+    )]
+    source: Option<String>,
+    /// Install the official package of `--runtime` from this extracted
+    /// daemon archive. With a local daemon the install goes through it; on a
+    /// host without one, the archive is verified and its own `pohunekd`
+    /// installs the package once, without installing a service.
+    #[arg(
+        long,
+        value_name = "DIR",
+        value_hint = ValueHint::DirPath,
+        requires = "runtime",
+        conflicts_with_all = ["sha256", "catalog", "index", "index_url", "no_enable"]
+    )]
+    release: Option<PathBuf>,
+    /// The runtime whose official package `--release` installs (for example
+    /// `hermes`).
+    #[arg(long, value_name = "ID", requires = "release", value_parser = parse_runtime_id)]
+    runtime: Option<RuntimeId>,
     #[command(flatten)]
     trust: InstallTrustArgs,
     /// Plugin index to resolve a package id through, instead of the official
@@ -372,7 +395,13 @@ impl FromStr for DigestSelector {
     }
 }
 
+/// Parse a runtime id for `--runtime`.
+fn parse_runtime_id(value: &str) -> Result<RuntimeId, String> {
+    RuntimeId::parse(value).map_err(|_malformed| format!("`{value}` is not a runtime id"))
+}
+
 /// Parse an archive digest: `sha256:<64 hex>` or the bare 64 hex characters.
+
 pub(super) fn parse_archive_digest(value: &str) -> Result<PackageDigest, String> {
     let hex = value.strip_prefix(DIGEST_PREFIX).unwrap_or(value);
     PackageDigest::parse(&format!("{DIGEST_PREFIX}{hex}")).map_err(|_malformed| {
@@ -893,14 +922,17 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
 }
 
 async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
+    let Some(source_text) = args.source.as_deref() else {
+        return release::run(args).await;
+    };
     let ingest = Ingest::Install {
         enable: !args.no_enable,
     };
     let Some(trust) = install_trust(&args.trust)? else {
-        return run_install_by_id(args, ingest).await;
+        return run_install_by_id(args, source_text, ingest).await;
     };
     let source = Source::Archive {
-        path: canonical_path(Path::new(&args.source), "file", Path::is_file)?,
+        path: canonical_path(Path::new(source_text), "file", Path::is_file)?,
         trust,
     };
     let mut client = connect_ingest().await?;
@@ -919,16 +951,20 @@ async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
 
 /// Install `<package-id>[@<version>]`: fetch the index and the archive it
 /// lists, then hand both to the daemon, which verifies them.
-async fn run_install_by_id(args: &InstallArgs, ingest: Ingest) -> Result<(), CliError> {
+async fn run_install_by_id(
+    args: &InstallArgs,
+    source_text: &str,
+    ingest: Ingest,
+) -> Result<(), CliError> {
     // A forgotten trust flag must not turn into a network lookup: an archive
     // file name such as `muse.tar.zst` is also a valid package id.
-    if args.source.ends_with(ARCHIVE_SUFFIX) || std::fs::symlink_metadata(&args.source).is_ok() {
+    if source_text.ends_with(ARCHIVE_SUFFIX) || std::fs::symlink_metadata(source_text).is_ok() {
         return Err(Error::TrustRequired {
-            source_text: args.source.clone(),
+            source_text: source_text.to_owned(),
         }
         .into());
     }
-    let request = PackageRef::parse(&args.source)?;
+    let request = PackageRef::parse(source_text)?;
     let mut client = connect_ingest().await?;
     require_index_support(&mut client).await?;
     let staged = plugin_index::stage(&request, args.index_url.as_deref()).await?;
@@ -1909,7 +1945,7 @@ fn render_doctor(result: &PackageDoctorResult) -> String {
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
-    use protocol::{PackageFinding, RuntimeId};
+    use protocol::PackageFinding;
 
     use super::*;
     use crate::{Cli, Commands};

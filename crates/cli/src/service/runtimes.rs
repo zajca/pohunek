@@ -23,8 +23,9 @@ use pohunek_platform::filesystem::{AdvisoryLock, EntryKind, FsError, TrustedDir}
 use pohunek_service_config::runtimes::{
     AcceptedGap, CatalogStatus, EnsureReport, IntegrationAction, PackageAction, PackageStatus,
     ProfileAction, ProfileStatus, ACCEPT_GAP_FLAG, DETECT_FLAG, DRY_RUN_FLAG,
-    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG,
+    ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RUNTIME_FLAG,
 };
+use protocol::RuntimeId;
 use tokio::io::AsyncReadExt as _;
 
 use super::context::Context;
@@ -155,6 +156,7 @@ impl RuntimeStep for DaemonRuntimes {
                 dry_run,
                 detect: false,
                 accepted,
+                requested: &[],
             },
             search_path,
         ))
@@ -184,6 +186,38 @@ impl DaemonRuntimes {
                 dry_run: true,
                 detect: true,
                 accepted: &[],
+                requested: &[],
+            },
+            search_path,
+        )
+        .await
+    }
+
+    /// Plans (`dry_run`) or applies the install of the `requested` runtimes
+    /// from the release in `dir`, on a host that may have no service. An apply
+    /// takes the daemon's instance locks, so it refuses while a daemon runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of a run: the daemon cannot run, does not finish,
+    /// exits unsuccessfully, or prints a report this CLI does not read.
+    pub async fn run_requested(
+        &self,
+        context: &Context,
+        dir: &VerifiedVersionDir,
+        dry_run: bool,
+        search_path: &str,
+        requested: &[RuntimeId],
+    ) -> Result<EnsureReport, Error> {
+        run_daemon(
+            *self,
+            context,
+            dir,
+            Flags {
+                dry_run,
+                detect: false,
+                accepted: &[],
+                requested,
             },
             search_path,
         )
@@ -200,6 +234,9 @@ struct Flags<'a> {
     detect: bool,
     /// One [`ACCEPT_GAP_FLAG`] per gap; not with `detect`.
     accepted: &'a [AcceptedGap],
+    /// One [`RUNTIME_FLAG`] per runtime to install from the release; not with
+    /// `detect`.
+    requested: &'a [RuntimeId],
 }
 
 /// The command that runs the step in `daemon` with `flags`.
@@ -214,6 +251,9 @@ fn ensure_command(daemon: &Path, flags: Flags<'_>) -> tokio::process::Command {
     }
     for gap in flags.accepted {
         command.arg(ACCEPT_GAP_FLAG).arg(gap.to_arg());
+    }
+    for runtime in flags.requested {
+        command.arg(RUNTIME_FLAG).arg(runtime.as_str());
     }
     command
 }
@@ -781,6 +821,7 @@ mod tests {
                 dry_run: true,
                 detect: false,
                 accepted: &[],
+                requested: &[],
             },
             "/usr/bin:/bin",
         )
@@ -795,6 +836,7 @@ mod tests {
                 dry_run: false,
                 detect: false,
                 accepted: &[],
+                requested: &[],
             },
             "/usr/bin:/bin",
         )
@@ -837,6 +879,7 @@ mod tests {
                 dry_run: true,
                 detect: false,
                 accepted: &[],
+                requested: &[],
             },
             &search_path,
         )
@@ -850,6 +893,7 @@ mod tests {
                 dry_run: false,
                 detect: false,
                 accepted: &[],
+                requested: &[],
             },
             &search_path,
         )
@@ -864,6 +908,7 @@ mod tests {
                     dry_run: true,
                     detect: false,
                     accepted: &[],
+                    requested: &[],
                 },
                 "/usr/bin:/bin",
             )
@@ -888,6 +933,7 @@ mod tests {
                     dry_run: true,
                     detect: false,
                     accepted: &[],
+                    requested: &[],
                 },
                 "/usr/bin:/bin",
             )
@@ -916,6 +962,7 @@ mod tests {
                     dry_run: false,
                     detect: false,
                     accepted: &[],
+                    requested: &[],
                 },
                 "/usr/bin:/bin",
             )
@@ -940,6 +987,7 @@ mod tests {
                     dry_run: false,
                     detect: false,
                     accepted: &[],
+                    requested: &[],
                 },
                 "/usr/bin:/bin",
             )

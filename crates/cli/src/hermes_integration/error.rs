@@ -11,7 +11,7 @@ use protocol::{official_package_install_only_step, RuntimeId};
 /// once because the install step is formatted.
 static PACKAGE_NOT_INSTALLED_HINT: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "{}, then retry; `pohunek integration uninstall --agent hermes` with the original `--hermes-profile` or `--hermes-home` works without the package",
+        "{}, or on a host without a local daemon `pohunek plugin install --release <extracted daemon archive> --runtime hermes`, then retry; `pohunek integration uninstall --agent hermes` with the original `--hermes-profile` or `--hermes-home` works without the package",
         official_package_install_only_step(&RuntimeId::hermes())
     )
 });

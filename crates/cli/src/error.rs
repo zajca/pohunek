@@ -232,6 +232,32 @@ pub(crate) enum CliError {
     #[error("setup changes this host and needs your consent; nothing was changed")]
     SetupConsentRequired,
 
+    /// `pohunek plugin install --release` installs on a host without a daemon
+    /// and needs the owner's consent, which the run cannot ask for (`--yes` is
+    /// missing and stdin is not a terminal, or `--json`). Nothing is changed.
+    #[error("installing from a release changes this host and needs your consent; nothing was changed")]
+    ReleaseInstallConsentRequired,
+
+    /// The owner declined the plan shown by `pohunek plugin install --release`.
+    #[error("the release install was not confirmed; nothing was changed")]
+    ReleaseInstallDeclined,
+
+    /// `pohunek plugin install --release` stopped before its first write: the
+    /// release directory is not usable, or its plan refuses the install.
+    #[error("the release install stopped before any change: {detail}")]
+    ReleaseInstallBlocked {
+        /// The reason, with the next step.
+        detail: String,
+    },
+
+    /// `pohunek plugin install --release` applied the install and the result
+    /// does not hold.
+    #[error("the release install did not complete: {detail}")]
+    ReleaseInstallIncomplete {
+        /// What was left undone, with the next step.
+        detail: String,
+    },
+
     /// The owner declined the plan shown by bare `pohunek setup`.
     #[error("setup was not confirmed; nothing was changed")]
     SetupDeclined,
@@ -539,6 +565,37 @@ impl CliError {
                     "fix the cause named above, then re-run `pohunek setup`; it plans from the installed service and does not reinstall it"
                         .to_owned(),
                 ),
+            ),
+            CliError::ReleaseInstallConsentRequired => ProtocolError::new(
+                ErrorClass::Configuration,
+                "release_install_consent_required",
+                "installing from a release changes this host and needs your consent; nothing was changed"
+                    .to_owned(),
+                Some(
+                    "run `pohunek plugin install --release <dir> --runtime <id> --yes` to apply it; in a terminal, omit `--yes` to see the plan and be asked"
+                        .to_owned(),
+                ),
+            ),
+            CliError::ReleaseInstallDeclined => ProtocolError::new(
+                ErrorClass::Configuration,
+                "release_install_declined",
+                "the release install was not confirmed; nothing was changed".to_owned(),
+                Some("re-run and confirm, or pass `--yes`".to_owned()),
+            ),
+            CliError::ReleaseInstallBlocked { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "release_install_blocked",
+                format!("the release install stopped before any change: {detail}"),
+                Some(
+                    "resolve the reported refusal, then re-run `pohunek plugin install --release <dir> --runtime <id>`"
+                        .to_owned(),
+                ),
+            ),
+            CliError::ReleaseInstallIncomplete { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "release_install_incomplete",
+                format!("the release install did not complete: {detail}"),
+                Some("inspect `pohunek plugin list`, then re-run the install".to_owned()),
             ),
             CliError::SetupDeclined => ProtocolError::new(
                 ErrorClass::Configuration,

@@ -42,6 +42,8 @@ mod hermes_provider;
 mod interpreter;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
+#[path = "support/setup_release.rs"]
+mod setup_release;
 #[path = "support/worker_identity_answers.rs"]
 mod worker_identity_answers;
 
@@ -3219,4 +3221,237 @@ async fn hermes_launches_only_from_the_installed_official_package() {
     let (code, stopped) = harness.json(&["session", "stop", &id]).await;
     assert_eq!(code, 0, "{stopped}");
     harness.stop().await;
+}
+
+// --- `plugin install --release` on a host with and without a daemon ---
+
+/// Directory of the extracted daemon archive below the environment root.
+const RELEASE_DIR: &str = "release";
+
+/// Builds an extracted daemon archive that carries the Hermes package among
+/// the release runtimes, signed by `key`. `alter` edits the staged tree
+/// before it is sealed, so the archive verifies and the edit reaches the
+/// release daemon's own checks.
+fn sealed_release(env: &TestEnv, key: &ed25519_dalek::SigningKey, alter: impl FnOnce(&Path)) -> PathBuf {
+    let release = env.root().join(RELEASE_DIR);
+    setup_release::stage_binaries(&release);
+    let runtimes: Vec<&str> = setup_release::RELEASE_RUNTIMES
+        .iter()
+        .copied()
+        .chain(["hermes"])
+        .collect();
+    setup_release::sign_runtimes(&release, key, &runtimes);
+    alter(&release);
+    setup_release::seal(&release);
+    release
+}
+
+/// Runs `pohunek plugin install --release` against `release` with no daemon.
+fn install_release(env: &TestEnv, release: &Path, extra: &[&str]) -> Output {
+    env.command(bin_exe("pohunek"))
+        .args(["plugin", "install", "--release", path_str(release)])
+        .args(["--runtime", "hermes", "--json"])
+        .args(extra)
+        .output()
+        .expect("run the pohunek binary")
+}
+
+fn json_of(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout is one JSON document ({error}): {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+/// A host without a daemon or a service installs the Hermes package from an
+/// extracted daemon archive; the Hermes integration then installs from it and
+/// its doctor passes `asset_source`.
+#[test]
+fn a_cli_only_host_installs_the_release_package_and_the_integration_uses_it() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let hermes = HermesFixture::new(&env);
+    let release = sealed_release(&env, &test_key(), |_| {});
+    let plugins = env.state_home().join("pohunek/plugins");
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(output.status.success(), "{}", json_of(&output));
+    let document = json_of(&output);
+    assert_eq!(document["ok"]["route"], "offline", "{document:#}");
+    assert_eq!(document["ok"]["packages"][0]["runtime"], "hermes");
+    assert_eq!(document["ok"]["packages"][0]["status"], "present");
+    assert!(plugins.join("registry.json").exists());
+    assert!(
+        !env.config_home().join("pohunek/service.toml").exists(),
+        "no service is installed"
+    );
+
+    let installed = env
+        .command(bin_exe("pohunek"))
+        .args(hermes.install_args())
+        .arg("--json")
+        .output()
+        .expect("run the pohunek binary");
+    assert!(installed.status.success(), "{}", json_of(&installed));
+    let doctor = env
+        .command(bin_exe("pohunek"))
+        .args(hermes.args("doctor"))
+        .arg("--json")
+        .output()
+        .expect("run the pohunek binary");
+    assert_eq!(check(&json_of(&doctor)["ok"], "asset_source").0, "pass");
+}
+
+/// Without `--yes` and without a terminal the run is refused before anything
+/// runs, and nothing is written.
+#[test]
+fn an_offline_release_install_without_consent_changes_nothing() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |_| {});
+
+    let output = install_release(&env, &release, &[]);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        json_of(&output)["err"]["code"],
+        "release_install_consent_required"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// A package archive altered before sealing passes the archive check and is
+/// refused by the release daemon's own catalog digest check.
+#[test]
+fn an_altered_package_archive_is_refused_by_the_release_daemon() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |release| {
+        let archive = release.join("runtime/packages/hermes.tar.zst");
+        let mut bytes = fs::read(&archive).expect("the archive");
+        bytes.push(0);
+        fs::write(&archive, bytes).expect("alter the archive");
+    });
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("hermes")),
+        "{error:#}"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// A catalog altered before sealing fails its signature in the release daemon.
+#[test]
+fn an_altered_catalog_is_refused_by_the_release_daemon() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |release| {
+        let catalog = release.join("runtime/runtime-catalog.json");
+        let text = fs::read_to_string(&catalog).expect("the catalog");
+        let altered = text.replacen("\"sequence\": 1", "\"sequence\": 9", 1);
+        assert_ne!(altered, text, "the fixture alters the catalog");
+        fs::write(&catalog, altered).expect("alter the catalog");
+    });
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        json_of(&output)["err"]["code"],
+        "release_install_blocked"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// A member changed after sealing fails the archive verification, and the
+/// release daemon never runs.
+#[test]
+fn a_package_archive_altered_after_sealing_is_refused_before_anything_runs() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |_| {});
+    let archive = release.join("runtime/packages/hermes.tar.zst");
+    let mut bytes = fs::read(&archive).expect("the archive");
+    bytes.push(0);
+    fs::write(&archive, bytes).expect("alter the archive");
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "setup_blocked", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("failed its verification")),
+        "{error:#}"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// A release of another version than this pohunek is refused before its
+/// daemon plans anything.
+#[test]
+fn a_release_of_another_version_is_refused() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |release| {
+        write_executable(
+            release.join("pohunekd"),
+            "[ \"$1\" = --version ] && echo 'pohunekd 0.0.1'",
+        )
+        .expect("write the other-version daemon");
+    });
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success());
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_blocked", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("does not match this pohunek")),
+        "{error:#}"
+    );
+    assert!(!env.state_home().join("pohunek/plugins").exists());
+}
+
+/// A running daemon owns the registry: the install goes over `package.install`
+/// with the release's own archive and catalog, and no offline step runs.
+#[tokio::test]
+async fn a_running_daemon_installs_the_release_package_over_its_rpc() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let release = harness.env.root().join(RELEASE_DIR);
+    fs::create_dir_all(&release).expect("the release directory");
+    setup_release::sign_runtimes(&release, &key, &["hermes"]);
+
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            "--release",
+            path_str(&release),
+            "--runtime",
+            "hermes",
+            "--yes",
+        ])
+        .await;
+
+    assert_eq!(code, 0, "{installed:#}");
+    assert_eq!(installed["ok"]["package"]["package"]["id"], PACKAGE_ID);
+    let registry = harness.registry();
+    assert!(
+        registry
+            .packages()
+            .iter()
+            .any(|record| record.identity().id.as_str() == PACKAGE_ID),
+        "the daemon recorded the package"
+    );
 }
