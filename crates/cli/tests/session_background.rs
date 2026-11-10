@@ -297,9 +297,9 @@ fn trace_files_under(dir: &Path, found: &mut Vec<PathBuf>) {
 /// been applied before its exchange timed out, and the repeat then advances
 /// the revision and emits one more `background_state`.
 ///
-/// A resent Stop carries the same task list: the items stay the same, the
-/// snapshot's revision and observed time advance, and the daemon applies it
-/// again.
+/// A resent Stop carries the same task list: the same tasks are
+/// listed, the snapshot's revision, observed time and each item's last-seen
+/// time advance, and the daemon applies it again.
 async fn send_hook_until<T, Fut>(
     harness: &Harness,
     id: &str,
