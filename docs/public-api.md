@@ -149,7 +149,8 @@ opening of an attach stream (the entry `kind=attach.stream`, written when the
 stream is redeemed; the keys typed on it are not logged one by one). Read-only
 requests and `session.resize` write none. An entry has `transport` (`remote` or
 `local`), `peer`, `kind`, `session` (the session the request names, the one the result
-creates, or for `session.detach` the one the stream belongs to), `outcome` (`ok`
+creates, or for `session.detach` the one the stream belongs to while the stream is
+pending or active; a detach of an already closed or unknown stream has none), `outcome` (`ok`
 or `error`; an `error` after the input was already written, such as a post-send
 acknowledgement timeout, does not mean it was not delivered), `error_code`, and the
 `claimed_origin_session` / `claimed_origin_daemon` markers the caller declared.

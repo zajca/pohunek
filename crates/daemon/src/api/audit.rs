@@ -94,9 +94,13 @@ pub(crate) fn record_request(
     if !changes_session(request.method()) {
         return;
     }
-    let session = stream_session
-        .map(str::to_owned)
-        .or_else(|| session_of(request, response));
+    // A detach request names only a stream, so its session comes from the
+    // stream alone and never from fields the caller adds to the params.
+    let session = if request.method() == method::SESSION_DETACH {
+        stream_session.map(str::to_owned)
+    } else {
+        session_of(request, response)
+    };
     let error_code = response.result().err().map(|error| error.code.as_str());
     emit(
         Caller::of(state),

@@ -886,6 +886,14 @@ async fn session_changing_requests_are_audited_without_input_text() {
             .await
             .detached
     );
+    // A detach never takes its session from a field the caller adds.
+    let forged = Request::make(
+        "forged-detach",
+        method::SESSION_DETACH,
+        serde_json::json!({ "stream_id": "no-such-stream", "session_id": "forged-session" }),
+    );
+    ok_payload(exchange(&mut control, &forged).await);
+
     // Refused lifecycle requests are audited with the session they named.
     for (id, kind) in [
         ("refused-resume", method::SESSION_RESUME),
@@ -970,11 +978,17 @@ async fn session_changing_requests_are_audited_without_input_text() {
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(refused[0].contains("kind=attach.stream") && refused[0].contains("outcome=error"));
     let detach_entries = entry("session.detach");
-    assert_eq!(detach_entries.len(), 1, "{lines:?}");
+    assert_eq!(detach_entries.len(), 2, "{lines:?}");
     assert!(
         detach_entries[0].contains(&id) && detach_entries[0].contains("outcome=ok"),
         "a detach entry names the session of the stream: {}",
         detach_entries[0]
+    );
+    assert!(
+        !captured_log_lines("audit.session_change")
+            .iter()
+            .any(|line| line.contains("forged-session")),
+        "a detach entry names no session the caller invented"
     );
     for kind in [
         "session.resume",
