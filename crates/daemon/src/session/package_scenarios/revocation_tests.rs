@@ -185,8 +185,9 @@ async fn a_live_session_keeps_running_is_flagged_and_cannot_be_resumed_from_a_re
         session
             .warnings
             .iter()
-            .any(|warning| warning.kind == SessionWarningKind::PackageRevoked
-                && warning.detail.as_deref() == Some(official.first.digest.to_string().as_str())),
+            .any(|warning| warning.kind == SessionWarningKind::Hook
+                && warning.detail.as_deref()
+                    == Some(format!("package_revoked digest={}", official.first.digest).as_str())),
         "the session list flags the session"
     );
     assert!(

@@ -1142,7 +1142,7 @@ read counts as incompatible.
   `package_revoked`. The selection is never moved on its own: run `pohunek
   plugin select` for another installed version, or install a release that
   carries a new package. A session already running from the digest keeps
-  running; `session list` flags it with a `package_revoked` warning and `plugin
+  running; `session list` flags it with a `hook` warning (`detail` `package_revoked digest=<digest>`) and `plugin
   doctor` reports the package as `revoked`. Packages installed by explicit
   digest or linked are not affected. `integration doctor --agent hermes`
   reports the revoked Hermes package in its `asset_source` check.

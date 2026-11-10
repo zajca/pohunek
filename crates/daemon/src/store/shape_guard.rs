@@ -724,7 +724,7 @@ fn persisted_enums() -> Vec<EnumEntry> {
         own("session.info.warnings[].kind"),
         unit_values!(
             SessionWarningKind: Fetch, BaseBranchFallback, SetupScript, Hook, NativeRecovery,
-            BranchAheadOfRemote, PackageRevoked; skip Unknown
+            BranchAheadOfRemote; skip Unknown
         ),
     );
     add(

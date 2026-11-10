@@ -1663,6 +1663,7 @@ pub(super) struct PinResolutions {
         Result<Arc<RuntimeDefinition>, ProtocolError>,
     )>,
     newer_official: Vec<(LaunchBinding, PackageId, PackageDigest, bool)>,
+    revocations: Vec<(PackageDigest, Result<(), ProtocolError>)>,
 }
 
 impl PinResolutions {
@@ -1707,6 +1708,30 @@ impl PinResolutions {
         pins
     }
 
+    /// [`RuntimeHost::ensure_not_revoked`], which reads the registry record and
+    /// the revocation file, once per package digest.
+    fn not_revoked(
+        &mut self,
+        runtimes: &RuntimeHost,
+        definition: &RuntimeDefinition,
+    ) -> Result<(), ProtocolError> {
+        let BindingProvenance::Package { package_digest, .. } = &definition.binding().provenance
+        else {
+            return Ok(());
+        };
+        if let Some((_, verdict)) = self
+            .revocations
+            .iter()
+            .find(|(digest, _)| digest == package_digest)
+        {
+            return verdict.clone();
+        }
+        let verdict = runtimes.ensure_not_revoked(definition);
+        self.revocations
+            .push((package_digest.clone(), verdict.clone()));
+        verdict
+    }
+
     fn pinned(
         &mut self,
         runtimes: &RuntimeHost,
@@ -1738,16 +1763,17 @@ pub(super) fn recovery_definition_memo(
     let runtimes = profiles.runtimes();
     if let Some(adopter) = resolutions.adopter(runtimes, binding) {
         // A revoked adopter is skipped: the session's own frozen digest is
-        // judged next, and a revocation of either refuses the relaunch.
+        // judged next, and only a revocation of that digest refuses the
+        // relaunch.
         if newer_adoption_holds(profiles, binding, &adopter)
-            && runtimes.ensure_not_revoked(&adopter).is_ok()
+            && resolutions.not_revoked(runtimes, &adopter).is_ok()
         {
             return Ok(adopter);
         }
     }
     let definition = resolutions.pinned(runtimes, binding)?;
     recovery_contract(binding, &definition)?;
-    runtimes.ensure_not_revoked(&definition)?;
+    resolutions.not_revoked(runtimes, &definition)?;
     Ok(definition)
 }
 

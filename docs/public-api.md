@@ -563,7 +563,7 @@ relaunch of a stored session, no `package.select`, no enabling and no
 `package.bind_profile`: each fails with `package_revoked`, and the selection is
 never moved to another version on its own. A session already running from the
 digest keeps running and stays controllable; `session.list` flags it with a
-`package_revoked` warning and `package.doctor` reports the package as
+`hook` warning whose `detail` starts with `package_revoked` and `package.doctor` reports the package as
 `revoked`. A revocation file that cannot be read fails closed for official
 packages (`runtime_incompatible` at launch) and is never replaced.
 
@@ -1936,9 +1936,9 @@ Important fields:
   `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup,
   and `branch_ahead_of_remote` for a `branch_source: "remote"` session whose
   local branch is ahead of `origin` (`detail` is `local=<commit> remote=<commit>`).
-  `package_revoked` is added by `session.list` (not stored) to a session
-  launched from a package digest that a recorded catalog revoked; `detail` is
-  that digest. The session keeps running and stays controllable, but cannot be
+  `session.list` (not the stored record) adds a `hook`-kind warning to a
+  session launched from a package digest that a recorded catalog revoked; its
+  `detail` is `package_revoked digest=<digest>`. The session keeps running and stays controllable, but cannot be
   resumed or relaunched from the digest.
   `base_branch_fallback` marks a requested base branch that was not used
   because the session's `branch` already existed locally at another commit and

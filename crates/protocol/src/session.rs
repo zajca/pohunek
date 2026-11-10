@@ -2834,10 +2834,6 @@ pub enum SessionWarningKind {
     /// is ahead of `origin/<branch>`, so commits not on the remote are in the
     /// worktree. The `detail` names both heads.
     BranchAheadOfRemote,
-    /// The package the session was launched from carries a digest that a
-    /// recorded catalog revoked. A running session keeps running; it cannot be
-    /// resumed or relaunched from that digest. The `detail` names the digest.
-    PackageRevoked,
     /// A kind this build does not know, sent by a newer daemon. Decoding a
     /// [`SessionInfo`] drops warnings of this kind, and serializing it fails,
     /// so it never reaches a display or a re-emitted document.

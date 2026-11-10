@@ -121,7 +121,9 @@ impl Registry {
     /// [`RegistryError::TooManyRevokedKeys`] when the union would exceed
     /// [`MAX_REVOKED_KEYS`] ids and [`RegistryError::TooManyRevokedDigests`]
     /// when the digest union would exceed the digest cap; both files are
-    /// unchanged on every error except [`RegistryError::CommitUncertain`].
+    /// unchanged on those errors. A failed write of the state file after the
+    /// digests file was written leaves the digests recorded, which only
+    /// tightens trust.
     pub fn record_catalog(
         &self,
         verified: &VerifiedCatalog,

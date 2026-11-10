@@ -975,7 +975,7 @@ fn prepare_archive(
             let index_state = registry
                 .index_state()
                 .map_err(|error| registry_kind(&error))?;
-            prepare_indexed(
+            let prepared = prepare_indexed(
                 &IndexTrustInputs {
                     anchor,
                     endorser,
@@ -984,8 +984,12 @@ fn prepare_archive(
                 },
                 path,
                 index_path,
-            )
-            .map(|prepared| Candidate::Runtime(Box::new(prepared)))
+            )?;
+            if revocation::revoked_set(context)?.contains(&prepared.digest) {
+                warn!("a package archive was refused: a recorded catalog revoked its digest");
+                return Err(PackageErrorKind::Revoked);
+            }
+            Ok(Candidate::Runtime(Box::new(prepared)))
         }
     }
 }
