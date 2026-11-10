@@ -126,16 +126,19 @@ fn emit(
         Caller::Local { pid, uid } => format!("pid={pid} uid={uid}"),
         Caller::LocalUnattested => "unattested".to_owned(),
     };
+    let session = session.map(bounded);
+    let origin_session = origin_session.map(bounded);
+    let origin_daemon = origin_daemon.map(bounded);
     info!(
         target: AUDIT_TARGET,
         transport = %caller.transport(),
         peer = %peer,
         kind = %kind,
-        session = ?session.map(bounded),
+        session = session.as_deref(),
         outcome = %outcome,
-        error_code = ?error_code,
-        claimed_origin_session = ?origin_session.map(bounded),
-        claimed_origin_daemon = ?origin_daemon.map(bounded),
+        error_code,
+        claimed_origin_session = origin_session.as_deref(),
+        claimed_origin_daemon = origin_daemon.as_deref(),
         "session change request"
     );
 }

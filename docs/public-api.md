@@ -157,8 +157,10 @@ attested identity, and a browser reaching the daemon through a WebSocket relay
 appears as the relay's address. On the local socket `peer` is the kernel-attested
 `pid` and `uid` of the connecting process, or `unattested` without one. The
 claimed origin markers are declared by the caller and are not verified. An entry
-never contains input text, keys, environment values, or attach stream ids. To
-find who answered a dialog, filter the daemon log for `audit.session_change`
+never contains input text, keys, environment values, or attach stream ids. The
+entries are written at `info` level through the daemon's non-blocking log
+writer, so a log filter below `info` for this target drops them, and a saturated
+writer can lose lines. To find who answered a dialog, filter the daemon log for `audit.session_change`
 and the session id.
 
 The local runtime path is a shared host/client contract, not a wire-protocol

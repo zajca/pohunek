@@ -946,8 +946,8 @@ async fn session_changing_requests_are_audited_without_input_text() {
         input_entries[1]
     );
     assert!(
-        input_entries[2].contains("claimed_origin_session=Some(\"s-claimed-origin\")")
-            && input_entries[2].contains("claimed_origin_daemon=Some(\"daemon-claimed-origin\")"),
+        input_entries[2].contains("claimed_origin_session=\"s-claimed-origin\"")
+            && input_entries[2].contains("claimed_origin_daemon=\"daemon-claimed-origin\""),
         "{}",
         input_entries[2]
     );
