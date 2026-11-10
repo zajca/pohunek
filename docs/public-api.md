@@ -140,6 +140,27 @@ The daemon exposes the same protocol on two transports:
 | Local | Unix socket at the configured runtime path | Owner-only socket directory and mode |
 | Remote | One TCP listener per configured overlay, bound to that provider's validated local member address and port, which must also be the address the provider reports at bind time. The provider and the port come from the owner-private `overlays.toml` (see "Overlay configuration" below); without the file the host works over NetBird on port 18722 | Overlay reachability and provider policy. NetBird is the default provider and Tailscale a supported opt-in provider. The listener authenticates nothing beyond overlay reachability, so the overlay's policy (NetBird policies, tailnet ACLs) is the access control |
 
+**Audit log.** Every request that changes a session writes one `info` entry on
+the `audit.session_change` tracing target of the daemon log: `session.new`,
+`session.stop`, `session.resume`, `session.remove`,
+`session.remove_accepting_unconfirmed`, `session.input`, `session.detach`,
+`session.set_metadata`, `session.rename`, `session.retention.sweep`, and the
+opening of an attach stream (the entry `kind=attach.stream`, written when the
+stream is redeemed; the keys typed on it are not logged one by one). Read-only
+requests and `session.resize` write none. An entry has `transport` (`remote` or
+`local`), `peer`, `kind`, `session` (when the request names one or the result
+creates it), `outcome` (`ok` or `error`), `error_code`, and the
+`claimed_origin_session` / `claimed_origin_daemon` markers the caller declared.
+On the remote transport `peer` is the TCP address of the overlay connection; the
+listener has no client authentication of its own, so that address is the only
+attested identity, and a browser reaching the daemon through a WebSocket relay
+appears as the relay's address. On the local socket `peer` is the kernel-attested
+`pid` and `uid` of the connecting process, or `unattested` without one. The
+claimed origin markers are declared by the caller and are not verified. An entry
+never contains input text, keys, environment values, or attach stream ids. To
+find who answered a dialog, filter the daemon log for `audit.session_change`
+and the session id.
+
 The local runtime path is a shared host/client contract, not a wire-protocol
 field. A valid absolute `XDG_RUNTIME_DIR` resolves the application root to
 `$XDG_RUNTIME_DIR/pohunek` on Linux and macOS. Linux fails fast when it is
