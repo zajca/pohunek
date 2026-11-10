@@ -123,18 +123,18 @@ impl Registry {
     /// Returns [`RegistryError::Corrupt`], [`RegistryError::UnsupportedSchema`]
     /// or [`RegistryError::Unsafe`] when the file is not usable.
     pub fn revoked_digests(&self) -> Result<RevokedDigests, RegistryError> {
-        let bytes = match self.root.read_file(
-            REVOKED_DIGESTS_NAME,
-            FILE_MODE,
-            MAX_REVOKED_DIGESTS_BYTES,
-        ) {
-            Ok(bytes) => bytes,
-            Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => {
-                return Ok(RevokedDigests::default());
-            }
-            Err(FsError::FileTooLarge { .. }) => return Err(RegistryError::Corrupt),
-            Err(error) => return Err(registry_fs(&error)),
-        };
+        let bytes =
+            match self
+                .root
+                .read_file(REVOKED_DIGESTS_NAME, FILE_MODE, MAX_REVOKED_DIGESTS_BYTES)
+            {
+                Ok(bytes) => bytes,
+                Err(error) if error.io_kind() == Some(ErrorKind::NotFound) => {
+                    return Ok(RevokedDigests::default());
+                }
+                Err(FsError::FileTooLarge { .. }) => return Err(RegistryError::Corrupt),
+                Err(error) => return Err(registry_fs(&error)),
+            };
         parse_revoked(&bytes)
     }
 
@@ -175,7 +175,10 @@ fn parse_revoked(bytes: &[u8]) -> Result<RevokedDigests, RegistryError> {
     }
     let file: RevokedFile =
         serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
-    let ordered = file.revoked_digests.windows(2).all(|pair| pair[0] < pair[1]);
+    let ordered = file
+        .revoked_digests
+        .windows(2)
+        .all(|pair| pair[0] < pair[1]);
     if file.revoked_digests.len() > MAX_REVOKED_DIGESTS_TOTAL || !ordered {
         return Err(RegistryError::Corrupt);
     }

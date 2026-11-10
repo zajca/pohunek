@@ -114,7 +114,7 @@ impl SessionRegistry {
                             package,
                             package_digest,
                         } => Some((info.id.clone(), package.clone(), package_digest.clone())),
-                        _ => None,
+                        BindingProvenance::Builtin { .. } => None,
                     }
                 })
                 .collect()

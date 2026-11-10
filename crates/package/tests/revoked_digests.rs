@@ -161,24 +161,24 @@ fn the_catalog_state_stays_a_schema_one_file_for_a_rollback() {
     // any other key or schema.
     let text = std::fs::read_to_string(state_file(&fixture)).unwrap();
     assert_eq!(
-        text,
-        "{\"schema\":1,\"high_water\":7,\"revoked_key_ids\":[]}",
+        text, "{\"schema\":1,\"high_water\":7,\"revoked_key_ids\":[]}",
         "the state file keeps the shape the previous release parses"
     );
     assert!(
         !text.contains("revoked_digests"),
         "no digest leaks into the schema 1 file"
     );
-    assert_eq!(fixture.open().catalog_state().unwrap().high_water(), Some(7));
+    assert_eq!(
+        fixture.open().catalog_state().unwrap().high_water(),
+        Some(7)
+    );
 }
 
 #[test]
 fn a_damaged_revocation_file_is_reported_and_never_replaced() {
     let fixture = PluginFixture::new();
     let registry = fixture.open();
-    registry
-        .record_catalog(&verified(1, &['a', 'b']))
-        .unwrap();
+    registry.record_catalog(&verified(1, &['a', 'b'])).unwrap();
     let good = std::fs::read_to_string(revoked_file(&fixture)).unwrap();
     let low = digest('a').to_string();
     let high = digest('b').to_string();

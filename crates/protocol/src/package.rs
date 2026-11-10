@@ -133,6 +133,10 @@ pub struct PackageSelectionBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "PackageInfo.ts"))]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the wire form reports independent facts about one installed package"
+)]
 pub struct PackageInfo {
     /// Digest of the package archive, its content address.
     pub digest: PackageDigest,

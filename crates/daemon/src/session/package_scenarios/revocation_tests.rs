@@ -272,10 +272,7 @@ async fn a_revoked_digest_stays_revoked_across_a_restart_and_a_later_catalog_tha
 
     let relisted = signed_by(
         &official.key,
-        catalog(
-            3,
-            vec![entry(&official.first, PACKAGE, RUNTIME, "1.0.0")],
-        ),
+        catalog(3, vec![entry(&official.first, PACKAGE, RUNTIME, "1.0.0")]),
     );
     let mut install = catalog_install(&official.fixture, &official.first, &relisted, false);
     install.select = false;
@@ -312,7 +309,10 @@ async fn a_package_the_owner_trusts_by_digest_is_not_revoked_by_a_catalog() {
         .expect("install by explicit digest");
 
     let other = Package::build("acme.runtime.other", "1.0.0", "other", &script);
-    let mut body = catalog(1, vec![entry(&other, "acme.runtime.other", "other", "1.0.0")]);
+    let mut body = catalog(
+        1,
+        vec![entry(&other, "acme.runtime.other", "other", "1.0.0")],
+    );
     body.revoked_digests = vec![local.digest.clone()];
     let document = signed_by(&key, body);
     fixture

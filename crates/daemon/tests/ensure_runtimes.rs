@@ -7290,9 +7290,13 @@ fn a_recorded_release_catalog_persists_the_digests_it_revokes() {
 
     assert_eq!(report.catalog, CatalogStatus::Recorded);
     assert!(report.refusals.is_empty(), "{:?}", report.refusals);
-    let registry = package::registry::Registry::open_at(&host.plugins_dir(), package::Limits::DEFAULT)
-        .expect("the registry the step created");
-    assert!(registry.revoked_digests().expect("revoked digests").contains(&revoked));
+    let registry =
+        package::registry::Registry::open_at(&host.plugins_dir(), package::Limits::DEFAULT)
+            .expect("the registry the step created");
+    assert!(registry
+        .revoked_digests()
+        .expect("revoked digests")
+        .contains(&revoked));
 }
 
 /// A daemon that holds the instance lock owns the registry: the request is
