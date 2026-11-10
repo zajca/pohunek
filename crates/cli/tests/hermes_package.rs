@@ -3566,6 +3566,74 @@ fn the_release_install_previews_and_reports_the_profile_pin_it_applies() {
         .contains("digest"));
 }
 
+/// The text result names the profile the step bound, as the JSON result does.
+#[test]
+fn the_text_result_of_the_release_install_names_the_bound_profile() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let profiles = env.config_home().join("pohunek/agents");
+    fs::create_dir_all(&profiles).expect("profiles directory");
+    fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700)).expect("owner-only");
+    let profile = profiles.join("hermes-official.toml");
+    fs::write(&profile, "base = \"hermes\"\n").expect("profile");
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).expect("owner-only");
+    let release = sealed_release(&env, &test_key(), |_| {});
+
+    let output = env
+        .command(bin_exe("pohunek"))
+        .args(["plugin", "install", "--release", path_str(&release)])
+        .args(["--runtime", "hermes", "--yes"])
+        .output()
+        .expect("run the pohunek binary");
+
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.lines().any(
+            |line| line.starts_with("installed: profile hermes-official (hermes)")
+                && line.ends_with("bound")
+        ),
+        "{text}"
+    );
+}
+
+/// A release daemon whose apply reports another catalog trust state than the
+/// preview promised is an incomplete install, not a success.
+#[test]
+fn an_apply_that_leaves_another_catalog_state_than_previewed_is_incomplete() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let release = sealed_release(&env, &test_key(), |release| {
+        // Wraps the release daemon so that an apply reports the catalog as
+        // already current instead of recorded.
+        let daemon = release.join("pohunekd");
+        let real = release.join("pohunekd.real");
+        fs::rename(&daemon, &real).expect("move the daemon aside");
+        fs::write(
+            &daemon,
+            "#!/bin/sh\nreal=\"${0%/*}/pohunekd.real\"\n\
+             case \"$*\" in\n\
+             *ensure-official-runtimes*--dry-run*) exec \"$real\" \"$@\" ;;\n\
+             *ensure-official-runtimes*) \"$real\" \"$@\" | sed 's/\"catalog\": *\"recorded\"/\"catalog\":\"current\"/' ;;\n\
+             *) exec \"$real\" \"$@\" ;;\n\
+             esac\n",
+        )
+        .expect("write the wrapper");
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).expect("executable");
+    });
+
+    let output = install_release(&env, &release, &["--yes"]);
+
+    assert!(!output.status.success(), "{}", json_of(&output));
+    let error = json_of(&output)["err"].clone();
+    assert_eq!(error["code"], "release_install_incomplete", "{error:#}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .expect("message")
+            .contains("catalog trust state"),
+        "{error:#}"
+    );
+}
+
 /// A daemon that holds the instance lock without answering its socket owns
 /// the registry: the apply is refused as a blocked install, not as an
 /// incomplete one, and nothing is written.

@@ -234,8 +234,8 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
     ensure_no_refusal(&applied.refusals)?;
     if !matches_preview(&plan, &applied) {
         return Err(CliError::ReleaseInstallIncomplete {
-            detail: "the apply changed packages or profiles other than the previewed ones; \
-                     inspect `pohunek plugin list` and the host profiles"
+            detail: "the apply changed packages, profiles or the catalog trust state other than \
+                     the previewed ones; inspect `pohunek plugin list` and the host profiles"
                 .to_owned(),
         });
     }
@@ -270,7 +270,9 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
         };
         print!("{}", render_json(&result)?);
     } else {
-        print!("{}", render(&verdict, "installed"));
+        let mut shown = verdict;
+        shown.profiles = applied.profiles;
+        print!("{}", render(&shown, "installed"));
     }
     Ok(())
 }
@@ -316,7 +318,7 @@ fn refuse_unless_installable(plan: &EnsureReport, runtime: &RuntimeId) -> Result
 }
 
 /// Whether the apply changed exactly the packages and profiles the plan
-/// showed.
+/// showed and left the catalog trust state the plan said it would record.
 fn matches_preview(plan: &EnsureReport, applied: &EnsureReport) -> bool {
     let packages = |report: &EnsureReport, status: PackageStatus| -> BTreeSet<(String, String)> {
         report
@@ -340,8 +342,13 @@ fn matches_preview(plan: &EnsureReport, applied: &EnsureReport) -> bool {
             .map(|profile| (profile.name.clone(), profile.digest.clone()))
             .collect()
     };
+    let catalog = match plan.catalog {
+        CatalogStatus::Record => CatalogStatus::Recorded,
+        other => other,
+    };
     packages(plan, PackageStatus::Install) == packages(applied, PackageStatus::Installed)
         && profiles(plan, false) == profiles(applied, true)
+        && applied.catalog == catalog
 }
 
 /// Fails an apply or a verdict that carries refusals.
