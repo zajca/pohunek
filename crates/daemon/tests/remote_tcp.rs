@@ -886,6 +886,21 @@ async fn session_changing_requests_are_audited_without_input_text() {
             .await
             .detached
     );
+    // Refused lifecycle requests are audited with the session they named.
+    for (id, kind) in [
+        ("refused-resume", method::SESSION_RESUME),
+        ("refused-remove", method::SESSION_REMOVE),
+        (
+            "refused-remove-accepting",
+            method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
+        ),
+    ] {
+        let refused = Request::make(id, kind, serde_json::json!("ghost-session"));
+        exchange(&mut control, &refused)
+            .await
+            .result()
+            .expect_err("a request for an unknown session is refused");
+    }
 
     // The origin markers a caller declares are logged as claimed, not attested.
     let claimed = Request::make(
@@ -954,6 +969,27 @@ async fn session_changing_requests_are_audited_without_input_text() {
     let refused = audit_lines(&bogus_peer);
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(refused[0].contains("kind=attach.stream") && refused[0].contains("outcome=error"));
+    let detach_entries = entry("session.detach");
+    assert_eq!(detach_entries.len(), 1, "{lines:?}");
+    assert!(
+        detach_entries[0].contains(&id) && detach_entries[0].contains("outcome=ok"),
+        "a detach entry names the session of the stream: {}",
+        detach_entries[0]
+    );
+    for kind in [
+        "session.resume",
+        "session.remove",
+        "session.remove_accepting_unconfirmed",
+    ] {
+        let refused = entry(kind);
+        assert_eq!(refused.len(), 1, "{kind}: {lines:?}");
+        assert!(
+            refused[0].contains("session=\"ghost-session\"")
+                && refused[0].contains("outcome=error"),
+            "{}",
+            refused[0]
+        );
+    }
     assert_eq!(entry("session.stop").len(), 1, "{lines:?}");
     assert!(
         entry("session.inspect").is_empty(),
@@ -998,6 +1034,30 @@ async fn local_session_changing_requests_are_audited_with_the_peer_process() {
     assert_eq!(local_entry.len(), 1, "{local_entry:?}");
     assert!(local_entry[0].contains("transport=local"));
     assert!(local_entry[0].contains(&format!("pid={}", std::process::id())));
+    assert!(local_entry[0].contains(&format!("uid={}", rustix::process::geteuid().as_raw())));
+
+    let refused = Request::make(
+        "local-refused-input",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: SessionId("local-ghost".to_owned()),
+            text: "true\n".to_owned(),
+            wait: None,
+        })
+        .expect("serialize input params"),
+    );
+    exchange(&mut local, &refused)
+        .await
+        .result()
+        .expect_err("input to an unknown session is refused");
+    let refused_entry = captured_log_lines("audit.session_change")
+        .into_iter()
+        .filter(|line| line.contains("local-ghost"))
+        .collect::<Vec<_>>();
+    assert_eq!(refused_entry.len(), 1, "{refused_entry:?}");
+    assert!(
+        refused_entry[0].contains("transport=local") && refused_entry[0].contains("outcome=error")
+    );
 
     let _ = shutdown.send(());
     let _ = handle.await;

@@ -81,11 +81,22 @@ fn changes_session(method: &str) -> bool {
 }
 
 /// Writes the audit entry of a finished request when it changes a session.
-pub(crate) fn record_request(request: &Request, response: &Response, state: &DaemonState) {
+///
+/// `stream_session` is the session of the attach stream a `session.detach`
+/// request names, resolved by the caller because the request carries only the
+/// stream id.
+pub(crate) fn record_request(
+    request: &Request,
+    response: &Response,
+    state: &DaemonState,
+    stream_session: Option<&str>,
+) {
     if !changes_session(request.method()) {
         return;
     }
-    let session = session_of(request, response);
+    let session = stream_session
+        .map(str::to_owned)
+        .or_else(|| session_of(request, response));
     let error_code = response.result().err().map(|error| error.code.as_str());
     emit(
         Caller::of(state),
@@ -146,9 +157,17 @@ fn emit(
 /// The session a request addressed: from its params, else from a successful result.
 fn session_of(request: &Request, response: &Response) -> Option<String> {
     let params = request.params();
-    let from_params = params
-        .as_str()
-        .or_else(|| params.get("session_id").and_then(serde_json::Value::as_str));
+    // Only these methods take the session id as the bare params value.
+    let bare = matches!(
+        request.method(),
+        method::SESSION_STOP
+            | method::SESSION_RESUME
+            | method::SESSION_REMOVE
+            | method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+    )
+    .then(|| params.as_str())
+    .flatten();
+    let from_params = bare.or_else(|| params.get("session_id").and_then(serde_json::Value::as_str));
     from_params
         .or_else(|| {
             response

@@ -148,8 +148,10 @@ the `audit.session_change` tracing target of the daemon log: `session.new`,
 opening of an attach stream (the entry `kind=attach.stream`, written when the
 stream is redeemed; the keys typed on it are not logged one by one). Read-only
 requests and `session.resize` write none. An entry has `transport` (`remote` or
-`local`), `peer`, `kind`, `session` (when the request names one or the result
-creates it), `outcome` (`ok` or `error`), `error_code`, and the
+`local`), `peer`, `kind`, `session` (the session the request names, the one the result
+creates, or for `session.detach` the one the stream belongs to), `outcome` (`ok`
+or `error`; an `error` after the input was already written, such as a post-send
+acknowledgement timeout, does not mean it was not delivered), `error_code`, and the
 `claimed_origin_session` / `claimed_origin_daemon` markers the caller declared.
 On the remote transport `peer` is the TCP address of the overlay connection; the
 listener has no client authentication of its own, so that address is the only
@@ -157,7 +159,8 @@ attested identity, and a browser reaching the daemon through a WebSocket relay
 appears as the relay's address. On the local socket `peer` is the kernel-attested
 `pid` and `uid` of the connecting process, or `unattested` without one. The
 claimed origin markers are declared by the caller and are not verified. An entry
-never contains input text, keys, environment values, or attach stream ids. The
+never contains input text, keys, environment values, or attach stream ids. An entry is written when the request finishes, so a waited input is logged after
+its wait and entries can be out of delivery order. The
 entries are written at `info` level through the daemon's non-blocking log
 writer, so a log filter below `info` for this target drops them, and a saturated
 writer can lose lines. To find who answered a dialog, filter the daemon log for `audit.session_change`

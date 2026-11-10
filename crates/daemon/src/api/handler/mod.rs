@@ -300,8 +300,23 @@ pub(crate) async fn dispatch_line(
         }
     };
 
+    // A detach request names only the stream; its session is read before the
+    // request ends the stream.
+    let detached_session = if request.method() == method::SESSION_DETACH {
+        match serde_json::from_value::<protocol::SessionDetachParams>(request.params().clone()) {
+            Ok(params) => state.sessions.attach_session_id(&params.stream_id).await,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let resp = handle_request(&request, state).await;
-    audit::record_request(&request, &resp, state);
+    audit::record_request(
+        &request,
+        &resp,
+        state,
+        detached_session.as_ref().map(|id| id.0.as_str()),
+    );
     if request.method() == method::SUBSCRIBE && resp.is_ok() {
         let version = resp.version();
         return Dispatch::Subscribe(serialize_response(&resp), version);
