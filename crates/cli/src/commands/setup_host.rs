@@ -1435,7 +1435,10 @@ fn hook_lines(hooks: &[IntegrationReinstall], status: &str) -> Vec<String> {
 /// Returns [`CliError::SetupBlocked`] with the verifier's reason when the
 /// archive is refused or the verifier cannot run. A directory that is not a
 /// sealed archive returns `None`.
-pub(crate) async fn verify_sealed_archive(staged: &Path, uid: u32) -> Result<Option<SealedRelease>, CliError> {
+pub(crate) async fn verify_sealed_archive(
+    staged: &Path,
+    uid: u32,
+) -> Result<Option<SealedRelease>, CliError> {
     use std::os::unix::fs::MetadataExt as _;
 
     let blocked = |detail: String| CliError::SetupBlocked { detail };

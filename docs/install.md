@@ -407,6 +407,34 @@ The trust model and the package classes are described
 in [the architecture](architecture.md#runtime-packages-and-trust) and the
 [runtime packages guide](knowledge/guides/runtime-packages.md).
 
+## CLI-only host: the Hermes package without a daemon
+
+A host that runs only the `pohunek` CLI against a remote daemon installs no
+service. The Hermes operator plugin still needs the official
+`pohunek.runtime.hermes` package in the local package registry, because the CLI
+carries no copy of the payload. Install it from the extracted daemon archive of
+the same version as the CLI, without `service install`:
+
+```bash
+tar -xf pohunek-daemon-<version>-<target>.tar.zst -C ~/pohunek-release
+export PATH="$HOME/pohunek-release/pohunek-daemon-<version>-<target>:$PATH"
+pohunek plugin install --release ~/pohunek-release/pohunek-daemon-<version>-<target> --runtime hermes --yes
+pohunek integration install --agent hermes --hermes-profile default --access-mode manage --allow-host local
+```
+
+With no daemon answering, the command verifies the sealed archive, checks that
+its `pohunekd` has this CLI's version, and runs that `pohunekd` once to verify
+the signed catalog (anchor, revocations, freshness, digest) and record the
+package. `pohunekd` and `pohunek-sessiond` stay on disk and are never run as a
+service. `XDG_RUNTIME_DIR` must be set on Linux. If a daemon is installed on
+the host later, it reads the same registry; the two never write it at once,
+because the one-shot step and the daemon take the same locks.
+
+To upgrade, extract the next archive, put its `pohunek` on `PATH`, run the same
+`plugin install --release ... --yes`, then `pohunek integration update --agent
+hermes`. The new version is selected and the old one stays installed for
+`pohunek plugin select`.
+
 ## Install the assistant package
 
 `pohunek assistant` reads its knowledge bundle from the context package

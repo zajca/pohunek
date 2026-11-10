@@ -92,7 +92,16 @@ pub(super) async fn run(args: &InstallArgs) -> Result<(), CliError> {
             let ingest = Ingest::Install {
                 enable: !args.no_enable,
             };
-            ingest_package(&mut client, &source, ingest, None, None, args.yes, args.json).await
+            ingest_package(
+                &mut client,
+                &source,
+                ingest,
+                None,
+                None,
+                args.yes,
+                args.json,
+            )
+            .await
         }
         Err(CliError::DaemonUnreachable { source, .. }) if no_daemon(&source) => {
             offline(args, Path::new(&dir), runtime).await
@@ -137,7 +146,9 @@ async fn offline(args: &InstallArgs, dir: &Path, runtime: &RuntimeId) -> Result<
             ))
         })?;
     let search_path = std::env::var("PATH").map_err(|_unset| {
-        blocked("PATH is not set to valid UTF-8, so the release step cannot judge the agent".to_owned())
+        blocked(
+            "PATH is not set to valid UTF-8, so the release step cannot judge the agent".to_owned(),
+        )
     })?;
     let steps = DaemonRuntimes::default();
     let requested = std::slice::from_ref(runtime);

@@ -401,7 +401,6 @@ fn parse_runtime_id(value: &str) -> Result<RuntimeId, String> {
 }
 
 /// Parse an archive digest: `sha256:<64 hex>` or the bare 64 hex characters.
-
 pub(super) fn parse_archive_digest(value: &str) -> Result<PackageDigest, String> {
     let hex = value.strip_prefix(DIGEST_PREFIX).unwrap_or(value);
     PackageDigest::parse(&format!("{DIGEST_PREFIX}{hex}")).map_err(|_malformed| {

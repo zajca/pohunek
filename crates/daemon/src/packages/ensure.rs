@@ -229,6 +229,12 @@ impl Uses {
         }
     }
 
+    fn add_all(&mut self, runtimes: &[RuntimeId], reason: UseReason) {
+        for runtime in runtimes {
+            self.add(runtime, reason);
+        }
+    }
+
     /// Makes `runtime` one the plan judges, without a reason of its own.
     fn touch(&mut self, runtime: &RuntimeId) {
         self.0
@@ -661,12 +667,8 @@ fn compute(inputs: &EnsureInputs, detect: bool) -> Result<Computed, EnsureError>
         pinned,
         official,
     } = gather(inputs, launch, &profiles, &managed, &mut report)?;
-    for runtime in &managed {
-        uses.add(runtime, UseReason::Installed);
-    }
-    for runtime in &inputs.requested {
-        uses.add(runtime, UseReason::Requested);
-    }
+    uses.add_all(&managed, UseReason::Installed);
+    uses.add_all(&inputs.requested, UseReason::Requested);
     let catalog = catalog_plan(release.as_ref(), &catalog_state);
     report.catalog = catalog.status;
     if detect {

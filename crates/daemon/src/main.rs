@@ -81,8 +81,8 @@ use pohunek_service_config::runtimes::{
     DETECT_FLAG, DRY_RUN_FLAG, ENSURE_REPORT_VERSION, ENSURE_RUNTIMES_ARG, RELEASE_RUNTIME_DIR,
     RUNTIME_FLAG,
 };
-use protocol::RuntimeId;
 use pohunek_service_config::{InputTiming, ServiceConfig, WaitTiming, RUNTIME_DROP_BOUND};
+use protocol::RuntimeId;
 
 /// File name of the unified logical-session metadata store under the data dir.
 const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
@@ -456,8 +456,9 @@ fn parse_ensure_options(
             })?);
         } else if flag.as_os_str() == OsStr::new(RUNTIME_FLAG) {
             let value = value(RUNTIME_FLAG)?;
-            let runtime = RuntimeId::parse(value)
-                .map_err(|_| format!("{RUNTIME_FLAG} takes a runtime id, not `{value}`"))?;
+            let runtime = RuntimeId::parse(value).map_err(|_malformed| {
+                format!("{RUNTIME_FLAG} takes a runtime id, not `{value}`")
+            })?;
             if !requested.contains(&runtime) {
                 requested.push(runtime);
             }

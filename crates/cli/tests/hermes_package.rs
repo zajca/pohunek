@@ -3232,7 +3232,11 @@ const RELEASE_DIR: &str = "release";
 /// the release runtimes, signed by `key`. `alter` edits the staged tree
 /// before it is sealed, so the archive verifies and the edit reaches the
 /// release daemon's own checks.
-fn sealed_release(env: &TestEnv, key: &ed25519_dalek::SigningKey, alter: impl FnOnce(&Path)) -> PathBuf {
+fn sealed_release(
+    env: &TestEnv,
+    key: &ed25519_dalek::SigningKey,
+    alter: impl FnOnce(&Path),
+) -> PathBuf {
     let release = env.root().join(RELEASE_DIR);
     setup_release::stage_binaries(&release);
     let runtimes: Vec<&str> = setup_release::RELEASE_RUNTIMES
@@ -3363,10 +3367,7 @@ fn an_altered_catalog_is_refused_by_the_release_daemon() {
     let output = install_release(&env, &release, &["--yes"]);
 
     assert!(!output.status.success());
-    assert_eq!(
-        json_of(&output)["err"]["code"],
-        "release_install_blocked"
-    );
+    assert_eq!(json_of(&output)["err"]["code"], "release_install_blocked");
     assert!(!env.state_home().join("pohunek/plugins").exists());
 }
 

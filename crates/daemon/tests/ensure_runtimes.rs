@@ -7123,8 +7123,11 @@ fn an_altered_release_catalog_is_refused_and_nothing_is_recorded() {
     host.publish(&[REQUESTED]);
     let catalog = host.release_dir().join("runtime-catalog.json");
     let text = fs::read_to_string(&catalog).expect("the catalog");
-    fs::write(&catalog, text.replacen("\"sequence\": 1", "\"sequence\": 9", 1))
-        .expect("alter the catalog");
+    fs::write(
+        &catalog,
+        text.replacen("\"sequence\": 1", "\"sequence\": 9", 1),
+    )
+    .expect("alter the catalog");
     assert_ne!(
         fs::read_to_string(&catalog).expect("the catalog"),
         text,
@@ -7214,9 +7217,16 @@ fn a_key_revoked_by_an_earlier_catalog_cannot_sign_a_later_one() {
     .to_bytes()
     .expect("anchor bytes");
     let revoked = key_id(&second);
-    host.publish_signed(&first, anchor.clone(), &["claude"], 1, WINDOW_END, |catalog| {
-        catalog.revoked_key_ids.push(revoked);
-    });
+    host.publish_signed(
+        &first,
+        anchor.clone(),
+        &["claude"],
+        1,
+        WINDOW_END,
+        |catalog| {
+            catalog.revoked_key_ids.push(revoked);
+        },
+    );
     let accepted = host.request(false, &["claude"]);
     assert!(accepted.refusals.is_empty(), "{:?}", accepted.refusals);
 
@@ -7427,6 +7437,12 @@ fn a_newer_release_installs_beside_the_old_package_and_selects_it() {
     assert_eq!(upgraded.packages[0].status, PackageStatus::Installed);
     assert_eq!(upgraded.packages[0].digest, digest.to_string());
     let registry = fs::read_to_string(host.registry_path()).expect("the registry");
-    assert!(registry.contains(&old_digest), "the old version is retained");
-    assert!(registry.contains(digest.as_str()), "the new one is recorded");
+    assert!(
+        registry.contains(&old_digest),
+        "the old version is retained"
+    );
+    assert!(
+        registry.contains(digest.as_str()),
+        "the new one is recorded"
+    );
 }

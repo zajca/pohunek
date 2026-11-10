@@ -235,7 +235,9 @@ pub(crate) enum CliError {
     /// `pohunek plugin install --release` installs on a host without a daemon
     /// and needs the owner's consent, which the run cannot ask for (`--yes` is
     /// missing and stdin is not a terminal, or `--json`). Nothing is changed.
-    #[error("installing from a release changes this host and needs your consent; nothing was changed")]
+    #[error(
+        "installing from a release changes this host and needs your consent; nothing was changed"
+    )]
     ReleaseInstallConsentRequired,
 
     /// The owner declined the plan shown by `pohunek plugin install --release`.
