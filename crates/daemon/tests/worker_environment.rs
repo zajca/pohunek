@@ -920,8 +920,14 @@ async fn an_attach_write_lands_between_the_fragments_of_a_delayed_control_plan()
 /// Line the attach client types while it reads none of the output.
 const UNREAD_KEYSTROKE: &str = "keystroke-while-output-unread";
 
-/// Line typed after the client resumed reading; its echo is live output.
+/// Line typed after the client resumed reading; the child answers it with
+/// [`RESYNCED_REPLY`], which is live output.
 const RESYNCED_KEYSTROKE: &str = "keystroke-after-resync";
+
+/// What the flooding child prints for the line [`RESYNCED_KEYSTROKE`]. The
+/// child produces it itself: the terminal's echo is not a signal, because a
+/// terminal may drop echo it cannot queue while its output side is full.
+const RESYNCED_REPLY: &str = "seen:keystroke-after-resync";
 
 /// Bytes the child prints once told to start: four times the subscriber queue
 /// the fixture grants (1 MiB) and many times the socket and PTY buffers
@@ -950,8 +956,10 @@ async fn start_flooding(start: &Path) {
 }
 
 /// Starts a child that waits for the returned `start` FIFO to be written,
-/// floods its output, signals through the returned `flooded` file and copies
-/// its input into the returned `typed` file.
+/// floods its output, signals through the returned `flooded` file, appends
+/// each input line to the returned `typed` file and answers it with
+/// `seen:<line>`. Terminal echo is off, so the answer is the only output a
+/// typed line causes.
 async fn initialize_flooding_child(
     fixture: &Fixture,
     worker: &Worker,
@@ -972,7 +980,7 @@ async fn initialize_flooding_child(
     initialize.arguments = vec![
         "-c".to_owned(),
         format!(
-            "read _ < \"$3\"; {{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > \"$2\"; }} & exec cat > \"$1\""
+            "stty -echo; read _ < \"$3\"; {{ head -c {UNREAD_FLOOD_BYTES} /dev/zero | tr '\\0' y; : > \"$2\"; }} & while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$1\"; printf 'seen:%s\\n' \"$line\"; done"
         ),
         "sh".to_owned(),
         sink.to_str().expect("UTF-8 fixture path").to_owned(),
@@ -1006,7 +1014,7 @@ fn attach_input_frame(attach: &DataStream, sequence: u32, text: &str) -> DataFra
 const RESYNC_TRACE_FRAMES: usize = 12;
 
 /// What the client that resumed reading has seen of the gap, the repaint and
-/// the live output, reported when the wait for the echo times out.
+/// the live output, reported when the wait for the reply times out.
 #[derive(Default)]
 struct ResyncProgress {
     frames: u64,
@@ -1015,6 +1023,8 @@ struct ResyncProgress {
     resync_keystroke_sent: bool,
     snapshot_bytes: usize,
     output_bytes: usize,
+    input_acks: u32,
+    output_end: u64,
     live: Vec<u8>,
     last_frames: std::collections::VecDeque<String>,
 }
@@ -1024,7 +1034,11 @@ impl ResyncProgress {
         self.frames += 1;
         match frame.header().kind {
             FrameKind::TerminalSnapshot { .. } => self.snapshot_bytes += frame.payload().len(),
-            FrameKind::Output { .. } => self.output_bytes += frame.payload().len(),
+            FrameKind::Output { offset } => {
+                self.output_bytes += frame.payload().len();
+                self.output_end = offset + frame.payload().len() as u64;
+            }
+            FrameKind::InputAck { .. } => self.input_acks += 1,
             _ => {}
         }
         if self.last_frames.len() == RESYNC_TRACE_FRAMES {
@@ -1043,13 +1057,16 @@ impl std::fmt::Display for ResyncProgress {
         write!(
             f,
             "frames read {}, gaps {}, repainted {}, resync keystroke sent {}, snapshot bytes {}, \
-             output bytes {}, live bytes after the repaint {}, last frames {:?}",
+             output bytes {}, input acks {}, output end offset {}, live bytes after the \
+             repaint {}, last frames {:?}",
             self.frames,
             self.gaps,
             self.repainted,
             self.resync_keystroke_sent,
             self.snapshot_bytes,
             self.output_bytes,
+            self.input_acks,
+            self.output_end,
             self.live.len(),
             self.last_frames
         )
@@ -1090,7 +1107,7 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
 
     // Reading resumes: the lost output is reported as a gap that a repaint
     // follows, and live output continues after it. The repaint is over once a
-    // live `Output` frame carrying the echo of a fresh keystroke arrives.
+    // live `Output` frame carrying the reply to a fresh keystroke arrives.
     let mut progress = ResyncProgress::default();
     let resynced = tokio::time::timeout(DEADLINE, async {
         loop {
@@ -1113,8 +1130,8 @@ async fn keystrokes_reach_the_child_while_the_attach_stream_reads_no_output_and_
                     progress.live.extend_from_slice(frame.payload());
                     if progress
                         .live
-                        .windows(RESYNCED_KEYSTROKE.len())
-                        .any(|window| window == RESYNCED_KEYSTROKE.as_bytes())
+                        .windows(RESYNCED_REPLY.len())
+                        .any(|window| window == RESYNCED_REPLY.as_bytes())
                     {
                         return;
                     }

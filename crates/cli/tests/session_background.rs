@@ -237,17 +237,106 @@ async fn send_hook(harness: &Harness, id: &str, hook: &str) {
     assert_eq!(code, 0, "{sent}");
 }
 
-/// How long a hook may stay unobserved before [`send_hook_until_inspected`] sends it again.
-///
-/// The installed state hook is best effort: it gives the worker one 0.5 s
-/// socket exchange and drops the report on a timeout, so a loaded host can lose
-/// a single send. Each Stop fixture carries the whole task list, so a repeat
-/// only replaces the snapshot with the same one.
-const HOOK_RESEND_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// Trace reasons that start with this prefix name a report the state hook
+/// could not hand to the worker (`worker_timeout`, `worker_closed`, ...).
+const WORKER_ROUTE_REASON_PREFIX: &str = "worker_";
 
-/// Sends `hook` and waits for the session's `inspect` document to satisfy
-/// `ready`, sending the hook again every [`HOOK_RESEND_AFTER`] while it does
-/// not. Returns the document that satisfied `ready`.
+/// Trace lines of the state hooks that `id` ran for `action` and that name a
+/// report dropped on the worker route.
+///
+/// The hook is best effort by design: it gives the worker one 0.5 s socket
+/// exchange, drops the report on a failure and records why in the hook trace
+/// (`pohunek-hooks.jsonl` below the worker's state directory).
+fn dropped_worker_reports(harness: &Harness, id: &str, action: &str) -> Vec<Value> {
+    let mut traces = Vec::new();
+    trace_files_under(&harness.env.root().join("worker"), &mut traces);
+    traces
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .flat_map(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|line| {
+            line["session"] == id
+                && line["action"] == action
+                && line["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with(WORKER_ROUTE_REASON_PREFIX))
+        })
+        .collect()
+}
+
+fn trace_files_under(dir: &Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            trace_files_under(&path, found);
+        } else if path.file_name().is_some_and(|name| {
+            name == std::ffi::OsStr::new(pohunek_logging::config::HOOK_TRACE_FILE_NAME)
+        }) {
+            found.push(path);
+        }
+    }
+}
+
+/// Sends `hook` and returns what `poll` yields once it is `Some`. The hook is
+/// sent again only when the hook trace records a new report of this session
+/// and action dropped on the worker route, and each resend is logged with the
+/// trace line that caused it. Without such a line the wait runs into the hang
+/// guard, so a snapshot that is lost for any other reason still fails the test.
+///
+/// A `worker_*` line of a Stop may name its identity report instead of its
+/// snapshot, so it is a hint that the snapshot was lost, not proof.
+///
+/// Only waits that tolerate a snapshot applied twice use it: the hook may have
+/// been applied before its exchange timed out, and the repeat then advances
+/// the revision and emits one more `background_state`.
+///
+/// A resent Stop carries the same task list: the same tasks are
+/// listed, the snapshot's revision, observed time and each item's last-seen
+/// time advance, and the daemon applies it again.
+async fn send_hook_until<T, Fut>(
+    harness: &Harness,
+    id: &str,
+    hook: &str,
+    what: &str,
+    mut poll: impl FnMut() -> Fut,
+) -> T
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let action = hook.split(':').next().expect("a hook names its action");
+    let answered = std::cell::Cell::new(dropped_worker_reports(harness, id, action).len());
+    send_hook(harness, id, hook).await;
+    let answered = &answered;
+    wait_until(what, || {
+        let next = poll();
+        let dropped = dropped_worker_reports(harness, id, action);
+        async move {
+            if let Some(value) = next.await {
+                return Some(value);
+            }
+            if dropped.len() > answered.get() {
+                answered.set(dropped.len());
+                eprintln!(
+                    "resending {hook} for {what} after a dropped report: {}",
+                    dropped.last().expect("a dropped report")
+                );
+                send_hook(harness, id, hook).await;
+            }
+            None
+        }
+    })
+    .await
+}
+
+/// [`send_hook_until`] for a wait on the session's `inspect` document:
+/// returns the first document `ready` accepts.
 async fn send_hook_until_inspected(
     harness: &Harness,
     id: &str,
@@ -255,18 +344,9 @@ async fn send_hook_until_inspected(
     what: &str,
     ready: impl Fn(&Value) -> bool,
 ) -> Value {
-    send_hook(harness, id, hook).await;
-    let last_sent = std::cell::Cell::new(std::time::Instant::now());
-    wait_until(what, || async {
+    send_hook_until(harness, id, hook, what, || async {
         let info = inspect(harness, id).await;
-        if ready(&info) {
-            return Some(info);
-        }
-        if last_sent.get().elapsed() >= HOOK_RESEND_AFTER {
-            send_hook(harness, id, hook).await;
-            last_sent.set(std::time::Instant::now());
-        }
-        None
+        ready(&info).then_some(info)
     })
     .await
 }
@@ -739,12 +819,13 @@ async fn a_worker_lost_while_the_daemon_is_down_leaves_no_background() {
     let harness = start_serving_claude(true).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    send_hook(&harness, &id, "stop:stop-one").await;
-    wait_until("the snapshot before the daemon stops", || async {
-        inspect(&harness, &id).await["background"]
-            .is_object()
-            .then_some(())
-    })
+    send_hook_until_inspected(
+        &harness,
+        &id,
+        "stop:stop-one",
+        "the snapshot before the daemon stops",
+        |info| info["background"].is_object(),
+    )
     .await;
 
     let pid = worker_pid(&harness, &id).await;

@@ -496,13 +496,13 @@ impl Rig {
 
 /// Loopback port the closed-address scenario connects to.
 ///
-/// A privileged port below the range the OS assigns to `bind(0)` and to
-/// outgoing connections, so no unprivileged test can bind or be handed it, and
-/// nothing in the rig listens there: the connect is
-/// refused immediately on Linux and macOS. A port that a test holds bound
-/// without listening is not used because macOS drops, instead of refusing, a
-/// connect to it and the request times out.
-const CLOSED_PORT: u16 = 1;
+/// Port 0 is not a destination: no socket is ever bound to it, so a connect
+/// fails at once on every OS and in every network namespace, whatever the
+/// privileged-port range or the rig's listeners are (Linux refuses the
+/// connection, macOS reports an unassignable address). A port that a test holds
+/// bound without listening is not used because macOS drops, instead of
+/// refusing, a connect to it and the request times out.
+const CLOSED_PORT: u16 = 0;
 
 fn archive_path(version: &str) -> String {
     format!("/{version}.tar.zst")

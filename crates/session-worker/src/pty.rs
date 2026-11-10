@@ -3059,15 +3059,26 @@ mod tests {
     async fn spawn_held_root(cwd: &std::path::Path, hold: Duration) -> PtyOwner {
         let mut env = crate::test_support::child_env();
         env.push((HELD_ROOT_HOLD_VAR.to_owned(), hold.as_millis().to_string()));
+        // `SIGTERM` is ignored before the test binary starts (the disposition
+        // survives `exec`), so no thread of the root can die of it: only the
+        // traced leader reports it to the tracer, and `SIGKILL` is the one signal
+        // that ends the root.
         let pty = spawn(Command {
-            program: std::env::current_exe()
-                .expect("test executable")
-                .into_os_string()
-                .into_string()
-                .expect("test executable path is UTF-8"),
-            args: ["--ignored", "--exact", HELD_ROOT_CHILD_TEST, "--nocapture"]
-                .map(str::to_owned)
-                .to_vec(),
+            program: "/bin/sh".to_owned(),
+            args: [
+                "-c",
+                "trap '' TERM; exec \"$0\" \"$@\"",
+                std::env::current_exe()
+                    .expect("test executable")
+                    .to_str()
+                    .expect("test executable path is UTF-8"),
+                "--ignored",
+                "--exact",
+                HELD_ROOT_CHILD_TEST,
+                "--nocapture",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
             env,
             cwd: cwd.to_path_buf(),
             cols: 200,
