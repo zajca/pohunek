@@ -290,6 +290,9 @@ fn trace_files_under(dir: &Path, found: &mut Vec<PathBuf>) {
 /// trace line that caused it. Without such a line the wait runs into the hang
 /// guard, so a snapshot that is lost for any other reason still fails the test.
 ///
+/// A `worker_*` line of a Stop may name its identity report instead of its
+/// snapshot, so it is a hint that the snapshot was lost, not proof.
+///
 /// Only waits that tolerate a snapshot applied twice use it: the hook may have
 /// been applied before its exchange timed out, and the repeat then advances
 /// the revision and emits one more `background_state`.
@@ -646,13 +649,11 @@ async fn ending_the_agent_clears_the_background_and_publishes_null() {
     let collected = subscribe(&harness).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    let held = send_hook_until_inspected(
-        &harness,
-        &id,
-        "stop:stop-one",
-        "the snapshot before the agent ends",
-        |info| info["background"].is_object(),
-    )
+    send_hook(&harness, &id, "stop:stop-one").await;
+    let held = wait_until("the snapshot before the agent ends", || async {
+        let info = inspect(&harness, &id).await;
+        info["background"].is_object().then_some(info)
+    })
     .await;
     wait_for_background_state(&collected, &id, "the snapshot event", Value::is_object).await;
 
@@ -791,15 +792,12 @@ async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
     let harness = start_serving_claude(true).await;
     let (id, _) = start_agent_session(&harness).await;
 
-    let held = send_hook_until_inspected(
-        &harness,
-        &id,
-        "stop:stop-one",
-        "the snapshot before the restart",
-        |info| info["background"].is_object(),
-    )
-    .await["background"]
-        .clone();
+    send_hook(&harness, &id, "stop:stop-one").await;
+    let held = wait_until("the snapshot before the restart", || async {
+        let background = inspect(&harness, &id).await["background"].clone();
+        background.is_object().then_some(background)
+    })
+    .await;
 
     let root = harness.env.root().to_path_buf();
     let surviving = harness.shut_down().await;
