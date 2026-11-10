@@ -145,6 +145,11 @@ development archives, and the release build's archives before assembly adds
 the catalog), so they build the package with `scripts/build-hermes-package`
 and write the catalog and anchor with `cargo xtask hermes throwaway-catalog`,
 whose signing key is random and never written.
+`--no-daemon <sealed release dir> <hermes>` smokes the CLI-only route instead:
+the `hermes-compatibility-macos` job seals a copy of the development archive
+with the throwaway package, catalog and anchor, and the smoke runs `pohunek
+plugin install --release` in place with no daemon, requiring the `offline`
+route.
 The smoke resolves symlinked temporary parents (macOS `/tmp` and `/var/tmp`)
 before validating them. The harness resolves symlinks in its isolation root so redaction matches
 the paths child processes print, and uses `en_US.UTF-8` where macOS lacks

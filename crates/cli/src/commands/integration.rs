@@ -1776,6 +1776,11 @@ fn render_hermes_human(result: &HermesResult) -> String {
                 check.code, check.status, check.recovery_hint
             );
         }
+        for check in &report.checks {
+            if let Some(note) = check.note {
+                let _ = writeln!(output, "doctor: {}: note: {note}", check.code);
+            }
+        }
     }
     output
 }
@@ -1982,6 +1987,7 @@ mod tests {
                 code,
                 status,
                 recovery_hint: "test recovery",
+                note: None,
             })
             .collect();
         let ok = checks
