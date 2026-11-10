@@ -4193,10 +4193,20 @@ impl SessionRegistry {
         // above its minimum, so that bound stands in for the release: a gate
         // whose `authority_from` is at or below the minimum is open, and the
         // records stay authoritative across a daemon restart.
+        // The bound is used only when it opens the gate: a lower bound below
+        // `authority_from` would report a release the session may not run.
         let runtime_version = pinned
             .as_deref()
             .and_then(RuntimeDefinition::version_probe_policy)
-            .map(package::version_probe::VersionProbePolicy::min);
+            .map(package::version_probe::VersionProbePolicy::min)
+            .filter(|bound| {
+                crate::detect::AuthorityGate::evaluate(
+                    default_detector_config.manifest.as_deref(),
+                    Some(*bound),
+                    false,
+                )
+                .open
+            });
         default_detector_config.runtime_version = runtime_version;
         let probe_answered_at_reattach = default_detector_config.answers_program_status_probe();
         let mut restored_detector_config = self

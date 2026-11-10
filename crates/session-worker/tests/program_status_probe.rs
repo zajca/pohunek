@@ -393,5 +393,9 @@ async fn a_listed_job_sharing_the_foreground_group_of_a_shell_without_job_contro
 
 #[tokio::test]
 async fn a_listed_job_in_the_background_of_a_job_control_shell_is_not_answered() {
-    first_byte_after_a_refused_probe("set -m; sleep 1234 & ", &listed(r"^sleep 1234")).await;
+    first_byte_after_a_refused_probe(
+        "set -m; sleep 1234 & trap 'kill %1' EXIT; ",
+        &listed(r"^sleep 1234"),
+    )
+    .await;
 }

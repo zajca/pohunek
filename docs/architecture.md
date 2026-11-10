@@ -1255,8 +1255,9 @@ the screen rules stay the fallback.
   the next record the manifest's `below_authority` screen rules read the turn
   (Claude's status line and `esc to interrupt` footer), so a turn running when a
   lag resync or a reconfigure dropped the record keeps reading working. A session
-  re-attached after a daemon restart restores the record from the retained output
-  and keeps the gate open.
+  re-attached after a daemon restart keeps the gate open when the runtime's
+  version minimum reaches `authority_from` (Claude, Codex), and the record is
+  restored when the retained output still covers it.
 - **Readiness.** Initial-input readiness and the idle barrier ignore the record:
   they evaluate the screen winner alone, so a record never releases or holds a
   prompt.

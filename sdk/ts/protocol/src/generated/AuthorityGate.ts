@@ -16,7 +16,8 @@ export type AuthorityGate = {
   open: boolean;
   reason: AuthorityGateReason;
   /**
-   * The release the session's launch probed.
+   * The release the session's launch probed. A session re-attached after a daemon
+   * restart carries the lowest release its package accepts, when that opens the gate.
    */
   runtime_version?: string;
   /**
