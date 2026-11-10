@@ -18540,6 +18540,12 @@ pub(in crate::session) fn temp_agents_dir_with(tag: &str, name: &str, body: &str
     dir
 }
 
+/// Manifest whose title and status-line rules read a running turn from the
+/// output: the frozen Claude manifest of release 0.34.2. The shipped Claude
+/// manifest reads a turn from OSC 7501 records only.
+const SCREEN_WORKING_MANIFEST: &str =
+    include_str!("../../../../compat/claude/builtin-v0.34/detect.toml");
+
 fn write_agent_manifest(dir: &std::path::Path, name: &str, body: &str) {
     let manifests = dir.join("manifests");
     std::fs::create_dir_all(&manifests).expect("create manifests dir");
@@ -18835,11 +18841,12 @@ async fn the_detector_launch_name_follows_the_name_each_launch_uses() {
         "launch-name-claude",
         "named",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            "base = \"claude\"\nprogram = \"{}\"\nmanifest = \"named\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
             script.display(),
             claude_home.display()
         ),
     );
+    write_agent_manifest(&agents_dir, "named", SCREEN_WORKING_MANIFEST);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
@@ -31361,10 +31368,11 @@ async fn fast_turn_session(tag: &str, trigger: &str) -> (SessionRegistry, Sessio
         tag,
         "fast-turn",
         &format!(
-            "base = \"claude\"\nprogram = \"python3\"\nargs = [\"{}\", \"{trigger}\"]\n",
+            "base = \"claude\"\nprogram = \"python3\"\nargs = [\"{}\", \"{trigger}\"]\nmanifest = \"fast-turn\"\n",
             script.display()
         ),
     );
+    write_agent_manifest(&agents_dir, "fast-turn", SCREEN_WORKING_MANIFEST);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),

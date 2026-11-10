@@ -581,8 +581,8 @@ fn titled(title: &str, rows: &[&str]) -> Vec<u8> {
     frame(Some(title), rows)
 }
 
-/// A Claude screen whose only working evidence is a markdown bullet that the
-/// spinner rule reads as a live status line.
+/// A Claude screen with a markdown bullet shaped like a status line above the
+/// prompt box.
 fn claude_stale_spinner() -> Vec<u8> {
     let rule = "\u{2500}".repeat(40);
     frame(
@@ -752,13 +752,13 @@ fn a_notice_before_a_blocked_record_is_held_once_and_the_record_adds_the_blocked
 }
 
 #[test]
-fn an_idle_record_beats_a_stale_working_screen_winner() {
+fn an_idle_record_beats_a_stale_spinner_screen() {
     let mut harness = Harness::claude();
     harness.feed(&claude_stale_spinner());
     assert_eq!(
         harness.activity(),
-        Some((AgentActivity::Working, StateSource::Screen)),
-        "without a record the bullet reads as a live spinner"
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "without a record the bullet is no working evidence"
     );
 
     for state in ["idle", "done", "error"] {

@@ -1,9 +1,10 @@
 //! The screen rules that OSC 7501 records cover.
 //!
-//! Under an open release gate the working and idle screen rules marked
-//! `below_authority` are skipped, while dialog and blocked rules stay. Below
-//! the gate every rule applies. The scenarios replay the screens and record
-//! sequences captured from the real agents (`compat/*/screens`).
+//! Claude's records are authoritative for every supported release, so its
+//! manifest has no working screen rule: a running turn comes from the held
+//! record, a dialog from the screen. Codex keeps screen rules that an open
+//! release gate skips. The scenarios replay the screens and record sequences
+//! captured from the real agents (`compat/*/screens`).
 
 // Rust guideline compliant 2026-06-26
 
@@ -24,8 +25,7 @@ const COLUMNS: u16 = 100;
 const STEP: Duration = Duration::from_millis(10);
 const SETTLE_STEP: Duration = Duration::from_millis(100);
 const SETTLE_TICKS: u32 = 12;
-const CLAUDE_GATE_OPEN: &str = "2.1.309";
-const CLAUDE_N_MINUS_1: &str = "2.1.289";
+const CLAUDE_RELEASE: &str = "2.1.309";
 const CODEX_RELEASE: &str = "0.164.0";
 
 fn read(relative: &str) -> String {
@@ -127,14 +127,14 @@ const CLAUDE_MEANING: [(&str, AgentActivity); 10] = [
 ];
 
 #[test]
-fn a_gate_open_claude_reads_every_capture_with_its_record_and_every_dialog_from_the_screen() {
+fn claude_reads_every_capture_with_its_record_and_every_dialog_from_the_screen() {
     for (name, meant) in CLAUDE_MEANING {
         // The streaming-reply capture has no recorded sequence; the next
         // scenario covers it.
         if name == "working_stream" {
             continue;
         }
-        let mut harness = Harness::new("claude", CLAUDE_GATE_OPEN, InputReadiness::ScreenIdle);
+        let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
         harness.feed(&captured("claude", "", name));
         let records = if std::path::Path::new(
             &workspace_root().join(format!("compat/claude/screens/{name}.program-status")),
@@ -158,36 +158,23 @@ fn a_gate_open_claude_reads_every_capture_with_its_record_and_every_dialog_from_
 }
 
 #[test]
-fn a_gate_open_claude_without_a_held_record_reads_the_screen_as_before() {
-    // The rules marked `below_authority` are skipped only while a record is
-    // held; before the first record, and after a clear or a lag resync, the
-    // screen keeps deciding so the activity never goes stale.
-    for (name, meant) in [
-        ("idle", AgentActivity::Idle),
-        ("working_early", AgentActivity::Working),
-        ("working_stream", AgentActivity::Working),
-        ("idle_after_turn", AgentActivity::Idle),
-    ] {
-        let mut harness = Harness::new("claude", CLAUDE_GATE_OPEN, InputReadiness::ScreenIdle);
+fn claude_without_a_held_record_reads_the_prompt_box_as_idle() {
+    // Before the first record, and after a clear or a lag resync, the screen
+    // decides: a running turn shows the prompt box too, so it reads idle until
+    // the next record.
+    for name in ["idle", "working_early", "working_stream", "idle_after_turn"] {
+        let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
         harness.feed(&captured("claude", "", name));
-        assert_eq!(harness.activity(), Some(meant), "{name}");
+        assert_eq!(harness.activity(), Some(AgentActivity::Idle), "{name}");
     }
 
-    let mut harness = Harness::new("claude", CLAUDE_GATE_OPEN, InputReadiness::ScreenIdle);
+    let mut harness = Harness::new("claude", CLAUDE_RELEASE, InputReadiness::ScreenIdle);
     harness.feed(&captured("claude", "", "working_early"));
     harness.feed(b"\x1b]7501;state=working:app=claude-code\x1b\\");
+    assert_eq!(harness.activity(), Some(AgentActivity::Working));
     harness.feed(b"\x1b]7501;state=clear\x1b\\");
     harness.feed(&captured("claude", "", "idle_after_turn"));
     assert_eq!(harness.activity(), Some(AgentActivity::Idle));
-}
-
-#[test]
-fn claude_2_1_289_still_reads_every_capture_from_the_title_and_screen() {
-    for (name, meant) in CLAUDE_MEANING {
-        let mut harness = Harness::new("claude", CLAUDE_N_MINUS_1, InputReadiness::ScreenIdle);
-        harness.feed(&captured("claude", "n-1/", name));
-        assert_eq!(harness.activity(), Some(meant), "{name}");
-    }
 }
 
 #[test]

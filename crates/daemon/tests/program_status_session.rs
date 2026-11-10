@@ -89,10 +89,7 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// reports working, `d` done, `b` blocked and `q` exits; `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
-/// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
-/// program answers no probe and draws one screen per FIFO byte: `s` and `w`
-/// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
-/// transcript bullet that only looks like one, above the prompt box.
+/// an `id` and a `title`, then a bare `clear`); `m` draws a marker line.
 fn agent_script() -> String {
     format!(
         r#"#!/bin/sh
@@ -112,21 +109,6 @@ box() {{
 }}
 printf '\033[2J\033[H'
 box
-if [ "$mode" = screen ]; then
-  exec 3<> "$dir/cmd"
-  while :; do
-    c=$(head -c 1 <&3)
-    printf '\033[2J\033[H'
-    case "$c" in
-      s) printf '✻ Billowing… (1…\r\n' ;;
-      w) printf '✻ Contemplating deeply… (1m…\r\n' ;;
-      b) printf '* Then it waits… (see below)\r\n' ;;
-      n) printf '* Then it waits… (3 items)\r\n' ;;
-      k) printf '* Then it waits… (see…\r\n' ;;
-    esac
-    box
-  done
-fi
 if [ "$mode" = reply ]; then emit idle; fi
 if [ "$mode" = silent ] || [ "$mode" = recording ]; then
   head -c 2 | od -An -v -tx1 | tr -d ' \n' > "$dir/typed.hex"
@@ -165,7 +147,8 @@ done
 }
 
 /// The shipped Claude manifest with its `[program_status]` table replaced by one
-/// that sets `answer_probe` as the scenario needs.
+/// that sets `answer_probe` and, for the gate scenarios, an `authority_from` the
+/// shipped manifest does not declare.
 fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String {
     let mut in_table = false;
     let shipped =
@@ -173,11 +156,6 @@ fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String
             .expect("read the shipped Claude manifest")
             .lines()
             .filter(|line| {
-                // A manifest without `authority_from` has no gate to retire
-                // rules under.
-                if authority_from.is_none() && line.trim() == "below_authority = true" {
-                    return false;
-                }
                 if line.trim() == "[program_status]" {
                     in_table = true;
                 } else if in_table && line.trim().is_empty() {
@@ -229,7 +207,6 @@ impl Fixture {
             ("fake-reply-fifo", "reply", "fifo"),
             ("fake-silent", "silent", "stdin"),
             ("fake-recording", "recording", "stdin"),
-            ("fake-screen", "screen", "fifo"),
         ] {
             std::fs::write(
                 agents.join(format!("{name}.toml")),
@@ -715,39 +692,6 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
         1,
         "the child records over a held root `done` add no edge before the root `blocked`"
     );
-    fixture
-        .registry
-        .stop(&created.id)
-        .await
-        .expect("stop the session");
-}
-
-/// A status line whose timer the terminal width cut reads working from the
-/// screen alone; a transcript bullet that only looks like one reads idle.
-#[tokio::test]
-async fn a_width_cut_status_line_reads_working_and_a_lookalike_bullet_reads_idle() {
-    if !pohunek_test_support::process_env::in_own_process() {
-        return;
-    }
-    let fixture = Fixture::new(false).await;
-    let created = fixture.start("fake-screen").await;
-    fixture
-        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
-        .await;
-
-    for (shown, reads) in [
-        (b's', AgentActivity::Working),
-        (b'b', AgentActivity::Idle),
-        (b'w', AgentActivity::Working),
-        (b'n', AgentActivity::Idle),
-        (b's', AgentActivity::Working),
-        (b'k', AgentActivity::Idle),
-    ] {
-        command(&fixture, shown);
-        fixture
-            .wait_activity(&created.id, (reads, StateSource::Screen))
-            .await;
-    }
     fixture
         .registry
         .stop(&created.id)

@@ -915,7 +915,7 @@ A descriptor names the supported release range with `version_probe` in
 - `semver-v1` when it prints exactly `MAJOR.MINOR.PATCH` (Pi).
 - `semver-line-v1` with a `line` template when the release sits inside fixed
   text: `line = "codex-cli {version}"` for `codex-cli 0.160.0`,
-  `line = "{version} (Claude Code)"` for `2.1.289 (Claude Code)`,
+  `line = "{version} (Claude Code)"` for `2.1.309 (Claude Code)`,
   `line = "Hermes Agent v{version} {annotation}"` for
   `Hermes Agent v0.20.0 (2026.8.3)`.
 

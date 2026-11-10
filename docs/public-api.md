@@ -1573,11 +1573,9 @@ version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", bel
 four tokens) is the probe argv, and `[min, below)` is the supported release
 range, so a package update can move the range without a daemon release. The
 official packages declare `min` as their tested minimum (the verified release,
-except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release, and Claude, whose
-`min` is the previous verified release, with its captures kept in the
-repository; Codex's `min` is the verified release) and `below` as
+except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 captures kept as the previous release; Claude's and Codex's `min` is the verified release) and `below` as
 the next major release (codex `[0.164.0, 1.0.0)`, claude
-`[2.1.289, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
+`[2.1.309, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
 update the agent CLIs independently of pohunek. The
 declaration is rejected unless `args`, `min` and `below` are all present, `min`
 is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH` (for
@@ -1595,7 +1593,7 @@ leading or trailing space; the prefix must not end in a digit or `.`, the
 suffix must not start with a digit, `.`, `-` or `+`; at least one literal
 character next to `{version}`). The official runtimes read as
 `codex-cli {version}` (`codex-cli 0.160.0`), `{version} (Claude Code)`
-(`2.1.289 (Claude Code)`) and `Hermes Agent v{version} {annotation}`
+(`2.1.309 (Claude Code)`) and `Hermes Agent v{version} {annotation}`
 (`Hermes Agent v0.20.0 (2026.8.3)`). The trimmed first output line (at most
 256 bytes) must match the whole template; later lines are ignored. The
 template is literal text, not a pattern, and is matched without backtracking.
