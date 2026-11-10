@@ -768,7 +768,8 @@ fn hermes_error_class(error: &crate::hermes_integration::error::Error) -> ErrorC
         | Error::UnsupportedHermes
         | Error::ConfirmationRequired
         | Error::PackageNotInstalled
-        | Error::PackageNotSelected => ErrorClass::Configuration,
+        | Error::PackageNotSelected
+        | Error::PackageRevoked => ErrorClass::Configuration,
         Error::Io { .. }
         | Error::InvalidAsset
         | Error::PackageRegistryUnreadable
@@ -805,6 +806,7 @@ pub(crate) fn hermes_error_code(error: &crate::hermes_integration::error::Error)
         Error::PackageNotInstalled => "hermes_package_not_installed",
         Error::PackageRegistryUnreadable => "hermes_package_registry_unreadable",
         Error::PackageNotSelected => "hermes_package_not_selected",
+        Error::PackageRevoked => "hermes_package_revoked",
         Error::Collision => "hermes_plugin_collision",
         Error::InvalidMarker => "hermes_invalid_marker",
         Error::HermesCommand => "hermes_command_failed",
