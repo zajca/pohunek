@@ -3771,7 +3771,8 @@ pub struct SessionRetentionCandidate {
     /// Rule that selected it.
     pub reason: SessionRetentionReason,
     /// Age in seconds at selection time, measured from the timestamp the rule
-    /// used (the session's last update, or the runtime's last connection).
+    /// used: `ended_at` for a terminal session (the last update for a record
+    /// without one), or the runtime's last connection for a lost one.
     pub age_secs: u64,
     /// Pohunek-owned worktree the removal cleans, when the session bound one.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -10280,6 +10280,10 @@ while os.getppid() == parent:
             .await
             .expect("terminal logical record remains visible");
         assert_eq!(imported.state, SessionState::Done);
+        assert!(
+            imported.ended_at.is_some(),
+            "a worker that ended while the daemon was down ends the session at import"
+        );
         assert_eq!(imported.exit_code, Some(0));
         assert_eq!((imported.cols, imported.rows), (100, 30));
         assert_eq!(

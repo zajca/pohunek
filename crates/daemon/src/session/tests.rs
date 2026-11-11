@@ -19564,6 +19564,10 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
         .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("fresh Hermes process exits");
+    let first_end = terminal
+        .ended_at
+        .clone()
+        .expect("the exit records when the session ended");
     let initial_generation = terminal
         .runtime
         .as_ref()
@@ -19577,6 +19581,7 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
 
     assert_eq!(resumed.id, created.id);
     assert_eq!(resumed.created_at, created.created_at);
+    assert_eq!(resumed.ended_at, None, "a resumed session has not ended");
     assert_eq!(
         resumed
             .runtime
@@ -19596,6 +19601,16 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
     assert!(!argv.contains("--continue"));
     assert!(!argv.contains("--pass-session-id"));
     registry.stop(&resumed.id).await.expect("stop the session");
+    let second_end = registry
+        .inspect(&resumed.id)
+        .await
+        .expect("inspect the stopped session")
+        .ended_at
+        .expect("the second end records when it ended");
+    assert!(
+        second_end > first_end,
+        "the second end is a new end time: {second_end} after {first_end}"
+    );
 }
 
 // Linux only: on macOS /usr/bin/python3 and framework Pythons re-exec another image, which the

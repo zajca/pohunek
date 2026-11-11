@@ -1269,7 +1269,11 @@ effect after a daemon restart.
 A terminal session ages from `ended_at`, the moment it ended, which a daemon
 restart, a metadata edit or any other record update does not move. A session
 whose runtime is `lost` ages from the last time the daemon reached the runtime
-(`last_connected_at`). A record without `ended_at` ages from its `updated_at`.
+(`last_connected_at`), or from `ended_at` when the runtime never connected. A
+record with neither ages from its `updated_at`. The schema 19 migration gives a
+finished record its last update as `ended_at`; a schema 18 daemon re-stamped
+that update on every start, so an existing finished session ages from the last
+start before the upgrade.
 
 The shipped default is deliberately conservative: sweeps are **disabled**, and
 once enabled they run every 6 hours, keep a terminal (`stopped`/`done`/`failed`)

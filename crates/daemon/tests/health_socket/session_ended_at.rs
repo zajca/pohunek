@@ -10,6 +10,9 @@ use protocol::{SessionRetentionParams, SessionRetentionReason};
 /// default terminal TTL.
 const LONG_AGO: &str = "2026-01-01T00:00:00Z";
 
+/// The last update the first scenario gives the record before the restart.
+const LONG_AGO_EDIT: &str = "2026-01-02T00:00:00Z";
+
 /// A shell that exits at once, so the session ends on its own.
 const EXIT_AT_ONCE: &str = "exit 0";
 
@@ -164,6 +167,7 @@ async fn a_finished_session_keeps_its_age_across_a_restart_and_a_metadata_edit()
     rewrite_session_lines(&store_path, |line| {
         let info = info_of(line);
         info.insert("ended_at".to_owned(), Value::from(LONG_AGO));
+        info.insert("updated_at".to_owned(), Value::from(LONG_AGO_EDIT));
     });
 
     let (session, selection) = restart_and_select(&socket, config(), &id, Journal::Kept).await;
@@ -175,8 +179,8 @@ async fn a_finished_session_keeps_its_age_across_a_restart_and_a_metadata_edit()
         "the restart and the metadata edit leave the end time alone"
     );
     assert_ne!(
-        session.updated_at, LONG_AGO,
-        "the record itself was rewritten, which is why it cannot be the clock"
+        session.updated_at, LONG_AGO_EDIT,
+        "the restart rewrote the record, which is why updated_at cannot be the clock"
     );
     let candidate = selection
         .sessions

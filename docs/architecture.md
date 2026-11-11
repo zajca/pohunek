@@ -2000,12 +2000,16 @@ Durability tiers (honest about limits):
    as `running` with a lost runtime is re-classified by its call site's proof;
    a worker that answers again re-adopts the session as `running`. A `failed`
    session with a lost runtime stays resumable (resume keys on the runtime) and
-   ages under the lost retention window, aged from the last connection.
+   ages under the lost retention window, aged from the last connection (the
+   end time for a runtime that never connected, the last update when it has
+   neither).
    A session that is terminal and not lost ages under the terminal window from
    `ended_at`, the time it entered `stopped`, `done` or `failed`; the daemon
    sets it once at that transition and no later record update, metadata edit or
-   restart moves it. A record that has no `ended_at` (store schema 18 or older)
-   was given its last update as `ended_at` by the schema 19 migration.
+   restart moves it. The schema 19 migration gives a `stopped`, `done` or
+   `failed` record of schema 18 or older its last update as `ended_at`; a
+   schema 18 daemon re-stamped that update on every start, so such a session
+   ages from the last start before the upgrade and its earlier age is lost.
    Operations that need a running session still refuse it with
    `session_runtime_lost` and its recovery hint. When the service manager still
    holds the failed worker job, the daemon reads its verdict before it retires

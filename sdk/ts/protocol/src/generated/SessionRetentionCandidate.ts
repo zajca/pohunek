@@ -18,7 +18,8 @@ export type SessionRetentionCandidate = {
   reason: SessionRetentionReason;
   /**
    * Age in seconds at selection time, measured from the timestamp the rule
-   * used (the session's last update, or the runtime's last connection).
+   * used: `ended_at` for a terminal session (the last update for a record
+   * without one), or the runtime's last connection for a lost one.
    */
   age_secs: bigint;
   /**
