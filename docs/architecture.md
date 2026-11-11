@@ -1203,7 +1203,11 @@ the screen rules stay the fallback.
   (2048 bytes for `msg`, 192 for `title`). A malformed pair is skipped and an
   unknown key ignored. `msg`, `title` and `progress` are validated and dropped:
   they are never stored, logged or exposed. `kind` counts only with `blocked`. A
-  probe (`7501;?`) is never a record.
+  probe (`7501;?`) is never a record. A record the daemon cannot map (an
+  unknown `state` or another rejection of the whole payload, or an unknown
+  `kind`) is logged at debug level under `session.program_status.unmapped` with
+  its `state`, `kind` and `app` tokens only; the text of `msg`, `title` and
+  `progress` is never logged.
 - **Release gate.** A manifest may declare `[program_status] authority_from =
   "<MAJOR.MINOR.PATCH>"`. The records are authoritative only while the release
   the session's launch probed (the `version_probe` of the exact executable it

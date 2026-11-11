@@ -11,6 +11,15 @@ const PERCENT_HEX_DIGITS: usize = 2;
 const HEX_HIGH_NIBBLE_SHIFT: u8 = 4;
 const HEX_ALPHA_OFFSET: u8 = 10;
 
+/// The debug-journal target of a 7501 record the detector cannot map.
+const UNMAPPED_PROGRAM_STATUS_TARGET: &str = "session.program_status.unmapped";
+
+/// Longest payload token the journal echoes.
+///
+/// The grammar bounds `state`, `kind` and `app` well below this; the bound keeps
+/// a rejected payload's pair from turning into a long log line.
+const MAX_JOURNAL_TOKEN_CHARS: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscEvidence {
     Title(String),
@@ -359,9 +368,13 @@ impl OscParser {
             b"9" => classify_osc9(&self.payload),
             b"777" => classify_osc777(&self.payload),
             b"99" => classify_osc99(&self.payload),
-            command if command == PROGRAM_STATUS => parse_program_status(&self.payload)
-                .filter(|report| *report != ProgramStatusReport::Probe)
-                .map(OscEvidence::ProgramStatus),
+            command if command == PROGRAM_STATUS => match parse_program_status(&self.payload) {
+                Some(ProgramStatusReport::Probe) => None,
+                report => {
+                    journal_unmapped_program_status(&self.payload, report.as_ref());
+                    report.map(OscEvidence::ProgramStatus)
+                }
+            },
             _ => None,
         };
 
@@ -379,6 +392,99 @@ impl OscParser {
     fn cwd_payload(&self) -> Option<String> {
         parse_file_url_cwd(&self.payload)
     }
+}
+
+/// The `state`, `kind` and `app` tokens of a 7501 payload, plus the presence of
+/// `msg` and `title`.
+#[derive(Debug, Default)]
+struct JournalTokens<'a> {
+    state: Option<&'a [u8]>,
+    kind: Option<&'a [u8]>,
+    app: Option<&'a [u8]>,
+    has_msg: bool,
+    has_title: bool,
+}
+
+impl<'a> JournalTokens<'a> {
+    /// Collects the tokens of `payload`.
+    ///
+    /// Pairs split as the parser splits them: on `:` first, then on the first
+    /// `=`; a pair without `=` and a pair with an empty key carry no token. A
+    /// repeated key keeps its last value, as the parser does.
+    fn of(payload: &'a [u8]) -> Self {
+        let mut tokens = Self::default();
+        for pair in payload.split(|&byte| byte == b':') {
+            let Some(eq) = pair.iter().position(|&byte| byte == b'=') else {
+                continue;
+            };
+            let (key, value) = (&pair[..eq], &pair[eq + 1..]);
+            match key {
+                b"state" => tokens.state = Some(value),
+                b"kind" => tokens.kind = Some(value),
+                b"app" => tokens.app = Some(value),
+                b"msg" => tokens.has_msg = true,
+                b"title" => tokens.has_title = true,
+                _ => {}
+            }
+        }
+        tokens
+    }
+
+    /// Whether the payload names a `kind` the grammar does not know.
+    fn kind_is_unknown(&self) -> bool {
+        self.kind
+            .is_some_and(|kind| !matches!(kind, b"permission" | b"question" | b"auth"))
+    }
+}
+
+/// Bounds an untrusted payload token for the journal.
+///
+/// A token the payload does not carry renders empty, its control characters
+/// become `?` so it cannot forge a log line, and it is cut to its first
+/// [`MAX_JOURNAL_TOKEN_CHARS`] characters.
+fn bounded_token(token: Option<&[u8]>) -> String {
+    String::from_utf8_lossy(token.unwrap_or_default())
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .take(MAX_JOURNAL_TOKEN_CHARS)
+        .collect()
+}
+
+/// Journals a 7501 record the detector cannot map, never the text it carries.
+///
+/// A record is unmapped when the parser rejects the payload whole
+/// (`reason = "rejected"`) or when the payload names a `kind` the grammar does
+/// not know, which the parser drops (`reason = "unknown_kind"`). The journal
+/// carries the bounded `state`, `kind` and `app` tokens and the presence of
+/// `msg` and `title`: their text is untrusted and is never logged. The report
+/// is only read, never changed.
+fn journal_unmapped_program_status(payload: &[u8], report: Option<&ProgramStatusReport>) {
+    let tokens = JournalTokens::of(payload);
+    let reason = match report {
+        None => "rejected",
+        Some(_) => {
+            if !tokens.kind_is_unknown() {
+                return;
+            }
+            "unknown_kind"
+        }
+    };
+    tracing::debug!(
+        target: UNMAPPED_PROGRAM_STATUS_TARGET,
+        reason,
+        state = bounded_token(tokens.state),
+        kind = bounded_token(tokens.kind),
+        app = bounded_token(tokens.app),
+        has_msg = tokens.has_msg,
+        has_title = tokens.has_title,
+        "unmapped program-status record"
+    );
 }
 
 fn parse_file_url_cwd(payload: &[u8]) -> Option<String> {

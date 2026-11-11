@@ -106,7 +106,9 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// then the end of that dialog, and `q` exits; `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
-/// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
+/// an `id` and a `title`, then a bare `clear`); `L` reports a record with a
+/// `kind` the grammar does not know and then one with an unknown `state`;
+/// `m` draws a marker line. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
 /// transcript bullet that only looks like one, above the prompt box.
@@ -183,6 +185,8 @@ run() {{
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
+    L) printf '\033]7501;state=blocked:app={APP}:kind=limit:msg=c2VjcmV0LWxpbWl0LXRleHQ=\033\\'
+       printf '\033]7501;state=limit:app={APP}:msg=c2VjcmV0LXN0YXRlLXRleHQ=\033\\' ;;
     m) printf 'SYNC\r\n' ;;
     q) exit 0 ;;
   esac
@@ -1501,6 +1505,119 @@ async fn a_blocked_records_kind_chooses_the_attention_record() {
         (unread.len() == 1 && unread[0].kind == NotificationKind::ApprovalRequired).then_some(())
     })
     .await;
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// The lines the detector journaled for a record it cannot map.
+fn unmapped_journal_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains("session.program_status.unmapped"))
+        .collect()
+}
+
+/// A record the detector cannot map is journaled at debug level without the
+/// text it carries, and it changes no state: an unknown `kind` still applies
+/// the record as blocked without a kind, and a rejected payload is only
+/// journaled.
+#[tokio::test]
+async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let captured = CapturedLog::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    )
+    .expect("no other subscriber is installed in this test process");
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'L');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    fixture
+        .wait_blocked_kind(&created.id, Some(BlockedKind::Unspecified))
+        .await;
+
+    let logged = wait_until("the journal of the unmapped records", || async {
+        let logged = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
+        let lines = unmapped_journal_lines(&logged);
+        let journaled = |reason: &str| lines.iter().any(|line| line.contains(reason));
+        (journaled("reason=\"unknown_kind\"") && journaled("reason=\"rejected\"")).then_some(logged)
+    })
+    .await;
+
+    let lines = unmapped_journal_lines(&logged);
+    let unknown_kind = lines
+        .iter()
+        .find(|line| line.contains("reason=\"unknown_kind\""))
+        .expect("the unknown kind is journaled");
+    for expected in [
+        "state=\"blocked\"",
+        "kind=\"limit\"",
+        "app=\"fake\"",
+        "has_msg=true",
+        "has_title=false",
+    ] {
+        assert!(
+            unknown_kind.contains(expected),
+            "{expected}: {unknown_kind}"
+        );
+    }
+    let rejected = lines
+        .iter()
+        .find(|line| line.contains("reason=\"rejected\""))
+        .expect("the rejected record is journaled");
+    // The rejected payload names no `kind`, which renders empty.
+    for expected in [
+        "state=\"limit\"",
+        "kind=\"\"",
+        "app=\"fake\"",
+        "has_msg=true",
+        "has_title=false",
+    ] {
+        assert!(rejected.contains(expected), "{expected}: {rejected}");
+    }
+    // The text of `msg` never reaches the log, in clear or encoded form.
+    for secret in [
+        "secret-limit-text",
+        "secret-state-text",
+        "c2VjcmV0LWxpbWl0LXRleHQ=",
+        "c2VjcmV0LXN0YXRlLXRleHQ=",
+    ] {
+        assert!(!logged.contains(secret), "{secret}: {logged}");
+    }
+
+    assert_eq!(
+        fixture.activity(&created.id).await,
+        Some((AgentActivity::Blocked, StateSource::OscProgress)),
+        "the rejected record leaves the state of the applied one"
+    );
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::AgentBlocked);
+    assert_eq!(
+        record.metadata.get("reason").map(String::as_str),
+        Some("blocked")
+    );
+    assert_eq!(attention.records(&created.id).len(), 1, "one record");
+
     fixture
         .registry
         .stop(&created.id)
