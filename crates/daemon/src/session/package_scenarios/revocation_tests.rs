@@ -86,6 +86,25 @@ impl Official {
         second
     }
 
+    /// Records catalog sequence 3, which revokes the first and the second
+    /// digest, by installing a third version through it. The third version is
+    /// enabled and left unselected.
+    async fn revoke_first_and_second(&self, second: &Package) -> Package {
+        let third = Package::build(PACKAGE, "3.0.0", RUNTIME, &self.script);
+        let mut body = catalog(3, vec![entry(&third, PACKAGE, RUNTIME, "3.0.0")]);
+        body.revoked_digests = vec![self.first.digest.clone(), second.digest.clone()];
+        let document = signed_by(&self.key, body);
+        let mut install = catalog_install(&self.fixture, &third, &document, false);
+        install.select = false;
+        self.fixture
+            .registry
+            .packages()
+            .package_install(install)
+            .await
+            .expect("install the third version through the revoking catalog");
+        third
+    }
+
     fn launch(&self) -> protocol::SessionNewParams {
         protocol::SessionNewParams {
             agent: RUNTIME.to_owned(),
@@ -283,6 +302,103 @@ async fn the_session_list_flags_exactly_the_sessions_pinned_to_a_revoked_digest(
     assert_eq!(flagged(&current.id), 0);
 
     for id in [&first.id, &sibling.id, &current.id] {
+        registry.stop(id).await.expect("stop");
+    }
+}
+
+/// The revoked check of the session list reads the package registry once,
+/// however many sessions and distinct revoked digests the list holds. The
+/// revocation set has no read counter, so only the registry read is pinned.
+#[tokio::test]
+async fn the_session_list_reads_the_registry_once_for_sessions_on_several_revoked_digests() {
+    let official = official("revoked-list-reads").await;
+    let registry = &official.fixture.registry;
+    let packages = registry.packages();
+    let on_first = registry.create(official.launch()).await.expect("first");
+    let on_first_too = registry.create(official.launch()).await.expect("sibling");
+    let second = official.revoke_first().await;
+    packages
+        .package_select(select(&second.digest))
+        .await
+        .expect("select the second version");
+    let on_second = registry.create(official.launch()).await.expect("second");
+    let third = official.revoke_first_and_second(&second).await;
+    packages
+        .package_select(select(&third.digest))
+        .await
+        .expect("select the third version");
+    let on_third = registry.create(official.launch()).await.expect("third");
+
+    let store = registry
+        .inner
+        .profiles
+        .runtimes()
+        .package_store()
+        .expect("package store")
+        .clone();
+    let reads_of = |sessions: Vec<protocol::SessionInfo>| {
+        let store = store.clone();
+        async move {
+            let mut sessions = sessions;
+            let before = store.registry_state_reads();
+            registry.flag_revoked_packages(&mut sessions).await;
+            (store.registry_state_reads() - before, sessions)
+        }
+    };
+    // The list flags its own result; the measured calls start from sessions
+    // that carry no revoked-package warning.
+    let mut listed = registry.list().await;
+    for session in &mut listed {
+        session.warnings.retain(|warning| {
+            warning
+                .detail
+                .as_deref()
+                .is_none_or(|detail| !detail.starts_with("package_revoked"))
+        });
+    }
+    let only = |id: &protocol::SessionId| {
+        listed
+            .iter()
+            .filter(|session| &session.id == id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let (one_session, flagged_one) = reads_of(only(&on_first.id)).await;
+    let (all_sessions, flagged_all) = reads_of(listed.clone()).await;
+
+    assert!(one_session > 0, "the check reads the registry");
+    assert_eq!(
+        all_sessions, one_session,
+        "four sessions on three distinct digests cost the reads of one"
+    );
+    let revoked_digest_of = |sessions: &[protocol::SessionInfo], id: &protocol::SessionId| {
+        sessions
+            .iter()
+            .find(|session| &session.id == id)
+            .expect("listed")
+            .warnings
+            .iter()
+            .filter_map(|warning| warning.detail.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        revoked_digest_of(&flagged_one, &on_first.id),
+        [format!("package_revoked digest={}", official.first.digest)]
+    );
+    for (id, digest) in [
+        (&on_first.id, &official.first.digest),
+        (&on_first_too.id, &official.first.digest),
+        (&on_second.id, &second.digest),
+    ] {
+        assert_eq!(
+            revoked_digest_of(&flagged_all, id),
+            [format!("package_revoked digest={digest}")]
+        );
+    }
+    assert!(revoked_digest_of(&flagged_all, &on_third.id).is_empty());
+
+    for id in [&on_first.id, &on_first_too.id, &on_second.id, &on_third.id] {
         registry.stop(id).await.expect("stop");
     }
 }

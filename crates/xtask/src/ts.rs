@@ -21,8 +21,8 @@ use std::process::Command;
 use protocol::compat::{introduced_methods, renamed_keys, RANGE_FORWARDING_METHODS};
 use protocol::{
     event, method, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundItem,
-    BackgroundKind, BackgroundRevision, BackgroundStatus, CwdSource, Event, NotificationId,
-    NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
+    BackgroundKind, BackgroundRevision, BackgroundStatus, BlockedKind, CwdSource, Event,
+    NotificationId, NotificationKind, NotificationRecord, NotificationSeverity, NotificationSource,
     NotificationStatus, OutputOffset, ProtocolError, Request, Response, RuntimeGeneration,
     RuntimeRef, SessionBackground, SessionCapabilities, SessionEvent, SessionId, SessionInfo,
     SessionListFilter, SessionListParams, SessionOutputGap, SessionOutputParams,
@@ -476,8 +476,8 @@ fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError
                 json_value(&AgentStateEvent {
                     session_id: SessionId(SESSION_FIXTURE_ID.to_owned()),
                     activity: AgentActivity::Blocked,
-                    source: StateSource::Report,
-                    blocked_kind: None,
+                    source: StateSource::OscProgress,
+                    blocked_kind: Some(BlockedKind::Permission),
                     runtime: Some(
                         SessionRuntimeIdentity::new("runtime-fixture-1", RuntimeGeneration::new(3))
                             .expect("fixture runtime identity is valid"),
@@ -736,7 +736,7 @@ fn session_full() -> SessionInfo {
     metadata.insert("track".to_owned(), "S.3".to_owned());
 
     SessionInfo {
-        blocked_kind: None,
+        blocked_kind: Some(BlockedKind::Permission),
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: Some(false),
         capabilities: SessionCapabilities {
@@ -754,8 +754,8 @@ fn session_full() -> SessionInfo {
         cols: FIXTURE_COLS,
         rows: FIXTURE_ROWS,
         state: SessionState::Done,
-        state_source: StateSource::Report,
-        activity: Some(AgentActivity::Idle),
+        state_source: StateSource::OscProgress,
+        activity: Some(AgentActivity::Blocked),
         subagents: vec![SubagentInfo {
             id: "agent-fixture-1".to_owned(),
             parent_id: None,

@@ -110,12 +110,20 @@ impl OverlayTransport for EmptyTransport {
 ///
 /// A login shell of the host runs its startup files, which can start helpers
 /// that keep the PTY open past a kill.
+#[allow(
+    dead_code,
+    reason = "each test binary using this module needs a different subset of its helpers"
+)]
 pub(crate) fn hermetic_shell() -> ShellCommand {
     ShellCommand::new("/bin/sh", std::iter::empty::<&str>())
 }
 
 /// Registry configuration that pins [`hermetic_shell`] and leaves every other
 /// field at its default.
+#[allow(
+    dead_code,
+    reason = "each test binary using this module needs a different subset of its helpers"
+)]
 pub(crate) fn hermetic_registry_config() -> SessionRegistryConfig {
     SessionRegistryConfig {
         shell_command: hermetic_shell(),

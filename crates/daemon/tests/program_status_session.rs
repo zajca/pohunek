@@ -13,12 +13,16 @@
 
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
+mod support;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::{SinkExt as _, StreamExt as _};
+use pohunek_daemon::api::{ConnectionTasks, ControlServer, DaemonState, HealthInfo, OverlaySource};
+use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::{spawn_projector, AttentionCoordinator, NotificationService};
 use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
@@ -31,9 +35,9 @@ use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
-    AgentActivity, BlockedKind, NotificationKind, NotificationListParams, NotificationRecord,
-    NotificationStatus, SessionId, SessionInfo, SessionInputParams, SessionInputWait,
-    SessionNewParams, StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
+    method, AgentActivity, BlockedKind, NotificationKind, NotificationListParams,
+    NotificationRecord, NotificationStatus, SessionId, SessionInfo, SessionInputParams,
+    SessionInputWait, SessionNewParams, StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 /// `session.detection` as a client that predates the program-status region
@@ -1771,6 +1775,113 @@ async fn a_session_reattached_after_a_daemon_restart_shows_its_blocked_kind_agai
     restarted
         .registry
         .stop(&id)
+        .await
+        .expect("stop the session");
+}
+
+/// A client that reseeds after a reconnect reads the blocked kind from
+/// `session.list` and `session.inspect` over the control socket.
+#[tokio::test]
+async fn a_client_reseeding_over_the_control_socket_reads_the_blocked_kind() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'b');
+    fixture
+        .wait_blocked_kind(&created.id, Some(BlockedKind::Permission))
+        .await;
+
+    let socket = fixture.env.root().join("control.sock");
+    let governance = Arc::new(
+        HostGovernanceService::open(fixture.env.root().join("governance"))
+            .await
+            .expect("open the host-governance service"),
+    );
+    let state = DaemonState::new(
+        HealthInfo::new("0.0.0-test"),
+        fixture.registry.clone(),
+        governance,
+        support::overlay_registry(),
+        OverlaySource::Default,
+    );
+    let server = ControlServer::bind_with_state(&socket, state)
+        .await
+        .expect("bind the control socket");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(async move {
+        server
+            .serve(
+                ConnectionTasks::new(
+                    "control_connections",
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
+                async move {
+                    let _ = stopped.await;
+                },
+            )
+            .await;
+    });
+
+    let stream = tokio::net::UnixStream::connect(&socket)
+        .await
+        .expect("connect to the control socket");
+    let mut client = tokio_util::codec::Framed::new(stream, tokio_util::codec::LinesCodec::new());
+    let mut ask = async |method: &str, params: serde_json::Value| -> serde_json::Value {
+        let request = protocol::Request::new("reseed", method, params).expect("valid request");
+        client
+            .send(serde_json::to_string(&request).expect("serialize request"))
+            .await
+            .expect("send the request");
+        let line = client
+            .next()
+            .await
+            .expect("a response line")
+            .expect("response framing");
+        serde_json::from_str::<protocol::Response>(&line)
+            .expect("parse the response")
+            .into_result()
+            .expect("the request succeeds")
+    };
+
+    let listed = ask(method::SESSION_LIST, serde_json::json!({})).await;
+    let entry = listed
+        .as_array()
+        .expect("a session array")
+        .iter()
+        .find(|session| session["id"] == created.id.0.as_str())
+        .expect("the session is listed");
+    assert_eq!(entry["activity"], "blocked");
+    assert_eq!(
+        entry["blocked_kind"], "permission",
+        "session.list carries the kind on the wire"
+    );
+    let inspected = ask(method::SESSION_INSPECT, serde_json::json!(created.id.0)).await;
+    assert_eq!(inspected["blocked_kind"], "permission");
+
+    command(&fixture, b'i');
+    fixture.wait_blocked_kind(&created.id, None).await;
+    let listed = ask(method::SESSION_LIST, serde_json::json!({})).await;
+    let entry = listed
+        .as_array()
+        .expect("a session array")
+        .iter()
+        .find(|session| session["id"] == created.id.0.as_str())
+        .expect("the session is listed");
+    assert!(
+        entry.get("blocked_kind").is_none(),
+        "an idle session lists no kind: {entry}"
+    );
+
+    let _ = stop.send(());
+    serving.await.expect("the control server stops");
+    fixture
+        .registry
+        .stop(&created.id)
         .await
         .expect("stop the session");
 }
