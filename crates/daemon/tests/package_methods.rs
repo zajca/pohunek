@@ -1574,6 +1574,135 @@ async fn a_manifest_with_composer_absent_installs_only_with_its_feature() {
     servers.stop().await;
 }
 
+/// A question dialog that replaces the composer, and the composer itself.
+const COMPOSER_SCREEN_MANIFEST: &str = r#"[[rules]]
+id = "question"
+state = "blocked"
+priority = 980
+region = "whole_recent"
+contains = ["which option do you want"]
+composer_absent = true
+
+[[rules]]
+id = "composer"
+state = "idle"
+priority = 300
+region = "whole_recent"
+contains = ["ask anything"]
+"#;
+
+/// A program that draws the picker of a dialog whose list scrolled out of a
+/// clipped region (the model text above it quotes a rule line, the dialog
+/// draws none), or, once `<program>.composer` exists, the same question text
+/// above a composer box.
+fn dialog_program(plugins: &Path) -> PathBuf {
+    write_program(
+        plugins,
+        "agent-dialog",
+        concat!(
+            "#!/bin/sh\n",
+            "rule='────────────────────────────────────────'\n",
+            "printf 'The plan has two steps:\\r\\n%s\\r\\n1. rename the module\\r\\n' \"$rule\"\n",
+            "printf 'Which option do you want?\\r\\n'\n",
+            "if [ -e \"$0.composer\" ]; then\n",
+            "  printf '%s\\r\\nask anything\\r\\n%s\\r\\n' \"$rule\" \"$rule\"\n",
+            "else\n",
+            "  printf '> first option\\r\\n'\n",
+            "fi\n",
+            "exec sleep 600\n",
+        ),
+    )
+}
+
+/// The activity the daemon reports for session `id`, once it reports one.
+async fn reported_activity<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    id: &protocol::SessionId,
+    expected: protocol::AgentActivity,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let shared = tokio::sync::Mutex::new(framed);
+    let shared = &shared;
+    pohunek_test_support::wait::wait_until(
+        &format!("the session to read {expected:?}"),
+        || async move {
+            let mut framed = shared.lock().await;
+            let info: protocol::SessionInfo =
+                call(&mut **framed, method::SESSION_INSPECT, json!(id)).await;
+            (info.activity == Some(expected)).then_some(())
+        },
+    )
+    .await;
+}
+
+/// A runtime that refuses input while blocked and gates its question dialog on
+/// `composer_absent` answers no typed input while the clipped picker is on
+/// screen, and answers input again once the screen shows the composer box.
+#[tokio::test]
+async fn typed_input_is_refused_while_a_composer_absent_dialog_reads_blocked() {
+    use protocol::AgentActivity;
+
+    let servers = spawn_servers("pkg-composer-input").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = dialog_program(&servers.plugins);
+    let document = descriptor_requiring(
+        "\"detect-composer-absent-v1\", \"input-refuse-while-blocked-v1\"",
+        "",
+    )
+    .replace(
+        "program = \"/bin/sh\"",
+        &format!("program = \"{}\"", program.display()),
+    )
+    .replace(
+        "text_policy = \"unrestricted\"\n",
+        "text_policy = \"unrestricted\"\nrefuse_while_blocked = true\n",
+    );
+    let (_digest, installed) = install_with_manifest(
+        &mut local,
+        &servers.plugins,
+        "agent-dialog",
+        &document,
+        COMPOSER_SCREEN_MANIFEST,
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+
+    let typed = json!({ "text": "1" });
+    let input = |id: &protocol::SessionId| {
+        let mut params = typed.clone();
+        params["session_id"] = json!(id);
+        params
+    };
+
+    let dialog = start_session(&mut local, RUNTIME, &cwd).await;
+    reported_activity(&mut local, &dialog, AgentActivity::Blocked).await;
+    assert_eq!(
+        refusal(&mut local, method::SESSION_INPUT, input(&dialog)).await,
+        "session_input_blocked"
+    );
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(dialog)).await;
+
+    // The same question text above a composer box is not a dialog.
+    std::fs::write(format!("{}.composer", program.display()), "").expect("select the composer");
+    let composer = start_session(&mut local, RUNTIME, &cwd).await;
+    reported_activity(&mut local, &composer, AgentActivity::Idle).await;
+    let accepted: Value = call(&mut local, method::SESSION_INPUT, input(&composer)).await;
+    drop(accepted);
+    let _: protocol::SessionStopResult =
+        call(&mut local, method::SESSION_STOP, json!(composer)).await;
+
+    drop(local);
+    servers.stop().await;
+}
+
 const OPEN_RANGE_FEATURE: &str = "\"version-probe-open-range-v1\"";
 
 /// [`probed_descriptor`] for the open-ended range `[min, ..)`: `below` is
@@ -2480,6 +2609,7 @@ async fn launch_env_pairs_reach_new_and_resumed_sessions_and_a_profile_overrides
 
 #[tokio::test]
 async fn a_descriptor_with_or_without_fork_data_installs_and_shows_no_fork() {
+    let log = DaemonLog::start();
     let servers = spawn_servers("pkg-fork-data").await;
     let mut local = connect_unix(&servers.socket).await;
     let plain = descriptor("/bin/sh");
@@ -2494,21 +2624,28 @@ async fn a_descriptor_with_or_without_fork_data_installs_and_shows_no_fork() {
         .replace(fork, "")
         .replace("version = \"1.0.0\"", "version = \"1.0.1\"");
     assert!(!current.contains("[fork]"));
+    // The warning names the package id; each descriptor gets a package and a
+    // runtime id no other test of the process uses, so the records below are
+    // this scenario's alone and the two packages do not serve one runtime.
+    let package_line = "id = \"acme.runtime.pi\"";
+    let runtime_line = format!("id = \"{RUNTIME}\"");
+    assert!(plain.contains(package_line) && plain.contains(&runtime_line));
     for (name, document, warns) in [
         ("legacy-fork", &legacy, true),
         ("current-no-fork", &current, false),
     ] {
-        let captured = captured_log();
-        let before = captured_text(captured).len();
+        let package = format!("acme.runtime.{name}");
+        let document = document
+            .replace(package_line, &format!("id = \"{package}\""))
+            .replace(&runtime_line, &format!("id = \"{name}\""));
         let (digest, installed) =
-            install_descriptor(&mut local, &servers.plugins, name, document, false).await;
+            install_descriptor(&mut local, &servers.plugins, name, &document, false).await;
         installed.unwrap_or_else(|error| panic!("{name} installs: {error:?}"));
-        let logged = captured_text(captured).split_off(before);
-        assert_eq!(
-            logged.contains("ignoring fork data in the runtime descriptor"),
-            warns,
-            "{name}: {logged}"
-        );
+        let warned = logged_records(&log.path(), "ignoring fork data in the runtime descriptor")
+            .into_iter()
+            .filter(|record| record["fields"]["runtime"] == package.as_str())
+            .count();
+        assert_eq!(warned > 0, warns, "{name}: {warned} warnings");
         let inspected: PackageInspectResult = call(
             &mut local,
             method::PACKAGE_INSPECT,
@@ -2868,12 +3005,8 @@ async fn assert_pair_creates(
 #[tokio::test]
 async fn pair_naming_args_follow_the_name_each_launch_uses() {
     let servers = spawn_servers_over("pkg-naming-pair", Some("")).await;
-    let log_dir = servers
-        .plugins
-        .parent()
-        .expect("the socket directory")
-        .join("daemon-logs");
-    let _capture = pohunek_daemon::logging::capture(&log_dir).expect("daemon logging initializes");
+    let log = DaemonLog::start();
+    let log_dir = log.path();
     let mut local = connect_unix(&servers.socket).await;
     let cwd = servers
         .plugins
@@ -2930,23 +3063,30 @@ async fn pair_naming_args_follow_the_name_each_launch_uses() {
     servers.stop().await;
 }
 
-/// The production JSON log records in `log_dir` whose message mentions
-/// `needle`.
-fn logged_records(log_dir: &Path, needle: &str) -> Vec<Value> {
+/// Every record of the production JSON log files in `log_dir`.
+fn log_records(log_dir: &Path) -> Vec<Value> {
     let mut records = Vec::new();
     for entry in std::fs::read_dir(log_dir).expect("the capture directory") {
         let text = std::fs::read_to_string(entry.expect("a log file").path()).unwrap_or_default();
         records.extend(
             text.lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .filter(|record| {
-                    record["fields"]["message"]
-                        .as_str()
-                        .is_some_and(|message| message.contains(needle))
-                }),
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
         );
     }
     records
+}
+
+/// The production JSON log records in `log_dir` whose message mentions
+/// `needle`.
+fn logged_records(log_dir: &Path, needle: &str) -> Vec<Value> {
+    log_records(log_dir)
+        .into_iter()
+        .filter(|record| {
+            record["fields"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(needle))
+        })
+        .collect()
 }
 
 /// `[naming]` tables the grammar refuses, next to the valid `valid` table.
@@ -4160,54 +4300,46 @@ async fn a_host_that_trusts_no_repository_never_adds_the_trusted_args() {
     servers.stop().await;
 }
 
-/// A tracing writer that keeps what the daemon logs.
-#[derive(Clone, Default)]
-struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for CapturedLog {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("log buffer").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+/// The production JSON log of the daemon, captured for the lifetime of one
+/// test.
+///
+/// Captures of one test binary run one after the other, each into its own
+/// directory, and the log of every thread reaches the active one, so a scenario
+/// selects its own records by a value only it produces: a checkout path, a
+/// session id, or a runtime id.
+struct DaemonLog {
+    // Ended before the directory is removed.
+    _capture: pohunek_daemon::logging::CaptureGuard,
+    dir: tempfile::TempDir,
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+impl DaemonLog {
+    fn start() -> Self {
+        let dir = pohunek_test_support::tempdir().expect("log directory");
+        let capture = pohunek_daemon::logging::capture(&dir.path().join("daemon-logs"))
+            .expect("daemon logging initializes");
+        Self {
+            _capture: capture,
+            dir,
+        }
     }
-}
 
-/// The log buffer of the process-wide subscriber, installed once so every
-/// test of this binary shares one callsite interest; a scenario finds its own
-/// lines by its checkout path.
-fn captured_log() -> &'static CapturedLog {
-    static LOG: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| {
-        let captured = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("no other subscriber is installed in this test binary");
-        captured
-    })
-}
+    fn path(&self) -> PathBuf {
+        self.dir.path().join("daemon-logs")
+    }
 
-fn captured_text(log: &CapturedLog) -> String {
-    String::from_utf8_lossy(&log.0.lock().expect("log buffer")).into_owned()
+    /// The records of the captured log whose `event` field is `event`.
+    fn event_records(&self, event: &str) -> Vec<Value> {
+        log_records(&self.path())
+            .into_iter()
+            .filter(|record| record["fields"]["event"] == event)
+            .collect()
+    }
 }
 
 #[tokio::test]
 async fn a_git_failure_withholds_the_trusted_args_and_logs_one_line() {
-    let captured = captured_log();
+    let log = DaemonLog::start();
     let servers = spawn_servers_trusting_repositories(
         "pkg-trust-failure",
         Some(""),
@@ -4237,14 +4369,12 @@ async fn a_git_failure_withholds_the_trusted_args_and_logs_one_line() {
     let argv = printed_argv(&mut local, &resumed.session.id).await;
     assert!(!carries_trust_arg(&argv), "{argv:?}");
 
-    let log = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf-8 log");
-    let lines: Vec<&str> = log
-        .lines()
-        .filter(|line| {
-            line.contains("checkout_trust.failed") && line.contains(&*dir.to_string_lossy())
-        })
+    let lines = log.event_records("checkout_trust.failed");
+    let lines: Vec<&Value> = lines
+        .iter()
+        .filter(|record| record["fields"]["checkout"] == dir.to_string_lossy().as_ref())
         .collect();
-    assert_eq!(lines.len(), 1, "one trace line for the failure: {log}");
+    assert_eq!(lines.len(), 1, "one trace line for the failure: {lines:?}");
 
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
@@ -4373,7 +4503,7 @@ async fn a_declared_path_swapped_for_a_link_while_the_checkout_is_read_is_not_tr
 
 #[tokio::test]
 async fn a_declared_file_that_grows_after_the_size_check_is_refused_without_a_failure() {
-    let captured = captured_log();
+    let log = DaemonLog::start();
     let servers = spawn_servers_trusting_repositories(
         "pkg-trust-growth",
         Some(""),
@@ -4408,13 +4538,7 @@ async fn a_declared_file_that_grows_after_the_size_check_is_refused_without_a_fa
     );
     assert!(!carries_trust_arg(&launched_argv(&mut local, &dir).await));
     assert!(hook.lock().expect("read hook").is_none(), "the growth ran");
-    let log = captured_text(captured);
-    assert!(
-        !log.lines()
-            .any(|line| line.contains("checkout_trust.failed")
-                && line.contains(&*dir.to_string_lossy())),
-        "a refusal is not a failure: {log}"
-    );
+    assert_eq!(failure_lines(&log, &dir), 0, "a refusal is not a failure");
 
     drop(local);
     servers.stop().await;
@@ -4932,13 +5056,10 @@ where
 }
 
 /// How many `checkout_trust.failed` lines the daemon logged for `dir`.
-fn failure_lines(dir: &Path) -> usize {
-    let log =
-        String::from_utf8(captured_log().0.lock().expect("log buffer").clone()).expect("utf-8 log");
-    log.lines()
-        .filter(|line| {
-            line.contains("checkout_trust.failed") && line.contains(&*dir.to_string_lossy())
-        })
+fn failure_lines(log: &DaemonLog, dir: &Path) -> usize {
+    log.event_records("checkout_trust.failed")
+        .into_iter()
+        .filter(|record| record["fields"]["checkout"] == dir.to_string_lossy().as_ref())
         .count()
 }
 
@@ -4953,7 +5074,7 @@ fn recorded_launch_checkout(store: &str, id: &protocol::SessionId) -> Option<Val
 
 #[tokio::test]
 async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
-    let _ = captured_log();
+    let log = DaemonLog::start();
     let servers = spawn_servers_configured("pkg-trust-anchor", Some(""), |config| {
         config.trusted_repositories = host_trusting(&["acme/widgets"]);
         config.procwatch_poll = std::time::Duration::from_millis(50);
@@ -4990,17 +5111,17 @@ async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
     // content; the resume launches there without the arguments and logs one
     // failure.
     drift(&mut local, &created, "osc", &second).await;
-    assert_eq!(failure_lines(&second), 0);
+    assert_eq!(failure_lines(&log, &second), 0);
     let argv = resumed_argv(&mut local, &created).await;
     assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
     assert_eq!(reported_cwd(&mut local, &created).await, second);
-    assert_eq!(failure_lines(&second), 1);
+    assert_eq!(failure_lines(&log, &second), 1);
 
     // Row 6: the resume reset the cwd source to the launch, yet the next
     // resume in the moved directory still withholds the arguments.
     let argv = resumed_argv(&mut local, &created).await;
     assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
-    assert_eq!(failure_lines(&second), 2);
+    assert_eq!(failure_lines(&log, &second), 2);
 
     // Row 5: back in the launch directory, the arguments return.
     drift(&mut local, &created, "osc", &anchor).await;
@@ -5058,7 +5179,7 @@ async fn the_trusted_args_follow_the_directory_the_session_was_created_in() {
     reason = "one session walks a move, a restart and a store without the launch checkout"
 )]
 async fn a_resumed_session_keeps_its_launch_checkout_across_a_restart_and_a_migration() {
-    let _ = captured_log();
+    let log = DaemonLog::start();
     let base = pohunek_test_support::tempdir().expect("checkout root");
     let own = "https://github.com/acme/widgets.git";
     let anchor = checkout(base.path(), "anchor", own);
@@ -5164,12 +5285,12 @@ async fn a_resumed_session_keeps_its_launch_checkout_across_a_restart_and_a_migr
         .await
         .expect("startup reconciles the stored sessions");
     announce_remote_source(&servers, Some(remote_snapshot(&anchor)));
-    let before = failure_lines(&anchor);
+    let before = failure_lines(&log, &anchor);
     let resumed: protocol::SessionResumeResult =
         call(&mut local, method::SESSION_RESUME, json!(created)).await;
     let argv = printed_argv(&mut local, &resumed.session.id).await;
     assert_eq!(trust_arg_count(&argv), 0, "{argv:?}");
-    assert_eq!(failure_lines(&anchor), before + 1);
+    assert_eq!(failure_lines(&log, &anchor), before + 1);
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(created)).await;
     drop(local);
@@ -5178,7 +5299,7 @@ async fn a_resumed_session_keeps_its_launch_checkout_across_a_restart_and_a_migr
 
 #[tokio::test]
 async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_nothing() {
-    let _ = captured_log();
+    let log = DaemonLog::start();
     let servers = spawn_servers_configured("pkg-trust-plain", Some(""), |config| {
         config.trusted_repositories = host_trusting(&["acme/widgets"]);
     })
@@ -5215,7 +5336,7 @@ async fn a_runtime_without_trusted_args_records_the_launch_checkout_and_logs_not
             .expect("the store records the launch checkout")["cwd"],
         json!(dir)
     );
-    assert_eq!(failure_lines(&dir), 0);
+    assert_eq!(failure_lines(&log, &dir), 0);
 
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(created)).await;

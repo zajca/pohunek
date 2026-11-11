@@ -1102,10 +1102,19 @@ what the rule matches; under `not` it negates together with its siblings.
 
 The fact is the same heuristic as the `prompt_box_body` region: a prompt box
 exists when the visible grid holds at least two horizontal-rule lines (the
-second counted from the bottom is its top border). A rule that uses the matcher
-is skipped while the screen is not part of the detection context, so a stale
-screen never reads as "no composer". Quoted model text with two rule lines of
-its own looks like a prompt box; such a dialog stays with the text matchers.
+second counted from the bottom is its top border). It counts every rule line on
+the visible grid: the dialog's own frame, transcript lines above the dialog, and
+quoted model text alike. A rule that uses the matcher is skipped while the
+screen is not part of the detection context, so a stale screen never reads as
+"no composer".
+
+The matcher therefore only narrows well for a dialog that draws no rule line of
+its own, and even then two quoted rule lines on the screen defeat it. A dialog
+that draws one rule (Claude's approval dialog draws one full-width rule) is
+defeated by a single quoted rule line anywhere on the screen: the rule stops firing, the session reads unblocked, and
+`refuse_while_blocked` no longer applies. Check the recorded screen of the
+dialog before relying on the matcher, and keep the text matchers of such a
+dialog sufficient on their own.
 
 The matcher lives in the detection manifest, which the descriptor key gates
 cannot see. A descriptor whose manifest uses it without listing the feature is
