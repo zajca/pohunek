@@ -62,9 +62,9 @@ use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 /// deadline. A command that takes longer is a stalled filesystem or network.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Longest one evaluation may take across all its git commands, so a launch
-/// holding its lifecycle lock is never delayed longer by a hostile or stalled
-/// checkout or network.
+/// Longest one evaluation may take across all its git commands and the
+/// checks between its file system calls. A single file system call that never
+/// returns (a stalled mount) is not interrupted.
 pub(crate) const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Most stdout bytes one git command may produce; the runner lowers a larger

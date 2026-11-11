@@ -4260,7 +4260,7 @@ async fn a_declared_path_swapped_for_a_link_while_the_checkout_is_read_is_not_tr
         let outside = root.join(format!("{name}-outside"));
         let target = dir.join(swapped);
         let replacement = outside.clone();
-        let original = dir.join(format!("{swapped}.original"));
+        let original = root.join(format!("{name}-original"));
         let swapped_path = target.clone();
         if whole_directory {
             copy_tree(&target, &outside);
@@ -4315,8 +4315,8 @@ async fn a_declared_file_that_grows_after_the_size_check_is_refused_without_a_fa
     assert!(carries_trust_arg(&launched_argv(&mut local, &dir).await));
 
     // A writer of the checkout extends the opened file to a sparse 64 GiB
-    // after its size passed the check. The read stops at the bound and
-    // refuses; it does not hash the grown file until a command timeout.
+    // after its size passed the check. The read stops one byte past the bound
+    // and the checkout is refused without a failure.
     let grown = dir.join(".muse/hooks.json");
     let to_grow = grown.clone();
     on_read(
