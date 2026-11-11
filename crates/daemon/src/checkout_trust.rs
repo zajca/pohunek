@@ -15,8 +15,8 @@
 //!    the evaluation. Git verifies every fetched object, so the commit and its
 //!    trees are what GitHub serves.
 //! 3. For each declared path, the files on disk are exactly the blobs the
-//!    tree of that commit holds there, with the same contents (hashed by git
-//!    in the private repository) and executable bits. Symbolic links,
+//!    tree of that commit holds there, with the same contents (all files hashed
+//!    by one git process in the private repository) and executable bits. Symbolic links,
 //!    submodules, special files, nested `.git` entries, a non-directory
 //!    ancestor and an entry that differs from a path component only by letter
 //!    case all refuse. So does a declared path that the file system resolves
@@ -33,17 +33,27 @@
 //! runs in the private repository through the bounded runner with a cleared
 //! environment, no user or system configuration, no hooks, no pager and no
 //! lazy fetch. The walk of the declared paths on disk and all git commands of
-//! one evaluation share one deadline. The files can still change between the
-//! evaluation and the moment the runtime reads them; a process that can write
-//! the checkout can win that race.
+//! one evaluation share one deadline.
+//!
+//! The launch directory is opened once; every component below it is opened
+//! relative to the descriptor of its parent without following a symbolic link,
+//! and a file is read in-process, up to a bound, through the descriptor that
+//! was checked. A component replaced by a link or by another kind of file
+//! while the evaluation runs is refused instead of redirecting a read. The
+//! files can still change between the evaluation and the moment the runtime
+//! reads them; a process that can write the checkout can win that race.
 
 // Rust guideline compliant 2026-11-06
 
 use std::collections::BTreeMap;
+use std::io::{Read as _, Seek as _, Write as _};
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use tracing::{debug, warn};
 
 use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
@@ -52,9 +62,9 @@ use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 /// deadline. A command that takes longer is a stalled filesystem or network.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Longest one evaluation may take across all its git commands, so a launch
-/// holding its lifecycle lock is never delayed longer by a hostile or stalled
-/// checkout or network.
+/// Longest one evaluation may take across all its git commands and the
+/// checks between its file system calls. A single file system call that never
+/// returns (a stalled mount) is not interrupted.
 pub(crate) const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Most stdout bytes one git command may produce; the runner lowers a larger
@@ -75,6 +85,15 @@ const MAX_WALKED_ENTRIES: usize = 8192;
 /// instead of being read.
 const MAX_COMPARED_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Most bytes of all declared files together that the predicate reads; a
+/// checkout with more is not trusted. The declared paths hold hooks, rules and
+/// plugin configuration, so this is far above any real checkout and keeps the
+/// scratch blob stream small.
+const MAX_COMPARED_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Bytes read from a declared file between two deadline checks.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Deepest directory nesting the predicate walks below a declared path.
 const MAX_COMPARED_DEPTH: usize = 32;
 
@@ -93,6 +112,10 @@ const SCP_USER: &str = "git@";
 
 /// Suffix git accepts on a remote URL.
 const GIT_SUFFIX: &str = ".git";
+
+/// Name of the file `git fast-import` exports the blob marks to, in the
+/// private directory.
+const MARKS_FILE: &str = "blob-marks";
 
 /// Mode of the daemon-private scratch directory.
 const SCRATCH_DIR_MODE: u32 = 0o700;
@@ -197,6 +220,41 @@ impl std::fmt::Debug for RemoteSourceResolver {
     }
 }
 
+/// The point of the read of a declared path at which a [`ReadObserver`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckoutReadStep {
+    /// Right before the path is opened relative to its parent directory.
+    BeforeOpen,
+    /// After a declared file was opened and its size checked, right before its
+    /// bytes are read.
+    BeforeRead,
+}
+
+/// Runs at each [`CheckoutReadStep`] of the evaluation with the absolute path
+/// being read. Lets an embedder or a test change the checkout at an exact point
+/// of the read.
+#[derive(Clone)]
+pub(crate) struct ReadObserver(Arc<ReadObserve>);
+
+/// The function behind a [`ReadObserver`].
+type ReadObserve = dyn Fn(CheckoutReadStep, &Path) + Send + Sync;
+
+impl ReadObserver {
+    /// An observer that runs `observe`.
+    pub(crate) fn new<F>(observe: F) -> Self
+    where
+        F: Fn(CheckoutReadStep, &Path) + Send + Sync + 'static,
+    {
+        Self(Arc::new(observe))
+    }
+}
+
+impl std::fmt::Debug for ReadObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadObserver")
+    }
+}
+
 /// What the predicate evaluates.
 #[derive(Clone, Copy)]
 pub(crate) struct CheckoutFacts<'a> {
@@ -213,6 +271,8 @@ pub(crate) struct CheckoutFacts<'a> {
     pub(crate) scratch_root: &'a Path,
     /// Replacement for the GitHub URL the remote `HEAD` is fetched from.
     pub(crate) remote_source: Option<&'a RemoteSourceResolver>,
+    /// Observer of the read of the declared paths.
+    pub(crate) read_observer: Option<&'a ReadObserver>,
 }
 
 /// Why the predicate could not reach an answer.
@@ -382,92 +442,51 @@ fn contents_match(git: &Git, facts: &CheckoutFacts<'_>, head: &str) -> Result<bo
         expected.insert(path.to_owned(), (executable, object.to_owned()));
     }
 
-    let mut walk = Walk {
-        cwd: facts.cwd,
-        deadline: git.deadline,
-        entries: 0,
-        files: Vec::new(),
-    };
+    let mut walk = Walk::open(facts, git)?;
     for path in facts.paths {
-        if !walk.collect(path, 0)? {
+        if !walk.collect_declared(path)? {
             return Ok(false);
         }
     }
-    let on_disk = walk.files;
+    let files = std::mem::take(&mut walk.files);
+    let hashes = git.hash_blobs(walk.stream)?;
+    if hashes.len() != files.len() {
+        return Err(Failure::Output);
+    }
     // Set equality: no path is seen twice, every on-disk path is expected
     // (checked with its hash below) and the counts agree.
-    let distinct: std::collections::BTreeSet<&str> = on_disk.iter().map(String::as_str).collect();
-    if distinct.len() != on_disk.len()
-        || on_disk.len() != expected.len()
+    let distinct: std::collections::BTreeSet<&str> =
+        files.iter().map(|file| file.relative.as_str()).collect();
+    if distinct.len() != files.len()
+        || files.len() != expected.len()
         || distinct.iter().any(|path| !expected.contains_key(*path))
     {
         return Ok(false);
     }
-    for path in &on_disk {
-        let Some((want_executable, want)) = expected.get(path) else {
+    for (file, hash) in files.iter().zip(&hashes) {
+        let Some((want_executable, want)) = expected.get(&file.relative) else {
             return Ok(false);
         };
-        let Some(file) = open_declared_file(&facts.cwd.join(path))? else {
-            return Ok(false);
-        };
-        if file.executable != *want_executable {
-            return Ok(false);
-        }
-        let hash = git.hash_blob(&file.handle)?;
-        if hash != *want {
+        if file.executable != *want_executable || hash != want {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// A declared file opened for hashing.
-struct DeclaredFile {
-    handle: std::fs::File,
-    executable: bool,
-}
-
-/// Opens `path` without following a final symbolic link or blocking on a
-/// special file, and checks the opened descriptor: a regular file no larger
-/// than [`MAX_COMPARED_FILE_BYTES`]. `None` refuses: a symbolic link, a
-/// special file or an oversized file, including one swapped in after the walk.
-///
-/// The returned handle is the object that was checked, so the hash and the
-/// executable bit describe it and not whatever the path names later.
-fn open_declared_file(path: &Path) -> Result<Option<DeclaredFile>, Failure> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-    let handle = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-    {
-        Ok(handle) => handle,
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_unreadable) => return Err(Failure::Disk),
-    };
-    let metadata = handle.metadata().map_err(|_unreadable| Failure::Disk)?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_COMPARED_FILE_BYTES {
-        return Ok(None);
-    }
-    Ok(Some(DeclaredFile {
-        executable: metadata.permissions().mode() & EXECUTE_BITS != 0,
-        handle,
-    }))
-}
-
 /// How a declared path is named on disk.
 enum NameState {
-    /// Every component exists under exactly the declared name.
-    Exact,
+    /// Every component exists under exactly the declared name; holds the
+    /// descriptor of the directory that contains the last component.
+    Exact(OwnedFd),
     /// Nothing on disk resolves to the declared path under any spelling.
     Absent,
     /// A sibling differs from a component only by letter case under Unicode
     /// case folding, a component is missing under its exact name yet the file
     /// system still resolves the path (a case-insensitive or
     /// normalization-insensitive file system opens a variant spelling as the
-    /// declared name), or the lookup exceeded its bounds.
+    /// declared name), a component was replaced while the lookup ran, or the
+    /// lookup exceeded its bounds.
     Refused,
 }
 
@@ -482,123 +501,310 @@ fn folds_together(a: &str, b: &str) -> bool {
     a != b && fold(a) == fold(b)
 }
 
-/// The bounded walk of the declared paths on disk.
-struct Walk<'a> {
-    cwd: &'a Path,
-    deadline: Instant,
-    /// Directory entries visited so far, files and directories alike.
-    entries: usize,
-    /// The regular files found, relative to `cwd`.
-    files: Vec<String>,
+/// A regular file found below a declared path.
+struct DiskFile {
+    /// The path relative to the launch directory.
+    relative: String,
+    /// Whether any execute bit of the opened file is set.
+    executable: bool,
 }
 
-impl Walk<'_> {
+/// The blobs of the files read so far, in the stream format of
+/// `git fast-import`, written to a daemon-private file.
+struct BlobStream {
+    writer: std::io::BufWriter<std::fs::File>,
+    blobs: usize,
+}
+
+impl BlobStream {
+    /// Appends `bytes` as the next blob; its mark is its 1-based position.
+    fn push(&mut self, bytes: &[u8]) -> Result<(), Failure> {
+        self.blobs += 1;
+        let written = write!(
+            self.writer,
+            "blob\nmark :{}\ndata {}\n",
+            self.blobs,
+            bytes.len()
+        )
+        .and_then(|()| self.writer.write_all(bytes))
+        .and_then(|()| self.writer.write_all(b"\n"));
+        written.map_err(|_unwritable| Failure::Disk)
+    }
+}
+
+/// The bounded walk of the declared paths on disk, relative to a descriptor of
+/// the launch directory.
+struct Walk<'a> {
+    cwd: &'a Path,
+    root: OwnedFd,
+    deadline: Instant,
+    observer: Option<&'a ReadObserver>,
+    /// Directory entries visited so far, files and directories alike.
+    entries: usize,
+    /// Bytes of the declared files read so far.
+    bytes: u64,
+    /// The regular files found, in the order their blobs were streamed.
+    files: Vec<DiskFile>,
+    stream: BlobStream,
+}
+
+/// Flags for opening a directory without following a link in its name.
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC
+}
+
+/// Flags for opening a file without following a link in its name or blocking
+/// on a special file.
+fn file_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC
+}
+
+/// Whether `errno` says the name no longer designates what was classified: a
+/// link, another kind of file, or nothing.
+fn changed_under_us(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::LOOP | Errno::NOTDIR | Errno::NOENT | Errno::NXIO | Errno::ISDIR
+    )
+}
+
+impl<'a> Walk<'a> {
+    /// Opens the launch directory of `facts` and the blob stream of `git`.
+    fn open(facts: &CheckoutFacts<'a>, git: &Git) -> Result<Self, Failure> {
+        let root = rustix::fs::open(
+            facts.cwd,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_unreadable| Failure::Disk)?;
+        Ok(Self {
+            cwd: facts.cwd,
+            root,
+            deadline: git.deadline,
+            observer: facts.read_observer,
+            entries: 0,
+            bytes: 0,
+            files: Vec::new(),
+            stream: git.blob_stream()?,
+        })
+    }
+
+    fn observe(&self, step: CheckoutReadStep, relative: &str) {
+        if let Some(observer) = self.observer {
+            (observer.0)(step, &self.cwd.join(relative));
+        }
+    }
+
+    fn check_deadline(&self) -> Result<(), Failure> {
+        if Instant::now() >= self.deadline {
+            Err(Failure::Deadline)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Looks up each component of `relative` by its exact name among the
     /// entries of its parent directory, so that a file system that folds
     /// letter case or normalizes names cannot present another spelling as
-    /// the declared one. The entries read count toward the walk bounds and
-    /// the deadline. A path with a component missing under its exact name is
+    /// the declared one. Every parent is opened relative to the descriptor of
+    /// the one before it, so a component replaced by a link while the lookup
+    /// runs refuses. The entries read count toward the walk bounds and the
+    /// deadline. A path with a component missing under its exact name is
     /// still resolved once through the file system: only `NotFound` there
     /// means that nothing answers to the declared name.
+    ///
+    /// On success the descriptor of the directory that contains the last
+    /// component comes with it.
     fn exact_names(&mut self, relative: &str) -> Result<NameState, Failure> {
-        let mut dir = self.cwd.to_path_buf();
-        for component in relative.split('/') {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return self.resolve_absent(relative);
-                }
-                Err(_unreadable) => return Err(Failure::Disk),
-            };
+        let mut parent =
+            rustix::io::fcntl_dupfd_cloexec(&self.root, 0).map_err(|_unreadable| Failure::Disk)?;
+        let mut walked = String::new();
+        let mut components = relative.split('/').peekable();
+        while let Some(component) = components.next() {
             let mut exact = false;
+            let entries = Dir::read_from(&parent).map_err(|_unreadable| Failure::Disk)?;
             for entry in entries {
-                if Instant::now() >= self.deadline {
-                    return Err(Failure::Deadline);
-                }
+                self.check_deadline()?;
                 self.entries += 1;
                 if self.entries > MAX_WALKED_ENTRIES {
                     return Ok(NameState::Refused);
                 }
                 let entry = entry.map_err(|_unreadable| Failure::Disk)?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                let Ok(name) = std::str::from_utf8(entry.file_name().to_bytes()) else {
                     continue;
                 };
                 if name == component {
                     exact = true;
-                } else if folds_together(&name, component) {
+                } else if name != "." && name != ".." && folds_together(name, component) {
                     return Ok(NameState::Refused);
                 }
             }
             if !exact {
-                return self.resolve_absent(relative);
+                return Self::resolve_absent(&parent, component);
             }
-            dir.push(component);
+            if components.peek().is_none() {
+                return Ok(NameState::Exact(parent));
+            }
+            if !walked.is_empty() {
+                walked.push('/');
+            }
+            walked.push_str(component);
+            self.observe(CheckoutReadStep::BeforeOpen, &walked);
+            parent = match rustix::fs::openat(&parent, component, directory_flags(), Mode::empty())
+            {
+                Ok(child) => child,
+                Err(errno) if changed_under_us(errno) => return Ok(NameState::Refused),
+                Err(_unreadable) => return Err(Failure::Disk),
+            };
         }
-        Ok(NameState::Exact)
+        Ok(NameState::Refused)
     }
 
-    fn resolve_absent(&self, relative: &str) -> Result<NameState, Failure> {
-        match std::fs::symlink_metadata(self.cwd.join(relative)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(NameState::Absent),
+    /// Whether `component` is absent from `parent` under every spelling.
+    fn resolve_absent(parent: &OwnedFd, component: &str) -> Result<NameState, Failure> {
+        match rustix::fs::statat(parent, component, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => Ok(NameState::Absent),
             Err(_unreadable) => Err(Failure::Disk),
             Ok(_resolved_under_another_spelling) => Ok(NameState::Refused),
         }
     }
 
-    /// Appends the regular files below `relative` (relative to `cwd`) to
-    /// `files`. `Ok(false)` refuses: a symbolic link, a special file, a `.git`
-    /// entry, a name that is not UTF-8, or more than the compared limits. A
-    /// missing path holds no file. The deadline passing is a
+    /// Appends the regular files below the declared path `relative` to
+    /// `files` and streams their contents. `Ok(false)` refuses: a symbolic
+    /// link, a special file, a `.git` entry, a name that is not UTF-8, a
+    /// component replaced while the walk runs, or more than the compared
+    /// limits. A missing path holds no file. The deadline passing is a
     /// [`Failure::Deadline`].
-    fn collect(&mut self, relative: &str, depth: usize) -> Result<bool, Failure> {
+    fn collect_declared(&mut self, relative: &str) -> Result<bool, Failure> {
+        self.check_deadline()?;
+        let parent = match self.exact_names(relative)? {
+            NameState::Exact(parent) => parent,
+            NameState::Absent => return Ok(true),
+            NameState::Refused => return Ok(false),
+        };
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        self.collect(parent.as_fd(), name, relative, 0)
+    }
+
+    /// Visits `name` below the directory `parent`; `relative` is its path from
+    /// the launch directory, `name` included.
+    fn collect(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        name: &str,
+        relative: &str,
+        depth: usize,
+    ) -> Result<bool, Failure> {
         if depth > MAX_COMPARED_DEPTH {
             return Ok(false);
         }
-        if Instant::now() >= self.deadline {
-            return Err(Failure::Deadline);
-        }
+        self.check_deadline()?;
         self.entries += 1;
         if self.entries > MAX_WALKED_ENTRIES {
             return Ok(false);
         }
-        if depth == 0 {
-            match self.exact_names(relative)? {
-                NameState::Exact => {}
-                NameState::Absent => return Ok(true),
-                NameState::Refused => return Ok(false),
-            }
-        }
-        let metadata = match std::fs::symlink_metadata(self.cwd.join(relative)) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        let kind = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+            Err(Errno::NOENT) => return Ok(true),
             Err(_unreadable) => return Err(Failure::Disk),
         };
-        let kind = metadata.file_type();
-        if kind.is_file() {
-            if self.files.len() >= MAX_COMPARED_FILES {
-                return Ok(false);
-            }
-            self.files.push(relative.to_owned());
-            return Ok(true);
+        self.observe(CheckoutReadStep::BeforeOpen, relative);
+        match kind {
+            FileType::RegularFile => self.collect_file(parent, name, relative),
+            FileType::Directory => self.collect_directory(parent, name, relative, depth),
+            _ => Ok(false),
         }
-        if !kind.is_dir() {
-            return Ok(false);
-        }
-        let entries =
-            std::fs::read_dir(self.cwd.join(relative)).map_err(|_unreadable| Failure::Disk)?;
+    }
+
+    fn collect_directory(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        name: &str,
+        relative: &str,
+        depth: usize,
+    ) -> Result<bool, Failure> {
+        let directory = match rustix::fs::openat(parent, name, directory_flags(), Mode::empty()) {
+            Ok(directory) => directory,
+            Err(errno) if changed_under_us(errno) => return Ok(false),
+            Err(_unreadable) => return Err(Failure::Disk),
+        };
+        let entries = Dir::read_from(&directory).map_err(|_unreadable| Failure::Disk)?;
         for entry in entries {
             let entry = entry.map_err(|_unreadable| Failure::Disk)?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            let bytes = entry.file_name().to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let Ok(child) = std::str::from_utf8(bytes) else {
                 return Ok(false);
             };
-            if name.eq_ignore_ascii_case(GIT_SUFFIX) {
+            if child.eq_ignore_ascii_case(GIT_SUFFIX) {
                 return Ok(false);
             }
-            if !self.collect(&format!("{relative}/{name}"), depth + 1)? {
+            let child_relative = format!("{relative}/{child}");
+            if !self.collect(directory.as_fd(), child, &child_relative, depth + 1)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Opens, checks and reads one regular file. The checks and the read use
+    /// the one descriptor, so they describe the object that was opened and not
+    /// whatever the name designates later.
+    fn collect_file(
+        &mut self,
+        parent: BorrowedFd<'_>,
+        name: &str,
+        relative: &str,
+    ) -> Result<bool, Failure> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if self.files.len() >= MAX_COMPARED_FILES {
+            return Ok(false);
+        }
+        let handle = match rustix::fs::openat(parent, name, file_flags(), Mode::empty()) {
+            Ok(handle) => std::fs::File::from(handle),
+            Err(errno) if changed_under_us(errno) => return Ok(false),
+            Err(_unreadable) => return Err(Failure::Disk),
+        };
+        let metadata = handle.metadata().map_err(|_unreadable| Failure::Disk)?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_COMPARED_FILE_BYTES {
+            return Ok(false);
+        }
+        self.observe(CheckoutReadStep::BeforeRead, relative);
+        let Some(bytes) = self.read_bounded(&handle)? else {
+            return Ok(false);
+        };
+        self.bytes += bytes.len() as u64;
+        if self.bytes > MAX_COMPARED_TOTAL_BYTES {
+            return Ok(false);
+        }
+        self.stream.push(&bytes)?;
+        self.files.push(DiskFile {
+            relative: relative.to_owned(),
+            executable: metadata.permissions().mode() & EXECUTE_BITS != 0,
+        });
+        Ok(true)
+    }
+
+    /// The contents of `file`, or `None` when it holds more than
+    /// [`MAX_COMPARED_FILE_BYTES`]. The read stops one byte past the bound, so
+    /// a file that grows after its size was checked cannot extend it.
+    fn read_bounded(&self, file: &std::fs::File) -> Result<Option<Vec<u8>>, Failure> {
+        let mut limited = file.take(MAX_COMPARED_FILE_BYTES + 1);
+        let mut contents = Vec::new();
+        let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
+        loop {
+            self.check_deadline()?;
+            match limited.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => contents.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_unreadable) => return Err(Failure::Disk),
+            }
+        }
+        Ok((contents.len() as u64 <= MAX_COMPARED_FILE_BYTES).then_some(contents))
     }
 }
 
@@ -699,7 +905,7 @@ struct Git {
     env: Vec<(String, String)>,
     deadline: Instant,
     /// Removes the private repository when the evaluation ends.
-    _private: tempfile::TempDir,
+    private: tempfile::TempDir,
 }
 
 impl Git {
@@ -727,7 +933,7 @@ impl Git {
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
             deadline: Instant::now() + TOTAL_DEADLINE,
-            _private: private,
+            private,
         };
         let init = git.execute(
             &[
@@ -791,19 +997,52 @@ impl Git {
         }
     }
 
-    /// The object id git gives the contents of `file` as a blob, without
-    /// filters. Git reads the descriptor itself, so the hash is of the file
-    /// that was opened and checked.
-    fn hash_blob(&self, file: &std::fs::File) -> Result<String, Failure> {
-        let mut command_args = self.repository_args.clone();
-        command_args.extend(["hash-object", "--no-filters", "--stdin"].map(str::to_owned));
-        let hashed = self.execute_with_stdin(&command_args, &self.env, Some(file))?;
-        let hash = hashed.success_stdout()?.trim();
-        if is_object_id(hash) {
-            Ok(hash.to_owned())
-        } else {
-            Err(Failure::Output)
+    /// A fresh stream that collects the blobs `hash_blobs` hashes, in a file
+    /// of the private directory.
+    fn blob_stream(&self) -> Result<BlobStream, Failure> {
+        let file =
+            tempfile::tempfile_in(self.private.path()).map_err(|_unwritable| Failure::Disk)?;
+        Ok(BlobStream {
+            writer: std::io::BufWriter::new(file),
+            blobs: 0,
+        })
+    }
+
+    /// The object ids git gives the streamed contents as blobs, without
+    /// filters, in stream order. One `fast-import` run hashes them all in the
+    /// private repository's object format.
+    fn hash_blobs(&self, stream: BlobStream) -> Result<Vec<String>, Failure> {
+        let BlobStream { writer, blobs } = stream;
+        if blobs == 0 {
+            return Ok(Vec::new());
         }
+        let mut input = writer.into_inner().map_err(|_unwritable| Failure::Disk)?;
+        input.rewind().map_err(|_unreadable| Failure::Disk)?;
+        let marks = self.private.path().join(MARKS_FILE);
+        let marks_arg = format!("--export-marks={}", marks.to_str().ok_or(Failure::Disk)?);
+        let mut command_args = self.repository_args.clone();
+        command_args.extend(["fast-import".to_owned(), "--quiet".to_owned(), marks_arg]);
+        let imported = self.execute_with_stdin(&command_args, &self.env, Some(&input))?;
+        imported.success_stdout()?;
+        let exported = std::fs::read_to_string(&marks).map_err(|_unreadable| Failure::Output)?;
+        let mut hashes = vec![None; blobs];
+        for line in exported.lines() {
+            let (mark, object) = line.split_once(' ').ok_or(Failure::Output)?;
+            let index = mark
+                .strip_prefix(':')
+                .and_then(|number| number.parse::<usize>().ok())
+                .and_then(|number| number.checked_sub(1))
+                .ok_or(Failure::Output)?;
+            let slot = hashes.get_mut(index).ok_or(Failure::Output)?;
+            if slot.is_some() || !is_object_id(object) {
+                return Err(Failure::Output);
+            }
+            *slot = Some(object.to_owned());
+        }
+        hashes
+            .into_iter()
+            .map(|hash| hash.ok_or(Failure::Output))
+            .collect()
     }
 
     fn execute(&self, args: &[String], env: &[(String, String)]) -> Result<GitResult, Failure> {

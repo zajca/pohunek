@@ -34,6 +34,7 @@ use pohunek_daemon::catalog_anchor::{CatalogTrust, IndexTrust};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{HostTrustAnchor, SessionRegistry, SessionRegistryConfig};
+use pohunek_daemon::CheckoutReadStep;
 use pohunek_test_support::catalog::{root_of, test_key, WINDOW_END, WINDOW_START};
 use pohunek_test_support::worker_binary;
 
@@ -3601,6 +3602,9 @@ const CHECKOUT_TRUST_FEATURE: &str = "\"checkout-trust-args-v1\"";
 /// Largest declared file the predicate compares, in bytes.
 const MAX_COMPARED_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Size a declared file is extended to after its size check, in bytes (sparse).
+const GROWN_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
 /// The argument the fixture runtime adds to a trusted checkout.
 const TRUST_ARG: &str = "--trust-workspace";
 
@@ -4244,6 +4248,174 @@ async fn a_git_failure_withholds_the_trusted_args_and_logs_one_line() {
 
     let _: protocol::SessionStopResult =
         call(&mut local, method::SESSION_STOP, json!(resumed.session.id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+/// What the read observer does at one step of one path, once.
+type ReadAction = Box<dyn FnOnce() + Send>;
+
+/// The pending action of [`on_read`].
+type ReadHook = Arc<std::sync::Mutex<Option<(CheckoutReadStep, PathBuf, ReadAction)>>>;
+
+/// Installs the read observer on `servers` and returns the slot that arms it.
+fn read_hook(servers: &Servers) -> ReadHook {
+    let hook: ReadHook = Arc::default();
+    let armed = Arc::clone(&hook);
+    servers
+        .registry
+        .set_checkout_read_observer(move |step, path| {
+            let mut pending = armed.lock().expect("read hook");
+            if pending
+                .as_ref()
+                .is_some_and(|(at_step, at_path, _)| *at_step == step && at_path == path)
+            {
+                if let Some((_, _, action)) = pending.take() {
+                    action();
+                }
+            }
+        });
+    hook
+}
+
+/// Runs `action` once, when the evaluation reaches `step` of `path`.
+fn on_read(hook: &ReadHook, step: CheckoutReadStep, path: PathBuf, action: ReadAction) {
+    *hook.lock().expect("read hook") = Some((step, path, action));
+}
+
+/// Copies the directory `from` to `to`, files only one level deep below it.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create the copy");
+    for entry in std::fs::read_dir(from).expect("read the original") {
+        let entry = entry.expect("directory entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a file");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_declared_path_swapped_for_a_link_while_the_checkout_is_read_is_not_trusted() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-swap",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let hook = read_hook(&servers);
+    let root = servers.plugins.parent().expect("the socket directory");
+
+    // Each case replaces one component with a link to a copy that holds the
+    // very same bytes, so only the link itself can make the checkout differ.
+    // The swap runs after the walk classified the component and before it is
+    // opened.
+    for (name, swapped, whole_directory) in [
+        ("declared-directory", ".muse", true),
+        ("nested-directory", ".agents/nested", true),
+        ("declared-file", ".muse/hooks.json", false),
+    ] {
+        let dir = checkout(root, name, "https://github.com/acme/widgets.git");
+        std::fs::create_dir_all(dir.join(".agents/nested")).expect("create a nested directory");
+        std::fs::write(dir.join(".agents/nested/deep.md"), "deep\n").expect("write a deep file");
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-q", "-m", "nested"]);
+        git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+        assert!(
+            carries_trust_arg(&launched_argv(&mut local, &dir).await),
+            "{name}: the unmodified checkout is trusted"
+        );
+
+        let outside = root.join(format!("{name}-outside"));
+        let target = dir.join(swapped);
+        let replacement = outside.clone();
+        let original = root.join(format!("{name}-original"));
+        let swapped_path = target.clone();
+        if whole_directory {
+            copy_tree(&target, &outside);
+        } else {
+            std::fs::create_dir_all(&outside).expect("create the outside directory");
+            std::fs::copy(&target, outside.join("hooks.json")).expect("copy the file");
+        }
+        let link_to = if whole_directory {
+            replacement
+        } else {
+            replacement.join("hooks.json")
+        };
+        on_read(
+            &hook,
+            CheckoutReadStep::BeforeOpen,
+            target,
+            Box::new(move || {
+                std::fs::rename(&swapped_path, &original).expect("move the original aside");
+                std::os::unix::fs::symlink(&link_to, &swapped_path).expect("link");
+            }),
+        );
+        assert!(
+            !carries_trust_arg(&launched_argv(&mut local, &dir).await),
+            "{name}: a component swapped for a link is not trusted"
+        );
+        assert!(
+            hook.lock().expect("read hook").is_none(),
+            "{name}: the swap ran"
+        );
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_declared_file_that_grows_after_the_size_check_is_refused_without_a_failure() {
+    let captured = captured_log();
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-growth",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let hook = read_hook(&servers);
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "growing", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+    assert!(carries_trust_arg(&launched_argv(&mut local, &dir).await));
+
+    // A writer of the checkout extends the opened file to a sparse 64 GiB
+    // after its size passed the check. The read stops one byte past the bound
+    // and the checkout is refused without a failure.
+    let grown = dir.join(".muse/hooks.json");
+    let to_grow = grown.clone();
+    on_read(
+        &hook,
+        CheckoutReadStep::BeforeRead,
+        grown,
+        Box::new(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&to_grow)
+                .and_then(|file| file.set_len(GROWN_FILE_BYTES))
+                .expect("grow the file");
+        }),
+    );
+    assert!(!carries_trust_arg(&launched_argv(&mut local, &dir).await));
+    assert!(hook.lock().expect("read hook").is_none(), "the growth ran");
+    let log = captured_text(captured);
+    assert!(
+        !log.lines()
+            .any(|line| line.contains("checkout_trust.failed")
+                && line.contains(&*dir.to_string_lossy())),
+        "a refusal is not a failure: {log}"
+    );
+
     drop(local);
     servers.stop().await;
 }

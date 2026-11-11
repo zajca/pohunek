@@ -374,9 +374,14 @@ checkout and the reason, never a URL, and launches without the arguments. A run 
 fixed arguments equal to the `trusted_checkout_args`, in the descriptor's `args` or a host
 profile's `args`, is dropped from a create or resume command, so only the predicate
 adds them and a session whose frozen arguments hold them does not carry them into an
-untrusted checkout. Each declared file is opened without following a symbolic link in its last path component,
-checked on the opened descriptor (a regular file of at most 4 MiB) and hashed from that
-descriptor; a larger file, a special file or a symbolic link refuses.
+untrusted checkout. The launch directory is opened once and every component below it is
+opened relative to its parent directory without following a symbolic link, so a declared
+directory or file that is replaced by a link, or by another kind of file, while the
+evaluation runs refuses instead of redirecting a read. Each declared file is checked on
+the opened descriptor (a regular file of at most 4 MiB) and read through that descriptor
+up to the bound, so a file that grows after the check refuses without being read further;
+all declared files together may hold at most 64 MiB. The contents of every file are
+hashed by one git process. A larger file, a special file or a symbolic link refuses.
 
 The keys join the digest of a built-in descriptor only while declared. A core
 older than 0.40 refuses the descriptor with `runtime_feature_unsupported`.
