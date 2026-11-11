@@ -1063,8 +1063,12 @@ mod tests {
         assert_eq!(refusal.attempted_phase, RuntimePhase::Faulted);
         assert_eq!(refusal.changed_fields, ["phase", "subagents"]);
 
-        let clone = journal;
+        let clone = journal.clone();
         assert!(clone.check_seal(&changed).is_err(), "clones share the seal");
+        assert!(
+            journal.check_seal(&changed).is_err(),
+            "original keeps the seal"
+        );
         assert_eq!(
             Journal::new("/nonexistent/s-1/worker-2.json").check_seal(&changed),
             Ok(()),
