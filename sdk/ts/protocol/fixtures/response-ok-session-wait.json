@@ -75,7 +75,7 @@
         "session_id": "s-spawner-fixture"
       },
       "state": "done",
-      "state_source": "report",
+      "state_source": "osc_progress",
       "subagents": [
         {
           "activity": "working",

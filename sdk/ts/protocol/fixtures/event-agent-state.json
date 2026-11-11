@@ -9,6 +9,6 @@
     "worker_instance_id": "runtime-fixture-1"
   },
   "session_id": "s-fixture-1",
-  "source": "report",
+  "source": "osc_progress",
   "v": 5
 }

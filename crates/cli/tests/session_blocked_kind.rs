@@ -1,4 +1,4 @@
-//! What `pohunek session inspect` and `session list` show of a blocked agent,
+//! What `pohunek session inspect` shows of a blocked agent,
 //! against a scripted daemon that answers with scripted payloads.
 
 // Rust guideline compliant 2026-11-11

@@ -476,7 +476,7 @@ fn base_fixtures(values: &FixtureValues) -> Result<Vec<NamedFixture>, XtaskError
                 json_value(&AgentStateEvent {
                     session_id: SessionId(SESSION_FIXTURE_ID.to_owned()),
                     activity: AgentActivity::Blocked,
-                    source: StateSource::Report,
+                    source: StateSource::OscProgress,
                     blocked_kind: Some(BlockedKind::Permission),
                     runtime: Some(
                         SessionRuntimeIdentity::new("runtime-fixture-1", RuntimeGeneration::new(3))
@@ -754,7 +754,7 @@ fn session_full() -> SessionInfo {
         cols: FIXTURE_COLS,
         rows: FIXTURE_ROWS,
         state: SessionState::Done,
-        state_source: StateSource::Report,
+        state_source: StateSource::OscProgress,
         activity: Some(AgentActivity::Blocked),
         subagents: vec![SubagentInfo {
             id: "agent-fixture-1".to_owned(),

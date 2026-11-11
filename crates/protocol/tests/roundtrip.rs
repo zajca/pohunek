@@ -5953,7 +5953,7 @@ fn a_session_info_decodes_across_peers_that_do_and_do_not_know_the_blocked_kind(
     // is refused by the strict decode.
     let mut newer = wire;
     newer["blocked_kind"] = json!("a_kind_from_a_newer_daemon");
-    assert!(serde_json::from_value::<SessionInfo>(newer.clone()).is_err());
+    serde_json::from_value::<SessionInfo>(newer.clone()).expect_err("the strict decode refuses it");
     let tolerated: SessionInfo =
         protocol::tolerant::from_value(newer).expect("the tolerant decode maps it");
     assert_eq!(tolerated.blocked_kind, Some(BlockedKind::Unknown));

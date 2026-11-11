@@ -345,7 +345,17 @@ async fn the_session_list_reads_the_registry_once_for_sessions_on_several_revoke
             (store.registry_state_reads() - before, sessions)
         }
     };
-    let listed = registry.list().await;
+    // The list flags its own result; the measured calls start from sessions
+    // that carry no revoked-package warning.
+    let mut listed = registry.list().await;
+    for session in &mut listed {
+        session.warnings.retain(|warning| {
+            warning
+                .detail
+                .as_deref()
+                .is_none_or(|detail| !detail.starts_with("package_revoked"))
+        });
+    }
     let only = |id: &protocol::SessionId| {
         listed
             .iter()
