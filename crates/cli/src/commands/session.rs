@@ -2106,23 +2106,29 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         .max()
         .unwrap_or(0)
         .max("BACKGROUND".len());
+    let activity_width = sessions
+        .iter()
+        .map(|s| activity_column_label(s).len())
+        .max()
+        .unwrap_or(0)
+        .max("ACTIVITY".len());
 
     let mut output = String::new();
     let _ = writeln!(
         output,
-        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  CWD",
+        "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<activity_width$}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  CWD",
         "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN", "SUBAGENTS", "BACKGROUND",
     );
     for session in sessions {
         let _ = writeln!(
             output,
-            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<8}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  {}",
+            "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<activity_width$}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  {}",
             session.id.0,
             name_label(session),
             session_agent_label(session),
             origin_label(session),
             session.condition().as_str(),
-            activity_label_option(session.activity),
+            activity_column_label(session),
             state_source_label(session.state_source),
             session.pid,
             format!("{}x{}", session.cols, session.rows),
@@ -2390,6 +2396,11 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ("state", state_label(info.state).to_owned()),
         ("condition", info.condition().as_str().to_owned()),
         ("activity", activity_label_option(info.activity).to_owned()),
+        (
+            "blocked_kind",
+            info.blocked_kind
+                .map_or_else(none, |kind| kind.as_str().to_owned()),
+        ),
         (
             "state_source",
             state_source_label(info.state_source).to_owned(),
@@ -2808,6 +2819,16 @@ fn state_label(state: SessionState) -> &'static str {
     }
 }
 
+/// The activity of `session`, followed by `/<kind>` while it is blocked on a
+/// kind the program reported.
+fn activity_column_label(session: &SessionInfo) -> String {
+    let activity = activity_label_option(session.activity);
+    match session.blocked_kind {
+        Some(kind) => format!("{activity}/{}", kind.as_str()),
+        None => activity.to_owned(),
+    }
+}
+
 fn activity_label_option(activity: Option<AgentActivity>) -> &'static str {
     activity.map_or("-", activity_label)
 }
@@ -2882,6 +2903,7 @@ mod tests {
 
     fn running_session(id: &str) -> SessionInfo {
         SessionInfo {
+            blocked_kind: None,
             spawned_by: None,
             name: None,
             id: protocol::SessionId(id.to_owned()),
@@ -3413,6 +3435,8 @@ mod tests {
         let mut session = running_session("s-42");
         session.active_agent = Some("codex".to_owned());
         session.active_agent_base = Some(protocol::RuntimeRef::codex());
+        session.activity = Some(AgentActivity::Blocked);
+        session.blocked_kind = Some(protocol::BlockedKind::Permission);
 
         let output = render_list_human(&[session]);
 
@@ -3420,6 +3444,11 @@ mod tests {
             list_row(&output, "s-42")[2],
             "shell->codex",
             "AGENT column should show launch and active agent"
+        );
+        assert_eq!(
+            list_row(&output, "s-42")[5],
+            "blocked/permission",
+            "ACTIVITY column names what a blocked agent waits for"
         );
     }
 

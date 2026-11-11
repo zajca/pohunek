@@ -403,7 +403,9 @@ open and the records stay authoritative
   record is reported as `screen`. Records of background agents carry
   an `id=` and are ignored by the detector.
 - Attention: the `kind` of the `blocked` record travels as
-  `agent_state.blocked_kind` (also when a screen dialog is the reported source)
+  `agent_state.blocked_kind` and as `SessionInfo.blocked_kind` in every session
+  snapshot (also when a screen dialog is the reported source; a record with no
+  kind reads `unspecified`)
   and picks the attention record: `permission` (a tool call, a plan approval, a
   safety check) is `approval_required`, `question` (an AskUserQuestion, an MCP
   elicitation; verified with Claude Code 2.1.322) and `auth` are

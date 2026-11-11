@@ -1138,9 +1138,10 @@ impl SessionEntry {
         }
     }
 
-    /// Sets the published activity.
-    fn set_activity(&mut self, activity: AgentActivity) {
+    /// Sets the published activity and, for a blocked one, what it waits for.
+    fn set_activity(&mut self, activity: AgentActivity, blocked_kind: Option<BlockedKind>) {
         self.info.activity = Some(activity);
+        self.info.blocked_kind = blocked_kind.filter(|_| activity == AgentActivity::Blocked);
     }
 
     /// Notes that the agent the entry presents left or changed, so the turn it
@@ -1720,10 +1721,16 @@ impl Unavailability {
     }
 }
 
+/// Clears the published activity together with the blocked kind it carried.
+fn clear_activity(info: &mut SessionInfo) {
+    info.activity = None;
+    info.blocked_kind = None;
+}
+
 /// Clears what a session shows about a running agent: the activity and the
 /// active-agent identity.
 fn clear_agent_presentation(info: &mut SessionInfo) {
-    info.activity = None;
+    clear_activity(info);
     info.active_agent = None;
     info.active_agent_base = None;
     info.active_agent_pid = None;
@@ -1753,7 +1760,7 @@ fn present_lost_runtime(
     proof: LossProof,
     desired_state: DesiredState,
 ) -> bool {
-    info.activity = None;
+    clear_activity(info);
     if proof != LossProof::Ended || info.state.is_terminal() {
         return false;
     }
@@ -2319,7 +2326,10 @@ impl SessionRegistry {
             session_id: id.0.clone(),
             desired_state,
             transaction,
-            info: entry.info.clone(),
+            info: SessionInfo {
+                blocked_kind: None,
+                ..entry.info.clone()
+            },
             recovery: Some(Self::resume_binding_from_entry(id, entry)),
             native_identity_ordering: entry.last_native_report.clone(),
             runtime,
@@ -5108,7 +5118,7 @@ impl SessionRegistry {
             &entry.info.metadata,
             false,
         );
-        entry.set_activity(activity);
+        entry.set_activity(activity, None);
         entry.info.state_source = StateSource::Report;
         entry.hook_spoke = Some(HookSpoke {
             generation: entry
@@ -8355,6 +8365,7 @@ fn external_session_info(
     });
     let association = association.unwrap_or_default();
     SessionInfo {
+        blocked_kind: None,
         id: external_session_id(fact.pid),
         external: Some(true),
         capabilities: protocol::SessionCapabilities::default(),
@@ -8559,6 +8570,7 @@ fn create_intent_record(
     let native = resolved.native_launch();
     let created_at = timestamp_now();
     let info = SessionInfo {
+        blocked_kind: None,
         id: id.clone(),
         external: Some(false),
         capabilities: protocol::SessionCapabilities {
@@ -9378,7 +9390,7 @@ fn clear_active_agent(
     entry.info.active_agent_session_id = None;
     entry.info.active_agent_session_path = None;
     if activity_reported || entry.info.state_source == StateSource::OscProgress {
-        entry.info.activity = None;
+        clear_activity(&mut entry.info);
         entry.info.state_source = StateSource::Process;
     }
     let default_detector_config = entry.default_detector_config.clone();

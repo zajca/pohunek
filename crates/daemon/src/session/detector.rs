@@ -504,7 +504,7 @@ impl SessionRegistry {
                 &entry.info.metadata,
                 true,
             );
-            entry.set_activity(transition.activity);
+            entry.set_activity(transition.activity, transition.blocked_kind);
             entry.info.state_source = transition.source;
             entry.info.updated_at = timestamp_now();
             let evidence = record_activity_evidence(

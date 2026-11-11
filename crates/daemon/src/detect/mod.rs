@@ -1448,7 +1448,7 @@ fn overlay_program_status(
         return screen;
     };
     let blocked_kind = match record.state {
-        ProgramState::Blocked(kind) => kind.map(blocked_kind_of),
+        ProgramState::Blocked(kind) => Some(kind.map_or(BlockedKind::Unspecified, blocked_kind_of)),
         _ => None,
     };
     let from_record = |activity, visible_blocker| ManifestEvidenceHit {

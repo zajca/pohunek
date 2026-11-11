@@ -149,7 +149,7 @@ copies of that descriptor and its detection manifest in
   held `done` or `idle` beats a stale spinner title, and the record's
   `working` stands over an idle title. `done` turns into `idle` on the next
   key press; both read idle, so that change is no transition. `error` reads
-  idle. The `kind` of a `blocked` record travels as `agent_state.blocked_kind`:
+  idle. The `kind` of a `blocked` record travels as `agent_state.blocked_kind` and as `SessionInfo.blocked_kind` in session snapshots (`session list` shows `blocked/<kind>`):
   `permission` makes the projector's attention record `approval_required`, on
   the same key as the `PermissionRequest` hook's record, and a record that
   returns to `idle` or `done` resolves it. Codex 0.160.0 (recorded: no records) and 0.161.x to 0.162.x (not run; no

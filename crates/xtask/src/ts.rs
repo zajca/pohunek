@@ -682,6 +682,7 @@ where
 
 fn session_minimal() -> SessionInfo {
     SessionInfo {
+        blocked_kind: None,
         spawned_by: None,
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: None,
@@ -735,6 +736,7 @@ fn session_full() -> SessionInfo {
     metadata.insert("track".to_owned(), "S.3".to_owned());
 
     SessionInfo {
+        blocked_kind: None,
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: Some(false),
         capabilities: SessionCapabilities {

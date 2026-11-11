@@ -776,6 +776,7 @@ impl Installation {
         let now = "2026-09-24T00:00:00Z".to_owned();
         let live = runtime.state == RuntimeState::Live;
         let info = SessionInfo {
+            blocked_kind: None,
             spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),

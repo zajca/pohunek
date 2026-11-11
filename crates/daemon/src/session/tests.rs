@@ -24565,6 +24565,47 @@ async fn stop_intent_never_overwrites_an_exit_that_committed_first() {
     );
 }
 
+/// The blocked kind is derived from the live detector: the record written for
+/// a blocked session holds the activity but never the kind, which is what
+/// leaves the stored record without a field for it.
+#[tokio::test]
+async fn a_blocked_sessions_stored_record_has_no_blocked_kind() {
+    let daemon = RestartableDaemon::new("blocked-kind-not-stored");
+    let (registry, _supervisor) = scripted_registry(daemon.config.clone());
+    let created = registry.create(params()).await.expect("create session");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("session entry");
+    entry.set_activity(
+        AgentActivity::Blocked,
+        Some(protocol::BlockedKind::Permission),
+    );
+    entry.info.state_source = protocol::StateSource::OscProgress;
+    drop(sessions);
+    let live = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(live.blocked_kind, Some(protocol::BlockedKind::Permission));
+
+    let persist = registry.inner.persist_lock.lock().await;
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(&created.id).expect("session entry");
+    let record = SessionRegistry::session_record(&created.id, entry, entry.desired_state, None);
+    drop(sessions);
+    registry
+        .store_session_record(record)
+        .await
+        .expect("write the record of the blocked session");
+    drop(persist);
+
+    let stored = stored_record(&daemon.store_path, &created.id);
+    assert_eq!(stored.info.activity, Some(AgentActivity::Blocked));
+    assert_eq!(stored.info.blocked_kind, None);
+    let store_text = std::fs::read_to_string(&daemon.store_path).expect("read the store");
+    assert!(
+        !store_text.contains("blocked_kind"),
+        "the store never holds the derived kind"
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
 /// A create whose initial input was never delivered because its daemon
 /// exited, and the replacement daemon that finds its `initial_input` marker.
 struct OrphanedInputCreate {

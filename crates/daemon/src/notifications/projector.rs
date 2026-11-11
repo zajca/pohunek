@@ -656,7 +656,7 @@ impl ProjectorState {
                 activity,
                 ActivityOrigin {
                     source: Some(session.state_source),
-                    blocked_kind: None,
+                    blocked_kind: session.blocked_kind,
                 },
             ));
         } else {
@@ -718,13 +718,16 @@ impl ProjectorState {
         } else {
             self.record_backed_blocks.remove(session_id);
         }
-        // A blocked reading without a kind keeps the kind already derived.
+        // A blocked reading that names no kind keeps the kind already derived.
+        let named_kind = origin
+            .blocked_kind
+            .filter(|kind| *kind != BlockedKind::Unspecified);
         let kind_before = if activity == AgentActivity::Blocked {
-            if previous == Some(AgentActivity::Blocked) && origin.blocked_kind.is_none() {
+            if previous == Some(AgentActivity::Blocked) && named_kind.is_none() {
                 self.blocked_kind_by_session.get(session_id).copied()
             } else {
                 self.blocked_kind_by_session
-                    .insert(session_id.clone(), origin.blocked_kind)
+                    .insert(session_id.clone(), named_kind)
             }
         } else {
             self.blocked_kind_by_session.remove(session_id);
@@ -733,8 +736,8 @@ impl ProjectorState {
         // A blocked reading that names a different kind than the one derived
         // replaces that attention record.
         let kind_changed = previous == Some(AgentActivity::Blocked)
-            && origin.blocked_kind.is_some()
-            && kind_before.flatten() != origin.blocked_kind;
+            && named_kind.is_some()
+            && kind_before.flatten() != named_kind;
         if activity != AgentActivity::Blocked
             || (previous == Some(AgentActivity::Blocked) && !kind_changed)
         {
@@ -748,7 +751,7 @@ impl ProjectorState {
         if self.blocked_replay_candidates.remove(session_id) {
             return None;
         }
-        let wait = BlockedWait::of(origin.blocked_kind);
+        let wait = BlockedWait::of(named_kind);
         self.prepare_derived(DerivedNotification {
             session_id: session_id.clone(),
             kind: wait.kind,
@@ -1054,7 +1057,8 @@ struct AgentStatePayload {
     blocked_kind: Option<BlockedKind>,
 }
 
-/// Where an activity reading came from; a session snapshot carries neither field.
+/// Where an activity reading came from: the source and, for a blocked reading
+/// the program's status record reported, the kind it carried.
 #[derive(Debug, Default, Clone, Copy)]
 struct ActivityOrigin {
     source: Option<StateSource>,
@@ -1092,7 +1096,7 @@ impl BlockedWait {
                 title: "Agent needs attention",
                 body: "is waiting for authentication",
             },
-            Some(BlockedKind::Unknown) | None => Self {
+            Some(BlockedKind::Unspecified | BlockedKind::Unknown) | None => Self {
                 kind: NotificationKind::AgentBlocked,
                 reason: "blocked",
                 title: "Agent needs attention",

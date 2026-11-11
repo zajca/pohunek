@@ -103,6 +103,7 @@ fn output_result(
 
 fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
+        blocked_kind: None,
         spawned_by: None,
         name: None,
         id: SessionId("s-42".to_owned()),
