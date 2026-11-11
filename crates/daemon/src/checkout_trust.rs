@@ -33,7 +33,9 @@
 //! runs in the private repository through the bounded runner with a cleared
 //! environment, no user or system configuration, no hooks, no pager and no
 //! lazy fetch. The walk of the declared paths on disk and all git commands of
-//! one evaluation share one deadline.
+//! one evaluation share one deadline, and the launch stops waiting for an
+//! evaluation that outlives it (a stalled file system call), which means not
+//! trusted.
 //!
 //! The launch directory is opened once; every component below it is opened
 //! relative to the descriptor of its parent without following a symbolic link,
@@ -64,8 +66,10 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest one evaluation may take across all its git commands and the
 /// checks between its file system calls. A single file system call that never
-/// returns (a stalled mount) is not interrupted.
-pub(crate) const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
+/// returns (a stalled mount) cannot be interrupted, so the caller stops waiting
+/// for the evaluation after this long and treats the checkout as not trusted;
+/// the blocked thread and its scratch directory stay until the call returns.
+pub const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Most stdout bytes one git command may produce; the runner lowers a larger
 /// cap to its own maximum. A larger answer is a failure, which means not
@@ -335,31 +339,57 @@ impl GitResult {
     }
 }
 
-/// Whether the checkout of `facts` is trusted.
-///
-/// A failure logs one warning and returns `false`. A plain "no" (an untrusted
-/// repository, a changed path) logs at debug level only, because it is the
-/// expected answer for most checkouts.
+/// What the predicate concluded for one checkout.
+pub(crate) struct Outcome {
+    verdict: Result<Verdict, Failure>,
+}
+
+impl Outcome {
+    /// Whether the checkout is trusted.
+    pub(crate) fn trusted(&self) -> bool {
+        matches!(self.verdict, Ok(Verdict::Trusted))
+    }
+
+    /// Logs a failure as one warning; a plain "no" (an untrusted repository, a
+    /// changed path) logs at debug level only, because it is the expected
+    /// answer for most checkouts. A trusted outcome logs nothing.
+    pub(crate) fn log(&self, checkout: &Path) {
+        match &self.verdict {
+            Ok(Verdict::Trusted) => {}
+            Ok(Verdict::Untrusted(why)) => {
+                debug!(
+                    reason = *why,
+                    "checkout not trusted for the runtime's trusted arguments"
+                );
+            }
+            Err(failure) => {
+                warn!(
+                    event = "checkout_trust.failed",
+                    checkout = %checkout.display(),
+                    reason = failure.reason(),
+                    "the checkout trust predicate could not be evaluated; the checkout is not trusted"
+                );
+            }
+        }
+    }
+}
+
+impl Outcome {
+    /// The outcome of an evaluation that could not start; the caller has
+    /// logged why.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            verdict: Ok(Verdict::Untrusted("the project record is unavailable")),
+        }
+    }
+}
+
+/// Evaluates the checkout of `facts`. Any error, ambiguity or missing fact is
+/// an outcome that is not trusted.
 #[must_use]
-pub(crate) fn is_trusted(facts: &CheckoutFacts<'_>) -> bool {
-    match evaluate(facts) {
-        Ok(Verdict::Trusted) => true,
-        Ok(Verdict::Untrusted(why)) => {
-            debug!(
-                reason = why,
-                "checkout not trusted for the runtime's trusted arguments"
-            );
-            false
-        }
-        Err(failure) => {
-            warn!(
-                event = "checkout_trust.failed",
-                checkout = %facts.cwd.display(),
-                reason = failure.reason(),
-                "the checkout trust predicate could not be evaluated; the checkout is not trusted"
-            );
-            false
-        }
+pub(crate) fn evaluate_trust(facts: &CheckoutFacts<'_>) -> Outcome {
+    Outcome {
+        verdict: evaluate(facts),
     }
 }
 
