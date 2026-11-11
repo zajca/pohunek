@@ -389,6 +389,8 @@ hashed by one git process. A larger file, a special file or a symbolic link refu
 A launch stops waiting for an evaluation that has not finished at the 30 second deadline, for
 example one stalled in a file system call on a hung mount: it logs one
 `checkout_trust.failed` warning and launches without the arguments.
+While that evaluation is still blocked, a launch in the same directory is withheld at once with a
+`checkout_trust.failed` warning naming the stalled evaluation.
 
 The keys join the digest of a built-in descriptor only while declared. A core
 older than 0.40 refuses the descriptor with `runtime_feature_unsupported`.

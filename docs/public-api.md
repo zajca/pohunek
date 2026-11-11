@@ -1138,8 +1138,9 @@ declared component only by letter case, and a declared path that the file system
 under another spelling (case or normalization folding) refuse. Any error, timeout or
 missing fact withholds the arguments, the git calls and the on-disk walk of one
 evaluation share a 30 second deadline (a launch also stops waiting for an evaluation
-stalled in a file system call at that deadline), and a failure logs one
-`checkout_trust.failed` warning. The arguments are
+stalled in a file system call at that deadline, and refuses a new evaluation of
+that directory with a `checkout_trust.failed` warning until the stalled one ends), and a
+failure logs one `checkout_trust.failed` warning. The arguments are
 evaluated at every launch and never persisted. The directory and project a session was
 created in are persisted (store schema 16, no protocol change): `session.new` evaluates
 the predicate on its launch directory, and `session.resume` evaluates

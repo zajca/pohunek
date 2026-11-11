@@ -4629,9 +4629,13 @@ async fn install_runtime_declaring<S>(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario walks the whole life of a stalled evaluation against a single daemon"
+)]
 async fn an_evaluation_stalled_in_a_file_system_call_is_abandoned_at_its_deadline_and_not_trusted()
 {
-    let captured = captured_log();
+    let log = DaemonLog::start();
     let servers = spawn_servers_trusting_repositories(
         "pkg-trust-stall",
         Some(""),
@@ -4650,20 +4654,25 @@ async fn an_evaluation_stalled_in_a_file_system_call_is_abandoned_at_its_deadlin
         "the unmodified checkout is trusted"
     );
 
-    // A read that never returns: the observer blocks the evaluation's thread
-    // right before the bytes of a declared file are read, and holds it until
-    // `release` is sent or dropped. The ceiling only keeps an evaluation that
-    // is not abandoned from hanging the test.
+    // A call that never returns: the observer blocks the evaluation's thread
+    // right before a declared file is opened, and holds it until `release` is
+    // sent or dropped. The ceiling only keeps an evaluation that is not
+    // abandoned from hanging the test. Once released, the evaluation finds the
+    // file unreadable, so its late outcome is a failure that would be logged
+    // if the launch had not abandoned it.
+    let rules = dir.join(".agents/rules.md");
     let reached = Arc::new(tokio::sync::Notify::new());
     let (release, released) = std::sync::mpsc::channel::<()>();
-    let signal = Arc::clone(&reached);
+    let (signal, unreadable) = (Arc::clone(&reached), rules.clone());
     on_read(
         &hook,
-        CheckoutReadStep::BeforeRead,
-        dir.join(".muse/hooks.json"),
+        CheckoutReadStep::BeforeOpen,
+        rules.clone(),
         Box::new(move || {
             signal.notify_one();
             let _ = released.recv_timeout(pohunek_test_support::wait::HANG_GUARD);
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+                .expect("make the file unreadable");
         }),
     );
 
@@ -4682,55 +4691,75 @@ async fn an_evaluation_stalled_in_a_file_system_call_is_abandoned_at_its_deadlin
         start_named_session(&mut local, RUNTIME, &dir, None),
         past_deadline
     );
-    // While the abandoned evaluation is still blocked, another launch of the
-    // checkout is refused at once instead of starting a second one.
-    assert!(
-        !carries_trust_arg(&launched_argv(&mut local, &dir).await),
-        "a checkout with a stalled evaluation is not trusted"
-    );
-    drop(release);
-
     let argv = printed_argv(&mut local, &id).await;
     let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
     assert!(
         !carries_trust_arg(&argv),
         "a stalled evaluation does not trust the checkout"
     );
-    assert!(hook.lock().expect("read hook").is_none(), "the stall ran");
-    let log = captured_text(captured);
-    assert_eq!(
-        log.lines()
-            .filter(|line| line.contains("checkout_trust.failed")
-                && line.contains("did not finish within its total deadline")
-                && line.contains(&*dir.to_string_lossy()))
-            .count(),
-        1,
-        "one trace line for the abandoned evaluation: {log}"
-    );
 
+    // The records of the checkout: the refusals while the evaluation is
+    // blocked, and the failures.
+    let checkout_reasons = || -> Vec<String> {
+        log.event_records("checkout_trust.failed")
+            .iter()
+            .filter(|record| record["fields"]["checkout"] == dir.to_string_lossy().as_ref())
+            .map(|record| {
+                record["fields"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    };
+    let refusals = || {
+        checkout_reasons()
+            .iter()
+            .filter(|reason| reason.contains("still stalled"))
+            .count()
+    };
+
+    // While the abandoned evaluation is still blocked, another launch of the
+    // checkout is refused at once instead of starting a second one.
     assert!(
-        log.contains("an earlier evaluation of this checkout is still stalled"),
-        "the refused launch is traced: {log}"
+        !carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "a checkout with a stalled evaluation is not trusted"
     );
+    assert_eq!(refusals(), 1, "the refused launch is traced");
+    drop(release);
+    assert!(hook.lock().expect("read hook").is_none(), "the stall ran");
 
-    // Once the blocked evaluation ends, the checkout is trusted again.
+    // The blocked evaluation ends once a launch is no longer refused. That
+    // launch evaluates the unreadable file itself and fails.
     let shared = tokio::sync::Mutex::new(&mut local);
-    let (shared, dir_ref) = (&shared, &dir);
+    let (shared, dir_ref, refusals_ref) = (&shared, &dir, &refusals);
     pohunek_test_support::wait::wait_until("the stalled evaluation to end", || async move {
+        let before = refusals_ref();
         let mut local = shared.lock().await;
-        carries_trust_arg(&launched_argv(&mut **local, dir_ref).await).then_some(())
+        launched_argv(&mut **local, dir_ref).await;
+        (refusals_ref() == before).then_some(())
     })
     .await;
-    // The abandoned evaluation's late outcome adds no second warning.
-    let log = captured_text(captured);
+    std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o644))
+        .expect("make the file readable again");
+    assert!(
+        carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "the checkout is trusted again once the blocked evaluation ended"
+    );
+
+    // Exactly the abandonment and the unreadable file of the one later launch
+    // were reported: the abandoned evaluation's own late failure stays silent.
+    let reasons: Vec<String> = checkout_reasons()
+        .into_iter()
+        .filter(|reason| !reason.contains("still stalled"))
+        .collect();
     assert_eq!(
-        log.lines()
-            .filter(|line| line.contains("checkout_trust.failed")
-                && line.contains("passed its total deadline")
-                && line.contains(&*dir.to_string_lossy()))
-            .count(),
-        0,
-        "the abandoned evaluation stays silent: {log}"
+        reasons,
+        [
+            "the evaluation did not finish within its total deadline",
+            "a declared path could not be read",
+        ],
+        "one failure line per evaluation that was waited for"
     );
 
     drop(local);

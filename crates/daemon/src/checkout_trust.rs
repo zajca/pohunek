@@ -277,9 +277,6 @@ pub(crate) struct CheckoutFacts<'a> {
     pub(crate) remote_source: Option<&'a RemoteSourceResolver>,
     /// Observer of the read of the declared paths.
     pub(crate) read_observer: Option<&'a ReadObserver>,
-    /// Set once the caller stopped waiting for this evaluation; its late
-    /// outcome is then not logged.
-    pub(crate) abandoned: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Why the predicate could not reach an answer.
@@ -342,38 +339,57 @@ impl GitResult {
     }
 }
 
-/// Whether the checkout of `facts` is trusted.
-///
-/// A failure logs one warning and returns `false`. A plain "no" (an untrusted
-/// repository, a changed path) logs at debug level only, because it is the
-/// expected answer for most checkouts.
-#[must_use]
-pub(crate) fn is_trusted(facts: &CheckoutFacts<'_>) -> bool {
-    let verdict = evaluate(facts);
-    if facts
-        .abandoned
-        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-    {
-        return false;
+/// What the predicate concluded for one checkout.
+pub(crate) struct Outcome {
+    verdict: Result<Verdict, Failure>,
+}
+
+impl Outcome {
+    /// Whether the checkout is trusted.
+    pub(crate) fn trusted(&self) -> bool {
+        matches!(self.verdict, Ok(Verdict::Trusted))
     }
-    match verdict {
-        Ok(Verdict::Trusted) => true,
-        Ok(Verdict::Untrusted(why)) => {
-            debug!(
-                reason = why,
-                "checkout not trusted for the runtime's trusted arguments"
-            );
-            false
+
+    /// Logs a failure as one warning; a plain "no" (an untrusted repository, a
+    /// changed path) logs at debug level only, because it is the expected
+    /// answer for most checkouts. A trusted outcome logs nothing.
+    pub(crate) fn log(&self, checkout: &Path) {
+        match &self.verdict {
+            Ok(Verdict::Trusted) => {}
+            Ok(Verdict::Untrusted(why)) => {
+                debug!(
+                    reason = *why,
+                    "checkout not trusted for the runtime's trusted arguments"
+                );
+            }
+            Err(failure) => {
+                warn!(
+                    event = "checkout_trust.failed",
+                    checkout = %checkout.display(),
+                    reason = failure.reason(),
+                    "the checkout trust predicate could not be evaluated; the checkout is not trusted"
+                );
+            }
         }
-        Err(failure) => {
-            warn!(
-                event = "checkout_trust.failed",
-                checkout = %facts.cwd.display(),
-                reason = failure.reason(),
-                "the checkout trust predicate could not be evaluated; the checkout is not trusted"
-            );
-            false
+    }
+}
+
+impl Outcome {
+    /// The outcome of an evaluation that could not start; the caller has
+    /// logged why.
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            verdict: Ok(Verdict::Untrusted("the project record is unavailable")),
         }
+    }
+}
+
+/// Evaluates the checkout of `facts`. Any error, ambiguity or missing fact is
+/// an outcome that is not trusted.
+#[must_use]
+pub(crate) fn evaluate_trust(facts: &CheckoutFacts<'_>) -> Outcome {
+    Outcome {
+        verdict: evaluate(facts),
     }
 }
 
