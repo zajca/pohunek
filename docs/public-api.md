@@ -2042,6 +2042,7 @@ Important fields:
   boundary: a process of the same user can omit the origin variables, and then no
   spawner is recorded.
 - `created_at`, `updated_at`: RFC3339 timestamps.
+- `ended_at`: optional RFC3339 timestamp of the moment the session entered `stopped`, `done` or `failed`. The daemon sets it once at that transition; record updates, metadata edits and daemon restarts leave it alone, and a session that is running again has none. Retention ages a finished session from it. A record written before store schema 19 carries its last update as `ended_at`.
 - `exit_code`: optional process exit code.
 
 `RuntimeRef` wire values (`agent_base`, `active_agent_base`, the subagent

@@ -454,13 +454,17 @@ fn retention_reason(session: &SessionInfo) -> Option<(SessionRetentionReason, &s
         let timestamp = runtime
             .last_connected_at
             .as_deref()
+            .or(session.ended_at.as_deref())
             .unwrap_or(&session.updated_at);
         return Some((SessionRetentionReason::Lost, timestamp));
     }
     if session.state.is_terminal() {
         // A terminal session is finished regardless of its runtime: `resume`
-        // refuses it, so the shorter terminal grace is the right one.
-        return Some((SessionRetentionReason::Terminal, &session.updated_at));
+        // refuses it, so the shorter terminal grace is the right one. It ages
+        // from the end time, which no later record update moves; a record
+        // without one ages from its last update.
+        let timestamp = session.ended_at.as_deref().unwrap_or(&session.updated_at);
+        return Some((SessionRetentionReason::Terminal, timestamp));
     }
     None
 }
@@ -667,6 +671,7 @@ mod tests {
             metadata: BTreeMap::new(),
             created_at: updated_at.clone(),
             updated_at,
+            ended_at: None,
             exit_code: None,
         }
     }

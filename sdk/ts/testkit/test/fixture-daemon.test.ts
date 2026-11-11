@@ -110,6 +110,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(stoppedEvent.event).toBe("session_stopped");
       if (stoppedEvent.event === "session_stopped") {
         expect(stoppedEvent.session.state).toBe("stopped");
+        expect(stoppedEvent.session.ended_at).toBe(stoppedEvent.session.updated_at);
       }
 
       daemon.scenario.removeSession(created.id);
@@ -464,7 +465,9 @@ describe("@pohunek/testkit fixture daemon", () => {
         native_session_id: "hermes-native-session",
       })).toEqual({ recorded: true });
       await client.call("session.stop", hermes.id);
-      await client.call("session.resume", hermes.id);
+      expect((await client.call("session.inspect", hermes.id)).ended_at === undefined).toBe(false);
+      const resumedHermes = await client.call("session.resume", hermes.id);
+      expect(resumedHermes.session.ended_at).toBeUndefined();
 
       const missingReference = await client.call("session.new", {
         agent: "hermes",

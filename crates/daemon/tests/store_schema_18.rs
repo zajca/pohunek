@@ -16,7 +16,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 const SCHEMA_17: &str = include_str!("../src/store/fixtures/schema-17/metadata.jsonl");
-const SCHEMA_18: &str = include_str!("../src/store/fixtures/schema-18/metadata.jsonl");
+const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-19/metadata.jsonl");
 
 /// The digest the current-schema fixture records as its context pin.
 const CONTEXT_PIN: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -77,7 +77,7 @@ fn schema_17_sessions_migrate_without_inventing_a_context_pin() {
 #[test]
 fn a_recorded_context_pin_loads_survives_a_rewrite_and_is_retained() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let store = fixture_store(root.path(), SCHEMA_18);
+    let store = fixture_store(root.path(), CURRENT_SCHEMA);
     let expected = Some(digest(CONTEXT_PIN));
 
     let mut record = store.load_sessions().expect("load the session").remove(0);

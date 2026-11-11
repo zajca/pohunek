@@ -3243,6 +3243,13 @@ pub struct SessionInfo {
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.
     pub updated_at: String,
+    /// When the session entered a terminal state (`stopped`, `done` or
+    /// `failed`), in the daemon's wire timestamp format. Set once at that
+    /// transition and unaffected by later record updates; retention ages a
+    /// finished session from it. Omitted while the session has not ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub ended_at: Option<String>,
     /// Process exit code, when the session has exited with one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -3764,7 +3771,8 @@ pub struct SessionRetentionCandidate {
     /// Rule that selected it.
     pub reason: SessionRetentionReason,
     /// Age in seconds at selection time, measured from the timestamp the rule
-    /// used (the session's last update, or the runtime's last connection).
+    /// used: `ended_at` for a terminal session (the last update for a record
+    /// without one), or the runtime's last connection for a lost one.
     pub age_secs: u64,
     /// Pohunek-owned worktree the removal cleans, when the session bound one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3958,6 +3966,7 @@ mod tests {
             metadata: BTreeMap::new(),
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            ended_at: None,
             exit_code: None,
         }
     }

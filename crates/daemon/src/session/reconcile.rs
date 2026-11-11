@@ -4202,6 +4202,7 @@ impl SessionRegistry {
             record.info.rows = dimensions.rows();
         }
         record.info.state = SessionState::Running;
+        record.info.ended_at = None;
         record.info.state_source = StateSource::Process;
         record.info.runtime = Some(SessionRuntime {
             state: RuntimeState::Live,
@@ -4628,6 +4629,7 @@ impl SessionRegistry {
         record.runtime.state = state;
         record.runtime.reason.clone_from(&runtime.loss_reason);
         present_unavailable_record(&mut record, classification);
+        super::settle_ended_at(&mut record.info, &now);
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
@@ -9604,6 +9606,7 @@ while os.getppid() == parent:
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),
             updated_at: created_at,
+            ended_at: None,
             exit_code: None,
             capabilities: protocol::SessionCapabilities {
                 resume: true,
@@ -10277,6 +10280,10 @@ while os.getppid() == parent:
             .await
             .expect("terminal logical record remains visible");
         assert_eq!(imported.state, SessionState::Done);
+        assert!(
+            imported.ended_at.is_some(),
+            "a worker that ended while the daemon was down ends the session at import"
+        );
         assert_eq!(imported.exit_code, Some(0));
         assert_eq!((imported.cols, imported.rows), (100, 30));
         assert_eq!(
@@ -11173,6 +11180,7 @@ while os.getppid() == parent:
                 metadata: BTreeMap::new(),
                 created_at: created_at.clone(),
                 updated_at: created_at,
+                ended_at: None,
                 exit_code: None,
                 capabilities: protocol::SessionCapabilities {
                     resume: true,
@@ -13597,6 +13605,13 @@ handler = "codex-hook-v1"
             Box::pin(fixture.registry.reconcile_workers())
                 .await
                 .expect("first start");
+            let ended_at = fixture
+                .registry
+                .inspect(&SessionId("s-1332".to_owned()))
+                .await
+                .expect("inspect after the first start")
+                .ended_at;
+            assert!(ended_at.is_some(), "the proven loss ends the session");
             let mut events = fixture.registry.subscribe();
 
             Box::pin(fixture.registry.reconcile_workers())
@@ -13609,6 +13624,7 @@ handler = "codex-hook-v1"
                 .await
                 .expect("inspect");
             assert_eq!(info.state, protocol::SessionState::Failed);
+            assert_eq!(info.ended_at, ended_at, "a second start keeps the end time");
             assert_eq!(info.runtime.expect("runtime").state, RuntimeState::Lost);
             let _ = &mut events;
         }
@@ -24539,6 +24555,7 @@ generation "$1"
                 .find(|record| record.session_id == session_id)
                 .expect("record");
             record.info.state = protocol::SessionState::Failed;
+            record.info.ended_at = Some("2026-01-01T00:00:00Z".to_owned());
             record.info.activity = None;
             record.runtime.state = RuntimeState::Lost;
             record.info.runtime = Some(protocol::SessionRuntime {
@@ -24587,6 +24604,7 @@ generation "$1"
                 "a live runtime carries no loss cause"
             );
             assert_eq!(session.state, protocol::SessionState::Running);
+            assert_eq!(session.ended_at, None, "a running session has not ended");
             worker.server_task.abort();
             drop(worker.reporter);
         }
@@ -24653,6 +24671,10 @@ generation "$1"
                 session.state,
                 protocol::SessionState::Running,
                 "the previous worker still answers, so nothing proves the end"
+            );
+            assert_eq!(
+                session.ended_at, None,
+                "an unproven loss has not ended the session"
             );
             assert_eq!(session.activity, None);
             worker.server_task.abort();

@@ -1057,6 +1057,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
     session.state = "stopped";
     session.updated_at = timestamp();
+    session.ended_at = session.updated_at;
     session.exit_code = 0;
     this.notifyInputWaiters(session.id, { kind: "stopped" });
     this.pty.closeSession(session.id);
@@ -1115,6 +1116,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     }
     session.state = "running";
     delete session.exit_code;
+    delete session.ended_at;
     session.updated_at = timestamp();
     this.emitSessionEvent(EVENT_SESSION_UPDATED, session);
     return okResponse(request.id, { session: cloneValue(session) });
