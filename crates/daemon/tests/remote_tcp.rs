@@ -1413,6 +1413,7 @@ async fn daemon_doctor_reports_redacted_provider_integration_readiness() {
     .await;
     let mut local = connect_unix(&socket).await;
     let params = protocol::IntegrationInstallParams {
+        skill: false,
         agent: Some(protocol::RuntimeRef::codex()),
         profile: Some("b-real".to_owned()),
         all_profiles: false,

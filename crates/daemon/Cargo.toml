@@ -14,7 +14,7 @@ path = "src/main.rs"
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = { workspace = true }
-pohunek-knowledge = { workspace = true, features = ["protocol"] }
+pohunek-knowledge = { workspace = true, features = ["protocol", "agent-skill"] }
 pohunek-hostcheck = { workspace = true }
 pohunek-logging = { workspace = true }
 pohunek-protocol = { workspace = true }

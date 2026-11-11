@@ -595,6 +595,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/profile/compose.rs` — composes the text of a new profile.
 - `crates/daemon/src/packages/create.rs` — `package.create_profile`.
 - `crates/daemon/src/agent/host/`
+- `crates/daemon/src/integration/agent_skill.rs` — the opt-in agent skill install, status and removal.
 - `crates/xtask/tests/no_special_dispatch.rs`
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
@@ -748,7 +749,7 @@ Bundled agent skill:
 
 - `docs/knowledge/guides/agent-skill.md`
 - `crates/xtask/src/agent_skill.rs`
-- `crates/cli/src/commands/agent_skill/SKILL.md`
+- `crates/knowledge/src/agent_skill/SKILL.md`
 
 Hermes operator plugin and managed lifecycle:
 

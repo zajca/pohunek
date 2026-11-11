@@ -248,7 +248,7 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "crates/xtask/src/agent_skill.rs",
         &[
             "docs/knowledge/guides/agent-skill.md",
-            "crates/cli/src/commands/agent_skill/SKILL.md",
+            "crates/knowledge/src/agent_skill/SKILL.md",
         ],
         "agent skill source and its generated copy",
     ),

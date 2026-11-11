@@ -22,6 +22,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::agent_skill::{AgentSkill, AgentSkillRoot};
 use super::checkout_trust::CheckoutTrust;
 use super::config_home::ConfigHome;
 use super::features::{
@@ -446,6 +447,9 @@ pub struct RuntimeDefinition {
     /// trust predicate compares, from `[runtime] trusted_checkout_args`.
     checkout_trust: Option<CheckoutTrust>,
     config_home: Option<ConfigHome>,
+    /// Where the agent reads user-level skills; `None` for a runtime that
+    /// declares no location.
+    agent_skill: Option<AgentSkill>,
     /// Where below the config home the agent writes transcripts and which
     /// compiled parser reads them; `None` for a runtime that declares none.
     transcripts: Option<Transcripts>,
@@ -589,6 +593,7 @@ impl RuntimeDefinition {
             placement,
             checkout_trust,
             config_home: None,
+            agent_skill: None,
             transcripts: None,
             hook_existence: None,
             startup_grace: None,
@@ -637,6 +642,27 @@ impl RuntimeDefinition {
     pub fn with_config_home(mut self, config_home: ConfigHome) -> Self {
         self.config_home = Some(config_home);
         self
+    }
+
+    /// This definition declaring `agent_skill` as the location of the agent's
+    /// user-level skills.
+    ///
+    /// Like the config home, the declaration takes no part in launching the
+    /// agent; it only tells the integration step where to place the skill.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] when the root is the config home
+    /// and the definition declares none.
+    pub fn with_agent_skill(mut self, agent_skill: AgentSkill) -> Result<Self, DefinitionError> {
+        if agent_skill.root() == AgentSkillRoot::ConfigHome && self.config_home.is_none() {
+            return Err(DefinitionError::Field {
+                field: "agent_skill",
+                reason: "a config_home root requires a [config_home] table",
+            });
+        }
+        self.agent_skill = Some(agent_skill);
+        Ok(self)
     }
 
     /// This definition declaring `transcripts` as the transcript tree below
@@ -742,6 +768,11 @@ impl RuntimeDefinition {
             .as_ref()
             .map(RawTranscripts::validated)
             .transpose()?;
+        let agent_skill = raw
+            .agent_skill
+            .as_ref()
+            .map(|declared| AgentSkill::new(&declared.root, &declared.dir))
+            .transpose()?;
         let launch_env = raw.validated_launch_env(config_home.as_ref())?;
         let naming = raw.validated_naming()?;
         let placement = raw
@@ -789,7 +820,7 @@ impl RuntimeDefinition {
             None => definition,
         };
         let definition = with_declared_startup_grace(definition, raw.input.startup_grace_ms)?;
-        with_declared_files(definition, config_home, transcripts)
+        with_declared_files(definition, config_home, transcripts, agent_skill)
     }
 
     /// The `[placement]` declaration, `None` for a runtime that declares none.
@@ -914,6 +945,12 @@ impl RuntimeDefinition {
         self.config_home.as_ref()
     }
 
+    /// Where the agent reads user-level skills, when the descriptor declares it.
+    #[must_use]
+    pub fn agent_skill(&self) -> Option<&AgentSkill> {
+        self.agent_skill.as_ref()
+    }
+
     /// The literal environment pairs, in name order, that every launch and
     /// version probe of this runtime gets; empty when the descriptor declares
     /// none.
@@ -977,13 +1014,18 @@ fn with_declared_files(
     definition: RuntimeDefinition,
     config_home: Option<ConfigHome>,
     transcripts: Option<Transcripts>,
+    agent_skill: Option<AgentSkill>,
 ) -> Result<RuntimeDefinition, DefinitionError> {
     let definition = match config_home {
         Some(config_home) => definition.with_config_home(config_home),
         None => definition,
     };
-    match transcripts {
-        Some(transcripts) => definition.with_transcripts(transcripts),
+    let definition = match transcripts {
+        Some(transcripts) => definition.with_transcripts(transcripts)?,
+        None => definition,
+    };
+    match agent_skill {
+        Some(agent_skill) => definition.with_agent_skill(agent_skill),
         None => Ok(definition),
     }
 }
@@ -1370,6 +1412,15 @@ struct RawDefinition {
     config_home: Option<RawConfigHome>,
     #[serde(default)]
     transcripts: Option<RawTranscripts>,
+    #[serde(default)]
+    agent_skill: Option<RawAgentSkill>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentSkill {
+    root: String,
+    dir: String,
 }
 
 #[derive(Debug, Deserialize)]

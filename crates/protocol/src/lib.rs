@@ -87,6 +87,7 @@ pub use governance::{
 #[doc(inline)]
 #[doc(inline)]
 pub use integration::{
+    AgentSkillChange, AgentSkillRemoval, AgentSkillReport, AgentSkillState, AgentSkillStatus,
     IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
     IntegrationFindingSeverity, IntegrationHome, IntegrationHomeFailure, IntegrationInstallParams,

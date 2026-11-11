@@ -383,6 +383,14 @@ pohunek session inspect <target> --json
 Report the blocked session, the notification kind, and the pending request as
 evidence; the operator decides.
 
+## Installing this skill
+
+The owner can install this skill next to the agent's other user skills with
+`pohunek integration install --agent claude --skill` (or `--agent codex`). The
+install is opt-in per agent home, never touches a skill it did not write, and
+`pohunek integration status --json` reports its state. Do not install or edit
+it yourself; ask the owner.
+
 ## Explicit safety boundaries
 
 - Hooks are executable code. Never write, edit, or "repair" hook scripts,

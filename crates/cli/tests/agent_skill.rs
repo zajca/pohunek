@@ -12,7 +12,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-const EMBEDDED_SKILL: &str = include_str!("../src/commands/agent_skill/SKILL.md");
+const EMBEDDED_SKILL: &str = include_str!("../../knowledge/src/agent_skill/SKILL.md");
 
 /// The artifact frontmatter must name the skill exactly as agents consume it.
 const SKILL_FRONTMATTER_PREFIX: &str = "---\nname: pohunek\n";

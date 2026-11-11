@@ -160,4 +160,15 @@ export type HostCapabilities = {
    * only when this is `true`. `false` is likewise omitted on the wire.
    */
   package_create_profile_supported?: boolean;
+  /**
+   * Whether the daemon implements the agent skill install:
+   * `integration.install` accepts `skill`, `integration.uninstall` accepts
+   * `skill_only`, and `integration.status` reports a `skill` per home.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; its
+   * params are strict and would reject `skill` and `skill_only`, so a client
+   * sends them only when this is `true`. `false` is likewise omitted on the
+   * wire.
+   */
+  integration_agent_skill_supported?: boolean;
 };

@@ -7,9 +7,9 @@
 
 schema = 1
 id = "pohunek.runtime.codex"
-version = "1.8.0"
+version = "1.9.0"
 runtime_api = 1
-requires = ["transcripts-head-paths-v1", "placement-v1", "program-status-gate-v1"]
+requires = ["transcripts-head-paths-v1", "placement-v1", "program-status-gate-v1", "agent-skill-v1"]
 
 [runtime]
 id = "codex"
@@ -64,6 +64,12 @@ hook_schema = "identity-subagent-v1"
 [config_home]
 env = "CODEX_HOME"
 default = ".codex"
+
+# Codex reads user skills from `.agents/skills` below the user's home, which
+# every Codex home and profile of the user shares.
+[agent_skill]
+root = "user_home"
+dir = ".agents/skills"
 
 # Codex writes one JSON Lines rollout per conversation below `sessions` in its
 # config home; the external observer reads the head of each with this parser.

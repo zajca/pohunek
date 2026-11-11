@@ -1,8 +1,9 @@
 //! `pohunek agent-skill` — print the bundled agent skill.
 //!
-//! The skill is embedded at compile time from the checked-in generated artifact
-//! (`agent_skill/SKILL.md`, rendered by `cargo xtask agent-skill generate` from
-//! the hand-authored knowledge source `docs/knowledge/guides/agent-skill.md`).
+//! The skill is embedded at compile time by `pohunek-knowledge` from the
+//! checked-in generated artifact (`crates/knowledge/src/agent_skill/SKILL.md`,
+//! rendered by `cargo xtask agent-skill generate` from the hand-authored
+//! knowledge source `docs/knowledge/guides/agent-skill.md`).
 //! The `embed-agent-skill` feature controls the embedding: xtask builds this
 //! crate without it so the artifact generator stays runnable even while the
 //! artifact itself is missing or damaged. The command is purely local: it never
@@ -16,8 +17,6 @@ use std::io::{self, Write};
 
 #[cfg(feature = "embed-agent-skill")]
 use serde::Serialize;
-#[cfg(feature = "embed-agent-skill")]
-use sha2::{Digest, Sha256};
 
 #[cfg(feature = "embed-agent-skill")]
 use crate::commands::render_json;
@@ -27,7 +26,7 @@ use crate::error::CliError;
 /// artifact. The printed bytes are a compile-time constant, so one binary
 /// version always prints identical output.
 #[cfg(feature = "embed-agent-skill")]
-const EMBEDDED_SKILL: &str = include_str!("agent_skill/SKILL.md");
+const EMBEDDED_SKILL: &str = knowledge::AGENT_SKILL;
 
 /// Print the embedded agent skill to stdout.
 ///
@@ -89,7 +88,7 @@ fn write_payload(writer: &mut impl Write, payload: &[u8]) -> Result<(), CliError
 /// agents can use to verify or cache the printed skill.
 #[cfg(feature = "embed-agent-skill")]
 fn content_sha256() -> String {
-    format!("{:x}", Sha256::digest(EMBEDDED_SKILL.as_bytes()))
+    knowledge::agent_skill_sha256()
 }
 
 #[derive(Serialize)]

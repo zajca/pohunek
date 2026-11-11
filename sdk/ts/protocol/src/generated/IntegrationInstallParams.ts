@@ -26,4 +26,12 @@ export type IntegrationInstallParams = {
    * owner connections only; exclusive with `profile`.
    */
   all_profiles?: boolean;
+  /**
+   * Also install the bundled agent skill into the agent's skill location
+   * of each selected home, with an ownership marker. Without it nothing
+   * skill-related is written. A client sends it only when `host.inspect`
+   * reports `HostCapabilities::integration_agent_skill_supported`; an older
+   * daemon rejects the unknown parameter.
+   */
+  skill?: boolean;
 };

@@ -1495,6 +1495,7 @@ fn integration_doctor_params_and_result_roundtrip() {
             agent: RuntimeRef::codex(),
             ok: false,
             status: Some(IntegrationAgentStatus {
+                skill: None,
                 home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
@@ -3249,6 +3250,7 @@ fn host_capabilities_json_shape_roundtrips() {
         package_bind_profile_expected_supported: true,
         package_install_index_context_supported: false,
         package_create_profile_supported: true,
+        integration_agent_skill_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3285,7 +3287,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_context_pin_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true,
-            "package_create_profile_supported": true
+            "package_create_profile_supported": true,
+            "integration_agent_skill_supported": true
         })
     );
 
@@ -3425,6 +3428,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.package_create_profile_supported,
         "a host that omits the create-profile flag answers package.create_profile with method_not_found"
+    );
+    assert!(
+        !caps.integration_agent_skill_supported,
+        "a host that omits the agent-skill flag rejects skill and skill_only"
     );
 }
 

@@ -111,10 +111,11 @@ pub(super) async fn handle_integration_install(request: &Request, state: &Daemon
     // The update runs under the shared lifecycle guard, owned by a task the
     // caller's disconnect cannot cancel.
     let agent = params.agent;
+    let skill = params.skill;
     match sessions
         .packages()
         .integration_install(move |retained| {
-            crate::integration::install_in(&homes, agent.as_ref(), &selection, retained)
+            crate::integration::install_in_with(&homes, agent.as_ref(), &selection, retained, skill)
         })
         .await
     {
@@ -148,8 +149,9 @@ pub(super) async fn handle_integration_uninstall(
         Err(response) => return response,
     };
     let agent = params.agent;
+    let skill_only = params.skill_only;
     run_integration_uninstall_blocking(request, move || {
-        crate::integration::uninstall_in(&homes, &agent, &selection)
+        crate::integration::uninstall_in_with(&homes, &agent, &selection, skill_only)
     })
     .await
 }

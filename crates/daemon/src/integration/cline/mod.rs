@@ -319,6 +319,7 @@ fn status_with(
     warnings: Vec<String>,
 ) -> IntegrationAgentStatus {
     IntegrationAgentStatus {
+        skill: None,
         agent: RuntimeRef::from_wire(RUNTIME_ID),
         available,
         expected_asset_paths: Vec::new(),
@@ -475,6 +476,7 @@ fn uninstall_cline(
     gate: StepGate<'_>,
 ) -> Result<IntegrationUninstallReport, ProtocolError> {
     let mut report = IntegrationUninstallReport {
+        skill: None,
         agent: runtime.clone(),
         state: IntegrationUninstallState::NotInstalled,
         removed_paths: Vec::new(),

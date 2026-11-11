@@ -101,6 +101,14 @@ pub struct IntegrationInstallParams {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
     pub all_profiles: bool,
+    /// Also install the bundled agent skill into the agent's skill location
+    /// of each selected home, with an ownership marker. Without it nothing
+    /// skill-related is written. A client sends it only when `host.inspect`
+    /// reports `HostCapabilities::integration_agent_skill_supported`; an older
+    /// daemon rejects the unknown parameter.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub skill: bool,
 }
 
 /// Whether a flag is unset, so it is left out of the serialized parameters and
@@ -259,6 +267,136 @@ pub struct IntegrationAgentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub home: Option<IntegrationHome>,
+    /// State of the bundled agent skill in this home; present from a daemon
+    /// that implements the skill install. It never feeds `state` or
+    /// `recovery`, which describe the hooks only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub skill: Option<AgentSkillStatus>,
+}
+
+/// Condition of the bundled agent skill in one agent home.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentSkillState.ts"))]
+pub enum AgentSkillState {
+    /// No `pohunek` skill directory exists.
+    Absent,
+    /// The marker is valid and the skill file matches this build.
+    Current,
+    /// The marker is valid and the skill file matches it, but another Pohunek
+    /// version wrote it.
+    Stale,
+    /// The marker is valid and the skill file was edited since.
+    Modified,
+    /// A `pohunek` skill directory or file exists without a valid marker.
+    Foreign,
+    /// A link, a foreign owner or a group- or world-writable directory lies on
+    /// the path; nothing was followed.
+    Unsafe,
+    /// The runtime declares no skill location.
+    Unsupported,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(AgentSkillState);
+
+/// What an install did with the agent skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentSkillChange.ts"))]
+pub enum AgentSkillChange {
+    /// The skill and its marker were written.
+    Created,
+    /// The skill already matched this build.
+    Unchanged,
+    /// A marked skill from another version was replaced.
+    Refreshed,
+    /// The skill was left as found; the report carries the reason.
+    Refused,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(AgentSkillChange);
+
+/// What an uninstall did with the agent skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentSkillRemoval.ts"))]
+pub enum AgentSkillRemoval {
+    /// The marked skill and its marker were removed.
+    Removed,
+    /// No skill of this installer was present.
+    NotInstalled,
+    /// A skill without a valid marker, or behind an unsafe path, was left
+    /// alone.
+    LeftForeign,
+    /// The marked skill sits in a location every home of the agent shares, and
+    /// the request removed one profile's integration only.
+    KeptShared,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(AgentSkillRemoval);
+
+/// Result of installing the agent skill into one home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentSkillReport.ts"))]
+pub struct AgentSkillReport {
+    /// What the install did.
+    pub state: AgentSkillChange,
+    /// The condition found before the install acted.
+    pub found: AgentSkillState,
+    /// Absolute path of the `SKILL.md` the install addressed.
+    pub path: String,
+    /// Why a refused skill was left as found; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub error: Option<ProtocolError>,
+}
+
+/// Read-only condition of the agent skill in one home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "AgentSkillStatus.ts"))]
+pub struct AgentSkillStatus {
+    /// The condition found.
+    pub state: AgentSkillState,
+    /// Absolute path of the `SKILL.md`; absent for an unsupported runtime or a
+    /// location that does not resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub path: Option<String>,
+    /// Lowercase-hex sha256 of the installed `SKILL.md`, when one is readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub installed_sha256: Option<String>,
+    /// Lowercase-hex sha256 of the skill this build installs.
+    pub expected_sha256: String,
+    /// Whether every home of the agent on the host shares the location.
+    pub shared: bool,
 }
 
 /// Safe recovery action for one managed hook integration report.
@@ -329,6 +467,11 @@ pub struct IntegrationInstallReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub home: Option<IntegrationHome>,
+    /// What the install did with the agent skill; present only when the
+    /// request asked for it and the runtime declares a skill location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub skill: Option<AgentSkillReport>,
 }
 
 /// Parameters for `integration.uninstall`.
@@ -356,6 +499,12 @@ pub struct IntegrationUninstallParams {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
     pub all_profiles: bool,
+    /// Remove only the installed agent skill and leave the hooks. A client
+    /// sends it only when `host.inspect` reports
+    /// `HostCapabilities::integration_agent_skill_supported`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub skill_only: bool,
 }
 
 /// Outcome of removing one agent's managed hooks.
@@ -409,6 +558,11 @@ pub struct IntegrationUninstallReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub home: Option<IntegrationHome>,
+    /// What the removal did with the agent skill; present when the runtime
+    /// declares a skill location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub skill: Option<AgentSkillRemoval>,
 }
 
 /// Result returned by `integration.uninstall`.
@@ -627,6 +781,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(IntegrationUninstallParams {
+                skill_only: false,
                 agent: RuntimeRef::claude(),
                 profile: None,
                 all_profiles: false,
@@ -657,6 +812,7 @@ mod tests {
     #[test]
     fn the_home_selectors_round_trip_and_unknown_install_fields_are_rejected() {
         let install = super::IntegrationInstallParams {
+            skill: false,
             agent: Some(crate::RuntimeRef::claude()),
             profile: Some("work".to_owned()),
             all_profiles: false,
@@ -687,6 +843,7 @@ mod tests {
     fn results_without_labels_or_failures_keep_their_pre_existing_wire_shape() {
         let result = super::IntegrationInstallResult {
             installed: vec![super::IntegrationInstallReport {
+                skill: None,
                 agent: crate::RuntimeRef::claude(),
                 hook_path: "/h/hooks/x.sh".to_owned(),
                 config_paths: vec![],

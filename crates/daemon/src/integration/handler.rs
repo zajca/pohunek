@@ -44,7 +44,7 @@ use super::commit::StepGate;
 use super::homes::{ConfigHomes, HomeSelection, Target};
 use super::launch_input::LaunchContributor;
 use super::{config_dir_is_symlink, config_path_kind, report, ConfigPath, InstallPaths};
-use crate::agent::host::{is_reserved, ConfigHome, RuntimeHost};
+use crate::agent::host::{is_reserved, AgentSkill, ConfigHome, RuntimeHost};
 
 /// Error code for an update whose asset set is not compatible with the active
 /// set or with the runtime's hook schema.
@@ -409,6 +409,9 @@ pub(super) struct Resolved {
     /// Where the runtime's agent keeps its configuration, when its descriptor
     /// declares it.
     pub(super) config_home: Option<ConfigHome>,
+    /// Where the runtime's agent reads user-level skills, when its descriptor
+    /// declares it.
+    pub(super) agent_skill: Option<AgentSkill>,
     /// The handler the definition's `integration.handler` selects.
     pub(super) handler: &'static dyn DaemonHandler,
     /// The compiled hook schema the definition names.
@@ -440,6 +443,7 @@ pub(super) fn resolved(
         runtime_id: definition.runtime_id().clone(),
         display_name: definition.display_name().to_owned(),
         config_home: definition.config_home().cloned(),
+        agent_skill: definition.agent_skill().cloned(),
         handler,
         schema: definition.hook_schema()?,
     })
@@ -469,6 +473,7 @@ pub(super) fn retired(host: &RuntimeHost, agent: &RuntimeRef) -> Option<Resolved
             runtime_id: runtime_id.clone(),
             display_name: retired.display_name.to_owned(),
             config_home: Some(ConfigHome::new(retired.config_env, retired.config_default).ok()?),
+            agent_skill: None,
             handler: *handler,
             schema: pohunek_worker_protocol::hook_schema(retired.hook_schema)?,
         })
@@ -587,6 +592,7 @@ fn install_target(
     target: &Target,
     retained: &RetainedSchemas,
     skip_absent: bool,
+    skill: bool,
     gate: HomeGate<'_>,
 ) -> Result<Option<IntegrationInstallReport>, ProtocolError> {
     let dir = target.dir()?;
@@ -598,6 +604,9 @@ fn install_target(
     })?;
     let mut installed = report(target.resolved.runtime.clone(), &paths);
     installed.home.clone_from(&target.label);
+    if skill {
+        installed.skill = super::agent_skill::install_for(target);
+    }
     Ok(Some(installed))
 }
 
@@ -645,16 +654,41 @@ pub fn install_in(
     selection: &HomeSelection,
     retained: &RetainedSchemas,
 ) -> Result<IntegrationInstallResult, ProtocolError> {
-    install_in_gated(
+    install_in_with(homes, agent, selection, retained, false)
+}
+
+/// [`install_in`] that also installs the bundled agent skill into each
+/// selected home when `skill` is set.
+///
+/// The skill is written after the hooks of the same home and its outcome is
+/// part of that home's report: a skill that is refused leaves the hooks
+/// installed. When the request names its runtime (by `agent` or by a profile),
+/// a runtime that declares no skill location refuses the whole request before
+/// anything is written; without a named runtime such a runtime is skipped.
+///
+/// # Errors
+///
+/// The errors of [`install_in`], and `integration_agent_skill_unsupported` for
+/// a named runtime that declares no skill location.
+pub fn install_in_with(
+    homes: &ConfigHomes,
+    agent: Option<&RuntimeRef>,
+    selection: &HomeSelection,
+    retained: &RetainedSchemas,
+    skill: bool,
+) -> Result<IntegrationInstallResult, ProtocolError> {
+    install_core(
         homes,
         agent,
         selection,
         retained,
+        skill,
         &mut |_target, _index, _name| Ok(()),
     )
 }
 
 /// [`install_in`] running `gate` before each committed file of each home.
+#[cfg(test)]
 pub(super) fn install_in_gated(
     homes: &ConfigHomes,
     agent: Option<&RuntimeRef>,
@@ -662,7 +696,37 @@ pub(super) fn install_in_gated(
     retained: &RetainedSchemas,
     gate: HomeGate<'_>,
 ) -> Result<IntegrationInstallResult, ProtocolError> {
+    install_core(homes, agent, selection, retained, false, gate)
+}
+
+/// The runtime that declares no skill location, as the refusal of a request
+/// that named it.
+fn skill_unsupported(display_name: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        super::agent_skill::UNSUPPORTED_CODE,
+        format!("{display_name} declares no agent skill location, so its skill cannot be installed"),
+        Some("install a version of its package that declares an agent skill location, or install the hooks without --skill".to_owned()),
+    )
+}
+
+fn install_core(
+    homes: &ConfigHomes,
+    agent: Option<&RuntimeRef>,
+    selection: &HomeSelection,
+    retained: &RetainedSchemas,
+    skill: bool,
+    gate: HomeGate<'_>,
+) -> Result<IntegrationInstallResult, ProtocolError> {
     let targets = homes.targets(agent, selection)?;
+    if skill && (agent.is_some() || matches!(selection, HomeSelection::Profile(_))) {
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.resolved.agent_skill.is_none())
+        {
+            return Err(skill_unsupported(&target.resolved.display_name));
+        }
+    }
     let per_home = matches!(selection, HomeSelection::All);
     let skip_absent =
         per_home || (agent.is_none() && !matches!(selection, HomeSelection::Profile(_)));
@@ -682,7 +746,7 @@ pub(super) fn install_in_gated(
     let mut looked = Vec::new();
     let mut names = Vec::new();
     for target in &targets {
-        match install_target(target, retained, skip_absent, &mut *gate) {
+        match install_target(target, retained, skip_absent, skill, &mut *gate) {
             Ok(Some(report)) => installed.push(report),
             Ok(None) => {
                 let dir = target.dir()?.display().to_string();
@@ -791,6 +855,9 @@ fn inspect_target(target: &Target) -> IntegrationAgentStatus {
         .inspect(&target.resolved.runtime, target.dir_ref());
     scope_status(&mut status, target);
     status.home.clone_from(&target.label);
+    let (skill, warning) = super::agent_skill::status_of(target);
+    status.skill = Some(skill);
+    status.warnings.extend(warning);
     status
 }
 

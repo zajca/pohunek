@@ -120,11 +120,39 @@ The features this core implements:
 | `package-context-v1` | 0.41.0 | `[context]` |
 | `version-probe-open-range-v1` | 0.42.0 | `version_probe` with `min` and no `below` |
 | `detect-composer-absent-v1` | 0.42.0 | detection manifest rule matcher `composer_absent` (no descriptor key; enforced against the manifest the descriptor names) |
+| `agent-skill-v1` | 0.42.0 | `[agent_skill]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
 snapshot file that a test compares. Which core version first has a feature is
 not part of the refusal, because an older core cannot know it.
+
+## Agent skill location
+
+A runtime whose agent reads user-level skills declares where, in an optional
+`[agent_skill]` table, behind the runtime feature `agent-skill-v1`:
+
+```toml
+requires = ["agent-skill-v1"]
+
+[agent_skill]
+root = "config_home"   # closed set: "config_home" | "user_home"
+dir  = "skills"        # relative path of plain components
+```
+
+`root = "config_home"` is the runtime's `[config_home]` (the table is required
+with it) and `dir` is a plain relative path whose last component is `skills`.
+`root = "user_home"` is the user's home directory and accepts only
+`dir = ".agents/skills"`, a location every home and profile of the agent
+shares. The descriptor only names the location: core owns the content, the
+file layout (`<root>/<dir>/pohunek/SKILL.md` and the ownership marker
+`.pohunek-managed` beside it), the modes and every write, which
+`pohunek integration install --skill` performs for the homes it selects. The
+Claude package declares `config_home` and `skills`, the Codex package
+`user_home` and `.agents/skills`; a runtime without the table answers
+`integration_agent_skill_unsupported` to `--skill`. The official packages that
+declare it are Claude 2.1.0 and Codex 1.9.0, which reach a host with the
+release that ships the feature.
 
 ## Session placement
 

@@ -14,3 +14,4 @@ program-status-gate-v1 0.41.0
 package-context-v1 0.41.0
 version-probe-open-range-v1 0.42.0
 detect-composer-absent-v1 0.42.0
+agent-skill-v1 0.42.0

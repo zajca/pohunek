@@ -139,6 +139,7 @@ fn capabilities() -> Value {
         package_bind_profile_expected_supported: true,
         package_install_index_context_supported: false,
         package_create_profile_supported: true,
+        integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
     })
     .expect("serialize the capability snapshot")

@@ -1705,6 +1705,7 @@ dependencies = [
  "pohunek-client",
  "pohunek-daemon",
  "pohunek-hostcheck",
+ "pohunek-knowledge",
  "pohunek-logging",
  "pohunek-overlay",
  "pohunek-package",

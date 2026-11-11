@@ -1072,6 +1072,7 @@ mod tests {
             agent: agent.clone(),
             ok: true,
             status: Some(protocol::IntegrationAgentStatus {
+                skill: None,
                 agent,
                 available: true,
                 expected_asset_paths: Vec::new(),

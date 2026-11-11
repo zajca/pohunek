@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "agent-skill")]
+mod agent_skill;
 pub mod assistant;
 mod index;
 pub mod log;
@@ -11,6 +13,9 @@ mod protocol_conversions;
 mod schema;
 mod validation;
 
+#[cfg(feature = "agent-skill")]
+#[doc(inline)]
+pub use agent_skill::{agent_skill_sha256, AGENT_SKILL};
 #[doc(inline)]
 pub use assistant::{
     assistant_keyed_launch_id, assistant_launch_id, sha256_for_bytes, POHUNEK_VERSION,

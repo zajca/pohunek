@@ -198,6 +198,7 @@ impl DaemonHandler for MuseHook {
     fn inspect_provider(&self, home: Result<&Path, &ProtocolError>) -> IntegrationAgentStatus {
         let agent = RuntimeRef::from_wire(RUNTIME_ID);
         let status = |available, state, recovery, warnings: Vec<String>| IntegrationAgentStatus {
+            skill: None,
             agent: agent.clone(),
             available,
             expected_asset_paths: Vec::new(),
@@ -282,6 +283,7 @@ impl DaemonHandler for MuseHook {
         _dir: &Path,
     ) -> Result<IntegrationUninstallReport, ProtocolError> {
         Ok(IntegrationUninstallReport {
+            skill: None,
             agent: runtime.clone(),
             state: IntegrationUninstallState::NotInstalled,
             removed_paths: Vec::new(),

@@ -33,6 +33,7 @@ use pohunek_platform::filesystem::{
     EntryKind, FsError, LockKind, TrustedDir as PlatformTrustedDir,
 };
 
+mod agent_skill;
 mod cline;
 #[cfg(unix)]
 mod commit;
@@ -59,8 +60,8 @@ pub(crate) use doctor::doctor_in_noted;
 pub(crate) use doctor::is_ambiguous_owner;
 pub(crate) use handler::{hook_runtime_ids, launch_contributor};
 pub use handler::{
-    install_in, serves_retired, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
-    RetiredBuiltin, StagedUpdate,
+    install_in, install_in_with, serves_retired, status_in, AssetManifest, DaemonHandler, Handler,
+    RetainedSchemas, RetiredBuiltin, StagedUpdate,
 };
 #[cfg(all(test, unix))]
 pub use homes::process_environment::uninstall_for;
@@ -73,7 +74,9 @@ pub(crate) use homes::{Home, LaunchHome};
 #[cfg(all(test, unix))]
 pub use uninstall::uninstall;
 #[cfg(unix)]
-pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_in};
+pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_in, uninstall_in_with};
+#[cfg(all(test, unix))]
+mod agent_skill_tests;
 #[cfg(all(test, unix))]
 mod cline_tests;
 #[cfg(all(test, unix))]
@@ -471,6 +474,7 @@ fn reported_agent_status(
     match home {
         Ok(dir) => agent_status_at(agent, dir),
         Err(error) => IntegrationAgentStatus {
+            skill: None,
             agent: agent.kind(),
             available: false,
             expected_asset_paths: Vec::new(),
@@ -553,6 +557,7 @@ fn status_at(
 
     if let Some(issue) = config_dir_issue(config_dir) {
         return IntegrationAgentStatus {
+            skill: None,
             agent: agent.kind(),
             available: false,
             expected_asset_paths,
@@ -630,6 +635,7 @@ fn status_at(
     };
 
     IntegrationAgentStatus {
+        skill: None,
         agent: agent.kind(),
         available: true,
         expected_asset_paths,
@@ -1782,6 +1788,7 @@ fn registration_metadata_current(
 
 fn report(agent: RuntimeRef, paths: &InstallPaths) -> IntegrationInstallReport {
     IntegrationInstallReport {
+        skill: None,
         agent,
         hook_path: paths.hook_path.display().to_string(),
         config_paths: paths
