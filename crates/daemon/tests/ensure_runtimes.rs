@@ -7299,6 +7299,65 @@ fn a_recorded_release_catalog_persists_the_digests_it_revokes() {
         .contains(&revoked));
 }
 
+/// A digest an earlier recorded catalog revoked stays refused when a later
+/// release catalog lists its archive again; nothing is installed for it
+/// (case table row 5 of #2099).
+#[test]
+fn a_later_release_catalog_that_lists_a_revoked_digest_again_is_refused() {
+    const OTHER: &str = "pi";
+    let host = Host::without_service();
+    let key = test_key();
+    let (_, revoked) = official_runtimes::built_archive(REQUESTED);
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, Vec::new()),
+        &[OTHER],
+        1,
+        WINDOW_END,
+        |catalog| catalog.revoked_digests.push(revoked),
+    );
+    let first = host.request(false, &[OTHER]);
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    assert_eq!(first.catalog, CatalogStatus::Recorded);
+
+    host.publish_signed(
+        &key,
+        anchor_with(&key, WINDOW_START, WINDOW_END, Vec::new()),
+        &[REQUESTED],
+        2,
+        WINDOW_END,
+        |_| {},
+    );
+    let plan = host.request(true, &[REQUESTED]);
+    let applied = host.request(false, &[REQUESTED]);
+
+    for report in [&plan, &applied] {
+        assert_eq!(refusal_codes(report), ["official_package_archive_invalid"]);
+        assert_eq!(report.refusals[0].subject, REQUESTED);
+        assert!(
+            report.refusals[0].detail.contains("package_revoked"),
+            "{:?}",
+            report.refusals[0].detail
+        );
+        assert!(report
+            .packages
+            .iter()
+            .all(|package| package.runtime != REQUESTED));
+    }
+    let registry =
+        package::registry::Registry::open_at(&host.plugins_dir(), package::Limits::DEFAULT)
+            .expect("the registry the first step created");
+    assert!(
+        registry
+            .state()
+            .expect("state")
+            .packages()
+            .iter()
+            .all(|record| record.digest() != &official_runtimes::built_archive(REQUESTED).1),
+        "the revoked package is not installed"
+    );
+}
+
 /// A daemon that holds the instance lock owns the registry: the request is
 /// refused and nothing is written.
 #[test]

@@ -16,6 +16,7 @@ use protocol::{
 };
 use tracing::warn;
 
+use super::revocation;
 use super::selection::{conflict, differs, integration_of};
 use super::{
     inspect_record, prove_loadable, read_state, Context, Inspected, PackageService, RetainedPins,
@@ -97,10 +98,11 @@ fn resolve_target(
     }
     let state = read_state(context)?;
     let report = context.runtimes.package_report();
+    let revoked = revocation::revoked_set(context).ok();
     let mut serving: Vec<Inspected> = state
         .packages()
         .iter()
-        .map(|record| inspect_record(context, &state, record, retained, &report))
+        .map(|record| inspect_record(context, &state, record, retained, &report, revoked.as_ref()))
         .filter(|inspected| inspected.info.runtime_id.as_ref() == Some(base))
         .collect();
     let chosen = if let Some(digest) = digest {

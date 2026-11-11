@@ -389,6 +389,11 @@ fn resolve_blocking(
     if !record.enabled() {
         return Err(CommandErrorKind::PackageDisabled);
     }
+    // A catalog-authorized package whose digest a recorded catalog revoked
+    // runs nothing; so does one whose revocation set cannot be read.
+    store
+        .ensure_not_revoked(record)
+        .map_err(|_rejection| CommandErrorKind::Unavailable)?;
     let files = store
         .verified_files_path(&digest)
         .map_err(|_rejection| CommandErrorKind::Unavailable)?;

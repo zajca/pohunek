@@ -1383,6 +1383,56 @@ async fn a_package_runtime_that_reported_its_identity_is_adoptable_with_or_witho
     }
 }
 
+/// Records `digest` as revoked in the plugin root of `host`, in the persisted
+/// shape of `revoked-digests.json` (schema 1, owner-private).
+fn record_revoked_digest(host: &Host, digest: &package::PackageDigest) {
+    let file = host.inputs().plugins_dir.join("revoked-digests.json");
+    fs::write(
+        &file,
+        json!({"schema": 1, "revoked_digests": [digest.as_str()]}).to_string(),
+    )
+    .expect("write the revoked digests");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("private file");
+}
+
+/// A live session whose worker the upgrade adopts and whose package digest a
+/// recorded catalog revoked is judged `already_not_resumable`, as a stopped
+/// one is: the running release refuses to resume it as well, so the upgrade
+/// loses no recovery and does not block on it.
+#[tokio::test]
+async fn a_live_session_on_a_revoked_digest_is_already_not_resumable_in_the_preflight() {
+    let host = Host::serving().await;
+    host.write_store(&[
+        served_session_line("s-1", "w-fixture"),
+        served_session_line("s-2", "w-two"),
+    ]);
+    host.write_journal("s-1", "w-fixture", &journal("s-1", "w-fixture"));
+    host.write_journal("s-2", "w-two", &journal("s-2", "w-two"));
+    let served = official_runtimes::built_archive(SERVED_RUNTIME).1;
+    assert_eq!(
+        verdict_of(&host.report(), "s-1"),
+        (&Verdict::Adoptable, CODE_ADOPTABLE),
+        "adoptable before the revocation"
+    );
+
+    record_revoked_digest(&host, &served);
+    let report = host.report();
+
+    for session in ["s-1", "s-2"] {
+        assert_eq!(
+            verdict_of(&report, session),
+            (&Verdict::AlreadyNotResumable, "package_revoked"),
+            "{:?}",
+            report.sessions
+        );
+    }
+    assert!(
+        report.at_risk().next().is_none(),
+        "a revoked digest does not block the upgrade: {:?}",
+        report.sessions
+    );
+}
+
 #[test]
 fn a_runtime_whose_definition_cannot_be_read_stays_unverified() {
     let host = Host::new();

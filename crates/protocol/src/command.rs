@@ -107,8 +107,9 @@ command_error_kinds! {
     OutputTooLarge,
     /// Stdout is not valid UTF-8.
     OutputNotUtf8,
-    /// The package root fails verification, the run could not be set up, or
-    /// the daemon is shutting down.
+    /// The package root fails verification, a recorded catalog revoked the
+    /// digest of a catalog-authorized package (or the revocation set cannot
+    /// be read), the run could not be set up, or the daemon is shutting down.
     Unavailable,
 }
 

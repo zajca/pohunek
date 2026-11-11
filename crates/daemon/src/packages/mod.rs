@@ -44,6 +44,7 @@ use package::registry::{
     InstallRequest, InstallStatus, PackageRecord, PackageSource as RecordSource, RegistryError,
     RegistryState,
 };
+use package::revoked_digests::RevokedDigests;
 use package::{
     archive_digest, read_archive, read_archive_with_digest, IndexVerifierState, Limits, LocalTrust,
     LocalTrustError, PackageDigest, RootKey, VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES,
@@ -214,10 +215,21 @@ impl PackageService {
         blocking(move || {
             let state = read_state(&context)?;
             let report = context.runtimes.package_report();
+            let revoked = revocation::revoked_set(&context).ok();
             let packages = state
                 .packages()
                 .iter()
-                .map(|record| inspect_record(&context, &state, record, &retained, &report).info)
+                .map(|record| {
+                    inspect_record(
+                        &context,
+                        &state,
+                        record,
+                        &retained,
+                        &report,
+                        revoked.as_ref(),
+                    )
+                    .info
+                })
                 .collect();
             Ok(PackageListResult {
                 generation: state.generation(),
@@ -244,7 +256,7 @@ impl PackageService {
                 .package(&digest)
                 .ok_or(PackageErrorKind::NotInstalled)?;
             let report = context.runtimes.package_report();
-            let inspected = inspect_record(&context, &state, record, &retained, &report);
+            let inspected = inspect_one(&context, &state, record, &retained, &report);
             Ok(PackageInspectResult {
                 package: inspected.info,
                 runtime: inspected.runtime,
@@ -277,7 +289,7 @@ impl PackageService {
             let report = context.runtimes.package_report();
             // An unreadable revocation file is a doctor error of its own: it
             // refuses every catalog-authorized package.
-            revocation::revoked_set(&context)?;
+            let revoked = revocation::revoked_set(&context)?;
             let mut findings = Vec::new();
             for record in state.packages() {
                 if filter
@@ -286,7 +298,9 @@ impl PackageService {
                 {
                     continue;
                 }
-                let info = inspect_record(&context, &state, record, &retained, &report).info;
+                let info =
+                    inspect_record(&context, &state, record, &retained, &report, Some(&revoked))
+                        .info;
                 if let Some(block) = info.selection_blocked {
                     findings.push(PackageFinding {
                         kind: PackageFindingKind::SelectionBlocked,
@@ -776,12 +790,16 @@ fn runtime_info(definition: &RuntimeDefinition) -> PackageRuntimeInfo {
 
 /// Builds the wire description of a recorded package, verifying its root and
 /// loading its descriptor to fill the runtime and the fault.
+///
+/// `revoked` is the set the caller read once for the whole call; `None` (an
+/// unreadable file) flags nothing, so a listing stays readable.
 fn inspect_record(
     context: &Context,
     state: &RegistryState,
     record: &PackageRecord,
     retained: &RetainedPins,
     report: &PackageReport,
+    revoked: Option<&RevokedDigests>,
 ) -> Inspected {
     let digest = record.digest();
     let mut commands = Vec::new();
@@ -821,13 +839,7 @@ fn inspect_record(
             }
             Err(rejection) => (None, fault_of(&rejection), None),
         };
-    let revoked = match revocation::revoked_set(context) {
-        Ok(set) => revocation::is_revoked(&set, record),
-        Err(kind) => {
-            warn!(?kind, "the revoked package digests cannot be read");
-            false
-        }
-    };
+    let revoked = revoked.is_some_and(|set| revocation::is_revoked(set, record));
     Inspected {
         info: PackageInfo {
             digest: digest.clone(),
@@ -846,6 +858,19 @@ fn inspect_record(
         commands,
         commands_only,
     }
+}
+
+/// [`inspect_record`] for a call that describes a single record: it reads the
+/// revoked digests itself.
+fn inspect_one(
+    context: &Context,
+    state: &RegistryState,
+    record: &PackageRecord,
+    retained: &RetainedPins,
+    report: &PackageReport,
+) -> Inspected {
+    let revoked = revocation::revoked_set(context).ok();
+    inspect_record(context, state, record, retained, report, revoked.as_ref())
 }
 
 /// Applies the runtime-id claim rules to `definition` against the runtimes
@@ -949,7 +974,7 @@ fn reload_and_describe(
     let record = state
         .package(digest)
         .ok_or(PackageErrorKind::NotInstalled)?;
-    let info = inspect_record(context, &state, record, retained, &report).info;
+    let info = inspect_one(context, &state, record, retained, &report).info;
     Ok(PackageChangeResult {
         package: info,
         reloaded: true,
@@ -1479,7 +1504,7 @@ fn install_package(
     let record = state
         .package(&digest)
         .ok_or(PackageErrorKind::NotInstalled)?;
-    let inspected = inspect_record(context, &state, record, retained, &reloaded);
+    let inspected = inspect_one(context, &state, record, retained, &reloaded);
     Ok(PackageInstallResult {
         status,
         package: inspected.info,

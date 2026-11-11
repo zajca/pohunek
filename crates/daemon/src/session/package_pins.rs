@@ -160,25 +160,31 @@ impl SessionRegistry {
             return;
         }
         let revoked = tokio::task::spawn_blocking(move || {
-            // One check per distinct pinned package, however many sessions
-            // share it.
-            let mut verdicts: Vec<(PackageDigest, bool)> = Vec::new();
-            let mut revoked = Vec::new();
-            for (id, package, digest) in pinned {
-                let verdict = if let Some((_, verdict)) =
-                    verdicts.iter().find(|(known, _)| *known == digest)
-                {
-                    *verdict
-                } else {
-                    let verdict = store.is_revoked(&digest, &package) == Ok(true);
-                    verdicts.push((digest.clone(), verdict));
-                    verdict
-                };
-                if verdict {
-                    revoked.push((id, package, digest));
+            // One registry read and one set read, however many sessions share
+            // a package.
+            let mut distinct: Vec<(PackageDigest, protocol::PackageIdentity)> = Vec::new();
+            for (_, package, digest) in &pinned {
+                if !distinct.iter().any(|(known, _)| known == digest) {
+                    distinct.push((digest.clone(), package.clone()));
                 }
             }
-            revoked
+            let verdicts = match store.revoked_pins(&distinct) {
+                Ok(verdicts) => verdicts,
+                Err(error) => {
+                    warn!(%error, "the revoked package check of the session list could not read the store");
+                    return Vec::new();
+                }
+            };
+            pinned
+                .into_iter()
+                .filter(|(_, _, digest)| {
+                    distinct
+                        .iter()
+                        .position(|(known, _)| known == digest)
+                        .and_then(|index| verdicts.get(index).copied())
+                        == Some(true)
+                })
+                .collect::<Vec<_>>()
         })
         .await
         .unwrap_or_else(|error| {

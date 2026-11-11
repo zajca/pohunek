@@ -714,6 +714,38 @@ async fn revoked_keys_and_replayed_revocation_lists_are_refused() {
         .expect("the same document installs where its signer was never revoked");
 }
 
+/// An index entry whose digest an earlier recorded catalog revoked is refused
+/// as revoked, and the refusal records neither the package nor index marks
+/// (case table row 6 of #2099).
+#[tokio::test]
+async fn an_index_entry_for_a_digest_a_recorded_catalog_revoked_is_refused() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("index-relisted-revoked");
+    let package = idxfix("1.0.0");
+    let catalog_package = Package::pi();
+    let mut revoking = catalog(7, vec![entry(&catalog_package, PACKAGE, RUNTIME, "1.0.0")]);
+    revoking.revoked_digests = vec![package.digest.clone()];
+    let document = signed_by(&keys.root, revoking);
+    fixture
+        .registry
+        .packages()
+        .package_install(catalog_install(
+            &fixture,
+            &catalog_package,
+            &document,
+            false,
+        ))
+        .await
+        .expect("the catalog install records its revoked digests");
+
+    let index = keys.signed(now(), vec![idxfix_entry(&package, "1.0.0")]);
+    assert_eq!(
+        install_refused(&fixture, &package, &index).await,
+        PackageErrorKind::Revoked
+    );
+    assert_nothing_recorded(&fixture, &package);
+}
+
 #[tokio::test]
 async fn only_the_channel_designated_root_endorses_index_keys() {
     // Both roots of the anchor sign catalogs. The channel designates one of

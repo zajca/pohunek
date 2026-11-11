@@ -22,11 +22,13 @@ printf '%s\n' 'controlled package archive' > "$inputs/hermes.tar.zst"
 printf '%s\n' '{"controlled":"catalog"}' > "$inputs/runtime-catalog.json"
 printf '%s\n' '{"controlled":"anchor"}' > "$inputs/runtime-catalog-anchor.json"
 
-# Builds a release directory whose controlled CLI and daemon run in $2 mode.
+# Builds a release directory whose controlled CLI runs in $1 mode and daemon
+# in $2 mode. A third argument is the only package digest the CLI installs.
 release() {
-  local directory="$test_root/release-$1-$2"
+  local directory="$test_root/release-$1-$2${3:+-expecting}"
   mkdir -p "$directory"
-  sed "s/^mode=ok\$/mode=$1/" "$fixture_root/smoke-pohunek" > "$directory/pohunek"
+  sed -e "s/^mode=ok\$/mode=$1/" -e "s/^expected_digest=\$/expected_digest=${3:-}/" \
+    "$fixture_root/smoke-pohunek" > "$directory/pohunek"
   sed "s/^mode=ok\$/mode=$2/" "$fixture_root/smoke-pohunekd" > "$directory/pohunekd"
   cp "$fixture_root/smoke-pohunek-sessiond" "$directory/pohunek-sessiond"
   chmod 755 "$directory/pohunek" "$directory/pohunekd" "$directory/pohunek-sessiond"
@@ -82,6 +84,42 @@ fi
 # another package, is not the package-backed install the release must prove.
 expect_failure 'reported source=embedded' "$(release embedded ok)" "$safe_temp_parent" "$safe_temp_parent"
 expect_failure 'did not report the installed Hermes package' "$(release wrong-digest ok)" "$safe_temp_parent" "$safe_temp_parent"
+
+# Exported release_package, release_catalog and release_anchor variables are
+# not inputs of the daemon route: the positional package, catalog and anchor
+# win, whether the variables name other files or files that do not exist. The
+# controlled CLI exits 96 when it is handed any package but the positional one.
+other="$test_root/other"
+mkdir -p "$other"
+printf '%s\n' 'another package archive' > "$other/hermes.tar.zst"
+printf '%s\n' '{"controlled":"other catalog"}' > "$other/runtime-catalog.json"
+printf '%s\n' '{"controlled":"other anchor"}' > "$other/runtime-catalog-anchor.json"
+positional_digest="sha256:$(
+  if [[ -x /usr/bin/sha256sum ]]; then
+    /usr/bin/sha256sum -- "$inputs/hermes.tar.zst"
+  else
+    /usr/bin/shasum -a 256 -- "$inputs/hermes.tar.zst"
+  fi | cut -d' ' -f1
+)"
+expecting_release="$(release ok ok "$positional_digest")"
+for exported in "$other" "$test_root/missing"; do
+  output="$(
+    release_package="$exported/hermes.tar.zst" \
+      release_catalog="$exported/runtime-catalog.json" \
+      release_anchor="$exported/runtime-catalog-anchor.json" \
+      run_smoke "$expecting_release" "$safe_temp_parent" "$safe_temp_parent"
+  )"
+  if [[ "$output" != *"Hermes release-plugin smoke passed."* ]]; then
+    printf 'exported release variables overrode the positional inputs (%s)\n' "$exported" >&2
+    exit 1
+  fi
+done
+# The control: the expectation does fail the smoke for another package.
+other_expecting="$(release ok ok "sha256:$(printf '0%.0s' $(seq 1 64))")"
+if run_smoke "$other_expecting" "$safe_temp_parent" "$safe_temp_parent" >/dev/null 2>&1; then
+  printf '%s\n' 'a CLI expecting another package digest unexpectedly passed' >&2
+  exit 1
+fi
 
 # A daemon that never accepts connections fails the smoke before any install.
 expect_failure 'exited before it accepted connections' "$(release ok exits)" "$safe_temp_parent" "$safe_temp_parent"

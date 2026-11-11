@@ -402,6 +402,45 @@ impl PackageStore {
         }
     }
 
+    /// Which of `pins` are revoked, in the order given.
+    ///
+    /// Reads the registry record once and the revocation set at most once,
+    /// however many pins are asked about. A pin that is not registered, or is
+    /// registered under another identity, is not revoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageRejection::Registry`] when the registry record or the
+    /// revocation set cannot be read.
+    pub fn revoked_pins(
+        &self,
+        pins: &[(PackageDigest, PackageIdentity)],
+    ) -> Result<Vec<bool>, PackageRejection> {
+        let state = self.registry_state().map_err(PackageRejection::Registry)?;
+        let mut revoked: Option<package::revoked_digests::RevokedDigests> = None;
+        let mut verdicts = Vec::with_capacity(pins.len());
+        for (digest, identity) in pins {
+            let catalog_authorized = state.package(digest).is_some_and(|record| {
+                record.identity() == identity
+                    && record.source() == package::registry::PackageSource::Official
+            });
+            if !catalog_authorized {
+                verdicts.push(false);
+                continue;
+            }
+            let set = match &revoked {
+                Some(set) => set,
+                None => revoked.insert(
+                    self.registry
+                        .revoked_digests()
+                        .map_err(PackageRejection::Registry)?,
+                ),
+            };
+            verdicts.push(set.contains(digest));
+        }
+        Ok(verdicts)
+    }
+
     /// Whether the registry records `digest` under `identity`, enabled or not.
     ///
     /// Reads the registry record only; it does not verify the package root.

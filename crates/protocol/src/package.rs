@@ -951,7 +951,7 @@ impl PackageErrorKind {
                 "select another installed version with `pohunek plugin select`, or install a release that carries a new package"
             }
             Self::RevocationsUnreadable => {
-                "fix the mode or owner of `revoked-digests.json` in the plugin root, or restore a copy of it, then retry; removing the file forgets revocations that no later catalog repeats"
+                "fix the mode or owner of `revoked-digests.json` in the plugin root, or restore a copy of it, then retry; a damaged file, or one a newer release wrote, is cleared by removing it and installing the latest release catalog again, which records its revocations anew (a revocation that no later catalog repeats is lost)"
             }
         }
     }

@@ -684,7 +684,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_source_unreadable` | `runtime` | The archive file, package directory or catalog could not be read or is not an absolute path. |
 | `package_untrusted` | `runtime` | The trust does not authorize the archive, including a catalog-trusted archive that exports commands only (a catalog entry binds a runtime id). |
 | `package_revoked` | `runtime` | A recorded catalog revoked the package digest. `session.new`, `session.resume`, a relaunch, `package.select`, `package.set_enabled` (enable) and `package.bind_profile` refuse it, and `package.install --catalog` refuses a revoked digest even when a later catalog lists it. The `recover` text names `pohunek plugin select`. Nothing is changed and the selection is never moved on its own. |
-| `package_revocations_unreadable` | `runtime` | The recorded revoked package digests (`revoked-digests.json`) cannot be read: official packages are refused, catalogs cannot be recorded and `package.doctor` fails with this code. The `recover` text names the repair (fix the file's mode or owner, or restore a copy; removing it forgets revocations that no later catalog repeats); the daemon never replaces the file. |
+| `package_revocations_unreadable` | `runtime` | The recorded revoked package digests (`revoked-digests.json`) cannot be read: official packages are refused, catalogs cannot be recorded and `package.doctor` fails with this code. The `recover` text names the repair (fix the file's mode or owner, or restore a copy; a damaged file, or one a newer release wrote, is cleared by removing it and installing the latest release catalog again, which records its revocations anew, while a revocation that no later catalog repeats is lost); the daemon never replaces the file. |
 | `package_commands_client_unsupported` | `runtime` | The descriptor declares `[commands]` and the request did not set `accept_commands`; nothing was recorded, a dry run included. |
 | `official_trust_unavailable` | `configuration` | The host has no catalog trust anchor, so an official package cannot be authorized. |
 | `official_trust_anchor_invalid` | `configuration` | The host's catalog trust anchor exists but cannot be trusted (unsafe location, permissions or ownership, or invalid content), so an official package cannot be authorized. |
@@ -778,7 +778,7 @@ Errors are fixed text without a path, a value or program output:
 | `command_timed_out` | `runtime` | The deadline passed and the group was killed. |
 | `command_output_too_large` | `runtime` | Stdout exceeded the cap and the group was killed. |
 | `command_output_not_utf8` | `runtime` | Stdout is not valid UTF-8. |
-| `command_unavailable` | `runtime` | The package root fails verification, the run could not be set up, or the daemon is shutting down. |
+| `command_unavailable` | `runtime` | The package root fails verification, a recorded catalog revoked the digest of a catalog-authorized package (or the revocation set cannot be read), the run could not be set up, or the daemon is shutting down. |
 | `command_unsupported` | `daemon` | Produced by a client, never by a daemon: the daemon answered `method_not_found` (a release without `command.run`, protocol 4 included) or speaks protocol 3, which never defined it. |
 
 The log line of a run names the package, version, digest, command, transport,

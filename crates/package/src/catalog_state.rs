@@ -128,6 +128,27 @@ impl Registry {
         &self,
         verified: &VerifiedCatalog,
     ) -> Result<CatalogState, RegistryError> {
+        self.record_catalog_with(verified, || Ok(()))
+    }
+
+    /// Merges a verified catalog like [`Registry::record_catalog`], running
+    /// `between_writes` after the revoked digests file was written and
+    /// before the state file is replaced.
+    ///
+    /// An error from `between_writes` ends the record there, as a failed
+    /// write of the state file would: the revoked digests stay recorded and
+    /// the state file keeps its old content. It is the seam that stands in
+    /// for a crash between the two writes.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Registry::record_catalog`], and the error of
+    /// `between_writes`.
+    pub fn record_catalog_with(
+        &self,
+        verified: &VerifiedCatalog,
+        between_writes: impl FnOnce() -> Result<(), RegistryError>,
+    ) -> Result<CatalogState, RegistryError> {
         let _lock = self.acquire_lock()?;
         self.remove_stale_temporary(CATALOG_STATE_TEMP_NAME)?;
         self.remove_stale_revoked_digests_temporary()?;
@@ -159,6 +180,7 @@ impl Registry {
         if merged == current {
             return Ok(current);
         }
+        between_writes()?;
         let file = StateFile {
             schema: CATALOG_STATE_SCHEMA,
             high_water: merged.high_water,
