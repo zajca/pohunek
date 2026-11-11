@@ -13,12 +13,13 @@ use knowledge::{agent_skill_sha256, AGENT_SKILL};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 use protocol::{
     AgentSkillChange, AgentSkillRemoval, AgentSkillState, IntegrationAgentStatus,
-    IntegrationInstallResult, IntegrationStatusParams, IntegrationUninstallResult, ProtocolError,
-    RuntimeRef,
+    IntegrationInstallResult, IntegrationStatusParams, IntegrationUninstallResult,
+    IntegrationUninstallState, ProtocolError, RuntimeRef,
 };
 
 use super::{ConfigHomes, HomeSelection};
-use crate::agent::host::fixture::{official_host, official_profile_pin};
+use crate::agent::host::fixture::{cline_shaped_host, official_host, official_profile_pin};
+use crate::agent::host::RuntimeHost;
 use crate::agent::ProfileRegistry;
 use crate::integration::handler::{install_in_with, status_in, RetainedSchemas};
 use crate::integration::tests::{scoped_dir, TestDir};
@@ -39,6 +40,10 @@ struct Rig {
 
 impl Rig {
     fn new(profiles: &[(&str, String)]) -> Self {
+        Self::with_host(profiles, official_host())
+    }
+
+    fn with_host(profiles: &[(&str, String)], host: RuntimeHost) -> Self {
         let root = scoped_dir("skill");
         let home = root.join("home");
         let agents = root.join("agents");
@@ -57,7 +62,7 @@ impl Rig {
             .collect();
         let base = base_environment(&allowlist, &EnvironmentSource::fixed(variables))
             .expect("a base environment");
-        let registry = ProfileRegistry::with_runtimes(Some(agents), official_host());
+        let registry = ProfileRegistry::with_runtimes(Some(agents), host);
         Self {
             root,
             homes: ConfigHomes::new(registry, base),
@@ -318,6 +323,11 @@ fn uninstall_removes_only_the_marked_skill() {
 
     let only = rig.uninstall(&RuntimeRef::claude(), &HomeSelection::Runtime, true);
     assert_eq!(only.uninstalled[0].skill, Some(AgentSkillRemoval::Removed));
+    assert_eq!(
+        only.uninstalled[0].state,
+        IntegrationUninstallState::Unchanged,
+        "the hooks were left in place, not reported as absent"
+    );
     assert!(!dir.exists(), "the empty skill directory is removed too");
     assert!(config.join("skills").exists(), "the skills directory stays");
     assert!(hook.exists(), "the hooks stay");
@@ -578,4 +588,72 @@ fn a_failed_removal_of_an_owned_skill_is_an_error_not_a_foreign_skill() {
     assert_eq!(failure.code, "integration_agent_skill_unsafe");
     fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE)).expect("restore");
     assert!(dir.join("SKILL.md").exists());
+}
+
+/// Every file below `root`, to compare a home before and after a refusal.
+fn files_below(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("read a directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                pending.push(path.clone());
+            }
+            found.push(path);
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn a_runtime_with_a_handler_and_no_skill_location_refuses_the_skill_before_any_write() {
+    let rig = Rig::with_host(&[], cline_shaped_host(Path::new("/bin/sh"), &[]));
+    let cline = RuntimeRef::from_wire("cline");
+    let config = rig.home().join(".cline");
+    fs::create_dir_all(&config).expect("create the config home");
+    let before = files_below(&rig.home());
+
+    let refusal = rig
+        .install(&cline, &HomeSelection::Runtime, true)
+        .expect_err("the skill is refused");
+
+    assert_eq!(refusal.code, "integration_agent_skill_unsupported");
+    assert_eq!(files_below(&rig.home()), before, "nothing was written");
+    assert!(!config.join("skills").exists());
+
+    let hooks = rig
+        .install(&cline, &HomeSelection::Runtime, false)
+        .expect("the hooks install without the skill");
+    assert!(hooks.installed[0].skill.is_none(), "no skill report");
+
+    let status = rig.statuses(&cline, false);
+    let skill = status[0].skill.as_ref().expect("a skill report");
+    assert_eq!(skill.state, AgentSkillState::Unsupported);
+    assert!(skill.path.is_none());
+
+    let removal = uninstall_in_with(&rig.homes, &cline, &HomeSelection::Runtime, true)
+        .expect_err("skill-only removal is refused");
+    assert_eq!(removal.code, "integration_agent_skill_unsupported");
+}
+
+#[test]
+fn a_runtime_without_a_daemon_handler_answers_the_skill_with_the_unsupported_code() {
+    let rig = Rig::new(&[]);
+    let pi = RuntimeRef::from_wire("pi");
+
+    let install = rig
+        .install(&pi, &HomeSelection::Runtime, true)
+        .expect_err("the skill is refused");
+    assert_eq!(install.code, "integration_agent_skill_unsupported");
+
+    let removal = uninstall_in_with(&rig.homes, &pi, &HomeSelection::Runtime, true)
+        .expect_err("skill-only removal is refused");
+    assert_eq!(removal.code, "integration_agent_skill_unsupported");
+
+    let hooks = rig
+        .install(&pi, &HomeSelection::Runtime, false)
+        .expect_err("the hooks stay unsupported");
+    assert_eq!(hooks.code, "agent_not_installable");
 }

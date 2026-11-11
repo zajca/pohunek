@@ -1583,6 +1583,9 @@ fn render_uninstall_human(result: &IntegrationUninstallResult, skill_only: bool)
                 IntegrationUninstallState::Removed => {
                     let _ = writeln!(output, "{agent}: removed managed hooks");
                 }
+                IntegrationUninstallState::Unchanged => {
+                    let _ = writeln!(output, "{agent}: managed hooks left in place");
+                }
                 IntegrationUninstallState::Unknown => {
                     let _ = writeln!(output, "{agent}: unknown uninstall state");
                 }

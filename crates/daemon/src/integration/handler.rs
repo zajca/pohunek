@@ -700,14 +700,36 @@ pub(super) fn install_in_gated(
 }
 
 /// The runtime that declares no skill location, as the refusal of a request
-/// that named it.
-fn skill_unsupported(display_name: &str) -> ProtocolError {
+/// that named it; `profile` is the host profile whose pinned package version
+/// lacks the location.
+fn skill_unsupported(display_name: &str, profile: Option<&str>) -> ProtocolError {
+    let (subject, recover) = match profile {
+        Some(profile) => (
+            format!("{display_name} (profile {profile})"),
+            format!("repin profile {profile} to a package version that declares an agent skill location (pohunek plugin profile migrate {profile}), or install the hooks without --skill"),
+        ),
+        None => (
+            display_name.to_owned(),
+            "install a version of its package that declares an agent skill location, or install the hooks without --skill".to_owned(),
+        ),
+    };
     ProtocolError::new(
         ErrorClass::Configuration,
         super::agent_skill::UNSUPPORTED_CODE,
-        format!("{display_name} declares no agent skill location, so its skill cannot be installed"),
-        Some("install a version of its package that declares an agent skill location, or install the hooks without --skill".to_owned()),
+        format!("{subject} declares no agent skill location, so its skill cannot be installed"),
+        Some(recover),
     )
+}
+
+/// The refusal of a `--skill` request whose named runtime has no daemon-run
+/// handler: it declares no skill location either. Any other error is kept.
+pub(super) fn skill_refusal(agent: Option<&RuntimeRef>, error: ProtocolError) -> ProtocolError {
+    match agent {
+        Some(agent) if error.code == "agent_not_installable" => {
+            skill_unsupported(agent.as_wire(), None)
+        }
+        _ => error,
+    }
 }
 
 fn install_core(
@@ -718,13 +740,19 @@ fn install_core(
     skill: bool,
     gate: HomeGate<'_>,
 ) -> Result<IntegrationInstallResult, ProtocolError> {
-    let targets = homes.targets(agent, selection)?;
+    let targets = match homes.targets(agent, selection) {
+        Err(error) if skill => return Err(skill_refusal(agent, error)),
+        result => result?,
+    };
     if skill && (agent.is_some() || matches!(selection, HomeSelection::Profile(_))) {
         if let Some(target) = targets
             .iter()
             .find(|target| target.resolved.agent_skill.is_none())
         {
-            return Err(skill_unsupported(&target.resolved.display_name));
+            return Err(skill_unsupported(
+                &target.resolved.display_name,
+                target.scope_profile(),
+            ));
         }
     }
     let per_home = matches!(selection, HomeSelection::All);

@@ -5108,6 +5108,7 @@ fn doctor_and_integration_state_enums_are_tolerant_only_on_the_client() {
         known: vec![
             ("removed", IntegrationUninstallState::Removed),
             ("not_installed", IntegrationUninstallState::NotInstalled),
+            ("unchanged", IntegrationUninstallState::Unchanged),
         ],
         unknown: IntegrationUninstallState::Unknown,
         unknown_wire: "unknown",

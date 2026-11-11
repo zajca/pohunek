@@ -710,16 +710,16 @@ enum IntegrationAction {
     },
     /// Atomically update the managed Hermes plugin and its policy.
     Update {
-        /// Hermes has an update lifecycle of its own; Codex and Claude update
-        /// only their agent skill (`--skill`).
+        /// Hermes has an update lifecycle of its own; for Codex and Claude,
+        /// `--skill` re-installs the home: its hooks and its agent skill.
         #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
         home: HomeSelectionCliOptions,
         #[command(flatten)]
         hermes: HermesUpdateCliOptions,
-        /// Refresh the bundled Pohunek agent skill of a Codex or Claude home
-        /// to the current text. A modified or foreign skill is left alone and
+        /// Install or refresh the hooks and the bundled Pohunek agent skill of a
+        /// Codex or Claude home. A modified or foreign skill is left alone and
         /// reported.
         #[arg(long)]
         skill: bool,

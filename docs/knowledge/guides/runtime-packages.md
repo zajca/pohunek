@@ -149,8 +149,8 @@ file layout (`<root>/<dir>/pohunek/SKILL.md` and the ownership marker
 `.pohunek-managed` beside it), the modes and every write, which
 `pohunek integration install --skill` performs for the homes it selects. The
 Claude package declares `config_home` and `skills`, the Codex package
-`user_home` and `.agents/skills`; a runtime without the table answers
-`integration_agent_skill_unsupported` to `--skill`. The official packages that
+`user_home` and `.agents/skills`; a runtime without the table, or without a daemon-run hook handler such as Pi,
+answers `integration_agent_skill_unsupported` to `--skill`. The official packages that
 declare it are Claude 2.1.0 and Codex 1.9.0, which reach a host with the
 release that ships the feature.
 

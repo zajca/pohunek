@@ -252,10 +252,8 @@ async fn a_credential_literal_is_refused_and_nothing_is_written() {
         let output = harness.run(&arguments).await;
         let shown = format!("{}{}", stdout_text(&output), stderr_text(&output));
         assert!(!output.status.success(), "{arguments:?}: {shown}");
-        let key_without_value = arguments.contains(&"API_KEY=sk-ant-0123456789abcdef0123456789");
         assert!(
-            shown.contains("package_profile_credential_literal")
-                || (key_without_value && shown.contains("package_profile_unusable")),
+            shown.contains("package_profile_credential_literal"),
             "{arguments:?}: {shown}"
         );
         assert!(!shown.contains("sk-ant"), "{shown}");
@@ -524,13 +522,8 @@ async fn a_remote_host_is_refused_before_any_connection() {
         ])
         .await;
     assert!(!output.status.success());
-    assert!(
-        stderr_text(&output).contains("--host")
-            || stdout_text(&output).contains("plugin_local_only"),
-        "{}{}",
-        stdout_text(&output),
-        stderr_text(&output)
-    );
+    let shown = format!("{}{}", stdout_text(&output), stderr_text(&output));
+    assert!(shown.contains("plugin_local_only"), "{shown}");
     assert_eq!(entries(&harness.agents), Vec::<String>::new());
 
     harness.stop().await;

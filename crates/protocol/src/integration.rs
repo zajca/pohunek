@@ -517,6 +517,9 @@ pub enum IntegrationUninstallState {
     Removed,
     /// Nothing owned by the installer was present, so nothing changed.
     NotInstalled,
+    /// The request removed only the agent skill (`skill_only`), so the
+    /// managed hooks were not inspected and stay as they were.
+    Unchanged,
     /// A value a newer daemon sent that this build does not know. Only the
     /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
     /// rejects the value and the daemon never holds or emits one.
