@@ -148,8 +148,9 @@ impl Request {
 
     /// Replaces the method parameters, keeping every other envelope coordinate.
     ///
-    /// The daemon uses it to hand a handler the current-shape parameters of a
-    /// request that arrived in an older protocol version.
+    /// The [`crate::compat`] entry points use it when they translate a request's
+    /// parameters; the current version is the only one in the window, so a
+    /// request reaches a handler with the parameters it was sent with.
     #[must_use]
     pub fn with_params(mut self, params: Value) -> Self {
         self.params = params;

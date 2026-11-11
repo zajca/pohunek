@@ -993,9 +993,9 @@ impl Client {
     ///
     /// A request that omits `timeout_ms` is bounded by
     /// [`protocol::MAX_COMMAND_TIMEOUT_MS`], the ceiling the daemon applies.
-    /// A daemon that does not implement the method, whether it speaks the
-    /// previous protocol version or the current one, fails with
-    /// `command_unsupported`.
+    /// A daemon of the current protocol version that does not implement the
+    /// method fails with `command_unsupported`; a daemon of another protocol
+    /// version fails the call with `daemon/version_mismatch` instead.
     ///
     /// # Errors
     ///
@@ -1427,9 +1427,9 @@ fn run_token() -> &'static str {
 impl Subscription {
     /// Return the next raw event JSON line, or `None` when the daemon closes.
     ///
-    /// A connection that selected the previous protocol version yields each
-    /// event translated to the current shape and re-serialized, so a line is
-    /// always a current-shape event.
+    /// A line is always a current-shape event: the connection selects the
+    /// current version, the only one the window holds, so nothing is
+    /// translated.
     pub async fn next_line(&mut self) -> Result<Option<String>, ClientError> {
         match &mut self.inner {
             SubscriptionInner::Local(conn) => conn.next_adapted_line(self.selected_version).await,
