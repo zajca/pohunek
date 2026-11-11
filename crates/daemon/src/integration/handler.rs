@@ -702,7 +702,7 @@ pub(super) fn install_in_gated(
 /// The runtime that declares no skill location, as the refusal of a request
 /// that named it; `profile` is the host profile whose pinned package version
 /// lacks the location.
-fn skill_unsupported(display_name: &str, profile: Option<&str>) -> ProtocolError {
+pub(super) fn skill_unsupported(display_name: &str, profile: Option<&str>) -> ProtocolError {
     let (subject, recover) = match profile {
         Some(profile) => (
             format!("{display_name} (profile {profile})"),

@@ -83,6 +83,17 @@ pub fn uninstall_in_with(
         Err(error) if skill_only => return Err(super::handler::skill_refusal(Some(agent), error)),
         result => result?,
     };
+    if skill_only {
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.resolved.agent_skill.is_none())
+        {
+            return Err(super::handler::skill_unsupported(
+                &target.resolved.display_name,
+                target.scope_profile(),
+            ));
+        }
+    }
     for target in targets {
         match uninstall_target(&target, selection, skill_only) {
             Ok(report) => uninstalled.push(report),

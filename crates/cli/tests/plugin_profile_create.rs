@@ -516,14 +516,13 @@ async fn a_created_profile_pins_its_package_against_uninstall() {
 #[tokio::test]
 async fn a_remote_host_is_refused_before_any_connection() {
     let harness = Harness::start().await;
-    let output = harness
-        .run(&[
+    let (code, refused) = harness
+        .json(&[
             "--host", "other", "plugin", "profile", "create", "x", "--base", RUNTIME,
         ])
         .await;
-    assert!(!output.status.success());
-    let shown = format!("{}{}", stdout_text(&output), stderr_text(&output));
-    assert!(shown.contains("plugin_local_only"), "{shown}");
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "plugin_local_only");
     assert_eq!(entries(&harness.agents), Vec::<String>::new());
 
     harness.stop().await;
