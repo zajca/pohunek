@@ -63,10 +63,11 @@ pub const CURRENT_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange
     maximum: PROTOCOL_VERSION,
 };
 
-// The window needs a nonzero previous version to adapt.
+// Tests derive a version below the window as `MIN_PROTOCOL_VERSION - 1` or
+// `PROTOCOL_VERSION - 1`, which has to stay a valid nonzero version.
 const _: () = assert!(
     PROTOCOL_VERSION.0 >= 2,
-    "the window needs a previous version"
+    "the version below the window must be nonzero"
 );
 
 /// A protocol version number selected for responses and events.
