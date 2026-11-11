@@ -1307,6 +1307,40 @@ async fn subscribe_events(socket: &Path) -> Framed<UnixStream, LinesCodec> {
     subscriber
 }
 
+/// Reads streamed frames until one is the session lifecycle event `expected`.
+async fn wait_for_session_event(
+    subscriber: &mut Framed<UnixStream, LinesCodec>,
+    expected: &str,
+) -> Event {
+    wait::guard("the session lifecycle event", async {
+        loop {
+            let line = subscriber
+                .next()
+                .await
+                .expect("a streamed event line")
+                .expect("event framing ok");
+            let streamed: Event = serde_json::from_str(&line).expect("parse event");
+            if streamed.event() == expected {
+                return streamed;
+            }
+        }
+    })
+    .await
+}
+
+/// Asserts a session lifecycle payload is exactly the JSON
+/// [`protocol::SessionEvent`] defines, so every consumer decodes what the daemon
+/// emitted.
+fn assert_session_event_payload(payload: &Value) {
+    let typed: protocol::SessionEvent =
+        serde_json::from_value(payload.clone()).expect("decode the session event payload");
+    assert_eq!(
+        serde_json::to_value(&typed).expect("re-serialize the session event payload"),
+        *payload,
+        "the streamed payload must carry the protocol type's shape"
+    );
+}
+
 /// Waits for the attach lifecycle event `expected` of the stream `stream_id`:
 /// `attach_opened` once the daemon has bound the raw stream, `attach_closed`
 /// once it has deregistered it.
@@ -5250,6 +5284,54 @@ async fn subscribe_streams_session_created_event() {
         streamed.payload()["session"]["id"],
         Value::from(created.id.0.as_str()),
         "streamed event should carry the created session id"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn subscribe_session_event_payloads_match_the_protocol_type() {
+    let socket = temp_socket("subscribe-session-event-payloads");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+
+    let mut subscriber = subscribe_events(&socket).await;
+    let mut control = connect(&socket).await;
+    let created = create_session(&mut control, &socket).await;
+
+    let created_event = wait_for_session_event(&mut subscriber, event::SESSION_CREATED).await;
+    assert_session_event_payload(created_event.payload());
+    assert_eq!(
+        created_event.payload()["session"]["id"],
+        Value::from(created.id.0.as_str()),
+        "the created event should carry the created session"
+    );
+
+    // A rename publishes a second lifecycle frame for the same session.
+    let rename_req = Request::make(
+        "session-rename",
+        method::SESSION_RENAME,
+        serde_json::to_value(protocol::SessionRenameParams {
+            session_id: created.id.clone(),
+            name: Some("payload-guard".to_owned()),
+        })
+        .expect("serialize rename params"),
+    );
+    let renamed: protocol::SessionRenameResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &rename_req).await))
+            .expect("rename result");
+    assert_eq!(renamed.session.name.as_deref(), Some("payload-guard"));
+
+    let updated_event = wait_for_session_event(&mut subscriber, event::SESSION_UPDATED).await;
+    assert_session_event_payload(updated_event.payload());
+    assert_eq!(
+        updated_event.payload()["session"]["id"],
+        Value::from(created.id.0.as_str()),
+        "the updated event should carry the renamed session"
     );
 
     let _ = shutdown.send(());

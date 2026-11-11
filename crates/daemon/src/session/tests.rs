@@ -19491,6 +19491,11 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     .await;
     let recovered_event: SessionNativeRecoveredEvent =
         serde_json::from_value(event.payload().clone()).expect("recovery event payload");
+    assert_eq!(
+        serde_json::to_value(&recovered_event).expect("re-serialize the recovery event"),
+        *event.payload(),
+        "the streamed payload must carry the protocol type's shape"
+    );
     assert_eq!(recovered_event.session.id, created.id);
     assert_eq!(
         recovered_event.previous_worker_instance_id.as_deref(),
