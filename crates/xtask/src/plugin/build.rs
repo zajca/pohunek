@@ -72,6 +72,6 @@ pub(crate) fn build(args: &BuildArgs) -> Result<Built, XtaskError> {
         package_id,
         version,
         digest: verified.digest().clone(),
-        path: path.clone(),
+        path,
     })
 }

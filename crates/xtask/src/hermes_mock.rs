@@ -577,7 +577,7 @@ impl Drop for Mock {
 
 fn serve(
     listener: &TcpListener,
-    state: &Arc<Mutex<State>>,
+    state: &Mutex<State>,
     stopping: &Arc<AtomicBool>,
     controls: &Receiver<Control>,
     hooks: &Hooks,
@@ -628,7 +628,7 @@ fn serve(
 
 fn drain_connections(
     listener: &TcpListener,
-    state: &Arc<Mutex<State>>,
+    state: &Mutex<State>,
     stopping: &Arc<AtomicBool>,
     hooks: &Hooks,
 ) {
@@ -653,7 +653,7 @@ fn drain_connections(
 fn process_connection(
     mut stream: TcpStream,
     address: SocketAddr,
-    state: &Arc<Mutex<State>>,
+    state: &Mutex<State>,
     stopping: &Arc<AtomicBool>,
     hooks: &Hooks,
 ) {
@@ -669,11 +669,7 @@ fn process_connection(
     }
 }
 
-fn handle(
-    stream: &mut TcpStream,
-    state: &Arc<Mutex<State>>,
-    hooks: &Hooks,
-) -> Result<(), MockError> {
+fn handle(stream: &mut TcpStream, state: &Mutex<State>, hooks: &Hooks) -> Result<(), MockError> {
     prepare_stream(stream)?;
     let request = read_request(stream, hooks)?;
     let response = accept_request(state, &request)?;
@@ -905,7 +901,7 @@ fn parse_headers(bytes: &[u8]) -> Result<ParsedHeaders, MockError> {
     })
 }
 
-fn accept_request(state: &Arc<Mutex<State>>, request: &Request) -> Result<Response, MockError> {
+fn accept_request(state: &Mutex<State>, request: &Request) -> Result<Response, MockError> {
     match request {
         Request::Discovery(step) => accept_discovery_request(state, *step),
         Request::CopilotConnect(endpoint) => accept_copilot_connect(state, *endpoint),
@@ -914,7 +910,7 @@ fn accept_request(state: &Arc<Mutex<State>>, request: &Request) -> Result<Respon
 }
 
 fn accept_copilot_connect(
-    state: &Arc<Mutex<State>>,
+    state: &Mutex<State>,
     endpoint: CopilotEndpoint,
 ) -> Result<Response, MockError> {
     let mut state = lock_state(state)?;
@@ -942,7 +938,7 @@ fn accept_copilot_connect(
 }
 
 fn accept_discovery_request(
-    state: &Arc<Mutex<State>>,
+    state: &Mutex<State>,
     requested_step: usize,
 ) -> Result<Response, MockError> {
     let mut state = lock_state(state)?;
@@ -975,7 +971,7 @@ fn accept_discovery_request(
 }
 
 fn accept_chat_request(
-    state: &Arc<Mutex<State>>,
+    state: &Mutex<State>,
     streaming: bool,
     body: &Value,
 ) -> Result<Response, MockError> {
@@ -1168,13 +1164,13 @@ fn write_http(
         .map_err(|_error| MockError::new(Failure::Connection))
 }
 
-fn lock_state(state: &Arc<Mutex<State>>) -> Result<std::sync::MutexGuard<'_, State>, MockError> {
+fn lock_state(state: &Mutex<State>) -> Result<std::sync::MutexGuard<'_, State>, MockError> {
     state
         .lock()
         .map_err(|_poison| MockError::new(Failure::StatePoisoned))
 }
 
-fn record_failure(state: &Arc<Mutex<State>>, failure: Failure) {
+fn record_failure(state: &Mutex<State>, failure: Failure) {
     if let Ok(mut state) = state.lock() {
         state.failure.get_or_insert(failure);
     }

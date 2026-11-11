@@ -1056,7 +1056,7 @@ mod tests {
             "acknowledgement is final"
         );
 
-        let mut changed = acknowledged.clone();
+        let mut changed = acknowledged;
         changed.subagents.clear();
         changed.phase = RuntimePhase::Faulted;
         let refusal = journal.check_seal(&changed).expect_err("sealed");
@@ -1065,6 +1065,10 @@ mod tests {
 
         let clone = journal.clone();
         assert!(clone.check_seal(&changed).is_err(), "clones share the seal");
+        assert!(
+            journal.check_seal(&changed).is_err(),
+            "original keeps the seal"
+        );
         assert_eq!(
             Journal::new("/nonexistent/s-1/worker-2.json").check_seal(&changed),
             Ok(()),

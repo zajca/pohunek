@@ -807,7 +807,7 @@ fn canonical_signing_message_is_pinned_and_deterministic() {
     );
     let first = catalog_signing_message(&body).unwrap();
     assert_eq!(first, expected.as_bytes());
-    assert_eq!(first, catalog_signing_message(&body.clone()).unwrap());
+    assert_eq!(first, catalog_signing_message(&body).unwrap());
 }
 
 #[test]

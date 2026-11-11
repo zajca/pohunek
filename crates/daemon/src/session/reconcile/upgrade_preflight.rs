@@ -220,7 +220,9 @@ pub fn run_with(
             Vec::new(),
         ),
     };
-    let judged_definitions = planned.clone();
+    // Shared once, so judging each profile does not copy its definition.
+    let judged_definitions: Vec<Arc<RuntimeDefinition>> =
+        planned.iter().cloned().map(Arc::new).collect();
     let (runtimes, runtimes_report) = match read_only_runtimes(&inputs.plugins_dir, planned) {
         Ok(runtimes) => (runtimes, runtimes_report),
         Err(detail) => {
@@ -333,7 +335,7 @@ fn judging_profiles(
 fn judge_profile_warnings(
     profiles: &ProfileRegistry,
     planned_profiles: &[PlannedProfile],
-    planned: &[RuntimeDefinition],
+    planned: &[Arc<RuntimeDefinition>],
 ) -> Vec<ProfileWarning> {
     let mut warnings = Vec::new();
     for profile in planned_profiles {
@@ -346,9 +348,7 @@ fn judge_profile_warnings(
         else {
             continue;
         };
-        if let Ok(agent) =
-            profiles.resolve_candidate(&profile.name, &profile.text, &Arc::new(definition.clone()))
-        {
+        if let Ok(agent) = profiles.resolve_candidate(&profile.name, &profile.text, definition) {
             warnings.extend(profile_warning(&agent));
         }
     }
@@ -388,7 +388,7 @@ fn judge_profile_warnings(
         let Some(definition) = planned_for_pin(planned, &head.base, &pin) else {
             continue;
         };
-        if let Ok(agent) = profiles.resolve_candidate(&name, &text, &Arc::new(definition.clone())) {
+        if let Ok(agent) = profiles.resolve_candidate(&name, &text, definition) {
             warnings.extend(profile_warning(&agent));
         }
     }
@@ -399,10 +399,10 @@ fn judge_profile_warnings(
 /// The planned definition of `base` at exactly the package and digest `pin`
 /// names, as the apply installs it.
 fn planned_for_pin<'a>(
-    planned: &'a [RuntimeDefinition],
+    planned: &'a [Arc<RuntimeDefinition>],
     base: &RuntimeId,
     pin: &Pin,
-) -> Option<&'a RuntimeDefinition> {
+) -> Option<&'a Arc<RuntimeDefinition>> {
     planned.iter().find(|definition| {
         definition.runtime_id() == base
             && matches!(
@@ -2136,7 +2136,7 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
             // release too, so the upgrade loses no recovery.
             return Some((
                 Verdict::AlreadyNotResumable,
-                error.code.clone(),
+                error.code,
                 "resume refuses the session's host profile because it declares secret \
                  variables a relaunch cannot fill, on the running release too"
                     .to_owned(),
@@ -2286,7 +2286,7 @@ fn judge_pin(candidate: &SessionRecord, profiles: &ProfileRegistry) -> Option<Ju
         // upgrade loses no recovery.
         return Some((
             Verdict::AlreadyNotResumable,
-            error.code.clone(),
+            error.code,
             "resume refuses the session because a recorded catalog revoked the package digest \
              it was launched from, on the running release too; continue in a new session \
              after selecting another version with `pohunek plugin select`"

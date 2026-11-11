@@ -646,6 +646,20 @@ struct Journal {
     progress: HashMap<SessionId, Arc<TurnProgress>>,
 }
 
+/// The progress record of `session_id` in `progress`, created when absent; the
+/// id is copied only for a new record.
+fn shared_progress(
+    progress: &mut HashMap<SessionId, Arc<TurnProgress>>,
+    session_id: &SessionId,
+) -> Arc<TurnProgress> {
+    if let Some(existing) = progress.get(session_id) {
+        return Arc::clone(existing);
+    }
+    let created = Arc::<TurnProgress>::default();
+    progress.insert(session_id.clone(), Arc::clone(&created));
+    created
+}
+
 #[derive(Debug, Default)]
 struct Waiters {
     global: usize,
@@ -707,7 +721,7 @@ impl TurnEvents {
             journal
                 .terminal
                 .contains_key(session_id)
-                .then(|| Arc::clone(journal.progress.entry(session_id.clone()).or_default()))
+                .then(|| shared_progress(&mut journal.progress, session_id))
         };
         if let Some(progress) = progress {
             progress.note_input();
@@ -848,12 +862,7 @@ impl TurnEvents {
 
     /// Returns the progress record of `session_id`, creating it when absent.
     pub(crate) fn progress(&self, session_id: &SessionId) -> Arc<TurnProgress> {
-        Arc::clone(
-            self.journal()
-                .progress
-                .entry(session_id.clone())
-                .or_default(),
-        )
+        shared_progress(&mut self.journal().progress, session_id)
     }
 
     /// Returns the progress record of `session_id` without creating one.

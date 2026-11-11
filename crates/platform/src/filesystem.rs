@@ -591,7 +591,7 @@ impl TrustedDir {
         let actual = stat_mode(&stat);
         if actual & forbidden_mode_bits != 0 {
             return Err(FsError::UnsafeMode {
-                path: directory.path.clone(),
+                path: directory.path,
                 actual,
                 expected: actual & !forbidden_mode_bits,
             });
@@ -728,7 +728,7 @@ impl TrustedDir {
         let actual = stat_mode(&stat);
         if actual & forbidden_mode_bits != 0 {
             return Err(FsError::UnsafeMode {
-                path: child.path.clone(),
+                path: child.path,
                 actual,
                 expected: actual & !forbidden_mode_bits,
             });
@@ -1574,7 +1574,7 @@ impl TrustedDir {
             return Err(AtomicReplaceError::CommittedDurabilityUncertain(
                 FsError::CommittedDurabilityUncertain {
                     operation: "validate replaced file",
-                    path: destination_path.clone(),
+                    path: destination_path,
                     source: io::Error::other(
                         "replacement destination changed after the atomic rename",
                     ),
@@ -2558,15 +2558,13 @@ impl StagedEntry {
         ) {
             Ok(Some(quarantine)) => quarantine,
             Ok(None) => {
-                return Err(FsError::IdentityChanged {
-                    path: staged_path.clone(),
-                });
+                return Err(FsError::IdentityChanged { path: staged_path });
             }
             // The rename committed; only its synchronization is uncertain.
             Err(error @ FsError::CommittedDurabilityUncertain { .. }) => {
                 let parked = match &error {
                     FsError::CommittedDurabilityUncertain { path, .. } => path.clone(),
-                    _ => staged_path.clone(),
+                    _ => staged_path,
                 };
                 return Err(located(error, &parked));
             }
@@ -2684,7 +2682,7 @@ impl StagedEntry {
         if let Err(source) = durable_sync(&self.directory) {
             let error = FsError::CommittedDurabilityUncertain {
                 operation: "move entry to quarantine",
-                path: quarantine_path.clone(),
+                path: quarantine_path,
                 source,
             };
             return Err(self.restore_move_staging(&source_dir, original_name, error));

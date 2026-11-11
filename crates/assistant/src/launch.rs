@@ -251,7 +251,7 @@ pub async fn prepare_with_options(
     let knowledge = KnowledgeInfo {
         bundle_path: Some(materialized.bundle_path.clone()),
         snapshot_path: materialized.snapshot_path.clone(),
-        version: materialized.version.clone(),
+        version: materialized.version,
         label: "materialized",
     };
 

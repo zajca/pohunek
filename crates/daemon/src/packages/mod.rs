@@ -1525,7 +1525,7 @@ fn install_package(
         .install(&InstallRequest {
             archive: &bytes,
             expected: &digest,
-            identity: identity.clone(),
+            identity,
             source,
             enabled: plan.enable,
             select,

@@ -1590,7 +1590,7 @@ mod tests {
         });
 
         let (release_tx, release_rx) = mpsc::channel();
-        let writer_path = fifo.clone();
+        let writer_path = fifo;
         let writer = thread::spawn(move || {
             let mut writer = OpenOptions::new()
                 .write(true)
@@ -2194,7 +2194,7 @@ mod scan_tests {
         let inner_file = inner_path.join("x/s.jsonl");
         write_transcript(&outer_file, "claude");
         write_transcript(&inner_file, "codex");
-        let both = [outer.clone(), inner.clone()];
+        let both = [outer.clone(), inner];
         let index = TranscriptIndex::default();
         let token = CancellationToken::new();
         for root in &both {

@@ -2189,7 +2189,7 @@ async fn a_pinned_profile_whose_override_lacks_screen_readiness_is_warned_after_
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
     }
     let options = PreflightOptions {
-        profiles_dir: Some(profiles.clone()),
+        profiles_dir: Some(profiles),
         ..PreflightOptions::default()
     };
 

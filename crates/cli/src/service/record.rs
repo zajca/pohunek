@@ -1282,7 +1282,7 @@ mod tests {
         };
         let saved = Record {
             runtime_stop: true,
-            runtime_backup: Some(journal.clone()),
+            runtime_backup: Some(journal),
             launchd_default_path: None,
             launchd_boot_identity: None,
             step: Step::Runtimes,

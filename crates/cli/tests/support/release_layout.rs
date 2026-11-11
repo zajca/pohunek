@@ -666,7 +666,7 @@ impl Layout {
                     LayoutError::OutsideLayout {
                         pid: fact.pid,
                         executable: canonical_exe,
-                        layout: canonical_dir.clone(),
+                        layout: canonical_dir,
                     }
                 });
             };

@@ -303,7 +303,7 @@ mod tests {
             .expect("Ed25519 exposes one malformed candidate encoding");
         let mut malformed_verifying_key = encoded.clone();
         malformed_verifying_key[VERIFYING_KEY_RANGE].copy_from_slice(&malformed_candidate);
-        let mut seed_public_mismatch = encoded.clone();
+        let mut seed_public_mismatch = encoded;
         seed_public_mismatch[SIGNING_SEED_RANGE.start] ^= 1;
 
         for (case, bytes) in [

@@ -988,10 +988,7 @@ fn python_probe_reports_the_first_match_informationally_and_never_runs_it() {
     assert!(real_first.summary.contains("agent's own PATH"));
 
     // Stub first (or alone) without developer tools: the informational shim note.
-    for dirs in [
-        vec![stub_dir.clone(), real_dir.clone()],
-        vec![stub_dir.clone()],
-    ] {
+    for dirs in [vec![stub_dir.clone(), real_dir], vec![stub_dir.clone()]] {
         let note = only(python_findings(&probe(dirs)));
         assert_eq!(note.code, Code::HookRuntimeMacosShim);
         let fix = note.remediation.expect("remediation");
@@ -1970,7 +1967,7 @@ fn transaction_hints_name_the_operation_that_was_running() {
         Ok(())
     };
     let error = super::install_claude_gated(&dir, &mut collide).expect_err("collision");
-    let hint = error.recover.clone().expect("hint");
+    let hint = error.recover.expect("hint");
     assert!(hint.contains("`pohunek integration install`"), "{hint}");
     assert!(!hint.contains("uninstall"), "{hint}");
 
@@ -2580,8 +2577,8 @@ fn python_probe_uses_the_effective_execute_permission_like_the_shell() {
             "data file first, usable later",
             vec![data.clone(), usable.clone()],
         ),
-        ("usable first", vec![usable.clone(), group_only.clone()]),
-        ("nothing usable", vec![data.clone(), directory.clone()]),
+        ("usable first", vec![usable, group_only.clone()]),
+        ("nothing usable", vec![data, directory]),
     ];
     for (name, dirs) in layouts {
         let expected = shell_finds_python3(&dirs);

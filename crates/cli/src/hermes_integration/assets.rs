@@ -827,14 +827,14 @@ mod tests {
             parse_marker(&marker_bytes(&missing_provenance).expect("v2 marker without digest")),
             Err(Error::InvalidMarker)
         );
-        let mut unexpected_provenance = reporter_release.clone();
+        let mut unexpected_provenance = reporter_release;
         unexpected_provenance.operator_sha256 = Some("0".repeat(64));
         assert_eq!(
             parse_marker(&marker_bytes(&unexpected_provenance).expect("v1 marker with digest")),
             Err(Error::InvalidMarker)
         );
 
-        let mut previous_v2 = ownership.clone();
+        let mut previous_v2 = ownership;
         previous_v2.version = 2;
         previous_v2.source = None;
         previous_v2.package_id = None;

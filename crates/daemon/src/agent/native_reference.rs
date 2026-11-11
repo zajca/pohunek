@@ -1641,10 +1641,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside_project, store.root.join("sessions/linked"))
             .expect("link outside project directory");
         let check = existence(pi_spec());
-        let env = env_of(vec![(
-            "AGENT_CONFIG_DIR",
-            store.root.clone().into_os_string(),
-        )]);
+        let env = env_of(vec![("AGENT_CONFIG_DIR", store.root.into_os_string())]);
         assert_eq!(check.verify(&reference("abc-123"), &env), Ok(()));
         assert_eq!(check.verify(&reference("abc-124"), &env), Ok(()));
         assert_eq!(
@@ -1690,10 +1687,7 @@ mod tests {
             name_match: Some(NameMatch::Exact),
             ..pi_spec()
         });
-        let env = env_of(vec![(
-            "AGENT_CONFIG_DIR",
-            store.root.clone().into_os_string(),
-        )]);
+        let env = env_of(vec![("AGENT_CONFIG_DIR", store.root.into_os_string())]);
         assert_eq!(check.verify(&reference("abc-123"), &env), Ok(()));
         assert_eq!(
             check.verify(&reference("bc-123"), &env),
@@ -1708,10 +1702,7 @@ mod tests {
             max_depth: Some(0),
             ..pi_spec()
         });
-        let env = env_of(vec![(
-            "AGENT_CONFIG_DIR",
-            store.root.clone().into_os_string(),
-        )]);
+        let env = env_of(vec![("AGENT_CONFIG_DIR", store.root.into_os_string())]);
         assert_eq!(
             shallow.verify(&reference("abc"), &env),
             Err(ReferenceCheckFailure::Missing)
@@ -1729,7 +1720,7 @@ mod tests {
         for vars in [
             vec![("HOME", home.clone().into_os_string())],
             vec![
-                ("HOME", home.clone().into_os_string()),
+                ("HOME", home.into_os_string()),
                 ("AGENT_CONFIG_DIR", OsString::new()),
             ],
         ] {
@@ -1781,10 +1772,7 @@ mod tests {
     fn references_that_are_not_plain_components_are_refused() {
         let store = store_with("proj", "t_abc.jsonl");
         let check = existence(pi_spec());
-        let env = env_of(vec![(
-            "AGENT_CONFIG_DIR",
-            store.root.clone().into_os_string(),
-        )]);
+        let env = env_of(vec![("AGENT_CONFIG_DIR", store.root.into_os_string())]);
         for hostile in [
             "a/b",
             "a b",
@@ -1814,10 +1802,7 @@ mod tests {
             sessions.join("proj").join("t_abc.jsonl"),
         )
         .expect("file symlink");
-        let env = env_of(vec![(
-            "AGENT_CONFIG_DIR",
-            store.root.clone().into_os_string(),
-        )]);
+        let env = env_of(vec![("AGENT_CONFIG_DIR", store.root.into_os_string())]);
         assert_eq!(
             existence(pi_spec()).verify(&reference("abc"), &env),
             Err(ReferenceCheckFailure::Missing),

@@ -959,7 +959,7 @@ struct Snapshot {
     content: String,
     records: Records,
     /// The lines no loader accepts, in file order.
-    rejected: Arc<Vec<RejectedLine>>,
+    rejected: Arc<[RejectedLine]>,
 }
 
 impl Snapshot {
@@ -967,7 +967,7 @@ impl Snapshot {
         Self {
             content: String::new(),
             records: Records::default(),
-            rejected: Arc::new(Vec::new()),
+            rejected: Arc::from([]),
         }
     }
 }
@@ -1705,7 +1705,7 @@ impl Store {
         let snapshot = Arc::new(Snapshot {
             content,
             records: Records::from_store_records(records),
-            rejected: Arc::new(rejected),
+            rejected: Arc::from(rejected),
         });
         // A snapshot a writer installed while this one was decoded carries
         // cached lines and stays.
@@ -1826,7 +1826,7 @@ impl Store {
     /// record a later read of the file produces, and keeps the serialisation of
     /// that decode as its line. If a line does not decode to one record of its
     /// kind, nothing is remembered and the next access decodes the file.
-    fn remember(&self, body: String, mut records: Records, rejected: Arc<Vec<RejectedLine>>) {
+    fn remember(&self, body: String, mut records: Records, rejected: Arc<[RejectedLine]>) {
         let settled = settle(
             &self.path,
             &mut records.resume,
@@ -2644,7 +2644,7 @@ mod tests {
     #[test]
     fn loaded_session_snapshots_mirror_the_runtime_record_worker_instance_id() {
         let path = temp_store_path("session-snapshot-mirror");
-        let store = Store::new(path.clone());
+        let store = Store::new(path);
         let record: super::SessionRecord = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "session_id": "s-1",

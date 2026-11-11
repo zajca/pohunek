@@ -5496,7 +5496,7 @@ async fn session_new_auto_registers_project_from_cwd_and_stamps_ids() {
     assert_eq!(info.cwd, canonical_repo, "in-place runs in the checkout");
     assert_eq!(info.worktree_path, None, "in-place binds no worktree");
     assert_eq!(info.is_linked_worktree, Some(false), "the main checkout");
-    let project_id = info.project_id.clone().expect("a project was stamped");
+    let project_id = info.project_id.expect("a project was stamped");
 
     let projects = registry
         .projects()

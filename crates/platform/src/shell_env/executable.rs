@@ -954,12 +954,9 @@ mod tests {
         let real = executable(&cellar, "tool");
         let link = bin.join("tool");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
-        let search = SearchPath::new(vec![bin.clone()]).expect("search");
+        let search = SearchPath::new(vec![bin]).expect("search");
         // The link itself is returned, like a shell would, after the target passed.
-        assert_eq!(
-            resolve_executable(OsStr::new("tool"), &search),
-            Ok(link.clone())
-        );
+        assert_eq!(resolve_executable(OsStr::new("tool"), &search), Ok(link));
         fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).expect("chmod");
         assert!(matches!(
             resolve_executable(OsStr::new("tool"), &search),

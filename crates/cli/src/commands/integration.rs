@@ -2053,7 +2053,7 @@ mod tests {
             }],
             failed: vec![IntegrationHomeFailure {
                 agent: RuntimeRef::claude(),
-                home: shared.clone(),
+                home: shared,
                 error: ProtocolError::new(
                     ErrorClass::Runtime,
                     "integration_settings_invalid",

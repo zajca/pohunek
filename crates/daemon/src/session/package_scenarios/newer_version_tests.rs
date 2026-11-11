@@ -1152,7 +1152,7 @@ async fn assert_release_record(tag: &str, source: package::registry::PackageSour
         assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
         assert_eq!(
             judged,
-            (Verdict::WouldLoseRecovery, refused.code.clone()),
+            (Verdict::WouldLoseRecovery, refused.code),
             "the preflight judges what resume refuses: {}",
             verdict.detail
         );

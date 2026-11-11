@@ -324,7 +324,7 @@ fn a_rewrite_that_outgrows_the_read_limit_because_of_kept_lines_is_refused() {
     std::fs::write(&path, &content).expect("append the large rejected line");
     let before = std::fs::read(&path).expect("read store");
 
-    let mut grown = session.clone();
+    let mut grown = session;
     grown.info.name = Some("n".repeat(SIZE_SCENARIO_NAME_LEN));
     let error = store
         .record_session(&grown)

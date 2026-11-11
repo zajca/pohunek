@@ -464,7 +464,7 @@ fn spawn_unix_subscription_daemon_with_tail(
     });
 
     UnixSubscriptionDaemon {
-        socket_path: socket_path.clone(),
+        socket_path,
         request_line,
         task,
         _socket_file: socket_file,

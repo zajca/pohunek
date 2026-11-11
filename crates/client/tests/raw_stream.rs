@@ -170,7 +170,7 @@ fn spawn_unix_raw_daemon() -> UnixRawDaemon {
     });
 
     UnixRawDaemon {
-        socket_path: socket_path.clone(),
+        socket_path,
         captured,
         task,
         _socket_file: socket_file,

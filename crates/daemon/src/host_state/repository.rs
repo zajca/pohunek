@@ -535,7 +535,7 @@ mod tests {
     fn seed(path: &Path, include_identity: bool, include_key: bool, include_governance: bool) {
         let (identity, key, governance) = records();
         let identity = if include_identity && !(include_key && include_governance) {
-            IdentityRecord::in_progress(identity.host_id.clone())
+            IdentityRecord::in_progress(identity.host_id)
         } else {
             identity
         };
@@ -1401,13 +1401,8 @@ mod tests {
         validate_governance(&governance, &identity, key.key.reference(), &key.key)
             .expect("valid signed outcome");
 
-        let retired_governance = retired_governance_with_outcome(
-            &identity,
-            &key,
-            &candidate,
-            outcome.clone(),
-            target.clone(),
-        );
+        let retired_governance =
+            retired_governance_with_outcome(&identity, &key, &candidate, outcome, target);
         validate_governance(
             &retired_governance,
             &identity,

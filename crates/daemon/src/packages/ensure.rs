@@ -599,7 +599,7 @@ impl Computed {
         // The kept profiles are already in the report, as the planning found them.
         report
             .profiles
-            .extend(binds.iter().map(|bind| profile_action(bind, false)));
+            .extend(binds.into_iter().map(|bind| profile_action(bind, false)));
         report.finish()
     }
 }
@@ -981,7 +981,7 @@ fn apply(
                 code: "profile_not_bound".to_owned(),
             });
         }
-        report.profiles.push(profile_action(&bind, true));
+        report.profiles.push(profile_action(bind, true));
     }
     Ok(())
 }
@@ -2515,27 +2515,25 @@ fn install(
 
 /// The entry of one planned or applied pin: a bind, or a repin when the profile
 /// moves off a previous pin.
-fn profile_action(bind: &Bind, applied: bool) -> ProfileAction {
+fn profile_action(bind: Bind, applied: bool) -> ProfileAction {
     let status = match (bind.previous.is_some(), applied) {
         (false, false) => ProfileStatus::Bind,
         (false, true) => ProfileStatus::Bound,
         (true, false) => ProfileStatus::Repin,
         (true, true) => ProfileStatus::Repinned,
     };
+    let (previous_digest, previous_version) = bind
+        .previous
+        .map(|previous| (previous.digest.as_str().to_owned(), previous.version))
+        .unzip();
     ProfileAction {
-        name: bind.name.clone(),
+        name: bind.name,
         base: bind.base.as_str().to_owned(),
         digest: bind.digest.as_str().to_owned(),
         status,
-        previous_digest: bind
-            .previous
-            .as_ref()
-            .map(|previous| previous.digest.as_str().to_owned()),
-        previous_version: bind
-            .previous
-            .as_ref()
-            .map(|previous| previous.version.clone()),
-        version: Some(bind.version.clone()),
+        previous_digest,
+        previous_version,
+        version: Some(bind.version),
         kept_reason: None,
     }
 }

@@ -1509,7 +1509,7 @@ mod tests {
         run(&anchor_args(&[primary_root.clone(), ci_root.clone()])).expect("two roots");
         let forward = fs::read(&out).expect("read");
         fs::remove_file(&out).expect("remove");
-        run(&anchor_args(&[ci_root.clone(), primary_root.clone()])).expect("reversed");
+        run(&anchor_args(&[ci_root, primary_root])).expect("reversed");
         assert_eq!(forward, fs::read(&out).expect("read"));
         fs::remove_file(&out).expect("remove");
 
