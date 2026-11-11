@@ -4587,7 +4587,10 @@ again only to repeat the same request.
 Only the CLI's own refusals before that request prove that no session was
 created: `cli_usage` (including an invalid stdin request or request id),
 `confirmation_required`, `no_capable_agent`, `materialization_failed`,
-`agent_cannot_read_bundle` and `session_new_request_id_unsupported`.
+`agent_cannot_read_bundle`, `session_new_request_id_unsupported` and
+`session_new_context_pin_unsupported`. A refusal proves that the attempt raising
+it sent nothing: in a keyed launch whose first attempt got no answer, the error
+of the retry is returned and the first attempt's outcome stays unknown.
 
 Without a request id (a daemon that does not support one), any other failure
 leaves the outcome unknown, because the caller cannot tell whether it came

@@ -206,3 +206,37 @@ async fn a_request_without_a_key_does_not_probe_the_capability() {
         methods(&served)
     );
 }
+
+#[tokio::test]
+async fn a_digest_without_a_key_is_refused_by_a_daemon_without_the_pin_flag() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    // The daemon advertises the key flag but not the pin flag, so only the
+    // digest can be what the client checks.
+    let (socket, served) = spawn_daemon(&env, true);
+    let mut client = connect(&socket).await;
+    let mut pinned = params(None);
+    pinned.context_package_digest = Some(
+        protocol::PackageDigest::parse(
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        )
+        .expect("a package digest"),
+    );
+
+    let error = client
+        .session_new(pinned)
+        .await
+        .expect_err("a daemon that would drop the digest is refused");
+
+    let ClientError::Protocol(refusal) = &error else {
+        panic!("expected a protocol error, got {error:?}");
+    };
+    assert_eq!(refusal.code, "session_new_context_pin_unsupported");
+    assert_eq!(refusal.class, ErrorClass::Daemon);
+    assert!(
+        !methods(&served)
+            .iter()
+            .any(|method| method == protocol::method::SESSION_NEW),
+        "no session.new reached the daemon: {:?}",
+        methods(&served)
+    );
+}
