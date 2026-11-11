@@ -123,7 +123,7 @@ def names_a_workflow_job(required, workflow_path):
         if not job_name_pattern(name, matrix).match(caller):
             continue
         if not called:
-            return True
+            return uses is None
         if uses and any(
             job_name_pattern(inner, inner_matrix).match(called)
             for inner, inner_matrix, _ in workflow_jobs(uses)
@@ -510,6 +510,8 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, macos-13)", workflow))
         self.assertFalse(names_a_workflow_job(f"{smoke} (network-isolated, ubuntu-24.04) extra", workflow))
         self.assertFalse(names_a_workflow_job("tests (gpu, fast)", workflow))
+        # A caller of a reusable workflow is shown only as `caller / called job`.
+        self.assertFalse(names_a_workflow_job("release rehearsal (evidence, assembly, archive smoke)", workflow))
         # The release rehearsal is nightly-tier evidence: both legs of its
         # archive smoke gate a release through the nightly run, and the main
         # tier, which never starts the rehearsal, requires none of its jobs.
