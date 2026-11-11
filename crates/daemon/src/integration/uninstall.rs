@@ -112,7 +112,7 @@ fn uninstall_target(
             .uninstall(&target.resolved.runtime, dir)?
     };
     report.home.clone_from(&target.label);
-    report.skill = super::agent_skill::remove_for(target, selection);
+    report.skill = super::agent_skill::remove_for(target, selection)?;
     Ok(report)
 }
 

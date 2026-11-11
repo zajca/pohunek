@@ -154,6 +154,21 @@ Claude package declares `config_home` and `skills`, the Codex package
 declare it are Claude 2.1.0 and Codex 1.9.0, which reach a host with the
 release that ships the feature.
 
+The lifecycle is marker-owned. `integration install --skill` creates the skill
+or refreshes a `stale` one (marker and file agree, another Pohunek version
+wrote them); a `modified` skill (edited since,
+`integration_agent_skill_modified`), a `foreign` one (no valid marker,
+`integration_agent_skill_foreign`) and an `unsafe` path (a link or a group- or
+world-writable directory, `integration_agent_skill_unsafe`) are left as found
+and make the command exit non-zero while the hooks are installed. A plain
+`integration uninstall` removes the hooks and a marked skill; `uninstall
+--skill` removes only the skill, and is also how a `modified` skill is reset
+(then install it again). A skill in the shared Codex location survives the
+removal of one profile (`kept_shared`) and goes with the bare runtime or
+`--all-profiles`. `integration status` reports `skill` per home without
+changing the hook state. A removal that fails on an owned skill is an error,
+never reported as foreign.
+
 ## Session placement
 
 A session's agent must run only in its worker generation's own process tree,

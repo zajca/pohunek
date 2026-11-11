@@ -768,11 +768,6 @@ impl RuntimeDefinition {
             .as_ref()
             .map(RawTranscripts::validated)
             .transpose()?;
-        let agent_skill = raw
-            .agent_skill
-            .as_ref()
-            .map(|declared| AgentSkill::new(&declared.root, &declared.dir))
-            .transpose()?;
         let launch_env = raw.validated_launch_env(config_home.as_ref())?;
         let naming = raw.validated_naming()?;
         let placement = raw
@@ -820,7 +815,7 @@ impl RuntimeDefinition {
             None => definition,
         };
         let definition = with_declared_startup_grace(definition, raw.input.startup_grace_ms)?;
-        with_declared_files(definition, config_home, transcripts, agent_skill)
+        with_declared_files(definition, config_home, transcripts, raw.agent_skill)
     }
 
     /// The `[placement]` declaration, `None` for a runtime that declares none.
@@ -1014,7 +1009,7 @@ fn with_declared_files(
     definition: RuntimeDefinition,
     config_home: Option<ConfigHome>,
     transcripts: Option<Transcripts>,
-    agent_skill: Option<AgentSkill>,
+    agent_skill: Option<RawAgentSkill>,
 ) -> Result<RuntimeDefinition, DefinitionError> {
     let definition = match config_home {
         Some(config_home) => definition.with_config_home(config_home),
@@ -1025,7 +1020,9 @@ fn with_declared_files(
         None => definition,
     };
     match agent_skill {
-        Some(agent_skill) => definition.with_agent_skill(agent_skill),
+        Some(declared) => {
+            definition.with_agent_skill(AgentSkill::new(&declared.root, &declared.dir)?)
+        }
         None => Ok(definition),
     }
 }

@@ -1803,7 +1803,7 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
 
 mod bind;
 mod compose;
-pub(crate) use bind::{apply_pin, parse_head, BindError, Pin};
+pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
 pub(crate) use compose::{compose_profile, ProfileSpec};
 
 #[cfg(test)]

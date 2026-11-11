@@ -98,6 +98,9 @@ const PEM_BEGIN: &str = "-----BEGIN";
 /// `Authorization` schemes whose value is a secret.
 const AUTH_SCHEMES: [&str; 2] = ["bearer ", "basic "];
 
+/// Header prefix that may precede an `Authorization` scheme.
+const AUTH_HEADER_PREFIX: &str = "authorization:";
+
 /// Separator between a URL scheme and its authority.
 const URL_SCHEME_SEPARATOR: &str = "://";
 
@@ -130,7 +133,11 @@ pub(crate) fn credential_literal_problem(value: &str) -> Option<Problem> {
         value
             .split(['/', '='])
             .filter(|part| !part.is_empty() && *part != value)
-            .find_map(token_problem)
+            .find_map(|part| {
+                has_auth_scheme(part)
+                    .then_some("is an authorization header value")
+                    .or_else(|| token_problem(part))
+            })
     })
 }
 
@@ -161,6 +168,9 @@ fn token_problem(token: &str) -> Option<Problem> {
 
 fn has_auth_scheme(value: &str) -> bool {
     let lowered = value.trim_start().to_ascii_lowercase();
+    let lowered = lowered
+        .strip_prefix(AUTH_HEADER_PREFIX)
+        .map_or(lowered.as_str(), str::trim_start);
     AUTH_SCHEMES.iter().any(|scheme| {
         lowered
             .strip_prefix(scheme)

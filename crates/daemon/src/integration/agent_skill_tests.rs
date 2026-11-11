@@ -527,3 +527,55 @@ fn a_group_writable_skills_directory_is_unsafe() {
     assert_eq!(skill_report(&result).found, AgentSkillState::Unsafe);
     assert!(!skills.join("pohunek").exists());
 }
+
+#[test]
+fn a_marker_without_its_file_reads_stale_and_install_recreates_the_file() {
+    let rig = Rig::new(&[]);
+    let dir = claude_skill_dir(&rig.home().join(".claude"));
+    fs::create_dir_all(&dir).expect("create the skill directory");
+    let marker = format!(
+        "{{\"schema\":1,\"skill\":\"pohunek\",\"sha256\":\"{}\"}}\n",
+        agent_skill_sha256()
+    );
+    fs::write(dir.join(".pohunek-managed"), marker).expect("write the marker");
+    fs::set_permissions(
+        dir.join(".pohunek-managed"),
+        fs::Permissions::from_mode(FILE_MODE),
+    )
+    .expect("marker mode");
+
+    assert_eq!(
+        skill_status(&rig.statuses(&RuntimeRef::claude(), false)[0]).state,
+        AgentSkillState::Stale
+    );
+    let result = rig
+        .install(&RuntimeRef::claude(), &HomeSelection::Runtime, true)
+        .expect("install");
+
+    assert_eq!(skill_report(&result).state, AgentSkillChange::Refreshed);
+    assert_eq!(
+        fs::read_to_string(dir.join("SKILL.md")).expect("read"),
+        AGENT_SKILL
+    );
+}
+
+#[test]
+fn a_failed_removal_of_an_owned_skill_is_an_error_not_a_foreign_skill() {
+    let rig = Rig::new(&[]);
+    let dir = claude_skill_dir(&rig.home().join(".claude"));
+    rig.install(&RuntimeRef::claude(), &HomeSelection::Runtime, true)
+        .expect("install");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).expect("read-only directory");
+
+    let failure = uninstall_in_with(
+        &rig.homes,
+        &RuntimeRef::claude(),
+        &HomeSelection::Runtime,
+        true,
+    )
+    .expect_err("the removal fails");
+
+    assert_eq!(failure.code, "integration_agent_skill_unsafe");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE)).expect("restore");
+    assert!(dir.join("SKILL.md").exists());
+}

@@ -3188,6 +3188,10 @@ fn agent_runtime_config_home_id_is_additive_and_roundtrips() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one test asserts the wire shape of every host capability flag"
+)]
 fn host_capabilities_json_shape_roundtrips() {
     let caps = HostCapabilities {
         daemon_version: "0.1.0".to_owned(),

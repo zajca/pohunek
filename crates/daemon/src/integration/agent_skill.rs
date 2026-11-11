@@ -12,12 +12,13 @@
 
 // Rust guideline compliant 2026-11-11
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use knowledge::{agent_skill_sha256, AGENT_SKILL};
-use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
+use pohunek_platform::filesystem::{FsError, TrustedDir};
 use protocol::{
     AgentSkillChange, AgentSkillRemoval, AgentSkillReport, AgentSkillState, AgentSkillStatus,
     ErrorClass, ProtocolError,
@@ -391,7 +392,7 @@ fn temporary_name() -> Result<String, ProtocolError> {
         .map_err(|_error| unsafe_error("the system random source failed", None))?;
     let mut name = String::from(TEMPORARY_PREFIX);
     for byte in random {
-        name.push_str(&format!("{byte:02x}"));
+        let _ = write!(name, "{byte:02x}");
     }
     Ok(name)
 }
@@ -506,32 +507,7 @@ fn write_skill(site: &Site, inspection: &Inspection) -> Result<(), ProtocolError
     let content = AGENT_SKILL.as_bytes();
     let marker = Marker::for_content(agent_skill_sha256()).render();
     let directory = &chain.skill;
-    match &inspection.installed_sha256 {
-        None if inspection.skill_mode.is_none() => directory
-            .create_file(SKILL_FILE, content, FILE_MODE)
-            .map(|_identity| ())
-            .map_err(|failure| write_failure(&path, &failure))?,
-        found => {
-            let expected = found.clone();
-            let mode = inspection.skill_mode.unwrap_or(FILE_MODE);
-            directory
-                .replace_file_checked(SKILL_FILE, temporary_name()?, content, FILE_MODE, || {
-                    let bytes = directory.read_file(SKILL_FILE, mode, MAX_SKILL_BYTES)?;
-                    if Some(hex_sha256(&bytes)) == expected {
-                        Ok(())
-                    } else {
-                        Err(FsError::IdentityChanged {
-                            path: directory.path().join(SKILL_FILE),
-                        })
-                    }
-                })
-                .map_err(|failure| match failure {
-                    AtomicReplaceError::BeforeCommit(failure) => write_failure(&path, &failure),
-                    other => write_failure(&path, &other),
-                })?;
-        }
-    }
-    match read_entry(directory, MARKER_FILE, MAX_MARKER_BYTES) {
+    let write_marker = || match read_entry(directory, MARKER_FILE, MAX_MARKER_BYTES) {
         Entry::Missing => directory
             .create_file(MARKER_FILE, &marker, FILE_MODE)
             .map(|_identity| ())
@@ -539,7 +515,32 @@ fn write_skill(site: &Site, inspection: &Inspection) -> Result<(), ProtocolError
         _ => directory
             .replace_file(MARKER_FILE, temporary_name()?, &marker, FILE_MODE)
             .map_err(|failure| write_failure(&path, &failure)),
+    };
+    if inspection.skill_mode.is_none() {
+        // The marker goes first, so a write that stops between the two leaves
+        // an owned skill whose file is missing (`stale`), never an unmarked
+        // file that reads as foreign.
+        write_marker()?;
+        return directory
+            .create_file(SKILL_FILE, content, FILE_MODE)
+            .map(|_identity| ())
+            .map_err(|failure| write_failure(&path, &failure));
     }
+    let expected = inspection.installed_sha256.clone();
+    let mode = inspection.skill_mode.unwrap_or(FILE_MODE);
+    directory
+        .replace_file_checked(SKILL_FILE, temporary_name()?, content, FILE_MODE, || {
+            let bytes = directory.read_file(SKILL_FILE, mode, MAX_SKILL_BYTES)?;
+            if Some(hex_sha256(&bytes)) == expected {
+                Ok(())
+            } else {
+                Err(FsError::IdentityChanged {
+                    path: directory.path().join(SKILL_FILE),
+                })
+            }
+        })
+        .map_err(|failure| write_failure(&path, &failure))?;
+    write_marker()
 }
 
 /// Removes the owned skill from the home of `target`.
@@ -547,34 +548,43 @@ fn write_skill(site: &Site, inspection: &Inspection) -> Result<(), ProtocolError
 /// `None` when the runtime declares no skill location. A foreign or unsafe
 /// skill is left alone; a skill in a location every home shares is kept when
 /// the request removes one profile's integration only.
-pub(super) fn remove_for(target: &Target, selection: &HomeSelection) -> Option<AgentSkillRemoval> {
-    let site = match site_of(target)? {
-        Ok(site) => site,
-        Err(_failure) => return Some(AgentSkillRemoval::NotInstalled),
+///
+/// # Errors
+///
+/// `integration_agent_skill_unsafe` when an owned skill could not be removed.
+pub(super) fn remove_for(
+    target: &Target,
+    selection: &HomeSelection,
+) -> Result<Option<AgentSkillRemoval>, ProtocolError> {
+    let Some(site) = site_of(target) else {
+        return Ok(None);
+    };
+    let Ok(site) = site else {
+        return Ok(Some(AgentSkillRemoval::NotInstalled));
     };
     let (inspection, chain) = inspect_site(&site);
-    Some(match (inspection.state, chain) {
+    Ok(Some(match (inspection.state, chain) {
         (AgentSkillState::Foreign | AgentSkillState::Unsafe, _) => AgentSkillRemoval::LeftForeign,
         (AgentSkillState::Absent, _) | (_, None) => AgentSkillRemoval::NotInstalled,
         (_, Some(chain)) => {
             if site.shared && matches!(selection, HomeSelection::Profile(_)) {
-                return Some(AgentSkillRemoval::KeptShared);
+                return Ok(Some(AgentSkillRemoval::KeptShared));
             }
-            remove_owned(&chain)
+            remove_owned(&chain, &site.skill_path())?
         }
-    })
+    }))
 }
 
 /// Removes the skill file, its marker and the then-empty skill directory.
-fn remove_owned(chain: &Chain) -> AgentSkillRemoval {
+fn remove_owned(chain: &Chain, path: &Path) -> Result<AgentSkillRemoval, ProtocolError> {
     for name in [SKILL_FILE, MARKER_FILE] {
-        if let Err(failure) = chain.skill.remove_entry(name) {
+        chain.skill.remove_entry(name).map_err(|failure| {
             warn!(error = %failure, "an installed agent skill file was not removed");
-            return AgentSkillRemoval::LeftForeign;
-        }
+            unsafe_error("the installed skill could not be removed", Some(path))
+        })?;
     }
     if let Err(failure) = chain.parent.remove_empty_child(SKILL_NAME) {
         warn!(error = %failure, "the agent skill directory was not removed");
     }
-    AgentSkillRemoval::Removed
+    Ok(AgentSkillRemoval::Removed)
 }

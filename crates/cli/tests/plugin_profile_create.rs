@@ -232,11 +232,15 @@ async fn a_credential_literal_is_refused_and_nothing_is_written() {
     let harness = Harness::start().await;
     install(&harness).await;
     let token_home = format!("/{}/sk-ant-api03-{}", "srv", "x".repeat(40));
-    let cases: [Vec<&str>; 4] = [
+    let cases: [Vec<&str>; 8] = [
         vec!["--home", &token_home],
         vec!["--arg", "--api-key=sk-ant-0123456789abcdef0123456789"],
         vec!["--arg", "--token", "--arg", "abc"],
         vec!["--arg", "Bearer abcdefghijklmnop"],
+        vec!["--arg", "--header=Bearer abcdefghijklmnop"],
+        vec!["--arg", "Authorization: Bearer abcdefghijklmnop"],
+        vec!["--secret-env", "API_KEY=sk-ant-0123456789abcdef0123456789"],
+        vec!["--secret-env", "AKIAABCDEFGHIJKLMNOP"],
     ];
     for extra in cases {
         let mut arguments = vec!["plugin", "profile", "create", "leaky", "--base", RUNTIME];
@@ -248,8 +252,10 @@ async fn a_credential_literal_is_refused_and_nothing_is_written() {
         let output = harness.run(&arguments).await;
         let shown = format!("{}{}", stdout_text(&output), stderr_text(&output));
         assert!(!output.status.success(), "{arguments:?}: {shown}");
+        let key_without_value = arguments.contains(&"API_KEY=sk-ant-0123456789abcdef0123456789");
         assert!(
-            shown.contains("package_profile_credential_literal"),
+            shown.contains("package_profile_credential_literal")
+                || (key_without_value && shown.contains("package_profile_unusable")),
             "{arguments:?}: {shown}"
         );
         assert!(!shown.contains("sk-ant"), "{shown}");

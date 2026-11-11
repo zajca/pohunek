@@ -25,10 +25,10 @@ use tracing::warn;
 
 use super::bind::{bind_kind, ensure_coexists, resolve_target, unusable, Target};
 use super::{read_state, Context, PackageService, RetainedPins};
-use crate::agent::host::ConfigHome;
+use crate::agent::host::{ConfigHome, RuntimeDefinition};
 use crate::agent::{
-    compose_profile, credential_arg_problem, credential_literal_problem, BindError, Pin,
-    ProfileRegistry, ProfileSpec,
+    compose_profile, credential_arg_problem, credential_literal_problem, env_name_problem, BindDir,
+    BindError, Pin, ProfileFile, ProfileRegistry, ProfileSpec,
 };
 use crate::project::config::validate_name;
 
@@ -128,30 +128,7 @@ fn create_profile(
         )),
         None => None,
     };
-    let home = params
-        .home
-        .as_deref()
-        .map(|home| {
-            home_entry(
-                definition
-                    .as_ref()
-                    .and_then(|definition| definition.config_home()),
-                home,
-            )
-        })
-        .transpose()?;
-    if params
-        .home
-        .as_deref()
-        .is_some_and(|home| credential_literal_problem(home).is_some())
-    {
-        warn!(%name, "the home path of a new profile looks like a credential");
-        return Err(PackageErrorKind::ProfileCredentialLiteral);
-    }
-    if let Some(index) = credential_arg_problem(&params.args) {
-        warn!(%name, index, "an argument of a new profile looks like a credential");
-        return Err(PackageErrorKind::ProfileCredentialLiteral);
-    }
+    let home = checked_home(params, definition.as_deref(), name)?;
     let pin = target.as_ref().map(pin_of);
     let spec = ProfileSpec {
         base: params.base.clone(),
@@ -175,18 +152,7 @@ fn create_profile(
             .map_err(|error| bind_kind(name, error))?,
         None => None,
     };
-    let previous = match (&existing, &params.replace) {
-        (Some(_), None) => return Err(PackageErrorKind::ProfileExists),
-        (Some(file), Some(expected)) => {
-            let current = file_digest(file.text().as_bytes());
-            if &current != expected {
-                return Err(PackageErrorKind::ProfileDigestMismatch);
-            }
-            Some(current)
-        }
-        (None, Some(_)) => return Err(PackageErrorKind::ProfileNotFound),
-        (None, None) => None,
-    };
+    let previous = previous_digest(existing.as_ref(), params.replace.as_ref())?;
     let status = if params.dry_run {
         PackageCreateProfileStatus::Preview
     } else if existing.is_some() {
@@ -194,23 +160,9 @@ fn create_profile(
     } else {
         PackageCreateProfileStatus::Created
     };
-    if let Some(dir) = dir.as_ref().filter(|_dir| !params.dry_run) {
-        dir.remove_stale_temporaries();
-        match &existing {
-            Some(file) => dir
-                .publish(name, file, &text)
-                .map_err(|error| match error {
-                    BindError::Changed => PackageErrorKind::ProfileDigestMismatch,
-                    other => bind_kind(name, other),
-                })?,
-            None => dir
-                .create_new(name, &text)
-                .map_err(|error| bind_kind(name, error))?,
-        }
-    } else if !params.dry_run {
-        // The directory was created by `open_for_create(true)`; a missing one
-        // here would be a logic error, so fail closed.
-        return Err(PackageErrorKind::RegistryFailed);
+    if !params.dry_run {
+        let dir = dir.as_ref().ok_or(PackageErrorKind::RegistryFailed)?;
+        publish(dir, name, existing.as_ref(), &text)?;
     }
     let home_env = spec.home.map(|(env, _path)| env);
     let (package, runtime) = match target {
@@ -240,5 +192,83 @@ fn pin_of(target: &Target) -> Pin {
     Pin {
         package: target.inspected.info.package.id.clone(),
         digest: target.inspected.info.digest.clone(),
+    }
+}
+
+/// The home entry to write, after the home and credential checks.
+fn checked_home(
+    params: &PackageCreateProfileParams,
+    definition: Option<&RuntimeDefinition>,
+    name: &str,
+) -> Result<Option<(String, String)>, PackageErrorKind> {
+    let home = params
+        .home
+        .as_deref()
+        .map(|home| home_entry(definition.and_then(RuntimeDefinition::config_home), home))
+        .transpose()?;
+    if params
+        .home
+        .as_deref()
+        .is_some_and(|home| credential_literal_problem(home).is_some())
+    {
+        warn!(%name, "the home path of a new profile looks like a credential");
+        return Err(PackageErrorKind::ProfileCredentialLiteral);
+    }
+    for (index, slot) in params.secret_env.iter().enumerate() {
+        if credential_literal_problem(slot).is_some() {
+            warn!(%name, index, "a secret_env slot of a new profile looks like a credential");
+            return Err(PackageErrorKind::ProfileCredentialLiteral);
+        }
+        // A slot that is not a plain variable name is refused here, so the
+        // launch rules never echo it.
+        if env_name_problem(slot).is_some() {
+            warn!(%name, index, "a secret_env slot of a new profile is not a variable name");
+            return Err(PackageErrorKind::ProfileUnusable);
+        }
+    }
+    if let Some(index) = credential_arg_problem(&params.args) {
+        warn!(%name, index, "an argument of a new profile looks like a credential");
+        return Err(PackageErrorKind::ProfileCredentialLiteral);
+    }
+    Ok(home)
+}
+
+/// The digest of the file a replace targets, after the existence rules: a name
+/// that exists needs its digest, and a digest needs a name that exists.
+fn previous_digest(
+    existing: Option<&ProfileFile>,
+    replace: Option<&ProfileDigest>,
+) -> Result<Option<ProfileDigest>, PackageErrorKind> {
+    match (existing, replace) {
+        (Some(_), None) => Err(PackageErrorKind::ProfileExists),
+        (Some(file), Some(expected)) => {
+            let current = file_digest(file.text().as_bytes());
+            if &current == expected {
+                Ok(Some(current))
+            } else {
+                Err(PackageErrorKind::ProfileDigestMismatch)
+            }
+        }
+        (None, Some(_)) => Err(PackageErrorKind::ProfileNotFound),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Writes the new file, or replaces `existing` with `text`.
+fn publish(
+    dir: &BindDir,
+    name: &str,
+    existing: Option<&ProfileFile>,
+    text: &str,
+) -> Result<(), PackageErrorKind> {
+    dir.remove_stale_temporaries();
+    match existing {
+        Some(file) => dir.publish(name, file, text).map_err(|error| match error {
+            BindError::Changed => PackageErrorKind::ProfileDigestMismatch,
+            other => bind_kind(name, other),
+        }),
+        None => dir
+            .create_new(name, text)
+            .map_err(|error| bind_kind(name, error)),
     }
 }
