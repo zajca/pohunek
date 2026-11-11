@@ -3435,6 +3435,8 @@ mod tests {
         let mut session = running_session("s-42");
         session.active_agent = Some("codex".to_owned());
         session.active_agent_base = Some(protocol::RuntimeRef::codex());
+        session.activity = Some(AgentActivity::Blocked);
+        session.blocked_kind = Some(protocol::BlockedKind::Permission);
 
         let output = render_list_human(&[session]);
 
@@ -3442,6 +3444,11 @@ mod tests {
             list_row(&output, "s-42")[2],
             "shell->codex",
             "AGENT column should show launch and active agent"
+        );
+        assert_eq!(
+            list_row(&output, "s-42")[5],
+            "blocked/permission",
+            "ACTIVITY column names what a blocked agent waits for"
         );
     }
 

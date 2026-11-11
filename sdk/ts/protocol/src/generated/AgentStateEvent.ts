@@ -24,8 +24,8 @@ export type AgentStateEvent = {
    */
   source: StateSource;
   /**
-   * What the agent waits for, when `activity` is `blocked` and the agent
-   * reported a kind.
+   * What the agent waits for, when `activity` is `blocked` and the program's
+   * status record was reported (`unspecified` when it names no kind).
    */
   blocked_kind?: BlockedKind;
   /**

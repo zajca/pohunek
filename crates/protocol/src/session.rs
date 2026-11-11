@@ -3348,8 +3348,8 @@ pub struct AgentStateEvent {
     pub activity: AgentActivity,
     /// Signal source that produced the activity value.
     pub source: StateSource,
-    /// What the agent waits for, when `activity` is `blocked` and the agent
-    /// reported a kind.
+    /// What the agent waits for, when `activity` is `blocked` and the program's
+    /// status record was reported (`unspecified` when it names no kind).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_kind: Option<BlockedKind>,

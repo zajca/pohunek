@@ -1629,6 +1629,15 @@ async fn a_projector_that_lags_past_a_permission_event_still_derives_an_approval
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
+    let captured = CapturedLog::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    )
+    .expect("no other subscriber is installed in this test process");
     let fixture = Fixture::new(true).await;
     let idle_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1671,6 +1680,11 @@ async fn a_projector_that_lags_past_a_permission_event_still_derives_an_approval
     assert_eq!(
         record.metadata.get("reason").map(String::as_str),
         Some("permission")
+    );
+    let log = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
+    assert!(
+        log.contains("notification projector lagged"),
+        "the approval came from the snapshot resync, not the live event: {log}"
     );
 
     fixture
