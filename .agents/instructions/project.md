@@ -256,12 +256,10 @@ Hard constraints, decided on purpose — respect them in every change:
   a stable one: they stay pre-1.0 with no back-compat shims, and a client
   absorbs breaking changes when it bumps its pinned tag.
 - **UIs pin the core release they were built against.** A Rust or
-  TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS` and reaches
-  an N-1 daemon through its adapter; a client two releases newer than its daemon
-  is refused (`daemon/version_mismatch`). A daemon
-  of release N additionally serves the clients of release N-1 through the
-  protocol window (`docs/architecture.md` "Protocol versioning"), which bounds
-  how long a UI release trails a core update. A protocol surface that only UI
+  TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS`; a peer
+  outside the daemon's window is refused (`daemon/version_mismatch`). The window
+  holds one version today (`docs/architecture.md` "Protocol versioning"), so a UI
+  release must be rebuilt for each core protocol bump. A protocol surface that only UI
   clients call (`host.discover`, `worktree.remove`, and the UI use of
   `subscribe`) is still a public obligation: core keeps server-side contract
   tests for it, listed in `docs/public-api.md` ("External clients"). Core adds

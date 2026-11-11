@@ -34,7 +34,7 @@ remain under the operator's control.
 
 M1's exact-version-to-range-negotiation transition historically established
 protocol v2. M2 and M3 were ordinary rollouts that did not bump that then-current
-public protocol. Current releases use protocol v4 and require the coordinated
+public protocol. Current releases use protocol 5 and require the coordinated
 v4 upgrade described in the [update runbook](../knowledge/runbooks/update-after-release.md).
 
 For each host after that one-time transition:

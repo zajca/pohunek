@@ -707,7 +707,7 @@ fresh interactive input.
 
 ## Transport and Control Protocol
 
-Public protocol v4 currently exposes one logical owner protocol over two
+Public protocol 5 currently exposes one logical owner protocol over two
 transport classes:
 
 - **Local:** Unix domain socket at `<runtime-root>/daemon.sock`. A valid explicit
