@@ -54,6 +54,7 @@ use pohunek_test_support::fs::copy_shell_image;
 use pohunek_test_support::workspace_root;
 use protocol::{method, SessionId, SessionNewParams};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 /// Error code of a setup that stopped after the service install.
 const PLAN_CHANGED_CODE: &str = "setup_plan_changed_after_install";
@@ -134,6 +135,9 @@ fn release(installation: &Installation) -> PathBuf {
 }
 
 /// Snapshot of a directory tree: each entry's bytes, or `None` for a directory.
+/// Every entry below `root` with the SHA-256 of each file's content. A
+/// snapshot that held the bytes would print the staged release binaries
+/// (hundreds of MiB) in the message of a failed comparison.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     let mut entries = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
@@ -149,7 +153,8 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
                 entries.insert(relative, None);
                 pending.push(path);
             } else {
-                entries.insert(relative, Some(fs::read(&path).expect("read file")));
+                let content = fs::read(&path).expect("read file");
+                entries.insert(relative, Some(Sha256::digest(content).to_vec()));
             }
         }
     }
@@ -1899,5 +1904,35 @@ async fn a_hook_selection_naming_an_unknown_home_is_refused() {
             "the message lists the homes the host has: {error}"
         );
     }
-    assert_eq!(snapshot(&installation.root), before, "nothing is written");
+    // Resolving the macOS paths creates the empty runtime and state
+    // directories, so only a written file counts.
+    let after = snapshot(&installation.root);
+    let written: Vec<PathBuf> = changed_paths(&before, &after)
+        .into_iter()
+        .filter(|path| {
+            before.get(path).is_some_and(Option::is_some)
+                || after.get(path).is_some_and(Option::is_some)
+        })
+        .collect();
+    assert!(written.is_empty(), "nothing is written: {written:?}");
+}
+
+/// A failed snapshot comparison prints digests, not file contents: a staged
+/// release holds hundreds of MiB of binaries, and a printed copy of them
+/// stalled the macOS lane until its job timeout.
+#[test]
+fn a_snapshot_mismatch_message_stays_small() {
+    let root = pohunek_test_support::tempdir().expect("temporary directory");
+    fs::write(root.path().join("binary"), vec![0xa5_u8; 4 << 20]).expect("write a large file");
+    let before = snapshot(root.path());
+    fs::write(root.path().join("binary"), vec![0x5a_u8; 4 << 20]).expect("rewrite the file");
+    let after = snapshot(root.path());
+
+    assert_ne!(before, after, "the digest tells the contents apart");
+    let message = format!("{before:?} {after:?}");
+    assert!(
+        message.len() < 4096,
+        "a mismatch prints {} bytes for two 4 MiB files",
+        message.len()
+    );
 }
