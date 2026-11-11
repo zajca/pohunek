@@ -368,6 +368,7 @@ All params and result type names below refer to structs exported by
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local attention notification. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see Notification lifecycle. `turn_completed`, `error` and every other kind are accepted and not stored (`created: false`); an admitted hook report becomes a turn event. Accepts the optional `retryable_admission` flag described under Retryable admission. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists attention records with exact-match filters and cursor pagination. |
 | `project.list` | `ProjectListParams` or `null` | `Vec<ProjectInfo>` | Lists known projects on the target host. A `source` a newer daemon defines reads as `unknown` on the Rust client and the CLI; `--filter source=` still accepts only `auto` and `manual`. |
+| `project.candidates` | `ProjectCandidatesParams` or `null` | `ProjectCandidatesResult` | Read-only proposal of repositories the user works in; registers nothing. `sources` is empty or `["pohunek"]` for the host's pohunek sessions, `["history"]` or both for agent CLI history metadata (naming `history` is the consent to read it). Each `ProjectCandidate` carries exactly `repo_root`, `origin` (userinfo removed; omitted when unset), `last_used_at`, `sessions` (per agent `{owned, history}`), `registered` and `exists`; `ProjectCandidatesResult` adds `dropped` and `limits_reached` (omitted when empty). See [Project candidates](#project-candidates). |
 | `project.add` | `ProjectAddParams` | `ProjectInfo` | Registers a host-local git project path. |
 | `project.show` | `ProjectShowParams` | `ProjectShowResult` | Shows a project plus live worktree state. Each `ProjectWorktree` reports `owned` when pohunek created it; `owner_session_id` names the session it was created for and stays after that session stops; `session_id` names a live (non-terminal) session running in it. Each of the two ids is omitted, never `null`, when it does not apply: `owner_session_id` on a worktree pohunek does not own, `session_id` when no live session runs there. Clients older than `owner_session_id` ignore it. |
 | `project.rename` | `ProjectRenameParams` | `ProjectInfo` | Sets a custom display label. |
@@ -3452,6 +3453,50 @@ hook that sends `session.release_agent` with a fresh timestamp sequence, so
 clean exits normally clear active state promptly. Codex has no installed
 session-end release path because its `Stop` hook is turn completion, not process
 exit; procwatch remains the Codex release backstop.
+
+### Project candidates
+
+`project.candidates` proposes repositories so a client can offer them to
+`project.add`. It never registers a project and never writes.
+
+- **Sources.** `pohunek` reads the working directory of each session pohunek
+  owns on the host (stopped sessions included, observed external processes
+  excluded). `history` reads the agent CLI history that the installed runtime
+  packages declare in their `[transcripts]` table (`dir` below the runtime's
+  config home, parser `jsonl-head-v1`); no other location is opened. Without
+  `history` in `sources` no history file is opened. The `history` source is
+  served on the local control socket only; a remote connection that names it
+  gets `local_only_method` before anything is read.
+- **What is read.** From each history file only the head is read, within the
+  daemon's byte and record bounds: the working directory of the first record
+  that carries one (a top-level `cwd` key, or for the first record the runtime's
+  declared `cwd_path`) and the file's modification time. No other field of a
+  record is kept, returned or logged, and no message body is interpreted. A
+  value that is not an absolute path of plain components is skipped.
+- **No symlink is followed** below a history root: a linked directory is not
+  entered and a linked file is not opened.
+- **Resolution.** Each working directory resolves to its repository once; the
+  main checkout and every linked worktree collapse to one candidate keyed by the
+  git common dir. `origin` is the `origin` remote URL with any userinfo
+  removed (`https://user:token@host/o/r` is returned as `https://host/o/r`); the
+  user name of an scp-style `git@host:path` remote is not a URL userinfo and
+  stays.
+- **What is dropped.** A history path outside the user's home, a path that no
+  longer exists, a path in a temporary directory (`/tmp`, `/var/tmp`,
+  `/private/tmp`, `/private/var/folders`, `/dev/shm`, the daemon's temporary directory) and a path
+  outside a git repository are counted in `dropped` and never named. The home
+  restriction applies to history paths only; a pohunek session is a directory
+  the user started on purpose. `exists` is `false` when git still resolves a
+  pohunek session path to a repository whose main checkout is gone (for example
+  a separate git dir); a path git can no longer resolve is dropped.
+- **Bounds.** The scan is bounded in files, directory entries, head bytes,
+  records per file and time; a file whose head holds no working directory within
+  the record bound contributes nothing. The daemon sets the bounds; a client cannot raise
+  them. A bound that is reached ends the scan early with the candidates found
+  so far and is named in `limits_reached` (`files`, `entries`, `line_length`,
+  `time`), never as an error. A newer daemon may name a bound this client does
+  not know; it reads as `unknown`.
+- **Ordering.** Candidates are newest activity first.
 
 ### Session and Project Filters
 

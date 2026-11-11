@@ -532,6 +532,8 @@ const ROWS: &[Row] = &[
     row!(ProjectActionsParams, Lenient, LENIENT_PARAMS),
     row!(ProjectActionsResult, Lenient, LENIENT_RESULT),
     row!(ProjectAddParams, Lenient, LENIENT_PARAMS),
+    row!(ProjectCandidatesParams, Lenient, LENIENT_PARAMS),
+    row!(ProjectCandidatesResult, Lenient, LENIENT_RESULT),
     row!(ProjectListParams, Lenient, LENIENT_PARAMS),
     row!(ProjectPromptParams, Lenient, LENIENT_PARAMS),
     row!(ProjectPromptResult, Lenient, LENIENT_RESULT),

@@ -204,6 +204,7 @@ static COMMANDS: &[CommandDescriptor] = &[
         extra_body: "## Subcommands\n\n\
                      - `pohunek project list` — List all registered projects.\n\
                      - `pohunek project add` — Register a project by path.\n\
+                     - `pohunek project candidates` — Propose repositories from sessions and, on request, agent history metadata.\n\
                      - `pohunek project show` — Show a project and its live worktrees.\n\
                      - `pohunek project rename` — Set a project's custom display name.\n\
                      - `pohunek project rm` — Forget a project record.\n\
@@ -230,6 +231,18 @@ static COMMANDS: &[CommandDescriptor] = &[
         arguments: "- `<reference>`: Project id or label.\n\
                     - `--json`: Emit machine-readable JSON instead of human text.",
         intents: &["help", "project"],
+        extra_body: "",
+    },
+    CommandDescriptor {
+        id: "project-candidates",
+        title: "pohunek project candidates",
+        description: "Propose repositories without registering them.",
+        usage: "pohunek project candidates [--sources pohunek,history] [--json]",
+        arguments: "- `--sources <list>`: Comma-separated sources, `pohunek` (default) and `history`. \
+                    `history` reads only the working directory and modification time of the agent history \
+                    files the installed runtime packages declare, and is the consent to do so.\n\
+                    - `--json`: Emit machine-readable JSON instead of a table.",
+        intents: &["setup", "project"],
         extra_body: "",
     },
     CommandDescriptor {

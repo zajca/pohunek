@@ -14,6 +14,7 @@
 
 pub mod detect;
 
+pub mod candidates;
 pub(crate) mod config;
 
 pub(crate) use config::ProjectConfigResolver;

@@ -407,3 +407,119 @@ pub struct WorktreeRemoveResult {
     /// `worktree_in_use`) surface as typed errors instead.
     pub removed: bool,
 }
+
+/// Where `project.candidates` looks for repositories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CandidateSource.ts"))]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSource {
+    /// The working directories of the host's pohunek sessions.
+    Pohunek,
+    /// The agent CLI history the installed runtime packages declare. Naming it
+    /// is the consent to read history metadata (working directory and
+    /// modification time of each history file, nothing else).
+    History,
+}
+
+impl CandidateSource {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pohunek => "pohunek",
+            Self::History => "history",
+        }
+    }
+}
+
+/// Parameters for `project.candidates`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectCandidatesParams.ts"))]
+pub struct ProjectCandidatesParams {
+    /// The sources to read. Empty selects [`CandidateSource::Pohunek`] alone,
+    /// so no agent history is opened unless the caller names it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<CandidateSource>,
+}
+
+/// A work bound that cut a `project.candidates` scan short.
+///
+/// A bound that is reached is reported, never an error: the candidates found
+/// before it are returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CandidateLimit.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum CandidateLimit {
+    /// More history files exist than one scan reads.
+    Files,
+    /// A history directory tree has more entries than one scan lists.
+    Entries,
+    /// A history record is longer than one scan reads; the record is skipped.
+    LineLength,
+    /// The scan ran out of time.
+    Time,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(CandidateLimit);
+
+/// How many sessions of one agent worked in a candidate repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "CandidateSessions.ts"))]
+pub struct CandidateSessions {
+    /// Sessions pohunek owns (or owned) in the repository.
+    pub owned: u32,
+    /// History files of the agent that name the repository.
+    pub history: u32,
+}
+
+/// One repository `project.candidates` proposes.
+///
+/// The set of fields is closed: nothing from a history file other than the
+/// working directory it names and its modification time reaches this shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectCandidate.ts"))]
+pub struct ProjectCandidate {
+    /// The repository's main checkout; one candidate per git common dir.
+    pub repo_root: PathBuf,
+    /// The `origin` remote URL with any userinfo removed; absent when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub origin: Option<String>,
+    /// The newest activity in the repository (RFC3339): a session update or a
+    /// history file modification.
+    pub last_used_at: String,
+    /// Session counts per agent (runtime id).
+    pub sessions: std::collections::BTreeMap<String, CandidateSessions>,
+    /// Whether the repository is a registered project.
+    pub registered: bool,
+    /// Whether `repo_root` exists on the host now.
+    pub exists: bool,
+}
+
+/// Result of `project.candidates`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProjectCandidatesResult.ts"))]
+pub struct ProjectCandidatesResult {
+    /// The proposed repositories, newest activity first.
+    pub candidates: Vec<ProjectCandidate>,
+    /// Paths that were not listed: outside the user's home, no longer
+    /// existing, in a temporary directory, or not in a git repository. They
+    /// are counted and never named.
+    pub dropped: u32,
+    /// The bounds that cut the scan short; empty when none was reached.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits_reached: Vec<CandidateLimit>,
+}

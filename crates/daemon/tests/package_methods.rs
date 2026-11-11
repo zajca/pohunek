@@ -642,6 +642,42 @@ where
     (digest, result)
 }
 
+/// `project.candidates` serves the pohunek source on a remote connection and
+/// refuses the history source there before it reads any history.
+#[tokio::test]
+async fn project_candidates_history_is_served_on_the_local_socket_only() {
+    let servers = spawn_servers_over("pkg-candidates", Some("")).await;
+    let mut local = connect_unix(&servers.socket).await;
+    let mut remote = connect_tcp(servers.addr).await;
+
+    let refused = refused(
+        &mut remote,
+        method::PROJECT_CANDIDATES,
+        json!({ "sources": ["history"] }),
+    )
+    .await;
+    assert_eq!(refused.code, LOCAL_ONLY);
+    for sources in [json!(["history"]), json!(["pohunek", "history"])] {
+        let result: protocol::ProjectCandidatesResult = call(
+            &mut local,
+            method::PROJECT_CANDIDATES,
+            json!({ "sources": sources }),
+        )
+        .await;
+        assert!(result.candidates.is_empty());
+    }
+    for params in [Value::Null, json!({ "sources": ["pohunek"] })] {
+        let result: protocol::ProjectCandidatesResult =
+            call(&mut remote, method::PROJECT_CANDIDATES, params).await;
+        assert!(result.candidates.is_empty());
+        assert_eq!(result.dropped, 0);
+    }
+
+    drop(remote);
+    drop(local);
+    servers.stop().await;
+}
+
 #[tokio::test]
 async fn a_descriptor_with_an_invalid_transcript_declaration_is_refused() {
     use pohunek_daemon::agent::host::{MAX_TRANSCRIPT_DIR_BYTES, MAX_TRANSCRIPT_DIR_COMPONENTS};

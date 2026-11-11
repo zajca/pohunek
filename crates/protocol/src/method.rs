@@ -20,20 +20,21 @@ use crate::{
     PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
     PackageLinkParams, PackageListResult, PackageSelectParams, PackageSetEnabledParams,
     PackageUninstallParams, PackageUninstallResult, ProjectActionParams, ProjectActionResult,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
-    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
-    ProjectRenameParams, ProjectShowParams, ProjectShowResult, SessionAttachParams,
-    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionOutputParams, SessionOutputResult, SessionReadParams, SessionReadResult,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
-    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
-    SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams, WorktreeRemoveResult,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectCandidatesParams,
+    ProjectCandidatesResult, ProjectInfo, ProjectListParams, ProjectPromptParams,
+    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
+    ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionDiffParams, SessionDiffResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionResumeResult, SessionRetentionParams, SessionRetentionResult, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
+    SessionWaitParams, SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -544,6 +545,15 @@ method_table!(
     ProjectActionsResult,
     "ProjectActionsParams",
     "ProjectActionsResult";
+
+    /// Propose repositories from pohunek sessions and, on request, agent history metadata.
+    ProjectCandidates,
+    PROJECT_CANDIDATES,
+    "project.candidates",
+    ProjectCandidatesParams,
+    ProjectCandidatesResult,
+    "ProjectCandidatesParams",
+    "ProjectCandidatesResult";
 
     /// Remove one pohunek-owned worktree by path.
     WorktreeRemove,

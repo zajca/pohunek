@@ -679,6 +679,82 @@ fn project_actions_and_prompts_from_a_newer_daemon_show_unknown_and_keep_none() 
     assert_eq!(document["ok"]["layer"], "unknown", "{document}");
 }
 
+/// A `project.candidates` result of a daemon that reports a bound this build
+/// does not define.
+fn newer_daemon_candidates() -> Value {
+    json!({
+        "candidates": [{
+            "repo_root": "/home/me/work/app",
+            "origin": "https://example.com/org/app.git",
+            "last_used_at": "2026-11-11T08:00:00Z",
+            "sessions": { "claude": { "owned": 1, "history": 3 } },
+            "registered": false,
+            "exists": true,
+        }],
+        "dropped": 2,
+        "limits_reached": ["files", "a_bound_from_a_newer_daemon"],
+    })
+}
+
+/// A daemon that answers `project.candidates` only for the `sources` it expects.
+fn candidates_daemon(
+    expected_sources: Value,
+) -> impl Fn(&Request) -> Option<Result<Value, String>> {
+    move |request| {
+        (request.method() == protocol::method::PROJECT_CANDIDATES).then(|| {
+            if request.params() == &json!({ "sources": expected_sources }) {
+                Ok(newer_daemon_candidates())
+            } else {
+                Err(format!("unexpected sources: {}", request.params()))
+            }
+        })
+    }
+}
+
+#[test]
+fn project_candidates_sends_the_named_sources_and_shows_a_newer_bound_as_unknown() {
+    let default = run_against_scripted_daemon(
+        &["project", "candidates"],
+        candidates_daemon(json!(["pohunek"])),
+    );
+    assert_eq!(default.status.code(), Some(0), "{default:?}");
+    let stdout = String::from_utf8_lossy(&default.stdout);
+    assert!(stdout.contains("/home/me/work/app"), "{stdout}");
+    assert!(stdout.contains("claude=1+3"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&default.stderr);
+    assert!(stderr.contains("2 path(s) not listed"), "{stderr}");
+    assert!(stderr.contains("unknown limit reached"), "{stderr}");
+
+    let history = run_against_scripted_daemon(
+        &[
+            "project",
+            "candidates",
+            "--sources",
+            "pohunek,history",
+            "--json",
+        ],
+        candidates_daemon(json!(["pohunek", "history"])),
+    );
+    assert_eq!(history.status.code(), Some(0), "{history:?}");
+    let document: Value = serde_json::from_slice(&history.stdout).expect("one JSON document");
+    assert_eq!(
+        document["ok"]["limits_reached"],
+        json!(["files", "unknown"]),
+        "{document}"
+    );
+    assert_eq!(document["ok"]["dropped"], 2, "{document}");
+
+    let refused = run_against_scripted_daemon(
+        &["project", "candidates", "--sources", "transcripts"],
+        candidates_daemon(json!([])),
+    );
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "an unknown source is refused"
+    );
+}
+
 /// A governance status of a daemon that quarantines for a reason this build does
 /// not define.
 fn newer_daemon_quarantined_status() -> Value {

@@ -557,6 +557,7 @@ async fn handle_negotiated(
         method::PROJECT_PROMPT => project::handle_project_prompt(request, &state.sessions).await,
         method::PROJECT_ACTION => project::handle_project_action(request, &state.sessions).await,
         method::PROJECT_ACTIONS => project::handle_project_actions(request, &state.sessions).await,
+        method::PROJECT_CANDIDATES => project::handle_project_candidates(request, state).await,
         method::WORKTREE_REMOVE => worktree::handle_worktree_remove(request, &state.sessions).await,
         other => Response::err(
             selected_version,

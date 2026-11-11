@@ -546,6 +546,8 @@ pub struct SessionRegistryConfig {
     /// disables the host-default layer (e.g. unit tests that exercise only the
     /// in-repo layer). Read through [`SessionRegistry::config_dir`].
     pub config_dir: Option<PathBuf>,
+    /// Bounds and path filters of `project.candidates` scans.
+    pub candidates: crate::project::candidates::CandidateConfig,
     /// Directory holding host agent profiles (`<config_dir>/agents`). `None`
     /// disables host profiles (a bare installed runtime id still resolves).
     /// Part C: a profile extends a base kind with program/args/env/input-rules.
@@ -688,6 +690,7 @@ impl Default for SessionRegistryConfig {
             retention_policy_path: None,
             log_dir: None,
             config_dir: None,
+            candidates: crate::project::candidates::CandidateConfig::default(),
             agents_dir: None,
             // Unit tests launch profile-backed sessions, which need a revision
             // key; every default configuration of a test shares one directory.
@@ -2770,6 +2773,12 @@ impl SessionRegistry {
     #[must_use]
     pub fn config_dir(&self) -> Option<&Path> {
         self.inner.config.config_dir.as_deref()
+    }
+
+    /// Bounds and path filters of `project.candidates` scans.
+    #[must_use]
+    pub(crate) fn candidate_config(&self) -> &crate::project::candidates::CandidateConfig {
+        &self.inner.config.candidates
     }
 
     /// Debounce, dedupe window and record lifetime the notification inbox runs
