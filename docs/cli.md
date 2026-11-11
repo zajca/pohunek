@@ -127,7 +127,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [--yes \| --dry-run] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. It never upgrades an installed service. |
+| `pohunek setup [--yes \| --dry-run] [--hooks <none\|all\|agent[:profile],...>] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. `--hooks` limits the hooks to none or to the listed agent homes (default `all`). It never upgrades an installed service. |
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
@@ -298,9 +298,27 @@ blocks the run, such as an installed service of another version or a release
 archive that fails its verification, is the same error the run returns.
 `--dry-run` with `--yes`, or with a setup subcommand, is a usage error.
 
+`--hooks <selection>` chooses the agent homes that get hooks, so a client that
+asks the owner per home can drive one `setup --yes`. The selection is `all`
+(the default, as bare `setup` always behaved), `none`, or a comma-separated
+list of `agent` and `agent:profile`. `claude` names the default Claude home;
+`claude:work` names the home of the host profile `work`; `hermes` and
+`hermes:work` name the default Hermes home and a named Hermes profile. The
+preview, the `--json` result and `--dry-run --json` list only the selected
+homes (`integrations` and `hermes_homes`), and the apply touches no other agent
+home: `--hooks none` leaves every agent home byte-identical. Packages, profile
+pins and config files do not depend on the selection. A selection naming an
+agent or profile that has no home on this host fails with the usage exit status
+2 and the code `setup_hooks_unknown` before anything is changed; the message
+lists the homes the host has. The check runs when the plan is read, after the
+refusals that precede a plan (consent, a pending transaction, a service of
+another version, a refused release plan). A malformed selection is refused by
+the parser, and `--hooks` with a selection other than `all` together with a
+setup subcommand is a usage error.
+
 `--json --yes` applies the plan without asking and prints one result document.
 It carries the full preview in `preview` (service, packages, profiles,
-integrations, gaps, catalog, every Hermes home and the config files), then the
+integrations, gaps, catalog, every selected Hermes home and the config files), then the
 `applied` lines, the hook outcomes, the config result and the verdict. It
 prints no separate preview, because it cannot ask: to read the plan first, run
 `pohunek setup --dry-run --json`.

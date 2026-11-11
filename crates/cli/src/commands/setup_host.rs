@@ -60,6 +60,7 @@ use crate::commands::integration::{
 };
 use crate::commands::profile_bind::{self, PinCheck, UNCHECKED_PIN_NOTE};
 use crate::commands::setup::{config_files, install_config_into, ConfigResult};
+use crate::commands::setup_hooks::{home_label, HookSelection};
 use crate::error::CliError;
 use crate::hermes_integration::runner::safe_ancestor;
 use crate::paths::Paths;
@@ -290,6 +291,8 @@ pub struct HostPlan {
     previewed: EnsureReport,
     /// The preview shown to the owner.
     pub preview: Preview,
+    /// The agent homes the run installs hooks into.
+    hooks: HookSelection,
 }
 
 /// Why a host setup step stopped, with its stable code and next step.
@@ -332,7 +335,25 @@ pub async fn plan(
     staged: &Path,
     planner: &dyn ReleasePlanner,
 ) -> Result<HostPlan, SetupError> {
-    plan_in(context, staged, planner).await.map_err(SetupError)
+    plan_selecting(context, staged, planner, &HookSelection::All).await
+}
+
+/// Reads the plan like [`plan`], with hooks installed only in the homes
+/// `hooks` selects. The preview and the apply list and touch only those homes.
+///
+/// # Errors
+///
+/// Returns the errors of [`plan`], and [`SetupError`] with the code
+/// `setup_hooks_unknown` for a selected home the host does not have.
+pub async fn plan_selecting(
+    context: &Context,
+    staged: &Path,
+    planner: &dyn ReleasePlanner,
+    hooks: &HookSelection,
+) -> Result<HostPlan, SetupError> {
+    plan_in(context, staged, planner, hooks)
+        .await
+        .map_err(SetupError)
 }
 
 /// Applies a plan read by [`plan`], then runs the final checks.
@@ -359,9 +380,14 @@ pub async fn apply(
 /// no, [`CliError::SetupBlocked`] before any change, and
 /// [`CliError::SetupIncomplete`] or [`CliError::SetupInstalledOnly`] when a
 /// step after the first change fails.
-pub(crate) async fn run(yes: bool, json: bool, dry_run: bool) -> Result<(), CliError> {
+pub(crate) async fn run(
+    yes: bool,
+    json: bool,
+    dry_run: bool,
+    hooks: &HookSelection,
+) -> Result<(), CliError> {
     if dry_run {
-        return preview_only(json).await;
+        return preview_only(json, hooks).await;
     }
     if !yes && (json || !io::stdin().is_terminal()) {
         return Err(CliError::SetupConsentRequired);
@@ -369,7 +395,7 @@ pub(crate) async fn run(yes: bool, json: bool, dry_run: bool) -> Result<(), CliE
     let context = Context::resolve()?;
     let staged = service::staged_dir(&context, None)?;
     let planner = DaemonRuntimes::default();
-    let plan = plan_in(&context, &staged, &planner).await?;
+    let plan = plan_in(&context, &staged, &planner, hooks).await?;
     if !json {
         print!("{}", render_plan(&plan));
     }
@@ -392,11 +418,11 @@ pub(crate) async fn run(yes: bool, json: bool, dry_run: bool) -> Result<(), CliE
 ///
 /// Returns the errors of reading the plan, as a run returns them before its
 /// first change.
-async fn preview_only(json: bool) -> Result<(), CliError> {
+async fn preview_only(json: bool, hooks: &HookSelection) -> Result<(), CliError> {
     let context = Context::resolve()?;
     let staged = service::staged_dir(&context, None)?;
     let planner = DaemonRuntimes::default();
-    let plan = plan_in(&context, &staged, &planner).await?;
+    let plan = plan_in(&context, &staged, &planner, hooks).await?;
     if json {
         print!("{}", crate::commands::render_json(&plan.preview)?);
     } else {
@@ -418,6 +444,53 @@ fn integration_env(context: &Context) -> IntegrationEnv {
         home: context.home().map(Path::to_path_buf),
         state_dir: context.paths().state_dir.clone(),
     }
+}
+
+/// The Hermes homes the run acts on: those the host has and `hooks` selects.
+///
+/// # Errors
+///
+/// Returns [`CliError::SetupHooksUnknown`] when `hooks` names a home that
+/// neither the detected integrations nor the Hermes homes list.
+fn selected_hermes_homes(
+    env: &IntegrationEnv,
+    previewed: &EnsureReport,
+    detected: &EnsureReport,
+    search_path: &str,
+    hooks: &HookSelection,
+) -> Result<Vec<IntegrationReinstall>, CliError> {
+    let all = if serves_hermes(previewed) && hermes_home_exists(env) {
+        hermes_home_plan(
+            env,
+            OsStr::new(search_path),
+            changes_hermes_selection(previewed),
+        )
+    } else {
+        Vec::new()
+    };
+    let available: Vec<String> = detected
+        .integrations
+        .iter()
+        .map(|integration| home_label(&integration.runtime, integration.profile.as_deref()))
+        .chain(all.iter().map(|home| home.integration.clone()))
+        .collect();
+    hooks
+        .validate(&available)
+        .map_err(|detail| CliError::SetupHooksUnknown { detail })?;
+    Ok(all
+        .into_iter()
+        .filter(|home| hooks.selects(&home.integration, HERMES_RUNTIME))
+        .collect())
+}
+
+/// Keeps in `report` only the hook homes `hooks` selects, so the preview, the
+/// apply and the checks against later plans all see the same homes.
+fn select_hooks(mut report: EnsureReport, hooks: &HookSelection) -> EnsureReport {
+    report.integrations.retain(|integration| {
+        let label = home_label(&integration.runtime, integration.profile.as_deref());
+        hooks.selects(&label, &integration.runtime)
+    });
+    report
 }
 
 /// Whether the plan installs or keeps the official Hermes package.
@@ -558,6 +631,7 @@ async fn plan_in(
     context: &Context,
     staged: &Path,
     planner: &dyn ReleasePlanner,
+    hooks: &HookSelection,
 ) -> Result<HostPlan, CliError> {
     // Read without side effects, so the plan a dry run prints leaves the host
     // as it was.
@@ -610,7 +684,8 @@ async fn plan_in(
             job.value,
         )
     };
-    let previewed = planner.plan(context, &dir, &search_path).await?;
+    let detected = planner.plan(context, &dir, &search_path).await?;
+    let previewed = select_hooks(detected.clone(), hooks);
     if !previewed.refusals.is_empty() {
         return Err(CliError::SetupBlocked {
             detail: refusal_text(&previewed.refusals),
@@ -633,15 +708,7 @@ async fn plan_in(
     // and its plugin is installed by this CLI. So the homes are planned here
     // whenever the plan serves Hermes and its default home exists.
     let env = integration_env(context);
-    let hermes_homes = if serves_hermes(&previewed) && hermes_home_exists(&env) {
-        hermes_home_plan(
-            &env,
-            OsStr::new(&search_path),
-            changes_hermes_selection(&previewed),
-        )
-    } else {
-        Vec::new()
-    };
+    let hermes_homes = selected_hermes_homes(&env, &previewed, &detected, &search_path, hooks)?;
     let preview = Preview {
         service: service.clone(),
         packages: previewed.packages.clone(),
@@ -660,6 +727,7 @@ async fn plan_in(
         search_path,
         previewed,
         preview,
+        hooks: hooks.clone(),
     })
 }
 
@@ -718,7 +786,15 @@ async fn apply_steps(
     let hermes_homes = &plan.preview.hermes_homes;
     let (dir, search_path, remaining) = match &plan.service {
         ServiceStep::Install { from } => {
-            install_service(context, Path::new(from), previewed, applied, planner).await?
+            install_service(
+                context,
+                Path::new(from),
+                previewed,
+                &plan.hooks,
+                applied,
+                planner,
+            )
+            .await?
         }
         ServiceStep::Present => {
             let (dir, current) = recheck_present(context, plan, planner).await?;
@@ -762,7 +838,10 @@ async fn apply_steps(
     }
     written?;
 
-    let after = planner.plan(context, &dir, &search_path).await?;
+    let after = select_hooks(
+        planner.plan(context, &dir, &search_path).await?,
+        &plan.hooks,
+    );
     let catalog_recorded = installs_packages && previewed.catalog == CatalogStatus::Record;
     let verdict = verdict(&paths, previewed, &after, &hooks, catalog_recorded).await?;
     Ok((hooks, config, verdict))
@@ -807,6 +886,7 @@ async fn install_service(
     context: &Context,
     from: &Path,
     previewed: &EnsureReport,
+    hooks: &HookSelection,
     applied: &mut Vec<String>,
     planner: &dyn ReleasePlanner,
 ) -> Result<(VerifiedVersionDir, String, EnsureReport), CliError> {
@@ -830,9 +910,12 @@ async fn install_service(
         })?;
     let version_dir = layout::verify_installed(&install_layout(&installed.prefix)?, &version_dir)?;
     let installed_search = installed_job_search_path(context).await?.value;
-    let after = planner
-        .plan(context, &version_dir, &installed_search)
-        .await?;
+    let after = select_hooks(
+        planner
+            .plan(context, &version_dir, &installed_search)
+            .await?,
+        hooks,
+    );
     if let Err(detail) = check_transitions(previewed, &after, installed.runtimes.as_ref()) {
         return Err(CliError::SetupInstalledOnly {
             version: installed.version,
@@ -867,7 +950,10 @@ async fn recheck_present(
         Some(layout) => layout::verify_installed(layout, plan.dir.path())?,
         None => plan.dir.clone(),
     };
-    let current = planner.plan(context, &dir, &plan.search_path).await?;
+    let current = select_hooks(
+        planner.plan(context, &dir, &plan.search_path).await?,
+        &plan.hooks,
+    );
     check_transitions(&plan.previewed, &current, None).map_err(|detail| {
         CliError::SetupBlocked {
             detail: format!(
@@ -1695,7 +1781,11 @@ fn render_plan(plan: &HostPlan) -> String {
             let _ = writeln!(out, "    {detail}");
         }
     }
-    let _ = writeln!(out, "hooks:");
+    if plan.hooks.is_none() {
+        let _ = writeln!(out, "hooks: none selected");
+    } else {
+        let _ = writeln!(out, "hooks:");
+    }
     for integration in &preview.integrations {
         match &integration.profile {
             Some(profile) => {

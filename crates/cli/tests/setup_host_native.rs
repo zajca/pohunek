@@ -37,7 +37,9 @@ use ed25519_dalek::SigningKey;
 use native::Installation;
 use package::ANCHOR_FILE_NAME;
 
-use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
+use pohunek_cli::host_setup::{
+    apply, plan, plan_selecting, HookSelection, ReleasePlanner, ServiceStep, SetupReport,
+};
 use pohunek_cli::service::context::PathDiscovery;
 use pohunek_cli::service::layout::VerifiedVersionDir;
 #[cfg(target_os = "linux")]
@@ -1646,4 +1648,165 @@ async fn a_fresh_host_is_set_up_by_one_run_and_a_rerun_changes_nothing() {
         !changed.is_empty() && changed.iter().all(|path| path.starts_with(&store)),
         "only the package store changes: {changed:?}"
     );
+}
+
+/// A planner report that serves Hermes and lists the Claude default home and a
+/// Claude profile home as hook homes.
+fn hooks_report() -> EnsureReport {
+    let mut report = hermes_report();
+    report.integrations = serde_json::from_value(json!([
+        {"runtime": "claude", "profile": null},
+        {"runtime": "claude", "profile": "work"},
+    ]))
+    .expect("integration actions");
+    report
+}
+
+/// The labels of the hook homes a preview lists: the daemon-installed hooks
+/// first, then the Hermes homes.
+fn previewed_homes(host_plan: &pohunek_cli::host_setup::HostPlan) -> Vec<String> {
+    let mut homes: Vec<String> = host_plan
+        .preview
+        .integrations
+        .iter()
+        .map(|integration| match &integration.profile {
+            Some(profile) => format!("{} profile {profile}", integration.runtime),
+            None => integration.runtime.clone(),
+        })
+        .collect();
+    homes.extend(
+        host_plan
+            .preview
+            .hermes_homes
+            .iter()
+            .map(|home| home.integration.clone()),
+    );
+    homes
+}
+
+/// `--hooks none` leaves every agent home byte-identical: the preview lists no
+/// home, the apply attempts no hook, and a marked Hermes home that the default
+/// selection would update is not touched.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn hooks_none_leaves_every_agent_home_untouched() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![hooks_report()]);
+    let hermes = unmarked_hermes_home(&installation);
+    let home = installation.root.join("home");
+    fs::create_dir_all(hermes_marker(&home).parent().expect("plugin root")).expect("plugin root");
+    fs::write(hermes_marker(&home), "{}").expect("marker");
+
+    let default = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan with every home");
+    assert_eq!(
+        previewed_homes(&default),
+        ["claude", "claude profile work", "hermes"],
+        "the default selection lists every home"
+    );
+
+    let none = plan_selecting(
+        &installation.context,
+        &release,
+        &planner,
+        &HookSelection::None,
+    )
+    .await
+    .expect("plan without hooks");
+    assert!(previewed_homes(&none).is_empty(), "no home is previewed");
+    let before = snapshot(&hermes);
+    let report = apply(&installation.context, none, &planner)
+        .await
+        .expect("setup without hooks applies");
+    assert!(report.hooks.is_empty(), "no hook is attempted");
+    assert!(report.preview.integrations.is_empty());
+    assert!(report.preview.hermes_homes.is_empty());
+    assert!(report.verdict.hooks_failed.is_empty());
+    assert_eq!(
+        snapshot(&hermes),
+        before,
+        "the Hermes home is byte-identical"
+    );
+
+    // On the installed host the apply re-reads the plan; it must see the same
+    // filtered homes the preview showed.
+    let again = plan_selecting(
+        &installation.context,
+        &release,
+        &planner,
+        &HookSelection::None,
+    )
+    .await
+    .expect("plan the installed host without hooks");
+    assert_eq!(again.preview.service, ServiceStep::Present);
+    let rerun = apply(&installation.context, again, &planner)
+        .await
+        .expect("setup without hooks applies on the installed host");
+    assert!(rerun.hooks.is_empty(), "no hook is attempted");
+    assert_eq!(snapshot(&hermes), before, "the Hermes home is untouched");
+}
+
+/// A selection names exactly the homes it lists: `claude` is the default home
+/// only, `claude:work` the profile's home, and `hermes:work` only that Hermes
+/// profile.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_hook_selection_lists_exactly_the_selected_homes() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![hooks_report()]);
+    let hermes = unmarked_hermes_home(&installation);
+    fs::create_dir_all(hermes.join("profiles").join("work")).expect("profile home");
+
+    for (selection, expected) in [
+        ("claude", vec!["claude"]),
+        ("claude:work", vec!["claude profile work"]),
+        (
+            "claude:work,hermes:work",
+            vec!["claude profile work", "hermes profile work"],
+        ),
+        ("hermes", vec!["hermes"]),
+    ] {
+        let selection: HookSelection = selection.parse().expect("a valid selection");
+        let host_plan = plan_selecting(&installation.context, &release, &planner, &selection)
+            .await
+            .expect("plan the selection");
+        assert_eq!(previewed_homes(&host_plan), expected, "{selection:?}");
+    }
+}
+
+/// A selected agent or profile the host has no home for is refused with a
+/// usage-class code, before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_hook_selection_naming_an_unknown_home_is_refused() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![hooks_report()]);
+    let before = snapshot(&installation.root);
+
+    for selection in ["codex", "claude:nope", "claude,codex:work"] {
+        let selection: HookSelection = selection.parse().expect("a valid selection");
+        let error = plan_selecting(&installation.context, &release, &planner, &selection)
+            .await
+            .expect_err("an unknown home is refused");
+        assert_eq!(error.code(), "setup_hooks_unknown", "{selection:?}");
+        assert!(
+            error.to_string().contains("claude profile work")
+                || error.to_string().contains("claude:work"),
+            "the message lists the homes the host has: {error}"
+        );
+    }
+    assert_eq!(snapshot(&installation.root), before, "nothing is written");
 }

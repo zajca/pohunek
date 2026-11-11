@@ -22,8 +22,10 @@ mod process;
 pub mod host_setup {
     //! Bare `pohunek setup` as a library: the plan, then the apply, against the
     //! installation an explicit [`crate::service::Context`] describes.
+    pub use crate::commands::setup_hooks::HookSelection;
     pub use crate::commands::setup_host::{
-        apply, plan, HostPlan, ReleasePlanner, ServiceStep, SetupError, SetupReport, Verdict,
+        apply, plan, plan_selecting, HostPlan, ReleasePlanner, ServiceStep, SetupError,
+        SetupReport, Verdict,
     };
 }
 pub mod service;
@@ -166,7 +168,8 @@ enum Commands {
     /// and asks once, then installs the service, the official runtime packages
     /// and hooks, and writes the missing config files. `--yes` applies without
     /// asking; without a terminal or with `--json` it needs `--yes`.
-    /// `--dry-run` prints the plan and changes nothing. Setup never upgrades
+    /// `--dry-run` prints the plan and changes nothing. `--hooks` limits the
+    /// hooks to `none` or to the listed agent homes. Setup never upgrades
     /// an installed service. `setup config` and `setup
     /// completions` only write their own files. `--host` is ignored.
     Setup {
@@ -182,6 +185,10 @@ enum Commands {
         /// Emit machine-readable JSON instead of human text (bare `setup`).
         #[arg(long)]
         json: bool,
+        /// Agent homes that get hooks (bare `setup`): `all`, `none`, or a
+        /// comma-separated list of `agent` (default home) and `agent:profile`.
+        #[arg(long, value_name = "SELECTION", default_value = "all")]
+        hooks: commands::setup_hooks::HookSelection,
     },
 
     /// Discover, list, and inspect remote hosts over the configured overlay.
@@ -2256,11 +2263,12 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             yes,
             json,
             dry_run,
+            hooks,
         } => {
             // Setup is purely local: it configures this machine. It ignores `--host`.
             let paths = Paths::resolve()?;
             match action {
-                None => commands::setup_host::run(yes, json, dry_run).await?,
+                None => commands::setup_host::run(yes, json, dry_run, &hooks).await?,
                 Some(SetupAction::Completions {
                     shell,
                     dynamic,
@@ -2668,8 +2676,9 @@ fn session_wait_usage_error(cli: &Cli) -> Option<clap::Error> {
     )))
 }
 
-/// `--dry-run` previews bare `pohunek setup` only. A subcommand writes its own
-/// files, so the flag never rides along unnoticed: the pair is refused.
+/// `--dry-run` and a `--hooks` selection other than `all` apply to bare `pohunek setup` only. A subcommand
+/// writes its own files, so the flags never ride along unnoticed: the pair is
+/// refused.
 fn setup_dry_run_usage_error(cli: &Cli) -> Option<clap::Error> {
     match &cli.command {
         Commands::Setup {
@@ -2678,6 +2687,13 @@ fn setup_dry_run_usage_error(cli: &Cli) -> Option<clap::Error> {
             ..
         } => Some(usage_conflict(
             "--dry-run previews bare `pohunek setup` only and cannot be used with a setup subcommand",
+        )),
+        Commands::Setup {
+            action: Some(_),
+            hooks,
+            ..
+        } if *hooks != commands::setup_hooks::HookSelection::All => Some(usage_conflict(
+            "--hooks selects the hooks of bare `pohunek setup` only and cannot be used with a setup subcommand",
         )),
         _ => None,
     }
