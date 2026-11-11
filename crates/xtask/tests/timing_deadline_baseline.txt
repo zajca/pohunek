@@ -31,7 +31,6 @@ crates/daemon/src/external/mod.rs 1
 crates/daemon/src/external/watch/tests.rs 2
 crates/daemon/src/governance.rs 4
 crates/daemon/src/governance/owner_path_tests.rs 3
-crates/daemon/src/integration/worker_hook_tests.rs 1
 crates/daemon/src/runtime/client.rs 16
 crates/daemon/src/runtime/launcher.rs 4
 crates/daemon/src/session/detector.rs 1

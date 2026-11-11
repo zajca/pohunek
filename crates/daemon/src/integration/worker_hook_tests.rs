@@ -4,6 +4,10 @@
 //! worker over `POHUNEK_WORKER_SOCKET_PATH`, and the worker forwards to a daemon
 //! socket served by the real request dispatcher.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
 use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
 use pohunek_worker_protocol::{
     Dimensions, Initialize, InitializeLimits, InputPolicy, LaunchIdentity, SecretEnv, SessionId,
@@ -11,9 +15,6 @@ use pohunek_worker_protocol::{
 };
 use protocol::method;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -39,9 +40,9 @@ enum Admission {
     /// Every request is dispatched when it arrives.
     OnArrival,
     /// No request is dispatched before `arrived` requests have arrived, and the
-    /// hook's own request only after the worker's forward was dispatched, so
-    /// the forward is the one that creates the notification. Requests are
-    /// recorded in dispatch order.
+    /// hook's own request only after the worker's forward was answered, so the
+    /// forward is the one that creates the notification. Requests and replies
+    /// are both recorded forward first.
     ForwardFirst { arrived: usize },
 }
 
@@ -103,7 +104,7 @@ impl DaemonStub {
         );
         let lines = Arc::new(Mutex::new(Vec::new()));
         let replies = Arc::new(Mutex::new(Vec::new()));
-        // Requests that have arrived, and whether a forward was dispatched.
+        // Requests that have arrived, and whether a forward was answered.
         let arrivals = Arc::new(tokio::sync::watch::Sender::new(0_usize));
         let forwarded = Arc::new(tokio::sync::watch::Sender::new(false));
         let listener = UnixListener::bind(root.join("daemon.sock")).expect("bind daemon socket");
@@ -141,10 +142,12 @@ impl DaemonStub {
                     let Dispatch::Reply(reply) = dispatch_line(&line, &state, None).await else {
                         return;
                     };
+                    replies.lock().expect("replies lock").push(reply.clone());
+                    // Released only once the forward's reply is recorded, so the
+                    // hook's request and reply both come after it.
                     if request_id_starts_with(&line, FORWARD_ID_PREFIX) {
                         forwarded.send_replace(true);
                     }
-                    replies.lock().expect("replies lock").push(reply.clone());
                     let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
                 });
             }
