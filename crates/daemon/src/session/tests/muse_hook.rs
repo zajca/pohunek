@@ -498,19 +498,41 @@ fn handshake_with(base: &[u8], mutate: impl FnOnce(&mut serde_json::Value)) -> V
 /// Turns a valid handshake file into an unusable one.
 type Break = Box<dyn Fn(&Rig, &Path)>;
 
-/// `(label, trace reason, how to break the file)` for every way the reporter
-/// refuses a handshake before it reaches the worker; `valid` is the worker's
-/// own content.
-fn handshake_breakages(valid: &[u8]) -> Vec<(&'static str, &'static str, Break)> {
+/// A [`Break`] that writes `valid` with `mutate` applied.
+fn rewrite(valid: &[u8], mutate: fn(&mut serde_json::Value)) -> Break {
+    let valid = valid.to_vec();
+    Box::new(move |_rig, path| write_private(path, &handshake_with(&valid, mutate)))
+}
+
+/// The number of lines in `trace` whose `reason` is `reason` and whose `detail`
+/// is `detail` (`None`: the line has no detail).
+fn trace_lines(trace: &str, reason: &str, detail: Option<&str>) -> usize {
+    trace
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| {
+            entry["reason"].as_str() == Some(reason) && entry["detail"].as_str() == detail
+        })
+        .count()
+}
+
+/// `(label, trace reason, trace detail, how to break the file)` for every way the
+/// reporter refuses a handshake before it reaches the worker; `valid` is the
+/// worker's own content.
+fn handshake_breakages(
+    valid: &[u8],
+) -> Vec<(&'static str, &'static str, Option<&'static str>, Break)> {
     vec![
         (
             "missing",
             "handshake_missing",
+            Some("absent"),
             Box::new(|_rig, path| fs::remove_file(path).expect("remove")),
         ),
         (
             "group-readable",
             "handshake_unsafe",
+            Some("mode"),
             Box::new(|_rig, path| {
                 fs::set_permissions(path, fs::Permissions::from_mode(0o640)).expect("chmod");
             }),
@@ -518,6 +540,7 @@ fn handshake_breakages(valid: &[u8]) -> Vec<(&'static str, &'static str, Break)>
         (
             "symlink",
             "handshake_unsafe",
+            Some("symlink"),
             Box::new(|_rig, path| {
                 let target = path.with_file_name("elsewhere");
                 fs::rename(path, &target).expect("move");
@@ -527,6 +550,7 @@ fn handshake_breakages(valid: &[u8]) -> Vec<(&'static str, &'static str, Break)>
         (
             "fifo",
             "handshake_unsafe",
+            Some("not_regular"),
             Box::new(|_rig, path| {
                 fs::remove_file(path).expect("remove");
                 nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).expect("fifo");
@@ -535,6 +559,7 @@ fn handshake_breakages(valid: &[u8]) -> Vec<(&'static str, &'static str, Break)>
         (
             "hard link",
             "handshake_unsafe",
+            Some("links"),
             Box::new(|_rig, path| {
                 fs::hard_link(path, path.with_file_name("alias")).expect("link");
             }),
@@ -542,26 +567,40 @@ fn handshake_breakages(valid: &[u8]) -> Vec<(&'static str, &'static str, Break)>
         (
             "oversized",
             "handshake_too_large",
+            None,
             Box::new(|_rig, path| write_private(path, &vec![b' '; 64 * 1024])),
         ),
         (
             "not json",
             "handshake_invalid",
+            Some("not_json"),
             Box::new(|_rig, path| write_private(path, b"not json")),
+        ),
+        (
+            "missing field",
+            "handshake_invalid",
+            Some("worker_socket_path"),
+            rewrite(valid, |document| {
+                document
+                    .as_object_mut()
+                    .expect("handshake object")
+                    .remove("worker_socket_path");
+            }),
+        ),
+        (
+            "another version",
+            "handshake_invalid",
+            Some("version"),
+            rewrite(valid, |document| {
+                document["version"] = 2.into();
+            }),
         ),
         (
             "another session",
             "handshake_session_mismatch",
-            Box::new({
-                let valid = valid.to_vec();
-                move |_rig, path| {
-                    write_private(
-                        path,
-                        &handshake_with(&valid, |document| {
-                            document["session_id"] = "s-another".into();
-                        }),
-                    );
-                }
+            None,
+            rewrite(valid, |document| {
+                document["session_id"] = "s-another".into();
             }),
         ),
     ]
@@ -579,8 +618,8 @@ async fn a_cleared_hook_without_a_trustworthy_handshake_reports_nothing_and_leav
     let valid = fs::read(&path).expect("handshake");
 
     let cases = handshake_breakages(&valid);
-    for (label, reason, break_file) in cases {
-        let before = rig.daemon_trace().matches(reason).count();
+    for (label, reason, detail, break_file) in cases {
+        let before = trace_lines(&rig.daemon_trace(), reason, detail);
         // The file is replaced by a private copy of the worker's content first.
         for entry in fs::read_dir(path.parent().expect("dir")).expect("list") {
             let entry = entry.expect("entry");
@@ -596,9 +635,9 @@ async fn a_cleared_hook_without_a_trustworthy_handshake_reports_nothing_and_leav
             .await;
 
         assert_eq!(
-            rig.daemon_trace().matches(reason).count(),
+            trace_lines(&rig.daemon_trace(), reason, detail),
             before + 1,
-            "{label}: one trace line names {reason}: {}",
+            "{label}: one trace line names {reason} {detail:?}: {}",
             rig.daemon_trace()
         );
         let snapshot = rig.worker().await.inspect().await.expect("inspect");
@@ -621,14 +660,16 @@ async fn a_cleared_hook_without_a_trustworthy_handshake_reports_nothing_and_leav
             document["worker_instance_id"] = "runtime-stale".into();
         }),
     );
+    let refused = trace_lines(&rig.trace(), "worker_refused", None);
     rig.fire_bare("SessionStart", "session_start_clear", CLEARED)
         .await;
-    assert!(
-        rig.trace().contains("worker_refused"),
+    assert_eq!(
+        trace_lines(&rig.trace(), "worker_refused", None),
+        refused + 1,
         "a stale instance id is refused: {}",
         rig.trace()
     );
-    rig.assert_hooks_quiet(1 + 8 + 1);
+    rig.assert_hooks_quiet(1 + 10 + 1);
     rig.finish().await;
     rig.remove().await;
 }
