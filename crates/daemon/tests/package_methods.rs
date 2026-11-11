@@ -12,6 +12,8 @@
 
 mod support;
 
+pohunek_test_support::hold_image!();
+
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -3509,6 +3511,11 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
     let image = std::env::current_exe().expect("this test binary");
     let image = image.display();
     let dir = directory.display();
+    // The provider-named daemon is the holding image installed under the
+    // provider's name: one process that ends by itself.
+    let daemon_path = directory.join("pi-daemon");
+    pohunek_test_support::hold::install_at(&daemon_path).expect("install the holding image");
+    let daemon_words = pohunek_test_support::hold::shell_words_for(&daemon_path);
     // In order: a listening image that stays in the tree, a `setsid` wrapper
     // that neither listens nor is named for the provider, a double-forked
     // listening image in a session of its own, and a daemon image named for the
@@ -3519,7 +3526,6 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
     let script = format!(
         "#!/bin/sh\n\
          cd {dir}\n\
-         /bin/cp /bin/sh pi-daemon\n\
          wait_for() {{ until [ -e \"$1\" ]; do /bin/sleep 0.02; done; }}\n\
          sh -c 'echo $$ > tree.pid; exec {image} {filter} --ignored --nocapture {dir}/tree.sock {barrier}' </dev/null >/dev/null 2>&1 &\n\
          wait_for tree.pid\n\
@@ -3527,7 +3533,7 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
          wait_for wrapper.pid\n\
          ( /usr/bin/setsid sh -c 'echo $$ > listener.pid; exec {image} {filter} --ignored --nocapture {dir}/escaped.sock {barrier}' </dev/null >/dev/null 2>&1 & )\n\
          wait_for listener.pid\n\
-         /usr/bin/setsid sh -c 'echo $$ > daemon.pid; exec ./pi-daemon -c \"sleep 600; :\"' </dev/null >/dev/null 2>&1 &\n\
+         /usr/bin/setsid sh -c \"echo \\$\\$ > daemon.pid; exec {daemon_words}\" &\n\
          wait_for daemon.pid\n\
          exec /bin/sleep 600\n",
         barrier = barrier.display(),
@@ -3586,6 +3592,62 @@ async fn a_daemon_the_agent_prewarms_is_reported_and_one_that_stays_in_the_tree_
             && doctor.detail.contains(&listener.to_string()),
         "{doctor:?}"
     );
+
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    drop(local);
+    servers.stop().await;
+}
+
+/// A session that stays in its tree makes the doctor's placement check `ok`
+/// once the worker has judged it, and counts the session.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_session_that_stays_in_its_tree_leaves_the_doctor_placement_check_ok() {
+    let servers = spawn_servers_configured("pkg-placement-clean", Some(""), |config| {
+        config.placement_check_interval = std::time::Duration::from_millis(50);
+    })
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = argv_program(&servers.plugins);
+    let table = placement_table("mode = \"in_process\"");
+    let (_digest, installed) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "agent-placement-clean",
+        &placement_descriptor(&program, true, &table),
+        false,
+    )
+    .await;
+    installed.expect("the package installs");
+
+    let id = start_named_session(&mut local, RUNTIME, &cwd, None).await;
+    let shared = tokio::sync::Mutex::new(&mut local);
+    let shared = &shared;
+    let session = &id;
+    let judged =
+        pohunek_test_support::wait::wait_until("the worker to judge the session", || async move {
+            let mut framed = shared.lock().await;
+            placement_of(&mut **framed, session).await
+        })
+        .await;
+    assert_eq!(judged.outcome, "clean", "{judged:?}");
+    assert!(judged.processes.is_empty(), "{judged:?}");
+
+    let report: protocol::DaemonDoctorResult =
+        call(&mut local, method::DAEMON_DOCTOR, Value::Null).await;
+    let doctor = report
+        .report
+        .checks
+        .iter()
+        .find(|check| check.name == "placement_escape")
+        .expect("doctor carries the placement check");
+    assert_eq!(doctor.status, protocol::DoctorStatus::Ok, "{doctor:?}");
+    assert!(doctor.detail.starts_with("1 live session(s)"), "{doctor:?}");
 
     let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
     drop(local);

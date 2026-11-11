@@ -164,7 +164,11 @@ the feature is `runtime_feature_unsupported`.
 The worker checks a runtime that declares `[placement]`: a process of the
 generation that left the PTY's POSIX session and is named for the provider or
 listens is reported as `placement_escape` in `session inspect` and
-`pohunek doctor`. The check kills nothing.
+`pohunek doctor`. The check kills nothing. The report is `unobservable`, never
+clean, when the host withholds the PTY child's session or the process table, or
+when a process that carries the generation's marker cannot be classified (its
+listening sockets cannot be read); a process whose facts the host withholds
+cannot be attributed to the generation and is skipped.
 
 ## Config home
 

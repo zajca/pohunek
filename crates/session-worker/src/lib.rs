@@ -17,6 +17,9 @@
 
 // Rust guideline compliant 2026-10-14
 
+#[cfg(test)]
+pohunek_test_support::hold_image!();
+
 mod background;
 mod child_spawn;
 mod config;

@@ -1680,7 +1680,8 @@ in a POSIX session other than the PTY child's, carries the generation's
 socket. The tests run in that order, so the environment of an unrelated process
 is never read; a process whose facts the host withholds cannot be attributed
 and is not reported, and the check reports `unobservable` only when the PTY
-child's session or the process table cannot be read. The session is identified
+child's session or the process table cannot be read, or when a process that
+carries the generation's marker cannot be classified. The session is identified
 by `getsid` on macOS and `/proc/<pid>/stat` on Linux, a listening socket by
 `libproc` descriptor info on macOS and the `/proc/<pid>/net` socket tables on
 Linux, so the check needs no control group.
