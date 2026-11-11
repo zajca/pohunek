@@ -9,6 +9,7 @@ use protocol::ProtocolError;
 
 use super::*;
 use crate::agent::host::fixture::cline_shaped_host_with;
+use crate::test_support::worker_events::EventLog;
 
 /// Root session id of the `root_resume` fixture.
 const ROOT: &str = "c0ffee00-0000-4000-8000-000000000001";
@@ -180,6 +181,27 @@ impl Rig {
             (now > before).then_some(())
         })
         .await;
+    }
+
+    /// Makes the installed reporters wait for the worker's answer for
+    /// [`HANG_GUARD`] instead of their 0.5 s socket budget, so the connection
+    /// the worker verifies stays open until the worker has decided.
+    fn hold_the_socket_until_answered(&self) {
+        const BUDGET: &str = "SOCKET_TIMEOUT_SECS = 0.5";
+        let mut rewritten = 0_usize;
+        for entry in fs::read_dir(self.cline_home.join("hooks")).expect("the hooks directory") {
+            let path = entry.expect("a hook entry").path();
+            let body = fs::read_to_string(&path).expect("read the installed reporter");
+            if body.contains(BUDGET) {
+                let held = format!("SOCKET_TIMEOUT_SECS = {}", HANG_GUARD.as_secs());
+                fs::write(&path, body.replace(BUDGET, &held)).expect("rewrite the reporter");
+                rewritten += 1;
+            }
+        }
+        assert!(
+            rewritten > 0,
+            "no installed reporter carries the socket budget"
+        );
     }
 
     /// Asserts that exactly `count` hook files ran and every one exited 0
@@ -728,14 +750,32 @@ async fn every_launch_of_the_conversation_carries_the_sandbox_pair() {
 
 #[tokio::test]
 async fn a_hook_outside_the_pty_tree_is_refused_by_the_worker_even_with_the_sandbox_variables() {
+    let log = EventLog::default();
+    let _capture = log.install();
     let rig = Rig::new("cline-detached")
         .await
         .expect("create the Cline session");
+    rig.hold_the_socket_until_answered();
 
     rig.fire_as("TaskResume", "root_resume", DETACHED).await;
 
     rig.assert_hooks_quiet(1);
-    assert!(rig.trace().contains("worker_refused"), "{}", rig.trace());
+    // The refusal is read where the worker makes it: the hook traces it only
+    // when the worker's reply reaches the hook within the reporter's socket
+    // budget, and a late reply is traced as a timeout although the worker
+    // refused.
+    let refusals = wait_until("the worker to refuse the outside report", || async {
+        let refusals = log.named("worker.identity.rejected");
+        (!refusals.is_empty()).then_some(refusals)
+    })
+    .await;
+    assert_eq!(refusals.len(), 1, "{}", log.rendered());
+    assert_eq!(
+        refusals[0]["identity.reason"],
+        "reported_process_invalid",
+        "{}",
+        log.rendered()
+    );
     let snapshot = rig.worker().await.inspect().await.expect("inspect");
     assert!(
         snapshot.active_identity.is_none(),

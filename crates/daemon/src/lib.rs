@@ -65,6 +65,8 @@ pohunek_test_support::hold_image!();
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    pub(crate) mod worker_events;
+
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 

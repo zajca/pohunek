@@ -317,6 +317,10 @@ fn configured_profile_result(
             DoctorStatus::Fail,
             "The configured executable's version probe failed; repair the profile or runtime installation. If the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments.",
         ),
+        Err(RuntimeFailure::ProbeDeadline) => (
+            DoctorStatus::Fail,
+            "The configured executable's version check did not finish within its deadline; its version command must finish offline in a cleared environment. If the program is a wrapper or reaches a network service at start, point the profile's program at a launcher whose version command answers without it.",
+        ),
         Err(RuntimeFailure::ProbeBudget) => (
             DoctorStatus::Fail,
             "The configured runtime version was not checked because the doctor probe budget was exhausted.",
@@ -334,9 +338,14 @@ fn version_refusal_detail(subject: &str, refusal: VersionRefusal) -> String {
             version,
             min,
             below,
-        } => format!(
-            "{subject} reports version {version}, outside its runtime's supported range [{min}, {below}); install a release in that range or update the runtime package."
-        ),
+        } => match below {
+            Some(below) => format!(
+                "{subject} reports version {version}, outside its runtime's supported range [{min}, {below}); install a release in that range or update the runtime package."
+            ),
+            None => format!(
+                "{subject} reports version {version}, below its runtime's supported minimum {min}; install a release at or above it or update the runtime package."
+            ),
+        },
         VersionRefusal::Unparseable => format!(
             "{subject}'s version output does not match its runtime's declared format; the configured program must print its release in the format its runtime package declares. If the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments."
         ),
@@ -403,6 +412,10 @@ fn optional_runtime_result(
         Err(RuntimeFailure::OptionalMissing) => (
             DoctorStatus::Warn,
             "Optional provider is not installed; install it only if you use this agent.",
+        ),
+        Err(RuntimeFailure::ProbeDeadline) => (
+            DoctorStatus::Fail,
+            "Optional provider's version check did not finish within its deadline; its version command must finish offline in a cleared environment. If the program is a wrapper or reaches a network service at start, point the profile's program at a launcher whose version command answers without it.",
         ),
         Err(RuntimeFailure::ProbeBudget) => (
             DoctorStatus::Warn,
@@ -608,6 +621,8 @@ enum RuntimeFailure {
     Refused(VersionRefusal),
     /// The probe failed or its parser is not compiled in.
     Version,
+    /// The probe ran to its full deadline without exiting.
+    ProbeDeadline,
     ProbeBudget,
 }
 
@@ -658,6 +673,9 @@ fn profile_runtime_check(
         crate::capabilities::LaunchValidationFailure::ProbeTimedOut => RuntimeFailure::ProbeBudget,
         crate::capabilities::LaunchValidationFailure::Refused(refusal) => {
             RuntimeFailure::Refused(refusal)
+        }
+        crate::capabilities::LaunchValidationFailure::ProbeDeadline => {
+            RuntimeFailure::ProbeDeadline
         }
         crate::capabilities::LaunchValidationFailure::Unsupported => RuntimeFailure::Version,
     })?;

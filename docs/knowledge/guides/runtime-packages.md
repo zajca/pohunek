@@ -118,6 +118,7 @@ The features this core implements:
 | `integration-cline-hook-v1` | 0.40.0 | `integration.handler = "cline-hook-v1"` |
 | `program-status-gate-v1` | 0.41.0 | detection manifest `[program_status] authority_from` and rule `below_authority` (no descriptor key; the package lists it so an older core refuses it) |
 | `package-context-v1` | 0.41.0 | `[context]` |
+| `version-probe-open-range-v1` | 0.42.0 | `version_probe` with `min` and no `below` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -931,6 +932,40 @@ a `line` template and `requires = ["version-probe-revision-v1"]`: it orders
 `(MAJOR, MINOR, PATCH, n, m)` with an absent part as 0 (`1.4.13` equals
 `1.4.13-R0`), and `min` and `below` accept both forms. `semver-v1` and
 `semver-line-v1` keep refusing any suffix.
+
+A runtime that is supported from a release on, with no upper bound, omits
+`below` and lists `requires = ["version-probe-open-range-v1"]`:
+
+```toml
+requires = ["version-probe-open-range-v1"]
+
+[runtime]
+version_probe = { parser = "semver-v1", args = ["--version"], min = "3.0.74" }
+```
+
+Every release from `min` on is admitted, so a new major release of the agent
+launches without a package update; a release below `min` is refused with the
+minimum named. The feature id is what makes an older core refuse the package
+cleanly (`runtime_feature_unsupported`) instead of reading a half-declared
+probe; without the entry the omission is refused on this core too. `below`
+without `min` is not a policy. Prefer a closed range unless the owner of the
+package accepted that drift is caught by periodic capture of the agent, not by
+the daemon.
+
+### Version probe environment and deadline
+
+The probe runs the declared `args` in a cleared environment with a private
+`HOME` and a 2 second deadline, with only the launch `PATH` and the runtime's
+`[launch_env]` pairs. A program whose version command is slow unless a launch
+flag is set can therefore declare that flag in `[launch_env]` and be probed
+fast. The deadline is the daemon's; a package cannot declare another. A probe
+that runs to the deadline is refused as `agent_runtime_unsupported` with its own
+message and a `recover` hint, so the cause (a version command that waits for the
+network, say) is visible and not mistaken for an unsupported release. An agent
+that has no environment switch for the slow step, and reads it from a settings
+file under a home the probe does not see, needs a launcher program whose
+version command answers without it; set the profile's `program` to that
+launcher.
 
 ## Declaring input readiness
 

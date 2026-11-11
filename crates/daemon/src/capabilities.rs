@@ -552,16 +552,35 @@ pub(crate) fn validate_definition_launch_with_timeout(
     launch_path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_with_timeout_detailed(definition, spawn, launch_path, timeout)
+    validate_definition_launch_with_clock(definition, spawn, launch_path, timeout, &Instant::now)
+}
+
+/// [`validate_definition_launch_with_timeout`] reading the probe's deadline
+/// from `now`.
+fn validate_definition_launch_with_clock(
+    definition: &RuntimeDefinition,
+    spawn: Spawn<'_>,
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+    now: &impl Fn() -> Instant,
+) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+    validate_definition_launch_detailed_with_clock(definition, spawn, launch_path, timeout, now)
         .map_err(|failure| match failure {
             LaunchValidationFailure::Missing => {
                 ProtocolError::agent_binary_missing(reported_program(definition, spawn))
             }
             LaunchValidationFailure::Refused(refusal) => unsupported_version_error(refusal),
+            LaunchValidationFailure::ProbeDeadline => probe_timed_out_error(),
             LaunchValidationFailure::Unsupported | LaunchValidationFailure::ProbeTimedOut => {
                 ProtocolError::agent_runtime_unsupported()
             }
         })
+}
+
+/// The `agent_runtime_unsupported` refusal for a probe that ran to its full
+/// deadline, naming [`VERSION_PROBE_TIMEOUT`].
+pub(crate) fn probe_timed_out_error() -> ProtocolError {
+    ProtocolError::agent_runtime_probe_timed_out(VERSION_PROBE_TIMEOUT.as_secs())
 }
 
 /// The `agent_runtime_unsupported` refusal for probe output that ran to
@@ -574,7 +593,7 @@ pub(crate) fn unsupported_version_error(refusal: VersionRefusal) -> ProtocolErro
             version,
             min,
             below,
-        } => ProtocolError::agent_runtime_version_out_of_range(&version, &min, &below),
+        } => ProtocolError::agent_runtime_version_out_of_range(&version, &min, below.as_ref()),
     }
 }
 
@@ -597,10 +616,12 @@ pub(crate) enum LaunchValidationFailure {
     /// The probe exited successfully, and its output names no supported
     /// release.
     Refused(VersionRefusal),
-    /// The probe failed (a non-zero exit, its full deadline, or a setup
-    /// failure), or the definition names a parser this daemon does not
-    /// provide.
+    /// The probe failed (a non-zero exit or a setup failure), or the
+    /// definition names a parser this daemon does not provide.
     Unsupported,
+    /// The probe ran to its full [`VERSION_PROBE_TIMEOUT`] deadline without
+    /// exiting.
+    ProbeDeadline,
     /// The probe outran a budget shorter than [`VERSION_PROBE_TIMEOUT`].
     ProbeTimedOut,
 }
@@ -617,6 +638,24 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
     spawn: Spawn<'_>,
     launch_path: Option<&OsStr>,
     timeout: Duration,
+) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
+    validate_definition_launch_detailed_with_clock(
+        definition,
+        spawn,
+        launch_path,
+        timeout,
+        &Instant::now,
+    )
+}
+
+/// [`validate_definition_launch_with_timeout_detailed`] reading the probe's
+/// deadline from `now`.
+fn validate_definition_launch_detailed_with_clock(
+    definition: &RuntimeDefinition,
+    spawn: Spawn<'_>,
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+    now: &impl Fn() -> Instant,
 ) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
     let probed = definition.version_probe_parser().is_some();
     let binary = match spawn {
@@ -649,7 +688,7 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
         definition.launch_env(),
         timeout,
         &[],
-        &Instant::now,
+        now,
     );
     match outcome {
         ProbeOutcome::Output(output) => policy
@@ -657,7 +696,8 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
             .map(|version| Some(program.with_version(version)))
             .map_err(LaunchValidationFailure::Refused),
         ProbeOutcome::TimedOut if shortened_budget => Err(LaunchValidationFailure::ProbeTimedOut),
-        ProbeOutcome::TimedOut | ProbeOutcome::Failed | ProbeOutcome::Unavailable => {
+        ProbeOutcome::TimedOut => Err(LaunchValidationFailure::ProbeDeadline),
+        ProbeOutcome::Failed | ProbeOutcome::Unavailable => {
             Err(LaunchValidationFailure::Unsupported)
         }
     }
@@ -1306,6 +1346,61 @@ strategy = "none"
             reads.get(),
             STEPS + 1,
             "the probe must expire when the clock reaches start + timeout"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_reaches_its_full_deadline_is_refused_with_its_own_message() {
+        const STEPS: u32 = 4;
+        let dir = temp_agents_dir();
+        let tool = dir.join("tool");
+        let binary = tool.display().to_string();
+        write_test_executable(
+            &tool,
+            &format!("#!/bin/sh\nsleep {}\n", FIXTURE_HOLD.as_secs()),
+        );
+        let definition = probed_definition(SEMVER_PROBE);
+        // The fake clock advances by a quarter of the deadline on every read, so
+        // the probe ends on the read that reaches it without waiting.
+        let start = Instant::now();
+        let reads = Cell::new(0_u32);
+        let clock = || {
+            let read = reads.get();
+            reads.set(read + 1);
+            start + (VERSION_PROBE_TIMEOUT / STEPS) * read
+        };
+
+        let error = validate_definition_launch_with_clock(
+            &definition,
+            Spawn::Program(&binary),
+            process_path().as_deref(),
+            VERSION_PROBE_TIMEOUT,
+            &clock,
+        )
+        .expect_err("a probe that never exits is refused");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+        assert!(
+            error
+                .msg
+                .contains("version check did not finish within 2 seconds"),
+            "{error:?}"
+        );
+        assert!(!error.msg.contains(&binary), "{error:?}");
+        assert!(error.recover.is_some(), "{error:?}");
+
+        // A budget shorter than the deadline that runs out is the doctor's
+        // budget, not the probe's deadline.
+        reads.set(0);
+        let shortened = validate_definition_launch_detailed_with_clock(
+            &definition,
+            Spawn::Program(&binary),
+            process_path().as_deref(),
+            VERSION_PROBE_TIMEOUT / 2,
+            &clock,
+        );
+        assert_eq!(
+            shortened.err(),
+            Some(LaunchValidationFailure::ProbeTimedOut)
         );
     }
 
@@ -1976,7 +2071,7 @@ strategy = "none"
         };
         for invalid in [
             r#"{ parser = "semver-v1" }"#,
-            r#"{ parser = "semver-v1", args = ["--version"], min = "1.0.0" }"#,
+            r#"{ parser = "semver-v1", args = ["--version"], below = "1.1.0" }"#,
             r#"{ parser = "not-compiled", args = ["--version"], min = "1.0.0", below = "1.1.0" }"#,
             r#"{ parser = "semver-v1", args = ["--version"], min = "1.1.0", below = "1.0.0" }"#,
         ] {
