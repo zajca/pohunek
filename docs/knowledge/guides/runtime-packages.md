@@ -908,8 +908,10 @@ dir = "bundle"   # package-relative directory that holds the files
   A host whose daemon does not advertise `session_new_context_pin_supported`
   launches the assistant unpinned, and an uninstall there removes the files
   under a running session. Rolling the daemon back past the release that
-  introduced the pin needs the store copy `metadata.jsonl.pre-schema-17`,
-  because the older daemon refuses a store of a newer schema.
+  introduced the pin needs the store copy `metadata.jsonl.pre-schema-<old>`,
+  because the older daemon refuses a store of a newer schema; `<old>` is the
+  oldest schema the migration found (`-17` from 0.41, `-15` from 0.40.x).
+  Sessions created after the upgrade are lost on that rollback.
 - For the assistant, `dir` holds `index.md`, `assistant/system.md` (the prompt
   contract) and the concept files; the daemon answers `assistant.materialize`
   with the directory, its concept index and the contract text, and

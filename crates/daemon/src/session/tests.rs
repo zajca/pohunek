@@ -24739,10 +24739,9 @@ async fn a_lost_runtime_clears_the_blocked_kind_with_the_activity() {
             "{outcome:?}"
         );
 
-        let (activity, blocked_kind) = activity_and_blocked_kind(&registry, &created.id).await;
-        assert_ne!(activity, Some(AgentActivity::Blocked), "{proof:?}");
         assert_eq!(
-            blocked_kind, None,
+            activity_and_blocked_kind(&registry, &created.id).await,
+            (None, None),
             "{proof:?}: the kind does not outlive the blocked reading"
         );
         stop_test_worker(worker).await;

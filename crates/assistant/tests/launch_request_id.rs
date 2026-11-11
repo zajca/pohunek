@@ -81,6 +81,8 @@ struct Daemon {
     hangs: tokio::sync::mpsc::UnboundedReceiver<()>,
     /// Delays the next `host.inspect` answer, as a slow daemon would.
     inspect_delay: Arc<Mutex<Option<Duration>>>,
+    /// The `content_hash` `assistant.materialize` reports.
+    content_hash: Arc<Mutex<String>>,
     /// Keeps the fixture directory alive for the daemon's lifetime.
     _fixture: Box<dyn std::any::Any>,
 }
@@ -143,8 +145,10 @@ impl Daemon {
             .expect("serialize the capability snapshot");
         let (hang_signal, hangs) = tokio::sync::mpsc::unbounded_channel();
         let inspect_delay = Arc::new(Mutex::new(None));
+        let content_hash = Arc::new(Mutex::new(SERVED_DIGEST.to_owned()));
         let (accept_script, accept_creates) = (Arc::clone(&script), Arc::clone(&creates));
         let accept_delay = Arc::clone(&inspect_delay);
+        let accept_hash = Arc::clone(&content_hash);
         tokio::spawn(async move {
             loop {
                 match &listener {
@@ -157,6 +161,7 @@ impl Daemon {
                             Arc::clone(&accept_creates),
                             hang_signal.clone(),
                             Arc::clone(&accept_delay),
+                            Arc::clone(&accept_hash),
                         ));
                     }
                     Listener::Tcp(listener) => {
@@ -168,6 +173,7 @@ impl Daemon {
                             Arc::clone(&accept_creates),
                             hang_signal.clone(),
                             Arc::clone(&accept_delay),
+                            Arc::clone(&accept_hash),
                         ));
                     }
                 }
@@ -180,6 +186,7 @@ impl Daemon {
             creates,
             hangs,
             inspect_delay,
+            content_hash,
             _fixture: fixture,
         }
     }
@@ -208,6 +215,11 @@ impl Daemon {
             .collect()
     }
 
+    /// Makes `assistant.materialize` report `content_hash` from now on.
+    fn serve_content_hash(&self, content_hash: &str) {
+        content_hash.clone_into(&mut self.content_hash.lock().expect("hash lock"));
+    }
+
     /// Makes the next `host.inspect` answer after `delay`.
     fn delay_next_inspect(&self, delay: Duration) {
         *self.inspect_delay.lock().expect("delay lock") = Some(delay);
@@ -232,6 +244,7 @@ async fn serve<S>(
     creates: Arc<Mutex<Vec<Value>>>,
     hang_signal: tokio::sync::mpsc::UnboundedSender<()>,
     inspect_delay: Arc<Mutex<Option<Duration>>>,
+    content_hash: Arc<Mutex<String>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -262,7 +275,10 @@ async fn serve<S>(
                 }
                 ok(&request, capabilities.clone())
             }
-            method::ASSISTANT_MATERIALIZE => ok(&request, materialize_result(&request)),
+            method::ASSISTANT_MATERIALIZE => {
+                let hash = content_hash.lock().expect("hash lock").clone();
+                ok(&request, materialize_result(&request, &hash))
+            }
             method::SESSION_NEW => {
                 creates
                     .lock()
@@ -344,7 +360,7 @@ fn bundle_root() -> PathBuf {
 ///
 /// The package version carries the request id the daemon received, so a prompt
 /// shows which id reached `assistant.materialize`.
-fn materialize_result(request: &Request) -> Value {
+fn materialize_result(request: &Request, content_hash: &str) -> Value {
     let root = bundle_root();
     let version = match request.params()["request_id"].as_str() {
         Some(id) => format!("1.0.0+{id}"),
@@ -354,7 +370,7 @@ fn materialize_result(request: &Request) -> Value {
         "bundle_path": root,
         "snapshot_path": root.join("index.md"),
         "version": version,
-        "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "content_hash": content_hash,
         "concepts": [],
         "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
     })
@@ -883,4 +899,20 @@ async fn the_launch_pins_the_served_digest_only_on_a_host_that_advertises_the_pi
     let unpinned = Daemon::start_pinned(vec![Step::Session { replayed: false }], true, false);
     launch(&unpinned, None).await.expect("the unpinned launch");
     assert_eq!(unpinned.pins(), vec![None]);
+}
+
+#[tokio::test]
+async fn a_pin_capable_host_reporting_a_content_hash_that_is_no_digest_fails_the_launch_without_a_create(
+) {
+    let daemon = Daemon::start_pinned(vec![Step::Session { replayed: false }], true, true);
+    daemon.serve_content_hash("sha256:fixture");
+
+    let error = protocol_error(
+        prepare(&daemon, None)
+            .await
+            .expect_err("a launch cannot pin a digest it cannot parse"),
+    );
+
+    assert_eq!(error.code, "materialization_failed");
+    assert!(daemon.creates.lock().expect("creates lock").is_empty());
 }
