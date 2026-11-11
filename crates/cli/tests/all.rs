@@ -84,6 +84,8 @@ mod plugin_cli;
 mod plugin_daemon;
 #[path = "plugin_index_install.rs"]
 mod plugin_index_install;
+#[path = "plugin_profile_create.rs"]
+mod plugin_profile_create;
 #[path = "prompt_link.rs"]
 mod prompt_link;
 #[path = "prompt_render.rs"]

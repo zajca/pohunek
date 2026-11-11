@@ -624,6 +624,10 @@ pub(crate) enum Error {
         detail: String,
     },
 
+    /// The daemon predates `package.create_profile`.
+    #[error("the local daemon is too old for `plugin profile create`")]
+    ProfileCreateUnsupported,
+
     /// The migration target does not resolve to one usable package.
     #[error("profile {name}: {detail}")]
     ProfileTarget {
@@ -662,6 +666,7 @@ impl Error {
             Self::UpdateVersionUnordered { .. } => "plugin_update_version_unordered",
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
             Self::ProfileTarget { .. } => "profile_target_invalid",
+            Self::ProfileCreateUnsupported => "profile_create_unsupported",
         }
     }
 
@@ -745,6 +750,7 @@ impl Error {
             Self::ProfileDirectory { .. } => {
                 "the agents directory must be owned by you and not group- or world-writable"
             }
+            Self::ProfileCreateUnsupported => "run `pohunek service upgrade`, then repeat the command",
             Self::ProfileTarget { .. } => {
                 "list installed packages with `pohunek plugin list` and pass --digest"
             }

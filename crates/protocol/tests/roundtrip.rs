@@ -3248,6 +3248,7 @@ fn host_capabilities_json_shape_roundtrips() {
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
         package_install_index_context_supported: false,
+        package_create_profile_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3283,7 +3284,8 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_request_id_supported": true,
             "session_new_context_pin_supported": true,
             "package_install_commands_supported": true,
-            "package_bind_profile_expected_supported": true
+            "package_bind_profile_expected_supported": true,
+            "package_create_profile_supported": true
         })
     );
 
@@ -3419,6 +3421,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.package_bind_profile_expected_supported,
         "a host that omits the expected-pin flag rejects expected_previous"
+    );
+    assert!(
+        !caps.package_create_profile_supported,
+        "a host that omits the create-profile flag answers package.create_profile with method_not_found"
     );
 }
 

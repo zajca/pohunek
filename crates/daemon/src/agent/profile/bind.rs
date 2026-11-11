@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use package::PackageDigest;
 use pohunek_platform::filesystem::{
-    AtomicReplaceError, EntryIdentity, EntryKind, FsError, StageOutcome, TrustedDir,
+    AtomicReplaceError, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 use protocol::{PackageId, RuntimeId};
 use toml_edit::{DocumentMut, Item, TomlError, Value};
@@ -47,6 +47,12 @@ const MODE_BITS: u32 = 0o7777;
 /// retention scan, which read `*.toml` files only, never mistake it for a
 /// profile.
 const TEMPORARY_PREFIX: &str = ".pohunek-profile-bind-";
+
+/// Mode of the agents directory when a create makes it.
+const CREATED_DIR_MODE: u32 = 0o700;
+
+/// Mode of a profile file a create writes.
+const CREATED_FILE_MODE: u32 = 0o600;
 
 /// Random bytes in a temporary file name.
 const TEMPORARY_RANDOM_BYTES: usize = 16;
@@ -92,6 +98,11 @@ pub(crate) enum BindError {
     Changed,
     /// A filesystem operation failed.
     Failed(&'static str),
+    /// A profile of the name exists and the call did not replace it.
+    Exists,
+    /// The agents directory or one of its ancestors is a link or is not
+    /// private to the owner.
+    DirUnsafe,
 }
 
 /// Escape control characters of text that came from a parser.
@@ -280,6 +291,44 @@ impl ProfileRegistry {
     }
 }
 
+impl ProfileRegistry {
+    /// Opens the agents directory for a create.
+    ///
+    /// Every component of the path is opened without following links and must
+    /// be owned by the daemon user and not group- or world-writable. A missing
+    /// directory is created at 0700 when `create` is set, else `None` is
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::NotFound`] when the host loads no profiles from a
+    /// directory and [`BindError::DirUnsafe`] when the directory or an ancestor
+    /// fails the check or cannot be created.
+    pub(crate) fn open_for_create(&self, create: bool) -> Result<Option<BindDir>, BindError> {
+        let Some(root) = self.dir.as_ref() else {
+            return Err(BindError::NotFound);
+        };
+        let unsafe_dir = |error: FsError| {
+            warn!(%error, "the agents directory is not usable for a new profile");
+            BindError::DirUnsafe
+        };
+        let trusted = match TrustedDir::open_absolute_owner_safe(root, OTHERS_WRITE_BITS) {
+            Ok(trusted) => trusted,
+            Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => {
+                if !create {
+                    return Ok(None);
+                }
+                TrustedDir::open_or_create_absolute(root, CREATED_DIR_MODE).map_err(unsafe_dir)?
+            }
+            Err(error) => return Err(unsafe_dir(error)),
+        };
+        Ok(Some(BindDir {
+            trusted,
+            root: root.clone(),
+        }))
+    }
+}
+
 fn profile_file_name(name: &str) -> String {
     format!("{name}{PROFILE_EXTENSION}")
 }
@@ -420,13 +469,7 @@ impl BindDir {
         text: &str,
     ) -> Result<(), BindError> {
         let file = profile_file_name(name);
-        let mut random = [0_u8; TEMPORARY_RANDOM_BYTES];
-        getrandom::getrandom(&mut random)
-            .map_err(|_error| BindError::Failed("the system random source failed"))?;
-        let mut temporary = String::from(TEMPORARY_PREFIX);
-        for byte in random {
-            let _ = write!(temporary, "{byte:02x}");
-        }
+        let temporary = temporary_name()?;
         let mode = original.mode & PUBLISH_MODE_CEILING;
         self.trusted
             .replace_file_checked(&file, &temporary, text.as_bytes(), mode, || {
@@ -448,6 +491,90 @@ impl BindDir {
                 }
                 _ => BindError::Failed("the profile could not be replaced"),
             })
+    }
+}
+
+/// A fresh name for a staged temporary file.
+fn temporary_name() -> Result<String, BindError> {
+    let mut random = [0_u8; TEMPORARY_RANDOM_BYTES];
+    getrandom::getrandom(&mut random)
+        .map_err(|_error| BindError::Failed("the system random source failed"))?;
+    let mut temporary = String::from(TEMPORARY_PREFIX);
+    for byte in random {
+        let _ = write!(temporary, "{byte:02x}");
+    }
+    Ok(temporary)
+}
+
+impl BindDir {
+    /// Reads the profile `name` when it exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::Unusable`] for a profile that fails the rule or is
+    /// a link.
+    pub(crate) fn read_existing(&self, name: &str) -> Result<Option<ProfileFile>, BindError> {
+        match self.read(name) {
+            Ok(file) => Ok(Some(file)),
+            Err(BindError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes `text` as the new profile `name` at mode 0600.
+    ///
+    /// The text is written and synchronized under a temporary name, then moved
+    /// onto `<name>.toml` without replacing anything, so the name resolves to
+    /// the complete file or to nothing, and a file that appeared since the
+    /// caller looked is never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::Exists`] when a file of that name exists and
+    /// [`BindError::Failed`] when the write or the move failed; the temporary
+    /// is removed in both cases.
+    pub(crate) fn create_new(&self, name: &str, text: &str) -> Result<(), BindError> {
+        let file = profile_file_name(name);
+        let temporary = temporary_name()?;
+        let identity = self
+            .trusted
+            .create_file(&temporary, text.as_bytes(), CREATED_FILE_MODE)
+            .map_err(|error| {
+                warn!(%error, "the new profile could not be staged");
+                BindError::Failed("the new profile could not be written")
+            })?;
+        let outcome = self
+            .trusted
+            .move_no_replace(&temporary, &self.trusted, &file);
+        match outcome {
+            Ok(MoveOutcome::Moved) => Ok(()),
+            Ok(_exists) => {
+                self.discard(&temporary, identity);
+                Err(BindError::Exists)
+            }
+            Err(error) => {
+                warn!(%error, "the new profile could not be moved into place");
+                self.discard(&temporary, identity);
+                Err(BindError::Failed(
+                    "the new profile could not be moved into place",
+                ))
+            }
+        }
+    }
+
+    fn discard(&self, temporary: &str, identity: EntryIdentity) {
+        match self
+            .trusted
+            .stage_random(temporary, TEMPORARY_PREFIX, identity)
+        {
+            Ok(StageOutcome::Staged(entry)) => {
+                if let Err(error) = entry.remove() {
+                    warn!(%error, "a staged profile temporary was not removed");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "a staged profile temporary was not removed"),
+        }
     }
 }
 

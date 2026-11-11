@@ -289,6 +289,25 @@ honored only on the local control socket; a remote caller gets
 `package.bind_profile` rewrite the profile text, so existing sessions of that
 profile need the flag once. Profile values never appear in these errors.
 
+## Creating a profile
+
+`pohunek plugin profile create <name> --base <runtime>` (the wire method
+`package.create_profile`) writes a profile instead of a hand-written file. The
+daemon composes the text, validates it as a launch would, pins a package-served
+base to the selected, enabled package, and writes the file atomically at mode
+0600 under the package lifecycle authority. The profile `[env]` holds only the
+base runtime's config home variable (the `config_home.env` of its package
+descriptor, for example `CLAUDE_CONFIG_DIR` or `CODEX_HOME`), set from `--home`,
+which must be an absolute path. Secrets are never values in a profile: pass
+their names with `--secret-env`, and the values arrive with `session.new`. An
+argument or home that looks like a credential literal is refused
+(`package_profile_credential_literal`) and nothing is written. An existing name
+is replaced only with `--replace <file digest>`, the `file_digest` that
+`plugin profile list --json` reports; replacing a profile that sessions already
+use changes its revision, so a resume then needs `--accept-profile-change`.
+`--dry-run` prints the profile and its digest and writes nothing. The command is
+local only.
+
 ## Native recovery spec
 
 A native-session launch spec states how an agent CLI resumes one of its own

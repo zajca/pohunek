@@ -22,9 +22,12 @@ use clap::{Args, Subcommand};
 use pohunek_platform::filesystem::{EntryKind, FsError, TrustedDir};
 use protocol::{
     method, official_package_install_only_step, PackageBindProfileParams, PackageBindProfileResult,
-    PackageBindStatus, PackageDigest, PackageId, PackageInfo, PackageOrigin, RuntimeId,
+    PackageBindStatus, PackageCreateProfileParams, PackageCreateProfileResult,
+    PackageCreateProfileStatus, PackageDigest, PackageId, PackageInfo, PackageOrigin,
+    ProfileDigest, RuntimeId,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use toml_edit::{DocumentMut, TomlError};
 
 use super::plugin::{
@@ -62,6 +65,9 @@ pub(crate) const MAX_PROFILE_ENTRIES: usize = 1024;
 /// file from exhausting memory before it is parsed.
 const MAX_PROFILE_BYTES: usize = 1 << 20;
 
+/// Characters of a file digest shown in the listing table: `sha256:` and 12 hex.
+const FILE_DIGEST_SHORT_CHARS: usize = "sha256:".len() + 12;
+
 /// Permission bits that let another account modify a file.
 const OTHERS_WRITE_BITS: u32 = 0o022;
 
@@ -95,6 +101,16 @@ pub(crate) enum ProfileAction {
     /// command with `--yes`. A profile never changes digest through `plugin
     /// update` or `plugin select`.
     Migrate(MigrateArgs),
+
+    /// Create a profile pinned to the selected package of its base runtime.
+    ///
+    /// The daemon composes and validates the profile, then writes it
+    /// atomically at mode 0600. `[env]` holds only the base runtime's config
+    /// home variable, set from `--home`; secrets are passed by name with
+    /// `--secret-env` and never as values. An existing name is refused unless
+    /// `--replace` names the digest `plugin profile list --json` reports for
+    /// it. `--dry-run` prints the profile and its digest and writes nothing.
+    Create(CreateArgs),
 }
 
 impl ProfileAction {
@@ -103,8 +119,51 @@ impl ProfileAction {
         match self {
             Self::List { json } => *json,
             Self::Migrate(args) => args.json,
+            Self::Create(args) => args.json,
         }
     }
+}
+
+/// Arguments of `pohunek plugin profile create`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct CreateArgs {
+    /// Profile name: the file name under `agents/` without `.toml`.
+    #[arg(value_name = "NAME", value_parser = parse_profile_name)]
+    name: String,
+    /// Base runtime the profile extends: `shell` or a package-served runtime.
+    #[arg(long, value_name = "RUNTIME", value_parser = parse_base)]
+    base: RuntimeId,
+    /// Absolute path of the agent's config home. The daemon writes it to the
+    /// config home variable the base runtime declares, such as
+    /// `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
+    #[arg(long, value_name = "ABS_PATH")]
+    home: Option<String>,
+    /// Launch argument appended to the program; repeat for several. A value
+    /// that looks like a credential is refused.
+    #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+    args: Vec<String>,
+    /// Name of a secret variable a session launch fills; repeat for several.
+    /// Names only, never values.
+    #[arg(long = "secret-env", value_name = "NAME")]
+    secret_env: Vec<String>,
+    /// Replace the existing profile whose file digest this is.
+    #[arg(long, value_name = "DIGEST", value_parser = parse_profile_digest)]
+    replace: Option<ProfileDigest>,
+    /// Validate and print the profile and its digest without writing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+fn parse_base(value: &str) -> Result<RuntimeId, String> {
+    RuntimeId::parse(value).map_err(|_malformed| format!("`{value}` is not a runtime id"))
+}
+
+fn parse_profile_digest(value: &str) -> Result<ProfileDigest, String> {
+    ProfileDigest::parse(value)
+        .map_err(|_malformed| "expected `sha256:<64 lowercase hex>`".to_owned())
 }
 
 /// Arguments of `pohunek plugin profile migrate`.
@@ -405,6 +464,9 @@ struct ProfileEntry {
     package: Option<PackageId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     digest: Option<PackageDigest>,
+    /// Digest of the profile file, the value `create --replace` expects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_digest: Option<ProfileDigest>,
     state: ProfileState,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -472,6 +534,23 @@ fn check_file_policy(
 /// A profile file read through the trusted directory descriptor.
 struct LoadedProfile {
     text: String,
+}
+
+/// The digest of profile file text, as `create --replace` compares it.
+fn text_digest(text: &str) -> ProfileDigest {
+    let hash = Sha256::digest(text.as_bytes());
+    ProfileDigest::parse(&format!("sha256:{hash:x}"))
+        .unwrap_or_else(|_invalid| unreachable!("a SHA-256 digest is 64 lowercase hex digits"))
+}
+
+/// The first hex characters of a profile file digest, with the `sha256:` prefix.
+fn short_file_digest(digest: &ProfileDigest) -> String {
+    let text = digest.as_str();
+    let end = text
+        .char_indices()
+        .nth(FILE_DIGEST_SHORT_CHARS)
+        .map_or(text.len(), |(index, _)| index);
+    text[..end].to_owned()
 }
 
 fn profile_file_name(name: &str) -> String {
@@ -572,6 +651,7 @@ fn unreadable_entry(name: &str, detail: String) -> ProfileEntry {
         base: None,
         package: None,
         digest: None,
+        file_digest: None,
         state: ProfileState::Unreadable,
         detail: Some(detail),
     }
@@ -594,6 +674,7 @@ fn profile_entry(dir: &TrustedDir, name: &str, packages: &[PackageInfo]) -> Prof
                 base: Some(head.base),
                 package: head.package,
                 digest: head.digest,
+                file_digest: Some(text_digest(&loaded.text)),
                 state,
                 detail,
             }
@@ -605,7 +686,7 @@ fn render_listing(listing: &ProfileListing) -> String {
     if listing.profiles.is_empty() {
         return "No host agent profiles.\n".to_owned();
     }
-    let rows: Vec<[String; 5]> = listing
+    let rows: Vec<[String; 6]> = listing
         .profiles
         .iter()
         .map(|entry| {
@@ -627,11 +708,18 @@ fn render_listing(listing: &ProfileListing) -> String {
                     .digest
                     .as_ref()
                     .map_or_else(|| "-".to_owned(), short_digest),
+                entry
+                    .file_digest
+                    .as_ref()
+                    .map_or_else(|| "-".to_owned(), short_file_digest),
                 state,
             ]
         })
         .collect();
-    let mut output = render_table(["NAME", "BASE", "PACKAGE", "DIGEST", "STATE"], &rows);
+    let mut output = render_table(
+        ["NAME", "BASE", "PACKAGE", "DIGEST", "FILE", "STATE"],
+        &rows,
+    );
     if listing.truncated {
         let _ = writeln!(
             output,
@@ -707,7 +795,61 @@ pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
             print_output(json, &listing, || render_listing(&listing))
         }
         ProfileAction::Migrate(args) => run_migrate(&args).await,
+        ProfileAction::Create(args) => run_create(&args).await,
     }
+}
+
+/// Create the profile through the daemon.
+///
+/// The capability is read first, so a daemon that predates the method is told
+/// apart from a refusal and receives nothing.
+async fn run_create(args: &CreateArgs) -> Result<(), CliError> {
+    let paths = Paths::resolve()?;
+    let mut client = Client::connect(LOCAL_HOST, &paths).await?;
+    let capabilities = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?;
+    if !capabilities.package_create_profile_supported {
+        return Err(Error::ProfileCreateUnsupported.into());
+    }
+    let result = client
+        .call::<method::PackageCreateProfile>(PackageCreateProfileParams {
+            profile: args.name.clone(),
+            base: args.base.clone(),
+            home: args.home.clone(),
+            args: args.args.clone(),
+            secret_env: args.secret_env.clone(),
+            replace: args.replace.clone(),
+            dry_run: args.dry_run,
+        })
+        .await?;
+    print_output(args.json, &result, || render_created(&result))
+}
+
+fn render_created(result: &PackageCreateProfileResult) -> String {
+    let verb = match result.status {
+        PackageCreateProfileStatus::Preview => "would create",
+        PackageCreateProfileStatus::Created => "created",
+        PackageCreateProfileStatus::Replaced => "replaced",
+        PackageCreateProfileStatus::Unknown => "processed",
+    };
+    let pinned = result.package.as_ref().map_or_else(String::new, |package| {
+        format!(
+            ", package {} {}",
+            package.package.id,
+            short_digest(&package.digest)
+        )
+    });
+    let mut output = format!(
+        "{verb} {} (base {}{pinned}) digest {}\n",
+        result.profile, result.base, result.file_digest
+    );
+    if result.status == PackageCreateProfileStatus::Preview {
+        output.push_str(&result.text);
+    }
+    output
 }
 
 async fn run_migrate(args: &MigrateArgs) -> Result<(), CliError> {

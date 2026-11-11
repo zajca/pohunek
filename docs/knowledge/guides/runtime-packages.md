@@ -1431,6 +1431,19 @@ one state:
   group- or world-writable, is not valid TOML, or has an invalid `base`,
   `package`, or `digest`.
 
+`pohunek plugin profile create <name> --base <runtime> [--home <abs-path>]
+[--arg <a>]... [--secret-env <NAME>]... [--replace <sha256:...>] [--dry-run]
+[--json]` creates a profile through the daemon's `package.create_profile`
+method, under the same lifecycle authority, so a concurrent uninstall of the
+target either runs first (`package_profile_target_invalid`) or is refused with
+`package_referenced`. `--home` is written to the `[config_home]` `env` variable
+the package descriptor declares, so a base without that table takes no home
+(`package_profile_home_unsupported`) and one with a `subdir` is refused
+(`package_profile_home_invalid`). The file is written at mode 0600; the other
+refusals are `package_profile_exists`, `package_profile_digest_mismatch`,
+`package_profile_credential_literal` and `package_profile_dir_unsafe`. A daemon
+without the method (`package_create_profile_supported`) is sent nothing.
+
 `pohunek plugin profile migrate <name> [--digest <d>] [--yes] [--json]` pins
 the profile through the daemon's `package.bind_profile` method; the command
 never writes the file. The daemon applies the pin under the same exclusive

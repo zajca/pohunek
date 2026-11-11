@@ -81,6 +81,10 @@ fn package_methods(digest: &PackageDigest) -> Vec<(&'static str, Value)> {
             method::PACKAGE_BIND_PROFILE,
             json!({ "profile": "work", "digest": digest, "dry_run": true }),
         ),
+        (
+            method::PACKAGE_CREATE_PROFILE,
+            json!({ "profile": "work", "base": "shell", "dry_run": true }),
+        ),
     ]
 }
 

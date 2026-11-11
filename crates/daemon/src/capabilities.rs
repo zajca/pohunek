@@ -372,6 +372,7 @@ fn capability_snapshot(
         package_install_index_supported: false,
         package_install_index_context_supported: false,
         package_bind_profile_expected_supported: true,
+        package_create_profile_supported: true,
     }
 }
 

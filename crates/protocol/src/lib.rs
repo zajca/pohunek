@@ -124,12 +124,13 @@ pub use notification::{
 #[doc(inline)]
 pub use package::{
     CommandExposure, CommandInfo, ExpectedPin, PackageBindProfileParams, PackageBindProfileResult,
-    PackageBindStatus, PackageChangeResult, PackageDoctorParams, PackageDoctorResult,
-    PackageErrorKind, PackageFault, PackageFinding, PackageFindingKind, PackageInfo,
-    PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
-    PackageInstallStatus, PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo,
-    PackageSelectParams, PackageSelectionBlock, PackageSelectionBlockReason,
-    PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
+    PackageBindStatus, PackageChangeResult, PackageCreateProfileParams, PackageCreateProfileResult,
+    PackageCreateProfileStatus, PackageDoctorParams, PackageDoctorResult, PackageErrorKind,
+    PackageFault, PackageFinding, PackageFindingKind, PackageInfo, PackageInspectParams,
+    PackageInspectResult, PackageInstallParams, PackageInstallResult, PackageInstallStatus,
+    PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
+    PackageSelectionBlock, PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust,
+    PackageUninstallParams, PackageUninstallResult,
 };
 #[doc(inline)]
 pub use project::{
@@ -145,8 +146,8 @@ pub use project::{
 pub use runtime_id::{
     BindingFieldError, BindingProvenance, CommandName, CommandNameError, DescriptorDigest,
     HistoricalRuntime, LaunchBinding, PackageDigest, PackageId, PackageIdentity, PackageVersion,
-    RuntimeId, RuntimeIdError, RuntimeRef, MAX_AGENT_RUNTIME_ID_BYTES, MAX_COMMAND_NAME_BYTES,
-    MAX_PACKAGE_ID_BYTES, MAX_PACKAGE_VERSION_BYTES,
+    ProfileDigest, RuntimeId, RuntimeIdError, RuntimeRef, MAX_AGENT_RUNTIME_ID_BYTES,
+    MAX_COMMAND_NAME_BYTES, MAX_PACKAGE_ID_BYTES, MAX_PACKAGE_VERSION_BYTES,
 };
 #[doc(inline)]
 pub use secret_env::{

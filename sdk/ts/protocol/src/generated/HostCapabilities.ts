@@ -152,4 +152,12 @@ export type HostCapabilities = {
    * wire.
    */
   package_bind_profile_expected_supported?: boolean;
+  /**
+   * Whether the daemon serves `package.create_profile`.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; it
+   * answers the method with `method_not_found`, so a client sends the call
+   * only when this is `true`. `false` is likewise omitted on the wire.
+   */
+  package_create_profile_supported?: boolean;
 };

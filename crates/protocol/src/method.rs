@@ -16,25 +16,26 @@ use crate::{
     IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
     IntegrationUninstallResult, NotificationCreateParams, NotificationCreateResult,
     NotificationListParams, NotificationListResult, PackageBindProfileParams,
-    PackageBindProfileResult, PackageChangeResult, PackageDoctorParams, PackageDoctorResult,
-    PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
-    PackageLinkParams, PackageListResult, PackageSelectParams, PackageSetEnabledParams,
-    PackageUninstallParams, PackageUninstallResult, ProjectActionParams, ProjectActionResult,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectCandidatesParams,
-    ProjectCandidatesResult, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionDiffParams, SessionDiffResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams, SessionRenameResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionResumeResult, SessionRetentionParams, SessionRetentionResult, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult,
-    SessionWaitParams, SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
-    WorktreeRemoveParams, WorktreeRemoveResult,
+    PackageBindProfileResult, PackageChangeResult, PackageCreateProfileParams,
+    PackageCreateProfileResult, PackageDoctorParams, PackageDoctorResult, PackageInspectParams,
+    PackageInspectResult, PackageInstallParams, PackageInstallResult, PackageLinkParams,
+    PackageListResult, PackageSelectParams, PackageSetEnabledParams, PackageUninstallParams,
+    PackageUninstallResult, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
+    ProjectActionsResult, ProjectAddParams, ProjectCandidatesParams, ProjectCandidatesResult,
+    ProjectInfo, ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionOutputParams, SessionOutputResult,
+    SessionReadParams, SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
+    SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
+    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams,
+    WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -647,6 +648,16 @@ method_table!(
     PackageBindProfileResult,
     "PackageBindProfileParams",
     "PackageBindProfileResult";
+
+    /// Create a host agent profile pinned to the selected package of its base
+    /// runtime under the package lifecycle authority (local-only).
+    PackageCreateProfile,
+    PACKAGE_CREATE_PROFILE,
+    "package.create_profile",
+    PackageCreateProfileParams,
+    PackageCreateProfileResult,
+    "PackageCreateProfileParams",
+    "PackageCreateProfileResult";
 
     /// Run one command a package declared, once, and return its stdout.
     CommandRun,

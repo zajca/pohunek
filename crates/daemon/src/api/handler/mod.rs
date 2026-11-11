@@ -526,6 +526,9 @@ async fn handle_negotiated(
         method::PACKAGE_SELECT => package::handle_package_select(request, state).await,
         method::PACKAGE_UNINSTALL => package::handle_package_uninstall(request, state).await,
         method::PACKAGE_BIND_PROFILE => package::handle_package_bind_profile(request, state).await,
+        method::PACKAGE_CREATE_PROFILE => {
+            package::handle_package_create_profile(request, state).await
+        }
         method::COMMAND_RUN => command::handle_command_run(request, state).await,
         method::HOST_INSPECT => {
             host::handle_host_inspect(request, &state.health, &state.sessions).await
