@@ -2606,8 +2606,9 @@ impl Fixture {
     }
 
     /// Waits until the session's detected activity is `activity` and returns
-    /// the session record that matched. Panics with the record as soon as the
-    /// session is `stopped`, `done` or `failed`.
+    /// the session record that matched. Each wait slice is followed by a
+    /// terminal-state check: the helper panics with the record once the session
+    /// is `stopped`, `done` or `failed`.
     async fn wait_activity(&self, id: &str, activity: &str) -> Value {
         wait_until(&format!("activity {activity} of {id}"), || async {
             let (code, waited) = self
