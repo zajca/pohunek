@@ -24,7 +24,7 @@ const SCHEMA_10: &str = include_str!("../src/store/fixtures/schema-10/metadata.j
 const GOLDEN_AFTER_SESSION: &str = include_str!("fixtures/store-memo/after-session.jsonl");
 
 /// The same bytes after the second step of [`golden_steps`], with the same
-/// schema 12, 13 and 14 changes.
+/// schema 12, 13, 14 and 19 changes.
 const GOLDEN_AFTER_PROJECT: &str = include_str!("fixtures/store-memo/after-project.jsonl");
 
 /// Session recorded in the fixture.
