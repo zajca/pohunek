@@ -45,6 +45,7 @@ export const ClientErrorCode = {
   SessionNewSecretEnvUnsupported: "session_new_secret_env_unsupported",
   SessionNewSecretEnvRelayRefused: "session_new_secret_env_relay_refused",
   SessionNewRequestIdUnsupported: "session_new_request_id_unsupported",
+  SessionNewContextPinUnsupported: "session_new_context_pin_unsupported",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
@@ -69,6 +70,7 @@ export type ClientErrorKind =
   | "sessionNewSecretEnvUnsupported"
   | "sessionNewSecretEnvRelayRefused"
   | "sessionNewRequestIdUnsupported"
+  | "sessionNewContextPinUnsupported"
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
 
@@ -323,6 +325,25 @@ export class ClientError extends Error {
       protocolError(
         ClientErrorClass.Daemon,
         ClientErrorCode.SessionNewSecretEnvUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_new_context_pin_supported`, so it
+   * would drop `context_package_digest` silently and start an unpinned session.
+   */
+  public static sessionNewContextPinUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates context_package_digest and would drop it silently; nothing was sent`;
+    return new ClientError(
+      "sessionNewContextPinUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionNewContextPinUnsupported,
         msg,
         "upgrade the daemon, then retry",
       ),

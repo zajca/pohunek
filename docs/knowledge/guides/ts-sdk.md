@@ -68,8 +68,8 @@ daemon already sends.
 connection whose deadline follows `timeout_ms` (or `MAX_SESSION_WAIT_TURN_MS`
 when the daemon default applies), so the client's `requestTimeoutMs` never cuts
 a long wait short; generic `call("session.wait_turn", ...)` takes the same
-path. Against a protocol 3 daemon it fails with `daemon_protocol_too_old`
-before sending. The `@pohunek/testkit` fixture daemon serves the method:
+path. Against a daemon of another protocol version it fails with
+`version_mismatch`. The `@pohunek/testkit` fixture daemon serves the method:
 `scenario.recordTurnEvent(sessionId, kind, notificationId?)` records a turn
 signal at once, standing for one the daemon already accepted and debounced,
 `session.stop` records `exited` when the stopped state is committed, the
@@ -91,7 +91,7 @@ is unchanged; a `timeout_ms` or `max_output_bytes` that is not a nonzero `u32`
 fails with `bad_request` before sending. A `command_*` error keeps its code;
 `command_failed` exposes the exit status through `ClientError.details`
 (`process_exit.exit_code` or `signal`). A daemon that answers `method_not_found`
-or speaks protocol 3 fails with `command_unsupported`.
+fails with `command_unsupported`.
 
 `package.install` and `package.link` send `accept_commands` only after
 `host.inspect` reports `package_install_commands_supported` on the connection

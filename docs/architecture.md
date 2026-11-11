@@ -707,7 +707,7 @@ fresh interactive input.
 
 ## Transport and Control Protocol
 
-Public protocol v4 currently exposes one logical owner protocol over two
+Public protocol 5 currently exposes one logical owner protocol over two
 transport classes:
 
 - **Local:** Unix domain socket at `<runtime-root>/daemon.sock`. A valid explicit
@@ -884,14 +884,13 @@ states the contract and then the current state.
   `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.
   An adapter translates shape only. A semantic change raises
   `MIN_PROTOCOL_VERSION` as well and is an announced break. The oldest adapter
-  is deleted on the next bump. The current state: the daemon accepts `3..=4`
-  through the `v3` adapter, and the Rust client and CLI advertise the same
-  window and translate through that adapter against an N-1 daemon. A method new
-  in N is refused client-side with `daemon/daemon_protocol_too_old`. The
-  TypeScript SDK advertises the same window and translates through its port of
-  the adapter, so no direction of the N versus N-1 pair needs a one-pass
-  upgrade ([#527](https://github.com/zajca/pohunek/issues/527)). Mechanics, rules and
-  fixtures are under "Protocol window and edge adapters" above.
+  is deleted on the next bump. The current state: protocol 5 removed the
+  notification mutation, policy and retention methods, a semantic change, so the
+  window is `5..=5` (`MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`), the Rust
+  client, CLI and TypeScript SDK advertise the same window, and an N-1 peer is
+  refused with `daemon/version_mismatch`; the whole N versus N-1 pair needs a
+  one-pass upgrade. Mechanics, rules and fixtures are under "Protocol window and
+  edge adapters" above.
 - **Persisted daemon state.** Migrates from any older kept schema (see below).
   A session launched from a host profile by an N-1 that did not freeze the
   profile revision carries none, so after the upgrade it resumes only with `session resume

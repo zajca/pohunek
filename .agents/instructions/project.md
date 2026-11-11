@@ -56,12 +56,14 @@ rule. The current state of each place is stated separately.
   version served through adapters on both sides of the connection. An adapter
   translates shape only. A semantic change raises `MIN_PROTOCOL_VERSION` too
   and is an announced break; the oldest adapter is deleted on the next bump.
-  State: the daemon accepts `3..=4` (`MIN_PROTOCOL_VERSION` is
-  `PROTOCOL_VERSION - 1`, adapter in `crates/protocol/src/compat/v3.rs`) and the
-  Rust client, the CLI and the TypeScript SDK advertise the same window
-  (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`), translating
-  through the same adapter (ported to TypeScript in `sdk/ts/sdk/src/compat.ts`,
-  tested against the same recordings) when the daemon answers in N-1. A method
+  State: protocol 5 removed the notification mutation, policy and retention
+  methods, a semantic change, so the daemon accepts `5..=5`
+  (`MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`) and the Rust client, the
+  CLI and the TypeScript SDK advertise the same window
+  (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`); an N-1 peer is
+  refused with `daemon/version_mismatch`. When a window is wider again, a client translates
+  through the adapters in `crates/protocol/src/compat` (ported to TypeScript in
+  `sdk/ts/sdk/src/compat.ts`) when the daemon answers in N-1. A method
   new in N fails on the client with `daemon/daemon_protocol_too_old` before it
   is sent ([#527](https://github.com/zajca/pohunek/issues/527)). A new value of
   an existing enum on the same version is decoded tolerantly only by the client
@@ -254,12 +256,10 @@ Hard constraints, decided on purpose — respect them in every change:
   a stable one: they stay pre-1.0 with no back-compat shims, and a client
   absorbs breaking changes when it bumps its pinned tag.
 - **UIs pin the core release they were built against.** A Rust or
-  TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS` and reaches
-  an N-1 daemon through its adapter; a client two releases newer than its daemon
-  is refused (`daemon/version_mismatch`). A daemon
-  of release N additionally serves the clients of release N-1 through the
-  protocol window (`docs/architecture.md` "Protocol versioning"), which bounds
-  how long a UI release trails a core update. A protocol surface that only UI
+  TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS`; a peer
+  outside the daemon's window is refused (`daemon/version_mismatch`). The window
+  holds one version today (`docs/architecture.md` "Protocol versioning"), so a UI
+  release must be rebuilt for each core protocol bump. A protocol surface that only UI
   clients call (`host.discover`, `worktree.remove`, and the UI use of
   `subscribe`) is still a public obligation: core keeps server-side contract
   tests for it, listed in `docs/public-api.md` ("External clients"). Core adds
@@ -289,8 +289,7 @@ Hard constraints, decided on purpose — respect them in every change:
   digest.
 - **Issue/PR providers (Linear, GitHub) live only in `zajca/pohunek-work`,
   never in core** (neither the daemon, the CLI, nor this repository's scripts).
-- **Protocol today:** public protocol v4 (the daemon also accepts v3 through the
-  protocol window) is owner-only newline-delimited JSON
+- **Protocol today:** public protocol 5 (the window holds that one version) is owner-only newline-delimited JSON
   over a Unix socket (local) and TCP on configured overlays (remote); attach
   uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
   owns the coordinated v4 host-link cutover; do not describe relay protocol as

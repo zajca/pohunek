@@ -655,7 +655,7 @@ Runtime package archive format:
 - `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the v0.34.2 built-in goldens), catalog-installed package launch and version-probe tests, the clean-host scenarios (bare `codex`, its integration and an unpinned `base = "codex"` profile refused with the install hint until the package is installed), and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume argv, `semver-line-v1` version probe).
-- `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the v0.34.2 built-in one plus the #613 rules (running-turn title and footer, wrapped selection forms, first-run and trust dialogs, the `done <time>` completed-turn line, the npm `claude.exe` process); the daemon compiles no Claude in, so this package is the only source of `claude`.
+- `runtime-packages/claude/detect.toml` — Claude Code detection manifest: the v0.34.2 built-in one plus the #613 rules (running-turn footer, wrapped selection forms, first-run and trust dialogs, the npm `claude.exe` process); the daemon compiles no Claude in, so this package is the only source of `claude`.
 - `compat/claude/compatibility-lock.json` — pinned Claude Code release, native binary SHA-256 and supported range.
 - `compat/claude/screens/` — screens and terminal titles captured from a real Claude Code that the manifest test classifies.
 - `compat/claude/builtin-v0.34/` — golden copies of the built-in Claude descriptor and detection manifest of release 0.34.2.

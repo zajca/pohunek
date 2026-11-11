@@ -17,7 +17,7 @@ unknown-command usage error.
 
 ## What a host needs from the relay
 
-Nothing. Current Pohunek releases use public protocol v4 through an owner-only
+Nothing. Current Pohunek releases use public protocol 5 through an owner-only
 Unix socket or a direct configured overlay such as NetBird or Tailscale. A host
 with no relay configured behaves identically: `pohunek host list`,
 `pohunek session list`, and `pohunek doctor` do not depend on a relay. A

@@ -25,7 +25,7 @@ This directory turns the product idea into implementation-oriented planning.
 
 ## Committed Direction (summary)
 
-The shipped protocol v4 product is an **owner-operated personal multi-host
+The shipped protocol 5 product is an **owner-operated personal multi-host
 tool**: durable coding-agent sessions across the owner's machines locally or on
 a NetBird (default) or Tailscale network. The optional team relay, developed in its own
 repository ([`pohunekd/pohunek-relay`](https://github.com/pohunekd/pohunek-relay)), adds a public

@@ -420,16 +420,10 @@ a later hook report merged into, stays as it is (a record is ordered by its newe
 contribution), whether the input waited in a backlog or was only handled late behind a slow
 seed.
 
-Notification policy is provider-keyed. `enabled` is the complete base per-kind
-policy, while the deterministically ordered `providers` object holds complete
-overrides by open provider wire name. A missing provider key falls back to
-`enabled`. The old fixed `codex` and `claude` policy fields are not accepted.
-
-The notification policy also owns automatic retention. Informational/success,
-warning, acknowledged attention, acknowledged error, and archived records have
-separate TTLs. Unresolved action-required and error records have no automatic
-TTL. After a sweep appends deletion events, the daemon atomically compacts the
-JSONL action log once its configured action threshold is reached.
+`notifications.record_ttl_secs` bounds how long a resolved record stays. An
+unresolved attention record has no automatic TTL. After a sweep appends deletion events,
+the daemon atomically compacts the JSONL action log once its configured action
+threshold is reached.
 
 Every session has an immutable launch identity: `agent` is the selected profile
 name and `agent_base` is the `RuntimeRef` of the runtime backing the session (for

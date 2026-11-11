@@ -148,14 +148,13 @@ dropped rules.
   visible prompt box (a status line whose timer the terminal width cut,
   `✻ Billowing… (1…`, counts too; a parenthesis that opens with anything but a
   digit, a unit or the cut mark does not, so a Claude without records that
-  shows such a line reads idle from the screen until the title or the footer
-  speaks); a visible prompt box or a completed-turn line
-  (`✻ Brewed for 7s · done 3:34 PM`) means `idle`; the tool approval dialog
+  shows such a line reads idle from the screen until the footer
+  speaks); a visible prompt box means `idle`; the tool approval dialog
   (`Do you want to proceed?` with its options), the selection forms
   (`Enter to select · ↑/↓ to navigate · Esc to cancel`, also wrapped), the
   first-run theme picker, API-key approval and login method list, and the
-  folder trust dialog mean `blocked`. A title that starts with `◐` or `◑` (or a
-  braille spinner) means `working`, a title that starts with `✳` means `idle`.
+  folder trust dialog mean `blocked`. The package declares no terminal title
+  rules.
 
 ## Session name
 

@@ -10,7 +10,7 @@ Start here:
   flow.
 - [Optional team relay](concepts/team-relay.md) records that the relay lives in
   its own repository and what a host keeps for it, clearly separated from
-  shipped protocol v4.
+  shipped protocol 5.
 - [Host identity and local governance](concepts/host-governance.md) describes
   the shipped stable host ID, safe v4 inspection result, and owner-private
   governance persistence boundary.
