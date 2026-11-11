@@ -29651,6 +29651,8 @@ async fn a_profile_change_updates_the_label_of_an_unchanged_claim() {
 #[tokio::test]
 async fn a_projected_release_of_another_process_leaves_the_held_claim() {
     let (registry, inspector, created) = mock_direct_codex_registry("claim-foreign-release").await;
+    // The claim has no process, so a scan that runs after its 50 ms TTL clears it.
+    stop_procwatch_loop(&registry, &inspector, &created.id).await;
     let _ = root_start_identity(&inspector, &created);
     assert!(
         registry

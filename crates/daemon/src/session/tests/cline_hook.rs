@@ -231,6 +231,25 @@ impl Rig {
         .await;
     }
 
+    /// The hook trace lines that name something other than a missed socket
+    /// budget.
+    ///
+    /// The reporter traces `worker_timeout` whenever the worker does not answer
+    /// within its budget, whether or not the request reached the worker. A
+    /// caller that waited for the report's effect (`wait_identity`) knows it
+    /// did, so the timeout says nothing about that report.
+    fn trace_without_reply_timeouts(&self) -> String {
+        self.trace()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .is_none_or(|trace| trace["reason"] != "worker_timeout")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn trace(&self) -> String {
         let trace = self
             .state_root
@@ -478,11 +497,8 @@ async fn a_root_turn_binds_and_clear_and_fork_rebind_at_the_next_turn() {
     rig.wait_identity(GENERATED).await;
 
     rig.assert_hooks_quiet(4);
-    assert!(
-        rig.trace().is_empty(),
-        "accepted reports leave no trace: {}",
-        rig.trace()
-    );
+    let trace = rig.trace_without_reply_timeouts();
+    assert!(trace.is_empty(), "accepted reports leave no trace: {trace}");
     rig.finish().await;
     rig.remove().await;
 }
@@ -509,7 +525,8 @@ async fn the_end_of_the_lead_turn_does_not_release_or_change_the_identity() {
     );
     assert!(snapshot.subagents.is_empty());
     rig.assert_hooks_quiet(4);
-    assert!(rig.trace().is_empty(), "{}", rig.trace());
+    let trace = rig.trace_without_reply_timeouts();
+    assert!(trace.is_empty(), "{trace}");
     rig.finish().await;
     rig.remove().await;
 }
