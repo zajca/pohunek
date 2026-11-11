@@ -4818,6 +4818,146 @@ async fn an_evaluation_stalled_in_a_file_system_call_is_abandoned_at_its_deadlin
 }
 
 #[tokio::test]
+async fn an_evaluation_that_answers_as_its_deadline_passes_keeps_its_answer() {
+    let log = DaemonLog::start();
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-edge",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let hook = read_hook(&servers);
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "edge", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    // The evaluation records "trusted" and its thread is then held before it
+    // returns, so the launch's deadline passes while the answer is known but
+    // the task has not ended. `release` lets the thread return after the
+    // launch completed; the ceiling only keeps a broken run from hanging.
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let signal = Arc::clone(&reached);
+    on_read(
+        &hook,
+        CheckoutReadStep::Evaluated,
+        dir.clone(),
+        Box::new(move || {
+            signal.notify_one();
+            let _ = released.recv_timeout(pohunek_test_support::wait::HANG_GUARD);
+        }),
+    );
+
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
+    let past_deadline = async {
+        reached.notified().await;
+        tokio::time::advance(CHECKOUT_TRUST_DEADLINE + TIMER_TICK).await;
+        tokio::time::resume();
+        inhibitor.release().await;
+    };
+    let (id, ()) = tokio::join!(
+        start_named_session(&mut local, RUNTIME, &dir, None),
+        past_deadline
+    );
+    let argv = printed_argv(&mut local, &id).await;
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    drop(release);
+    assert!(hook.lock().expect("read hook").is_none(), "the hold ran");
+    assert!(
+        carries_trust_arg(&argv),
+        "an answer recorded before the deadline is the launch's answer: {argv:?}"
+    );
+    let failures: Vec<Value> = log
+        .event_records("checkout_trust.failed")
+        .into_iter()
+        .filter(|record| record["fields"]["checkout"] == dir.to_string_lossy().as_ref())
+        .collect();
+    assert!(failures.is_empty(), "nothing failed: {failures:?}");
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// The entries of the checkout trust scratch directory below `state_root`
+/// whose name has the evaluation prefix.
+fn trust_scratch_entries(state_root: &Path) -> Vec<String> {
+    match std::fs::read_dir(state_root.join("checkout-trust")) {
+        Ok(entries) => entries
+            .map(|entry| entry.expect("scratch entry").file_name())
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| name.starts_with("pohunek-trust-"))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("read the scratch directory: {error}"),
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_start_removes_the_trust_scratch_a_stopped_daemon_left() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut state_root = None;
+    let servers = spawn_servers_configured("pkg-trust-sweep", Some(""), |config| {
+        config.catalog_trust = CatalogTrust::Absent;
+        config.trusted_repositories = host_trusting(&["acme/widgets"]);
+        let root = config
+            .worker_state_root
+            .clone()
+            .expect("the fixture configures a worker state root");
+        // What a daemon that stopped during a blocked evaluation leaves: a
+        // populated private repository, next to an entry the sweep must keep.
+        let scratch = root.join("checkout-trust");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(scratch.join("pohunek-trust-left/objects/ab"))
+            .expect("create the left-over repository");
+        std::fs::write(
+            scratch.join("pohunek-trust-left/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .expect("write a repository file");
+        std::fs::write(scratch.join("pohunek-trust-left/objects/ab/cdef"), "tree")
+            .expect("write an object");
+        std::fs::write(scratch.join("unrelated"), "kept").expect("write an unrelated entry");
+        state_root = Some(root);
+    })
+    .await;
+    let state_root = state_root.expect("the configure step ran");
+    assert_eq!(
+        trust_scratch_entries(&state_root),
+        Vec::<String>::new(),
+        "the start removed the left-over repository"
+    );
+    assert!(
+        state_root.join("checkout-trust/unrelated").exists(),
+        "an entry without the evaluation prefix is kept"
+    );
+
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "after-sweep", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+    assert!(
+        carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "a trusted launch works after the sweep"
+    );
+    assert_eq!(
+        trust_scratch_entries(&state_root),
+        Vec::<String>::new(),
+        "the evaluation removed its own repository"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
 async fn an_ancestor_of_a_nested_declared_path_swapped_for_a_link_is_not_trusted() {
     let servers = spawn_servers_trusting_repositories(
         "pkg-trust-ancestor",

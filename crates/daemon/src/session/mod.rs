@@ -2435,6 +2435,9 @@ impl SessionRegistry {
             .as_deref()
             .map(open_runtime_host)
             .transpose()?;
+        if let Some(state_root) = config.worker_state_root.as_deref() {
+            launch_input::sweep_checkout_trust_scratch(state_root);
+        }
         Ok(Self::build(config, Some(supervisor), inspector, runtimes))
     }
 

@@ -27,7 +27,8 @@
 //! (`SessionRegistry::trusted_relaunch_args`).
 //!
 //! The scratch repository lives in a daemon-private directory, never in a
-//! directory a launched session can write. No git command runs against the
+//! directory a launched session can write; daemon start removes any a stopped
+//! daemon left there. No git command runs against the
 //! checkout: its refs, index, objects and configuration are never read, so a
 //! process that can write them cannot influence the answer. Every git command
 //! runs in the private repository through the bounded runner with a cleared
@@ -68,7 +69,8 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// checks between its file system calls. A single file system call that never
 /// returns (a stalled mount) cannot be interrupted, so the caller stops waiting
 /// for the evaluation after this long and treats the checkout as not trusted;
-/// the blocked thread and its scratch directory stay until the call returns.
+/// the blocked thread and its scratch directory stay until the call returns,
+/// and a daemon that stops first leaves the directory to the next start's sweep.
 pub const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Most stdout bytes one git command may produce; the runner lowers a larger
@@ -123,6 +125,10 @@ const MARKS_FILE: &str = "blob-marks";
 
 /// Mode of the daemon-private scratch directory.
 const SCRATCH_DIR_MODE: u32 = 0o700;
+
+/// Name prefix of the private repository one evaluation creates in the scratch
+/// directory.
+const SCRATCH_PREFIX: &str = "pohunek-trust-";
 
 /// File mode of a regular, non-executable blob in a tree listing.
 const MODE_FILE: &str = "100644";
@@ -232,6 +238,9 @@ pub enum CheckoutReadStep {
     /// After a declared file was opened and its size checked, right before its
     /// bytes are read.
     BeforeRead,
+    /// After the evaluation recorded its answer, right before its thread
+    /// returns; the path is the launch directory.
+    Evaluated,
 }
 
 /// Runs at each [`CheckoutReadStep`] of the evaluation with the absolute path
@@ -250,6 +259,11 @@ impl ReadObserver {
         F: Fn(CheckoutReadStep, &Path) + Send + Sync + 'static,
     {
         Self(Arc::new(observe))
+    }
+
+    /// Runs the observer at `step` of `path`.
+    pub(crate) fn observe(&self, step: CheckoutReadStep, path: &Path) {
+        (self.0)(step, path);
     }
 }
 
@@ -621,7 +635,7 @@ impl<'a> Walk<'a> {
 
     fn observe(&self, step: CheckoutReadStep, relative: &str) {
         if let Some(observer) = self.observer {
-            (observer.0)(step, &self.cwd.join(relative));
+            observer.observe(step, &self.cwd.join(relative));
         }
     }
 
@@ -928,6 +942,83 @@ fn github_repository(url: &str) -> Option<String> {
     (owner_ok && repo_ok).then(|| format!("{owner}/{repo}").to_ascii_lowercase())
 }
 
+/// Removes every private repository an evaluation left in `scratch_root`.
+///
+/// The daemon is the only writer of the directory and runs no evaluation yet
+/// when it calls this at startup, so every entry with the evaluation prefix is
+/// left over from a daemon that stopped while an evaluation was blocked in a
+/// file system call. Other entries are kept. A failure is logged and does not
+/// stop the daemon: the next start tries again.
+pub(crate) fn sweep_scratch(scratch_root: &Path) {
+    let entries = match std::fs::symlink_metadata(scratch_root) {
+        Ok(metadata) if metadata.is_dir() => std::fs::read_dir(scratch_root),
+        Ok(_not_a_directory) => {
+            warn!(
+                event = "checkout_trust.sweep_failed",
+                path = %scratch_root.display(),
+                reason = "the scratch directory is not a directory",
+                "stale checkout trust repositories were not removed"
+            );
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    let entries = match entries {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(
+                event = "checkout_trust.sweep_failed",
+                path = %scratch_root.display(),
+                error = %error,
+                "stale checkout trust repositories were not removed"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    event = "checkout_trust.sweep_failed",
+                    path = %scratch_root.display(),
+                    error = %error,
+                    "a stale checkout trust repository was not removed"
+                );
+                continue;
+            }
+        };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(SCRATCH_PREFIX))
+        {
+            continue;
+        }
+        let path = entry.path();
+        // `remove_dir_all` does not follow a symbolic link it meets.
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_other) => std::fs::remove_file(&path),
+            Err(error) => Err(error),
+        };
+        match removed {
+            Ok(()) => debug!(
+                event = "checkout_trust.swept",
+                path = %path.display(),
+                "removed a stale checkout trust repository"
+            ),
+            Err(error) => warn!(
+                event = "checkout_trust.sweep_failed",
+                path = %path.display(),
+                error = %error,
+                "a stale checkout trust repository was not removed"
+            ),
+        }
+    }
+}
+
 /// Runs git in a private bare repository under one total deadline.
 struct Git {
     program: std::path::PathBuf,
@@ -949,7 +1040,7 @@ impl Git {
             .create(scratch_root)
             .map_err(|_unwritable| Failure::Disk)?;
         let private = tempfile::Builder::new()
-            .prefix("pohunek-trust-")
+            .prefix(SCRATCH_PREFIX)
             .tempdir_in(scratch_root)
             .map_err(|_unwritable| Failure::Disk)?;
         let path = private.path().to_str().ok_or(Failure::Disk)?.to_owned();
