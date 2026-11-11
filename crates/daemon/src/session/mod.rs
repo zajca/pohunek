@@ -4530,6 +4530,7 @@ impl SessionRegistry {
             rows: params.rows,
             env_extra,
             validated_program,
+            worker_file: inputs.worker_file,
         };
         let plan = build_launch_command(
             resolved,

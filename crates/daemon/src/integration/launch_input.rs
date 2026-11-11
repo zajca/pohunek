@@ -95,6 +95,8 @@ pub struct LaunchInputContext<'a> {
     /// `<name>` at [`Self::file_path`]. A contributor that must embed a
     /// file's path inside another file builds it from here.
     pub private_dir: &'a Path,
+    /// The shared hook failure trace, when the daemon knows its log directory.
+    pub hook_trace_path: Option<&'a Path>,
 }
 
 impl LaunchInputContext<'_> {
@@ -138,6 +140,11 @@ pub struct LaunchInput {
     pub root_args: Vec<String>,
     /// Private files core writes before the launch.
     pub files: Vec<PrivateFile>,
+    /// Name of a launch-input file the session worker writes, after it chose
+    /// its instance id and before it starts the agent. Core removes an earlier
+    /// launch's copy, resolves `{file:<name>}` placeholders to its path and
+    /// hands the path to the worker; it never writes the file itself.
+    pub worker_file: Option<String>,
 }
 
 /// A contribution after placement: placeholders resolved, files written.
@@ -147,6 +154,9 @@ pub struct PlacedLaunchInput {
     pub env: Vec<(String, String)>,
     /// Arguments to place before the native session arguments.
     pub root_args: Vec<String>,
+    /// Absolute path of the file the worker writes, when the contribution
+    /// names one.
+    pub worker_file: Option<PathBuf>,
 }
 
 /// Computes the input one runtime adds to a launch.
@@ -207,6 +217,16 @@ fn validate(input: &LaunchInput) -> Result<(), ProtocolError> {
             return Err(invalid(format!("file {:?} is listed twice", file.name)));
         }
     }
+    if let Some(name) = &input.worker_file {
+        if !pohunek_paths::valid_launch_input_name(name) {
+            return Err(invalid(format!("file name {name:?} is not allowed")));
+        }
+        if input.files.iter().any(|file| &file.name == name) {
+            return Err(invalid(format!(
+                "file {name:?} is both written by core and by the worker"
+            )));
+        }
+    }
     for (name, _value) in &input.env {
         let acceptable = !name.is_empty()
             && !name.starts_with(RESERVED_ENV_PREFIX)
@@ -232,7 +252,7 @@ fn validate(input: &LaunchInput) -> Result<(), ProtocolError> {
 fn resolve_placeholders(
     text: &str,
     directory: &Path,
-    files: &[PrivateFile],
+    input: &LaunchInput,
 ) -> Result<String, ProtocolError> {
     let mut resolved = String::with_capacity(text.len());
     let mut rest = text;
@@ -243,7 +263,9 @@ fn resolve_placeholders(
             return Err(invalid("a file placeholder is not closed"));
         };
         let name = &after[..end];
-        if !files.iter().any(|file| file.name == name) {
+        let known = input.files.iter().any(|file| file.name == name)
+            || input.worker_file.as_deref() == Some(name);
+        if !known {
             return Err(invalid(format!("placeholder names unknown file {name:?}")));
         }
         let path = directory.join(pohunek_paths::launch_input_file_name(name));
@@ -304,13 +326,13 @@ pub(crate) fn place(
         .env
         .iter()
         .map(|(name, value)| {
-            resolve_placeholders(value, &path, &input.files).map(|value| (name.clone(), value))
+            resolve_placeholders(value, &path, input).map(|value| (name.clone(), value))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let root_args = input
         .root_args
         .iter()
-        .map(|arg| resolve_placeholders(arg, &path, &input.files))
+        .map(|arg| resolve_placeholders(arg, &path, input))
         .collect::<Result<Vec<_>, _>>()?;
     remove_stale(&directory, &input.files)?;
     for file in &input.files {
@@ -328,7 +350,15 @@ pub(crate) fn place(
             )
             .map_err(unavailable)?;
     }
-    Ok(PlacedLaunchInput { env, root_args })
+    let worker_file = input
+        .worker_file
+        .as_deref()
+        .map(|name| path.join(pohunek_paths::launch_input_file_name(name)));
+    Ok(PlacedLaunchInput {
+        env,
+        root_args,
+        worker_file,
+    })
 }
 
 /// Unlinks the launch-input entries of earlier launches that this

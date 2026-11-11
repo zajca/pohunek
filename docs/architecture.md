@@ -1700,7 +1700,10 @@ The Muse Code handler is the first user of this seam
 is a per-session managed hooks overlay plus the reporter script, in the state
 directory, never in the session `TMPDIR`, the worktree or the Muse config home
 (Muse hooks run outside Muse's sandbox, so a sandbox-writable overlay would be
-a sandbox escape). The reporter is stateless and reaches the worker only.
+a sandbox escape). The reporter reaches the worker only. A contribution may also name one
+launch-input file the session worker writes itself (`Initialize.handshake_file`), after it chose its
+instance id and before it starts the agent; the Muse handler uses it for the routing handshake its
+hooks read when Muse starts them without the `POHUNEK_*` environment.
 
 Plugins live outside core. A new runtime package is never
 added to this repository: an official plugin lives in `pohunekd/plugin-<name>`,

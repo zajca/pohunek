@@ -1122,6 +1122,7 @@ impl SessionRegistry {
             rows: binding.rows,
             env_extra: inputs.env,
             validated_program,
+            worker_file: inputs.worker_file,
         };
         let command = resume_pty_command_from_launch(
             &program,

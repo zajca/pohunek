@@ -633,11 +633,24 @@ overlay the config home would produce and reports a file a launch would refuse a
 at launch, not there. The reporter rebuilds its search path from the absolute entries
 of the `PATH` Muse leaves it, else a fixed system path, so a `python3` that only the
 daemon's `PATH` finds (Homebrew or Nix, say) is found by `integration doctor` but not
-by the hook. The reporter is stateless, reports the
+by the hook. The reporter writes no file but the hook trace, reports the
 root session only (`session_id` equal to `MUSE_SESSION_ID`, `-reminder` threads
 dropped), reports subagents without a role, and reaches the worker only. A
 foreground `muse` started inside a shell session gets no overlay and no
-identity. The payload fields, the hooks file layout and the `-c` spelling are
+identity. Muse starts the hooks of the conversation `/clear` creates without the
+`POHUNEK_*` variables, so the overlay also passes the reporter the session id, a
+handshake file path and the hook trace location as arguments, and the session
+worker writes that file (`launch-input.muse-handshake.json`, mode `0600`, in the
+session's launch-input directory) after it chose its instance id and before it
+starts Muse; each launch removes the earlier copy and the file goes with the
+session. The reporter reads it only when `POHUNEK_ENV` or `POHUNEK_SESSION_ID` is
+missing, and refuses a file that is missing, a symlink, not a regular file, owned
+by another user, readable by group or other, hard-linked, larger than 8 KiB, not
+the expected JSON or written for another session; every refusal reports nothing
+and appends one `handshake_*` line to the hook trace the overlay named. A worker
+that predates the handshake ignores the `Initialize.handshake_file` field and writes no
+file, so after `/clear` such a session traces `handshake_missing` until it is
+relaunched. The payload fields, the hooks file layout and the `-c` spelling are
 unverified against a real Muse run.
 `cline-hook-v1` (feature `integration-cline-hook-v1`, hook schema
 `identity-subagent-v1`, reference kind `id`) keeps a Cline session in the TUI's

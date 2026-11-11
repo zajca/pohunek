@@ -1,0 +1,3 @@
+## Unreleased (2026-11-11, Muse handshake across /clear, #1924)
+
+- The Muse reporter keeps the Pohunek route after `/clear`: the session worker writes a `0600` handshake file (`launch-input.muse-handshake.json`) before it starts Muse, the overlay passes the reporter its path, the session id and the hook trace location, and the reporter reads the file only when the `POHUNEK_*` environment is absent. `Initialize` gains the optional `handshake_file`; a worker that predates it writes nothing and the reporter traces `handshake_missing`. Every run that cannot report appends a `handshake_*` trace line. See [Hook schemas and integration handlers](guides/runtime-packages.md#hook-schemas-and-integration-handlers).

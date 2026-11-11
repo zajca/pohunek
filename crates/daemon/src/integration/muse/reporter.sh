@@ -5,10 +5,17 @@
 # POHUNEK_INTEGRATION_VERSION=1
 #
 # Muse hook reporter: reports the root session identity and the provider-managed
-# subagent lifecycle to the session worker. Stateless: it writes no file but the
-# hook trace. Fire-and-forget: every failure exits 0 without output so the hook
-# can never break the agent. A run that does not deliver its report appends one
-# bounded line per reason to the hook trace named by POHUNEK_HOOK_TRACE_PATH.
+# subagent lifecycle to the session worker. It writes no file but the hook
+# trace. Fire-and-forget: every failure exits 0 without output so the hook can
+# never break the agent. A run that does not deliver its report appends one
+# bounded line per reason to the hook trace.
+#
+# Arguments: the action, then values the overlay fixed for this session: the
+# pohunek session id, the handshake file, the hook trace path and the hook trace
+# size bound. A hook that still has the POHUNEK_* environment uses it and
+# ignores the handshake file. Muse starts the hooks of a conversation created by
+# /clear without those variables; the reporter then reads the routing values the
+# session worker wrote into the handshake file.
 #
 # UNVERIFIED: the hook payload fields below come from the Muse documentation,
 # the MIT Muse Code SDK schema and its changelog (release 1.4.13), not from a
@@ -41,14 +48,22 @@ case "$action" in
   *) exit 0 ;;
 esac
 
-[ "${POHUNEK_ENV:-}" = "1" ] || exit 0
-[ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
+session_arg="${2:-}"
+handshake_arg="${3:-}"
+trace_path_arg="${4:-}"
+trace_max_arg="${5:-}"
+
+# Without the environment the handshake file is the only route; an invocation
+# that names neither has nothing to report to and nowhere to trace.
+if [ "${POHUNEK_ENV:-}" != "1" ] || [ -z "${POHUNEK_SESSION_ID:-}" ]; then
+  [ -n "$handshake_arg" ] || exit 0
+fi
 command -v python3 >/dev/null 2>&1 || exit 0
 agent_pid="$PPID"
 
 POHUNEK_HOOK_ACTION="$action" \
 POHUNEK_AGENT_PID="$agent_pid" \
-python3 -I - 3<&0 <<'PY' || exit 0
+python3 -I - "$session_arg" "$handshake_arg" "$trace_path_arg" "$trace_max_arg" 3<&0 <<'PY' || exit 0
 import atexit
 import errno
 import fcntl
@@ -100,14 +115,32 @@ MAX_TRACE_BYTES_DIGITS = 15
 TRACE_LOCK_ATTEMPTS = 5
 TRACE_LOCK_RETRY_SECONDS = 0.005
 
-session_id = os.environ.get("POHUNEK_SESSION_ID")
+# The values the overlay fixed for this session, in the order of the arguments.
+ARGUMENT_COUNT = 4
+arguments = (sys.argv[1:] + [""] * ARGUMENT_COUNT)[:ARGUMENT_COUNT]
+argument_session, handshake_path, argument_trace_path, argument_trace_max = arguments
+
+# The environment names the route when the agent kept it; otherwise the route
+# comes from the handshake file once it is read and checked.
+environment_route = (
+    os.environ.get("POHUNEK_ENV") == "1" and bool(os.environ.get("POHUNEK_SESSION_ID"))
+)
 action = os.environ.get("POHUNEK_HOOK_ACTION")
-worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
-worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
-trace_path = os.environ.get("POHUNEK_HOOK_TRACE_PATH")
-trace_max_raw = os.environ.get("POHUNEK_HOOK_TRACE_MAX_BYTES")
-reference_kind = os.environ.get("POHUNEK_NATIVE_REFERENCE_KIND")
+if environment_route:
+    session_id = os.environ.get("POHUNEK_SESSION_ID")
+    worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
+    worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID")
+    trace_path = os.environ.get("POHUNEK_HOOK_TRACE_PATH")
+    trace_max_raw = os.environ.get("POHUNEK_HOOK_TRACE_MAX_BYTES")
+    reference_kind = os.environ.get("POHUNEK_NATIVE_REFERENCE_KIND")
+else:
+    session_id = argument_session or None
+    worker_socket_path = None
+    worker_instance_id = None
+    trace_path = argument_trace_path or None
+    trace_max_raw = argument_trace_max or None
+    reference_kind = None
 # Muse sets the root session id for every hook command, whatever thread fires it.
 muse_session_id = os.environ.get("MUSE_SESSION_ID") or None
 
@@ -126,8 +159,20 @@ def positive_int(raw):
     return None
 
 
-trace_max_bytes = positive_int(trace_max_raw)
-trace_enabled = bool(trace_path) and os.path.isabs(trace_path) and trace_max_bytes is not None
+trace_max_bytes = None
+trace_enabled = False
+
+
+def configure_trace():
+    # The trace is on when it has an absolute path and a positive size bound.
+    global trace_max_bytes, trace_enabled
+    trace_max_bytes = positive_int(trace_max_raw)
+    trace_enabled = (
+        bool(trace_path) and os.path.isabs(trace_path) and trace_max_bytes is not None
+    )
+
+
+configure_trace()
 trace_lines = []
 
 
@@ -221,9 +266,98 @@ def flush_trace():
             return
 
 
+# Handshake file bounds. The file holds a few short strings, so a larger one is
+# not the worker's. The open follows no symlink and cannot block on a FIFO.
+MAX_HANDSHAKE_BYTES = 8192
+HANDSHAKE_FORMAT_VERSION = 1
+HANDSHAKE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+# Group and other permission bits; a handshake carrying any of them is refused.
+HANDSHAKE_SHARED_MODE_BITS = 0o077
+
+
+def refuse_handshake(reason, detail=None):
+    trace(reason, detail)
+    raise SystemExit(0)
+
+
+def read_handshake_bytes():
+    # The file content, or traces why the file cannot be trusted and exits.
+    if not handshake_path or not os.path.isabs(handshake_path):
+        refuse_handshake("handshake_missing", "unnamed")
+    try:
+        descriptor = os.open(handshake_path, HANDSHAKE_OPEN_FLAGS)
+    except FileNotFoundError:
+        refuse_handshake("handshake_missing", "absent")
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            refuse_handshake("handshake_unsafe", "symlink")
+        refuse_handshake("handshake_unreadable", errno_name(error))
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            refuse_handshake("handshake_unsafe", "not_regular")
+        if opened.st_uid != os.getuid():
+            refuse_handshake("handshake_unsafe", "owner")
+        if opened.st_nlink != 1:
+            refuse_handshake("handshake_unsafe", "links")
+        if opened.st_mode & HANDSHAKE_SHARED_MODE_BITS:
+            refuse_handshake("handshake_unsafe", "mode")
+        if opened.st_size > MAX_HANDSHAKE_BYTES:
+            refuse_handshake("handshake_too_large")
+        return os.read(descriptor, MAX_HANDSHAKE_BYTES + 1)
+    except OSError as error:
+        refuse_handshake("handshake_unreadable", errno_name(error))
+    finally:
+        os.close(descriptor)
+
+
+def handshake_text(document, name):
+    value = document.get(name)
+    if not isinstance(value, str) or not value:
+        refuse_handshake("handshake_invalid", name)
+    return value
+
+
+def load_handshake():
+    # Takes the route from the handshake file the session worker wrote.
+    global worker_socket_path, worker_instance_id, trace_path, trace_max_raw, reference_kind
+    content = read_handshake_bytes()
+    if len(content) > MAX_HANDSHAKE_BYTES:
+        refuse_handshake("handshake_too_large")
+    try:
+        document = json.loads(content)
+    except RecursionError:
+        refuse_handshake("handshake_invalid", "too_deep")
+    except UnicodeDecodeError:
+        refuse_handshake("handshake_invalid", "not_utf8")
+    except ValueError:
+        refuse_handshake("handshake_invalid", "not_json")
+    if not isinstance(document, dict):
+        refuse_handshake("handshake_invalid", "not_object")
+    version = document.get("version")
+    if type(version) is not int or version != HANDSHAKE_FORMAT_VERSION:
+        refuse_handshake("handshake_invalid", "version")
+    if handshake_text(document, "session_id") != session_id:
+        refuse_handshake("handshake_session_mismatch")
+    worker_instance_id = handshake_text(document, "worker_instance_id")
+    worker_socket_path = handshake_text(document, "worker_socket_path")
+    file_trace_path = handshake_text(document, "hook_trace_path")
+    file_trace_max = document.get("hook_trace_max_bytes")
+    if type(file_trace_max) is not int:
+        refuse_handshake("handshake_invalid", "hook_trace_max_bytes")
+    kind = document.get("native_reference_kind")
+    reference_kind = kind if isinstance(kind, str) and kind else None
+    # The worker's trace location replaces the overlay's once the file is trusted.
+    trace_path = file_trace_path
+    trace_max_raw = str(file_trace_max)
+    configure_trace()
+
+
 if not session_id:
     raise SystemExit(0)
 atexit.register(flush_trace)
+if not environment_route:
+    load_handshake()
 
 if not worker_socket_path:
     trace("worker_socket_missing", "unset")

@@ -4109,6 +4109,7 @@ fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> La
         cols: 80,
         rows: 24,
         runtime_version: None,
+        worker_file: None,
     }
 }
 

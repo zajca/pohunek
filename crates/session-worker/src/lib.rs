@@ -24,6 +24,7 @@ mod background;
 mod child_spawn;
 mod config;
 mod error;
+mod handshake;
 mod identity;
 mod input;
 mod journal;
