@@ -381,6 +381,10 @@ fn entries(program: &str) -> Vec<ArchiveEntry> {
 }
 
 fn entries_of(descriptor: &str) -> Vec<ArchiveEntry> {
+    entries_with_manifest(descriptor, DETECT_MANIFEST)
+}
+
+fn entries_with_manifest(descriptor: &str, manifest: &str) -> Vec<ArchiveEntry> {
     vec![
         ArchiveEntry {
             path: "runtime.toml".to_owned(),
@@ -389,7 +393,7 @@ fn entries_of(descriptor: &str) -> Vec<ArchiveEntry> {
         },
         ArchiveEntry {
             path: "detect.toml".to_owned(),
-            contents: DETECT_MANIFEST.as_bytes().to_vec(),
+            contents: manifest.as_bytes().to_vec(),
             executable: false,
         },
     ]
@@ -601,7 +605,21 @@ async fn install_descriptor<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (bytes, digest) = archive_of(&entries_of(document));
+    install_with_manifest(framed, plugins, name, document, DETECT_MANIFEST, dry_run).await
+}
+
+async fn install_with_manifest<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    plugins: &Path,
+    name: &str,
+    document: &str,
+    manifest: &str,
+    dry_run: bool,
+) -> (PackageDigest, Result<Value, protocol::ProtocolError>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (bytes, digest) = archive_of(&entries_with_manifest(document, manifest));
     let archive_path = plugins.with_file_name(format!("{name}.tar.zst"));
     std::fs::write(&archive_path, &bytes).expect("write the archive");
     let result = exchange(
@@ -1493,6 +1511,63 @@ async fn revision_versions_are_read_by_inspect_and_the_launch_gate() {
     result.expect("the strict descriptor installs");
     let runtime = inspected_runtime(&mut local).await;
     assert_eq!((runtime.version, runtime.supported), (None, Some(false)));
+
+    drop(local);
+    servers.stop().await;
+}
+
+const COMPOSER_ABSENT_MANIFEST: &str = r#"[[rules]]
+id = "question"
+state = "blocked"
+priority = 100
+region = "whole_recent"
+contains = "which option"
+composer_absent = true
+"#;
+
+#[tokio::test]
+async fn a_manifest_with_composer_absent_installs_only_with_its_feature() {
+    let servers = spawn_servers("pkg-composer-absent").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = probe_program(&servers.plugins, "probe-composer", "fixture 1.4.13");
+
+    // The matcher belongs to the feature: without it the package is refused
+    // the way a core that does not know the feature refuses it.
+    let (_digest, result) = install_with_manifest(
+        &mut local,
+        &servers.plugins,
+        "composer-no-requires",
+        &probed_descriptor(&program, "1.0.0", "semver-line-v1", ("1.0.0", "2.0.0"), ""),
+        COMPOSER_ABSENT_MANIFEST,
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("composer_absent needs its feature").code,
+        "runtime_feature_unsupported"
+    );
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    let (_digest, result) = install_with_manifest(
+        &mut local,
+        &servers.plugins,
+        "composer-requires",
+        &probed_descriptor(
+            &program,
+            "1.0.1",
+            "semver-line-v1",
+            ("1.0.0", "2.0.0"),
+            "\"detect-composer-absent-v1\"",
+        ),
+        COMPOSER_ABSENT_MANIFEST,
+        false,
+    )
+    .await;
+    result.expect("the descriptor that requires the feature installs");
 
     drop(local);
     servers.stop().await;

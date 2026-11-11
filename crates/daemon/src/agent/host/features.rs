@@ -13,6 +13,10 @@
 use package::version_probe::SEMVER_REVISION_LINE_PARSER_ID;
 use toml::{Table, Value};
 
+use std::sync::Arc;
+
+use crate::detect::Manifest;
+
 use super::definition::{DefinitionError, MAX_LABEL_BYTES};
 use super::transcripts::MUSE_SESSION_PARSER_ID;
 
@@ -21,6 +25,12 @@ pub(super) const MAX_REQUIRES: usize = 16;
 
 /// Separator between the feature name and its version number.
 const VERSION_MARKER: &str = "-v";
+
+/// The feature that owns the detection manifest matcher `composer_absent`.
+///
+/// The matcher lives in the detection manifest, which the descriptor gate
+/// rows cannot see; [`manifest_covered`] enforces it.
+pub(super) const COMPOSER_ABSENT_FEATURE: &str = "detect-composer-absent-v1";
 
 /// One runtime feature this core implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +163,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
     },
     RuntimeFeature {
         id: "version-probe-open-range-v1",
+        since: "0.42.0",
+    },
+    RuntimeFeature {
+        id: COMPOSER_ABSENT_FEATURE,
         since: "0.42.0",
     },
 ];
@@ -347,6 +361,27 @@ pub(super) fn check_gates(
         }),
         None => Ok(()),
     }
+}
+
+/// Returns `manifest` when the descriptor's `requires` covers the features
+/// the detection manifest uses.
+///
+/// # Errors
+///
+/// [`DefinitionError::FeatureNotRequired`] naming `detect_manifest` when the
+/// manifest uses `composer_absent` and `requires` lacks its feature.
+pub(super) fn manifest_covered(
+    descriptor: &Table,
+    manifest: Arc<Manifest>,
+) -> Result<Arc<Manifest>, DefinitionError> {
+    let requires = declared_requires(descriptor).unwrap_or_default();
+    if manifest.uses_composer_fact() && !requires.contains(&COMPOSER_ABSENT_FEATURE) {
+        return Err(DefinitionError::FeatureNotRequired {
+            key: "detect_manifest",
+            feature: COMPOSER_ABSENT_FEATURE,
+        });
+    }
+    Ok(manifest)
 }
 
 /// Checks that every key a required feature makes mandatory is declared.
