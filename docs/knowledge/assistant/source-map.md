@@ -553,6 +553,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/project/mod.rs`
 - `crates/daemon/src/project/config.rs`
 - `crates/daemon/src/project/detect.rs`
+- `crates/daemon/src/project/candidates.rs` — `project.candidates` aggregation, bounds and path filters.
+- `crates/daemon/src/external/history.rs` — the bounded, symlink-safe read of agent history heads for `project.candidates`.
 - `crates/daemon/src/worktree/mod.rs`
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/capabilities.rs`

@@ -34,6 +34,7 @@ use crate::session::SessionRegistry;
 
 #[cfg(target_os = "macos")]
 mod fsevents;
+pub(crate) mod history;
 #[cfg(target_os = "linux")]
 mod inotify;
 mod muse;

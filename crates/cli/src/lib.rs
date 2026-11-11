@@ -352,6 +352,25 @@ enum ProjectAction {
         json: bool,
     },
 
+    /// Propose repositories on the target host from pohunek sessions and,
+    /// when asked, agent history metadata. Read-only: nothing is registered.
+    Candidates {
+        /// Where to look, comma-separated. `history` reads only the working
+        /// directory and modification time of the agent history files the
+        /// installed runtime packages declare, and is the consent to do so.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "SOURCE",
+            value_parser = commands::project::candidate_source_parser(),
+            default_value = "pohunek"
+        )]
+        sources: Vec<protocol::CandidateSource>,
+        /// Emit machine-readable JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Register a project by path (on the target host; defaults to the cwd locally).
     Add {
         /// Path to register, valid on the target host. Omit to use the current
@@ -1487,6 +1506,7 @@ impl ProjectAction {
     fn wants_json(&self) -> bool {
         match self {
             ProjectAction::List { json, .. }
+            | ProjectAction::Candidates { json, .. }
             | ProjectAction::Add { json, .. }
             | ProjectAction::Show { json, .. }
             | ProjectAction::Rename { json, .. }
@@ -2411,6 +2431,9 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 ProjectAction::List { filters, json } => {
                     commands::project::run_list(&host, &paths, &filters, json).await?;
+                }
+                ProjectAction::Candidates { sources, json } => {
+                    commands::project::run_candidates(&host, &paths, sources, json).await?;
                 }
                 ProjectAction::Add {
                     path,

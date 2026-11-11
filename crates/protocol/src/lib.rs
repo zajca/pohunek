@@ -133,11 +133,13 @@ pub use package::{
 };
 #[doc(inline)]
 pub use project::{
-    ActionSummary, ProjectActionParams, ProjectActionResult, ProjectActionsParams,
-    ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListFilter, ProjectListParams,
-    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
-    ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
-    PromptLayer, ProviderKind, WorktreeRemoveParams, WorktreeRemoveResult,
+    ActionSummary, CandidateLimit, CandidateSessions, CandidateSource, ProjectActionParams,
+    ProjectActionResult, ProjectActionsParams, ProjectActionsResult, ProjectAddParams,
+    ProjectCandidate, ProjectCandidatesParams, ProjectCandidatesResult, ProjectInfo,
+    ProjectListFilter, ProjectListParams, ProjectPromptParams, ProjectPromptResult,
+    ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams, ProjectShowParams,
+    ProjectShowResult, ProjectSource, ProjectWorktree, PromptLayer, ProviderKind,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 #[doc(inline)]
 pub use runtime_id::{

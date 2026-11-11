@@ -12,7 +12,8 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use protocol::{
-    method, ActionSummary, ProjectActionParams, ProjectActionsParams, ProjectAddParams,
+    method, ActionSummary, CandidateLimit, CandidateSource, ProjectActionParams,
+    ProjectActionsParams, ProjectAddParams, ProjectCandidatesParams, ProjectCandidatesResult,
     ProjectInfo, ProjectListFilter, ProjectListParams, ProjectPromptParams, ProjectRemoveParams,
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
     PromptLayer, ProviderKind,
@@ -55,6 +56,98 @@ fn parse_source(value: &str) -> Result<ProjectSource, String> {
             "invalid source filter value {other:?}; expected one of: auto, manual"
         )),
     }
+}
+
+/// The clap value parser of `project candidates --sources`: the closed set of
+/// wire names, so shell completion lists them.
+pub(crate) fn candidate_source_parser(
+) -> impl clap::builder::TypedValueParser<Value = CandidateSource> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::PossibleValuesParser::new([
+        CandidateSource::Pohunek.as_str(),
+        CandidateSource::History.as_str(),
+    ])
+    .map(|name| match name.as_str() {
+        "history" => CandidateSource::History,
+        _ => CandidateSource::Pohunek,
+    })
+}
+
+/// Response budget of `project candidates`: the daemon's own scan deadline plus
+/// the repository lookup that may follow its last check, so a scan that ends on
+/// its time bound answers with `limits_reached` instead of timing out here.
+const CANDIDATES_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `project candidates` against the daemon for `host`.
+pub(crate) async fn run_candidates(
+    host: &str,
+    paths: &Paths,
+    sources: Vec<CandidateSource>,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client =
+        Client::connect_with_request_timeout(host, paths, CANDIDATES_RESPONSE_TIMEOUT).await?;
+    let result = client
+        .call::<method::ProjectCandidates>(ProjectCandidatesParams { sources })
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_candidates_human(&result));
+        // Notes go to stderr so a table consumer on stdout is not disturbed.
+        if result.dropped > 0 {
+            eprintln!("pohunek: {} path(s) not listed", result.dropped);
+        }
+        for limit in &result.limits_reached {
+            eprintln!("pohunek: scan cut short: {}", limit_label(*limit));
+        }
+    }
+    Ok(())
+}
+
+fn limit_label(limit: CandidateLimit) -> &'static str {
+    match limit {
+        CandidateLimit::Files => "file limit reached",
+        CandidateLimit::Entries => "directory entry limit reached",
+        CandidateLimit::LineLength => "a history record exceeded the length limit",
+        CandidateLimit::Time => "time limit reached",
+        CandidateLimit::Unknown => "unknown limit reached",
+    }
+}
+
+fn render_candidates_human(result: &ProjectCandidatesResult) -> String {
+    let root_width = result
+        .candidates
+        .iter()
+        .map(|c| c.repo_root.display().to_string().len())
+        .max()
+        .unwrap_or(0)
+        .max("ROOT".len());
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{:<root_width$}  {:<10}  {:<10}  SESSIONS",
+        "ROOT", "REGISTERED", "LAST USED",
+    );
+    for candidate in &result.candidates {
+        let sessions = candidate
+            .sessions
+            .iter()
+            .map(|(agent, counts)| format!("{agent}={}+{}", counts.owned, counts.history))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = writeln!(
+            output,
+            "{:<root_width$}  {:<10}  {:<10}  {sessions}",
+            candidate.repo_root.display(),
+            if candidate.registered { "yes" } else { "-" },
+            candidate
+                .last_used_at
+                .get(..10)
+                .unwrap_or(&candidate.last_used_at),
+        );
+    }
+    output
 }
 
 fn list_params(filters: &[ProjectListFilter]) -> ProjectListParams {

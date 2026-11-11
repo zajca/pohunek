@@ -81,6 +81,15 @@ impl ConfigHomes {
         self.base.get("PATH").map(std::ffi::OsString::from)
     }
 
+    /// The home directory agents launch with, if the base environment has an
+    /// absolute one other than the filesystem root.
+    pub(crate) fn user_home(&self) -> Option<std::path::PathBuf> {
+        self.base
+            .get("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|home| home.is_absolute() && home.parent().is_some())
+    }
+
     /// The runtimes this host serves.
     pub(super) fn host(&self) -> &RuntimeHost {
         self.profiles.runtimes()

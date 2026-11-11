@@ -85,6 +85,10 @@ static METHODS: &[MethodDescriptor] = &[
         description: "Register (or re-add) a project by host-local path.",
     },
     MethodDescriptor {
+        wire_name: "project.candidates",
+        description: "Propose repositories from pohunek sessions and, on request, agent history metadata.",
+    },
+    MethodDescriptor {
         wire_name: "project.list",
         description: "List known projects on the target host.",
     },

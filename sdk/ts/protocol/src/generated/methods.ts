@@ -47,6 +47,8 @@ import type {
   ProjectActionsParams,
   ProjectActionsResult,
   ProjectAddParams,
+  ProjectCandidatesParams,
+  ProjectCandidatesResult,
   ProjectInfo,
   ProjectListParams,
   ProjectPromptParams,
@@ -130,6 +132,7 @@ export interface Methods {
   "project.action": { params: ProjectActionParams; output: ProjectActionResult };
   "project.actions": { params: ProjectActionsParams; output: ProjectActionsResult };
   "project.add": { params: ProjectAddParams; output: ProjectInfo };
+  "project.candidates": { params: ProjectCandidatesParams; output: ProjectCandidatesResult };
   "project.list": { params: ProjectListParams; output: ProjectInfo[] };
   "project.prompt": { params: ProjectPromptParams; output: ProjectPromptResult };
   "project.remove": { params: ProjectRemoveParams; output: ProjectRemoveResult };
@@ -191,6 +194,7 @@ export const METHOD_NAMES = [
   "project.action",
   "project.actions",
   "project.add",
+  "project.candidates",
   "project.list",
   "project.prompt",
   "project.remove",

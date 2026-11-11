@@ -9,12 +9,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use protocol::{
-    ProjectActionParams, ProjectActionsParams, ProjectActionsResult, ProjectAddParams,
-    ProjectListParams, ProjectPromptParams, ProjectRemoveParams, ProjectRenameParams,
-    ProjectShowParams, ProtocolError, Request, Response,
+    CandidateSource, ProjectActionParams, ProjectActionsParams, ProjectActionsResult,
+    ProjectAddParams, ProjectCandidatesParams, ProjectListParams, ProjectPromptParams,
+    ProjectRemoveParams, ProjectRenameParams, ProjectShowParams, ProtocolError, Request, Response,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
+use super::{ControlTransport, DaemonState};
+use crate::project::candidates::{self, Inputs, OwnedSession};
 use crate::project::{LiveSession, ProjectConfigResolver, ProjectManager};
 use crate::session::SessionRegistry;
 
@@ -85,6 +87,101 @@ pub(super) async fn handle_project_list(request: &Request, sessions: &SessionReg
     };
     let filters = params.filters;
     run_project_blocking(request, move || pm.list(&filters)).await
+}
+
+/// `project.candidates`: repositories proposed from pohunek sessions and, when
+/// asked for, agent history metadata. Read-only; registers nothing.
+pub(super) async fn handle_project_candidates(request: &Request, state: &DaemonState) -> Response {
+    let sessions = &state.sessions;
+    let params = match parse_optional_params::<ProjectCandidatesParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    // Agent history is the owner's: it is read only for a caller on the local
+    // control socket, like the profile homes of the integration methods.
+    if params.sources.contains(&CandidateSource::History)
+        && state.transport == ControlTransport::Remote
+    {
+        return error_value(
+            request,
+            ProtocolError::new(
+                protocol::ErrorClass::Daemon,
+                super::integration::PROFILE_LOCAL_ONLY_CODE,
+                "the history source reads agent history of the daemon host and is served on the local control socket only",
+                Some("run the command on the host that runs the daemon".to_owned()),
+            ),
+        );
+    }
+    let pm = match require_projects(request, sessions) {
+        Ok(pm) => pm,
+        Err(resp) => return resp,
+    };
+    // No source named selects the pohunek source alone: agent history is read
+    // only when the caller asks for it.
+    let wants_pohunek =
+        params.sources.is_empty() || params.sources.contains(&CandidateSource::Pohunek);
+    let homes = if params.sources.contains(&CandidateSource::History) {
+        match sessions.integration_homes() {
+            Ok(homes) => Some(homes),
+            Err(err) => return error_value(request, err),
+        }
+    } else {
+        None
+    };
+    let owned: Vec<OwnedSession> = if wants_pohunek {
+        sessions
+            .list()
+            .await
+            .into_iter()
+            .filter(|info| info.external != Some(true))
+            .map(|info| OwnedSession {
+                agent: info.agent_base.as_wire().to_owned(),
+                cwd: info.cwd,
+                updated_at: info.updated_at,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let config = sessions.candidate_config().clone();
+    run_project_blocking(request, move || {
+        let started = std::time::Instant::now();
+        let deadline = candidates::deadline_from(started, &config);
+        let registered = pm
+            .list(&[])?
+            .into_iter()
+            .map(|project| project.git_common_dir)
+            .collect();
+        let history = match homes {
+            Some(homes) => {
+                let home = homes.user_home().ok_or_else(|| {
+                    ProtocolError::new(
+                        protocol::ErrorClass::Daemon,
+                        "candidates_home_unavailable",
+                        "the daemon environment has no home directory to bound the history scan"
+                            .to_owned(),
+                        None,
+                    )
+                })?;
+                Some((
+                    crate::external::history::scan(&homes, &config, deadline),
+                    home,
+                ))
+            }
+            None => None,
+        };
+        Ok(candidates::resolve(
+            Inputs {
+                owned,
+                history,
+                registered,
+            },
+            &config,
+            deadline,
+            std::collections::BTreeSet::new(),
+        ))
+    })
+    .await
 }
 
 /// `project.add`: register (or re-add) a project by host-local path.
