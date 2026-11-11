@@ -654,10 +654,13 @@ session. The reporter reads it only when `POHUNEK_ENV` or `POHUNEK_SESSION_ID` i
 missing, and refuses a file that is missing, a symlink, not a regular file, owned
 by another user, readable by group or other, hard-linked, larger than 8 KiB, not
 the expected JSON or written for another session; every refusal reports nothing
-and appends one `handshake_*` line to the hook trace the overlay named. A worker
-that predates the handshake ignores the `Initialize.handshake_file` field and writes no
-file, so after `/clear` such a session traces `handshake_missing` until it is
-relaunched. The payload fields, the hooks file layout and the `-c` spelling are
+and appends one `handshake_*` line to the hook trace the overlay named. A session
+launched before the upgrade keeps the overlay and reporter of its launch, which read
+no handshake, so after `/clear` it reports nothing and traces nothing until it is
+resumed or relaunched. A worker binary that predates the handshake ignores the
+`Initialize.handshake_file` field and writes no file, so a session it runs under a
+newer daemon traces `handshake_missing` after each `/clear`, and a relaunch on that
+same worker binary does not change it. The payload fields, the hooks file layout and the `-c` spelling are
 unverified against a real Muse run.
 `cline-hook-v1` (feature `integration-cline-hook-v1`, hook schema
 `identity-subagent-v1`, reference kind `id`) keeps a Cline session in the TUI's
