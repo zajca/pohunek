@@ -552,7 +552,19 @@ pub(crate) fn validate_definition_launch_with_timeout(
     launch_path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_with_timeout_detailed(definition, spawn, launch_path, timeout)
+    validate_definition_launch_with_clock(definition, spawn, launch_path, timeout, &Instant::now)
+}
+
+/// [`validate_definition_launch_with_timeout`] reading the probe's deadline
+/// from `now`.
+fn validate_definition_launch_with_clock(
+    definition: &RuntimeDefinition,
+    spawn: Spawn<'_>,
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+    now: &impl Fn() -> Instant,
+) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+    validate_definition_launch_detailed_with_clock(definition, spawn, launch_path, timeout, now)
         .map_err(|failure| match failure {
             LaunchValidationFailure::Missing => {
                 ProtocolError::agent_binary_missing(reported_program(definition, spawn))
@@ -627,6 +639,24 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
     launch_path: Option<&OsStr>,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
+    validate_definition_launch_detailed_with_clock(
+        definition,
+        spawn,
+        launch_path,
+        timeout,
+        &Instant::now,
+    )
+}
+
+/// [`validate_definition_launch_with_timeout_detailed`] reading the probe's
+/// deadline from `now`.
+fn validate_definition_launch_detailed_with_clock(
+    definition: &RuntimeDefinition,
+    spawn: Spawn<'_>,
+    launch_path: Option<&OsStr>,
+    timeout: Duration,
+    now: &impl Fn() -> Instant,
+) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
     let probed = definition.version_probe_parser().is_some();
     let binary = match spawn {
         Spawn::HostShell if probed => return Err(LaunchValidationFailure::Unsupported),
@@ -658,7 +688,7 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
         definition.launch_env(),
         timeout,
         &[],
-        &Instant::now,
+        now,
     );
     match outcome {
         ProbeOutcome::Output(output) => policy
@@ -1316,6 +1346,61 @@ strategy = "none"
             reads.get(),
             STEPS + 1,
             "the probe must expire when the clock reaches start + timeout"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_reaches_its_full_deadline_is_refused_with_its_own_message() {
+        const STEPS: u32 = 4;
+        let dir = temp_agents_dir();
+        let tool = dir.join("tool");
+        let binary = tool.display().to_string();
+        write_test_executable(
+            &tool,
+            &format!("#!/bin/sh\nsleep {}\n", FIXTURE_HOLD.as_secs()),
+        );
+        let definition = probed_definition(SEMVER_PROBE);
+        // The fake clock advances by a quarter of the deadline on every read, so
+        // the probe ends on the read that reaches it without waiting.
+        let start = Instant::now();
+        let reads = Cell::new(0_u32);
+        let clock = || {
+            let read = reads.get();
+            reads.set(read + 1);
+            start + (VERSION_PROBE_TIMEOUT / STEPS) * read
+        };
+
+        let error = validate_definition_launch_with_clock(
+            &definition,
+            Spawn::Program(&binary),
+            process_path().as_deref(),
+            VERSION_PROBE_TIMEOUT,
+            &clock,
+        )
+        .expect_err("a probe that never exits is refused");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+        assert!(
+            error
+                .msg
+                .contains("version check did not finish within 2 seconds"),
+            "{error:?}"
+        );
+        assert!(!error.msg.contains(&binary), "{error:?}");
+        assert!(error.recover.is_some(), "{error:?}");
+
+        // A budget shorter than the deadline that runs out is the doctor's
+        // budget, not the probe's deadline.
+        reads.set(0);
+        let shortened = validate_definition_launch_detailed_with_clock(
+            &definition,
+            Spawn::Program(&binary),
+            process_path().as_deref(),
+            VERSION_PROBE_TIMEOUT / 2,
+            &clock,
+        );
+        assert_eq!(
+            shortened.err(),
+            Some(LaunchValidationFailure::ProbeTimedOut)
         );
     }
 

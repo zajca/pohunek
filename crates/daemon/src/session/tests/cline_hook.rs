@@ -183,6 +183,23 @@ impl Rig {
         .await;
     }
 
+    /// Makes the installed reporters wait for the worker's answer for
+    /// [`HANG_GUARD`] instead of their 0.5 s socket budget, so the connection
+    /// the worker verifies stays open until the worker has decided.
+    fn hold_the_socket_until_answered(&self) {
+        const BUDGET: &str = "SOCKET_TIMEOUT_SECS = 0.5";
+        for entry in fs::read_dir(self.cline_home.join("hooks")).expect("the hooks directory") {
+            let path = entry.expect("a hook entry").path();
+            let Ok(body) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if body.contains(BUDGET) {
+                let held = format!("SOCKET_TIMEOUT_SECS = {}", HANG_GUARD.as_secs());
+                fs::write(&path, body.replace(BUDGET, &held)).expect("rewrite the reporter");
+            }
+        }
+    }
+
     /// Asserts that exactly `count` hook files ran and every one exited 0
     /// without writing to stdout or stderr.
     fn assert_hooks_quiet(&self, count: usize) {
@@ -734,6 +751,7 @@ async fn a_hook_outside_the_pty_tree_is_refused_by_the_worker_even_with_the_sand
     let rig = Rig::new("cline-detached")
         .await
         .expect("create the Cline session");
+    rig.hold_the_socket_until_answered();
 
     rig.fire_as("TaskResume", "root_resume", DETACHED).await;
 

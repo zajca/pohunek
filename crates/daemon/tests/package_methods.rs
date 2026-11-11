@@ -1630,6 +1630,50 @@ async fn an_open_ended_range_admits_every_release_from_min_and_names_the_minimum
         }
     }
 
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn the_revision_parser_takes_an_open_range_and_orders_revisions_against_min() {
+    let servers = spawn_servers("pkg-open-revision").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    for (index, (printed, supported)) in [("1.4.13-R2", true), ("1.4.12-R9", false)]
+        .into_iter()
+        .enumerate()
+    {
+        let program = probe_program(
+            &servers.plugins,
+            &format!("probe-open-revision-{index}"),
+            &format!("fixture {printed}"),
+        );
+        let document = probed_descriptor(
+            &program,
+            &format!("1.2.{index}"),
+            REVISION_PARSER,
+            ("1.4.13", "99.0.0"),
+            &format!("{REVISION_FEATURE}, {OPEN_RANGE_FEATURE}"),
+        )
+        .replace(", below = \"99.0.0\"", "");
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("open-revision-{index}"),
+            &document,
+            false,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{printed}: the revision range installs: {error:?}"));
+        let runtime = inspected_runtime(&mut local).await;
+        assert_eq!(runtime.version.as_deref(), Some(printed), "{printed}");
+        assert_eq!(runtime.supported, Some(supported), "{printed}");
+    }
+
     // Listing the feature does not oblige a descriptor to leave `below` out.
     let program = probe_program(&servers.plugins, "probe-closed", "fixture 2.0.0");
     let (_digest, result) = install_descriptor(
@@ -1666,23 +1710,20 @@ async fn an_open_ended_range_admits_every_release_from_min_and_names_the_minimum
 }
 
 #[tokio::test]
-async fn a_version_probe_receives_the_launch_env_and_one_that_outlasts_its_deadline_is_refused_distinctly(
-) {
-    let servers = spawn_servers("pkg-probe-deadline").await;
+async fn a_version_probe_receives_the_descriptors_launch_env() {
+    let servers = spawn_servers("pkg-probe-env").await;
     let mut local = connect_unix(&servers.socket).await;
-    let cwd = servers
-        .plugins
-        .parent()
-        .expect("the socket directory")
-        .to_path_buf();
-    // The version answers at once when the runtime's launch flag is set and
-    // never otherwise, as a program that waits for an unreachable service.
-    let script = "#!/bin/sh\nif [ \"$PI_QUICK_VERSION\" = 1 ]; then printf '%s\\n' 'fixture 1.4.13'; else exec sleep 600; fi\n";
+    // The program prints an in-range release only when the runtime's launch
+    // flag is set, so the printed release shows what the probe's environment held.
+    let script = "#!/bin/sh\nif [ \"$PI_QUICK_VERSION\" = 1 ]; then printf '%s\\n' 'fixture 1.4.13'; else printf '%s\\n' 'fixture 0.0.1'; fi\n";
     let program = write_program(&servers.plugins, "probe-needs-flag", script);
-    let with_flag = |value: &str, version: &str| -> String {
+    for (index, (value, version, supported)) in [("1", "1.4.13", true), ("0", "0.0.1", false)]
+        .into_iter()
+        .enumerate()
+    {
         let mut document = probed_descriptor(
             &program,
-            version,
+            &format!("1.0.{index}"),
             "semver-line-v1",
             ("1.0.0", "2.0.0"),
             LAUNCH_ENV_FEATURE,
@@ -1690,53 +1731,22 @@ async fn a_version_probe_receives_the_launch_env_and_one_that_outlasts_its_deadl
         document.push_str(&launch_env_table(&[format!(
             "PI_QUICK_VERSION = \"{value}\""
         )]));
-        document
-    };
-
-    let (_digest, result) = install_descriptor(
-        &mut local,
-        &servers.plugins,
-        "flag-set",
-        &with_flag("1", "1.0.0"),
-        false,
-    )
-    .await;
-    result.expect("the descriptor with the launch flag installs");
-    let runtime = inspected_runtime(&mut local).await;
-    assert_eq!(
-        (runtime.version.as_deref(), runtime.supported),
-        (Some("1.4.13"), Some(true)),
-        "the probe sees the descriptor's launch env"
-    );
-
-    let (_digest, result) = install_descriptor(
-        &mut local,
-        &servers.plugins,
-        "flag-unset",
-        &with_flag("0", "1.0.1"),
-        false,
-    )
-    .await;
-    result.expect("the descriptor with the flag cleared installs");
-    let error = refused_launch(&mut local, &cwd).await;
-    assert_eq!(error.code, "agent_runtime_unsupported");
-    assert!(
-        error
-            .msg
-            .contains("version check did not finish within 2 seconds"),
-        "{error:?}"
-    );
-    assert!(
-        !error.msg.contains("fixture") && !error.msg.contains("sleep"),
-        "probe text never reaches the refusal: {error:?}"
-    );
-    assert!(
-        error
-            .recover
-            .as_deref()
-            .is_some_and(|hint| hint.contains("launcher")),
-        "{error:?}"
-    );
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("flag-{value}"),
+            &document,
+            false,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("flag {value} installs: {error:?}"));
+        let runtime = inspected_runtime(&mut local).await;
+        assert_eq!(
+            (runtime.version.as_deref(), runtime.supported),
+            (Some(version), Some(supported)),
+            "the probe sees the descriptor's launch env (flag {value})"
+        );
+    }
 
     drop(local);
     servers.stop().await;
