@@ -1702,6 +1702,7 @@ async fn pi_package_relocated_store_is_judged_would_lose_as_resume_refuses_it() 
         },
         &pohunek_daemon::session::upgrade_preflight::PreflightOptions {
             probe_budget: pohunek_service_config::preflight::PROBE_BUDGET,
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
             entry: std::time::Instant::now(),
             release: None,
             profiles_dir: Some(agents.to_path_buf()),

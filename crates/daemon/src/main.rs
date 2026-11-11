@@ -375,6 +375,7 @@ fn print_upgrade_preflight(
                 profiles_dir: Some(paths.config_dir.join(PROFILES_SUBDIR)),
                 host_state_dir: Some(paths.state_dir.clone()),
                 probe_budget,
+                probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
                 entry,
                 launch: launch_environment(&paths, false),
             };

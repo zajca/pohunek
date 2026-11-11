@@ -10,6 +10,8 @@
 
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
+#[path = "support/probe_clock.rs"]
+mod probe_clock;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -266,6 +268,7 @@ impl Host {
             profiles_dir: None,
             host_state_dir: None,
             probe_budget: PROBE_BUDGET,
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
             entry: std::time::Instant::now(),
             launch: Ok(self.launch()),
         }
@@ -1899,6 +1902,7 @@ fn release_options(
         profiles_dir: Some(profiles.to_path_buf()),
         host_state_dir: None,
         probe_budget: PROBE_BUDGET,
+        probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
         entry: std::time::Instant::now(),
         launch: Ok(host.launch()),
     }
@@ -2279,6 +2283,7 @@ fn a_release_plan_that_cannot_be_computed_is_a_refusal_not_an_empty_plan() {
         profiles_dir: None,
         host_state_dir: None,
         probe_budget: PROBE_BUDGET,
+        probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
         entry: std::time::Instant::now(),
         launch: Ok(host.launch()),
     };
@@ -2463,6 +2468,7 @@ async fn the_service_file_allowlist_decides_the_path_the_version_probe_runs_unde
                 profiles_dir: None,
                 host_state_dir: None,
                 probe_budget: PROBE_BUDGET,
+                probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
                 entry: std::time::Instant::now(),
                 launch: Ok(launch),
             },
@@ -2509,6 +2515,7 @@ fn an_unreadable_service_file_refuses_the_plan() {
             profiles_dir: None,
             host_state_dir: None,
             probe_budget: PROBE_BUDGET,
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
             entry: std::time::Instant::now(),
             launch: launch.map_err(|_detail| "the service file is unreadable".to_owned()),
         },
@@ -2939,6 +2946,8 @@ async fn sessions_sharing_a_hanging_executable_are_probed_once_and_share_its_ver
     let agent = hanging_agent(&host, "hanging-shared");
     stopped_sessions_launching(&host, &[agent.clone(), agent.clone(), agent.clone(), agent]);
 
+    // The clock reaches the probe's deadline at its first poll, so the hung
+    // agent is stopped without waiting for the real deadline.
     let report = run_with(
         &host.inputs(),
         &PreflightOptions {
@@ -2946,6 +2955,7 @@ async fn sessions_sharing_a_hanging_executable_are_probed_once_and_share_its_ver
             profiles_dir: None,
             host_state_dir: None,
             probe_budget: Duration::from_secs(3),
+            probe_clock: probe_clock::stepping_probe_clock(),
             entry: std::time::Instant::now(),
             launch: Ok(host.launch()),
         },
@@ -2963,6 +2973,16 @@ async fn sessions_sharing_a_hanging_executable_are_probed_once_and_share_its_ver
         report.stopped_sessions
     );
     assert_eq!(report.at_risk().count(), 4);
+    // A probe that ran its full deadline names it; a budget that ran out
+    // would be reported as exhausted instead.
+    for session in &report.stopped_sessions {
+        assert!(
+            session
+                .detail
+                .contains("version check did not finish within 2 seconds"),
+            "{session:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2983,6 +3003,7 @@ async fn a_spent_probe_budget_judges_the_remaining_sessions_pessimistically() {
             profiles_dir: None,
             host_state_dir: None,
             probe_budget: Duration::from_secs(3),
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
             entry: std::time::Instant::now(),
             launch: Ok(host.launch()),
         },
@@ -3062,6 +3083,7 @@ async fn the_probe_deadline_counts_the_work_before_the_probes_from_the_entry_of_
             host_state_dir: None,
             entry,
             probe_budget: PROBE_BUDGET,
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
             launch: Ok(host.launch()),
         },
         &HostInspector::new(),
@@ -3438,6 +3460,7 @@ async fn no_acceptance_scope_is_issued_for_a_verdict_nothing_can_durably_accept(
         &host.inputs(),
         &PreflightOptions {
             probe_budget: Duration::from_secs(3),
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
             ..host.options()
         },
         &HostInspector::new(),

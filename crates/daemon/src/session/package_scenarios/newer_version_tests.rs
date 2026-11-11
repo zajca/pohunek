@@ -841,6 +841,7 @@ fn release_preflight(
         },
         &crate::session::upgrade_preflight::PreflightOptions {
             probe_budget: pohunek_service_config::preflight::PROBE_BUDGET,
+            probe_clock: crate::capabilities::ProbeClock::default(),
             entry: std::time::Instant::now(),
             release: Some(crate::session::upgrade_preflight::ReleaseInputs {
                 release_dir: release.to_path_buf(),

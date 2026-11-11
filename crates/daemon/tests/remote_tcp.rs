@@ -13,6 +13,8 @@
 
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
+#[path = "support/probe_clock.rs"]
+mod probe_clock;
 mod support;
 
 use std::net::{IpAddr, SocketAddr};
@@ -2063,6 +2065,98 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
         2,
         "aggregate budget permits only two full probes"
     );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A doctor probe budget no host spends, so no probe of the scenario below
+/// runs on a shortened timeout whatever the host's load.
+const DOCTOR_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[tokio::test]
+async fn daemon_doctor_names_a_version_probe_that_ran_to_its_deadline() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let root = pohunek_test_support::tempdir().expect("create hung profile fixture root");
+    let mut process_env = pohunek_test_support::process_env::ProcessEnv::lock();
+    process_env.set("PATH", root.path());
+    let agents = root.path().join("agents");
+    std::fs::create_dir(&agents).expect("create agents directory");
+    // Neither the profile's program nor the optional provider ever answers
+    // its version command.
+    let hung_runtime = root.path().join("hung-runtime");
+    std::fs::write(&hung_runtime, "#!/bin/sh\nexec /bin/sleep 600\n")
+        .expect("write the hung version-probe executable");
+    std::fs::set_permissions(&hung_runtime, std::fs::Permissions::from_mode(0o755))
+        .expect("make the hung runtime executable");
+    std::os::unix::fs::symlink(&hung_runtime, root.path().join("hermes"))
+        .expect("expose the hung runtime as the optional Hermes provider");
+    std::fs::write(
+        agents.join("hung.toml"),
+        format!(
+            "base = \"hermes\"\n{}program = \"{}\"\n[env]\nPATH = \"/bin\"\n",
+            official_runtimes::profile_pin("hermes"),
+            hung_runtime.display()
+        ),
+    )
+    .expect("write the hung profile");
+    // The clock reaches every probe deadline at its first poll, so the hung
+    // programs are stopped without waiting for the real deadline.
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents),
+        probe_clock: probe_clock::stepping_probe_clock(),
+        doctor_probe_budget: DOCTOR_PROBE_BUDGET,
+        ..shell_config()
+    };
+    let (_addr, socket, shutdown, handle) =
+        spawn_dual_servers_serving_official_runtimes("doctor-probe-deadline", "0.0.0", config)
+            .await;
+    let mut client = connect_unix(&socket).await;
+    let payload = ok_payload(
+        exchange(
+            &mut client,
+            &Request::make("doctor-probe-deadline", method::DAEMON_DOCTOR, Value::Null),
+        )
+        .await,
+    );
+    let checks = payload["report"]["checks"]
+        .as_array()
+        .expect("doctor checks array");
+    let find = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("doctor reports {name}: {payload}"))
+    };
+
+    // A probe that ran its full deadline is the program's fault, not the
+    // aggregate budget running out: the detail says so and offers the way out.
+    for (name, status, prefix) in [
+        (
+            "agent_profile_hung",
+            "fail",
+            "The configured executable's version check did not finish within its deadline;",
+        ),
+        (
+            "agent_runtime_hermes",
+            "fail",
+            "Optional provider's version check did not finish within its deadline;",
+        ),
+    ] {
+        let check = find(name);
+        assert_eq!(check["status"], status, "{name}: {payload}");
+        let detail = check["detail"].as_str().expect("detail text");
+        assert!(detail.starts_with(prefix), "{name}: {detail}");
+        assert!(
+            detail.contains("launcher whose version command answers"),
+            "{name}: {detail}"
+        );
+        assert!(!detail.contains("budget"), "{name}: {detail}");
+    }
 
     let _ = shutdown.send(());
     let _ = handle.await;

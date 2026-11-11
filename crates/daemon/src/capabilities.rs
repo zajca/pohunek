@@ -35,6 +35,44 @@ pub(crate) use probe_cache::{ProbeCache, ProbeRequest};
 
 /// Maximum wall time for a local version probe, including interpreter startup.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The clock a version probe's deadline is read from.
+///
+/// The system clock unless a host embeds the daemon with another one, which
+/// lets a scenario reach a probe's full deadline without waiting for it.
+#[derive(Clone)]
+pub struct ProbeClock(Arc<dyn Fn() -> Instant + Send + Sync>);
+
+impl ProbeClock {
+    /// A clock that reads `now`.
+    pub fn new(now: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub(crate) fn now(&self) -> Instant {
+        (self.0)()
+    }
+}
+
+impl Default for ProbeClock {
+    fn default() -> Self {
+        Self::new(Instant::now)
+    }
+}
+
+impl PartialEq for ProbeClock {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ProbeClock {}
+
+impl std::fmt::Debug for ProbeClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProbeClock")
+    }
+}
 /// Maximum stdout the version probe may write or retain.
 const VERSION_OUTPUT_LIMIT: usize = 4 * 1024;
 
@@ -639,14 +677,11 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
     spawn: Spawn<'_>,
     launch_path: Option<&OsStr>,
     timeout: Duration,
+    clock: &ProbeClock,
 ) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
-    validate_definition_launch_detailed_with_clock(
-        definition,
-        spawn,
-        launch_path,
-        timeout,
-        &Instant::now,
-    )
+    validate_definition_launch_detailed_with_clock(definition, spawn, launch_path, timeout, &|| {
+        clock.now()
+    })
 }
 
 /// [`validate_definition_launch_with_timeout_detailed`] reading the probe's

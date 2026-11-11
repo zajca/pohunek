@@ -338,11 +338,13 @@ pub(crate) fn validate_launch_runtime_with_timeout_detailed(
     spawn: Spawn<'_>,
     launch_path: Option<&std::ffi::OsStr>,
     timeout: std::time::Duration,
+    clock: &crate::capabilities::ProbeClock,
 ) -> Result<Option<ValidatedLaunchProgram>, crate::capabilities::LaunchValidationFailure> {
     crate::capabilities::validate_definition_launch_with_timeout_detailed(
         definition,
         spawn,
         launch_path,
         timeout,
+        clock,
     )
 }

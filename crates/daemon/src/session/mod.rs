@@ -517,6 +517,12 @@ pub struct SessionRegistryConfig {
     /// `host.inspect` (`[inventory]` of `service.toml`). Defaults to
     /// [`pohunek_service_config::DEFAULT_INVENTORY_PROBE`].
     pub inventory_probe: pohunek_service_config::InventoryProbe,
+    /// The clock the deadlines of the doctor's version probes are read from.
+    /// Defaults to the system clock.
+    pub probe_clock: crate::capabilities::ProbeClock,
+    /// The time the doctor's version probes share, counted from the first
+    /// probe. Defaults to [`hostcheck::AGENT_RUNTIME_PROBE_BUDGET`].
+    pub doctor_probe_budget: Duration,
     /// Age after which the startup collection may delete the journal
     /// directory of a session that no longer exists (`[worker_journals]` of
     /// `service.toml`). Defaults to
@@ -674,6 +680,8 @@ impl Default for SessionRegistryConfig {
             event_retention: pohunek_service_config::DEFAULT_EVENT_RETENTION,
             remote_keepalive: pohunek_service_config::DEFAULT_KEEPALIVE_TIMING,
             inventory_probe: pohunek_service_config::DEFAULT_INVENTORY_PROBE,
+            probe_clock: crate::capabilities::ProbeClock::default(),
+            doctor_probe_budget: hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
             worker_journal_max_age: pohunek_service_config::DEFAULT_WORKER_JOURNAL_MAX_AGE,
             notification_settings: pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS,
             retention_policy_path: None,
@@ -2778,6 +2786,18 @@ impl SessionRegistry {
     #[must_use]
     pub(crate) fn profiles(&self) -> &ProfileRegistry {
         &self.inner.profiles
+    }
+
+    /// The time the doctor's version probes share.
+    #[must_use]
+    pub(crate) fn doctor_probe_budget(&self) -> Duration {
+        self.inner.config.doctor_probe_budget
+    }
+
+    /// The clock the doctor's version probes read their deadlines from.
+    #[must_use]
+    pub(crate) fn probe_clock(&self) -> &crate::capabilities::ProbeClock {
+        &self.inner.config.probe_clock
     }
 
     /// The version-probe cache `host.inspect` reads through.

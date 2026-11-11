@@ -66,6 +66,8 @@ pub(super) async fn handle_daemon_doctor(
         transport == ControlTransport::Local,
         sessions.rejected_lines_state().await,
         &sessions.live_placements().await,
+        sessions.probe_clock(),
+        sessions.doctor_probe_budget(),
     )
     .await
     {
