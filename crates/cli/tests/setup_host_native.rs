@@ -37,7 +37,9 @@ use ed25519_dalek::SigningKey;
 use native::Installation;
 use package::ANCHOR_FILE_NAME;
 
-use pohunek_cli::host_setup::{apply, plan, ReleasePlanner, ServiceStep, SetupReport};
+use pohunek_cli::host_setup::{
+    apply, plan, plan_selecting, HookSelection, ReleasePlanner, ServiceStep, SetupReport,
+};
 use pohunek_cli::service::context::PathDiscovery;
 use pohunek_cli::service::layout::VerifiedVersionDir;
 #[cfg(target_os = "linux")]
@@ -52,6 +54,7 @@ use pohunek_test_support::fs::copy_shell_image;
 use pohunek_test_support::workspace_root;
 use protocol::{method, SessionId, SessionNewParams};
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 
 /// Error code of a setup that stopped after the service install.
 const PLAN_CHANGED_CODE: &str = "setup_plan_changed_after_install";
@@ -132,6 +135,9 @@ fn release(installation: &Installation) -> PathBuf {
 }
 
 /// Snapshot of a directory tree: each entry's bytes, or `None` for a directory.
+/// Every entry below `root` with the SHA-256 of each file's content. A
+/// snapshot that held the bytes would print the staged release binaries
+/// (hundreds of MiB) in the message of a failed comparison.
 fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     let mut entries = BTreeMap::new();
     let mut pending = vec![root.to_path_buf()];
@@ -147,7 +153,8 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
                 entries.insert(relative, None);
                 pending.push(path);
             } else {
-                entries.insert(relative, Some(fs::read(&path).expect("read file")));
+                let content = fs::read(&path).expect("read file");
+                entries.insert(relative, Some(Sha256::digest(content).to_vec()));
             }
         }
     }
@@ -1645,5 +1652,287 @@ async fn a_fresh_host_is_set_up_by_one_run_and_a_rerun_changes_nothing() {
     assert!(
         !changed.is_empty() && changed.iter().all(|path| path.starts_with(&store)),
         "only the package store changes: {changed:?}"
+    );
+}
+
+/// A positive selection changes only the selected home: with `claude` selected
+/// the Claude hook is installed and the Codex home, which holds a hook on a
+/// default run, stays byte-identical.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_positive_hook_selection_installs_only_the_selected_home() {
+    let host = FreshHost::new();
+    let codex_home = host.home.join(".codex");
+    let codex_before = state_of(std::slice::from_ref(&codex_home));
+    let selection: HookSelection = "claude".parse().expect("a valid selection");
+
+    let planned = plan_selecting(
+        &host.installation.context,
+        &host.release,
+        &host.planner,
+        &selection,
+    )
+    .await
+    .expect("plan the selection");
+    assert_eq!(previewed_homes(&planned), ["claude"]);
+    let outcome = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the selection applies");
+
+    let attempted: Vec<&str> = outcome
+        .hooks
+        .iter()
+        .map(|hook| hook.integration.as_str())
+        .collect();
+    assert_eq!(attempted, ["claude"], "{:?}", outcome.hooks);
+    assert!(outcome.verdict.hooks_failed.is_empty());
+    assert!(
+        fs::read_to_string(host.home.join(".claude").join("settings.json"))
+            .expect("claude settings")
+            .contains(STATE_HOOK),
+        "claude's settings register the hook"
+    );
+    assert_eq!(
+        state_of(std::slice::from_ref(&codex_home)),
+        codex_before,
+        "the Codex home is byte-identical"
+    );
+    assert!(!codex_home.join(STATE_HOOK).exists());
+}
+
+/// A planner report that serves Hermes and lists the Claude default home and a
+/// Claude profile home as hook homes.
+fn hooks_report() -> EnsureReport {
+    let mut report = hermes_report();
+    report.integrations = serde_json::from_value(json!([
+        {"runtime": "claude", "profile": null},
+        {"runtime": "claude", "profile": "work"},
+    ]))
+    .expect("integration actions");
+    report
+}
+
+/// The labels of the hook homes a preview lists: the daemon-installed hooks
+/// first, then the Hermes homes.
+fn previewed_homes(host_plan: &pohunek_cli::host_setup::HostPlan) -> Vec<String> {
+    let mut homes: Vec<String> = host_plan
+        .preview
+        .integrations
+        .iter()
+        .map(|integration| match &integration.profile {
+            Some(profile) => format!("{} profile {profile}", integration.runtime),
+            None => integration.runtime.clone(),
+        })
+        .collect();
+    homes.extend(
+        host_plan
+            .preview
+            .hermes_homes
+            .iter()
+            .map(|home| home.integration.clone()),
+    );
+    homes
+}
+
+/// `--hooks none` leaves every agent home byte-identical: the preview lists no
+/// home, the apply attempts no hook, and a marked Hermes home that the default
+/// selection would update is not touched.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn hooks_none_leaves_every_agent_home_untouched() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![hooks_report()]);
+    let hermes = unmarked_hermes_home(&installation);
+    let home = installation.root.join("home");
+    fs::create_dir_all(hermes_marker(&home).parent().expect("plugin root")).expect("plugin root");
+    fs::write(hermes_marker(&home), "{}").expect("marker");
+
+    let default = plan(&installation.context, &release, &planner)
+        .await
+        .expect("plan with every home");
+    assert_eq!(
+        previewed_homes(&default),
+        ["claude", "claude profile work", "hermes"],
+        "the default selection lists every home"
+    );
+
+    let none = plan_selecting(
+        &installation.context,
+        &release,
+        &planner,
+        &HookSelection::None,
+    )
+    .await
+    .expect("plan without hooks");
+    assert!(previewed_homes(&none).is_empty(), "no home is previewed");
+    let before = snapshot(&hermes);
+    let report = apply(&installation.context, none, &planner)
+        .await
+        .expect("setup without hooks applies");
+    assert!(report.hooks.is_empty(), "no hook is attempted");
+    assert!(report.preview.integrations.is_empty());
+    assert!(report.preview.hermes_homes.is_empty());
+    assert!(report.verdict.hooks_failed.is_empty());
+    assert_eq!(
+        snapshot(&hermes),
+        before,
+        "the Hermes home is byte-identical"
+    );
+
+    // On the installed host the apply re-reads the plan; it must see the same
+    // filtered homes the preview showed.
+    let again = plan_selecting(
+        &installation.context,
+        &release,
+        &planner,
+        &HookSelection::None,
+    )
+    .await
+    .expect("plan the installed host without hooks");
+    assert_eq!(again.preview.service, ServiceStep::Present);
+    let rerun = apply(&installation.context, again, &planner)
+        .await
+        .expect("setup without hooks applies on the installed host");
+    assert!(rerun.hooks.is_empty(), "no hook is attempted");
+    assert_eq!(snapshot(&hermes), before, "the Hermes home is untouched");
+}
+
+/// A selection names exactly the homes it lists: `claude` is the default home
+/// only, `claude:work` the profile's home, and `hermes:work` only that Hermes
+/// profile.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_hook_selection_lists_exactly_the_selected_homes() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![hooks_report()]);
+    let hermes = unmarked_hermes_home(&installation);
+    fs::create_dir_all(hermes.join("profiles").join("work")).expect("profile home");
+
+    for (selection, expected) in [
+        ("claude", vec!["claude"]),
+        ("claude:work", vec!["claude profile work"]),
+        (
+            "claude:work,hermes:work",
+            vec!["claude profile work", "hermes profile work"],
+        ),
+        ("hermes", vec!["hermes"]),
+    ] {
+        let selection: HookSelection = selection.parse().expect("a valid selection");
+        let host_plan = plan_selecting(&installation.context, &release, &planner, &selection)
+            .await
+            .expect("plan the selection");
+        assert_eq!(previewed_homes(&host_plan), expected, "{selection:?}");
+    }
+}
+
+/// Gaps follow the selection: a gap about the config home of a profile that is
+/// not selected is not previewed, a gap about the runtime or its default home
+/// always is.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn hook_home_gaps_follow_the_selection() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let mut report = hooks_report();
+    report.gaps = serde_json::from_value(json!([
+        {"runtime": "claude", "code": "config_home_missing",
+         "detail": "its config home /h/.claude does not exist"},
+        {"runtime": "claude", "code": "config_home_missing", "profile": "work",
+         "detail": "the config home of profile `work` /h/work does not exist"},
+    ]))
+    .expect("gaps");
+    let planner = ScriptedPlanner::new(vec![report]);
+
+    for (selection, expected) in [("all", 2), ("claude:work", 2), ("claude", 1), ("none", 1)] {
+        let selection: HookSelection = selection.parse().expect("a valid selection");
+        let host_plan = plan_selecting(&installation.context, &release, &planner, &selection)
+            .await
+            .expect("plan the selection");
+        assert_eq!(
+            host_plan.preview.gaps.len(),
+            expected,
+            "{selection:?}: {:?}",
+            host_plan.preview.gaps
+        );
+        assert!(
+            host_plan
+                .preview
+                .gaps
+                .iter()
+                .any(|gap| gap.profile.is_none()),
+            "the default-home gap is always kept"
+        );
+    }
+}
+
+/// A selected agent or profile the host has no home for is refused with a
+/// usage-class code, before anything is written.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_hook_selection_naming_an_unknown_home_is_refused() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let planner = ScriptedPlanner::new(vec![hooks_report()]);
+    let before = snapshot(&installation.root);
+
+    for selection in ["codex", "claude:nope", "claude,codex:work"] {
+        let selection: HookSelection = selection.parse().expect("a valid selection");
+        let error = plan_selecting(&installation.context, &release, &planner, &selection)
+            .await
+            .expect_err("an unknown home is refused");
+        assert_eq!(error.code(), "setup_hooks_unknown", "{selection:?}");
+        assert!(
+            error.to_string().contains("claude profile work")
+                || error.to_string().contains("claude:work"),
+            "the message lists the homes the host has: {error}"
+        );
+    }
+    // Resolving the macOS paths creates the empty runtime and state
+    // directories, so only a written file counts.
+    let after = snapshot(&installation.root);
+    let written: Vec<PathBuf> = changed_paths(&before, &after)
+        .into_iter()
+        .filter(|path| {
+            before.get(path).is_some_and(Option::is_some)
+                || after.get(path).is_some_and(Option::is_some)
+        })
+        .collect();
+    assert!(written.is_empty(), "nothing is written: {written:?}");
+}
+
+/// A failed snapshot comparison prints digests, not file contents: a staged
+/// release holds hundreds of MiB of binaries, and a printed copy of them
+/// stalled the macOS lane until its job timeout.
+#[test]
+fn a_snapshot_mismatch_message_stays_small() {
+    let root = pohunek_test_support::tempdir().expect("temporary directory");
+    fs::write(root.path().join("binary"), vec![0xa5_u8; 4 << 20]).expect("write a large file");
+    let before = snapshot(root.path());
+    fs::write(root.path().join("binary"), vec![0x5a_u8; 4 << 20]).expect("rewrite the file");
+    let after = snapshot(root.path());
+
+    assert_ne!(before, after, "the digest tells the contents apart");
+    let message = format!("{before:?} {after:?}");
+    assert!(
+        message.len() < 4096,
+        "a mismatch prints {} bytes for two 4 MiB files",
+        message.len()
     );
 }

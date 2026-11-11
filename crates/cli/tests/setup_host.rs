@@ -787,3 +787,119 @@ fn a_dry_run_with_yes_or_a_subcommand_is_a_usage_error() {
         "a refused command line writes nothing"
     );
 }
+
+/// Report that lists three hook homes: Claude's default home, a Claude
+/// profile's home and Codex's default home.
+const HOOK_HOMES_REPORT: &str = r#"{
+  "report_version": 2,
+  "daemon_version": "fixture",
+  "dry_run": true,
+  "packages": [],
+  "catalog": "unavailable",
+  "profiles": [],
+  "integrations": [
+    {"runtime": "claude", "profile": null},
+    {"runtime": "claude", "profile": "work"},
+    {"runtime": "codex", "profile": null}
+  ],
+  "gaps": [
+    {"runtime": "claude", "code": "config_home_missing", "detail": "its config home does not exist"},
+    {"runtime": "claude", "code": "config_home_missing", "profile": "work",
+     "detail": "the config home of profile `work` does not exist"}
+  ],
+  "refusals": []
+}"#;
+
+/// The homes a `--json` dry-run preview lists, as `agent` or `agent:profile`.
+fn previewed_hook_homes(preview: &Value) -> Vec<String> {
+    preview["integrations"]
+        .as_array()
+        .expect("integrations array")
+        .iter()
+        .map(|home| match home["profile"].as_str() {
+            Some(profile) => format!("{}:{profile}", home["runtime"].as_str().expect("runtime")),
+            None => home["runtime"].as_str().expect("runtime").to_owned(),
+        })
+        .collect()
+}
+
+/// `--hooks` narrows the preview that `--dry-run --json` prints to the
+/// selected homes; the default and `all` list every home.
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
+fn the_dry_run_preview_lists_only_the_selected_hook_homes() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, HOOK_HOMES_REPORT);
+    let before = tree(env.root());
+
+    for (selection, expected) in [
+        (None, vec!["claude", "claude:work", "codex"]),
+        (Some("all"), vec!["claude", "claude:work", "codex"]),
+        (Some("none"), vec![]),
+        (Some("claude"), vec!["claude"]),
+        (Some("claude:work,codex"), vec!["claude:work", "codex"]),
+    ] {
+        let mut arguments = vec!["setup", "--dry-run", "--json"];
+        if let Some(selection) = selection {
+            arguments.extend(["--hooks", selection]);
+        }
+        let output = run_setup(&env, &binary, &arguments);
+        assert!(
+            output.status.success(),
+            "{selection:?}: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let document = json_document(&output);
+        assert_eq!(
+            previewed_hook_homes(&document["ok"]),
+            expected,
+            "{selection:?}"
+        );
+        let gaps = document["ok"]["gaps"].as_array().expect("gaps array").len();
+        let work_selected =
+            expected.contains(&"claude:work") || selection.is_none_or(|s| s == "all");
+        assert_eq!(
+            gaps,
+            if work_selected { 2 } else { 1 },
+            "{selection:?}: the gap about an unselected profile home is not listed"
+        );
+    }
+    assert_eq!(tree(env.root()), before, "a dry run writes nothing");
+}
+
+/// A home the host does not have is a usage error with a stable code, a
+/// malformed selection is refused by the parser, and `--hooks` does not ride
+/// along with a setup subcommand.
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager on the session bus"
+)]
+fn an_unknown_or_misplaced_hook_selection_is_a_usage_error() {
+    let env = TestEnv::new().expect("private environment");
+    let binary = release_with_fixture(&env, HOOK_HOMES_REPORT);
+    let before = tree(env.root());
+
+    let unknown = run_setup(
+        &env,
+        &binary,
+        &["setup", "--dry-run", "--json", "--hooks", "claude:nope"],
+    );
+    assert_eq!(unknown.status.code(), Some(2), "an unknown profile");
+    let document = json_document(&unknown);
+    assert_eq!(document["err"]["code"], "setup_hooks_unknown", "{document}");
+
+    for arguments in [
+        &["setup", "--dry-run", "--hooks", "no spaces allowed"][..],
+        &["setup", "--dry-run", "--hooks", "claude:"][..],
+        &["setup", "--hooks", "none", "config"][..],
+    ] {
+        let output = run_setup(&env, &binary, arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+    }
+    assert_eq!(tree(env.root()), before, "refused runs write nothing");
+}

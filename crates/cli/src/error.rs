@@ -272,6 +272,14 @@ pub(crate) enum CliError {
         detail: String,
     },
 
+    /// `pohunek setup --hooks` names an agent or profile home this host does
+    /// not have. Nothing is changed.
+    #[error("{detail}")]
+    SetupHooksUnknown {
+        /// The homes that are unknown and the homes the host has.
+        detail: String,
+    },
+
     /// Bare `pohunek setup` stopped after it started changing the host. The
     /// changes made so far are kept; re-running setup completes them.
     #[error("setup did not complete: {detail}{}", changes_text(.applied))]
@@ -598,6 +606,15 @@ impl CliError {
                 "release_install_incomplete",
                 format!("the release install did not complete: {detail}"),
                 Some("inspect `pohunek plugin list`, then re-run the install".to_owned()),
+            ),
+            CliError::SetupHooksUnknown { detail } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "setup_hooks_unknown",
+                detail.clone(),
+                Some(
+                    "pass `--hooks none`, `--hooks all`, or homes the host has; `pohunek setup --dry-run --json` lists them under `integrations` and `hermes_homes`"
+                        .to_owned(),
+                ),
             ),
             CliError::SetupDeclined => ProtocolError::new(
                 ErrorClass::Configuration,
@@ -1034,6 +1051,7 @@ fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
 pub(crate) fn failure_exit_code(error: &CliError) -> ExitCode {
     match error {
         CliError::Plugin(plugin) if plugin.is_usage() => ExitCode::from(CLI_USAGE_EXIT_CODE),
+        CliError::SetupHooksUnknown { .. } => ExitCode::from(CLI_USAGE_EXIT_CODE),
         _ => ExitCode::FAILURE,
     }
 }
