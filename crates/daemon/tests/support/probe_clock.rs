@@ -6,7 +6,8 @@ const PROBE_CLOCK_STEP: std::time::Duration = std::time::Duration::from_secs(360
 
 /// A version-probe clock that moves forward by [`PROBE_CLOCK_STEP`] on every
 /// read, so a probe that never exits reaches its full deadline without the
-/// test waiting for it.
+/// test waiting for it. A reader that measures a budget on it spends the budget
+/// after a few reads.
 pub(crate) fn stepping_probe_clock() -> pohunek_daemon::capabilities::ProbeClock {
     let start = std::time::Instant::now();
     let reads = std::sync::atomic::AtomicU32::new(0);

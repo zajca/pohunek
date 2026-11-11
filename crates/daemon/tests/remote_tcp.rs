@@ -2070,6 +2070,10 @@ async fn daemon_doctor_bounds_aggregate_version_probes_across_slow_profiles() {
     let _ = handle.await;
 }
 
+/// A doctor probe budget no host spends, so no probe of the scenario below
+/// runs on a shortened timeout whatever the host's load.
+const DOCTOR_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[tokio::test]
 async fn daemon_doctor_names_a_version_probe_that_ran_to_its_deadline() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2105,6 +2109,7 @@ async fn daemon_doctor_names_a_version_probe_that_ran_to_its_deadline() {
     let config = SessionRegistryConfig {
         agents_dir: Some(agents),
         probe_clock: probe_clock::stepping_probe_clock(),
+        doctor_probe_budget: DOCTOR_PROBE_BUDGET,
         ..shell_config()
     };
     let (_addr, socket, shutdown, handle) =

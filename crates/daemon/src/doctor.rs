@@ -65,6 +65,7 @@ pub(crate) async fn report(
     rejected_lines: RejectedLinesState,
     placements: &[(protocol::SessionId, protocol::SessionPlacement)],
     probe_clock: &ProbeClock,
+    probe_budget: Duration,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
@@ -103,7 +104,7 @@ pub(crate) async fn report(
     let probe_clock = probe_clock.clone();
     checks.extend(
         tokio::task::spawn_blocking(move || {
-            profile_checks(&profiles, &base_env, include_profile_homes, &probe_clock)
+            profile_checks(&profiles, &base_env, include_profile_homes, &probe_clock, probe_budget)
         })
             .await
             .unwrap_or_else(|_| vec![check("agent_profiles", DoctorStatus::Fail, "Configured agent profiles could not be inspected; check daemon logs and profile ownership.")]),
@@ -170,6 +171,7 @@ fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
 #[derive(Clone, Copy)]
 struct DoctorProbes<'a> {
     started: Instant,
+    budget: Duration,
     clock: &'a ProbeClock,
 }
 
@@ -179,11 +181,13 @@ fn profile_checks(
     base_env: &pohunek_worker_protocol::BaseEnv,
     include_profile_homes: bool,
     clock: &ProbeClock,
+    budget: Duration,
 ) -> Vec<DoctorCheck> {
     let mut checks = embedded_manifest_checks();
     checks.extend(manifest_override_checks(profiles));
     let probes = DoctorProbes {
         started: Instant::now(),
+        budget,
         clock,
     };
     let configured = match profiles.doctor_profiles() {
@@ -662,7 +666,7 @@ fn profile_runtime_check(
         ));
     }
     let probe_timeout = if agent.definition.version_probe_parser().is_some() {
-        hostcheck::AGENT_RUNTIME_PROBE_BUDGET.saturating_sub(probes.started.elapsed())
+        probes.budget.saturating_sub(probes.started.elapsed())
     } else {
         Duration::ZERO
     };
@@ -1206,6 +1210,7 @@ mod tests {
             },
             &[],
             &ProbeClock::default(),
+            hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )
         .await
         .expect("doctor report");
@@ -1289,6 +1294,7 @@ mod tests {
             },
             &[],
             &ProbeClock::default(),
+            hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )
         .await
         .expect("doctor report");

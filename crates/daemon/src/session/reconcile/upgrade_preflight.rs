@@ -151,8 +151,9 @@ pub struct PreflightOptions {
     /// `entry`. A probe that would start at or after the deadline is judged
     /// [`CODE_PROBE_BUDGET_EXHAUSTED`].
     pub probe_budget: Duration,
-    /// The clock the deadline of each version probe is read from. Defaults to
-    /// the system clock.
+    /// The clock the probe budget is measured on from `entry` and the deadline
+    /// of each version probe is read from; it reads the same `Instant` epoch
+    /// as `entry`. Defaults to the system clock.
     pub probe_clock: ProbeClock,
     /// The launch environment of the installed daemon, or the reason the
     /// installed `service.toml` cannot be read. The integration homes are read
