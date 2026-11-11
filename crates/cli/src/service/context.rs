@@ -226,7 +226,7 @@ impl Context {
         let paths = BasePaths::resolve().map_err(path_error)?;
         let env = PathEnv::capture();
         let home = env.home.clone().map(PathBuf::from);
-        let runtime_base = env.xdg_runtime_dir.clone().map(PathBuf::from);
+        let runtime_base = env.xdg_runtime_dir.map(PathBuf::from);
         let supervisor_dir = default_supervisor_dir(&paths, home.as_deref())?;
         let cli_executable = std::env::current_exe()
             .and_then(std::fs::canonicalize)

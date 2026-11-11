@@ -324,14 +324,14 @@ fn resolve_target_from_sessions(
     let mut candidates = sessions
         .iter()
         .filter(|session| session.name.as_deref() == Some(target.session_id.as_str()))
-        .map(|session| session.id.0.clone())
+        .map(|session| session.id.0.as_str())
         .collect::<Vec<_>>();
     candidates.sort_unstable();
     match candidates.as_slice() {
         [] => Ok(target.clone()),
         [session_id] => Ok(Target {
             host: target.host.clone(),
-            session_id: session_id.clone(),
+            session_id: (*session_id).to_owned(),
         }),
         _ => Err(CliError::AmbiguousSessionName {
             candidates: candidates.join(", "),

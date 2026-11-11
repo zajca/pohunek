@@ -240,7 +240,7 @@ fn an_enabled_selected_package_serves_a_package_origin_runtime_next_to_the_built
         definition.binding().provenance,
         BindingProvenance::Package {
             package: built.identity.clone(),
-            package_digest: built.digest.clone(),
+            package_digest: built.digest,
         }
     );
     assert_eq!(definition.program().as_str(), "acme-agent");
@@ -370,14 +370,14 @@ fn a_pin_resolves_from_its_digest_after_a_newer_version_is_selected() {
         fresh.binding().provenance,
         BindingProvenance::Package {
             package: second.identity.clone(),
-            package_digest: second.digest.clone(),
+            package_digest: second.digest,
         }
     );
     assert_eq!(
         pinned.binding().provenance,
         BindingProvenance::Package {
             package: first.identity.clone(),
-            package_digest: first.digest.clone(),
+            package_digest: first.digest,
         }
     );
 }
@@ -436,7 +436,7 @@ fn a_pin_with_a_fabricated_identity_is_refused() {
     let host = plugins.host();
     let forged = Built {
         bytes: Vec::new(),
-        digest: built.digest.clone(),
+        digest: built.digest,
         identity: identity("acme.agent", "9.9.9"),
     };
 

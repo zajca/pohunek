@@ -424,9 +424,8 @@ fn dynamic_command(context: CompletionContext) -> Command {
     let target_context = context;
     Cli::command()
         .mut_arg("host", |arg| arg.add(ArgValueCompleter::new(HostCompleter)))
-        .mut_subcommand("attach", {
-            let context = target_context.clone();
-            move |command| with_target_completer(command, &context)
+        .mut_subcommand("attach", move |command| {
+            with_target_completer(command, &target_context)
         })
         .mut_subcommand("plugin", move |command| {
             command.mut_subcommands(move |subcommand| {
@@ -467,7 +466,6 @@ fn dynamic_command(context: CompletionContext) -> Command {
 }
 
 fn with_plugin_completers(command: Command, context: &CompletionContext) -> Command {
-    let nested = context.clone();
     command
         .mut_args(|arg| match arg.get_id().as_str() {
             "package" => arg.add(ArgValueCompleter::new(PackageCompleter)),
@@ -477,7 +475,7 @@ fn with_plugin_completers(command: Command, context: &CompletionContext) -> Comm
             "name" => arg.add(ArgValueCompleter::new(ProfileNameCompleter)),
             _ => arg,
         })
-        .mut_subcommands(move |subcommand| with_plugin_completers(subcommand, &nested))
+        .mut_subcommands(|subcommand| with_plugin_completers(subcommand, context))
 }
 
 fn with_spawner_completer(command: Command, context: &CompletionContext) -> Command {
@@ -944,7 +942,7 @@ mod tests {
         let reachable = HostClass::ReachableDaemon {
             daemon_version: "1.0.0".to_owned(),
         };
-        let mut record = host_record("host-b", reachable.clone());
+        let mut record = host_record("host-b", reachable);
         record.address = None;
         assert!(completion_hosts(&[record.clone()]).is_empty());
 

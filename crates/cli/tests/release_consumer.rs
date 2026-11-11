@@ -314,7 +314,7 @@ check = "none"
         );
         // `worker_binary` fails with its own build command when the worker is absent.
         for (name, source) in [
-            ("pohunek", cli.clone()),
+            ("pohunek", cli),
             ("pohunekd", daemon),
             ("pohunek-sessiond", worker_binary()),
         ] {
@@ -508,7 +508,7 @@ check = "none"
         let mut values = valid_inputs(dir.path());
         let catalog = dir.path().join("catalog.json");
         fs::write(&catalog, b"{}").expect("catalog");
-        values.insert(CATALOG_VAR, catalog.clone().into_os_string());
+        values.insert(CATALOG_VAR, catalog.into_os_string());
 
         // No anchor beside the binaries: refused, naming the bin dir variable.
         let error = read(&values).unwrap_err();

@@ -205,7 +205,7 @@ mod tests {
         let paths = Paths {
             runtime_dir: root.join("runtime"),
             socket: root.join("runtime").join("daemon.sock"),
-            data_dir: data_dir.clone(),
+            data_dir,
             log_dir: root.join("logs"),
             cache_dir: root.join("cache"),
             config_home: config_home.clone(),

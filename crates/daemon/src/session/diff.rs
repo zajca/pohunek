@@ -61,10 +61,10 @@ impl SessionRegistry {
             validate_git_ref_arg(base, "base ref")?;
         }
         let info = self.inspect(id).await?;
-        let Some(worktree) = info.worktree_path.clone() else {
+        let Some(worktree) = info.worktree_path else {
             return Err(session_no_worktree(id));
         };
-        let repository = info.repo.clone();
+        let repository = info.repo;
         let store = self.inner.store.clone();
         let session_id = id.0.clone();
         tokio::task::spawn_blocking(move || -> Result<SessionDiffResult, ProtocolError> {

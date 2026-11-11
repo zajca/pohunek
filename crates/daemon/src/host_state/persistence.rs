@@ -1111,7 +1111,7 @@ mod tests {
             )
             .expect("create collision");
         }
-        host.inject_temp_suffixes(suffixes.clone());
+        host.inject_temp_suffixes(suffixes);
 
         assert!(matches!(
             host.replace_record("identity.json", b"new"),

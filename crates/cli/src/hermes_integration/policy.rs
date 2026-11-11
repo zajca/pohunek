@@ -705,7 +705,7 @@ mod tests {
             ["peer-.netbird"]
         );
 
-        let mut wildcard = input(cli.clone());
+        let mut wildcard = input(cli);
         wildcard.allowed_hosts = vec!["*".to_owned()];
         assert_eq!(
             Policy::new(wildcard.clone()),

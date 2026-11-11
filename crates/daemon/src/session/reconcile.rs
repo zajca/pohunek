@@ -4673,7 +4673,7 @@ impl SessionRegistry {
         let recorded_generation =
             super::Generation::from_record(&record.session_id, &record.runtime);
         let entry = SessionEntry {
-            info: info.clone(),
+            info,
             activity_revision: 0,
             entry_incarnation: super::next_entry_incarnation(),
             agent_incarnation: 0,

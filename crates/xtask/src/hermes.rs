@@ -2952,7 +2952,7 @@ fn run_pty_actions(
     scenario: &Scenario,
     child: &mut dyn portable_pty::Child,
     writer: &mut dyn Write,
-    output: &Arc<Mutex<(Vec<u8>, bool)>>,
+    output: &Mutex<(Vec<u8>, bool)>,
 ) -> Result<(), XtaskError> {
     for action in &scenario.actions {
         match action {
@@ -2985,7 +2985,7 @@ fn run_pty_actions(
 fn wait_for_evidence(
     scenario_id: &str,
     child: &mut dyn portable_pty::Child,
-    output: &Arc<Mutex<(Vec<u8>, bool)>>,
+    output: &Mutex<(Vec<u8>, bool)>,
     evidence: &Evidence,
     timeout: Duration,
 ) -> Result<bool, XtaskError> {
@@ -3124,7 +3124,7 @@ fn terminated_lines(text: &str) -> &str {
     text.rfind('\n').map_or("", |end| &text[..=end])
 }
 
-fn output_snapshot(output: &Arc<Mutex<(Vec<u8>, bool)>>) -> Result<(Vec<u8>, bool), XtaskError> {
+fn output_snapshot(output: &Mutex<(Vec<u8>, bool)>) -> Result<(Vec<u8>, bool), XtaskError> {
     output
         .lock()
         .map(|locked| locked.clone())

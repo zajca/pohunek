@@ -244,7 +244,7 @@ pub struct PtyOwner {
     output_order: Arc<Mutex<()>>,
     output_reader: Arc<Mutex<Box<dyn Read + Send>>>,
     output_readiness: Arc<OutputReadiness>,
-    tty_name: Arc<PathBuf>,
+    tty_name: Arc<Path>,
     held_echo: Arc<HeldEchoRelease>,
     input: WriteCoordinator,
     resize: Arc<AsyncMutex<ResizeState>>,
@@ -475,7 +475,8 @@ impl PtyOwner {
             })
             .map_err(|source| PtyError::Allocate(source.to_string()))?;
 
-        let tty_name = Arc::new(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
+        let tty_name: Arc<Path> =
+            Arc::from(pair.master.tty_name().ok_or(PtyError::MissingTtyName)?);
         // Every master descriptor below shares this file description, so the
         // output reader and the input writer both observe non-blocking mode.
         // See `drain_available_output` for why a read must never park.
@@ -2202,7 +2203,7 @@ fn read_process_start(pid: u32) -> Result<String, io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process no longer exists"))
 }
 
-async fn join_thread(slot: &Arc<Mutex<Option<thread::JoinHandle<()>>>>) -> Result<(), PtyError> {
+async fn join_thread(slot: &Mutex<Option<thread::JoinHandle<()>>>) -> Result<(), PtyError> {
     let thread = lock_result(slot)?.take();
     if let Some(thread) = thread {
         tokio::task::spawn_blocking(move || thread.join())

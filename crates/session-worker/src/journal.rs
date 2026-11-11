@@ -1056,14 +1056,14 @@ mod tests {
             "acknowledgement is final"
         );
 
-        let mut changed = acknowledged.clone();
+        let mut changed = acknowledged;
         changed.subagents.clear();
         changed.phase = RuntimePhase::Faulted;
         let refusal = journal.check_seal(&changed).expect_err("sealed");
         assert_eq!(refusal.attempted_phase, RuntimePhase::Faulted);
         assert_eq!(refusal.changed_fields, ["phase", "subagents"]);
 
-        let clone = journal.clone();
+        let clone = journal;
         assert!(clone.check_seal(&changed).is_err(), "clones share the seal");
         assert_eq!(
             Journal::new("/nonexistent/s-1/worker-2.json").check_seal(&changed),

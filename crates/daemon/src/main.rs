@@ -534,7 +534,7 @@ fn ensure_runtimes(
     ensure_private_dir(&paths.runtime_dir).map_err(|error| error.to_string())?;
     let mut locks = vec![paths.data_authority_lock_path()];
     if paths.runtime_dir != paths.data_dir {
-        locks.push(paths.lock.clone());
+        locks.push(paths.lock);
     }
     let mut held = Vec::with_capacity(locks.len());
     for path in &locks {
@@ -2499,7 +2499,7 @@ mod supervision_tests {
         );
         for (service_config, launcher) in [
             (None, None),
-            (Some(config.clone()), Some(OsString::from("subprocess"))),
+            (Some(config), Some(OsString::from("subprocess"))),
         ] {
             let error = select_supervision(service_config, launcher)
                 .expect_err("ambiguous or missing supervision");

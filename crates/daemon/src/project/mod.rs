@@ -649,7 +649,7 @@ mod tests {
         let live = vec![LiveSession {
             session_id: "s-1".to_owned(),
             cwd: canonical_wt.clone(),
-            worktree_path: Some(canonical_wt.clone()),
+            worktree_path: Some(canonical_wt),
         }];
         let shown = pm.show(&added.id, &live).expect("show");
 

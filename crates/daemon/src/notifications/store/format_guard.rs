@@ -141,7 +141,7 @@ fn action_values() -> Vec<String> {
             updated: vec![record.clone()],
         },
         StoreAction::Updated { .. } => StoreAction::Updated { record: record.clone() },
-        StoreAction::Deleted { .. } => StoreAction::Deleted { record: record.clone() },
+        StoreAction::Deleted { .. } => StoreAction::Deleted { record },
     )
 }
 

@@ -452,7 +452,6 @@ mod tests {
             .resolve(profiles)
             .expect_err("must be rejected")
             .code
-            .clone()
     }
 
     #[test]

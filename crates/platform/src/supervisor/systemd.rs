@@ -2049,7 +2049,7 @@ mod tests {
         };
         let path = executable.to_string_lossy().into_owned();
         let live = LiveCommand {
-            executable: executable.clone(),
+            executable,
             cmdline: vec![path.clone(), "--flag".to_owned(), "value".to_owned()],
         };
         assert!(verify_live_command(&facts, &live, "active").expect("matching command"));

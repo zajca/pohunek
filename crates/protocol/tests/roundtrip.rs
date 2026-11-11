@@ -1635,9 +1635,7 @@ fn session_resize_params_json_shape_roundtrips() {
 #[test]
 fn session_resize_result_carries_updated_session_info() {
     let session = running_shell_session(None);
-    let result = SessionResizeResult {
-        session: session.clone(),
-    };
+    let result = SessionResizeResult { session };
 
     let value = serde_json::to_value(&result).expect("serialize resize result");
     assert_eq!(
@@ -2582,8 +2580,8 @@ fn session_output_result_rejects_encoding_size_and_offset_invariants() {
     ));
     assert!(matches!(
         output_result(
-            valid_session.clone(),
-            valid_runtime.clone(),
+            valid_session,
+            valid_runtime,
             "dGVzdA==".to_owned(),
             0,
             0,
@@ -2639,7 +2637,7 @@ fn session_output_result_rejects_gap_flag_and_identifier_invariants() {
     assert!(matches!(
         output_result(
             "s".repeat(MAX_SESSION_ID_BYTES + 1),
-            valid_runtime.clone(),
+            valid_runtime,
             String::new(),
             0,
             0,

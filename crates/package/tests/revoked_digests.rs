@@ -275,7 +275,7 @@ fn the_accumulated_set_is_capped_and_a_refused_record_writes_nothing() {
     let full: Vec<String> = (0..MAX_REVOKED_DIGESTS_TOTAL)
         .map(|index| format!("sha256:{index:064x}"))
         .collect();
-    let mut sorted = full.clone();
+    let mut sorted = full;
     sorted.sort();
     let body = serde_json::json!({"schema": 1, "revoked_digests": sorted});
     std::fs::write(revoked_file(&fixture), serde_json::to_vec(&body).unwrap()).unwrap();

@@ -3407,7 +3407,7 @@ mod tests {
         });
 
         StatusTestDaemon {
-            paths: status_test_paths(socket.clone()),
+            paths: status_test_paths(socket),
             controls,
             active,
             task,

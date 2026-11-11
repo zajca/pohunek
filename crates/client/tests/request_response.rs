@@ -1803,7 +1803,7 @@ fn spawn_unix_daemon(reply: Reply) -> UnixDaemon {
     });
 
     UnixDaemon {
-        socket_path: socket_path.clone(),
+        socket_path,
         request_line,
         task,
         _socket_file: socket_file,
@@ -1822,7 +1822,7 @@ fn spawn_unix_echo_daemon(ok: Value) -> UnixDaemon {
     });
 
     UnixDaemon {
-        socket_path: socket_path.clone(),
+        socket_path,
         request_line,
         task,
         _socket_file: socket_file,

@@ -176,8 +176,9 @@ fn apply_lifecycle_command(
             if enrollment.status() != EnrollmentStatus::LocallyUnenrolled {
                 return Err(GovernanceTransitionError::InvalidLifecycle.into());
             }
+            let enrollment_revision = next_enrollment_revision(&enrollment)?;
             let retired = RetiredEnrollment::new(
-                enrollment.clone(),
+                enrollment,
                 current_owner,
                 owner_revision,
                 state.latest_transfer_outcome().cloned(),
@@ -188,7 +189,7 @@ fn apply_lifecycle_command(
                 Some(EnrollmentInfo::new(
                     relay_id,
                     EnrollmentStatus::PendingLocalCommit,
-                    next_enrollment_revision(&enrollment)?,
+                    enrollment_revision,
                 )),
                 Some(owner),
                 Some(

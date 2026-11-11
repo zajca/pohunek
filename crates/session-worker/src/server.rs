@@ -1980,7 +1980,7 @@ async fn stop_request(
             pty,
             grace,
             kill_reap,
-        } => (pty, grace, kill_reap),
+        } => (*pty, grace, kill_reap),
     };
     run_placement_check(shared).await;
     pty.stop(transaction_id.as_str(), grace, kill_reap)
@@ -2006,7 +2006,8 @@ async fn stop_request(
 enum StopPreparation {
     AlreadyCommitted(ExitStatus),
     Begin {
-        pty: PtyOwner,
+        // Boxed: the owner is far larger than the committed exit status.
+        pty: Box<PtyOwner>,
         grace: Duration,
         kill_reap: Duration,
     },
@@ -2037,7 +2038,7 @@ fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
     state.stop_requested = true;
     state.phase = WireRuntimePhase::Stopping;
     Ok(StopPreparation::Begin {
-        pty,
+        pty: Box::new(pty),
         grace: state.stop_grace,
         kill_reap: state.kill_reap_deadline,
     })
@@ -10328,7 +10329,7 @@ mod tests {
         };
         let mut hijacked = Connection::new(std::sync::Arc::new(owner_peer(&drifted)));
         hijacked.owner = Some(owner);
-        hijacked.lease_id = connection.lease_id.clone();
+        hijacked.lease_id = connection.lease_id;
         let error = authorize_control_request(&server.shared, &hijacked)
             .expect_err("a drifted peer must lose the lease");
         assert!(
@@ -10981,7 +10982,7 @@ mod tests {
         };
         let next_lease = LeaseId::new("lease-next").expect("lease id");
         leases
-            .acquire(next_owner.clone(), next_lease.to_string())
+            .acquire(next_owner, next_lease.to_string())
             .expect("replacement lease");
         redeem_data_grant(
             &tokens,

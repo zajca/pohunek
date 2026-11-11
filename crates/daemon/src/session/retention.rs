@@ -778,7 +778,7 @@ mod tests {
         starting.runtime = Some(runtime(RuntimeState::Starting, Some(ancient.clone())));
 
         let mut reconnecting = session("s-reconnecting", SessionState::Running, ancient.clone());
-        reconnecting.runtime = Some(runtime(RuntimeState::Reconnecting, Some(ancient.clone())));
+        reconnecting.runtime = Some(runtime(RuntimeState::Reconnecting, Some(ancient)));
 
         let mut unreadable = session("s-unreadable", SessionState::Done, "not-a-date".to_owned());
         unreadable.runtime = None;
@@ -873,7 +873,7 @@ mod tests {
         .is_err());
         assert!(validate_policy(&SessionRetentionPolicy {
             max_removals_per_sweep: 0,
-            ..base.clone()
+            ..base
         })
         .is_err());
     }

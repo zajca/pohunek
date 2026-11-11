@@ -385,7 +385,7 @@ async fn exercise_owner_transport(servers: &Servers, transport: OwnerTransport) 
             let mut control = connect_unix(&servers.socket).await?;
             let socket = servers.socket.clone();
             exercise_owner_control(&mut control, servers.root.path(), move |stream_id| {
-                let socket = socket.clone();
+                let socket = socket;
                 let stream_id = stream_id.to_owned();
                 async move { open_unix_attach(&socket, &stream_id).await }
             })

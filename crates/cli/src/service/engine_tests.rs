@@ -7733,7 +7733,7 @@ async fn check_reports_how_a_pending_transaction_would_be_handled() {
     assert_pending_untouched(&harness, &record);
 
     // A pending install past registration refuses another install.
-    let mut advanced = record.clone();
+    let mut advanced = record;
     advanced.step = Step::Registering;
     harness
         .engine()
@@ -8108,7 +8108,6 @@ fn an_unmanaged_host_gets_no_recorded_path_warning() {
     let harness = Harness::new();
     let context = harness
         .context
-        .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
     assert!(
         super::preflight::recorded_path_warning(
