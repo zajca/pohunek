@@ -97,6 +97,7 @@ fn initialize(root: &Path, arguments: Vec<String>) -> Initialize {
         answers_program_status_probe: false,
         probe_foreground_programs: Vec::new(),
         placement_check_interval_ms: None,
+        handshake_file: None,
     }
 }
 

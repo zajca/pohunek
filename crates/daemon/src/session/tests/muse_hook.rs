@@ -113,6 +113,9 @@ struct Rig {
     launches: PathBuf,
     state_root: PathBuf,
     muse_home: PathBuf,
+    /// The daemon's log directory; the overlay passes its hook trace to the
+    /// reporter for runs that have no handshake to take the worker's from.
+    log_dir: PathBuf,
 }
 
 impl Rig {
@@ -169,9 +172,12 @@ impl Rig {
         pohunek_test_support::fs::copy_shell_image(native_supersede::bash_path(), &program)
             .expect("copy the fixture agent image");
         let host = muse_host(&program, &script, extra_args, declare_home);
+        let log_dir = dir.join("logs");
+        fs::create_dir_all(&log_dir).expect("create the log directory");
         let mut config = SessionRegistryConfig {
             shell_command: hermetic_shell(),
             store_path: Some(temp_store_path(tag)),
+            log_dir: Some(log_dir.clone()),
             ..SessionRegistryConfig::default()
         };
         let mut agent = "muse";
@@ -216,6 +222,7 @@ impl Rig {
             launches,
             state_root,
             muse_home,
+            log_dir,
         })
     }
 
@@ -227,13 +234,24 @@ impl Rig {
 
     /// [`Self::fire`] with the payload read from `fixture`.
     async fn fire_file(&self, event: &str, fixture: &Path, root: &str) {
+        self.signal("fire", event, fixture, root).await;
+    }
+
+    /// [`Self::fire`] in the environment of a conversation created by `/clear`:
+    /// none of the variables the launch listed.
+    async fn fire_bare(&self, event: &str, payload: &str, root: &str) {
+        self.signal("fire_bare", event, &fixture_path(payload), root)
+            .await;
+    }
+
+    async fn signal(&self, command: &str, event: &str, fixture: &Path, root: &str) {
         let before = fs::read_to_string(&self.acks)
             .unwrap_or_default()
             .lines()
             .count();
         let mut writer = &self.commands;
         writer
-            .write_all(format!("fire {event} {} {root}\n", fixture.display()).as_bytes())
+            .write_all(format!("{command} {event} {} {root}\n", fixture.display()).as_bytes())
             .expect("signal the fake Muse");
         wait_until("the hooks to finish", || async {
             let now = fs::read_to_string(&self.acks)
@@ -291,6 +309,22 @@ impl Rig {
             .join(pohunek_paths::launch_input_file_name("muse-hooks.json"))
     }
 
+    fn handshake_path(&self) -> PathBuf {
+        self.state_root
+            .join(&self.session.id.0)
+            .join(pohunek_paths::launch_input_file_name("muse-handshake.json"))
+    }
+
+    /// The trace the reporter writes to when it has no handshake: the one the
+    /// overlay names.
+    fn daemon_trace(&self) -> String {
+        fs::read_to_string(
+            self.log_dir
+                .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME),
+        )
+        .unwrap_or_default()
+    }
+
     fn trace(&self) -> String {
         let trace = self
             .state_root
@@ -326,7 +360,9 @@ fn fixture_path(name: &str) -> PathBuf {
 /// managed_hooks_env_vars` list and the overlay named by
 /// `TBH_MANAGED_HOOKS_PATH`, and on `fire` runs the overlay's hooks for an
 /// event in a cleared environment that keeps only the listed variables plus
-/// `MUSE_SESSION_ID` and `MUSE_THREAD_ID`, with the payload on stdin. Each hook's
+/// `MUSE_SESSION_ID` and `MUSE_THREAD_ID`, with the payload on stdin. `fire_bare`
+/// runs them without the listed variables, as Muse 1.4.14 does for the
+/// conversation a `/clear` creates. Each hook's
 /// exit status and combined output size is appended to `hook_runs`; the hook
 /// runs as a direct child so its `$PPID` is the fake Muse.
 fn fake_muse(fifo: &Path, acks: &Path, hook_runs: &Path, launches: &Path) -> String {
@@ -354,9 +390,11 @@ for entry in overlay["hooks"].get(sys.argv[2], []):
 }}
 while read -r command event payload root < '{fifo}'; do
   case "$command" in
-    fire)
+    fire|fire_bare)
       assign=
-      for name in $names; do
+      listed=$names
+      [ "$command" = fire_bare ] && listed=
+      for name in $listed; do
         value=$(printenv "$name") || continue
         assign="$assign $name=$(printf '%q' "$value")"
       done
@@ -417,7 +455,9 @@ async fn clear_rebinds_the_session_to_the_new_conversation() {
         .await;
     rig.wait_identity(ROOT).await;
 
-    rig.fire("SessionStart", "session_start_clear", CLEARED)
+    // Muse 1.4.14 starts the hooks of the conversation `/clear` creates without
+    // the variables the launch listed.
+    rig.fire_bare("SessionStart", "session_start_clear", CLEARED)
         .await;
 
     rig.wait_identity(CLEARED).await;
@@ -426,14 +466,232 @@ async fn clear_rebinds_the_session_to_the_new_conversation() {
         "session_start_fork",
         "session_start_compact",
     ] {
-        rig.fire("SessionStart", "session_start_clear", CLEARED)
+        rig.fire_bare("SessionStart", "session_start_clear", CLEARED)
             .await;
         rig.wait_identity(CLEARED).await;
-        rig.fire("SessionStart", source, ROOT).await;
+        rig.fire_bare("SessionStart", source, ROOT).await;
         rig.wait_identity(ROOT).await;
     }
+
+    // Subagent reports take the same route.
+    rig.fire_bare("SubagentStart", "subagent_start", CLEARED)
+        .await;
+    let worker = rig.worker().await;
+    let running = wait_until("the subagent start to journal", || async {
+        let snapshot = worker.inspect().await.ok()?;
+        (!snapshot.subagents.is_empty()).then_some(snapshot)
+    })
+    .await;
+    assert_eq!(running.subagents[0].parent_id.as_deref(), Some(CLEARED));
+    rig.assert_hooks_quiet(2 + 6 + 1);
     rig.finish().await;
     rig.remove().await;
+}
+
+/// `base`, a handshake file's content, with `mutate` applied.
+fn handshake_with(base: &[u8], mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+    let mut document: serde_json::Value = serde_json::from_slice(base).expect("handshake JSON");
+    mutate(&mut document);
+    serde_json::to_vec(&document).expect("encode")
+}
+
+/// Turns a valid handshake file into an unusable one.
+type Break = Box<dyn Fn(&Rig, &Path)>;
+
+/// `(label, trace reason, how to break the file)` for every way the reporter
+/// refuses a handshake before it reaches the worker; `valid` is the worker's
+/// own content.
+fn handshake_breakages(valid: &[u8]) -> Vec<(&'static str, &'static str, Break)> {
+    vec![
+        (
+            "missing",
+            "handshake_missing",
+            Box::new(|_rig, path| fs::remove_file(path).expect("remove")),
+        ),
+        (
+            "group-readable",
+            "handshake_unsafe",
+            Box::new(|_rig, path| {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o640)).expect("chmod");
+            }),
+        ),
+        (
+            "symlink",
+            "handshake_unsafe",
+            Box::new(|_rig, path| {
+                let target = path.with_file_name("elsewhere");
+                fs::rename(path, &target).expect("move");
+                std::os::unix::fs::symlink(&target, path).expect("link");
+            }),
+        ),
+        (
+            "fifo",
+            "handshake_unsafe",
+            Box::new(|_rig, path| {
+                fs::remove_file(path).expect("remove");
+                nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).expect("fifo");
+            }),
+        ),
+        (
+            "hard link",
+            "handshake_unsafe",
+            Box::new(|_rig, path| {
+                fs::hard_link(path, path.with_file_name("alias")).expect("link");
+            }),
+        ),
+        (
+            "oversized",
+            "handshake_too_large",
+            Box::new(|_rig, path| write_private(path, &vec![b' '; 64 * 1024])),
+        ),
+        (
+            "not json",
+            "handshake_invalid",
+            Box::new(|_rig, path| write_private(path, b"not json")),
+        ),
+        (
+            "another session",
+            "handshake_session_mismatch",
+            Box::new({
+                let valid = valid.to_vec();
+                move |_rig, path| {
+                    write_private(
+                        path,
+                        &handshake_with(&valid, |document| {
+                            document["session_id"] = "s-another".into();
+                        }),
+                    );
+                }
+            }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_cleared_hook_without_a_trustworthy_handshake_reports_nothing_and_leaves_a_trace() {
+    let rig = Rig::new("muse-handshake-refused", None, &[])
+        .await
+        .expect("create the Muse session");
+    rig.fire("SessionStart", "session_start_startup", ROOT)
+        .await;
+    rig.wait_identity(ROOT).await;
+    let path = rig.handshake_path();
+    let valid = fs::read(&path).expect("handshake");
+
+    let cases = handshake_breakages(&valid);
+    for (label, reason, break_file) in cases {
+        let before = rig.daemon_trace().matches(reason).count();
+        // The file is replaced by a private copy of the worker's content first.
+        for entry in fs::read_dir(path.parent().expect("dir")).expect("list") {
+            let entry = entry.expect("entry");
+            if entry.file_name() == "alias" || entry.file_name() == "elsewhere" {
+                fs::remove_file(entry.path()).expect("remove helper");
+            }
+        }
+        let _ = fs::remove_file(&path);
+        write_private(&path, &valid);
+        break_file(&rig, &path);
+
+        rig.fire_bare("SessionStart", "session_start_clear", CLEARED)
+            .await;
+
+        assert_eq!(
+            rig.daemon_trace().matches(reason).count(),
+            before + 1,
+            "{label}: one trace line names {reason}: {}",
+            rig.daemon_trace()
+        );
+        let snapshot = rig.worker().await.inspect().await.expect("inspect");
+        assert_eq!(
+            snapshot
+                .active_identity
+                .as_ref()
+                .and_then(|identity| identity.native_reference.as_deref()),
+            Some(ROOT),
+            "{label}: no report reaches the worker"
+        );
+    }
+
+    // A handshake of another worker instance is trusted as a file and refused
+    // by the worker, which is the authority on its own instance id.
+    let _ = fs::remove_file(&path);
+    write_private(
+        &path,
+        &handshake_with(&valid, |document| {
+            document["worker_instance_id"] = "runtime-stale".into();
+        }),
+    );
+    rig.fire_bare("SessionStart", "session_start_clear", CLEARED)
+        .await;
+    assert!(
+        rig.trace().contains("worker_refused"),
+        "a stale instance id is refused: {}",
+        rig.trace()
+    );
+    rig.assert_hooks_quiet(1 + 8 + 1);
+    rig.finish().await;
+    rig.remove().await;
+}
+
+/// Writes `bytes` to `path` as an owner-private file.
+fn write_private(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).expect("write");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+#[tokio::test]
+async fn a_resume_rewrites_the_handshake_for_the_new_instance_and_removal_deletes_it() {
+    let rig = Rig::new("muse-handshake-resume", None, &[])
+        .await
+        .expect("create the Muse session");
+    rig.fire("SessionStart", "session_start_startup", ROOT)
+        .await;
+    let snapshot = rig.wait_identity(ROOT).await;
+    assert!(snapshot.native_reference.is_some());
+    let worker = rig.worker().await;
+    let settled = worker.inspect().await.expect("inspect");
+    wait_until("daemon to settle the Muse identity", || async {
+        match Box::pin(
+            rig.registry
+                .apply_worker_metadata_snapshot(&rig.session.id, &settled),
+        )
+        .await
+        {
+            WorkerMetadataApplyOutcome::Retryable(_) => None,
+            settled => Some(settled),
+        }
+    })
+    .await;
+    let first = fs::read(rig.handshake_path()).expect("handshake");
+    rig.finish().await;
+
+    rig.registry
+        .resume(&rig.session.id)
+        .await
+        .expect("resume the conversation");
+    wait_until("the relaunch to log its argv", || async {
+        let log = fs::read_to_string(&rig.launches).unwrap_or_default();
+        (log.matches(&format!("resume {ROOT}")).count() == 1).then_some(())
+    })
+    .await;
+    let second = fs::read(rig.handshake_path()).expect("handshake");
+    assert_ne!(first, second, "the new worker instance has its own id");
+    let first: serde_json::Value = serde_json::from_slice(&first).expect("first");
+    let second: serde_json::Value = serde_json::from_slice(&second).expect("second");
+    assert_ne!(first["worker_instance_id"], second["worker_instance_id"]);
+    assert_eq!(second["session_id"], rig.session.id.0.as_str());
+    assert_eq!(second["native_reference_kind"], "id");
+
+    // A cleared hook after the resume rebinds through the rewritten file.
+    rig.fire_bare("SessionStart", "session_start_clear", CLEARED)
+        .await;
+    rig.wait_identity(CLEARED).await;
+    rig.finish().await;
+    rig.remove().await;
+    assert!(
+        !rig.handshake_path().exists(),
+        "the handshake is deleted with the session"
+    );
 }
 
 #[tokio::test]
@@ -563,7 +821,28 @@ async fn the_overlay_and_reporter_live_in_the_state_directory_with_private_modes
     let command = parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         .as_str()
         .expect("command");
-    assert_eq!(command, format!("'{}' session", reporter.display()));
+    let handshake = rig.handshake_path();
+    assert_eq!(
+        command,
+        format!(
+            "'{}' session '{}' '{}' '{}' '{}'",
+            reporter.display(),
+            rig.session.id.0,
+            handshake.display(),
+            rig.log_dir
+                .join(pohunek_logging::config::HOOK_TRACE_FILE_NAME)
+                .display(),
+            pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES,
+        )
+    );
+    assert_eq!(
+        fs::metadata(&handshake)
+            .expect("the worker wrote the handshake before the agent started")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert!(
         overlay.starts_with(&rig.state_root),
         "outside TMPDIR, worktree and config home"

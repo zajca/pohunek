@@ -1458,6 +1458,7 @@ impl SessionRegistry {
                     .map_err(|error| {
                         runtime_error("worker_initialize_invalid", error.to_string())
                     })?,
+                handshake_file: command.worker_file,
             })
             .await
             .map_err(super::worker_error_to_protocol)?;

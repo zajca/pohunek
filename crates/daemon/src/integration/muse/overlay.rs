@@ -289,20 +289,61 @@ pub(super) fn refuse_conflicting_args(args: &[String]) -> Result<(), ProtocolErr
     Ok(())
 }
 
-/// The command line that runs the reporter for `action`: the absolute path in
-/// single quotes, then the action.
-fn command(reporter: &Path, action: &str) -> String {
-    let quoted = reporter.to_string_lossy().replace('\'', "'\\''");
-    format!("'{quoted}' {action}")
+/// What the overlay fixes for the reporter of one session, passed as arguments
+/// because Muse can start a hook without the `POHUNEK_*` environment.
+#[derive(Debug)]
+pub(super) struct ReporterSession<'a> {
+    /// The reporter script.
+    pub(super) reporter: &'a Path,
+    /// The pohunek session id.
+    pub(super) session_id: &'a str,
+    /// The handshake file the session worker writes.
+    pub(super) handshake: &'a Path,
+    /// The shared hook trace, when the daemon knows it.
+    pub(super) trace: Option<&'a Path>,
+    /// Size at which the hook trace rotates.
+    pub(super) trace_max_bytes: u64,
+}
+
+/// Single-quotes `text` for the `sh` that runs the hook command.
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The command line that runs the reporter for `action`: the absolute path of
+/// the script, the action, then the session id, the handshake path, the trace
+/// path and its size bound, each in single quotes.
+fn command(session: &ReporterSession<'_>, action: &str) -> String {
+    let trace = session
+        .trace
+        .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+    format!(
+        "{} {action} {} {} {} {}",
+        quote(&session.reporter.to_string_lossy()),
+        quote(session.session_id),
+        quote(&session.handshake.to_string_lossy()),
+        quote(&trace),
+        quote(&session.trace_max_bytes.to_string()),
+    )
 }
 
 /// Checks that `inputs` can produce an overlay, as a launch would build it.
 pub(super) fn validate(inputs: &Inputs) -> Result<(), Problem> {
-    build(inputs, Path::new("/reporter")).map(|_overlay| ())
+    build(
+        inputs,
+        &ReporterSession {
+            reporter: Path::new("/reporter"),
+            session_id: "s-validate",
+            handshake: Path::new("/handshake"),
+            trace: None,
+            trace_max_bytes: 1,
+        },
+    )
+    .map(|_overlay| ())
 }
 
 /// The overlay file: the foreign hooks verbatim plus the reporter per event.
-pub(super) fn build(inputs: &Inputs, reporter: &Path) -> Result<Vec<u8>, Problem> {
+pub(super) fn build(inputs: &Inputs, session: &ReporterSession<'_>) -> Result<Vec<u8>, Problem> {
     let (foreign_path, mut root) = inputs
         .foreign
         .clone()
@@ -328,7 +369,7 @@ pub(super) fn build(inputs: &Inputs, reporter: &Path) -> Result<Vec<u8>, Problem
         entries.push(json!({
             "hooks": [{
                 "type": "command",
-                "command": command(reporter, action),
+                "command": command(session, action),
                 "timeout": HOOK_TIMEOUT_SECS,
             }],
         }));

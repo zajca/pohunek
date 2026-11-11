@@ -4,7 +4,7 @@
 //! file named by `managed_hooks_path`. Pohunek installs nothing persistent
 //! for it: every launch gets a session-private overlay file, selected through
 //! `TBH_MANAGED_HOOKS_PATH`, and the launch arguments `-c
-//! managed_hooks_env_vars=[...]` that let the stateless reporter see the
+//! managed_hooks_env_vars=[...]` that let the reporter see the
 //! `POHUNEK_*` names it reads. Both come from [`MuseHook`] as launch input
 //! (see [`super::launch_input`]); `integration install`, `status` and
 //! `uninstall` only inspect and never write to the Muse config home.
@@ -72,6 +72,10 @@ const REPORTER_FILE: &str = "muse-reporter.sh";
 /// Name of the per-session managed hooks overlay below the launch-input prefix.
 const OVERLAY_FILE: &str = "muse-hooks.json";
 
+/// Name of the handshake file the session worker writes below the launch-input
+/// prefix, for hooks that Muse starts without the `POHUNEK_*` environment.
+const HANDSHAKE_FILE: &str = "muse-handshake.json";
+
 /// The reporter script every launch writes.
 const REPORTER: &str = include_str!("reporter.sh");
 
@@ -100,8 +104,16 @@ impl LaunchContributor for MuseHook {
         let inputs = Inputs::read(ctx.config_home, ctx.env)
             .map_err(|problem| overlay_unavailable(&problem))?;
         let reporter = ctx.file_path(REPORTER_FILE);
+        let handshake = ctx.file_path(HANDSHAKE_FILE);
+        let session = overlay::ReporterSession {
+            reporter: &reporter,
+            session_id: &ctx.session_id.0,
+            handshake: &handshake,
+            trace: ctx.hook_trace_path,
+            trace_max_bytes: pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES,
+        };
         let hooks =
-            overlay::build(&inputs, &reporter).map_err(|problem| overlay_unavailable(&problem))?;
+            overlay::build(&inputs, &session).map_err(|problem| overlay_unavailable(&problem))?;
         Ok(LaunchInput {
             env: vec![(
                 overlay::MANAGED_PATH_ENV.to_owned(),
@@ -120,6 +132,7 @@ impl LaunchContributor for MuseHook {
                     kind: FileKind::Executable,
                 },
             ],
+            worker_file: Some(HANDSHAKE_FILE.to_owned()),
         })
     }
 }

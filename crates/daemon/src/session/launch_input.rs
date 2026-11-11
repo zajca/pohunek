@@ -7,7 +7,7 @@
 
 // Rust guideline compliant 2026-10-27
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
@@ -48,6 +48,9 @@ pub(super) struct LaunchInputs {
     /// session arguments: the contributor's, then the runtime's `[placement]`
     /// and `[naming]` arguments; empty for a runtime with none of them.
     pub(super) root_args: Vec<String>,
+    /// Absolute path of the file the session worker writes before it starts
+    /// the agent, when the contribution names one.
+    pub(super) worker_file: Option<PathBuf>,
 }
 
 impl SessionRegistry {
@@ -244,6 +247,7 @@ impl SessionRegistry {
             return Ok(LaunchInputs {
                 env: base,
                 root_args: declared_args,
+                worker_file: None,
             });
         };
         let Some(state_root) = self.inner.config.worker_state_root.as_deref() else {
@@ -255,6 +259,7 @@ impl SessionRegistry {
         Ok(LaunchInputs {
             env: self.launch_env_with(definition, profile_env, &placed.env, agent, id),
             root_args,
+            worker_file: placed.worker_file,
         })
     }
 
@@ -318,6 +323,12 @@ impl SessionRegistry {
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .chain(base.iter().cloned())
             .collect();
+        let hook_trace_path = self
+            .inner
+            .config
+            .log_dir
+            .as_ref()
+            .map(|dir| dir.join(pohunek_logging::config::HOOK_TRACE_FILE_NAME));
         contributor
             .contribute(&LaunchInputContext {
                 session_id: id,
@@ -326,6 +337,7 @@ impl SessionRegistry {
                 env: &effective,
                 args: frozen_args,
                 private_dir: &state_root.join(&id.0),
+                hook_trace_path: hook_trace_path.as_deref(),
             })
             .map(Some)
     }

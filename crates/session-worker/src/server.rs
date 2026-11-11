@@ -1462,6 +1462,7 @@ async fn initialize_request(
 
     freeze_launch_rule(shared, hook_schema, &initialize)?;
     let command = command_from_initialize(shared, &initialize, &worker_instance_id);
+    write_handshake_file(shared, &initialize, &worker_instance_id).await;
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
     let subscriber_bytes = usize::try_from(initialize.limits.subscriber_queue_bytes())
@@ -7398,6 +7399,48 @@ fn validate_lease(
         .map_err(lease_control_error)
 }
 
+/// Writes the handshake file the daemon named in `initialize`, if any.
+///
+/// A failure is logged and does not refuse the launch: without the file only a
+/// hook that runs without the `POHUNEK_*` environment loses its route, and that
+/// hook traces the missing file.
+async fn write_handshake_file(
+    shared: &Shared,
+    initialize: &Initialize,
+    worker_instance_id: &WorkerInstanceId,
+) {
+    let Some(target) = initialize.handshake_file.clone() else {
+        return;
+    };
+    let session_id = shared.session_id.to_string();
+    let instance_id = worker_instance_id.to_string();
+    let socket_path = shared.socket_path.to_string_lossy().into_owned();
+    let trace_path = shared.hook_trace_path.to_string_lossy().into_owned();
+    let journal_path = shared.journal.path().to_path_buf();
+    let reference_kind = initialize.launch.reference_kind.clone();
+    let written = tokio::task::spawn_blocking(move || {
+        crate::handshake::Handshake::new(
+            &session_id,
+            &instance_id,
+            &socket_path,
+            &trace_path,
+            pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES,
+            reference_kind.as_deref(),
+        )
+        .write(&target, &journal_path)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "the hook handshake file is not written");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "the hook handshake task failed");
+        }
+    }
+}
+
 /// Builds the PTY child command from a validated `Initialize`.
 ///
 /// The child environment starts empty and is layered as base environment,
@@ -11622,6 +11665,7 @@ mod tests {
             answers_program_status_probe: false,
             probe_foreground_programs: Vec::new(),
             placement_check_interval_ms: None,
+            handshake_file: None,
             input_policy: protocol::InputPolicy::new(500).expect("input policy"),
         }
     }

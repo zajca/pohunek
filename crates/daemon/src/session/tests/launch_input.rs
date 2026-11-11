@@ -87,6 +87,7 @@ impl LaunchContributor for Fixture {
                     kind: FileKind::Executable,
                 },
             ],
+            worker_file: None,
         })
     }
 }
@@ -278,6 +279,7 @@ fn input(env: Vec<(&str, String)>, root_args: Vec<String>, files: Vec<PrivateFil
         env: env.into_iter().map(|(n, v)| (n.to_owned(), v)).collect(),
         root_args,
         files,
+        worker_file: None,
     }
 }
 

@@ -393,6 +393,7 @@ impl crate::integration::launch_input::LaunchContributor for EnvContributor {
             env: vec![("CONTRIBUTED_FLAG".to_owned(), "contributed".to_owned())],
             root_args: Vec::new(),
             files: Vec::new(),
+            worker_file: None,
         })
     }
 }

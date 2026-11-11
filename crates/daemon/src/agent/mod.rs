@@ -132,6 +132,9 @@ pub struct LaunchOpts {
     pub env_extra: LaunchEnv,
     /// Exact provider executable already resolved and validated for this launch.
     pub(crate) validated_program: Option<ValidatedLaunchProgram>,
+    /// File the session worker writes before it starts the agent, named by the
+    /// runtime's launch input.
+    pub worker_file: Option<PathBuf>,
 }
 
 /// Sanitized process launch plan passed to a durable worker.
@@ -153,6 +156,9 @@ pub struct LaunchCommand {
     /// The release the launch probe read from the program, when it has a
     /// version probe.
     pub runtime_version: Option<ProbeVersion>,
+    /// File the session worker writes before it starts the agent; it receives
+    /// the path as the handshake file of its launch plan.
+    pub worker_file: Option<PathBuf>,
 }
 
 /// Input framing rules for programmatic prompt injection.
@@ -437,6 +443,7 @@ pub fn build_pty_command(
             .validated_program
             .as_ref()
             .and_then(ValidatedLaunchProgram::version),
+        worker_file: opts.worker_file.clone(),
     })
 }
 
@@ -565,6 +572,7 @@ mod tests {
             rows: 40,
             env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())].into(),
             validated_program: None,
+            worker_file: None,
         }
     }
 

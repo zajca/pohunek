@@ -759,6 +759,16 @@ pub struct Initialize {
     /// A peer that predates the field ignores it and never checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_check_interval_ms: Option<u64>,
+    /// Absolute path of the handshake file the worker writes for the agent's
+    /// hooks before it starts the agent, or absent to write none.
+    ///
+    /// The file holds the session id, the worker instance id, the worker
+    /// socket path and the hook trace location, so a hook that runs without
+    /// the `POHUNEK_*` environment can still reach the worker. The daemon sets
+    /// it when the runtime's launch input names such a file. A peer that
+    /// predates the field ignores it and writes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handshake_file: Option<PathBuf>,
 }
 
 #[expect(
@@ -801,6 +811,7 @@ impl Debug for Initialize {
                 "placement_check_interval_ms",
                 &self.placement_check_interval_ms,
             )
+            .field("handshake_file", &self.handshake_file.is_some())
             .finish()
     }
 }
@@ -1728,6 +1739,7 @@ mod tests {
             answers_program_status_probe: false,
             probe_foreground_programs: Vec::new(),
             placement_check_interval_ms: None,
+            handshake_file: None,
         }
     }
 

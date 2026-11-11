@@ -113,6 +113,7 @@ mod tests {
             rows: 24,
             env_extra: secret_env(),
             validated_program: None,
+            worker_file: None,
         };
         assert_redacted(&format!("{opts:?}"));
         assert_redacted(&format!("{opts:#?}"));
@@ -125,6 +126,7 @@ mod tests {
             cols: 80,
             rows: 24,
             runtime_version: None,
+            worker_file: None,
         };
         assert_redacted(&format!("{command:?}"));
         assert_redacted(&format!("{command:#?}"));
