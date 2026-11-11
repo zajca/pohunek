@@ -392,7 +392,7 @@ async fn a_daemon_left_at_a_stop_is_reported_by_the_check_the_stop_runs() {
          : > trapped\nsleep 600 &\nwait $!",
     )
     .await;
-    let daemon = runtime.release_daemon();
+    runtime.release_daemon();
     assert_eq!(escape_warnings(&capture), 0, "no check saw the daemon yet");
     poll_until("the root to install its trap", || {
         runtime
@@ -404,8 +404,16 @@ async fn a_daemon_left_at_a_stop_is_reported_by_the_check_the_stop_runs() {
     });
 
     assert!(matches!(runtime.stop().await, ResponseKind::Stopped { .. }));
-    end(daemon);
 
+    // `Stopped` follows the terminal commit, which is written after the check
+    // that ends the runtime. A trap that outran the stop grace would leave the
+    // daemon for that check to report, so a clean commit proves the root
+    // reaped the daemon and the one WARN came from the stop's own check.
+    assert_eq!(
+        latest(&runtime.server).await.map(|report| report.outcome),
+        Some(PlacementOutcome::Clean),
+        "the root killed the daemon within the stop grace"
+    );
     assert_eq!(escape_warnings(&capture), 1);
 }
 

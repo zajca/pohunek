@@ -492,6 +492,8 @@ directory and on the newest 1024 session directories of each dated root,
 registered newest first;
 a new session directory evicts the watch registered longest ago, and older sessions are reached
 by the periodic pass, so a large store never takes watches from other runtimes.
+On both backends (inotify on Linux, the recursive FSEvents watch on macOS) a change
+event the backend reports for a session log indexes it, wherever the pass stopped.
 A foreground agent started inside a shell session is
 attributed through this root; the agent's session log is the only evidence.
 
@@ -917,7 +919,9 @@ dir = "bundle"   # package-relative directory that holds the files
   and after a daemon restart, and `session rm` or a retention sweep releases it.
   A host whose daemon does not advertise `session_new_context_pin_supported`
   launches the assistant unpinned, and an uninstall there removes the files
-  under a running session. Rolling the daemon back past the release that
+  under a running session. A daemon replaced by an older release between the
+  launch's capability check and its `session.new` is refused with
+  `session_new_context_pin_unsupported` before anything is sent. Rolling the daemon back past the release that
   introduced the pin needs the store copy `metadata.jsonl.pre-schema-<old>`,
   because the older daemon refuses a store of a newer schema; `<old>` is the
   oldest schema the migration found (`-17` from 0.41, `-15` from 0.40.x).

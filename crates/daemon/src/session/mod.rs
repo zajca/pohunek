@@ -520,8 +520,9 @@ pub struct SessionRegistryConfig {
     /// The clock the deadlines of the doctor's version probes are read from.
     /// Defaults to the system clock.
     pub probe_clock: crate::capabilities::ProbeClock,
-    /// The time the doctor's version probes share, counted from the first
-    /// probe. Defaults to [`hostcheck::AGENT_RUNTIME_PROBE_BUDGET`].
+    /// The time the doctor's version probes share, counted from the start of
+    /// the doctor's profile checks, before the configured profiles are
+    /// resolved. Defaults to [`hostcheck::AGENT_RUNTIME_PROBE_BUDGET`].
     pub doctor_probe_budget: Duration,
     /// Age after which the startup collection may delete the journal
     /// directory of a session that no longer exists (`[worker_journals]` of
