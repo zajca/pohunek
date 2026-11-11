@@ -1,8 +1,11 @@
 """Every step that can wait on a network or a local archive has an upper bound (#1811),
 and every fail-fast cancel names the job it came from (#1823). Stdlib only."""
 
+import contextlib
 import os
 import re
+import shutil
+import signal
 import subprocess
 import tempfile
 import unittest
@@ -82,9 +85,19 @@ class CancelAttributionTests(unittest.TestCase):
                         self.assertIn("(a called workflow) failed first", step)
 
     def run_script(
-        self, jobs_api_json: str | None, job_id: str = "99", hang: bool = False, timeout: str = "20"
+        self,
+        jobs_api_json: str | None,
+        job_id: str = "99",
+        hang: bool = False,
+        timeout: str = "20",
+        sleep_log: Path | None = None,
     ) -> tuple[str, str, str]:
-        """Run cancel-run.sh with a fake `gh`; return (stdout, summary, gh calls)."""
+        """Run cancel-run.sh with a fake `gh`; return (stdout, summary, gh calls).
+
+        With `sleep_log`, a fake `sleep` records its pid there and the fake
+        `gh api` waits for it, so the watchdog's sleep has started before the
+        watchdog is killed.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bin_dir = tmp_path / "bin"
@@ -93,12 +106,22 @@ class CancelAttributionTests(unittest.TestCase):
             reply = tmp_path / "reply.json"
             if jobs_api_json is not None:
                 reply.write_text(jobs_api_json)
+            api_wait = ""
+            if sleep_log is not None:
+                real_sleep = shutil.which("sleep")
+                self.assertIsNotNone(real_sleep)
+                sleep_writer = bin_dir / "sleep.tmp"
+                sleep_writer.write_text(f'#!/bin/sh\necho $$ > "{sleep_log}"\nexec "{real_sleep}" "$@"\n')
+                sleep_writer.chmod(0o755)
+                sleep_writer.rename(bin_dir / "sleep")
+                api_wait = f'  while [ ! -s "{sleep_log}" ]; do :; done\n'
             gh = bin_dir / "gh"
             gh.write_text(
                 "#!/bin/sh\n"
                 f'echo "$*" >> "{calls}"\n'
                 'if [ "$1" = api ]; then\n'
                 + (f'  read -r _ < "{tmp_path / "never"}"\n' if hang else "")
+                + api_wait
                 + f'  [ -f "{reply}" ] || exit 1\n'
                 f'  cat "{reply}"\n'
                 "fi\n"
@@ -137,7 +160,6 @@ class CancelAttributionTests(unittest.TestCase):
         self.assertIn("failed first", summary)
         self.assertIn("run cancel 7 --repo o/r", calls)
 
-
     def test_an_empty_job_id_skips_the_lookup_and_the_job_link_but_cancels(self):
         out, summary, calls = self.run_script('{"name": "unused"}', job_id="")
         expected = "job 'fast-tests' (fast-tests, https://github.com/o/r/actions/runs/7) failed first"
@@ -152,6 +174,23 @@ class CancelAttributionTests(unittest.TestCase):
         out, _, calls = self.run_script('{"name": "unused"}', hang=True, timeout="0")
         self.assertIn("::error title=Fail fast::job 'fast-tests' (fast-tests, https://github.com/o/r/actions/runs/7/job/99) failed first;", out)
         self.assertIn("run cancel 7 --repo o/r", calls)
+
+    def test_no_sleep_outlives_a_normal_run_of_the_script(self):
+        # The lookup ends before its bound, so the parent kills the watchdog: the
+        # watchdog's own sleep must end with it instead of running on orphaned.
+        sleep_pid = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sleep_log = Path(tmp) / "sleep.pid"
+                _, _, calls = self.run_script('{"name": "tests (cli, fast)", "steps": []}', sleep_log=sleep_log)
+                self.assertIn("run cancel 7 --repo o/r", calls)
+                sleep_pid = int(sleep_log.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(sleep_pid, 0)
+        finally:
+            if sleep_pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(sleep_pid, signal.SIGKILL)
 
 
 if __name__ == "__main__":

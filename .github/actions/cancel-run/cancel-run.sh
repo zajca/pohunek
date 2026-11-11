@@ -18,7 +18,15 @@ bounded_job_lookup() {
   reply="$(mktemp)" || return 1
   gh api "repos/${REPOSITORY}/actions/jobs/${JOB_ID}" >"$reply" 2>/dev/null &
   gh_pid=$!
-  (sleep "$LOOKUP_TIMEOUT_SECONDS" && kill "$gh_pid") >/dev/null 2>&1 &
+  # The trap ends the subshell's own sleep with it: a plain foreground `sleep`
+  # would survive the kill of the subshell as an orphan. `wait` reaps the
+  # killed sleep, so the subshell exits only once the sleep is gone.
+  (
+    trap 'kill "${lookup_sleep:-}" 2>/dev/null; wait "${lookup_sleep:-}" 2>/dev/null' TERM
+    sleep "$LOOKUP_TIMEOUT_SECONDS" &
+    lookup_sleep=$!
+    wait "$lookup_sleep" && kill "$gh_pid"
+  ) >/dev/null 2>&1 &
   watchdog_pid=$!
   wait "$gh_pid" 2>/dev/null
   rc=$?
