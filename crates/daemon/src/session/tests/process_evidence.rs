@@ -13,9 +13,17 @@ use super::*;
 
 const AGENT_PROFILE: &str = "process-evidence-claude";
 
-/// A Claude profile over a shell that echoes every line it reads, with the
-/// submit delay removed so the input is one atomic plan.
-fn process_evidence_registry(tag: &str) -> SessionRegistry {
+/// Any non-zero Claude submit delay selects the delayed-submit framing, which
+/// writes Enter on its own after the body.
+const DELAYED_SUBMIT: Duration = Duration::from_millis(20);
+
+/// The `session.new` acknowledgement window of the initial-input scenario.
+const ACK_WINDOW_MS: u32 = 5_000;
+
+/// A Claude profile over a shell that echoes every line it reads, with
+/// `submit_delay` between the body and Enter; `Duration::ZERO` makes the
+/// input one atomic plan.
+fn process_evidence_registry(tag: &str, submit_delay: Duration) -> SessionRegistry {
     let agents_dir = temp_agents_dir_with(
         tag,
         AGENT_PROFILE,
@@ -24,7 +32,7 @@ fn process_evidence_registry(tag: &str) -> SessionRegistry {
     SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
-        submit_delay_overrides: submit_delay_override("claude", Duration::ZERO),
+        submit_delay_overrides: submit_delay_override("claude", submit_delay),
         ..SessionRegistryConfig::default()
     })
 }
@@ -107,7 +115,7 @@ async fn expire_waited_input<F: std::future::Future<Output = ()>>(
 
 #[tokio::test]
 async fn terminal_output_after_the_write_does_not_acknowledge_a_working_wait() {
-    let registry = process_evidence_registry("process-evidence-output");
+    let registry = process_evidence_registry("process-evidence-output", Duration::ZERO);
     let id = create_session(&registry).await;
     let mut events = registry.subscribe();
 
@@ -124,7 +132,7 @@ async fn terminal_output_after_the_write_does_not_acknowledge_a_working_wait() {
 /// next input is written is not evidence of that input, whatever its source.
 #[tokio::test]
 async fn process_activity_recorded_before_the_write_does_not_acknowledge_a_working_wait() {
-    let registry = process_evidence_registry("process-evidence-before");
+    let registry = process_evidence_registry("process-evidence-before", Duration::ZERO);
     let id = create_session(&registry).await;
     let mut events = registry.subscribe();
     registry
@@ -147,37 +155,25 @@ async fn process_activity_recorded_before_the_write_does_not_acknowledge_a_worki
 /// an `idle` target needs `working` evidence that is not process output.
 #[tokio::test]
 async fn terminal_output_then_an_idle_record_does_not_acknowledge_an_idle_wait() {
-    let registry = process_evidence_registry("process-evidence-idle");
+    let registry = process_evidence_registry("process-evidence-idle", DELAYED_SUBMIT);
     let id = create_session(&registry).await;
     let record = |activity, source| ActivityTransition {
         activity,
         source,
         blocked_kind: None,
     };
-    let idle_wait = || protocol::SessionInputWait {
-        until: Some(vec![AgentActivity::Idle]),
-        timeout_ms: Some(protocol::MAX_SESSION_WAIT_MS),
-        allow_prompt_accepted: None,
-    };
-    let submission = |boundary: crate::session::input::InputActivitySnapshot| InputSubmission {
-        runtime: boundary.runtime,
-        activity_epoch: registry.daemon_instance_id().to_owned(),
-        after_revision: boundary.revision,
-        deadline: tokio::time::Instant::now()
-            + Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS)),
-        idle_requires_working: true,
-        prompt_mark: None,
-        prompt_capable: false,
-        prompt_opt_in: false,
-    };
 
     // A program status `working` followed by idle is a turn.
-    let boundary = registry
-        .input_activity_snapshot(&id, None)
-        .await
-        .expect("capture the boundary");
-    let mut events = registry.subscribe();
-    let positive = submission(boundary);
+    let sent = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_sent(Arc::clone(&sent));
+    let call = spawn_waited_input(
+        &registry,
+        &id,
+        "m",
+        vec![AgentActivity::Idle],
+        protocol::MAX_SESSION_WAIT_MS,
+    );
+    reach_boundary(&sent).await;
     registry
         .record_activity(
             &id,
@@ -187,48 +183,26 @@ async fn terminal_output_then_an_idle_record_does_not_acknowledge_an_idle_wait()
     registry
         .record_activity(&id, record(AgentActivity::Idle, StateSource::OscProgress))
         .await;
-    let result = registry
-        .await_input_settled(&id, idle_wait(), positive, &mut events)
+    reach_boundary(&sent).await;
+    let result = call
         .await
+        .expect("waited input task joins")
         .expect("a program status turn answers the idle target");
     assert_eq!(result.activity, Some(AgentActivity::Idle));
     assert_eq!(result.activity_source, Some(StateSource::OscProgress));
 
     // Process output followed by idle is not.
-    let boundary = registry
-        .input_activity_snapshot(&id, None)
-        .await
-        .expect("capture the boundary");
-    let mut events = registry.subscribe();
-    let negative = submission(boundary);
-    registry
-        .record_activity(&id, record(AgentActivity::Working, StateSource::Process))
-        .await;
-    registry
-        .record_activity(&id, record(AgentActivity::Idle, StateSource::Screen))
-        .await;
-    let inhibitor = AutoAdvanceInhibitor::new();
-    tokio::time::pause();
-    let wait = tokio::spawn({
-        let registry = registry.clone();
-        let id = id.clone();
-        async move {
-            registry
-                .await_input_settled(&id, idle_wait(), negative, &mut events)
-                .await
-        }
-    });
-    tokio::time::advance(
-        Duration::from_millis(u64::from(protocol::MAX_SESSION_WAIT_MS)) + TIMER_TICK,
-    )
+    let outcome = expire_waited_input(&registry, &id, AgentActivity::Idle, async {
+        registry
+            .record_activity(&id, record(AgentActivity::Working, StateSource::Process))
+            .await;
+        registry
+            .record_activity(&id, record(AgentActivity::Idle, StateSource::Screen))
+            .await;
+    })
     .await;
-    let error = wait
-        .await
-        .expect("wait task joins")
-        .expect_err("process output followed by idle is not a turn");
+    let error = outcome.expect_err("process output followed by idle is not a turn");
     assert_eq!(error.code, "session_input_timeout");
-    tokio::time::resume();
-    inhibitor.release().await;
     registry.stop(&id).await.expect("stop the session");
 }
 
@@ -237,7 +211,7 @@ async fn terminal_output_then_an_idle_record_does_not_acknowledge_an_idle_wait()
 /// false and keeps the session.
 #[tokio::test]
 async fn terminal_output_after_the_initial_input_does_not_deliver_the_prompt() {
-    let registry = process_evidence_registry("process-evidence-new");
+    let registry = process_evidence_registry("process-evidence-new", Duration::ZERO);
     let mut events = registry.subscribe();
     let sent = Arc::new(tokio::sync::Barrier::new(2));
     registry.hold_next_input_sent(Arc::clone(&sent));
@@ -245,7 +219,7 @@ async fn terminal_output_after_the_initial_input_does_not_deliver_the_prompt() {
     let mut create = params();
     create.agent = AGENT_PROFILE.to_owned();
     create.input = Some("m".to_owned());
-    create.input_ack_timeout_ms = Some(5_000);
+    create.input_ack_timeout_ms = Some(ACK_WINDOW_MS);
     let create = tokio::spawn({
         let registry = registry.clone();
         async move { create_acknowledged(&registry, create).await }
@@ -256,10 +230,19 @@ async fn terminal_output_after_the_initial_input_does_not_deliver_the_prompt() {
     tokio::time::pause();
     process_working_published(&mut events).await;
     reach_boundary(&sent).await;
-    // The window opens once the write returned; advance until it closed.
+    // The window opens once the write returned; advance a window at a time
+    // until it closed, for at most `HANG_GUARD` of virtual time.
+    let step = Duration::from_millis(u64::from(ACK_WINDOW_MS)) + TIMER_TICK;
+    let max_steps = pohunek_test_support::wait::HANG_GUARD.as_millis() / step.as_millis();
+    let mut steps = 0;
     while !create.is_finished() {
-        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(
+            steps < max_steps,
+            "the acknowledgement window closes within the hang guard"
+        );
+        tokio::time::advance(step).await;
         tokio::task::yield_now().await;
+        steps += 1;
     }
     let (info, prompt_delivered) = create
         .await
