@@ -16,7 +16,7 @@ use super::{
     AgentActivity, Duration, ErrorClass, InputRules, LaunchCommand, LaunchCommandPlan,
     ProtocolError, ResolvedAgent, RuntimeHandle, RuntimeRef, SessionEntry, SessionId,
     SessionInputParams, SessionInputResult, SessionInputWait, SessionRegistry,
-    SessionRegistryConfig, SessionState, Worker,
+    SessionRegistryConfig, SessionState, StateSource, Worker,
 };
 use super::{live_runtime_identity, PromptAcceptance};
 
@@ -1144,17 +1144,27 @@ impl SessionRegistry {
 /// The earliest evidence of the submission's runtime above its boundary, up to
 /// its deadline, whose activity is one of `targets`. On delayed-submit framing
 /// an `idle` target counts only after `working` evidence.
+///
+/// On a session whose manifest declares a program status source, `working`
+/// evidence from the process watcher is output the terminal produced (the
+/// startup banner, the composer redrawing the typed text), not a turn, so it
+/// never counts.
 fn matching_input_evidence<'a>(
     entry: &'a SessionEntry,
     targets: &[AgentActivity],
     submission: &InputSubmission,
     event_revision: Option<ActivityRevision>,
 ) -> Option<&'a ActivityEvidence> {
+    let status_source_declared =
+        super::program_status_app(&entry.detector_config.borrow().config).is_some();
     let after_submit = |evidence: &&ActivityEvidence| {
         evidence.runtime == submission.runtime
             && evidence.activity_epoch == submission.activity_epoch
             && evidence.revision > submission.after_revision
             && evidence.observed_at <= submission.deadline
+            && !(status_source_declared
+                && evidence.source == StateSource::Process
+                && evidence.activity == AgentActivity::Working)
     };
     let first_working = submission
         .idle_requires_working

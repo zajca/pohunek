@@ -466,7 +466,7 @@ impl ProtocolError {
                 "Enter was written to session {session_id}, but no requested activity followed it before the input deadline"
             ),
             Some(
-                "the input was submitted; inspect the current session before deciding whether to resend, and do not retry blindly"
+                "Enter was written but the agent may not have taken the text; read the screen (`pohunek session screen`) before resending or pressing Enter, and do not retry blindly"
                     .to_owned(),
             ),
         )
@@ -484,7 +484,7 @@ impl ProtocolError {
                 "Enter was written to session {session_id}, but neither the requested activity nor a prompt acceptance followed it before the input deadline"
             ),
             Some(
-                "the input was submitted; inspect the current session before deciding whether to resend, and do not retry blindly"
+                "Enter was written but the agent may not have taken the text; read the screen (`pohunek session screen`) before resending or pressing Enter, and do not retry blindly"
                     .to_owned(),
             ),
         )

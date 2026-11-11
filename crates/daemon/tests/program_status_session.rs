@@ -90,7 +90,9 @@ const PROCWATCH_POLL: std::time::Duration = std::time::Duration::from_millis(100
 /// Bound of a wait that must be satisfied by the stand-in agent.
 const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 
-/// The stand-in agent. `$1` is the mode, `$2` the scratch directory and `$3`
+/// The stand-in agent. The `late` mode shows nothing until it reads Enter, then
+/// prints a plain line (process output without any record). `$1` is the mode,
+/// `$2` the scratch directory and `$3`
 /// where commands come from.
 ///
 /// It answers the version probe, switches the terminal to raw mode, prints the
@@ -125,8 +127,18 @@ box() {{
   printf '────────────────────────────────────────\r\n'
   printf '  ? for shortcuts'
 }}
-printf '\033[2J\033[H'
-box
+if [ "$mode" = late ]; then
+  head -c 10 | od -An -v -tx1 | tr -d ' \n' > "$dir/reply.hex"
+  late_cr=$(printf '\r')
+  while :; do
+    c=$(head -c 1)
+    if [ "$c" = "$late_cr" ]; then break; fi
+  done
+  printf 'SYNC\r\n'
+else
+  printf '\033[2J\033[H'
+  box
+fi
 if [ "$mode" = screen ]; then
   exec 3<> "$dir/cmd"
   while :; do
@@ -243,6 +255,7 @@ fn prepare_agents(env: &TestEnv, answer_probe: bool, authority_from: Option<&str
         ("fake-silent", "silent", "stdin"),
         ("fake-recording", "recording", "stdin"),
         ("fake-screen", "screen", "fifo"),
+        ("fake-late", "late", "stdin"),
     ] {
         std::fs::write(
             agents.join(format!("{name}.toml")),
@@ -390,6 +403,17 @@ impl Fixture {
             })
             .await
             .expect("create the stand-in agent session")
+    }
+
+    /// Starts the host profile `profile` and waits until the stand-in agent has
+    /// switched to raw mode and read the worker's probe reply.
+    async fn start_after_reply(&self, profile: &str) -> SessionInfo {
+        let created = self.start(profile).await;
+        wait_until("the agent to record the worker's reply", || async {
+            read_trimmed(&self.scratch_file("reply.hex"))
+        })
+        .await;
+        created
     }
 
     async fn activity(&self, id: &SessionId) -> Option<(AgentActivity, StateSource)> {
@@ -629,6 +653,52 @@ async fn a_record_without_input_changes_the_activity() {
         .expect("stop the session");
 }
 
+/// Waits until the detector has published a process-sourced `working`.
+async fn wait_process_working(
+    events: &std::sync::Mutex<tokio::sync::broadcast::Receiver<protocol::Event>>,
+) {
+    wait_until("the detector to publish Working/Process", || async {
+        saw_process_working(&mut events.lock().expect("event receiver lock")).then_some(())
+    })
+    .await;
+}
+
+/// A program status `working` record after the write is a turn, also when the
+/// detector already published `Working/Process` from the first input's output.
+#[tokio::test]
+async fn a_program_status_working_record_after_the_write_acknowledges_a_working_wait() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let created = fixture.start_after_reply("fake-late").await;
+    let events = std::sync::Mutex::new(fixture.registry.subscribe());
+    fixture
+        .registry
+        .input(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "m".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("type the first input");
+    wait_process_working(&events).await;
+
+    // The record follows the write although Working/Process is already current.
+    let working = fixture
+        .input(&created.id, "g", AgentActivity::Working)
+        .await
+        .expect("the program status record is a turn");
+    assert_eq!(working.activity, Some(AgentActivity::Working));
+    assert_eq!(working.activity_source, Some(StateSource::OscProgress));
+    assert_eq!(working.submitted, Some(true));
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
 #[tokio::test]
 async fn a_blocked_record_is_blocked_activity_and_refuses_a_waited_input() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -833,6 +903,13 @@ fn agent_states(
         }
     }
     states
+}
+
+/// Whether the events include a process-sourced `working` activity.
+fn saw_process_working(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> bool {
+    agent_states(events).iter().any(|event| {
+        event.payload()["activity"] == "working" && event.payload()["source"] == "process"
+    })
 }
 
 #[tokio::test]

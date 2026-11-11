@@ -66,6 +66,7 @@ mod lifecycle_queue;
 mod muse_hook;
 mod native_recovery;
 mod native_supersede;
+mod process_evidence;
 mod prompt_accepted;
 mod stale_worker_metadata;
 mod stop_monitoring;
