@@ -35,7 +35,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 17;
+pub const STORE_SCHEMA_VERSION: u32 = 18;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -117,6 +117,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 16,
         apply: migrate_v16_to_v17,
+    },
+    Migration {
+        from: 17,
+        apply: migrate_v17_to_v18,
     },
 ];
 
@@ -260,6 +264,15 @@ fn migrate_v16_to_v17(record: &mut Map<String, Value>) {
         }
     }
 }
+
+/// Schema 17 to 18: a resume binding may record the digest of the context
+/// package its session reads by path (`context_pin`), which keeps that package
+/// installed while the record exists.
+///
+/// A record written without the field pins no context package, which is how
+/// every schema 17 session reads: its files were never retained, and the pin is
+/// never backfilled from the package installed now.
+fn migrate_v17_to_v18(_record: &mut Map<String, Value>) {}
 
 /// Removes the fork keys from one native launch spec.
 #[expect(

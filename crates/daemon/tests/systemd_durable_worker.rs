@@ -1303,6 +1303,7 @@ impl Fixture {
                     profile_revision: None,
                     native_launch_unresolved: false,
                     launch_checkout: None,
+                    context_pin: None,
                 }),
                 active_agent_origin: None,
                 native_identity_ordering: None,

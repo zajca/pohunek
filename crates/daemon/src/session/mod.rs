@@ -3933,6 +3933,9 @@ impl SessionRegistry {
         // Verified and held before anything is persisted, so a package that
         // fails verification launches nothing and leaves no record.
         let _package_launch = self.guard_package_launch(&resolved.definition).await?;
+        if let Some(digest) = params.context_package_digest.as_ref() {
+            self.verify_context_pin(digest).await?;
+        }
         let guard = self.lock_lifecycle(&id).await;
         let intent = create_intent_record(
             &id,
@@ -4463,6 +4466,7 @@ impl SessionRegistry {
                 cwd: launch_cwd.clone(),
                 project_id: project_id.clone(),
             })),
+            context_pin: params.context_package_digest.clone(),
         };
         // The detection-manifest override is consumed only by the detector, on
         // both the launch and resume paths; never persisted (re-resolved by name).

@@ -958,6 +958,7 @@ impl SessionRegistry {
                 profile_revision: snapshot.profile_revision.clone(),
                 native_launch_unresolved: false,
                 launch_checkout: snapshot.launch_checkout.clone(),
+                context_pin: snapshot.context_pin.clone(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,

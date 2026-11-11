@@ -39,45 +39,10 @@ pub async fn materialize_assistant(
     let id = PackageId::parse(ASSISTANT_CONTEXT_PACKAGE_ID).map_err(|error| {
         ProtocolError::materialization_failed("assistant package id", &error.to_string())
     })?;
-    let context = packages.context_dir(id).await.map_err(|error| {
-        // A registry read error is transient and says nothing about the
-        // package, so it must not suggest reinstalling a healthy one.
-        if let ContextError::Rejected(PackageRejection::Registry(registry)) = &error {
-            return ProtocolError::materialization_failed(
-                "assistant package registry",
-                &registry.to_string(),
-            );
-        }
-        let (detail, remedy) = match &error {
-            ContextError::NotInstalled => (
-                "it is not installed".to_owned(),
-                format!(
-                    "install the assistant package on that host with `pohunek plugin install <archive> --sha256 <digest>` (id `{ASSISTANT_CONTEXT_PACKAGE_ID}`; see the plugin-assistant release), then retry"
-                ),
-            ),
-            ContextError::NotSelected => (
-                "it is installed but not selected".to_owned(),
-                format!(
-                    "select it with `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID} --digest <digest>` (`pohunek plugin list` shows the digests), then retry"
-                ),
-            ),
-            ContextError::Disabled => (
-                "it is disabled".to_owned(),
-                format!(
-                    "enable it with `pohunek plugin enable {ASSISTANT_CONTEXT_PACKAGE_ID}` (see `pohunek plugin list`), then retry"
-                ),
-            ),
-            ContextError::LookupFailed => (
-                "the package lookup failed".to_owned(),
-                "retry the launch; if it repeats, inspect the daemon log".to_owned(),
-            ),
-            ContextError::Rejected(rejection) => (
-                rejection.to_string(),
-                "run `pohunek plugin doctor` for the package, then reinstall it (`plugin uninstall --remove-modified`, then `plugin install ... --sha256 <digest>`)".to_owned(),
-            ),
-        };
-        ProtocolError::assistant_package_missing(ASSISTANT_CONTEXT_PACKAGE_ID, &detail, &remedy)
-    })?;
+    let context = packages
+        .context_dir(id)
+        .await
+        .map_err(|error| context_error(&error))?;
     let paths = paths.clone();
     tokio::task::spawn_blocking(move || {
         let concepts: Vec<protocol::ConceptMeta> = bundle_index(&context.dir)
@@ -132,6 +97,49 @@ pub async fn materialize_assistant(
     .map_err(|_join_error| {
         ProtocolError::materialization_failed("assistant materialization", "the task panicked")
     })?
+}
+
+/// The `assistant_package_missing` (or `materialization_failed`) refusal for a
+/// context package that cannot serve the assistant files, with the recovery
+/// step that fits the cause.
+pub(crate) fn context_error(error: &ContextError) -> ProtocolError {
+    // A registry read error is transient and says nothing about the
+    // package, so it must not suggest reinstalling a healthy one.
+    if let ContextError::Rejected(PackageRejection::Registry(registry)) = error {
+        return ProtocolError::materialization_failed(
+            "assistant package registry",
+            &registry.to_string(),
+        );
+    }
+    let (detail, remedy) = match error {
+        ContextError::NotInstalled => (
+            "it is not installed".to_owned(),
+            format!(
+                "install the assistant package on that host with `pohunek plugin install <archive> --sha256 <digest>` (id `{ASSISTANT_CONTEXT_PACKAGE_ID}`; see the plugin-assistant release), then retry"
+            ),
+        ),
+        ContextError::NotSelected => (
+            "it is installed but not selected".to_owned(),
+            format!(
+                "select it with `pohunek plugin select {ASSISTANT_CONTEXT_PACKAGE_ID} --digest <digest>` (`pohunek plugin list` shows the digests), then retry"
+            ),
+        ),
+        ContextError::Disabled => (
+            "it is disabled".to_owned(),
+            format!(
+                "enable it with `pohunek plugin enable {ASSISTANT_CONTEXT_PACKAGE_ID}` (see `pohunek plugin list`), then retry"
+            ),
+        ),
+        ContextError::LookupFailed => (
+            "the package lookup failed".to_owned(),
+            "retry the launch; if it repeats, inspect the daemon log".to_owned(),
+        ),
+        ContextError::Rejected(rejection) => (
+            rejection.to_string(),
+            "run `pohunek plugin doctor` for the package, then reinstall it (`plugin uninstall --remove-modified`, then `plugin install ... --sha256 <digest>`)".to_owned(),
+        ),
+    };
+    ProtocolError::assistant_package_missing(ASSISTANT_CONTEXT_PACKAGE_ID, &detail, &remedy)
 }
 
 /// Writes the launch snapshot to `path`.

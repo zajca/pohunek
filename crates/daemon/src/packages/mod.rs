@@ -204,6 +204,21 @@ impl PackageService {
             })?
     }
 
+    /// The verified files of the context package `id` at `digest`: an
+    /// installed, enabled package of that id, selected or not.
+    ///
+    /// # Errors
+    ///
+    /// The [`ContextError`] of the package source, or
+    /// [`ContextError::NotInstalled`] on a host without a package store.
+    pub async fn context_dir_at(
+        &self,
+        id: PackageId,
+        digest: PackageDigest,
+    ) -> Result<ContextDir, ContextError> {
+        self.authority.context_dir_at(id, digest).await
+    }
+
     /// Lists every installed package with its health.
     ///
     /// # Errors

@@ -61,6 +61,9 @@ pub(super) struct ResumeSnapshot {
     /// checkout arguments are evaluated on this pair. Set once at create,
     /// carried unchanged by every resume.
     pub(super) launch_checkout: Option<Box<LaunchCheckout>>,
+    /// The context package whose files the session reads by path, verified at
+    /// create. Set once, carried unchanged by every resume.
+    pub(super) context_pin: Option<package::PackageDigest>,
 }
 
 impl ResumeSnapshot {
@@ -74,6 +77,7 @@ impl ResumeSnapshot {
             reference_provenance: NativeReferenceProvenance::Reported,
             profile_revision: None,
             launch_checkout: None,
+            context_pin: None,
         }
     }
 
@@ -87,6 +91,7 @@ impl ResumeSnapshot {
             reference_provenance: binding.native_reference_provenance,
             profile_revision: binding.profile_revision.clone(),
             launch_checkout: binding.launch_checkout.clone(),
+            context_pin: binding.context_pin.clone(),
         }
     }
 
@@ -998,6 +1003,7 @@ impl SessionRegistry {
             profile_revision: entry.snapshot.profile_revision.clone(),
             native_launch_unresolved: false,
             launch_checkout: entry.snapshot.launch_checkout.clone(),
+            context_pin: entry.snapshot.context_pin.clone(),
         }
     }
 
@@ -1135,6 +1141,7 @@ impl SessionRegistry {
             reference_provenance: binding.native_reference_provenance,
             profile_revision: revision,
             launch_checkout: binding.launch_checkout.clone(),
+            context_pin: binding.context_pin.clone(),
         };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk

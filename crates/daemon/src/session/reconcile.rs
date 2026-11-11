@@ -9543,6 +9543,7 @@ while os.getppid() == parent:
             profile_revision: None,
             native_launch_unresolved: false,
             launch_checkout: None,
+            context_pin: None,
         };
         store
             .record_session(&SessionRecord {
@@ -9966,6 +9967,7 @@ while os.getppid() == parent:
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create after daemon replacement");
@@ -11010,6 +11012,10 @@ while os.getppid() == parent:
             .expect("valid test templates")
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one full literal of the persisted record"
+    )]
     fn identity_record() -> SessionRecord {
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         SessionRecord {
@@ -11100,6 +11106,7 @@ while os.getppid() == parent:
                 profile_revision: None,
                 native_launch_unresolved: false,
                 launch_checkout: None,
+                context_pin: None,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -12672,6 +12679,7 @@ handler = "codex-hook-v1"
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
         }
     }
 
@@ -20725,6 +20733,7 @@ generation "$1"
                         input_ack_timeout_ms: None,
                         metadata: std::collections::BTreeMap::new(),
                         secret_env: protocol::SessionSecretEnv::default(),
+                        context_package_digest: None,
                     })
                     .await
                     .expect("create a supervised session");

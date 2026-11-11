@@ -313,6 +313,7 @@ fn session_params(socket: &Path) -> SessionNewParams {
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     }
 }
 

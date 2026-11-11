@@ -674,6 +674,7 @@ fn session_new_params_json_shape_roundtrips() {
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -711,6 +712,7 @@ fn session_new_params_roundtrips_with_metadata() {
         input_ack_timeout_ms: None,
         metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -752,6 +754,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -791,6 +794,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -3240,6 +3244,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
         session_new_request_id_supported: true,
+        session_new_context_pin_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
@@ -3277,6 +3282,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_input_ack_supported": true,
             "session_new_secret_env_supported": true,
             "session_new_request_id_supported": true,
+            "session_new_context_pin_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true
         })

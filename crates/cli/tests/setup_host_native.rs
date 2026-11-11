@@ -1336,6 +1336,7 @@ async fn start_agent(installation: &Installation, profile: &str, cwd: &Path) -> 
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
         })
         .await
         .expect("start the agent session")

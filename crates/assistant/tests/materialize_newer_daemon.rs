@@ -44,6 +44,7 @@ fn capabilities() -> Value {
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
         session_new_request_id_supported: true,
+        session_new_context_pin_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
@@ -181,7 +182,7 @@ async fn prepare_against(materialize: Value) -> Result<PreparedLaunch, Assistant
 #[tokio::test]
 async fn a_concept_type_from_a_newer_daemon_does_not_fail_the_launch() {
     let prepared = prepare_against(materialize_result(
-        "sha256:fixture",
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         &json!([concept(
             "a_type_from_a_newer_daemon",
             "newer",
@@ -197,7 +198,7 @@ async fn a_concept_type_from_a_newer_daemon_does_not_fail_the_launch() {
 #[tokio::test]
 async fn a_daemon_that_sends_no_prompt_contract_is_named_outdated() {
     let result = prepare_against(materialize_result_with_contract(
-        "sha256:fixture",
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         &json!([]),
         "",
     ))
@@ -212,7 +213,7 @@ async fn a_daemon_that_sends_no_prompt_contract_is_named_outdated() {
 #[tokio::test]
 async fn a_concept_intent_from_a_newer_daemon_is_dropped_without_failing_the_launch() {
     let prepared = prepare_against(materialize_result(
-        "sha256:fixture",
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         &json!([
             concept(
                 "guide",

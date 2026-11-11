@@ -897,8 +897,18 @@ dir = "bundle"   # package-relative directory that holds the files
   opt-in, and never appears among the supported agents.
 - The daemon verifies the package root against its archive digest each time it
   resolves the files for a request, and uses only the selected, enabled package
-  of the id. The files are then read by path: a session that already started
-  keeps reading them, and uninstalling the package removes them under it (#2066).
+  of the id. The files are then read by path, so a launch pins the digest it
+  was served: `session.new` takes it as `context_package_digest`, checks that it
+  is an installed, enabled package of the id whose root verifies, and records it
+  in the session's resume binding. While the session is live, lost or
+  resumable, `plugin uninstall` of that digest is refused with
+  `package_referenced`, also after a newer release was installed and selected
+  and after a daemon restart, and `session rm` or a retention sweep releases it.
+  A host whose daemon does not advertise `session_new_context_pin_supported`
+  launches the assistant unpinned, and an uninstall there removes the files
+  under a running session. Rolling the daemon back past the release that
+  introduced the pin needs the store copy `metadata.jsonl.pre-schema-17`,
+  because the older daemon refuses a store of a newer schema.
 - For the assistant, `dir` holds `index.md`, `assistant/system.md` (the prompt
   contract) and the concept files; the daemon answers `assistant.materialize`
   with the directory, its concept index and the contract text, and

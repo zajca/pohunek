@@ -53,6 +53,34 @@ impl SessionRegistry {
             .await
     }
 
+    /// Verifies that `digest` is an installed, enabled package of the assistant
+    /// context package id whose root verifies, so a session may pin it.
+    ///
+    /// Callers hold the guard of [`Self::guard_package_launch`], which keeps
+    /// the package from being uninstalled until the session's record carries
+    /// the pin.
+    ///
+    /// # Errors
+    ///
+    /// `assistant_package_missing` when the package cannot serve the files, or
+    /// `materialization_failed` when the registry cannot be read.
+    pub(super) async fn verify_context_pin(
+        &self,
+        digest: &PackageDigest,
+    ) -> Result<(), ProtocolError> {
+        let id = protocol::PackageId::parse(protocol::ASSISTANT_CONTEXT_PACKAGE_ID).map_err(
+            |error| {
+                ProtocolError::materialization_failed("assistant package id", &error.to_string())
+            },
+        )?;
+        self.inner
+            .packages
+            .context_dir_at(id, digest.clone())
+            .await
+            .map(drop)
+            .map_err(|error| crate::assistant::context_error(&error))
+    }
+
     /// What the package command service needs from this registry: the package
     /// store, the `PATH` every agent launch sees, and the daemon shutdown
     /// signal.
@@ -390,6 +418,7 @@ impl SessionRegistry {
         let sessions = self.inner.sessions.lock().await;
         for entry in sessions.values() {
             retained.extend(pinned_digest(&entry.snapshot.launch_binding));
+            retained.extend(entry.snapshot.context_pin.clone());
         }
         drop(sessions);
         let installed = if unreadable_lines > 0 {

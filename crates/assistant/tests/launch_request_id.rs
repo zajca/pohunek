@@ -93,6 +93,12 @@ enum Listener {
 
 impl Daemon {
     fn start(steps: Vec<Step>, request_id_supported: bool) -> Self {
+        Self::start_pinned(steps, request_id_supported, true)
+    }
+
+    /// A local daemon that does or does not advertise
+    /// `session_new_context_pin_supported`.
+    fn start_pinned(steps: Vec<Step>, request_id_supported: bool, pin_supported: bool) -> Self {
         let fixture = pohunek_test_support::tempdir().expect("create the hermetic fixture root");
         let socket_path = fixture.path().join("assistant.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind the fixture host socket");
@@ -102,6 +108,7 @@ impl Daemon {
             Box::new(fixture),
             steps,
             request_id_supported,
+            pin_supported,
         )
     }
 
@@ -117,6 +124,7 @@ impl Daemon {
             Box::new(()),
             steps,
             true,
+            true,
         )
     }
 
@@ -126,11 +134,12 @@ impl Daemon {
         fixture: Box<dyn std::any::Any>,
         steps: Vec<Step>,
         request_id_supported: bool,
+        pin_supported: bool,
     ) -> Self {
         let remote = matches!(listener, Listener::Tcp(_));
         let script = Arc::new(Mutex::new(VecDeque::from(steps)));
         let creates = Arc::new(Mutex::new(Vec::new()));
-        let capabilities = serde_json::to_value(capabilities(request_id_supported))
+        let capabilities = serde_json::to_value(capabilities(request_id_supported, pin_supported))
             .expect("serialize the capability snapshot");
         let (hang_signal, hangs) = tokio::sync::mpsc::unbounded_channel();
         let inspect_delay = Arc::new(Mutex::new(None));
@@ -186,6 +195,16 @@ impl Daemon {
             .expect("creates lock")
             .iter()
             .map(|params| params["client_request_id"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The `context_package_digest` of every `session.new` the daemon received.
+    fn pins(&self) -> Vec<Option<String>> {
+        self.creates
+            .lock()
+            .expect("creates lock")
+            .iter()
+            .map(|params| params["context_package_digest"].as_str().map(str::to_owned))
             .collect()
     }
 
@@ -283,7 +302,7 @@ fn ok(request: &Request, result: Value) -> Response {
     Response::ok(protocol::PROTOCOL_VERSION, request.id(), result).expect("a valid response")
 }
 
-fn capabilities(request_id_supported: bool) -> HostCapabilities {
+fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabilities {
     HostCapabilities {
         daemon_version: "test".to_owned(),
         protocol_version: protocol::PROTOCOL_VERSION,
@@ -307,6 +326,7 @@ fn capabilities(request_id_supported: bool) -> HostCapabilities {
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
         session_new_request_id_supported: request_id_supported,
+        session_new_context_pin_supported: pin_supported,
         package_install_commands_supported: true,
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
@@ -334,7 +354,7 @@ fn materialize_result(request: &Request) -> Value {
         "bundle_path": root,
         "snapshot_path": root.join("index.md"),
         "version": version,
-        "content_hash": "sha256:fixture",
+        "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "concepts": [],
         "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
     })
@@ -846,4 +866,21 @@ async fn a_local_conflict_keeps_the_daemons_own_recovery() {
         "a local rerun replays, so a conflict there gets no remote explanation"
     );
     inhibitor.release().await;
+}
+
+/// The digest `assistant.materialize` reports as `content_hash`.
+const SERVED_DIGEST: &str =
+    "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+#[tokio::test]
+async fn the_launch_pins_the_served_digest_only_on_a_host_that_advertises_the_pin() {
+    let pinning = Daemon::start_pinned(vec![Step::Session { replayed: false }], true, true);
+    launch(&pinning, None).await.expect("the pinned launch");
+    assert_eq!(pinning.pins(), vec![Some(SERVED_DIGEST.to_owned())]);
+
+    // A host without the flag would drop the field and leave the files
+    // unpinned, so the launch does not send it.
+    let unpinned = Daemon::start_pinned(vec![Step::Session { replayed: false }], true, false);
+    launch(&unpinned, None).await.expect("the unpinned launch");
+    assert_eq!(unpinned.pins(), vec![None]);
 }

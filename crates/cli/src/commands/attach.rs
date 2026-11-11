@@ -884,6 +884,7 @@ fn build_menu_new_session_request(
             input_ack_timeout_ms: None,
             metadata: std::collections::BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
         },
     )
 }

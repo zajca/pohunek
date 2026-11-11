@@ -405,6 +405,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create shell session")
@@ -495,6 +496,7 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create shell session")
@@ -602,6 +604,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                                 input_ack_timeout_ms: None,
                                 metadata: BTreeMap::new(),
                                 secret_env: protocol::SessionSecretEnv::default(),
+                                context_package_digest: None,
                             })
                             .await
                             .expect("create shell session")
@@ -707,6 +710,10 @@ impl Drop for ReapOnDrop {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a scenario that spells out each session.new parameter"
+)]
 async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
@@ -760,6 +767,7 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create shell session")
@@ -846,6 +854,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
         })
         .await
         .expect("create shell session");

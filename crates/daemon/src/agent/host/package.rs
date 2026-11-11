@@ -1119,6 +1119,42 @@ impl PackageSource {
         })
     }
 
+    /// The verified directory of the files of the context package `id` at
+    /// `digest`: an installed, enabled package of that id, selected or not.
+    ///
+    /// # Errors
+    ///
+    /// [`ContextError::NotInstalled`] without a package of that id at `digest`,
+    /// [`ContextError::Disabled`] when it is disabled, and
+    /// [`ContextError::Rejected`] when its root, descriptor or context export
+    /// is unusable.
+    pub fn context_dir_at(
+        &self,
+        id: &protocol::PackageId,
+        digest: &PackageDigest,
+    ) -> Result<ContextDir, ContextError> {
+        let state = self
+            .store
+            .registry_state()
+            .map_err(|error| ContextError::Rejected(PackageRejection::Registry(error)))?;
+        let record = state
+            .package(digest)
+            .filter(|record| &record.identity().id == id)
+            .ok_or(ContextError::NotInstalled)?;
+        if !record.enabled() {
+            return Err(ContextError::Disabled);
+        }
+        let dir = self
+            .store
+            .context_dir(record.digest(), record.identity())
+            .map_err(ContextError::Rejected)?;
+        Ok(ContextDir {
+            dir,
+            identity: record.identity().clone(),
+            digest: record.digest().clone(),
+        })
+    }
+
     /// Loads the definition of every selected, enabled package.
     ///
     /// Each package root is re-verified before its descriptor is read. A

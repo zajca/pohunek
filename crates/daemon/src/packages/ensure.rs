@@ -999,8 +999,10 @@ fn session_runtime(binding: &crate::store::ResumeBinding) -> Option<RuntimeId> {
 struct SessionRecord {
     /// The record's official runtime, whatever its state.
     runtime: Option<RuntimeId>,
-    /// The package digest the record pins.
+    /// The runtime package digest the record pins.
     pin: Option<PackageDigest>,
+    /// The context package digest the record pins.
+    context_pin: Option<PackageDigest>,
 }
 
 /// What the metadata store's records use and pin.
@@ -1022,7 +1024,9 @@ impl StoreView {
 
     /// The package digests the records pin.
     fn pins(&self) -> impl Iterator<Item = &PackageDigest> {
-        self.records.iter().filter_map(|record| record.pin.as_ref())
+        self.records
+            .iter()
+            .flat_map(|record| record.pin.iter().chain(record.context_pin.iter()))
     }
 }
 
@@ -1042,11 +1046,15 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
         .collect();
     // A rejected line that still decodes pins what the daemon's gate reads from
     // it, though no runtime of it is known.
-    let rejected_pins = dry.rejected.iter().filter_map(|line| {
-        line.decoded_pin.clone().map(|digest| SessionRecord {
-            runtime: None,
-            pin: Some(digest),
-        })
+    let rejected_pins = dry.rejected.iter().flat_map(|line| {
+        line.decoded_pins
+            .iter()
+            .cloned()
+            .map(|digest| SessionRecord {
+                runtime: None,
+                pin: Some(digest),
+                context_pin: None,
+            })
     });
     let records = bindings
         .iter()
@@ -1062,6 +1070,7 @@ fn read_store(store_path: &Path) -> Result<StoreView, EnsureError> {
                 }
                 Some(protocol::BindingProvenance::Builtin { .. }) | None => None,
             },
+            context_pin: binding.context_pin.clone(),
         })
         .chain(rejected_pins)
         .collect();

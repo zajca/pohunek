@@ -1316,6 +1316,7 @@ where
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     };
     exchange(
         framed,
@@ -1964,6 +1965,7 @@ where
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     };
     let created: protocol::SessionNewResult = call(
         framed,

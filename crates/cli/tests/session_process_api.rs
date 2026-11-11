@@ -868,7 +868,7 @@ fn assistant_materialize_result() -> Value {
         "bundle_path": root,
         "snapshot_path": root.join("index.md"),
         "version": "1.0.0",
-        "content_hash": "sha256:fixture",
+        "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "concepts": [],
         "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
     })

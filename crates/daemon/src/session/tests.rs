@@ -212,6 +212,7 @@ pub(super) fn params() -> SessionNewParams {
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     }
 }
 
@@ -1689,6 +1690,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         profile_revision: None,
         native_launch_unresolved: false,
         launch_checkout: None,
+        context_pin: None,
     };
     let package_pin = |runtime: &str| {
         LaunchPin::Pinned(Box::new(LaunchBinding {
@@ -19150,6 +19152,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         profile_revision: None,
         native_launch_unresolved: false,
         launch_checkout: None,
+        context_pin: None,
     };
 
     let err = registry
@@ -19723,6 +19726,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         profile_revision: None,
         native_launch_unresolved: false,
         launch_checkout: None,
+        context_pin: None,
     };
 
     for (program, version_output) in [
@@ -20124,6 +20128,7 @@ async fn resume_binding_restores_metadata_from_store() {
             profile_revision: None,
             native_launch_unresolved: false,
             launch_checkout: None,
+            context_pin: None,
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())

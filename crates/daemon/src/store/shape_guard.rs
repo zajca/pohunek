@@ -79,6 +79,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (15, include_str!("fixtures/shape/schema-15.txt")),
     (16, include_str!("fixtures/shape/schema-16.txt")),
     (17, include_str!("fixtures/shape/schema-17.txt")),
+    (18, include_str!("fixtures/shape/schema-18.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -125,7 +126,8 @@ fn resume_builtin_json() -> Value {
         },
         "native_reference_provenance": "assigned",
         "profile_revision": REVISION,
-        "launch_checkout": {"cwd": "/work", "project_id": "p-1"}
+        "launch_checkout": {"cwd": "/work", "project_id": "p-1"},
+        "context_pin": DIGEST
     })
 }
 
@@ -352,6 +354,7 @@ fn assert_every_field_is_reviewed(
             native_reference_provenance,
             profile_revision: _,
             launch_checkout: _,
+            context_pin: _,
         } = binding;
         let _: &NativeReferenceProvenance = native_reference_provenance;
         let StoredInputRules {
@@ -805,6 +808,7 @@ const RESUME_FREE: &[&str] = &[
     "launch_binding.provenance.package.version",
     "launch_binding.provenance.descriptor_digest",
     "launch_binding.provenance.package_digest",
+    "context_pin",
     "profile_revision",
 ];
 /// Free-text leaves of the other record kinds, by full path.

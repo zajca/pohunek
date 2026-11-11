@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 const SCHEMA_15: &str = include_str!("../src/store/fixtures/schema-15/metadata.jsonl");
-const SCHEMA_17: &str = include_str!("../src/store/fixtures/schema-17/metadata.jsonl");
+const SCHEMA_18: &str = include_str!("../src/store/fixtures/schema-18/metadata.jsonl");
 
 fn fixture_store(root: &std::path::Path, contents: &str) -> Store {
     let path = root.join("metadata.jsonl");
@@ -60,7 +60,7 @@ fn schema_15_sessions_migrate_without_inventing_a_launch_checkout() {
 #[test]
 fn a_recorded_launch_checkout_loads_and_survives_a_rewrite() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let store = fixture_store(root.path(), SCHEMA_17);
+    let store = fixture_store(root.path(), SCHEMA_18);
     let expected = Some(Box::new(LaunchCheckout {
         cwd: PathBuf::from("/fixture"),
         project_id: Some("p-fixture".to_owned()),

@@ -2,6 +2,7 @@
 
 import type { BranchSource } from "./BranchSource";
 import type { OnDiverged } from "./OnDiverged";
+import type { PackageDigest } from "./PackageDigest";
 
 /**
  * Parameters for `session.new`.
@@ -134,4 +135,18 @@ export type SessionNewParams = {
    * client adapter refuses it).
    */
   client_request_id?: string;
+  /**
+   * The digest of the context package whose files the session reads by
+   * path, as `assistant.materialize` reports it in `content_hash`.
+   *
+   * The daemon accepts it only for an installed, enabled package of the
+   * assistant context package id whose root verifies, and otherwise fails
+   * with `assistant_package_missing` before anything is created. It records
+   * the digest with the session, so `package.uninstall` refuses the digest
+   * while the session is live, lost or resumable. A daemon that does not
+   * advertise `HostCapabilities::session_new_context_pin_supported` would
+   * drop the field silently and leave the files unpinned, so a client checks
+   * the flag before sending it.
+   */
+  context_package_digest?: PackageDigest;
 };
