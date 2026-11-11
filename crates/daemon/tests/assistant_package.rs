@@ -797,6 +797,30 @@ async fn a_launch_that_pins_a_package_the_assistant_cannot_read_creates_no_sessi
     assert_eq!(error.code, "assistant_package_missing", "{error:?}");
     assert!(error.msg.contains("disabled"), "{error:?}");
 
+    // A root that no longer verifies against its archive digest is refused too.
+    exchange(
+        &mut client,
+        method::PACKAGE_SET_ENABLED,
+        json!({ "digest": assistant, "enabled": true }),
+    )
+    .await
+    .into_result()
+    .expect("enable");
+    let served = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect("the enabled assistant package is served");
+    let index = Path::new(&served.bundle_path).join("index.md");
+    let mut permissions = std::fs::metadata(&index)
+        .expect("stat the index")
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&index, permissions).expect("make the index writable");
+    std::fs::write(&index, "# tampered\n").expect("modify the installed file");
+    let error = create_session(&mut client, &cwd, Some(&assistant))
+        .await
+        .expect_err("a root that fails verification cannot be pinned");
+    assert_eq!(error.code, "assistant_package_missing", "{error:?}");
+
     assert_eq!(
         session_count(&mut client).await,
         0,
