@@ -7,10 +7,12 @@ name: Upgrade test
 # runtimes with a fake agent that runs the managed hooks, upgrades through the
 # operator path, and asserts the preflight judges the session adoptable, the
 # session stays live and its screen and input work, the hooks of the adopted
-# worker (protocol 4) are refused until the session relaunches, stop/resume
-# relaunch from the same package digest with the native reference and their
-# hooks report turn errors, and the previous release's own CLI is refused with
-# a version mismatch (the window is protocol 5 only). The upgrade
+# worker are refused until the session relaunches when the previous release
+# speaks protocol 4 (from 0.41.0 on they are admitted), stop/resume relaunch
+# from the same package digest with the native reference and their hooks report
+# turn errors, and the previous release's own CLI is refused with a version
+# mismatch when it speaks protocol 4 (from 0.41.0 on it reads and writes
+# through its own client, the window being protocol 5 only). The upgrade
 # installs the official runtime packages from the head build's `runtime/` tree
 # (written by `cargo xtask release test-runtime`). scripts/upgrade-test does the
 # work; crates/cli/tests/release_upgrade.rs holds the assertions.

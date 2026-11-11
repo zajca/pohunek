@@ -322,10 +322,14 @@ if [[ "$no_daemon" -eq 1 ]]; then
   release_package="$release_dir/$RELEASE_PACKAGE_PATH"
   release_catalog="$release_dir/$RELEASE_CATALOG_PATH"
   release_anchor="$release_dir/$ANCHOR_FILE_NAME"
+else
+  release_package="$2"
+  release_catalog="$3"
+  release_anchor="$4"
 fi
-release_package="$(absolute_file "${release_package:-$2}")"
-release_catalog="$(absolute_file "${release_catalog:-$3}")"
-release_anchor="$(absolute_file "${release_anchor:-$4}")"
+release_package="$(absolute_file "$release_package")"
+release_catalog="$(absolute_file "$release_catalog")"
+release_anchor="$(absolute_file "$release_anchor")"
 pinned_hermes="$(absolute_executable "$5")"
 for binary in "${RELEASE_BINARIES[@]}"; do
   absolute_executable "$release_dir/$binary" >/dev/null

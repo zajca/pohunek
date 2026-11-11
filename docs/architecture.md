@@ -2070,7 +2070,7 @@ Runtime state under the user data directory:
 ```text
 ~/.local/share/pohunek/
   metadata.jsonl           # logical sessions, worktrees, and projects (0600)
-  metadata.rejected.jsonl  # rejected store lines set aside, with audit records (0600)
+  metadata.rejected.jsonl  # rejected store lines an operator moved aside by hand (0600)
   notifications/
     notifications.jsonl    # durable attention-notification action log (0600)
     format.json             # notification store format marker (0600)
