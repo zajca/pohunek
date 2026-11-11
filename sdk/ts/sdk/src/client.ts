@@ -25,7 +25,7 @@ import {
   type SessionWaitTurnParams,
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
-import { CompatError, carriesClientRequestId, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
+import { CompatError, carriesClientRequestId, carriesContextPackageDigest, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
 import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -395,6 +395,12 @@ export class Client {
       await this.requireCapability(connection, {
         flag: "session_new_request_id_supported",
         unsupported: (host) => ClientError.sessionNewRequestIdUnsupported(host),
+      });
+    }
+    if (request.method === "session.new" && carriesContextPackageDigest(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_new_context_pin_supported",
+        unsupported: (host) => ClientError.sessionNewContextPinUnsupported(host),
       });
     }
     if (isPackageCommandsRequest(request)) {

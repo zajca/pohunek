@@ -13,33 +13,38 @@ since: 0.3.3
 Use this runbook after replacing an installed Pohunek binary from a component
 release archive or rebuilding it from source.
 
-## Current public protocol v4 boundary
+## Current public protocol boundary
 
-A daemon of the current release accepts public protocol `3..=4`: clients of the
-previous release (protocol 3) keep working against it, and a range outside that
-returns `daemon/version_mismatch` before any method runs. The CLI and Rust client
-of the current release speak `3..=4`, so they also work against a daemon that only
-speaks v3, and so do TypeScript SDK clients (see "Mixed releases across hosts"
-below). A client and a daemon more than one release apart are refused.
+The current public protocol version is `5`. A daemon of this release accepts
+exactly that version (`SUPPORTED_PROTOCOL_VERSIONS` is `5..=5`,
+`MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`), and the CLI, the Rust client
+and the TypeScript SDK advertise the same window. Protocol 5 removed the
+`notification.update`, `notification.delete`, `notification.policy.*` and
+`notification.retention.prune` methods, a semantic change no shape adapter can
+express, so a client, hook or plugin that announces protocol 3 or 4 is refused
+with `daemon/version_mismatch` before any method runs. A client of the previous
+release does not keep working against this daemon, and a CLI of this release
+does not work against a daemon of the previous release.
 Before replacing any component, inventory every CLI, SDK, custom client, managed
 hook and local or overlay-reachable daemon that must talk to another peer. Drain
-cross-host automation, upgrade the daemons first, and then verify every host with
+cross-host automation, upgrade every daemon and every client of those peers in
+one pass, and then verify every host with
 `pohunek health --json` and `pohunek host inspect <host> --json`. The reported
-`protocol_version` is the version negotiated for that connection (`4` for a
-current CLI).
+`protocol_version` is the version negotiated for that connection (`5` for a
+current CLI). A session launched before the upgrade carries
+`POHUNEK_PROTOCOL_VERSION=4` for its life, so its managed hooks are refused
+until the session is relaunched.
 
-Protocol v4 spells the worker instance identifier `worker_instance_id` where
-v3 spelled it `runtime_id`. The daemon translates that spelling for protocol 3
-clients only; a v4 client or hook never sends it. Do not downgrade one peer
-independently: a v3 client is served by a v4 daemon, a v4 CLI or
-SDK client works against a v3 daemon. Managed Codex and Claude hook assets carry
+Protocol 4 spelled the worker instance identifier `worker_instance_id` where
+protocol 3 spelled it `runtime_id`; protocol 5 accepts only the current spelling
+and no adapter translates the old one. Do not downgrade one peer independently.
+
+Managed Codex and Claude hook assets carry
 `POHUNEK_INTEGRATION_VERSION=17`. `pohunek service upgrade` reinstalls the
 ones it lists and reports each result; follow "Managed hook assets after an
 upgrade" below for every other install. An older hook still sends the old
-key, which the daemon accepts only inside a session whose launch baked protocol
-3; in any other session its native-identity reports are rejected. Hooks of a
-session launched before the upgrade keep reporting with the protocol version
-baked into its launch environment while the daemon serves that version. State
+key, which the daemon rejects, so its native-identity reports are lost until the
+hooks are reinstalled. State
 hooks older than version 11 sent an integer `seq` that the daemon rejects, so
 their public-socket reports were dropped, and always spelled the native-id worker
 key in the protocol 4 form. Notification hooks older than version 10 send a bare
@@ -64,7 +69,7 @@ the version marker is shared, so `integration status` reports all of them
 trace sets neither `POHUNEK_HOOK_TRACE_PATH` nor `POHUNEK_HOOK_TRACE_MAX_BYTES`,
 so its hooks write no trace either until the session gets a new worker.
 Earlier protocol transitions (integer-v1 to range negotiation,
-the v3 overlay-routing change) do not widen the supported range.
+the protocol 3 overlay-routing change) do not widen the supported range.
 
 ## Managed hook assets after an upgrade
 
@@ -108,13 +113,11 @@ upgrade, and installs that bypassed `service upgrade`:
    release even though no file was edited; `integration status` shows
    `outdated=true`. Run `pohunek integration update --agent hermes --hermes-profile work`
    with the same target; it needs `--confirm-modified` only when `modified=true`.
-   A v0.33.0 Hermes plugin with a `3..=3` policy can continue using its tools
-   through the current CLI's `3..=4` protocol window, including its old
-   `--runtime-id` flag and timed-out start recovery. The update refreshes the
-   plugin assets and policy to the current shape; it is not required solely to
-   restore tool access during that window. A policy outside the window is
-   rejected as `pohunek_cli_incompatible` and needs an explicit update. An
-   upgrade never rewrites a user-modified Hermes plugin or policy.
+   A Hermes plugin whose policy names protocol 3 or 4 is outside the current
+   CLI's `5..=5` window: its policy is rejected as `pohunek_cli_incompatible`
+   and needs `pohunek integration update --agent hermes --hermes-profile work`
+   (or `--hermes-home <absolute path>`) with the target it was installed with.
+   An upgrade never rewrites a user-modified Hermes plugin or policy.
 
 The installer wrapper prints these commands after a successful install or
 upgrade. A new or resumed session whose agent has outdated Claude or
@@ -126,34 +129,12 @@ start or a launch.
 
 ## Mixed releases across hosts
 
-During a staggered multi-host upgrade a CLI of the current release may talk to a
-daemon of the previous release on another host over an overlay. Nothing has to be
-upgraded in one pass for that pair. The CLI and Rust client advertise the protocol
-window `3..=4`; the older daemon answers in protocol 3 and the client translates
-requests, results and subscription events through the same shape-only adapter the
-daemon uses. The CLI's `--json` output uses the current shape plus the old
-runtime-identity spelling at typed session sites while v3 remains supported.
-The command
-`pohunek host inspect <host> --json` reports `protocol_version` `3` for such a host, `pohunek host list`
-shows it as `reachable`, and multi-host commands include it.
-
-A method added in the current release does not exist on the older daemon. The
-client refuses it before sending anything, with
-`daemon/daemon_protocol_too_old`, whose message reads "host '<host>' runs
-protocol 3, but package.list needs protocol 4". The `recover` hint names the fix:
-upgrade the pohunek install on that host, then retry. Today the `package.*` methods are the only
-ones in this class; the rest of the public methods work across the pair.
-A payload the adapter cannot translate fails with
-`daemon/version_translation_failed` instead of being passed through; upgrade the
-host the same way.
-
-The TypeScript SDK (and so the web and desktop UIs built on it) behaves the same
-way: it advertises protocol `3..=4`, translates a protocol 3 daemon's payloads,
-and refuses a method new in the current release with the same typed
-`daemon_protocol_too_old` error (`ClientError.kind === "daemonProtocolTooOld"`,
-with `tooOld.host`, `tooOld.daemonVersion` and `tooOld.requiredVersion`). Only a
-peer two releases apart still has to be upgraded: the window is exactly one
-release wide and the client is refused with `daemon/version_mismatch`.
+The public protocol window holds one version, so there is no mixed-release
+pair. A CLI, Rust client or TypeScript SDK of this release refuses a daemon that
+answers in an older protocol, and a daemon of this release refuses an older
+client, both with `daemon/version_mismatch`; host discovery classes such a
+peer as `version_mismatch`. During a staggered multi-host upgrade, upgrade the pohunek install on that host
+first, then retry; cross-host commands stay unavailable for it until then.
 
 ## Upgrade window and the metadata store
 
@@ -162,11 +143,10 @@ workers (private worker protocol versions `PREVIOUS_VERSION` and
 `CURRENT_VERSION`), for the worker journal, and for public-protocol clients;
 nothing else is shimmed. The current state differs for the last two. The worker
 journal reader accepts an explicit list of schemas, which today holds only the
-current one. The public protocol window is `3..=4`: protocol 3 clients and tooling keep
-working against a daemon of this release, and the CLI and Rust client of this
-release work against a protocol 3 daemon, as do TypeScript SDK clients
-([#527](https://github.com/zajca/pohunek/issues/527)); a peer two releases
-apart is refused. The
+current one. The public protocol window is `5..=5`: protocol 5 removed the notification
+mutation, policy and retention methods, which no adapter can express, so a peer
+that announces an earlier protocol is refused with `daemon/version_mismatch`
+in both directions. The
 daemon's persisted state, `<data_dir>/metadata.jsonl`, does migrate from any
 older kept schema, so skipping releases is safe for it. Each release's notes name every schema or
 protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,
@@ -628,6 +608,15 @@ back first. 0.35.2 then refuses the install or upgrade
 (`service_upgrade_runtimes_refused`, `release_runtime_catalog_unavailable`, because its
 verifier rejects the lower catalog sequence), and it can neither select the
 older Pi nor migrate a profile while Pi 1.0.4 is selected.
+
+## Claude Code floor before an upgrade
+
+The Claude runtime package accepts Claude Code `[2.1.309, 3.0.0)`. On a host
+whose `claude` is older, upgrade Claude Code first, then run
+`pohunek service check` and `pohunek service upgrade`. With an older Claude the
+preflight reports a session that launches from it as unable to recover and the
+upgrade refuses it unless `--accept-runtime-loss` is given, which leaves that
+session unresumable until a supported Claude is installed.
 
 ## Upgrade preflight
 

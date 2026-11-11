@@ -759,7 +759,7 @@ exposes a Pohunek session to an external agent (or calls one) is a later adapter
 Owner answer Q10: questions ship first, permissions (Part B rights) after; VMs (#88) are future scope and
 not part of this work. The ids below are the sub-issues of epic #1987 (design issue #1982).
 
-**Milestones.** AC-01 ships in 0.40, AC-02 to AC-07 in 0.42, the secret and further-runtime slices in 0.43,
+**Milestones.** AC-01 ships in 0.40, AC-02 to AC-07 are planned for 0.42 and not started, the secret and further-runtime slices in 0.43,
 and AC-15 with the rights phase (AC-17 to AC-20) in 0.44. AC-08 lives in `pohunekd/pohunek-companion` and AC-09 in `zajca/pohunek-work`; their milestones are
 recorded on their issues. AC-16 is unscheduled until #1561 lands.
 

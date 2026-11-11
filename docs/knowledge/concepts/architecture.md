@@ -41,11 +41,11 @@ Remote launches preserve the existing remote session safety model and read the
 bundle from the assistant context package installed on the host that runs the
 agent.
 
-All shipped clients use the same public protocol v4. Each request advertises an
+All shipped clients use the same public protocol, version 5. Each request advertises an
 inclusive `minimum`/`maximum` version range; the first response selects the
-highest overlap for that connection. A daemon accepts its own version and the
-previous one (`3..=4` today) through shape-only adapters, while clients advertise
-only their own version. The old integer-v1 request envelope is not accepted. Waiting observation calls open dedicated connections so they do not
+highest overlap for that connection. A daemon and its clients accept exactly one
+version today (`5..=5`); a semantic protocol change raises the minimum, and an
+older peer is refused with `daemon/version_mismatch`. The old integer-v1 request envelope is not accepted. Waiting observation calls open dedicated connections so they do not
 block the caller's ordinary control connection.
 
 The shipped platform foundation centralizes target-neutral process identity,

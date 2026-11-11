@@ -60,6 +60,11 @@ export function carriesClientRequestId(params: unknown): boolean {
   return isObject(params) && isSet(params["client_request_id"]);
 }
 
+/** Whether `params` carries a `context_package_digest` the daemon must pin. */
+export function carriesContextPackageDigest(params: unknown): boolean {
+  return isObject(params) && isSet(params["context_package_digest"]);
+}
+
 function requireCurrent(version: number): void {
   if (version !== PROTOCOL_VERSION) {
     throw new CompatError({ kind: "unsupportedVersion", version });

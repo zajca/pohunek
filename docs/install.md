@@ -145,6 +145,11 @@ and delete them (`systemctl --user disable --now <unit>` and
 `systemctl --user daemon-reload`, or `launchctl bootout gui/$(id -u)/<label>`),
 then retry.
 
+Claude Code 2.1.309 is the supported floor. On a host whose `claude` is older,
+upgrade Claude Code first, then run `pohunek service check` and
+`pohunek service upgrade`; with an older Claude the upgrade refuses a session
+that launches from it unless `--accept-runtime-loss` is given.
+
 `pohunek service upgrade` first runs a read-only preflight with the new
 binaries. It judges every live session and every stopped session that keeps
 native resume, and refuses while one would lose its recovery or would

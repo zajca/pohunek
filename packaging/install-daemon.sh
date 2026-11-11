@@ -35,8 +35,10 @@
 # `no trusted id found` before anything is changed.
 #
 # After a successful install or upgrade the wrapper prints the exact commands
-# that bring the managed agent hook assets in line with the new release; the
-# daemon itself never rewrites files in an agent's config home.
+# that bring the managed agent hook assets in line with the new release. A
+# `service upgrade` reinstalls the hooks of the homes it lists; the wrapper's
+# printed commands cover every other home. Daemon start never rewrites files in
+# an agent's config home.
 #
 # `--accept-runtime-loss` is the single flag that accepts live sessions losing
 # their runtime. For a service-managed upgrade it is passed to both `service check`
@@ -274,9 +276,9 @@ else
 fi
 status=0
 "$archive_dir/pohunek" "$@" || status=$?
-# The daemon never rewrites the hook assets in the agents' config homes. The
-# new daemon is running by now, so its doctor compares the installed assets with
-# the ones this release embeds.
+# `service upgrade` reinstalls the hooks of the homes it lists; the doctor of the
+# new daemon, which is running by now, compares every installed asset with the
+# ones this release embeds and finds the homes that upgrade did not cover.
 if [ "$status" -eq 0 ]; then
     echo "next: check the agent hook assets against this release with" >&2
     echo "\`pohunek integration doctor\`, and reinstall each Claude or Codex agent it" >&2
