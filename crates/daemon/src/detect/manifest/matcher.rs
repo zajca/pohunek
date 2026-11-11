@@ -18,6 +18,12 @@ impl<'a> MatchEvaluation<'a> {
         }
     }
 
+    /// Whether the screen shows a prompt box; `None` while the screen fact
+    /// is not part of the context.
+    fn prompt_box(&self) -> Option<bool> {
+        self.context.prompt_box()
+    }
+
     pub(super) fn has_region_text(&self, region: &ManifestRegion) -> bool {
         self.context.region_text(region).is_some()
     }
@@ -42,6 +48,9 @@ pub(super) enum Gate {
     Contains(String),
     Regex(Regex),
     LineRegex(Regex),
+    /// The screen shows no prompt box. A screen-wide fact, not text of the
+    /// rule's region.
+    ComposerAbsent,
     All(Vec<Gate>),
     Any(Vec<Gate>),
     Not(Box<Gate>),
@@ -63,6 +72,7 @@ impl Gate {
             Self::LineRegex(regex) => evaluation
                 .region_text(region)
                 .is_some_and(|text| text.lines().any(|line| regex.is_match(line))),
+            Self::ComposerAbsent => evaluation.prompt_box() == Some(false),
             Self::All(gates) => gates.iter().all(|gate| gate.matches(region, evaluation)),
             Self::Any(gates) => gates.iter().any(|gate| gate.matches(region, evaluation)),
             Self::Not(gate) => !gate.matches(region, evaluation),
@@ -72,8 +82,21 @@ impl Gate {
     pub(super) fn has_matcher(&self) -> bool {
         match self {
             Self::Contains(_) | Self::Regex(_) | Self::LineRegex(_) => true,
+            Self::ComposerAbsent => false,
             Self::All(gates) | Self::Any(gates) => gates.iter().any(Gate::has_matcher),
             Self::Not(gate) => gate.has_matcher(),
+        }
+    }
+}
+
+impl Gate {
+    /// Whether the gate reads the screen-wide prompt-box fact.
+    pub(super) fn uses_composer_fact(&self) -> bool {
+        match self {
+            Self::ComposerAbsent => true,
+            Self::Contains(_) | Self::Regex(_) | Self::LineRegex(_) => false,
+            Self::All(gates) | Self::Any(gates) => gates.iter().any(Gate::uses_composer_fact),
+            Self::Not(gate) => gate.uses_composer_fact(),
         }
     }
 }

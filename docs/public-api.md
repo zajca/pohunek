@@ -2252,6 +2252,10 @@ Parameterized manifest syntax is `bottom_lines(N)`,
 second horizontal rule counted from the bottom, or an empty preview when a
 complete prompt box or preceding content is absent. All screen regions use the
 same visible-grid, wide-glyph, and soft-wrap semantics as activity matching.
+A rule may also require that no prompt box is on screen with
+`composer_absent = true` (runtime feature `detect-composer-absent-v1`, see
+"Dialog rules that fail closed" in the runtime packages guide); the screen-wide
+fact is not a region, so `session.detection` lists no preview for it.
 Unknown region names remain a typed manifest parse failure, so older engines
 reject manifests that use regions they do not implement instead of silently
 over-matching another surface. A preview observes every accepted detector

@@ -35,6 +35,8 @@ pub enum ManifestError {
     },
     #[error("rule {rule_id:?} has empty {kind:?} matcher")]
     EmptyMatcher { rule_id: String, kind: MatcherKind },
+    #[error("rule {rule_id:?} sets composer_absent to false; only true is accepted")]
+    ComposerAbsentNotTrue { rule_id: String },
     #[error("[program_status] app {app:?} is not 1-32 characters of [A-Za-z0-9_.+-]")]
     InvalidProgramStatusApp { app: String },
     #[error("[program_status] authority_from {value:?} is not a MAJOR.MINOR.PATCH version")]

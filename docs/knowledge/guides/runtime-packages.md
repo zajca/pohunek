@@ -119,6 +119,7 @@ The features this core implements:
 | `program-status-gate-v1` | 0.41.0 | detection manifest `[program_status] authority_from` and rule `below_authority` (no descriptor key; the package lists it so an older core refuses it) |
 | `package-context-v1` | 0.41.0 | `[context]` |
 | `version-probe-open-range-v1` | 0.42.0 | `version_probe` with `min` and no `below` |
+| `detect-composer-absent-v1` | 0.42.0 | detection manifest rule matcher `composer_absent` (no descriptor key; enforced against the manifest the descriptor names) |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -1064,6 +1065,48 @@ to the override restores screen readiness. A `manifest_idle` base never
 downgrades this way: an override manifest without an eligible idle rule keeps
 the strict readiness, so the input is refused instead of released by a signal
 the runtime did not declare.
+
+## Dialog rules that fail closed
+
+A dialog that replaces the composer is told apart from quoted model text by
+text alone unless the rule also requires the composer to be gone. A detection
+manifest rule may add the matcher `composer_absent = true` to its text matchers
+(`requires = ["detect-composer-absent-v1"]`):
+
+```toml
+[[rules]]
+id = "question"
+state = "blocked"
+priority = 980
+region = "bottom_non_empty_lines(12)"
+contains = "which option"
+composer_absent = true
+```
+
+The rule reads `blocked` only while the screen shows no prompt box, so a
+clipped dialog whose question text quotes a horizontal-rule line still reads
+`blocked`, and a runtime that declares `refuse_while_blocked` refuses typed
+input instead of answering the dialog. The matcher is a screen-wide fact, not
+text of the rule's region. It sits in the rule's own table or in a nested gate
+table (`all`, `any`, `not`, `gates`) next to a text matcher, counts as one
+matcher against the manifest budget, and accepts only `true`; there is no
+"composer present" form. Every gate table, nested ones included, needs a text
+matcher, so a table that holds nothing but `composer_absent` is refused like
+any table without one. At the top of a rule the matcher therefore only narrows
+what the rule matches; under `not` it negates together with its siblings.
+
+The fact is the same heuristic as the `prompt_box_body` region: a prompt box
+exists when the visible grid holds at least two horizontal-rule lines (the
+second counted from the bottom is its top border). A rule that uses the matcher
+is skipped while the screen is not part of the detection context, so a stale
+screen never reads as "no composer". Quoted model text with two rule lines of
+its own looks like a prompt box; such a dialog stays with the text matchers.
+
+The matcher lives in the detection manifest, which the descriptor key gates
+cannot see. A descriptor whose manifest uses it without listing the feature is
+refused with `runtime_feature_unsupported` naming `detect_manifest`, and a core
+that predates the feature refuses a package that lists it for the same reason
+before it reads the manifest. The official packages do not use the matcher yet.
 
 ## Declaring program status
 

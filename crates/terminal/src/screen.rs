@@ -270,6 +270,16 @@ impl ScreenTracker {
         }
     }
 
+    /// Whether the visible grid holds a prompt box: a top border, which is the
+    /// second horizontal rule counting from the bottom.
+    ///
+    /// The structural fact behind an empty [`Self::prompt_box_body`] that an
+    /// empty composer and an absent one share.
+    #[must_use]
+    pub fn has_prompt_box(&self) -> bool {
+        Self::prompt_box_top_border_index(&self.visible_lines()).is_some()
+    }
+
     /// Visible text inside the prompt box body.
     ///
     /// Mirrors herdr's `prompt_box_body`: the lines between the prompt-box top

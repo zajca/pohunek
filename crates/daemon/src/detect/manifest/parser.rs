@@ -65,6 +65,7 @@ impl Rule {
             contains,
             regex,
             line_regex,
+            composer_absent,
             all,
             any,
             not,
@@ -84,6 +85,7 @@ impl Rule {
             contains,
             regex,
             line_regex,
+            composer_absent,
             all,
             any,
             not,
@@ -150,6 +152,7 @@ fn collect_gate_parts(
         contains,
         regex,
         line_regex,
+        composer_absent,
         all,
         any,
         not,
@@ -159,6 +162,19 @@ fn collect_gate_parts(
     push_matcher_parts(
         rule_id, contains, regex, line_regex, depth, budget, &mut parts,
     )?;
+
+    match composer_absent {
+        Some(true) => {
+            budget.note_matcher(depth)?;
+            parts.push(Gate::ComposerAbsent);
+        }
+        Some(false) => {
+            return Err(ManifestError::ComposerAbsentNotTrue {
+                rule_id: rule_id.to_string(),
+            });
+        }
+        None => {}
+    }
 
     if let Some(children) = all {
         if children.is_empty() {
@@ -421,6 +437,7 @@ pub(super) struct RawRule {
     contains: Option<MatcherInput>,
     regex: Option<MatcherInput>,
     line_regex: Option<MatcherInput>,
+    composer_absent: Option<bool>,
     all: Option<Vec<RawGate>>,
     any: Option<Vec<RawGate>>,
     not: Option<Box<RawGate>>,
@@ -436,6 +453,7 @@ struct RawGate {
     contains: Option<MatcherInput>,
     regex: Option<MatcherInput>,
     line_regex: Option<MatcherInput>,
+    composer_absent: Option<bool>,
     all: Option<Vec<RawGate>>,
     any: Option<Vec<RawGate>>,
     not: Option<Box<RawGate>>,

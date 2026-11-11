@@ -37,6 +37,8 @@ pub struct Manifest {
     /// Whether the detector may latch a working sighting from inside one
     /// output chunk. Every manifest does except the generic shell one.
     latches_working: bool,
+    /// Whether any rule reads the screen-wide prompt-box fact.
+    uses_composer_fact: bool,
 }
 
 /// A manifest compiles deterministically from its source, so two manifests
@@ -98,12 +100,15 @@ impl Manifest {
             .map(|raw_process| compile_process_matchers(raw_process, &mut budget))
             .transpose()?;
 
+        let uses_composer_fact = rules.iter().any(|rule| rule.gate.uses_composer_fact());
+
         Ok(Self {
             rules,
             process,
             program_status,
             source: Arc::from(source),
             latches_working: true,
+            uses_composer_fact,
         })
     }
 
@@ -137,6 +142,12 @@ impl Manifest {
             if !evaluation.has_region_text(&rule.region) {
                 continue;
             }
+            if self.uses_composer_fact
+                && rule.gate.uses_composer_fact()
+                && context.prompt_box().is_none()
+            {
+                continue;
+            }
 
             if !rule.gate.matches(&rule.region, &mut evaluation) {
                 continue;
@@ -158,6 +169,13 @@ impl Manifest {
             visible_blocker: rule.visible_blocker,
             overrides_program_status: rule.overrides_program_status,
         })
+    }
+
+    /// Whether a rule reads the screen-wide prompt-box fact (`composer_absent`),
+    /// so the match context has to carry it.
+    #[must_use]
+    pub fn uses_composer_fact(&self) -> bool {
+        self.uses_composer_fact
     }
 
     #[must_use]
@@ -399,6 +417,10 @@ pub struct MatchContext {
     /// The program-status gate is open: rules marked `below_authority` serve
     /// releases below the gate only and are skipped.
     authority_open: bool,
+    /// Whether the screen shows a prompt box; `None` when the screen is not
+    /// part of the context. A rule with `composer_absent` is skipped then,
+    /// like a rule whose region text is missing.
+    prompt_box: Option<bool>,
 }
 
 impl MatchContext {
@@ -421,6 +443,18 @@ impl MatchContext {
     pub fn with_authority_open(mut self, open: bool) -> Self {
         self.authority_open = open;
         self
+    }
+
+    /// Records whether the screen shows a prompt box, which `composer_absent`
+    /// reads.
+    #[must_use]
+    pub fn with_prompt_box(mut self, present: bool) -> Self {
+        self.prompt_box = Some(present);
+        self
+    }
+
+    pub(super) fn prompt_box(&self) -> Option<bool> {
+        self.prompt_box
     }
 
     pub(super) fn region_text(&self, region: &ManifestRegion) -> Option<&str> {

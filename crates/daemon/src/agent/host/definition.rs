@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 
 use super::checkout_trust::CheckoutTrust;
 use super::config_home::ConfigHome;
-use super::features::{check_gates, check_required_keys, check_requires, FeatureTables};
+use super::features::{
+    check_gates, check_required_keys, check_requires, manifest_covered, FeatureTables,
+};
 use super::launch_env::DescriptorLaunchEnv;
 use super::naming::{NamingLaunchArgs, SESSION_NAME_PLACEHOLDER};
 use super::placement::{Placement, RawPlacement};
@@ -719,7 +721,7 @@ impl RuntimeDefinition {
                 field: "runtime.id",
                 source,
             })?;
-        let manifest = manifest(&raw.runtime.detect_manifest)?;
+        let manifest = manifest_covered(&document, manifest(&raw.runtime.detect_manifest)?)?;
         let mut input_rules = input_rules_for(
             raw.input.text_policy.into_policy(),
             raw.input.bracketed_paste,

@@ -1234,6 +1234,9 @@ fn match_context_for(
     freshness: ContextFreshness,
 ) -> MatchContext {
     let mut context = MatchContext::default();
+    if freshness.screen && manifest.uses_composer_fact() {
+        context = context.with_prompt_box(screen.has_prompt_box());
+    }
 
     for region in manifest.required_regions() {
         if !freshness.includes(&region) {
