@@ -251,6 +251,12 @@ layout) is not verified by setup: such a directory cannot be told from an
 archive stripped of both, and the download's attestation or the package
 manager's checksum is what rules out tampering. It never upgrades an installed service: a
 different installed version is a gap, and `pohunek service upgrade` runs first.
+It also installs the assistant package `pohunek.context.assistant` that
+matches this release from the signed plugin index, under the same consent: the
+daemon verifies the index and the archive digest, and every outcome without that
+verification (index unreachable or without the package, a document the daemon
+refuses, a daemon without the index channel) is a gap that ends the run with
+`setup_incomplete` and the manual command of `docs/install.md`.
 `--hooks none|all|<agent[:profile]>,...` (default `all`) limits the hooks to
 none or to the listed agent homes: the preview, the result and `--dry-run
 --json` then list only the selected homes (and the gaps about their profile

@@ -385,6 +385,64 @@ async fn fetch_official_index(client: &Client, kind: IndexEntryKind) -> Result<V
     fetch(client, &checked_url(url)?, Download::Index).await
 }
 
+/// The index document and the entry `request` resolved to.
+struct Selection {
+    index_bytes: Vec<u8>,
+    entry: IndexEntry,
+}
+
+/// Fetch the index at `index_url` (the official one when `None`) and select
+/// the entry `request` resolves to for this core version and platform.
+async fn select_entry(
+    client: &Client,
+    request: &PackageRef,
+    index_url: Option<&str>,
+) -> Result<Selection, Error> {
+    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
+        detail: "this build has no semantic version to match entries against".to_owned(),
+    })?;
+    let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
+    let index_bytes = match index_url {
+        Some(url) => fetch(client, &checked_url(url)?, Download::Index).await?,
+        None => fetch_official_index(client, wanted_kind(request)).await?,
+    };
+    let envelope = parse_index_envelope(&index_bytes).map_err(|error| Error::IndexInvalid {
+        detail: error.to_string(),
+    })?;
+    if unix_now() >= envelope.index.expires_at {
+        return Err(Error::IndexExpired);
+    }
+    let entry = select(&envelope.index.entries, request, &core, &platform)?.clone();
+    Ok(Selection { index_bytes, entry })
+}
+
+impl Selection {
+    fn resolved(&self) -> Resolved {
+        Resolved {
+            id: self.entry.package_id.clone(),
+            version: self.entry.version.clone(),
+            digest: self.entry.digest.clone(),
+        }
+    }
+}
+
+/// Fetch the index at `index_url` (the official one when `None`) and resolve
+/// `request` without downloading the archive.
+///
+/// The result is what the unverified index claims; the daemon verifies the
+/// signature, revocations, freshness and digest when the package installs.
+///
+/// # Errors
+///
+/// Returns the first failed step as an [`Error`].
+pub(crate) async fn resolve(
+    request: &PackageRef,
+    index_url: Option<&str>,
+) -> Result<Resolved, Error> {
+    let client = client()?;
+    Ok(select_entry(&client, request, index_url).await?.resolved())
+}
+
 /// Fetch the index at `index_url` (the official one when `None`), resolve
 /// `request`, download the archive and stage both files.
 ///
@@ -393,27 +451,10 @@ async fn fetch_official_index(client: &Client, kind: IndexEntryKind) -> Result<V
 /// Returns the first failed step as an [`Error`]; nothing is sent to the
 /// daemon by this function.
 pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
-    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
-        detail: "this build has no semantic version to match entries against".to_owned(),
-    })?;
-    let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
     let client = client()?;
-    let index_bytes = match index_url {
-        Some(url) => fetch(&client, &checked_url(url)?, Download::Index).await?,
-        None => fetch_official_index(&client, wanted_kind(request)).await?,
-    };
-    let envelope = parse_index_envelope(&index_bytes).map_err(|error| Error::IndexInvalid {
-        detail: error.to_string(),
-    })?;
-    if unix_now() >= envelope.index.expires_at {
-        return Err(Error::IndexExpired);
-    }
-    let entry = select(&envelope.index.entries, request, &core, &platform)?;
-    let resolved = Resolved {
-        id: entry.package_id.clone(),
-        version: entry.version.clone(),
-        digest: entry.digest.clone(),
-    };
+    let selection = select_entry(&client, request, index_url).await?;
+    let resolved = selection.resolved();
+    let Selection { index_bytes, entry } = selection;
     let archive_url = checked_url(&entry.url)?;
     let archive = fetch(&client, &archive_url, Download::Archive).await?;
     let actual = archive_digest(&archive).map_err(|_error| Error::ArchiveDigestMismatch {

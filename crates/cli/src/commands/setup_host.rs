@@ -60,6 +60,7 @@ use crate::commands::integration::{
 };
 use crate::commands::profile_bind::{self, PinCheck, UNCHECKED_PIN_NOTE};
 use crate::commands::setup::{config_files, install_config_into, ConfigResult};
+use crate::commands::setup_assistant::{self, AssistantOutcome, AssistantStep};
 use crate::commands::setup_hooks::{home_label, HookSelection};
 use crate::error::CliError;
 use crate::hermes_integration::runner::safe_ancestor;
@@ -235,6 +236,10 @@ pub struct Preview {
     pub hermes_homes: Vec<IntegrationReinstall>,
     /// The config files, each with whether it exists.
     pub config: Vec<ConfigPreview>,
+    /// The assistant context package the run installs; absent when the plan
+    /// was read without the package step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<AssistantStep>,
 }
 
 /// The final checks of a run.
@@ -252,6 +257,9 @@ pub struct Verdict {
     pub hooks_failed: Vec<String>,
     /// Hook homes left as gaps, each with the command that installs it.
     pub hook_gaps: Vec<String>,
+    /// The assistant package gap, with the manual command, when the package
+    /// was not installed.
+    pub assistant_gap: Option<String>,
     /// The release catalog's trust state in the plan read after the apply.
     pub catalog: String,
     /// The daemon's health status.
@@ -293,6 +301,56 @@ pub struct HostPlan {
     pub preview: Preview,
     /// The agent homes the run installs hooks into.
     hooks: HookSelection,
+    /// Where the assistant package is resolved from; `None` when the plan
+    /// has no package step.
+    assistant_index: Option<AssistantIndex>,
+}
+
+/// The plugin index the assistant package is resolved from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssistantIndex {
+    /// The official plugin index.
+    Official,
+    /// The index at this URL, which replaces the official one. Only an
+    /// `https` URL, or `http` to this machine, is read.
+    Url(String),
+}
+
+impl AssistantIndex {
+    fn url(&self) -> Option<&str> {
+        match self {
+            Self::Official => None,
+            Self::Url(url) => Some(url),
+        }
+    }
+}
+
+/// What a setup run is asked to do beyond the release it installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupOptions {
+    /// The agent homes the run installs hooks into.
+    pub hooks: HookSelection,
+    /// Where the assistant package is resolved from; `None` leaves the
+    /// package step out of the plan.
+    pub assistant: Option<AssistantIndex>,
+}
+
+impl SetupOptions {
+    /// Options with `hooks` and no assistant package step.
+    #[must_use]
+    pub fn new(hooks: HookSelection) -> Self {
+        Self {
+            hooks,
+            assistant: None,
+        }
+    }
+
+    /// These options with the assistant package resolved from `index`.
+    #[must_use]
+    pub fn with_assistant(mut self, index: AssistantIndex) -> Self {
+        self.assistant = Some(index);
+        self
+    }
 }
 
 /// Why a host setup step stopped, with its stable code and next step.
@@ -351,7 +409,22 @@ pub async fn plan_selecting(
     planner: &dyn ReleasePlanner,
     hooks: &HookSelection,
 ) -> Result<HostPlan, SetupError> {
-    plan_in(context, staged, planner, hooks)
+    plan_with(context, staged, planner, &SetupOptions::new(hooks.clone())).await
+}
+
+/// Reads the plan like [`plan`], with the hooks and the plugin index `options`
+/// select.
+///
+/// # Errors
+///
+/// Returns the errors of [`plan_selecting`].
+pub async fn plan_with(
+    context: &Context,
+    staged: &Path,
+    planner: &dyn ReleasePlanner,
+    options: &SetupOptions,
+) -> Result<HostPlan, SetupError> {
+    plan_in(context, staged, planner, options)
         .await
         .map_err(SetupError)
 }
@@ -385,9 +458,14 @@ pub(crate) async fn run(
     json: bool,
     dry_run: bool,
     hooks: &HookSelection,
+    index_url: Option<&str>,
 ) -> Result<(), CliError> {
+    let options = SetupOptions::new(hooks.clone()).with_assistant(match index_url {
+        Some(url) => AssistantIndex::Url(url.to_owned()),
+        None => AssistantIndex::Official,
+    });
     if dry_run {
-        return preview_only(json, hooks).await;
+        return preview_only(json, &options).await;
     }
     if !yes && (json || !io::stdin().is_terminal()) {
         return Err(CliError::SetupConsentRequired);
@@ -395,7 +473,7 @@ pub(crate) async fn run(
     let context = Context::resolve()?;
     let staged = service::staged_dir(&context, None)?;
     let planner = DaemonRuntimes::default();
-    let plan = plan_in(&context, &staged, &planner, hooks).await?;
+    let plan = plan_in(&context, &staged, &planner, &options).await?;
     if !json {
         print!("{}", render_plan(&plan));
     }
@@ -418,11 +496,11 @@ pub(crate) async fn run(
 ///
 /// Returns the errors of reading the plan, as a run returns them before its
 /// first change.
-async fn preview_only(json: bool, hooks: &HookSelection) -> Result<(), CliError> {
+async fn preview_only(json: bool, options: &SetupOptions) -> Result<(), CliError> {
     let context = Context::resolve()?;
     let staged = service::staged_dir(&context, None)?;
     let planner = DaemonRuntimes::default();
-    let plan = plan_in(&context, &staged, &planner, hooks).await?;
+    let plan = plan_in(&context, &staged, &planner, options).await?;
     if json {
         print!("{}", crate::commands::render_json(&plan.preview)?);
     } else {
@@ -638,8 +716,9 @@ async fn plan_in(
     context: &Context,
     staged: &Path,
     planner: &dyn ReleasePlanner,
-    hooks: &HookSelection,
+    options: &SetupOptions,
 ) -> Result<HostPlan, CliError> {
+    let hooks = &options.hooks;
     // Read without side effects, so the plan a dry run prints leaves the host
     // as it was.
     let status = service::installed_facts(context)?;
@@ -716,6 +795,7 @@ async fn plan_in(
     // whenever the plan serves Hermes and its default home exists.
     let env = integration_env(context);
     let hermes_homes = selected_hermes_homes(&env, &previewed, &detected, &search_path, hooks)?;
+    let assistant = plan_assistant(context, &service, options).await;
     let preview = Preview {
         service: service.clone(),
         packages: previewed.packages.clone(),
@@ -726,6 +806,7 @@ async fn plan_in(
         catalog_note: catalog_note(&service, &previewed),
         hermes_homes,
         config,
+        assistant,
     };
     Ok(HostPlan {
         service,
@@ -735,7 +816,23 @@ async fn plan_in(
         previewed,
         preview,
         hooks: hooks.clone(),
+        assistant_index: options.assistant.clone(),
     })
+}
+
+/// Plans the assistant package. An installed service answers, so the package
+/// is compared with what is installed; a fresh host has no daemon to ask.
+async fn plan_assistant(
+    context: &Context,
+    service: &ServiceStep,
+    options: &SetupOptions,
+) -> Option<AssistantStep> {
+    let index = options.assistant.as_ref()?;
+    let mut client = match service {
+        ServiceStep::Present => Client::connect(LOCAL_HOST, &paths_of(context)).await.ok(),
+        ServiceStep::Install { .. } => None,
+    };
+    Some(setup_assistant::plan(index.url(), client.as_mut()).await)
 }
 
 /// Applies a previewed plan, step by step, and runs the final checks.
@@ -845,12 +942,34 @@ async fn apply_steps(
     }
     written?;
 
+    let assistant_gap = match (&plan.preview.assistant, &plan.assistant_index) {
+        (Some(step), Some(index)) => {
+            match setup_assistant::apply(&mut client, step, index.url()).await {
+                AssistantOutcome::Installed(line) => {
+                    applied.push(line);
+                    None
+                }
+                AssistantOutcome::Present => None,
+                AssistantOutcome::Gap(text) => Some(text),
+            }
+        }
+        _ => None,
+    };
+
     let after = select_hooks(
         planner.plan(context, &dir, &search_path).await?,
         &plan.hooks,
     );
     let catalog_recorded = installs_packages && previewed.catalog == CatalogStatus::Record;
-    let verdict = verdict(&paths, previewed, &after, &hooks, catalog_recorded).await?;
+    let verdict = verdict(
+        &paths,
+        previewed,
+        &after,
+        &hooks,
+        catalog_recorded,
+        assistant_gap,
+    )
+    .await?;
     Ok((hooks, config, verdict))
 }
 
@@ -1358,6 +1477,7 @@ async fn verdict(
     after: &EnsureReport,
     hooks: &[IntegrationReinstall],
     catalog_recorded_by_install: bool,
+    assistant_gap: Option<String>,
 ) -> Result<Verdict, CliError> {
     let packages_missing: Vec<String> = previewed
         .packages
@@ -1416,6 +1536,7 @@ async fn verdict(
             .collect(),
         hooks_failed,
         hook_gaps,
+        assistant_gap,
         catalog: wire_name(&after.catalog),
         health: health.status,
         doctor: diagnosis.overall.as_str().to_owned(),
@@ -1475,6 +1596,9 @@ fn verdict_problems(
     }
     if !verdict.hooks_failed.is_empty() {
         problems.push(format!("hooks failed: {}", verdict.hooks_failed.join("; ")));
+    }
+    if let Some(gap) = &verdict.assistant_gap {
+        problems.push(gap.clone());
     }
     if !doctor_failures.is_empty() {
         problems.push(format!(
@@ -1733,6 +1857,38 @@ fn accepted_gaps_note(preview: &Preview) -> Option<String> {
     })
 }
 
+/// Writes the assistant package line of the plan to `out`.
+fn render_assistant(out: &mut String, step: Option<&AssistantStep>) {
+    match step {
+        None => {}
+        Some(AssistantStep::Install {
+            package_id,
+            version,
+            digest,
+            replaces,
+        }) => {
+            let _ = write!(out, "assistant: install {package_id}@{version} ({digest})");
+            if let Some(current) = replaces {
+                let _ = write!(out, ", replacing the selected {current}");
+            }
+            let _ = writeln!(out);
+        }
+        Some(AssistantStep::Present {
+            package_id,
+            version,
+            ..
+        }) => {
+            let _ = writeln!(out, "assistant: {package_id}@{version} installed; kept");
+        }
+        Some(AssistantStep::Gap { detail, command }) => {
+            let _ = writeln!(
+                out,
+                "assistant: gap, {detail}\n  install by hand: {command}"
+            );
+        }
+    }
+}
+
 /// Renders the preview: every effect and gap, before anything is written.
 fn render_plan(plan: &HostPlan) -> String {
     let preview = &plan.preview;
@@ -1775,6 +1931,7 @@ fn render_plan(plan: &HostPlan) -> String {
             let _ = writeln!(out, "  {line}");
         }
     }
+    render_assistant(&mut out, preview.assistant.as_ref());
     let _ = writeln!(out, "profiles:");
     for profile in &preview.profiles {
         let _ = writeln!(

@@ -22,10 +22,11 @@ mod process;
 pub mod host_setup {
     //! Bare `pohunek setup` as a library: the plan, then the apply, against the
     //! installation an explicit [`crate::service::Context`] describes.
+    pub use crate::commands::setup_assistant::AssistantStep;
     pub use crate::commands::setup_hooks::HookSelection;
     pub use crate::commands::setup_host::{
-        apply, plan, plan_selecting, HostPlan, ReleasePlanner, ServiceStep, SetupError,
-        SetupReport, Verdict,
+        apply, plan, plan_selecting, plan_with, AssistantIndex, HostPlan, ReleasePlanner,
+        ServiceStep, SetupError, SetupOptions, SetupReport, Verdict,
     };
 }
 pub mod service;
@@ -189,6 +190,12 @@ enum Commands {
         /// comma-separated list of `agent` (default home) and `agent:profile`.
         #[arg(long, value_name = "SELECTION", default_value = "all")]
         hooks: commands::setup_hooks::HookSelection,
+        /// Plugin index the assistant package is resolved from instead of the
+        /// official one (bare `setup`); only `https` URLs and `http` to
+        /// `127.0.0.1` or `[::1]` are read. The daemon still verifies the
+        /// index signature.
+        #[arg(long, value_name = "URL")]
+        index_url: Option<String>,
     },
 
     /// Discover, list, and inspect remote hosts over the configured overlay.
@@ -2284,11 +2291,15 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             json,
             dry_run,
             hooks,
+            index_url,
         } => {
             // Setup is purely local: it configures this machine. It ignores `--host`.
             let paths = Paths::resolve()?;
             match action {
-                None => commands::setup_host::run(yes, json, dry_run, &hooks).await?,
+                None => {
+                    commands::setup_host::run(yes, json, dry_run, &hooks, index_url.as_deref())
+                        .await?;
+                }
                 Some(SetupAction::Completions {
                     shell,
                     dynamic,
@@ -2717,6 +2728,13 @@ fn setup_dry_run_usage_error(cli: &Cli) -> Option<clap::Error> {
             ..
         } if *hooks != commands::setup_hooks::HookSelection::All => Some(usage_conflict(
             "--hooks selects the hooks of bare `pohunek setup` only and cannot be used with a setup subcommand",
+        )),
+        Commands::Setup {
+            action: Some(_),
+            index_url: Some(_),
+            ..
+        } => Some(usage_conflict(
+            "--index-url selects the index of bare `pohunek setup` only and cannot be used with a setup subcommand",
         )),
         _ => None,
     }

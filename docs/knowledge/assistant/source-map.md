@@ -45,6 +45,7 @@ Current CLI and command surface:
 - `crates/cli/src/commands/discovery_cache.rs`
 - `crates/cli/src/commands/setup.rs`
 - `crates/cli/src/commands/setup_host.rs`
+- `crates/cli/src/commands/setup_assistant.rs`
 - `crates/cli/src/commands/setup_hooks.rs`
 - `crates/cli/src/commands/host.rs`
 - `crates/cli/src/commands/integration.rs`

@@ -128,7 +128,7 @@ cannot be pinned: the operation fails before its first connection with
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [--yes \| --dry-run] [--hooks <none\|all\|agent[:profile],...>] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. `--hooks` limits the hooks to none or to the listed agent homes (default `all`). It never upgrades an installed service. |
+| `pohunek setup [--yes \| --dry-run] [--hooks <none\|all\|agent[:profile],...>] [--index-url <url>] [--json]` | The one host setup: installs the service from this release, applies the official runtime packages, profile pins and hooks for the runtimes this host has, installs the assistant package `pohunek.context.assistant` that matches this release, and writes the missing config files. It previews every change and asks once; `--yes` applies without asking, and without a terminal or with `--json` it needs `--yes`. `--dry-run` prints the plan and changes nothing. `--hooks` limits the hooks to none or to the listed agent homes (default `all`). It never upgrades an installed service. |
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
@@ -319,9 +319,31 @@ another version, a refused release plan). A malformed selection is refused by
 the parser, and `--hooks` with a selection other than `all` together with a
 setup subcommand is a usage error.
 
+The assistant package `pohunek.context.assistant` is installed under the same
+consent, so `pohunek assistant` works on the host after `setup --yes`. The plan
+resolves it through the signed plugin index (`official-index-v2.json`) with the
+resolver of `plugin install`, and the preview and `--dry-run --json` carry it in
+`assistant`: `{"status":"install","package_id":...,"version":...,"digest":...}`
+for a package the run installs (with `replaces` naming the selected version it replaces, when there is one), `present` for one already installed, enabled and
+selected (at the listed digest, or a serving selected version that is not older than the listed one, which setup keeps and reports with its own version and digest), and `gap` with a `detail` and the manual
+`command` when it cannot be installed. A dry run reads only the index; the
+digest it shows is the index's claim, and the daemon verifies the index
+signature, revocations, freshness and archive digest when the package installs.
+The apply resolves the archive again at the previewed version and refuses a
+digest that differs from the previewed one before anything reaches the daemon.
+Nothing is installed without the daemon's verification: an unreachable index, an
+index that does not list the package or whose document expired, a daemon that
+refuses the document, and a daemon without the plugin index channel are gaps. So is a revoked package, and so is a package installed at the listed digest that the owner disabled or did not select: setup leaves that choice and names the `plugin enable` and `plugin select` commands. A serving selected version that is not older than the listed one is kept (`present`), so setup never downgrades a hand-installed or newer build; a selected version that is older, revoked, faulted or disabled is replaced by the listed one. A package whose root is missing or damaged is installed again, which restores the root. The result's `verdict.assistant_gap` carries the gap text, or is `null` when the package is installed.
+The other steps finish, then the run exits with `setup_incomplete` naming the
+gap and the manual command from the [install guide](install.md#install-the-assistant-package),
+and a re-run completes the package. `--index-url <url>` replaces the official
+index (only `https` URLs and `http` to `127.0.0.1` or `[::1]` are read; the
+daemon still verifies the signature) and is a usage error with a setup
+subcommand.
+
 `--json --yes` applies the plan without asking and prints one result document.
 It carries the full preview in `preview` (service, packages, profiles,
-integrations, gaps, catalog, every selected Hermes home and the config files), then the
+integrations, gaps, catalog, every selected Hermes home, the config files and the assistant package), then the
 `applied` lines, the hook outcomes, the config result and the verdict. It
 prints no separate preview, because it cannot ask: to read the plan first, run
 `pohunek setup --dry-run --json`.
