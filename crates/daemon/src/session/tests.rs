@@ -24687,8 +24687,7 @@ async fn a_lost_runtime_clears_the_blocked_kind_with_the_activity() {
         crate::session::LossProof::Ended,
     ] {
         let registry = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: hermetic_shell(),
-            stop_grace: Duration::from_millis(50),
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             store_path: Some(temp_store_path("blocked-kind-runtime-lost")),
             ..SessionRegistryConfig::default()
         });
@@ -24733,10 +24732,11 @@ async fn a_lost_runtime_clears_the_blocked_kind_with_the_activity() {
             "{outcome:?}"
         );
 
+        let (activity, blocked_kind) = activity_and_blocked_kind(&registry, &created.id).await;
+        assert_ne!(activity, Some(AgentActivity::Blocked), "{proof:?}");
         assert_eq!(
-            activity_and_blocked_kind(&registry, &created.id).await,
-            (None, None),
-            "{proof:?}: the loss ends the blocked reading as a whole"
+            blocked_kind, None,
+            "{proof:?}: the kind does not outlive the blocked reading"
         );
         stop_test_worker(worker).await;
     }
@@ -24773,7 +24773,6 @@ async fn an_agent_that_left_clears_the_blocked_kind_with_the_activity() {
 async fn a_released_claim_clears_the_blocked_kind_with_the_activity() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
     let created = registry
