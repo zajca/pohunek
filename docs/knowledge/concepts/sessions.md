@@ -147,7 +147,7 @@ arrives before Enter, Enter is not written and the call fails with
 because arbitrary TUIs cannot retract it. A deadline that is not longer than the submit delay, or that or a shutdown arrives before the body is written, writes nothing (`session_input_timeout`, `daemon_shutting_down`). An `idle` target on delayed framing
 counts only after `working` evidence above the boundary, since the prompt box
 reads as idle until Enter is written; `--until working` confirms the agent
-started on the input, and a success carries `submitted: true`. Zero-delay waited
+started on the input, and a success carries `submitted: true`. On a session whose manifest declares a program status source (Claude, Codex, Pi), activity from the process watcher (output such as the startup banner or the composer repainting the typed text) never counts as `working` here, nor as the `working` evidence an `idle` target requires, and `prompt_delivered` ignores it too. Zero-delay waited
 input reserves the exclusive worker write first, then captures its causal
 boundary immediately before the prepared atomic two-fragment plan starts. A
 timeout or shutdown while reserving the worker cancels the unsent plan without
@@ -168,8 +168,9 @@ arrive before the deadline (on delayed framing also when Enter was written and
 no target followed). Rust and TypeScript
 SDK helpers validate the timeout locally and fail closed with
 `session_input_wait_contract_mismatch` when a daemon ignores `wait` or omits
-runtime-scoped evidence. Its recovery guidance says to inspect the session rather
-than blindly resending input because delivery may already have happened.
+runtime-scoped evidence. Its recovery guidance says to read the screen before resending or pressing
+Enter, because the text may still sit unsent in the prompt or may already have
+been taken.
 A Claude session also reports each submitted prompt through the
 `UserPromptSubmit` hook. A caller that opts in with `allow_prompt_accepted`
 (the CLI always does for a waited input) gets that report as the answer to a
