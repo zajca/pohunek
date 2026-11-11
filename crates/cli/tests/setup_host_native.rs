@@ -2353,7 +2353,7 @@ async fn a_daemon_without_the_index_channel_leaves_the_package_a_gap() {
 }
 
 /// A selected version that is older than the listed one is replaced, and the
-/// preview says so; a selected version that is not older is kept as a gap.
+/// preview says so; a selected version that is not older is kept (`present`).
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
@@ -2442,6 +2442,164 @@ async fn a_selected_assistant_version_is_replaced_only_when_it_is_older_or_does_
             .iter()
             .any(|(_, digest, selected)| digest == older.digest.as_str() && *selected),
         "the listed version serves"
+    );
+}
+
+/// A serving selection is kept even while the index lists another installed
+/// digest: the kept-selection rule is read before the listed digest, and the
+/// listed digest stays as the owner left it unless the selection changed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one run follows the same host through the served, disabled and restored selection"
+)]
+async fn an_installed_listed_digest_does_not_hide_a_serving_selection() {
+    let host = FreshHost::new();
+    let rig = AssistantRig::publish(&host);
+    let listed = rig.archive.digest.as_str();
+    let planned = host.plan_assistant(&rig.options()).await;
+    apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the first run installs the listed digest");
+
+    // A newer listing replaces the selection; the listed digest stays
+    // installed and is no longer selected.
+    let newer = rig.serve_version("0.42.1");
+    let planned = host.plan_assistant(&rig.options()).await;
+    apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the newer listing replaces the selection");
+    let installed = host.assistant_packages().await;
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == newer.digest.as_str() && *selected),
+        "{installed:?}"
+    );
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == listed && !*selected),
+        "{installed:?}"
+    );
+
+    // The index lists the installed digest again. The serving selection is
+    // kept, so the run completes instead of asking for a selection the owner
+    // already made.
+    rig.serve(&rig.archive);
+    let kept = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &kept.preview.assistant,
+            Some(AssistantStep::Present { version, digest, .. })
+                if version == "0.42.1" && digest == newer.digest.as_str()
+        ),
+        "{:?}",
+        kept.preview.assistant
+    );
+    let outcome = apply(&host.installation.context, kept, &host.planner)
+        .await
+        .expect("a kept serving selection completes the run");
+    assert_eq!(outcome.verdict.assistant_gap, None);
+    let installed = host.assistant_packages().await;
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == newer.digest.as_str() && *selected),
+        "the serving selection stays selected: {installed:?}"
+    );
+
+    // A selection that no longer serves does not switch to the listed digest:
+    // the listed digest is already recorded, so enable and select stay the
+    // owner's calls and the run names them.
+    let mut client = host.installation.client().await;
+    client
+        .call::<method::PackageSetEnabled>(protocol::PackageSetEnabledParams {
+            digest: newer.digest.clone(),
+            enabled: false,
+        })
+        .await
+        .expect("disable the selected version");
+    let disabled = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &disabled.preview.assistant,
+            Some(AssistantStep::Gap { command, .. })
+                if command.contains("pohunek plugin enable")
+                    && command.contains(&format!("--digest {listed}"))
+        ),
+        "{:?}",
+        disabled.preview.assistant
+    );
+    let error = apply(&host.installation.context, disabled, &host.planner)
+        .await
+        .expect_err("an installed digest the owner left disabled ends the run incomplete");
+    assert_eq!(error.code(), "setup_incomplete");
+    let installed = host.assistant_packages().await;
+    assert_eq!(
+        installed.len(),
+        2,
+        "the gap run installs and removes nothing: {installed:?}"
+    );
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == listed && !*selected),
+        "the listed digest stays as the owner left it: {installed:?}"
+    );
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == newer.digest.as_str() && !*selected),
+        "the disabled selection stays recorded on its digest: {installed:?}"
+    );
+
+    // Restoring the selection serves again, whatever the listed digest is.
+    let mut client = host.installation.client().await;
+    client
+        .call::<method::PackageSetEnabled>(protocol::PackageSetEnabledParams {
+            digest: newer.digest.clone(),
+            enabled: true,
+        })
+        .await
+        .expect("enable the selected version again");
+    client
+        .call::<method::PackageSetEnabled>(protocol::PackageSetEnabledParams {
+            digest: rig.archive.digest.clone(),
+            enabled: false,
+        })
+        .await
+        .expect("disable the listed version");
+    let serving = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &serving.preview.assistant,
+            Some(AssistantStep::Present { version, digest, .. })
+                if version == "0.42.1" && digest == newer.digest.as_str()
+        ),
+        "{:?}",
+        serving.preview.assistant
+    );
+    let outcome = apply(&host.installation.context, serving, &host.planner)
+        .await
+        .expect("a serving selection completes the run");
+    assert_eq!(outcome.verdict.assistant_gap, None);
+    let installed = host.assistant_packages().await;
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == listed && !*selected),
+        "the disabled listed digest stays as the owner left it: {installed:?}"
+    );
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == newer.digest.as_str() && *selected),
+        "the serving selection stays selected: {installed:?}"
     );
 }
 

@@ -107,6 +107,24 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
             return AssistantStep::gap(error.to_string());
         }
         if let Ok(listed) = plugin::list(client).await {
+            // A selection that serves and is not older than the listing stays:
+            // it is the assistant the owner runs now. This rule is read before
+            // the listed digest, so a digest the owner does not run never
+            // replaces a selection that serves.
+            let selected = listed
+                .packages
+                .iter()
+                .find(|info| info.package.id == resolved.id && info.selected);
+            if let Some(selected) = selected {
+                let current = selected.package.version.to_string();
+                if serves(selected) && !is_older(&current, &version) {
+                    return AssistantStep::Present {
+                        package_id,
+                        version: current,
+                        digest: selected.digest.as_str().to_owned(),
+                    };
+                }
+            }
             if let Some(info) = listed
                 .packages
                 .iter()
@@ -145,22 +163,10 @@ pub(crate) async fn plan(index_url: Option<&str>, client: Option<&mut Client>) -
                     ),
                 };
             }
-            let selected = listed
-                .packages
-                .iter()
-                .find(|info| info.package.id == resolved.id && info.selected);
+            // The listed digest is not installed, so installing it replaces a
+            // selection that does not serve or is older than the listing.
             if let Some(selected) = selected {
-                let current = selected.package.version.to_string();
-                // A selection that serves and is not older than the listing
-                // stays: it is the assistant the owner runs now.
-                if serves(selected) && !is_older(&current, &version) {
-                    return AssistantStep::Present {
-                        package_id,
-                        version: current,
-                        digest: selected.digest.as_str().to_owned(),
-                    };
-                }
-                replaces = Some(current);
+                replaces = Some(selected.package.version.to_string());
             }
         }
     }
