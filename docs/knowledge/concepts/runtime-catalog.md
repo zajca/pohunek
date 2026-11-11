@@ -367,7 +367,8 @@ Errors are typed (`CatalogError`) and never carry catalog content.
 ## Plugin index
 
 A plugin package is authorized by a signed **plugin index**, a document family
-separate from the catalog: file name `official-index-v1.json`, its own
+separate from the catalog: file name `official-index-v1.json` (schema 1) or
+`official-index-v2.json` (schema 2, below), its own
 signature domains and its own verifier (`verify_index` in
 `crates/package/src/plugin_index.rs`). `verify_index` never calls the catalog
 key-set builder, so a catalog signature or key record never counts as an index
@@ -384,7 +385,7 @@ other root, the release CI root included, is `UnknownEndorser`.
 **Document.** `{schema_version, index, key_records, signatures, revocations}`,
 every object `deny_unknown_fields`, 1 MiB, parsed with the strict JSON subset
 of the catalog. `index` is `{schema_version, scope, sequence, expires_at,
-entries}`; an entry is `{package_id, runtime_id, version, digest, url,
+entries}`; a schema 1 entry is `{package_id, runtime_id, version, digest, url,
 platforms, core}`. `revocations` is `{revocations: {schema_version, sequence,
 revoked_key_ids}, signature}` and is required, so a revocation cannot be
 withheld separately from the index. Signatures cover the domain prefix plus
@@ -392,9 +393,68 @@ the canonical bytes of the member as parsed:
 
 | Signs | Prefix |
 |---|---|
-| `index` | `pohunek-plugin-index-v1\n` |
+| `index` (schema 1) | `pohunek-plugin-index-v1\n` |
+| `index` (schema 2) | `pohunek-plugin-index-v2\n` |
 | key record without `signature` | `pohunek-plugin-index-key-record-v1\n` |
 | `revocations.revocations` | `pohunek-plugin-index-revocations-v1\n` |
+
+**Schema 2 and the `context` entry kind.** A client that reads only schema 1
+(`deny_unknown_fields`, one schema version) refuses a document with a new field
+as a whole, so an additive field would break runtime installs on every shipped
+host. Schema 2 is therefore a new schema version published under its own file
+name, `official-index-v2.json`, beside the unchanged schema 1 document: the
+index repository publishes both from the same entries tree (`cargo xtask index
+build --schema-version 1|2`), and a host that reads only schema 1 keeps
+resolving runtime plugins from `official-index-v1.json` and never sees a
+context entry. Both documents are built at the same `--sequence`: a daemon
+keeps one index high-water mark for both, so a document built at a lower
+sequence than the other is refused as stale once the other was installed from.
+The schema 2 body is signed under its own domain prefix, so a
+schema 1 signature never verifies a schema 2 body; the key records, the
+endorser root, the channel file and the embedded revocation list (still
+`schema_version` 1, signed as before) are the same in both. A schema 2 entry
+has a `kind`:
+
+- `runtime`: the schema 1 entry plus `"kind": "runtime"`, with a `runtime_id`.
+  Its package id is `pohunek.runtime.` plus the runtime id and never starts
+  with `pohunek.context.`.
+- `context`: `{package_id, kind: "context", version, digest, url, platforms,
+  core}` with no `runtime_id`. Its package id is `pohunek.context.` plus a
+  non-empty name. A context package exports a directory of files and no
+  runtime or commands (for example `pohunek.context.assistant`).
+
+A schema 1 entry has no `kind` and is a `runtime` entry; a `kind` in a schema 1
+document, a schema 2 entry without one, a `context` entry with a `runtime_id` or
+a `runtime` entry without one is an invalid entry (`IndexEntryRejection::Kind`),
+and a package id under the other kind's prefix is
+`IndexEntryRejection::PackageIdKind`. The kinds never authorize each other:
+`VerifiedIndex::authorize` (runtime) and `VerifiedIndex::authorize_context`
+(context) return `KindMismatch` for an entry of the other kind, and the daemon
+reaches the context rule only for a descriptor with no runtime and no commands.
+`authorize_context` checks, first failure wins: listed, kind `context`, identity
+equal, `pohunek.` namespace, package id `pohunek.context.` plus a name, core
+range, platform. A daemon that reads schema 2 reports
+`package_install_index_context_supported`; the CLI resolves a
+`pohunek.context.*` reference from `official-index-v2.json` only, and every
+runtime reference from `official-index-v1.json`, with no fallback: a daemon that
+predates schema 2 cannot read the schema 2 document, so a runtime install keeps
+needing the schema 1 file.
+
+**Residual risk of the shared key scope.** Index key records and documents keep
+the single scope `official`; the separation of the kinds lives in the verifier
+rules above, not in a second key hierarchy. The same index key could already list
+a runtime package that executes code, so a context entry does not widen what a
+stolen index key can do, but it is a second thing it can do: a stolen key could
+list a malicious `pohunek.context.assistant`, which changes the knowledge an
+assistant session reads and so influences a capable agent at the prompt level,
+until the revocation list names the key. Revoking the digest of such a package
+stops it from being served too: the assistant refuses a revoked context package
+like a revoked runtime. The bounds are the same as for runtime
+entries: a document lives at most 14 days (`LifetimeTooLong`, `Expired`), the
+sequence cannot lead the host clock by more than a day, the endorser root can
+revoke the key at any time, and every install shows the resolved package, version
+and digest before it writes. Per-kind key scopes (a `kinds` allow-list on the key
+record) are the next step if that risk is not acceptable.
 
 **Freshness.** `sequence` is the Unix second of signing. A sequence below the
 persisted high-water mark is `StaleSequence` (an equal one is accepted); one
@@ -418,7 +478,7 @@ the first five checks for untrusted version selection.
 
 **Install-time authorization.** `VerifiedIndex::authorize` takes the entry
 with the given digest and checks, first failure wins: listed (`NotListed`),
-identity equal (`IdentityMismatch`), `pohunek.` namespace (`Namespace`),
+kind `runtime` (`KindMismatch`), identity equal (`IdentityMismatch`), `pohunek.` namespace (`Namespace`),
 runtime id not one of `shell`, `codex`, `claude`, `hermes`, `pi`
 (`RuntimeRefused`), package id exactly `pohunek.runtime.` plus the runtime id
 (`PackageIdBinding`, which keeps an entry from claiming a release package id),
@@ -453,7 +513,13 @@ commit = "<40 lowercase hex>"
 built_with = "v0.40.0" # release tag of the workflow that built it, never a sha
 ```
 
-The seven fields before `[source]` are the signed entry. `[source]` is
+The seven fields before `[source]` are the signed entry. A context entry sets
+`kind = "context"`, omits `runtime_id` and uses a package id of the form
+`pohunek.context.<name>` with `core = ">=0.42.0"` or higher (admission refuses a
+context entry whose range admits a core below the first one that reads schema 2);
+`kind = "runtime"` is the default. `index build --schema-version 1` (the
+default) leaves the context entries of the tree out, because schema 1 cannot
+list them, and `--schema-version 2` writes the `kind` of every entry. `[source]` is
 admission metadata: it is validated (`repo` is `owner/name` over letters,
 digits, `-`, `.` and `_`, never `.` or `..` as the name), and never copied into
 the document. `index build --entries <dir> --print-source` prints it as

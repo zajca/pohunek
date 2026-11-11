@@ -203,6 +203,34 @@ pub(super) fn authorize_indexed(
         })
 }
 
+/// Checks that the verified index authorizes the decoded context package and
+/// that its entry supports this core version and platform.
+///
+/// # Errors
+///
+/// Returns [`PackageErrorKind::Incompatible`] when the entry does not support
+/// `core` or `platform`, and [`PackageErrorKind::Untrusted`] for every other
+/// refusal, a runtime entry listing the digest included.
+pub(super) fn authorize_indexed_context(
+    index: &VerifiedIndex,
+    identity: &PackageIdentity,
+    digest: &PackageDigest,
+    core: &Version,
+    platform: &str,
+) -> Result<(), PackageErrorKind> {
+    index
+        .authorize_context(&identity.id, &identity.version, digest, core, platform)
+        .map_err(|refusal| {
+            warn!(%refusal, "a context package was refused by the plugin index");
+            match refusal {
+                IndexEntryRefusal::CoreRange
+                | IndexEntryRefusal::CoreExcluded
+                | IndexEntryRefusal::Platform => PackageErrorKind::Incompatible,
+                _ => PackageErrorKind::Untrusted,
+            }
+        })
+}
+
 /// Checks that the verified catalog lists the raw archive `digest` and does
 /// not revoke it.
 ///

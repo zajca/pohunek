@@ -98,7 +98,7 @@ struct Documents {
 }
 
 fn assemble(args: &ThrowawayArgs, now: u64) -> Result<Documents, XtaskError> {
-    let entries = entries_of(&args.entries)?;
+    let entries = entries_of(&args.entries, INDEX_SCHEMA_VERSION)?;
     let entry_count = entries.len();
     let not_before = now.saturating_sub(VALID_BEFORE_SECONDS);
     let not_after = now.saturating_add(VALID_AFTER_SECONDS);

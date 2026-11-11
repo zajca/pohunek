@@ -29,6 +29,7 @@ pub(crate) mod prompt;
 pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod setup;
+pub(crate) mod setup_assistant;
 pub(crate) mod setup_hooks;
 pub(crate) mod setup_host;
 

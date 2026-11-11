@@ -14,8 +14,9 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use package::registry::Registry;
 use package::{
     index_key_record_signing_message, index_signing_message, revocation_signing_message,
-    CatalogSignature, IndexBody, IndexEntry, IndexEnvelope, IndexKeyRecord, KeyId, Limits,
-    RevocationBody, RootKey, SignedRevocations, INDEX_SCHEMA_VERSION,
+    ArchiveEntry, CatalogSignature, IndexBody, IndexEntry, IndexEntryKind, IndexEnvelope,
+    IndexKeyRecord, KeyId, Limits, RevocationBody, RootKey, SignedRevocations,
+    INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
 };
 use pohunek_test_support::catalog::host_platform;
 use protocol::{
@@ -25,6 +26,7 @@ use protocol::{
 
 use super::catalog_tests::{anchor, catalog, catalog_install, entry, signed_by, signing_key};
 use super::test_fixture::{Fixture, Package, HOST_STATE_COMMAND, INERT_PROGRAM, PACKAGE, RUNTIME};
+use crate::agent::host::{ContextError, PackageRejection};
 use crate::catalog_anchor::{CatalogTrust, IndexChannelFault, IndexTrust};
 use crate::packages::HostTrustAnchor;
 
@@ -176,8 +178,27 @@ impl Keys {
         entries: Vec<IndexEntry>,
         revocations: SignedRevocations,
     ) -> Vec<u8> {
+        Self::document_of_schema(
+            INDEX_SCHEMA_VERSION,
+            signer,
+            key_records,
+            sequence,
+            entries,
+            revocations,
+        )
+    }
+
+    /// An index document of `schema_version` signed by `signer`.
+    fn document_of_schema(
+        schema_version: u64,
+        signer: &SigningKey,
+        key_records: Vec<IndexKeyRecord>,
+        sequence: u64,
+        entries: Vec<IndexEntry>,
+        revocations: SignedRevocations,
+    ) -> Vec<u8> {
         let body = IndexBody {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version,
             scope: "official".to_owned(),
             sequence,
             expires_at: sequence + INDEX_LIFETIME,
@@ -189,13 +210,26 @@ impl Keys {
             signature: hex(&signer.sign(&message).to_bytes()),
         };
         serde_json::to_vec(&IndexEnvelope {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version,
             index: body,
             key_records,
             signatures: vec![signature],
             revocations,
         })
         .expect("serialize the index")
+    }
+
+    /// A schema 2 document signed by K at `sequence` with an empty revocation
+    /// list at sequence 1.
+    fn signed_v2(&self, sequence: u64, entries: Vec<IndexEntry>) -> Vec<u8> {
+        Self::document_of_schema(
+            INDEX_SCHEMA_VERSION_2,
+            &self.key,
+            vec![self.record(&self.key)],
+            sequence,
+            entries,
+            self.revocations(1, Vec::new()),
+        )
     }
 
     /// A document signed by K at `sequence` with an empty revocation list at
@@ -215,7 +249,8 @@ impl Keys {
 fn index_entry(package: &Package, package_id: &str, runtime: &str, version: &str) -> IndexEntry {
     IndexEntry {
         package_id: PackageId::parse(package_id).expect("package id"),
-        runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
+        kind: None,
+        runtime_id: Some(RuntimeId::parse(runtime).expect("runtime id")),
         version: PackageVersion::parse(version).expect("version"),
         digest: package.digest.clone(),
         url: "https://example.test/package.tar.zst".to_owned(),
@@ -744,6 +779,148 @@ async fn an_index_entry_for_a_digest_a_recorded_catalog_revoked_is_refused() {
         PackageErrorKind::Revoked
     );
     assert_nothing_recorded(&fixture, &package);
+}
+
+/// A context entry for a digest a recorded catalog revoked is refused like a
+/// runtime entry: revocation is checked on the context candidate too.
+#[tokio::test]
+async fn a_context_entry_for_a_revoked_digest_is_refused() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("index-context-revoked");
+    let package = context_package();
+    let context_entry = context_entry(&package);
+
+    let allowed = keys.signed_v2(now(), vec![context_entry.clone()]);
+    fixture
+        .registry
+        .packages()
+        .package_install(index_install(&fixture, &package, &allowed, true))
+        .await
+        .expect("an unrevoked context entry passes its dry run");
+
+    let catalog_package = Package::pi();
+    let mut revoking = catalog(7, vec![entry(&catalog_package, PACKAGE, RUNTIME, "1.0.0")]);
+    revoking.revoked_digests = vec![package.digest.clone()];
+    let document = signed_by(&keys.root, revoking);
+    fixture
+        .registry
+        .packages()
+        .package_install(catalog_install(
+            &fixture,
+            &catalog_package,
+            &document,
+            false,
+        ))
+        .await
+        .expect("the catalog install records its revoked digests");
+
+    let index = keys.signed_v2(now(), vec![context_entry]);
+    assert_eq!(
+        install_refused(&fixture, &package, &index).await,
+        PackageErrorKind::Revoked
+    );
+    assert_nothing_recorded(&fixture, &package);
+}
+
+/// Package id of the context fixture package.
+const CONTEXT_PACKAGE: &str = "pohunek.context.idxctx";
+
+/// A context package archive: a descriptor that exports one directory.
+fn context_package() -> Package {
+    Package::from_entries(&[
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: format!(
+                "schema = 1\nid = \"{CONTEXT_PACKAGE}\"\nversion = \"1.0.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n"
+            )
+            .into_bytes(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bundle/index.md".to_owned(),
+            contents: b"# Index\n".to_vec(),
+            executable: false,
+        },
+    ])
+}
+
+/// The `context` index entry that lists `package`.
+fn context_entry(package: &Package) -> IndexEntry {
+    IndexEntry {
+        package_id: PackageId::parse(CONTEXT_PACKAGE).expect("package id"),
+        kind: Some(IndexEntryKind::Context),
+        runtime_id: None,
+        version: PackageVersion::parse("1.0.0").expect("version"),
+        digest: package.digest.clone(),
+        url: "https://example.test/package.tar.zst".to_owned(),
+        platforms: vec![host_platform()],
+        core: ANY_CORE.to_owned(),
+    }
+}
+
+/// An installed context package that a recorded catalog later revokes is not
+/// served: the lookup by selection and the lookup by digest both refuse it.
+#[tokio::test]
+async fn a_revoked_context_package_is_not_served() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("index-context-served-revoked");
+    let package = context_package();
+    let id = PackageId::parse(CONTEXT_PACKAGE).expect("package id");
+    let index = keys.signed_v2(now(), vec![context_entry(&package)]);
+    fixture
+        .registry
+        .packages()
+        .package_install(index_install(&fixture, &package, &index, false))
+        .await
+        .expect("the index installs the context package");
+    fixture
+        .registry
+        .packages()
+        .context_dir(id.clone())
+        .await
+        .expect("an unrevoked context package is served");
+
+    let catalog_package = Package::pi();
+    let mut revoking = catalog(7, vec![entry(&catalog_package, PACKAGE, RUNTIME, "1.0.0")]);
+    revoking.revoked_digests = vec![package.digest.clone()];
+    fixture
+        .registry
+        .packages()
+        .package_install(catalog_install(
+            &fixture,
+            &catalog_package,
+            &signed_by(&keys.root, revoking),
+            false,
+        ))
+        .await
+        .expect("the catalog install records its revoked digests");
+
+    let selected = fixture.registry.packages().context_dir(id.clone()).await;
+    assert!(
+        matches!(
+            selected,
+            Err(ContextError::Rejected(PackageRejection::Revoked))
+        ),
+        "{selected:?}"
+    );
+    let pinned = fixture
+        .registry
+        .packages()
+        .context_dir_at(id, package.digest.clone())
+        .await;
+    assert!(
+        matches!(
+            pinned,
+            Err(ContextError::Rejected(PackageRejection::Revoked))
+        ),
+        "{pinned:?}"
+    );
+
+    let refusal =
+        crate::assistant::context_error(&ContextError::Rejected(PackageRejection::Revoked));
+    let remedy = refusal.recover.expect("the refusal carries a remedy");
+    assert!(remedy.contains("pohunek setup"), "{remedy}");
+    assert!(!remedy.contains("--sha256"), "{remedy}");
 }
 
 #[tokio::test]

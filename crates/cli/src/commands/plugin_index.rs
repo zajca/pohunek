@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use package::{
-    archive_digest, host_platform, parse_index_envelope, IndexEntry, MAX_COMPRESSED_BYTES,
-    MAX_INDEX_BYTES,
+    archive_digest, host_platform, parse_index_envelope, IndexEntry, IndexEntryKind,
+    MAX_COMPRESSED_BYTES, MAX_INDEX_BYTES, OFFICIAL_CONTEXT_PACKAGE_PREFIX,
 };
 use protocol::{PackageDigest, PackageId, PackageVersion};
 use reqwest::redirect::{Attempt, Policy};
@@ -26,8 +26,13 @@ use tempfile::TempDir;
 
 use crate::commands::plugin::Error;
 
-/// The official plugin index: the newest release of the index repository.
+/// The official plugin index, schema 1 (runtime entries only): the newest
+/// release of the index repository.
 pub(crate) const OFFICIAL_INDEX_URL: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v1.json";
+
+/// The official plugin index, schema 2 (runtime and context entries), which
+/// the index repository publishes beside the schema 1 document.
+pub(crate) const OFFICIAL_INDEX_URL_V2: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v2.json";
 
 /// Core version an entry's `core` range is matched against: this build's.
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -303,6 +308,20 @@ fn unix_now() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
+/// The kind of entry `request` can resolve to: ids under the context prefix
+/// resolve to `context` entries only, every other id to `runtime` entries.
+fn wanted_kind(request: &PackageRef) -> IndexEntryKind {
+    if request
+        .id
+        .as_str()
+        .starts_with(OFFICIAL_CONTEXT_PACKAGE_PREFIX)
+    {
+        IndexEntryKind::Context
+    } else {
+        IndexEntryKind::Runtime
+    }
+}
+
 /// The entry `request` resolves to among `entries`, for `core` on `platform`.
 ///
 /// With a pinned version the exact entry is chosen; otherwise the highest
@@ -314,9 +333,14 @@ fn select<'a>(
     core: &Version,
     platform: &str,
 ) -> Result<&'a IndexEntry, Error> {
+    let wanted = wanted_kind(request);
     let candidates: Vec<&IndexEntry> = entries
         .iter()
-        .filter(|entry| entry.package_id == request.id && entry.supports(core, platform))
+        .filter(|entry| {
+            entry.package_id == request.id
+                && entry.kind() == wanted
+                && entry.supports(core, platform)
+        })
         .collect();
     if candidates.is_empty() {
         return Err(Error::IndexPackageNotFound {
@@ -346,6 +370,79 @@ fn select<'a>(
         })
 }
 
+/// Fetches the official index document for entries of `kind`.
+///
+/// A `runtime` request reads the schema 1 document, which every daemon
+/// accepts; a `context` request reads the schema 2 document, the only one that
+/// lists a context package. The index repository builds both documents at the
+/// same sequence, so the daemon's index high-water mark, which the two share,
+/// never rejects one because the other was read first.
+async fn fetch_official_index(client: &Client, kind: IndexEntryKind) -> Result<Vec<u8>, Error> {
+    let url = match kind {
+        IndexEntryKind::Runtime => OFFICIAL_INDEX_URL,
+        IndexEntryKind::Context => OFFICIAL_INDEX_URL_V2,
+    };
+    fetch(client, &checked_url(url)?, Download::Index).await
+}
+
+/// The index document and the entry `request` resolved to.
+struct Selection {
+    index_bytes: Vec<u8>,
+    entry: IndexEntry,
+}
+
+/// Fetch the index at `index_url` (the official one when `None`) and select
+/// the entry `request` resolves to for this core version and platform.
+async fn select_entry(
+    client: &Client,
+    request: &PackageRef,
+    index_url: Option<&str>,
+) -> Result<Selection, Error> {
+    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
+        detail: "this build has no semantic version to match entries against".to_owned(),
+    })?;
+    let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
+    let index_bytes = match index_url {
+        Some(url) => fetch(client, &checked_url(url)?, Download::Index).await?,
+        None => fetch_official_index(client, wanted_kind(request)).await?,
+    };
+    let envelope = parse_index_envelope(&index_bytes).map_err(|error| Error::IndexInvalid {
+        detail: error.to_string(),
+    })?;
+    if unix_now() >= envelope.index.expires_at {
+        return Err(Error::IndexExpired);
+    }
+    let entry = select(&envelope.index.entries, request, &core, &platform)?.clone();
+    Ok(Selection { index_bytes, entry })
+}
+
+impl Selection {
+    fn resolved(&self) -> Resolved {
+        Resolved {
+            id: self.entry.package_id.clone(),
+            version: self.entry.version.clone(),
+            digest: self.entry.digest.clone(),
+        }
+    }
+}
+
+/// Fetch the index at `index_url` (the official one when `None`) and resolve
+/// `request` without downloading the archive.
+///
+/// The result is what the unverified index claims; the daemon verifies the
+/// signature, revocations, freshness and digest when the package installs.
+///
+/// # Errors
+///
+/// Returns the first failed step as an [`Error`].
+pub(crate) async fn resolve(
+    request: &PackageRef,
+    index_url: Option<&str>,
+) -> Result<Resolved, Error> {
+    let client = client()?;
+    Ok(select_entry(&client, request, index_url).await?.resolved())
+}
+
 /// Fetch the index at `index_url` (the official one when `None`), resolve
 /// `request`, download the archive and stage both files.
 ///
@@ -354,25 +451,10 @@ fn select<'a>(
 /// Returns the first failed step as an [`Error`]; nothing is sent to the
 /// daemon by this function.
 pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
-    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
-        detail: "this build has no semantic version to match entries against".to_owned(),
-    })?;
-    let index_url = checked_url(index_url.unwrap_or(OFFICIAL_INDEX_URL))?;
-    let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
     let client = client()?;
-    let index_bytes = fetch(&client, &index_url, Download::Index).await?;
-    let envelope = parse_index_envelope(&index_bytes).map_err(|error| Error::IndexInvalid {
-        detail: error.to_string(),
-    })?;
-    if unix_now() >= envelope.index.expires_at {
-        return Err(Error::IndexExpired);
-    }
-    let entry = select(&envelope.index.entries, request, &core, &platform)?;
-    let resolved = Resolved {
-        id: entry.package_id.clone(),
-        version: entry.version.clone(),
-        digest: entry.digest.clone(),
-    };
+    let selection = select_entry(&client, request, index_url).await?;
+    let resolved = selection.resolved();
+    let Selection { index_bytes, entry } = selection;
     let archive_url = checked_url(&entry.url)?;
     let archive = fetch(&client, &archive_url, Download::Archive).await?;
     let actual = archive_digest(&archive).map_err(|_error| Error::ArchiveDigestMismatch {

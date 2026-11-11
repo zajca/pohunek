@@ -19,6 +19,8 @@
 
 // Rust guideline compliant 2026-10-14
 
+#[path = "support/assistant_index.rs"]
+mod assistant_index;
 #[path = "support/native.rs"]
 mod native;
 #[path = "support/setup_release.rs"]
@@ -35,10 +37,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ed25519_dalek::SigningKey;
 use native::Installation;
-use package::ANCHOR_FILE_NAME;
+use package::{IndexChannel, ANCHOR_FILE_NAME, INDEX_CHANNEL_FILE_NAME};
 
 use pohunek_cli::host_setup::{
-    apply, plan, plan_selecting, HookSelection, ReleasePlanner, ServiceStep, SetupReport,
+    apply, plan, plan_selecting, plan_with, AssistantIndex, AssistantStep, HookSelection,
+    ReleasePlanner, ServiceStep, SetupOptions, SetupReport,
 };
 use pohunek_cli::service::context::PathDiscovery;
 use pohunek_cli::service::layout::VerifiedVersionDir;
@@ -49,7 +52,7 @@ use pohunek_cli::service::{self, Context, VERSION};
 #[cfg(target_os = "linux")]
 use pohunek_platform::supervisor::UnitEnvironment;
 use pohunek_service_config::runtimes::{EnsureReport, PackageStatus};
-use pohunek_test_support::catalog::test_key;
+use pohunek_test_support::catalog::{key_id, test_key};
 use pohunek_test_support::fs::copy_shell_image;
 use pohunek_test_support::workspace_root;
 use protocol::{method, SessionId, SessionNewParams};
@@ -1235,11 +1238,24 @@ fn supported_banner(runtime: &str) -> String {
 /// Stages the release the scenario installs from as an extracted daemon
 /// archive: this build's binaries, the throwaway trust anchor beside the
 /// daemon and the signed `runtime/`, sealed with the archive's verifier and
-/// `MANIFEST`, so setup verifies it before it runs anything from it.
-fn stage_release(installation: &Installation, key: &SigningKey, runtimes: &[&str]) -> PathBuf {
+/// `MANIFEST`, so setup verifies it before it runs anything from it. The
+/// plugin index channel file, from which the installed daemon reads plugin
+/// indexes endorsed by the anchor's key, is staged only when `channel` is set.
+fn stage_release(
+    installation: &Installation,
+    key: &SigningKey,
+    runtimes: &[&str],
+    channel: bool,
+) -> PathBuf {
     let release = installation.root.join("archive");
     setup_release::stage_binaries(&release);
     setup_release::sign_runtimes(&release, key, runtimes);
+    if channel {
+        let bytes = IndexChannel::new(key_id(key))
+            .to_bytes()
+            .expect("encode the index channel");
+        fs::write(release.join(INDEX_CHANNEL_FILE_NAME), bytes).expect("write the index channel");
+    }
     setup_release::seal(&release);
     release
 }
@@ -1391,6 +1407,8 @@ struct FreshHost {
     log: PathBuf,
     release: PathBuf,
     planner: DaemonRuntimes,
+    /// The endorser root the release's anchor and index channel name.
+    endorser: SigningKey,
 }
 
 impl FreshHost {
@@ -1403,6 +1421,12 @@ impl FreshHost {
     /// The same host, with a release whose catalog lists only the packages of
     /// `runtimes`.
     fn with_runtimes(runtimes: &[&str]) -> Self {
+        Self::with_release(runtimes, true)
+    }
+
+    /// The same host, whose release carries the plugin index channel file
+    /// only when `channel` is set.
+    fn with_release(runtimes: &[&str], channel: bool) -> Self {
         let mut installation = Installation::new();
         let root = canonical(&installation.root);
         let home = root.join("home");
@@ -1413,7 +1437,8 @@ impl FreshHost {
         system_tools(&tools);
         let interpreters = root.join("interpreters");
         directory(&interpreters, PRIVATE_DIR);
-        let release = stage_release(&installation, &test_key(), runtimes);
+        let endorser = test_key();
+        let release = stage_release(&installation, &endorser, runtimes, channel);
         installation.context =
             installation
                 .context
@@ -1431,6 +1456,7 @@ impl FreshHost {
             interpreters,
             release,
             planner: DaemonRuntimes::default(),
+            endorser,
         };
         host.add_agent(
             "claude",
@@ -1935,4 +1961,516 @@ fn a_snapshot_mismatch_message_stays_small() {
         "a mismatch prints {} bytes for two 4 MiB files",
         message.len()
     );
+}
+
+/// The assistant package a scenario publishes: a signed schema 2 index and
+/// the archive it lists, on a loopback server.
+struct AssistantRig {
+    server: assistant_index::Server,
+    keys: assistant_index::Keys,
+    archive: assistant_index::Archive,
+}
+
+impl AssistantRig {
+    /// A rig whose index is endorsed by the host's release root and lists the
+    /// archive for `this core`.
+    fn publish(host: &FreshHost) -> Self {
+        let rig = Self {
+            server: assistant_index::Server::start(),
+            keys: assistant_index::Keys::with_root(host.endorser.clone()),
+            archive: assistant_index::assistant_archive(
+                assistant_index::ASSISTANT_VERSION,
+                "listed",
+            ),
+        };
+        rig.serve(&rig.archive);
+        rig
+    }
+
+    /// Serves `archive` at the listed URL and an index that lists `listed`.
+    fn serve_listing(&self, listed: &assistant_index::Archive, served: &assistant_index::Archive) {
+        let url = self.server.url(&assistant_index::archive_path(
+            assistant_index::ASSISTANT_VERSION,
+        ));
+        let entry =
+            assistant_index::assistant_entry(listed, assistant_index::ASSISTANT_VERSION, url);
+        self.server
+            .set(assistant_index::INDEX_PATH, self.keys.signed(vec![entry]));
+        self.server.set(
+            &assistant_index::archive_path(assistant_index::ASSISTANT_VERSION),
+            served.bytes.clone(),
+        );
+    }
+
+    /// Serves an index that lists only `version` of the package.
+    fn serve_version(&self, version: &str) -> assistant_index::Archive {
+        let archive = assistant_index::assistant_archive(version, version);
+        let path = assistant_index::archive_path(version);
+        let entry = assistant_index::assistant_entry(&archive, version, self.server.url(&path));
+        self.server
+            .set(assistant_index::INDEX_PATH, self.keys.signed(vec![entry]));
+        self.server.set(&path, archive.bytes.clone());
+        archive
+    }
+
+    fn serve(&self, archive: &assistant_index::Archive) {
+        self.serve_listing(archive, archive);
+    }
+
+    fn options(&self) -> SetupOptions {
+        SetupOptions::new(HookSelection::All).with_assistant(AssistantIndex::Url(
+            self.server.url(assistant_index::INDEX_PATH),
+        ))
+    }
+
+    /// Requests the server answered for the archive.
+    fn archive_requests(&self) -> usize {
+        self.server
+            .requests()
+            .iter()
+            .filter(|path| path.ends_with(".tar.zst"))
+            .count()
+    }
+}
+
+impl FreshHost {
+    async fn plan_assistant(&self, options: &SetupOptions) -> pohunek_cli::host_setup::HostPlan {
+        plan_with(
+            &self.installation.context,
+            &self.release,
+            &self.planner,
+            options,
+        )
+        .await
+        .expect("plan the run")
+    }
+
+    /// The assistant packages the daemon lists, as `(id, digest, selected)`.
+    async fn assistant_packages(&self) -> Vec<(String, String, bool)> {
+        let mut client = self.installation.client().await;
+        client
+            .call::<method::PackageList>(())
+            .await
+            .expect("list packages")
+            .packages
+            .into_iter()
+            .filter(|info| info.package.id.as_str() == assistant_index::ASSISTANT_PACKAGE)
+            .map(|info| {
+                (
+                    info.package.id.to_string(),
+                    info.digest.as_str().to_owned(),
+                    info.selected && info.enabled,
+                )
+            })
+            .collect()
+    }
+
+    /// `pohunek assistant help --print-prompt --json` against this host's
+    /// daemon, as a fresh process with this installation's directories.
+    fn print_assistant_prompt(&self) -> std::process::Output {
+        let root = &self.installation.root;
+        std::process::Command::new(pohunek_test_support::bin_exe("pohunek"))
+            .args([
+                "assistant",
+                "help",
+                "--print-prompt",
+                "--json",
+                "--no-start-daemon",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("HOME", root.join("home"))
+            .output()
+            .expect("run pohunek assistant")
+    }
+}
+
+/// A fresh host installs the assistant package the signed index lists under
+/// the consent that installs the rest, a dry run previews it and installs
+/// nothing, and a rerun finds it installed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_fresh_host_installs_the_assistant_package() {
+    let host = FreshHost::new();
+    let rig = AssistantRig::publish(&host);
+
+    let before = state_of(&host.roots());
+    let dry_run = host.plan_assistant(&rig.options()).await.preview;
+    let digest = rig.archive.digest.as_str();
+    assert_eq!(
+        dry_run.assistant,
+        Some(AssistantStep::Install {
+            package_id: assistant_index::ASSISTANT_PACKAGE.to_owned(),
+            version: assistant_index::ASSISTANT_VERSION.to_owned(),
+            digest: digest.to_owned(),
+            replaces: None,
+        }),
+        "the dry run lists the package and its digest"
+    );
+    let shown = serde_json::to_value(&dry_run).expect("the preview serializes");
+    assert_eq!(shown["assistant"]["status"], "install", "{shown}");
+    assert_eq!(
+        shown["assistant"]["package_id"],
+        assistant_index::ASSISTANT_PACKAGE
+    );
+    assert_eq!(shown["assistant"]["digest"], digest);
+    assert_eq!(state_of(&host.roots()), before, "a dry run changes no file");
+    assert_eq!(rig.archive_requests(), 0, "a dry run downloads no archive");
+
+    let planned = host.plan_assistant(&rig.options()).await;
+    let outcome = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the run applies");
+    assert_eq!(outcome.verdict.assistant_gap, None);
+    assert!(
+        outcome
+            .applied
+            .iter()
+            .any(|line| line.starts_with("package pohunek.context.assistant@")),
+        "{:?}",
+        outcome.applied
+    );
+    assert_eq!(
+        host.assistant_packages().await,
+        [(
+            assistant_index::ASSISTANT_PACKAGE.to_owned(),
+            digest.to_owned(),
+            true
+        )]
+    );
+    let printed = host.print_assistant_prompt();
+    assert!(
+        printed.status.success(),
+        "assistant help --print-prompt: {} {}",
+        String::from_utf8_lossy(&printed.stdout),
+        String::from_utf8_lossy(&printed.stderr)
+    );
+
+    let rerun = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(rerun.preview.assistant, Some(AssistantStep::Present { .. })),
+        "{:?}",
+        rerun.preview.assistant
+    );
+    let rerun = apply(&host.installation.context, rerun, &host.planner)
+        .await
+        .expect("the rerun applies");
+    assert!(
+        !rerun.applied.iter().any(|line| line.contains("assistant")),
+        "a rerun installs nothing: {:?}",
+        rerun.applied
+    );
+
+    a_damaged_package_is_repaired_and_a_disabled_one_is_kept(&host, &rig).await;
+}
+
+/// A package whose root is gone is installed again, and an owner's disable is
+/// not undone by setup.
+async fn a_damaged_package_is_repaired_and_a_disabled_one_is_kept(
+    host: &FreshHost,
+    rig: &AssistantRig,
+) {
+    let digest = rig.archive.digest.as_str();
+    // A package whose root is gone is installed again: the daemon restores
+    // the root of the same digest.
+    let root = host
+        .installation
+        .context
+        .paths()
+        .plugins_dir()
+        .join("packages")
+        .join(digest.strip_prefix("sha256:").expect("digest prefix"));
+    fs::remove_dir_all(&root).expect("remove the installed root");
+    let damaged = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            damaged.preview.assistant,
+            Some(AssistantStep::Install { .. })
+        ),
+        "{:?}",
+        damaged.preview.assistant
+    );
+    let repaired = apply(&host.installation.context, damaged, &host.planner)
+        .await
+        .expect("setup repairs the package");
+    assert_eq!(repaired.verdict.assistant_gap, None);
+    assert!(root.exists(), "the root is restored");
+
+    // An owner's disable is not undone by setup: the package is a gap that
+    // names the command, and the daemon keeps it disabled.
+    let mut client = host.installation.client().await;
+    client
+        .call::<method::PackageSetEnabled>(protocol::PackageSetEnabledParams {
+            digest: rig.archive.digest.clone(),
+            enabled: false,
+        })
+        .await
+        .expect("disable the package");
+    let disabled = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &disabled.preview.assistant,
+            Some(AssistantStep::Gap { command, .. }) if command.contains("pohunek plugin enable")
+        ),
+        "{:?}",
+        disabled.preview.assistant
+    );
+    let error = apply(&host.installation.context, disabled, &host.planner)
+        .await
+        .expect_err("a disabled package ends the run incomplete");
+    assert_eq!(error.code(), "setup_incomplete");
+    assert!(!host.assistant_packages().await[0].2, "still disabled");
+}
+
+/// Makes a rig's index unusable in one way.
+type IndexBreaker = fn(&AssistantRig);
+
+/// A host the signed index cannot serve gets every other step, then
+/// `setup_incomplete` with the manual command, and no package.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn an_index_that_cannot_serve_the_package_is_a_gap() {
+    let cases: [(&str, IndexBreaker); 3] = [
+        ("unreachable", |rig| {
+            rig.server.remove(assistant_index::INDEX_PATH);
+        }),
+        ("not listed", |rig| {
+            rig.server
+                .set(assistant_index::INDEX_PATH, rig.keys.signed(Vec::new()));
+        }),
+        ("expired", |rig| {
+            let url = rig.server.url(&assistant_index::archive_path(
+                assistant_index::ASSISTANT_VERSION,
+            ));
+            let entry = assistant_index::assistant_entry(
+                &rig.archive,
+                assistant_index::ASSISTANT_VERSION,
+                url,
+            );
+            rig.server.set(
+                assistant_index::INDEX_PATH,
+                rig.keys.signed_ago(30 * 24 * 60 * 60, vec![entry]),
+            );
+        }),
+    ];
+    for (name, break_index) in cases {
+        let host = FreshHost::new();
+        let rig = AssistantRig::publish(&host);
+        break_index(&rig);
+        let planned = host.plan_assistant(&rig.options()).await;
+        assert!(
+            matches!(planned.preview.assistant, Some(AssistantStep::Gap { .. })),
+            "{name}: {:?}",
+            planned.preview.assistant
+        );
+        let error = apply(&host.installation.context, planned, &host.planner)
+            .await
+            .expect_err("a gap ends the run incomplete");
+        assert_eq!(error.code(), "setup_incomplete", "{name}");
+        let text = error.to_string();
+        assert!(
+            text.contains("pohunek plugin install ./assistant.tar.zst --sha256"),
+            "{name}: the manual command is named: {text}"
+        );
+        assert!(host.assistant_packages().await.is_empty(), "{name}");
+        assert_eq!(rig.archive_requests(), 0, "{name}: no archive is fetched");
+        assert!(
+            host.installation.context.paths().plugins_dir().exists(),
+            "{name}: the other steps ran"
+        );
+    }
+}
+
+/// The daemon refuses a document its anchor does not endorse, and an archive
+/// that is not the one the owner saw never reaches it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_document_or_archive_that_does_not_verify_installs_nothing() {
+    // A document endorsed by a root the release's anchor does not name.
+    let host = FreshHost::new();
+    let rig = AssistantRig::publish(&host);
+    let foreign = assistant_index::Keys::with_root(test_key());
+    let url = rig.server.url(&assistant_index::archive_path(
+        assistant_index::ASSISTANT_VERSION,
+    ));
+    let entry =
+        assistant_index::assistant_entry(&rig.archive, assistant_index::ASSISTANT_VERSION, url);
+    rig.server
+        .set(assistant_index::INDEX_PATH, foreign.signed(vec![entry]));
+    let planned = host.plan_assistant(&rig.options()).await;
+    let error = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect_err("the daemon refuses the document");
+    assert_eq!(error.code(), "setup_incomplete");
+    assert!(host.assistant_packages().await.is_empty());
+
+    // The archive served at apply differs from the one the preview listed:
+    // the index at apply lists another digest.
+    let host = FreshHost::new();
+    let rig = AssistantRig::publish(&host);
+    let planned = host.plan_assistant(&rig.options()).await;
+    let other = assistant_index::assistant_archive(assistant_index::ASSISTANT_VERSION, "swapped");
+    rig.serve(&other);
+    let error = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect_err("a digest that differs from the preview is refused");
+    assert_eq!(error.code(), "setup_incomplete");
+    assert!(error.to_string().contains("not the previewed"), "{error}");
+    assert!(host.assistant_packages().await.is_empty());
+}
+
+/// A release without the plugin index channel file cannot take an index
+/// install: the package is a gap and no archive is fetched.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_daemon_without_the_index_channel_leaves_the_package_a_gap() {
+    let host = FreshHost::with_release(&setup_release::RELEASE_RUNTIMES, false);
+    let rig = AssistantRig::publish(&host);
+    let planned = host.plan_assistant(&rig.options()).await;
+    let error = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect_err("the gap ends the run incomplete");
+    assert_eq!(error.code(), "setup_incomplete");
+    assert!(host.assistant_packages().await.is_empty());
+    assert_eq!(rig.archive_requests(), 0);
+}
+
+/// A selected version that is older than the listed one is replaced, and the
+/// preview says so; a selected version that is not older is kept as a gap.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_selected_assistant_version_is_replaced_only_when_it_is_older_or_does_not_serve() {
+    let host = FreshHost::new();
+    let rig = AssistantRig::publish(&host);
+    let planned = host.plan_assistant(&rig.options()).await;
+    apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the first run installs the package");
+
+    let newer = rig.serve_version("0.42.1");
+    let planned = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &planned.preview.assistant,
+            Some(AssistantStep::Install { replaces: Some(current), .. })
+                if current == assistant_index::ASSISTANT_VERSION
+        ),
+        "{:?}",
+        planned.preview.assistant
+    );
+    apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the newer listing replaces the selection");
+    let installed = host.assistant_packages().await;
+    assert!(
+        installed
+            .iter()
+            .any(|(_, digest, selected)| digest == newer.digest.as_str() && *selected),
+        "{installed:?}"
+    );
+
+    // A serving selection that is not older than the listing stays, and the
+    // run completes: nothing is left for the owner to do.
+    let older = rig.serve_version("0.41.9");
+    let kept = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &kept.preview.assistant,
+            Some(AssistantStep::Present { version, digest, .. })
+                if version == "0.42.1" && digest == newer.digest.as_str()
+        ),
+        "{:?}",
+        kept.preview.assistant
+    );
+    let outcome = apply(&host.installation.context, kept, &host.planner)
+        .await
+        .expect("a kept serving selection completes the run");
+    assert_eq!(outcome.verdict.assistant_gap, None);
+    assert!(
+        host.assistant_packages()
+            .await
+            .iter()
+            .any(|(_, digest, selected)| digest == newer.digest.as_str() && *selected),
+        "the newer version stays selected"
+    );
+
+    // A selection that no longer serves is replaced by the listed version.
+    let mut client = host.installation.client().await;
+    client
+        .call::<method::PackageSetEnabled>(protocol::PackageSetEnabledParams {
+            digest: newer.digest.clone(),
+            enabled: false,
+        })
+        .await
+        .expect("disable the selected version");
+    let replaced = host.plan_assistant(&rig.options()).await;
+    assert!(
+        matches!(
+            &replaced.preview.assistant,
+            Some(AssistantStep::Install { digest, replaces: Some(current), .. })
+                if digest == older.digest.as_str() && current == "0.42.1"
+        ),
+        "{:?}",
+        replaced.preview.assistant
+    );
+    apply(&host.installation.context, replaced, &host.planner)
+        .await
+        .expect("the listed version replaces the version that does not serve");
+    assert!(
+        host.assistant_packages()
+            .await
+            .iter()
+            .any(|(_, digest, selected)| digest == older.digest.as_str() && *selected),
+        "the listed version serves"
+    );
+}
+
+/// The hook selection does not change the assistant step: with `--hooks none`
+/// the package is still installed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn the_assistant_step_does_not_depend_on_the_hook_selection() {
+    let host = FreshHost::new();
+    let rig = AssistantRig::publish(&host);
+    let options = SetupOptions::new(HookSelection::None).with_assistant(AssistantIndex::Url(
+        rig.server.url(assistant_index::INDEX_PATH),
+    ));
+    let planned = host.plan_assistant(&options).await;
+    assert!(
+        matches!(
+            planned.preview.assistant,
+            Some(AssistantStep::Install { .. })
+        ),
+        "{:?}",
+        planned.preview.assistant
+    );
+    let outcome = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the run applies");
+    assert_eq!(outcome.verdict.assistant_gap, None);
+    assert!(outcome.hooks.is_empty(), "{:?}", outcome.hooks);
+    assert_eq!(host.assistant_packages().await.len(), 1);
 }

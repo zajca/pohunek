@@ -443,9 +443,13 @@ hermes`. The new version is selected and the old one stays installed for
 ## Install the assistant package
 
 `pohunek assistant` reads its knowledge bundle from the context package
-`pohunek.context.assistant`; the daemon binaries carry no copy. Install the
-package once per host that runs assistant sessions (a remote assistant reads the
-package installed on that remote host). The package is published as a release
+`pohunek.context.assistant`; the daemon binaries carry no copy. `pohunek setup`
+installs the package that matches the release from the signed plugin index, so
+a host set up with 0.42.0 or later has it (`pohunek setup --dry-run --json`
+shows the package and its digest in `assistant`). When the package is a gap in a
+setup run (the index is unreachable or does not list it yet, or the daemon
+refuses it), install it by hand once per host that runs assistant sessions (a
+remote assistant reads the package installed on that remote host). The package is published as a release
 asset of [`pohunekd/plugin-assistant`](https://github.com/pohunekd/plugin-assistant)
 and the pohunek release notes carry its SHA-256 digest; a context package
 installs by digest, never through the catalog. Each pohunek release publishes

@@ -108,7 +108,14 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Option<u64>> {
     entries
 }
 
+/// Plugin index URL the runs read the assistant package from: loopback port 0
+/// is no destination, so the connect fails at once on every OS and no run
+/// reaches the network.
+const UNREACHABLE_INDEX: &str = "http://127.0.0.1:0/official-index-v2.json";
+
 /// Runs `pohunek` with `arguments` from `binary`, with no terminal on stdin.
+/// A `setup` run without a subcommand reads the plugin index at
+/// [`UNREACHABLE_INDEX`] unless the arguments name another.
 ///
 /// On Linux the run reaches this user's systemd user manager over the session
 /// bus, as a login session does: a fresh host's plan reads the `PATH` the
@@ -118,8 +125,15 @@ fn run_setup(env: &TestEnv, binary: &Path, arguments: &[&str]) -> Output {
     if let Some(address) = session_bus_address() {
         command.env(SESSION_BUS_VARIABLE, address);
     }
+    let bare_setup = arguments.first() == Some(&"setup")
+        && !arguments.contains(&"config")
+        && !arguments.contains(&"completions")
+        && !arguments.contains(&"--index-url");
+    command.args(arguments);
+    if bare_setup {
+        command.args(["--index-url", UNREACHABLE_INDEX]);
+    }
     command
-        .args(arguments)
         .stdin(Stdio::null())
         .output()
         .expect("spawn pohunek")
@@ -753,6 +767,16 @@ fn a_dry_run_on_a_fresh_host_prints_the_preview_and_changes_nothing() {
     let preview = &document["ok"];
     assert_eq!(preview["service"]["action"], "install", "{preview}");
     assert!(preview["packages"].is_array(), "{preview}");
+    assert_eq!(
+        preview["assistant"]["status"], "gap",
+        "an index that cannot be read leaves the assistant package a gap: {preview}"
+    );
+    assert!(
+        preview["assistant"]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("pohunek plugin install ./assistant.tar.zst")),
+        "{preview}"
+    );
     assert!(
         preview.get("applied").is_none(),
         "a dry run applies nothing: {preview}"
@@ -781,6 +805,16 @@ fn a_dry_run_with_yes_or_a_subcommand_is_a_usage_error() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("--dry-run"), "{arguments:?}: {stderr}");
     }
+    let output = run_setup(
+        &env,
+        &binary,
+        &["setup", "config", "--index-url", UNREACHABLE_INDEX],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--index-url"),
+        "a setup subcommand refuses --index-url"
+    );
     assert_eq!(
         tree(env.root()),
         before,

@@ -32,7 +32,7 @@ adds one (`plugin-directories`).
 
 | Tier | Repository | Package id | Created by |
 |---|---|---|---|
-| Official | `pohunekd/plugin-<name>` | `pohunek.runtime.<runtime_id>` | The owner, from `pohunekd/pohunek-plugin-template` |
+| Official | `pohunekd/plugin-<name>` | `pohunek.runtime.<runtime_id>`, or `pohunek.context.<name>` for a context package (index schema 2) | The owner, from `pohunekd/pohunek-plugin-template` |
 | Third party | `<owner>/pohunek-plugin-<name>` in the author's account | Outside `pohunek.*`, for example `<owner>.runtime.<id>` | The author, from the template |
 
 Only the owner creates `pohunekd/*` repositories. An agent proposes one in an

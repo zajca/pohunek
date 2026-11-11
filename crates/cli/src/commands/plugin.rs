@@ -479,6 +479,11 @@ pub(crate) enum Error {
     #[error("the daemon does not support installs through a plugin index")]
     IndexUnsupported,
 
+    /// The daemon authorizes runtime packages through a plugin index but not
+    /// context packages (index schema 2).
+    #[error("the daemon does not support installing context packages through a plugin index")]
+    IndexContextUnsupported,
+
     /// The fetched index document is not a valid plugin index.
     #[error("the plugin index document is invalid: {detail}")]
     IndexInvalid {
@@ -641,6 +646,7 @@ impl Error {
             Self::IndexUnavailable { .. } => "plugin_index_unavailable",
             Self::ArchiveUnavailable { .. } => "plugin_archive_unavailable",
             Self::IndexUnsupported => "plugin_index_unsupported",
+            Self::IndexContextUnsupported => "plugin_index_context_unsupported",
             Self::IndexInvalid { .. } => "plugin_index_invalid",
             Self::IndexExpired => "plugin_index_expired",
             Self::IndexPackageNotFound { .. } => "plugin_index_package_not_found",
@@ -693,6 +699,9 @@ impl Error {
             }
             Self::IndexUnsupported => {
                 "the daemon is older than 0.40 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog"
+            }
+            Self::IndexContextUnsupported => {
+                "the daemon predates context packages in the plugin index (0.42); upgrade the daemon or install the context package from its archive with --sha256"
             }
             Self::IndexInvalid { .. } => {
                 "the index is malformed; retry later or report it to the index maintainers"
@@ -966,6 +975,13 @@ async fn run_install_by_id(
     let request = PackageRef::parse(source_text)?;
     let mut client = connect_ingest().await?;
     require_index_support(&mut client).await?;
+    if request
+        .id
+        .as_str()
+        .starts_with(package::OFFICIAL_CONTEXT_PACKAGE_PREFIX)
+    {
+        require_index_context_support(&mut client).await?;
+    }
     let staged = plugin_index::stage(&request, args.index_url.as_deref()).await?;
     let source = Source::Archive {
         path: staged.archive_path.clone(),
@@ -1022,6 +1038,22 @@ async fn require_index_support(client: &mut Client) -> Result<(), CliError> {
         Ok(())
     } else {
         Err(Error::IndexUnsupported.into())
+    }
+}
+
+/// Refuse before any fetch when the daemon cannot authorize a context package
+/// through the index.
+async fn require_index_context_support(client: &mut Client) -> Result<(), CliError> {
+    if client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_install_index_context_supported
+    {
+        Ok(())
+    } else {
+        Err(Error::IndexContextUnsupported.into())
     }
 }
 

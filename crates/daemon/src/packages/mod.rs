@@ -114,6 +114,9 @@ struct CommandsPrepared {
     commands: Vec<CommandInfo>,
     identity: PackageIdentity,
     source: RecordSource,
+    /// The plugin index that authorized the package, recorded before the
+    /// install; only a context package authorized by the index has one.
+    index: Option<VerifiedIndex>,
 }
 
 /// An archive that passed every check an install makes before it writes, by
@@ -122,7 +125,7 @@ enum Candidate {
     /// A runtime package, with or without commands.
     Runtime(Box<Prepared>),
     /// A package that exports commands only.
-    Commands(CommandsPrepared),
+    Commands(Box<CommandsPrepared>),
 }
 
 /// What a caller asked an install to do.
@@ -1051,7 +1054,7 @@ fn prepare_archive(
             let index_state = registry
                 .index_state()
                 .map_err(|error| registry_kind(&error))?;
-            let prepared = prepare_indexed(
+            let candidate = prepare_indexed(
                 &IndexTrustInputs {
                     anchor,
                     endorser,
@@ -1061,11 +1064,15 @@ fn prepare_archive(
                 path,
                 index_path,
             )?;
-            if revocation::revoked_set(context)?.contains(&prepared.digest) {
+            let digest = match &candidate {
+                Candidate::Runtime(prepared) => &prepared.digest,
+                Candidate::Commands(prepared) => &prepared.digest,
+            };
+            if revocation::revoked_set(context)?.contains(digest) {
                 warn!("a package archive was refused: a recorded catalog revoked its digest");
                 return Err(PackageErrorKind::Revoked);
             }
-            Ok(Candidate::Runtime(Box::new(prepared)))
+            Ok(candidate)
         }
     }
 }
@@ -1080,13 +1087,14 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, Packag
     let Some(definition) = definition else {
         // The archive was read against `pinned`, so the exact-digest trust is
         // already satisfied; there is no runtime id to check.
-        return Ok(Candidate::Commands(CommandsPrepared {
+        return Ok(Candidate::Commands(Box::new(CommandsPrepared {
             bytes,
             digest,
             commands,
             identity,
             source: RecordSource::ExplicitDigest,
-        }));
+            index: None,
+        })));
     };
     LocalTrust::ExplicitDigest(pinned.clone())
         .authorize(definition.runtime_id(), &digest)
@@ -1183,14 +1191,16 @@ struct IndexTrustInputs<'a> {
 ///
 /// The verified index must list the raw archive digest before the archive is
 /// decoded; the identity the decoded descriptor declares must then match the
-/// listed entry. A package that exports commands, alone or beside a runtime,
-/// is refused: the index install paths have no consent step that shows a
-/// command.
+/// listed entry, and the descriptor must be of the entry's kind: a runtime
+/// package for a `runtime` entry, a context package (no runtime, no commands)
+/// for a `context` entry. A package that exports commands, alone or beside a
+/// runtime, is refused: the index install paths have no consent step that
+/// shows a command.
 fn prepare_indexed(
     inputs: &IndexTrustInputs<'_>,
     path: &str,
     index_path: &str,
-) -> Result<Prepared, PackageErrorKind> {
+) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = read_archive_file(path, &limits)?;
     let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
@@ -1213,10 +1223,29 @@ fn prepare_indexed(
     let identity = descriptor.identity().clone();
     let (definition, commands) = descriptor.into_parts();
     let Some(definition) = definition else {
-        warn!(
-            "a package that exports commands only was refused: an index entry binds a runtime id"
-        );
-        return Err(PackageErrorKind::Untrusted);
+        if !commands.is_empty() {
+            warn!(
+                "a package that exports commands only was refused: no index entry kind authorizes it"
+            );
+            return Err(PackageErrorKind::Untrusted);
+        }
+        // No runtime and no commands: the descriptor exports a context
+        // directory, so only a `context` entry can authorize it.
+        trust::authorize_indexed_context(
+            &verified,
+            &identity,
+            &digest,
+            &trust::core_version()?,
+            &trust::host_platform()?,
+        )?;
+        return Ok(Candidate::Commands(Box::new(CommandsPrepared {
+            bytes,
+            digest,
+            commands,
+            identity,
+            source: RecordSource::Official,
+            index: Some(verified),
+        })));
     };
     if !commands.is_empty() {
         warn!("an indexed package that declares commands was refused: no consent step shows them");
@@ -1230,7 +1259,7 @@ fn prepare_indexed(
         &trust::core_version()?,
         &trust::host_platform()?,
     )?;
-    Ok(Prepared {
+    Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
         definition,
@@ -1240,7 +1269,7 @@ fn prepare_indexed(
         source: RecordSource::Official,
         catalog: None,
         index: Some(verified),
-    })
+    })))
 }
 
 /// Reads archive `bytes` whose digest `authorized` a trust source already
@@ -1281,13 +1310,14 @@ fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
     let identity = descriptor.identity().clone();
     let (definition, commands) = descriptor.into_parts();
     let Some(definition) = definition else {
-        return Ok(Candidate::Commands(CommandsPrepared {
+        return Ok(Candidate::Commands(Box::new(CommandsPrepared {
             bytes,
             digest,
             commands,
             identity,
             source: RecordSource::Link,
-        }));
+            index: None,
+        })));
     };
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
@@ -1338,7 +1368,7 @@ fn commit_candidate(
                 identity: prepared.identity,
                 source: prepared.source,
                 catalog: None,
-                index: None,
+                index: prepared.index,
                 integration: Integration::Known(None),
                 runtime: None,
                 commands: prepared.commands,

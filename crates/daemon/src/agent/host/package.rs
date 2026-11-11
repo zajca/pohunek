@@ -1081,8 +1081,8 @@ impl PackageSource {
     ///
     /// [`ContextError::NotInstalled`] without a selected package of that id,
     /// [`ContextError::Disabled`] when it is disabled, and
-    /// [`ContextError::Rejected`] when its root, descriptor or context export
-    /// is unusable.
+    /// [`ContextError::Rejected`] when its digest is revoked or its root,
+    /// descriptor or context export is unusable.
     pub fn context_dir(&self, id: &protocol::PackageId) -> Result<ContextDir, ContextError> {
         let state = self
             .store
@@ -1108,6 +1108,9 @@ impl PackageSource {
         if !record.enabled() {
             return Err(ContextError::Disabled);
         }
+        self.store
+            .ensure_not_revoked(record)
+            .map_err(ContextError::Rejected)?;
         let dir = self
             .store
             .context_dir(record.digest(), record.identity())
@@ -1126,8 +1129,8 @@ impl PackageSource {
     ///
     /// [`ContextError::NotInstalled`] without a package of that id at `digest`,
     /// [`ContextError::Disabled`] when it is disabled, and
-    /// [`ContextError::Rejected`] when its root, descriptor or context export
-    /// is unusable.
+    /// [`ContextError::Rejected`] when its digest is revoked or its root,
+    /// descriptor or context export is unusable.
     pub fn context_dir_at(
         &self,
         id: &protocol::PackageId,
@@ -1144,6 +1147,9 @@ impl PackageSource {
         if !record.enabled() {
             return Err(ContextError::Disabled);
         }
+        self.store
+            .ensure_not_revoked(record)
+            .map_err(ContextError::Rejected)?;
         let dir = self
             .store
             .context_dir(record.digest(), record.identity())

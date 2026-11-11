@@ -228,8 +228,10 @@ pub struct Gap {
     pub code: String,
     /// Operator-facing detail with the one next step.
     pub detail: String,
-    /// The host profile whose config home the gap is about; absent for a gap
-    /// about the runtime itself or its default home.
+    /// The host profile the gap is about: either its config home, or its
+    /// resolution against the package it names (then `code` is the profile
+    /// resolver's error code). Absent for a gap about the runtime itself or
+    /// its default home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 }

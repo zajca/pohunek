@@ -134,6 +134,12 @@ pub(crate) fn context_error(error: &ContextError) -> ProtocolError {
             "the package lookup failed".to_owned(),
             "retry the launch; if it repeats, inspect the daemon log".to_owned(),
         ),
+        ContextError::Rejected(PackageRejection::Revoked) => (
+            PackageRejection::Revoked.to_string(),
+            format!(
+                "the publisher revoked this version; run `pohunek setup` (or `pohunek plugin install {ASSISTANT_CONTEXT_PACKAGE_ID}`) to install the version the signed index lists now, and do not reinstall the revoked archive"
+            ),
+        ),
         ContextError::Rejected(rejection) => (
             rejection.to_string(),
             "run `pohunek plugin doctor` for the package, then reinstall it (`plugin uninstall --remove-modified`, then `plugin install ... --sha256 <digest>`)".to_owned(),
