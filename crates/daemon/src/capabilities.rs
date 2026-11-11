@@ -49,7 +49,7 @@ impl ProbeClock {
         Self(Arc::new(now))
     }
 
-    fn now(&self) -> Instant {
+    pub(crate) fn now(&self) -> Instant {
         (self.0)()
     }
 }

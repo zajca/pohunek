@@ -1498,7 +1498,7 @@ struct ProbeLedger {
     deadline: Instant,
     /// The budget the deadline was computed from, for the messages that name it.
     budget: Duration,
-    /// The clock the deadline and each probe's own deadline are read from.
+    /// The clock the budget deadline and each probe's own deadline are read from.
     clock: ProbeClock,
     outcomes: RefCell<HashMap<ProbeKey, ProbeOutcome>>,
 }
@@ -1528,7 +1528,7 @@ impl ProbeLedger {
 
     /// The time left before the probe deadline, as of now.
     fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
+        self.deadline.saturating_duration_since(self.clock.now())
     }
 }
 
