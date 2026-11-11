@@ -64,6 +64,19 @@ impl SessionRegistry {
         }
     }
 
+    /// Runs `observe` at each step of the trusted-checkout predicate's read of
+    /// the declared paths (right before a path is opened, and before a file's
+    /// bytes are read) with the absolute path concerned, for an embedder or a
+    /// test that must change the checkout at an exact point of the read.
+    pub fn set_checkout_read_observer<F>(&self, observe: F)
+    where
+        F: Fn(crate::checkout_trust::CheckoutReadStep, &Path) + Send + Sync + 'static,
+    {
+        if let Ok(mut slot) = self.inner.checkout_read_observer.lock() {
+            *slot = Some(crate::checkout_trust::ReadObserver::new(observe));
+        }
+    }
+
     /// The runtime's `trusted_checkout_args` for a relaunch of `binding`: the
     /// arguments when the relaunch directory is the directory the session was
     /// created in and that checkout is trusted, else empty.
@@ -143,6 +156,12 @@ impl SessionRegistry {
             .lock()
             .ok()
             .and_then(|resolver| resolver.clone());
+        let read_observer = self
+            .inner
+            .checkout_read_observer
+            .lock()
+            .ok()
+            .and_then(|observer| observer.clone());
         let (cwd, project_id, paths) = (
             cwd.to_path_buf(),
             project_id.to_owned(),
@@ -167,6 +186,7 @@ impl SessionRegistry {
                 paths: &paths,
                 scratch_root: &scratch_root,
                 remote_source: remote_source.as_ref(),
+                read_observer: read_observer.as_ref(),
             })
         })
         .await

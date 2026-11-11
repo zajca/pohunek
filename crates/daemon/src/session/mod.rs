@@ -837,6 +837,9 @@ struct SessionRegistryInner {
     /// Replacement for the GitHub URL the trusted-checkout predicate fetches a
     /// remote `HEAD` from; `None` fetches from GitHub over https.
     checkout_remote_source: std::sync::Mutex<Option<crate::checkout_trust::RemoteSourceResolver>>,
+    /// Observer of the trusted-checkout predicate's read of the declared paths;
+    /// `None` observes nothing.
+    checkout_read_observer: std::sync::Mutex<Option<crate::checkout_trust::ReadObserver>>,
     /// Cancellation signal for the event-log drain, fired by
     /// [`SessionRegistry::shutdown_event_log`] so the drain flushes its backlog
     /// and exits cleanly at shutdown.
@@ -2650,6 +2653,7 @@ impl SessionRegistry {
                 worktree,
                 projects,
                 checkout_remote_source: std::sync::Mutex::new(None),
+                checkout_read_observer: std::sync::Mutex::new(None),
                 event_log_shutdown: CancellationToken::new(),
                 event_log_task: std::sync::Mutex::new(None),
                 agent_state_hook_shutdown: CancellationToken::new(),
