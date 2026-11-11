@@ -7,7 +7,7 @@
       "active_agent_pid": 42425,
       "active_agent_session_id": "claude-native-fixture",
       "active_agent_session_path": "/workspace/pohunek/.claude/session.json",
-      "activity": "idle",
+      "activity": "blocked",
       "agent": "codex",
       "agent_base": "codex",
       "background": {
@@ -42,6 +42,7 @@
         "observed_at_ms": 1788825600500,
         "revision": "2"
       },
+      "blocked_kind": "permission",
       "branch": "zajca/12-typescript-sdk",
       "capabilities": {
         "fork": true,

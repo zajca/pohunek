@@ -24606,6 +24606,229 @@ async fn a_blocked_sessions_stored_record_has_no_blocked_kind() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
+/// A program-status record that says the agent waits for a permission.
+fn blocked_on_permission() -> ActivityTransition {
+    ActivityTransition {
+        activity: AgentActivity::Blocked,
+        source: protocol::StateSource::OscProgress,
+        blocked_kind: Some(protocol::BlockedKind::Permission),
+    }
+}
+
+/// Reads the activity and the blocked kind of `id` from `session.inspect`.
+async fn activity_and_blocked_kind(
+    registry: &SessionRegistry,
+    id: &SessionId,
+) -> (Option<AgentActivity>, Option<protocol::BlockedKind>) {
+    let info = registry.inspect(id).await.expect("inspect session");
+    (info.activity, info.blocked_kind)
+}
+
+/// The `session_updated` payload names what a program-status block waits for;
+/// a hook report that then sets `blocked` carries no kind, because the hook
+/// says nothing about what the agent waits for.
+#[tokio::test]
+async fn a_session_updated_event_carries_the_blocked_kind_and_a_hook_block_has_none() {
+    let (registry, inspector, created) = mock_direct_codex_registry("blocked-kind-hook").await;
+    let start = root_start_identity(&inspector, &created);
+    registry
+        .record_activity(&created.id, blocked_on_permission())
+        .await;
+    let mut events = registry.subscribe();
+
+    registry
+        .set_metadata(&created.id, metadata_patch(&[("ticket", Some("POH-1"))]))
+        .await
+        .expect("set metadata");
+    let published = next_session_updated(&mut events).await;
+    assert_eq!(published.activity, Some(AgentActivity::Blocked));
+    assert_eq!(
+        published.blocked_kind,
+        Some(protocol::BlockedKind::Permission),
+        "the event payload names what the agent waits for"
+    );
+
+    assert!(
+        registry
+            .report_agent(SessionReportAgentParams {
+                activity: Some(AgentActivity::Blocked),
+                ..bound_report(&created, start, 1, "native-one")
+            })
+            .await
+            .recorded
+    );
+    let hooked = guard("the session_updated event of the hook report", async {
+        loop {
+            let info = next_session_updated(&mut events).await;
+            if info.state_source == protocol::StateSource::Report {
+                break info;
+            }
+        }
+    })
+    .await;
+    assert_eq!(hooked.activity, Some(AgentActivity::Blocked));
+    assert_eq!(
+        hooked.blocked_kind, None,
+        "a hook-reported block names no kind"
+    );
+    assert_eq!(
+        activity_and_blocked_kind(&registry, &created.id).await,
+        (Some(AgentActivity::Blocked), None)
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// A lost runtime has no detector reading, so the blocked kind goes with the
+/// activity, whether or not the loss proves that the worker ended.
+#[tokio::test]
+async fn a_lost_runtime_clears_the_blocked_kind_with_the_activity() {
+    for proof in [
+        crate::session::LossProof::Unproven,
+        crate::session::LossProof::Ended,
+    ] {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(temp_store_path("blocked-kind-runtime-lost")),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(params()).await.expect("create session");
+        let (worker, expected) = live_worker_and_identity(&registry, &created.id).await;
+        registry
+            .record_activity(&created.id, blocked_on_permission())
+            .await;
+        assert_eq!(
+            activity_and_blocked_kind(&registry, &created.id).await,
+            (
+                Some(AgentActivity::Blocked),
+                Some(protocol::BlockedKind::Permission)
+            )
+        );
+
+        let mut outcome = super::RuntimeTransitionOutcome::RetryableConcurrentChange;
+        for _ in 0..CONCURRENT_TRANSITION_RETRY_LIMIT {
+            // A retry follows a change that raced the transition, so the
+            // blocked reading is restated before each attempt.
+            registry
+                .record_activity(&created.id, blocked_on_permission())
+                .await;
+            outcome = registry
+                .mark_worker_unavailable(
+                    &created.id,
+                    &expected,
+                    crate::session::Unavailability::lost(proof, None),
+                    crate::session::supervision::RUNTIME_LOST,
+                )
+                .await;
+            if !matches!(
+                outcome,
+                super::RuntimeTransitionOutcome::RetryableConcurrentChange
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(outcome, super::RuntimeTransitionOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+
+        assert_eq!(
+            activity_and_blocked_kind(&registry, &created.id).await,
+            (None, None),
+            "{proof:?}: the loss ends the blocked reading as a whole"
+        );
+        stop_test_worker(worker).await;
+    }
+}
+
+/// An agent that left the session takes the blocked reading with it.
+#[tokio::test]
+async fn an_agent_that_left_clears_the_blocked_kind_with_the_activity() {
+    let (registry, inspector, created) = mock_procwatch_registry("blocked-kind-agent-left").await;
+    observe_codex(&registry, &inspector, &created, Some(300)).await;
+    registry
+        .record_activity(&created.id, blocked_on_permission())
+        .await;
+    assert_eq!(
+        activity_and_blocked_kind(&registry, &created.id).await,
+        (
+            Some(AgentActivity::Blocked),
+            Some(protocol::BlockedKind::Permission)
+        )
+    );
+
+    observe_codex(&registry, &inspector, &created, None).await;
+
+    assert_eq!(
+        activity_and_blocked_kind(&registry, &created.id).await,
+        (None, None),
+        "the agent left, so no blocked reading is left"
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+/// A released agent claim takes the blocked reading with it.
+#[tokio::test]
+async fn a_released_claim_clears_the_blocked_kind_with_the_activity() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let claimed = registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            activity: None,
+            seq: Some(ReportSequence::new(1)),
+            pid: None,
+            agent_session_id: None,
+            agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
+            retryable_admission: false,
+        })
+        .await;
+    assert!(claimed.recorded);
+    registry
+        .record_activity(&created.id, blocked_on_permission())
+        .await;
+    assert_eq!(
+        activity_and_blocked_kind(&registry, &created.id).await,
+        (
+            Some(AgentActivity::Blocked),
+            Some(protocol::BlockedKind::Permission)
+        )
+    );
+
+    let released = registry
+        .release_agent(SessionReleaseAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(ReportSequence::new(2)),
+            pid: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
+            retryable_admission: false,
+        })
+        .await;
+    assert!(released.released);
+
+    assert_eq!(
+        activity_and_blocked_kind(&registry, &created.id).await,
+        (None, None),
+        "the release ends the blocked reading as a whole"
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
 /// A create whose initial input was never delivered because its daemon
 /// exited, and the replacement daemon that finds its `initial_input` marker.
 struct OrphanedInputCreate {

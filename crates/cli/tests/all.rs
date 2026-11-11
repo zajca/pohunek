@@ -108,6 +108,8 @@ mod service_workflow_leftovers;
 mod session_background;
 #[path = "session_background_work.rs"]
 mod session_background_work;
+#[path = "session_blocked_kind.rs"]
+mod session_blocked_kind;
 #[path = "session_condition.rs"]
 mod session_condition;
 #[path = "session_lifecycle_notice.rs"]

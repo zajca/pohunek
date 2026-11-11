@@ -5896,3 +5896,65 @@ fn client_request_id_and_its_outcomes_have_the_documented_wire_shape() {
     assert_eq!(in_progress["details"], json!({ "session_id": "s-2" }));
     assert_eq!(in_progress["recover"], "retry the same request");
 }
+
+/// A peer that predates `blocked_kind` and a peer that knows it exchange the
+/// same session snapshot apart from one additive key.
+#[test]
+fn a_session_info_decodes_across_peers_that_do_and_do_not_know_the_blocked_kind() {
+    let blocked = SessionInfo {
+        activity: Some(AgentActivity::Blocked),
+        blocked_kind: Some(BlockedKind::Permission),
+        ..running_shell_session(None)
+    };
+    let wire = serde_json::to_value(&blocked).expect("serialize the blocked snapshot");
+    assert_eq!(wire["blocked_kind"], "permission");
+
+    // What a daemon that predates the field sends: the same snapshot without
+    // the key. It decodes with no kind.
+    let mut older = wire.clone();
+    assert!(older
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("blocked_kind")
+        .is_some());
+    let decoded: SessionInfo =
+        serde_json::from_value(older.clone()).expect("a snapshot without the kind decodes");
+    assert_eq!(decoded.activity, Some(AgentActivity::Blocked));
+    assert_eq!(decoded.blocked_kind, None);
+
+    // A snapshot without a kind never carries the key, so a reader that ignores
+    // unknown keys sees exactly what a daemon without the field sends.
+    let without_kind = serde_json::to_value(SessionInfo {
+        blocked_kind: None,
+        ..blocked.clone()
+    })
+    .expect("serialize");
+    assert_eq!(without_kind, older);
+
+    // The snapshot with the kind differs from the older one by that one key,
+    // and decodes back to the same value.
+    let keys = |value: &Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("snapshot object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let added: Vec<String> = keys(&wire)
+        .into_iter()
+        .filter(|key| !keys(&older).contains(key))
+        .collect();
+    assert_eq!(added, ["blocked_kind"]);
+    let back: SessionInfo = serde_json::from_value(wire.clone()).expect("decode the kind");
+    assert_eq!(back, blocked);
+
+    // A kind a newer daemon invents decodes on a client that tolerates it and
+    // is refused by the strict decode.
+    let mut newer = wire;
+    newer["blocked_kind"] = json!("a_kind_from_a_newer_daemon");
+    assert!(serde_json::from_value::<SessionInfo>(newer.clone()).is_err());
+    let tolerated: SessionInfo =
+        protocol::tolerant::from_value(newer).expect("the tolerant decode maps it");
+    assert_eq!(tolerated.blocked_kind, Some(BlockedKind::Unknown));
+}

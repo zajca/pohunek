@@ -1,6 +1,7 @@
 {
   "activity": "blocked",
   "activity_epoch": "d-fixture-1",
+  "blocked_kind": "permission",
   "event": "agent_state",
   "revision": "7",
   "runtime": {
