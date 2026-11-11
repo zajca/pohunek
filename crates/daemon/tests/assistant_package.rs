@@ -38,35 +38,51 @@ const CONCEPT: &str = "---\ntype: Guide\nid: guide-overview\ntitle: Overview\nde
 struct Servers {
     socket: PathBuf,
     plugins: PathBuf,
+    registry: SessionRegistry,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
     /// Restores the XDG variables the handler resolves its runtime root from.
     _env: ProcessEnv,
-    _dirs: (tempfile::TempDir, tempfile::TempDir),
+    dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
 impl Servers {
     async fn stop(self) {
+        let _ = self.stop_keeping_state().await;
+    }
+
+    /// Stops the server and hands back the directories that hold the plugin
+    /// root and the metadata store, so a later server can run over them.
+    async fn stop_keeping_state(self) -> (tempfile::TempDir, tempfile::TempDir) {
         let _ = self.shutdown.send(());
         self.task.await.expect("server stops");
+        self.dirs
     }
 }
 
 async fn spawn_servers(tag: &str) -> Servers {
     let socket_dir = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
         .expect("create the socket directory");
+    let worker_home_dir =
+        pohunek_test_support::tempdir_with_prefix("pw-a-").expect("create the worker home");
+    spawn_servers_over(socket_dir, worker_home_dir).await
+}
+
+/// Starts a server over `socket_dir`, which holds the plugin root and the
+/// metadata store of any earlier server that ran over it.
+async fn spawn_servers_over(
+    socket_dir: tempfile::TempDir,
+    worker_home_dir: tempfile::TempDir,
+) -> Servers {
     let socket = socket_dir.path().join("daemon.sock");
     let plugins = socket_dir.path().join("plugins");
     let agents = socket_dir.path().join("agents");
-    std::fs::create_dir(&agents).expect("create the agents directory");
-    std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o700))
-        .expect("make the agents directory owner-private");
     let host_state = socket_dir.path().join("host-state");
-    std::fs::create_dir(&host_state).expect("create the host-state directory");
-    std::fs::set_permissions(&host_state, std::fs::Permissions::from_mode(0o700))
-        .expect("make the host-state directory owner-private");
-    let worker_home_dir =
-        pohunek_test_support::tempdir_with_prefix("pw-a-").expect("create the worker home");
+    for private in [&agents, &host_state] {
+        std::fs::create_dir_all(private).expect("create the private directory");
+        std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700))
+            .expect("make the directory owner-private");
+    }
     let worker_home = worker_home_dir.path().to_path_buf();
     let environment = SubprocessWorkerEnvironment {
         runtime_home: worker_home.join("runtime"),
@@ -86,6 +102,7 @@ async fn spawn_servers(tag: &str) -> Servers {
         .set("HOME", socket_dir.path().join("home"));
     let config = SessionRegistryConfig {
         socket_path: Some(socket.clone()),
+        store_path: Some(socket_dir.path().join("metadata.jsonl")),
         plugins_dir: Some(plugins.clone()),
         agents_dir: Some(agents),
         host_state_dir: Some(host_state),
@@ -104,7 +121,7 @@ async fn spawn_servers(tag: &str) -> Servers {
     );
     let state = DaemonState::new(
         HealthInfo::new("0.0.0-test"),
-        registry,
+        registry.clone(),
         governance,
         support::overlay_registry(),
         pohunek_daemon::api::OverlaySource::Default,
@@ -128,10 +145,11 @@ async fn spawn_servers(tag: &str) -> Servers {
     Servers {
         socket,
         plugins,
+        registry,
         shutdown,
         task,
         _env: env,
-        _dirs: (socket_dir, worker_home_dir),
+        dirs: (socket_dir, worker_home_dir),
     }
 }
 
@@ -606,5 +624,280 @@ async fn a_context_descriptor_that_mixes_exports_or_names_nothing_is_refused_at_
             "{name}: {error:?}"
         );
     }
+    servers.stop().await;
+}
+
+/// A second release of the context package: other bundle content, so a
+/// different archive digest under the same id.
+fn bundle_entries_v2() -> Vec<ArchiveEntry> {
+    let mut entries = bundle_entries(CONTRACT);
+    entries[0] = entry("runtime.toml", &descriptor("").replace("1.2.3", "1.3.0"));
+    entries.push(entry("bundle/concepts/added.md", CONCEPT));
+    entries
+}
+
+/// `session.new` for a shell session in `cwd`, pinning `digest` when given.
+async fn create_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    cwd: &Path,
+    digest: Option<&PackageDigest>,
+) -> Result<protocol::SessionNewResult, ProtocolError> {
+    let mut params = json!({ "agent": "shell", "cwd": cwd, "cols": 80, "rows": 24 });
+    if let Some(digest) = digest {
+        params["context_package_digest"] = json!(digest);
+    }
+    exchange(framed, method::SESSION_NEW, params)
+        .await
+        .into_result()
+        .map(|value| serde_json::from_value(value).expect("session.new result"))
+}
+
+async fn uninstall(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    digest: &PackageDigest,
+    remove_modified: bool,
+) -> Result<(), ProtocolError> {
+    exchange(
+        framed,
+        method::PACKAGE_UNINSTALL,
+        json!({ "digest": digest, "remove_modified": remove_modified }),
+    )
+    .await
+    .into_result()
+    .map(drop)
+}
+
+async fn stop_and_remove(framed: &mut Framed<UnixStream, LinesCodec>, id: &protocol::SessionId) {
+    for method in [method::SESSION_STOP, method::SESSION_REMOVE] {
+        exchange(framed, method, json!(id))
+            .await
+            .into_result()
+            .unwrap_or_else(|error| panic!("{method} failed: {error:?}"));
+    }
+}
+
+async fn session_count(framed: &mut Framed<UnixStream, LinesCodec>) -> usize {
+    exchange(framed, method::SESSION_LIST, Value::Null)
+        .await
+        .into_result()
+        .expect("session.list")
+        .as_array()
+        .map_or_else(|| panic!("session.list answers an array"), Vec::len)
+}
+
+#[tokio::test]
+async fn a_pinned_session_keeps_the_context_package_installed_until_it_is_removed() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers("asst-pin").await;
+    let mut client = connect(&servers.socket).await;
+    let first = install(&mut client, &servers.plugins, &bundle_entries(CONTRACT))
+        .await
+        .expect("install the first release");
+    let served = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect("materialize");
+    assert_eq!(served.content_hash, first.to_string());
+    let cwd = servers.plugins.parent().expect("plugin root parent");
+    let session = create_session(&mut client, cwd, Some(&first))
+        .await
+        .expect("a session pinning the served digest launches")
+        .session;
+
+    // Uninstalling the pinned release is refused and leaves the files the
+    // session reads in place.
+    let refused = uninstall(&mut client, &first, false)
+        .await
+        .expect_err("a pinned package is not uninstalled");
+    assert_eq!(refused.code, "package_referenced", "{refused:?}");
+    assert!(Path::new(&served.bundle_path).join("index.md").is_file());
+    // A later release replaces the selection; the pinned release stays.
+    let second = install(&mut client, &servers.plugins, &bundle_entries_v2())
+        .await
+        .expect("install and select the second release");
+    assert_ne!(first, second);
+    let current = materialize(&mut client, json!({ "snapshot": "{}" }))
+        .await
+        .expect("the second release is served");
+    assert_eq!(current.content_hash, second.to_string());
+    let refused = uninstall(&mut client, &first, false)
+        .await
+        .expect_err("the replaced release stays while a session pins it");
+    assert_eq!(refused.code, "package_referenced", "{refused:?}");
+
+    // Also a modified root is not removed as modified while a session pins it.
+    let index = Path::new(&served.bundle_path).join("index.md");
+    let mut permissions = std::fs::metadata(&index)
+        .expect("stat the index")
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&index, permissions).expect("make the index writable");
+    std::fs::write(&index, "# tampered\n").expect("modify the installed file");
+    let refused = uninstall(&mut client, &first, true)
+        .await
+        .expect_err("a pinned package is not removed as modified either");
+    assert_eq!(refused.code, "package_referenced", "{refused:?}");
+    assert!(index.is_file());
+
+    // Removing the session releases the pin.
+    stop_and_remove(&mut client, &session.id).await;
+    uninstall(&mut client, &first, true)
+        .await
+        .expect("the unreferenced modified release is removed");
+    assert!(!Path::new(&served.bundle_path).join("index.md").exists());
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_launch_that_pins_a_package_the_assistant_cannot_read_creates_no_session() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers("asst-pin-refused").await;
+    let mut client = connect(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("plugin root parent")
+        .to_owned();
+    let absent = PackageDigest::parse(&format!("sha256:{}", "7".repeat(64))).expect("digest");
+    let other_id = {
+        let mut entries = bundle_entries(CONTRACT);
+        entries[0] = entry(
+            "runtime.toml",
+            &descriptor("").replace(ASSISTANT_CONTEXT_PACKAGE_ID, "acme.context.other"),
+        );
+        entries
+    };
+    let foreign = install(&mut client, &servers.plugins, &other_id)
+        .await
+        .expect("install a context package of another id");
+    let assistant = install(&mut client, &servers.plugins, &bundle_entries(CONTRACT))
+        .await
+        .expect("install the assistant package");
+
+    for (name, digest) in [("absent", &absent), ("another id", &foreign)] {
+        let error = create_session(&mut client, &cwd, Some(digest))
+            .await
+            .expect_err("the daemon verifies the digest the client names");
+        assert_eq!(error.code, "assistant_package_missing", "{name}: {error:?}");
+    }
+    exchange(
+        &mut client,
+        method::PACKAGE_SET_ENABLED,
+        json!({ "digest": assistant, "enabled": false }),
+    )
+    .await
+    .into_result()
+    .expect("disable");
+    let error = create_session(&mut client, &cwd, Some(&assistant))
+        .await
+        .expect_err("a disabled package cannot be pinned");
+    assert_eq!(error.code, "assistant_package_missing", "{error:?}");
+    assert!(error.msg.contains("disabled"), "{error:?}");
+
+    assert_eq!(
+        session_count(&mut client).await,
+        0,
+        "no refusal left a session"
+    );
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_stopped_session_still_pins_the_package_after_a_daemon_restart() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let first_run = spawn_servers("asst-pin-restart").await;
+    let mut client = connect(&first_run.socket).await;
+    let digest = install(&mut client, &first_run.plugins, &bundle_entries(CONTRACT))
+        .await
+        .expect("install");
+    let cwd = first_run
+        .plugins
+        .parent()
+        .expect("plugin root parent")
+        .to_owned();
+    let session = create_session(&mut client, &cwd, Some(&digest))
+        .await
+        .expect("launch")
+        .session;
+    exchange(&mut client, method::SESSION_STOP, json!(session.id))
+        .await
+        .into_result()
+        .expect("stop");
+    drop(client);
+    let (socket_dir, worker_home) = first_run.stop_keeping_state().await;
+
+    // The pin is read from the durable record, not from the first process.
+    let second_run = spawn_servers_over(socket_dir, worker_home).await;
+    second_run
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciles the stored session");
+    let mut client = connect(&second_run.socket).await;
+    let refused = uninstall(&mut client, &digest, false)
+        .await
+        .expect_err("the stored session still pins the package");
+    assert_eq!(refused.code, "package_referenced", "{refused:?}");
+
+    stop_and_remove(&mut client, &session.id).await;
+    uninstall(&mut client, &digest, false)
+        .await
+        .expect("the package uninstalls once the record is gone");
+    second_run.stop().await;
+}
+
+#[tokio::test]
+async fn a_keyed_launch_replays_only_with_the_digest_it_pinned() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers("asst-pin-replay").await;
+    let mut client = connect(&servers.socket).await;
+    let digest = install(&mut client, &servers.plugins, &bundle_entries(CONTRACT))
+        .await
+        .expect("install");
+    let cwd = servers.plugins.parent().expect("plugin root parent");
+    let request = |pinned: bool| {
+        let mut params = json!({
+            "agent": "shell",
+            "cwd": cwd,
+            "cols": 80,
+            "rows": 24,
+            "client_request_id": "pin-key",
+        });
+        if pinned {
+            params["context_package_digest"] = json!(digest);
+        }
+        params
+    };
+
+    let created: protocol::SessionNewResult = serde_json::from_value(
+        exchange(&mut client, method::SESSION_NEW, request(true))
+            .await
+            .into_result()
+            .expect("the keyed pinned launch creates"),
+    )
+    .expect("session.new result");
+    let conflict = exchange(&mut client, method::SESSION_NEW, request(false))
+        .await
+        .into_result()
+        .expect_err("the same key without the pin is another request");
+    assert_eq!(conflict.code, "session_request_conflict", "{conflict:?}");
+    let replay: protocol::SessionNewResult = serde_json::from_value(
+        exchange(&mut client, method::SESSION_NEW, request(true))
+            .await
+            .into_result()
+            .expect("the same request replays"),
+    )
+    .expect("session.new result");
+    assert_eq!(replay.replayed, Some(true));
+    assert_eq!(replay.session.id, created.session.id);
+
+    stop_and_remove(&mut client, &created.session.id).await;
     servers.stop().await;
 }

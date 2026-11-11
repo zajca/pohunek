@@ -165,6 +165,7 @@ impl Installation {
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create a session")

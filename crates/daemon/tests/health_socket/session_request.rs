@@ -548,9 +548,13 @@ async fn a_record_without_a_live_session_still_holds_its_key() {
 async fn retention_frees_the_key_of_the_session_it_removes() {
     let socket = temp_socket("request-retention");
     let store_path = socket.dir.join("metadata.jsonl");
+    let policy_path = socket
+        .dir
+        .join(pohunek_daemon::session::RETENTION_POLICY_NAME);
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", IDLE_SHELL]),
         store_path: Some(store_path.clone()),
+        retention_policy_path: Some(policy_path.clone()),
         host_state_dir: Some(socket.dir.join("host-state")),
         ..support::hermetic_registry_config()
     };
@@ -568,14 +572,22 @@ async fn retention_frees_the_key_of_the_session_it_removes() {
     );
 
     // The frozen session is weeks old, so the shortest accepted TTLs select it.
-    registry
-        .set_retention_policy(protocol::SessionRetentionPolicy {
-            terminal_ttl_secs: 3_600,
-            lost_ttl_secs: 3_600,
-            ..protocol::SessionRetentionPolicy::default()
-        })
-        .await
-        .expect("the policy is within bounds");
+    let policy = protocol::SessionRetentionPolicy {
+        terminal_ttl_secs: 3_600,
+        lost_ttl_secs: 3_600,
+        ..protocol::SessionRetentionPolicy::default()
+    };
+    write_store(
+        &policy_path,
+        &serde_json::to_string_pretty(&policy).expect("policy JSON"),
+    );
+    assert_eq!(
+        registry
+            .load_retention_policy()
+            .await
+            .expect("the policy file is within bounds"),
+        policy
+    );
     let swept = registry
         .sweep_retention(&protocol::SessionRetentionParams {
             dry_run: false,

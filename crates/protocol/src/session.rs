@@ -12,7 +12,7 @@ use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    envelope::StateSource, ActivityRevision, BackgroundRevision, OutputOffset,
+    envelope::StateSource, ActivityRevision, BackgroundRevision, OutputOffset, PackageDigest,
     ProcessStartIdentity, ProtocolError, ReportSequence, RuntimeGeneration, RuntimeRef,
     SessionSecretEnv, SubagentRevision, TerminalWatermark, MAX_SESSION_ID_BYTES,
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
@@ -486,6 +486,20 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub client_request_id: Option<String>,
+    /// The digest of the context package whose files the session reads by
+    /// path, as `assistant.materialize` reports it in `content_hash`.
+    ///
+    /// The daemon accepts it only for an installed, enabled package of the
+    /// assistant context package id whose root verifies, and otherwise fails
+    /// with `assistant_package_missing` before anything is created. It records
+    /// the digest with the session, so `package.uninstall` refuses the digest
+    /// while the session is live, lost or resumable. A daemon that does not
+    /// advertise `HostCapabilities::session_new_context_pin_supported` would
+    /// drop the field silently and leave the files unpinned, so a client checks
+    /// the flag before sending it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub context_package_digest: Option<PackageDigest>,
 }
 
 /// Most bytes a [`SessionNewParams::client_request_id`] may hold.

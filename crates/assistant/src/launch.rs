@@ -236,6 +236,7 @@ pub async fn prepare_with_options(
         is_remote(config),
     )
     .await?;
+    let context_package_digest = context_pin(&capabilities, &materialized)?;
     let contract = prompt_contract(&materialized)?;
     let prompt = compose(&ComposeParams {
         contract: &contract,
@@ -272,6 +273,7 @@ pub async fn prepare_with_options(
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest,
     };
 
     Ok(PreparedLaunch {
@@ -553,6 +555,30 @@ fn host_label(config: &HostConfig) -> String {
         HostTransport::Remote { host, .. } | HostTransport::Pinned { host, .. } => host.clone(),
         HostTransport::Tcp { .. } => config.id.as_str().to_owned(),
     }
+}
+
+/// The digest the session pins for the files it reads by path, or `None` when
+/// the host does not advertise `session_new_context_pin_supported` (its
+/// `session.new` would drop the field and leave the files unpinned).
+///
+/// # Errors
+///
+/// Returns `materialization_failed` when a pin-capable host reports a
+/// `content_hash` that is not a package digest, because the launch would
+/// otherwise run unpinned without saying so.
+fn context_pin(
+    capabilities: &HostCapabilities,
+    materialized: &AssistantMaterializeResult,
+) -> Result<Option<protocol::PackageDigest>, AssistantError> {
+    if !capabilities.session_new_context_pin_supported {
+        return Ok(None);
+    }
+    protocol::PackageDigest::parse(&materialized.content_hash)
+        .map(Some)
+        .map_err(|error| {
+            ProtocolError::materialization_failed("assistant package digest", &error.to_string())
+                .into()
+        })
 }
 
 async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, AssistantError> {

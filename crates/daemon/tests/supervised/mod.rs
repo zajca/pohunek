@@ -459,6 +459,7 @@ impl Installation {
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
         }
     }
 
@@ -887,6 +888,7 @@ impl Installation {
             profile_revision: None,
             native_launch_unresolved: false,
             launch_checkout: None,
+            context_pin: None,
         }
     }
 

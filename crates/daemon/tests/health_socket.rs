@@ -911,6 +911,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     }
 }
 
@@ -933,6 +934,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     }
 }
 
@@ -960,6 +962,7 @@ fn session_params_for_worktree(
         input_ack_timeout_ms: None,
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     }
 }
 

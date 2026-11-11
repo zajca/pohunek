@@ -137,6 +137,7 @@ fn shell_session(cwd: &Path) -> SessionNewParams {
         input_ack_timeout_ms: None,
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
     }
 }
 

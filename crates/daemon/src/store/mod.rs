@@ -207,6 +207,12 @@ pub struct ResumeBinding {
     /// stored before it was recorded and for an external session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_checkout: Option<Box<LaunchCheckout>>,
+    /// The digest of the context package whose files the session reads by path
+    /// (the assistant knowledge bundle). The retention gate keeps the package
+    /// while the record exists; absent for a session that reads no context
+    /// package and for one stored before the pin was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pin: Option<protocol::PackageDigest>,
 }
 
 impl ResumeBinding {
@@ -271,6 +277,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             native_launch_unresolved: bool,
             #[serde(default)]
             launch_checkout: Option<Box<LaunchCheckout>>,
+            #[serde(default)]
+            context_pin: Option<protocol::PackageDigest>,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -309,6 +317,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             profile_revision: raw.profile_revision,
             native_launch_unresolved: raw.native_launch_unresolved,
             launch_checkout: raw.launch_checkout,
+            context_pin: raw.context_pin,
         })
     }
 }
@@ -2196,10 +2205,10 @@ pub(crate) struct RejectedLine {
     pub(crate) reason: String,
     /// The line as stored, without its terminator.
     pub(crate) text: String,
-    /// The package digest a line that still decodes as a record pins. Such a
+    /// The package digests a line that still decodes as a record pins. Such a
     /// line is rejected only because its agent kind is not a runtime id, so
-    /// its pin is as readable as that of a loaded record.
-    pub(crate) decoded_pin: Option<protocol::PackageDigest>,
+    /// its pins are as readable as those of a loaded record.
+    pub(crate) decoded_pins: Vec<protocol::PackageDigest>,
     /// Whether the line decodes as a record at all.
     pub(crate) decodable: bool,
 }
@@ -2240,7 +2249,7 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
                 (text, (None, None, false, false), Err(error))
             }
         };
-        let mut decoded_pin = None;
+        let mut decoded_pins = Vec::new();
         let mut decodable = false;
         let reason = match parsed {
             Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
@@ -2256,7 +2265,7 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
             }
             Ok(record @ (Record::Session(_) | Record::Resume(_))) => {
                 decodable = true;
-                decoded_pin = record_pin(&record);
+                decoded_pins = record_pin(&record);
                 "the agent kind is not a runtime id".to_owned()
             }
             Ok(Record::Worktree(binding)) => {
@@ -2277,7 +2286,7 @@ fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<Rej
             removal_intent,
             reason,
             text: text.to_owned(),
-            decoded_pin,
+            decoded_pins,
             decodable,
         });
     }
@@ -2324,22 +2333,30 @@ pub(crate) fn kind_may_pin(kind: Option<&str>) -> bool {
     !matches!(kind, Some("worktree" | "project"))
 }
 
-/// The package digest `record` pins: its recovery's launch binding for a
-/// session, its launch binding for a resume binding.
-fn record_pin(record: &Record) -> Option<protocol::PackageDigest> {
-    let pin = |pin: &LaunchPin| match pin.binding().map(|binding| &binding.provenance) {
-        Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
-            Some(package_digest.clone())
-        }
-        _ => None,
+/// The package digests `record` pins: the launch binding and the context
+/// package of its recovery for a session, of the binding itself for a resume
+/// binding.
+fn record_pin(record: &Record) -> Vec<protocol::PackageDigest> {
+    let pins = |binding: &ResumeBinding| {
+        let runtime = match binding
+            .launch_binding
+            .binding()
+            .map(|binding| &binding.provenance)
+        {
+            Some(protocol::BindingProvenance::Package { package_digest, .. }) => {
+                Some(package_digest.clone())
+            }
+            _ => None,
+        };
+        runtime
+            .into_iter()
+            .chain(binding.context_pin.clone())
+            .collect()
     };
     match record {
-        Record::Session(record) => record
-            .recovery
-            .as_ref()
-            .and_then(|recovery| pin(&recovery.launch_binding)),
-        Record::Resume(binding) => pin(&binding.launch_binding),
-        Record::Worktree(_) | Record::Project(_) => None,
+        Record::Session(record) => record.recovery.as_ref().map(pins).unwrap_or_default(),
+        Record::Resume(binding) => pins(binding),
+        Record::Worktree(_) | Record::Project(_) => Vec::new(),
     }
 }
 
@@ -2778,6 +2795,7 @@ mod tests {
             profile_revision: None,
             native_launch_unresolved: false,
             launch_checkout: None,
+            context_pin: None,
         }
     }
 
@@ -2858,7 +2876,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":17,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":18,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2874,7 +2892,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":17,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":18,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2986,7 +3004,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":17,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":18,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3108,7 +3126,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":17,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":18,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),

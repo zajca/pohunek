@@ -161,6 +161,13 @@ pub struct HostCapabilities {
     /// create a second session. `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_request_id_supported: bool,
+    /// Whether `session.new` honors `context_package_digest`.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; it
+    /// would drop `context_package_digest` silently and leave the context
+    /// files unpinned. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_new_context_pin_supported: bool,
     /// Whether `package.install` and `package.link` accept `accept_commands`
     /// and install packages that declare commands.
     ///

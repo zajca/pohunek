@@ -74,6 +74,7 @@ fn capabilities(runtimes: Vec<AgentRuntime>) -> HostCapabilities {
         session_new_input_ack_supported: true,
         session_new_secret_env_supported: true,
         session_new_request_id_supported: true,
+        session_new_context_pin_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
@@ -601,7 +602,7 @@ fn materialize_result() -> Value {
         "bundle_path": root,
         "snapshot_path": root.join("index.md"),
         "version": "1.0.0",
-        "content_hash": "sha256:fixture",
+        "content_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
         "concepts": [],
         "prompt_contract": "## Safety\n- Never run destructive commands.\n\n## Navigation\n- Read the index first.\n",
     })

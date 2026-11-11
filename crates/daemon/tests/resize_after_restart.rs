@@ -175,6 +175,7 @@ async fn create_session(registry: &SessionRegistry, env: &TestEnv) -> SessionInf
             input_ack_timeout_ms: None,
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
+            context_package_digest: None,
         })
         .await
         .expect("create the session")

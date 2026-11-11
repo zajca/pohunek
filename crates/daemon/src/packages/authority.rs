@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use protocol::{BindingProvenance, ProtocolError};
+use protocol::{BindingProvenance, PackageDigest, PackageId, ProtocolError};
 use tokio::sync::{OwnedRwLockReadGuard, RwLock, RwLockReadGuard};
 
-use crate::agent::host::{RuntimeDefinition, RuntimeHost};
+use crate::agent::host::{ContextDir, ContextError, PackageSource, RuntimeDefinition, RuntimeHost};
 use crate::agent::ProfileRegistry;
 use crate::catalog_anchor::{CatalogTrust, IndexTrust};
 use crate::session::SessionRegistry;
@@ -112,6 +112,29 @@ impl PackageAuthority {
         self.runtimes.verify_launchable(definition)?;
         self.ensure_launch_is_current(definition, profiles).await?;
         Ok(LaunchGuard(guard))
+    }
+
+    /// The verified files of the context package `id` at `digest`, read off
+    /// the async runtime.
+    ///
+    /// # Errors
+    ///
+    /// The [`ContextError`] of the package source, or
+    /// [`ContextError::NotInstalled`] on a host without a package store.
+    pub(crate) async fn context_dir_at(
+        &self,
+        id: PackageId,
+        digest: PackageDigest,
+    ) -> Result<ContextDir, ContextError> {
+        let Some(store) = self.runtimes.package_store().cloned() else {
+            return Err(ContextError::NotInstalled);
+        };
+        tokio::task::spawn_blocking(move || PackageSource::new(store).context_dir_at(&id, &digest))
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "a context package lookup task failed");
+                ContextError::LookupFailed
+            })?
     }
 
     /// Verifies, under the shared lifecycle guard, that a launch resolved

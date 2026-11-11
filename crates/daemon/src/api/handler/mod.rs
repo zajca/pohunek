@@ -864,6 +864,7 @@ mod tests {
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create session");
@@ -957,6 +958,7 @@ mod tests {
                 input_ack_timeout_ms: None,
                 metadata: metadata(&[("owner", "cli")]),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create session");
@@ -1021,6 +1023,7 @@ mod tests {
                 input_ack_timeout_ms: None,
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
+                context_package_digest: None,
             })
             .await
             .expect("create shell session");
@@ -1247,6 +1250,7 @@ mod tests {
                         input_ack_timeout_ms: None,
                         metadata: BTreeMap::new(),
                         secret_env: protocol::SessionSecretEnv::default(),
+                        context_package_digest: None,
                     })
                     .await
             }

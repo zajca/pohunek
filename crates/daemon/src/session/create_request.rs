@@ -13,7 +13,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use protocol::{BranchSource, OnDiverged, ProtocolError, SessionId, SessionInfo, SessionNewParams};
+use protocol::{
+    BranchSource, OnDiverged, PackageDigest, ProtocolError, SessionId, SessionInfo,
+    SessionNewParams,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -66,6 +69,8 @@ struct FingerprintView<'a> {
     secret_env_names: Vec<&'a str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     metadata: &'a BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_package_digest: Option<&'a PackageDigest>,
 }
 
 /// The fingerprint of `params`, or `None` for a request without a key: the
@@ -101,6 +106,7 @@ pub(super) fn request_fingerprint(
         secret_env,
         metadata,
         client_request_id: _client_request_id,
+        context_package_digest,
     } = params;
     let mut secret_env_names: Vec<&str> = secret_env.names().collect();
     secret_env_names.sort_unstable();
@@ -119,6 +125,7 @@ pub(super) fn request_fingerprint(
         input_ack_timeout_ms: *input_ack_timeout_ms,
         secret_env_names,
         metadata,
+        context_package_digest: context_package_digest.as_ref(),
     };
     let bytes = serde_json::to_vec(&view).map_err(|_error| {
         ProtocolError::bad_request("session.new: the parameters cannot be fingerprinted")
