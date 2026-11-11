@@ -37,11 +37,25 @@ use crate::catalog::{
     SIGNATURE_BYTES,
 };
 
-/// Index schema version this build reads and writes.
+/// Schema version 1: every entry is a runtime package.
 pub const INDEX_SCHEMA_VERSION: u64 = 1;
 
-/// Published file name; a later schema publishes a new file name.
+/// Schema version 2: entries carry a `kind`, `runtime` or `context`.
+///
+/// A client that reads only schema 1 refuses a schema 2 document as a whole,
+/// so schema 2 is published under its own file name beside the schema 1 file.
+pub const INDEX_SCHEMA_VERSION_2: u64 = 2;
+
+/// Every schema version this build reads.
+pub const SUPPORTED_INDEX_SCHEMA_VERSIONS: [u64; 2] =
+    [INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2];
+
+/// Published file name of the schema 1 document, which lists runtime packages
+/// only; each schema publishes its own file name.
 pub const OFFICIAL_INDEX_FILE_NAME: &str = "official-index-v1.json";
+
+/// Published file name of the schema 2 document.
+pub const OFFICIAL_INDEX_FILE_NAME_V2: &str = "official-index-v2.json";
 
 /// Largest accepted index document: 1 MiB, checked before parsing.
 pub const MAX_INDEX_BYTES: usize = 1024 * 1024;
@@ -79,6 +93,11 @@ pub const MAX_INDEX_LIFETIME_SECONDS: u64 = 14 * 24 * 60 * 60;
 /// `.pi`) has this shape, so the binding keeps an entry from claiming one.
 pub const OFFICIAL_RUNTIME_PACKAGE_PREFIX: &str = "pohunek.runtime.";
 
+/// A context package id is exactly this prefix plus a non-empty tail.
+///
+/// The prefix belongs to `context` entries; a `runtime` entry never carries it.
+pub const OFFICIAL_CONTEXT_PACKAGE_PREFIX: &str = "pohunek.context.";
+
 /// The only scope an index key record and an index document carry.
 pub const OFFICIAL_SCOPE: &str = "official";
 
@@ -89,8 +108,21 @@ pub const OFFICIAL_NAMESPACE: &str = "pohunek.";
 /// aliases, and every runtime the release catalog serves.
 pub const INDEX_REFUSED_RUNTIME_IDS: [&str; 5] = ["shell", "codex", "claude", "hermes", "pi"];
 
-/// Domain separator of the index body signature.
+/// Domain separator of the schema 1 index body signature.
 const INDEX_DOMAIN: &[u8] = b"pohunek-plugin-index-v1\n";
+
+/// Domain separator of the schema 2 index body signature, so a signature of one
+/// schema never verifies a body of the other.
+const INDEX_DOMAIN_V2: &[u8] = b"pohunek-plugin-index-v2\n";
+
+/// The signature domain of a body of schema `version`.
+fn index_domain(version: u64) -> &'static [u8] {
+    if version == INDEX_SCHEMA_VERSION_2 {
+        INDEX_DOMAIN_V2
+    } else {
+        INDEX_DOMAIN
+    }
+}
 
 /// Domain separator of an index key record endorsement.
 const INDEX_KEY_RECORD_DOMAIN: &[u8] = b"pohunek-plugin-index-key-record-v1\n";
@@ -99,14 +131,31 @@ const INDEX_KEY_RECORD_DOMAIN: &[u8] = b"pohunek-plugin-index-key-record-v1\n";
 /// document family so no other revocation document can share it.
 const REVOCATION_DOMAIN: &[u8] = b"pohunek-plugin-index-revocations-v1\n";
 
+/// What an index entry authorizes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexEntryKind {
+    /// A runtime package; the entry names the runtime it provides.
+    Runtime,
+    /// A context package: files without a runtime or commands.
+    Context,
+}
+
 /// One plugin package version the index authorizes.
+///
+/// A schema 1 entry has no `kind` and a `runtime_id`; a schema 2 entry has a
+/// `kind`, and a `runtime_id` exactly when the kind is `runtime`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexEntry {
     /// Package identity.
     pub package_id: PackageId,
-    /// Runtime the package provides.
-    pub runtime_id: RuntimeId,
+    /// What the entry authorizes; absent in schema 1, where it is `runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<IndexEntryKind>,
+    /// Runtime the package provides; absent for a `context` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<RuntimeId>,
     /// Package version.
     pub version: PackageVersion,
     /// Digest of the package archive bytes.
@@ -121,6 +170,12 @@ pub struct IndexEntry {
 }
 
 impl IndexEntry {
+    /// What the entry authorizes: its `kind`, `runtime` when it has none.
+    #[must_use]
+    pub fn kind(&self) -> IndexEntryKind {
+        self.kind.unwrap_or(IndexEntryKind::Runtime)
+    }
+
     /// Whether the entry lists `platform` and its core range parses and
     /// matches `core`. The same two checks [`VerifiedIndex::authorize`] ends
     /// with, so a client that selects by this predicate never picks an entry
@@ -136,7 +191,8 @@ impl IndexEntry {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexBody {
-    /// Must equal [`INDEX_SCHEMA_VERSION`].
+    /// A version in [`SUPPORTED_INDEX_SCHEMA_VERSIONS`], equal to the
+    /// envelope's.
     pub schema_version: u64,
     /// Must equal [`OFFICIAL_SCOPE`].
     pub scope: String,
@@ -173,7 +229,9 @@ pub struct IndexKeyRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevocationBody {
-    /// Must equal [`INDEX_SCHEMA_VERSION`].
+    /// A version in [`SUPPORTED_INDEX_SCHEMA_VERSIONS`]. The list's format is
+    /// the same in every schema, so a document embeds the list as signed,
+    /// whatever its own schema.
     pub schema_version: u64,
     /// Publication counter of the revocation list.
     pub sequence: u64,
@@ -195,7 +253,7 @@ pub struct SignedRevocations {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexEnvelope {
-    /// Must equal [`INDEX_SCHEMA_VERSION`].
+    /// A version in [`SUPPORTED_INDEX_SCHEMA_VERSIONS`].
     pub schema_version: u64,
     /// The signed body.
     pub index: IndexBody,
@@ -257,6 +315,15 @@ pub enum IndexEntryRejection {
     /// provides two runtime ids.
     #[error("package and runtime identities are not one-to-one")]
     IdentityConflict,
+    /// The `kind` and the `runtime_id` of the entry do not fit its schema
+    /// version: schema 1 has no `kind`, schema 2 has one, and only a `runtime`
+    /// entry has a `runtime_id`.
+    #[error("entry kind and runtime id do not fit the schema")]
+    Kind,
+    /// The package id carries the prefix of the other kind, or a `context`
+    /// entry's id is not [`OFFICIAL_CONTEXT_PACKAGE_PREFIX`] plus a tail.
+    #[error("package id does not fit the entry kind")]
+    PackageIdKind,
 }
 
 /// Why an index document was rejected. Carries no document content.
@@ -401,9 +468,14 @@ pub enum IndexEntryRefusal {
     /// The runtime id is one an index never authorizes.
     #[error("runtime id is refused for index packages")]
     RuntimeRefused,
-    /// The package id is not `pohunek.runtime.` plus the runtime id.
+    /// The package id is not `pohunek.runtime.` plus the runtime id, or a
+    /// context package id is not `pohunek.context.` plus a tail.
     #[error("package id does not match its runtime id")]
     PackageIdBinding,
+    /// The entry that lists the digest has the other kind: a runtime entry
+    /// never authorizes a context package and the reverse.
+    #[error("index entry is of another kind")]
+    KindMismatch,
     /// The core range does not parse or constrains nothing.
     #[error("core version range is invalid")]
     CoreRange,
@@ -423,7 +495,7 @@ pub enum IndexEntryRefusal {
 /// Returns [`IndexError::Schema`] if the body cannot be serialized.
 pub fn index_signing_message(body: &IndexBody) -> Result<Vec<u8>, IndexError> {
     let value = serde_json::to_value(body).map_err(|_cause| IndexError::Schema)?;
-    Ok(domain_message(INDEX_DOMAIN, &value))
+    Ok(domain_message(index_domain(body.schema_version), &value))
 }
 
 /// Canonical message an endorsement covers: the domain prefix followed by the
@@ -484,15 +556,17 @@ fn parse_document(bytes: &[u8]) -> Result<ParsedIndex, IndexError> {
     .into_iter()
     .flatten()
     .filter_map(Value::as_u64)
-    .any(|version| version != INDEX_SCHEMA_VERSION);
+    .any(|version| !SUPPORTED_INDEX_SCHEMA_VERSIONS.contains(&version));
     if declared_other {
         return Err(IndexError::UnsupportedSchemaVersion);
     }
     let envelope: IndexEnvelope =
         serde_json::from_value(value.clone()).map_err(|_cause| IndexError::Schema)?;
-    if envelope.schema_version != INDEX_SCHEMA_VERSION
-        || envelope.index.schema_version != INDEX_SCHEMA_VERSION
-        || envelope.revocations.revocations.schema_version != INDEX_SCHEMA_VERSION
+    let version = envelope.schema_version;
+    if !SUPPORTED_INDEX_SCHEMA_VERSIONS.contains(&version)
+        || envelope.index.schema_version != version
+        || !SUPPORTED_INDEX_SCHEMA_VERSIONS
+            .contains(&envelope.revocations.revocations.schema_version)
     {
         return Err(IndexError::UnsupportedSchemaVersion);
     }
@@ -505,7 +579,7 @@ fn parse_document(bytes: &[u8]) -> Result<ParsedIndex, IndexError> {
         .pointer("/revocations/revocations")
         .ok_or(IndexError::Schema)?;
     Ok(ParsedIndex {
-        index_message: domain_message(INDEX_DOMAIN, index_member),
+        index_message: domain_message(index_domain(version), index_member),
         revocation_message: domain_message(REVOCATION_DOMAIN, revocation_member),
         envelope,
     })
@@ -625,7 +699,7 @@ pub fn verify_index(
 
     let body = &envelope.index;
     check_body(body, state, now)?;
-    check_entries(&body.entries)?;
+    check_entries(body.schema_version, &body.entries)?;
 
     let revoked_key_ids = envelope
         .revocations
@@ -769,13 +843,13 @@ pub fn verify_revocation_document(
     if value
         .pointer("/revocations/schema_version")
         .and_then(Value::as_u64)
-        .is_some_and(|version| version != INDEX_SCHEMA_VERSION)
+        .is_some_and(|version| !SUPPORTED_INDEX_SCHEMA_VERSIONS.contains(&version))
     {
         return Err(IndexError::UnsupportedSchemaVersion);
     }
     let document: SignedRevocations =
         serde_json::from_value(value.clone()).map_err(|_cause| IndexError::Schema)?;
-    if document.revocations.schema_version != INDEX_SCHEMA_VERSION {
+    if !SUPPORTED_INDEX_SCHEMA_VERSIONS.contains(&document.revocations.schema_version) {
         return Err(IndexError::UnsupportedSchemaVersion);
     }
     if document.revocations.revoked_key_ids.len() > MAX_REVOKED_KEYS {
@@ -813,7 +887,7 @@ pub fn index_document_signing_message(bytes: &[u8]) -> Result<Vec<u8>, IndexErro
 /// Returns the first violated rule as an [`IndexError`].
 pub fn check_index_body(body: &IndexBody, now: u64) -> Result<(), IndexError> {
     check_body(body, &IndexVerifierState::default(), now)?;
-    check_entries(&body.entries)
+    check_entries(body.schema_version, &body.entries)
 }
 
 /// Returns the id of the first signature that verifies from a valid,
@@ -903,7 +977,7 @@ fn valid_url(url: &str) -> bool {
 
 /// Structure of every entry. The core range is only length-bounded here: it
 /// is parsed at install time, so one unusable range never voids the document.
-fn check_entries(entries: &[IndexEntry]) -> Result<(), IndexError> {
+fn check_entries(schema_version: u64, entries: &[IndexEntry]) -> Result<(), IndexError> {
     let mut versions = BTreeSet::new();
     let mut digests = BTreeSet::new();
     let mut runtime_owner: BTreeMap<&RuntimeId, &PackageId> = BTreeMap::new();
@@ -929,14 +1003,39 @@ fn check_entries(entries: &[IndexEntry]) -> Result<(), IndexError> {
         if !digests.insert(&entry.digest) {
             return Err(reject(IndexEntryRejection::DuplicateDigest));
         }
-        if runtime_owner
-            .insert(&entry.runtime_id, &entry.package_id)
-            .is_some_and(|owner| owner != &entry.package_id)
-            || package_runtime
-                .insert(&entry.package_id, &entry.runtime_id)
-                .is_some_and(|runtime| runtime != &entry.runtime_id)
-        {
-            return Err(reject(IndexEntryRejection::IdentityConflict));
+        let kind_fits = matches!(
+            (schema_version, entry.kind, &entry.runtime_id),
+            (INDEX_SCHEMA_VERSION, None, Some(_))
+                | (
+                    INDEX_SCHEMA_VERSION_2,
+                    Some(IndexEntryKind::Runtime),
+                    Some(_)
+                )
+                | (INDEX_SCHEMA_VERSION_2, Some(IndexEntryKind::Context), None)
+        );
+        if !kind_fits {
+            return Err(reject(IndexEntryRejection::Kind));
+        }
+        let id = entry.package_id.as_str();
+        let id_fits = match entry.kind() {
+            IndexEntryKind::Runtime => !id.starts_with(OFFICIAL_CONTEXT_PACKAGE_PREFIX),
+            IndexEntryKind::Context => id
+                .strip_prefix(OFFICIAL_CONTEXT_PACKAGE_PREFIX)
+                .is_some_and(|tail| !tail.is_empty()),
+        };
+        if !id_fits {
+            return Err(reject(IndexEntryRejection::PackageIdKind));
+        }
+        if let Some(runtime_id) = &entry.runtime_id {
+            if runtime_owner
+                .insert(runtime_id, &entry.package_id)
+                .is_some_and(|owner| owner != &entry.package_id)
+                || package_runtime
+                    .insert(&entry.package_id, runtime_id)
+                    .is_some_and(|runtime| runtime != runtime_id)
+            {
+                return Err(reject(IndexEntryRejection::IdentityConflict));
+            }
         }
     }
     Ok(())
@@ -1000,11 +1099,12 @@ impl VerifiedIndex {
         self.entries.iter().any(|entry| &entry.digest == digest)
     }
 
-    /// Decides whether the index authorizes installing this package on
+    /// Decides whether the index authorizes installing this runtime package on
     /// `core` and `platform`.
     ///
     /// Takes the entry whose digest equals `digest` and applies the checks
-    /// below in order; the first failure wins. The package id must be exactly
+    /// below in order; the first failure wins. The entry must be of kind
+    /// `runtime`, and the package id must be exactly
     /// [`OFFICIAL_RUNTIME_PACKAGE_PREFIX`] plus the runtime id, which keeps an
     /// entry from claiming a release package id. A pre-release core such as
     /// `0.41.0-rc.1` does not match `>=0.40.0`, so it gets
@@ -1022,13 +1122,12 @@ impl VerifiedIndex {
         core: &Version,
         platform: &str,
     ) -> Result<(), IndexEntryRefusal> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| &entry.digest == digest)
-            .ok_or(IndexEntryRefusal::NotListed)?;
+        let entry = self.entry_of(digest)?;
+        if entry.kind() != IndexEntryKind::Runtime {
+            return Err(IndexEntryRefusal::KindMismatch);
+        }
         if package_id != &entry.package_id
-            || runtime_id != &entry.runtime_id
+            || entry.runtime_id.as_ref() != Some(runtime_id)
             || version != &entry.version
         {
             return Err(IndexEntryRefusal::IdentityMismatch);
@@ -1046,6 +1145,60 @@ impl VerifiedIndex {
         if !bound {
             return Err(IndexEntryRefusal::PackageIdBinding);
         }
+        Self::check_support(entry, core, platform)
+    }
+
+    /// Decides whether the index authorizes installing this context package on
+    /// `core` and `platform`.
+    ///
+    /// The entry whose digest equals `digest` must be of kind `context` and
+    /// carry exactly this package id and version, and the id must be
+    /// [`OFFICIAL_CONTEXT_PACKAGE_PREFIX`] plus a tail. A runtime entry never
+    /// authorizes a context package.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`IndexEntryRefusal`] of the first failed check.
+    pub fn authorize_context(
+        &self,
+        package_id: &PackageId,
+        version: &PackageVersion,
+        digest: &PackageDigest,
+        core: &Version,
+        platform: &str,
+    ) -> Result<(), IndexEntryRefusal> {
+        let entry = self.entry_of(digest)?;
+        if entry.kind() != IndexEntryKind::Context {
+            return Err(IndexEntryRefusal::KindMismatch);
+        }
+        if package_id != &entry.package_id || version != &entry.version {
+            return Err(IndexEntryRefusal::IdentityMismatch);
+        }
+        if !package_id.as_str().starts_with(OFFICIAL_NAMESPACE) {
+            return Err(IndexEntryRefusal::Namespace);
+        }
+        let bound = package_id
+            .as_str()
+            .strip_prefix(OFFICIAL_CONTEXT_PACKAGE_PREFIX)
+            .is_some_and(|tail| !tail.is_empty());
+        if !bound {
+            return Err(IndexEntryRefusal::PackageIdBinding);
+        }
+        Self::check_support(entry, core, platform)
+    }
+
+    fn entry_of(&self, digest: &PackageDigest) -> Result<&IndexEntry, IndexEntryRefusal> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.digest == digest)
+            .ok_or(IndexEntryRefusal::NotListed)
+    }
+
+    fn check_support(
+        entry: &IndexEntry,
+        core: &Version,
+        platform: &str,
+    ) -> Result<(), IndexEntryRefusal> {
         let range = parse_core_range(&entry.core).ok_or(IndexEntryRefusal::CoreRange)?;
         if !range.matches(core) {
             return Err(IndexEntryRefusal::CoreExcluded);

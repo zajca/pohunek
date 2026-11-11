@@ -95,7 +95,8 @@ fn index_bytes(signer: &str, sequence: u64, revocation_sequence: u64, revoked: &
         expires_at: sequence + 7 * DAY,
         entries: vec![IndexEntry {
             package_id: PackageId::parse("pohunek.runtime.muse").expect("package id"),
-            runtime_id: RuntimeId::parse("muse").expect("runtime id"),
+            kind: None,
+            runtime_id: Some(RuntimeId::parse("muse").expect("runtime id")),
             version: PackageVersion::parse("0.2.0").expect("version"),
             digest: PackageDigest::parse(&format!("sha256:{:064x}", 1)).expect("digest"),
             url: "https://example.test/muse.tar.zst".to_owned(),

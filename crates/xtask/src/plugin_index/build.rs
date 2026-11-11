@@ -13,9 +13,9 @@ use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 
 use package::{
-    check_index_body, parse_index_envelope, IndexBody, IndexEntry, IndexEnvelope, IndexKeyRecord,
-    PackageDigest, SignedRevocations, INDEX_SCHEMA_VERSION, MAX_INDEX_BYTES, MAX_INDEX_KEY_RECORDS,
-    OFFICIAL_SCOPE,
+    check_index_body, parse_index_envelope, IndexBody, IndexEntry, IndexEntryKind, IndexEnvelope,
+    IndexKeyRecord, PackageDigest, SignedRevocations, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
+    MAX_INDEX_BYTES, MAX_INDEX_KEY_RECORDS, OFFICIAL_SCOPE,
 };
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde::Deserialize;
@@ -49,7 +49,12 @@ const COMMIT_HEX_LEN: usize = 40;
 #[serde(deny_unknown_fields)]
 pub(super) struct EntryFile {
     pub(super) package_id: PackageId,
-    pub(super) runtime_id: RuntimeId,
+    /// `runtime` (the default) or `context`.
+    #[serde(default)]
+    pub(super) kind: Option<IndexEntryKind>,
+    /// The runtime a `runtime` entry provides; a `context` entry has none.
+    #[serde(default)]
+    pub(super) runtime_id: Option<RuntimeId>,
     pub(super) version: PackageVersion,
     pub(super) digest: PackageDigest,
     pub(super) url: String,
@@ -77,6 +82,9 @@ pub(crate) struct BuildArgs {
     pub(crate) sequence: u64,
     pub(crate) expires_at: u64,
     pub(crate) output: PathBuf,
+    /// Schema of the document: 1 lists runtime entries only, 2 also lists
+    /// context entries.
+    pub(crate) schema_version: u64,
 }
 
 fn refuse(reason: String) -> XtaskError {
@@ -283,32 +291,76 @@ fn read_entry(path: &Path) -> Result<EntryFile, XtaskError> {
         .source
         .validate(&entry.version)
         .map_err(|error| refuse(format!("`{}`: {error}", path.display())))?;
+    match (entry.kind(), &entry.runtime_id) {
+        (IndexEntryKind::Runtime, Some(_)) | (IndexEntryKind::Context, None) => {}
+        (IndexEntryKind::Runtime, None) => {
+            return Err(refuse(format!(
+                "`{}`: a runtime entry needs a runtime_id",
+                path.display()
+            )));
+        }
+        (IndexEntryKind::Context, Some(_)) => {
+            return Err(refuse(format!(
+                "`{}`: a context entry has no runtime_id",
+                path.display()
+            )));
+        }
+    }
     Ok(entry)
 }
 
-/// The signed entry of an entry file; `[source]` stays behind.
-pub(super) fn index_entry(entry: EntryFile) -> IndexEntry {
-    IndexEntry {
+impl EntryFile {
+    /// What the entry authorizes; `runtime` when the file names no kind.
+    pub(super) fn kind(&self) -> IndexEntryKind {
+        self.kind.unwrap_or(IndexEntryKind::Runtime)
+    }
+}
+
+/// The signed entry of an entry file in a document of `schema_version`;
+/// `[source]` stays behind. A schema 1 entry has no `kind`.
+///
+/// # Errors
+///
+/// Returns a usage error for a context entry in a schema 1 document, which
+/// cannot express it.
+pub(super) fn index_entry(entry: EntryFile, schema_version: u64) -> Result<IndexEntry, XtaskError> {
+    let kind = entry.kind();
+    if schema_version == INDEX_SCHEMA_VERSION && kind == IndexEntryKind::Context {
+        return Err(refuse(format!(
+            "`{}` is a context entry, which a schema {INDEX_SCHEMA_VERSION} index cannot list; build with --schema-version {INDEX_SCHEMA_VERSION_2}",
+            entry.package_id
+        )));
+    }
+    Ok(IndexEntry {
         package_id: entry.package_id,
+        kind: (schema_version == INDEX_SCHEMA_VERSION_2).then_some(kind),
         runtime_id: entry.runtime_id,
         version: entry.version,
         digest: entry.digest,
         url: entry.url,
         platforms: entry.platforms,
         core: entry.core,
-    }
+    })
 }
 
-/// The signed entry of the single entry file `path`, checked like `index
-/// build` checks an entry of a tree.
+/// The signed entry of the single entry file `path` in a schema 2 document,
+/// checked like `index build` checks an entry of a tree.
 pub(crate) fn entry_of(path: &Path) -> Result<IndexEntry, XtaskError> {
-    read_entry(path).map(index_entry)
+    index_entry(read_entry(path)?, INDEX_SCHEMA_VERSION_2)
 }
 
 /// The signed entries of the tree at `root`, in `(package_id, version)` order,
-/// each checked like `index build` checks it.
-pub(super) fn entries_of(root: &Path) -> Result<Vec<IndexEntry>, XtaskError> {
-    Ok(read_tree(root)?.into_iter().map(index_entry).collect())
+/// each checked like `index build` checks it, as entries of a document of
+/// `schema_version`. A schema 1 document lists the runtime entries only: it
+/// cannot express a context entry, so the tree's context entries stay out.
+pub(super) fn entries_of(root: &Path, schema_version: u64) -> Result<Vec<IndexEntry>, XtaskError> {
+    read_tree(root)?
+        .into_iter()
+        .filter(|entry| {
+            schema_version != INDEX_SCHEMA_VERSION || entry.kind() == IndexEntryKind::Runtime
+        })
+        .map(|entry| index_entry(entry, schema_version))
+        .collect()
 }
 
 /// Builds the unsigned index document and writes it to `args.output`.
@@ -323,7 +375,12 @@ pub(crate) fn build(args: &BuildArgs, now: u64) -> Result<usize, XtaskError> {
             "--key-record must be given 1 to {MAX_INDEX_KEY_RECORDS} times"
         )));
     }
-    let entries = entries_of(&args.entries)?;
+    if !package::SUPPORTED_INDEX_SCHEMA_VERSIONS.contains(&args.schema_version) {
+        return Err(refuse(format!(
+            "--schema-version must be {INDEX_SCHEMA_VERSION} or {INDEX_SCHEMA_VERSION_2}"
+        )));
+    }
+    let entries = entries_of(&args.entries, args.schema_version)?;
 
     let mut key_records = Vec::with_capacity(args.key_records.len());
     for path in &args.key_records {
@@ -342,9 +399,9 @@ pub(crate) fn build(args: &BuildArgs, now: u64) -> Result<usize, XtaskError> {
         })?;
 
     let envelope = IndexEnvelope {
-        schema_version: INDEX_SCHEMA_VERSION,
+        schema_version: args.schema_version,
         index: IndexBody {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version: args.schema_version,
             scope: OFFICIAL_SCOPE.to_owned(),
             sequence: args.sequence,
             expires_at: args.expires_at,

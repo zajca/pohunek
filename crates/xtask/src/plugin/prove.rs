@@ -129,6 +129,11 @@ struct Outcome {
 /// platform, or whose evidence path exists, writes no evidence.
 pub(crate) fn prove(args: &ProveArgs) -> Result<String, XtaskError> {
     let entry = entry_of(&args.entry)?;
+    if entry.kind() == package::IndexEntryKind::Context {
+        return Err(XtaskError::Usage(
+            "plugin prove proves runtime entries; a context entry is proved by installing it through the index with `pohunek plugin install`".to_owned(),
+        ));
+    }
     let platform = host_platform().ok_or_else(|| {
         XtaskError::Usage("this platform has no plugin index platform name".to_owned())
     })?;
@@ -236,7 +241,7 @@ fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), Stri
     let identity =
         archive_identity(&verified, Path::new("archive")).map_err(|error| error.to_string())?;
     if identity.package_id != entry.package_id
-        || identity.runtime_id != entry.runtime_id
+        || Some(&identity.runtime_id) != entry.runtime_id.as_ref()
         || identity.version != entry.version
     {
         return Err("the archive descriptor differs from the entry's identity".to_owned());
@@ -359,7 +364,8 @@ fn inspect(host: &mut Host, entry: &package::IndexEntry) -> Result<(), String> {
     let output = host.cli(&["plugin", "inspect", entry.package_id.as_str(), "--json"])?;
     let inspected = json_result(&output, "`pohunek plugin inspect`")?;
     let package = &inspected["package"];
-    if package["runtime_id"] != entry.runtime_id.as_str()
+    let runtime = entry.runtime_id.as_ref().map(protocol::RuntimeId::as_str);
+    if package["runtime_id"].as_str() != runtime
         || !package["fault"].is_null()
         || package["digest"] != entry.digest.as_str()
     {

@@ -3191,12 +3191,9 @@ fn host_capabilities_json_shape_roundtrips() {
     let caps = HostCapabilities {
         daemon_version: "0.1.0".to_owned(),
         protocol_version: PROTOCOL_VERSION,
-        supported_agents: vec![
-            "shell".to_owned(),
-            "codex".to_owned(),
-            "claude".to_owned(),
-            "hermes".to_owned(),
-        ],
+        supported_agents: ["shell", "codex", "claude", "hermes"]
+            .map(str::to_owned)
+            .to_vec(),
         runtimes: vec![
             AgentRuntime {
                 agent: "shell".to_owned(),
@@ -3250,6 +3247,7 @@ fn host_capabilities_json_shape_roundtrips() {
         package_install_commands_supported: true,
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
+        package_install_index_context_supported: false,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3313,6 +3311,39 @@ fn the_index_install_flag_is_on_the_wire_only_when_true() {
     caps.package_install_index_supported = true;
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
     assert_eq!(value["package_install_index_supported"], json!(true));
+    assert_eq!(line_roundtrip(&caps), caps);
+}
+
+/// The context-index flag is additive: a host that predates it decodes as
+/// `false`, `false` is omitted on the wire, and `true` is serialized.
+#[test]
+fn the_context_index_flag_is_additive() {
+    let mut caps: HostCapabilities = serde_json::from_value(json!({
+        "daemon_version": "0.1.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_agents": [],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "terminal_read_supported": false,
+        "output_read_supported": false,
+        "session_wait_supported": false,
+        "package_install_index_supported": true
+    }))
+    .expect("a host that predates the context flag decodes");
+    assert!(caps.package_install_index_supported);
+    assert!(!caps.package_install_index_context_supported);
+    let value = serde_json::to_value(&caps).expect("serialize host capabilities");
+    assert!(value
+        .get("package_install_index_context_supported")
+        .is_none());
+
+    caps.package_install_index_context_supported = true;
+    let value = serde_json::to_value(&caps).expect("serialize host capabilities");
+    assert_eq!(
+        value["package_install_index_context_supported"],
+        json!(true)
+    );
     assert_eq!(line_roundtrip(&caps), caps);
 }
 
@@ -3380,6 +3411,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.package_install_index_supported,
         "a host that omits the index flag rejects the index trust kind"
+    );
+    assert!(
+        !caps.package_install_index_context_supported,
+        "a host that omits the context flag cannot authorize a context package"
     );
     assert!(
         !caps.package_bind_profile_expected_supported,

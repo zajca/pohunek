@@ -1422,6 +1422,77 @@ impl Tooling {
     }
 }
 
+/// A context entry file; `digit` makes the digest unique.
+fn context_entry_text(name: &str, digit: char) -> String {
+    admission_entry(
+        "x",
+        &format!("pohunek.context.{name}"),
+        "0.42.0",
+        digit,
+        ">=0.42.0",
+    )
+    .replace("runtime_id = \"x\"\n", "kind = \"context\"\n")
+}
+
+#[test]
+fn a_tree_with_context_entries_builds_in_both_schemas_and_admits_more_than_one() {
+    let tooling = Tooling::new();
+    let tree = tooling.tree("context-tree");
+    let file = tree.join("official/pohunek.context.assistant/0.42.0.toml");
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&file, context_entry_text("assistant", '4')).expect("context entry");
+
+    let v1 = tooling.path("context-v1.json");
+    let at = now();
+    let mut args = tooling.build_args(&tree, at, at + 7 * DAY, &v1);
+    args.extend(["--schema-version".to_owned(), "1".to_owned()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    tooling.xtask_ok(&args);
+    let v1_envelope = read_envelope(&v1);
+    assert!(
+        v1_envelope
+            .index
+            .entries
+            .iter()
+            .all(|entry| entry.kind.is_none() && entry.runtime_id.is_some()),
+        "a schema 1 document lists runtime entries only"
+    );
+
+    let v2 = tooling.path("context-v2.json");
+    let mut args = tooling.build_args(&tree, at, at + 7 * DAY, &v2);
+    args.extend(["--schema-version".to_owned(), "2".to_owned()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    tooling.xtask_ok(&args);
+    assert_eq!(
+        read_envelope(&v2).index.entries.len(),
+        v1_envelope.index.entries.len() + 1,
+        "a schema 2 document also lists the context entry"
+    );
+
+    let added = tooling.path("added-context");
+    let added_file = added.join("official/pohunek.context.second/0.42.0.toml");
+    std::fs::create_dir_all(added_file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&added_file, context_entry_text("second", '5')).expect("added entry");
+    let result = tooling.xtask(&[
+        "index",
+        "check-entry",
+        "--entries",
+        s(&added),
+        "--existing",
+        s(&tree),
+        "--core-version",
+        "0.42.0",
+        "--stage",
+        "schema",
+    ]);
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
 #[test]
 fn check_entry_accepts_a_new_release_and_prints_only_validated_fields() {
     let tooling = Tooling::new();

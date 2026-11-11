@@ -1,0 +1,3 @@
+## Unreleased (2026-11-12, plugin index context entries, #2134)
+
+- The plugin index has a schema 2 (`official-index-v2.json`, its own signature domain) whose entries carry a `kind` of `runtime` or `context`; `context` entries authorize context packages (`pohunek.context.<name>`, no runtime or commands) under a verifier rule with no cross-kind authorization. Schema 1 and its file stay as they are for hosts that read only schema 1. `HostCapabilities` gains `package_install_index_context_supported`, `pohunek plugin install pohunek.context.<name>` resolves from the schema 2 index, and the release daemon's gaps carry an optional `profile`. See [Plugin index](concepts/runtime-catalog.md#plugin-index).

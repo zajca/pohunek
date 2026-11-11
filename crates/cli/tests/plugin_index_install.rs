@@ -25,8 +25,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use package::{
     build_archive, index_key_record_signing_message, index_signing_message, read_archive,
     revocation_signing_message, ArchiveEntry, CatalogSignature, IndexBody, IndexChannel,
-    IndexEntry, IndexEnvelope, IndexKeyRecord, Limits, PackageDigest, RevocationBody,
-    SignedRevocations, INDEX_SCHEMA_VERSION,
+    IndexEntry, IndexEntryKind, IndexEnvelope, IndexKeyRecord, Limits, PackageDigest,
+    RevocationBody, SignedRevocations, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
 };
 use pohunek_test_support::bin_exe;
 use pohunek_test_support::catalog::{anchor_for, host_platform, key_id, test_key, ANY_CORE};
@@ -175,7 +175,8 @@ impl Listing {
     fn entry(&self) -> IndexEntry {
         IndexEntry {
             package_id: PackageId::parse(PACKAGE_ID).expect("package id"),
-            runtime_id: RuntimeId::parse(RUNTIME).expect("runtime id"),
+            kind: None,
+            runtime_id: Some(RuntimeId::parse(RUNTIME).expect("runtime id")),
             version: PackageVersion::parse(self.version).expect("version"),
             digest: self.archive.digest.clone(),
             url: self.url.clone(),
@@ -219,8 +220,25 @@ impl Keys {
 
     /// An index document signed by `signer` at `sequence` listing `entries`.
     fn document(&self, signer: &SigningKey, sequence: u64, entries: Vec<IndexEntry>) -> Vec<u8> {
+        self.document_of(INDEX_SCHEMA_VERSION, signer, sequence, entries)
+    }
+
+    /// A schema 2 document signed by K, current as of now.
+    fn signed_v2(&self, entries: Vec<IndexEntry>) -> Vec<u8> {
+        self.document_of(INDEX_SCHEMA_VERSION_2, &self.key, now(), entries)
+    }
+
+    /// An index document of `schema` signed by `signer` at `sequence`. The
+    /// embedded revocation list keeps its own schema 1 format.
+    fn document_of(
+        &self,
+        schema: u64,
+        signer: &SigningKey,
+        sequence: u64,
+        entries: Vec<IndexEntry>,
+    ) -> Vec<u8> {
         let body = IndexBody {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version: schema,
             scope: "official".to_owned(),
             sequence,
             expires_at: sequence + INDEX_LIFETIME,
@@ -234,7 +252,7 @@ impl Keys {
         };
         let revocation_message = revocation_signing_message(&revocations).expect("revocations");
         serde_json::to_vec(&IndexEnvelope {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version: schema,
             index: body,
             key_records: vec![self.record(&self.key)],
             signatures: vec![CatalogSignature {
@@ -1075,5 +1093,227 @@ async fn an_index_file_authorizes_install_and_update_of_a_local_archive() {
     assert!(
         rig.server.requests().is_empty(),
         "no network for a local archive"
+    );
+}
+
+/// Package id of the indexed context fixture package.
+const CONTEXT_PACKAGE_ID: &str = "pohunek.context.idxctx";
+
+/// A context package archive: a descriptor that exports a directory of files
+/// and nothing else.
+fn context_archive(version: &str) -> Archive {
+    let descriptor = format!(
+        "schema = 1\nid = \"{CONTEXT_PACKAGE_ID}\"\nversion = \"{version}\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n"
+    );
+    let entries = [
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: descriptor.into_bytes(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "bundle/index.md".to_owned(),
+            contents: b"# Index\n".to_vec(),
+            executable: false,
+        },
+    ];
+    let bytes = build_archive(&entries, &Limits::DEFAULT).expect("the archive builds");
+    let digest = read_archive(&bytes, &Limits::DEFAULT)
+        .expect("the archive reads")
+        .digest()
+        .clone();
+    Archive { bytes, digest }
+}
+
+impl Rig {
+    /// A `context` entry for `archive` served at `/<version>.tar.zst`.
+    fn context_entry(&self, archive: &Archive, version: &str) -> IndexEntry {
+        IndexEntry {
+            package_id: PackageId::parse(CONTEXT_PACKAGE_ID).expect("package id"),
+            kind: Some(IndexEntryKind::Context),
+            runtime_id: None,
+            version: PackageVersion::parse(version).expect("version"),
+            digest: archive.digest.clone(),
+            url: self.server.url(&archive_path(version)),
+            platforms: vec![host_platform()],
+            core: ANY_CORE.to_owned(),
+        }
+    }
+
+    /// Serves `entries` as a schema 2 index and `archive` at its version path.
+    fn publish_v2(&self, entries: Vec<IndexEntry>, archives: &[(&str, &Archive)]) {
+        self.server
+            .set(INDEX_PATH, Route::Body(self.keys.signed_v2(entries)));
+        for (version, archive) in archives {
+            self.server
+                .set(&archive_path(version), Route::Body(archive.bytes.clone()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_context_package_installs_through_a_schema_2_index() {
+    let rig = Rig::start().await;
+    let archive = context_archive("0.1.0");
+    let entry = rig.context_entry(&archive, "0.1.0");
+    rig.publish_v2(vec![entry], &[("0.1.0", &archive)]);
+
+    let (code, document) = rig.install(CONTEXT_PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(document["ok"]["status"], "installed", "{document}");
+    let packages = rig.install.packages().await;
+    assert_eq!(packages.len(), 1, "{packages:?}");
+    assert_eq!(packages[0]["package"]["id"], CONTEXT_PACKAGE_ID);
+    assert_eq!(packages[0]["origin"], "official");
+    assert_eq!(packages[0]["selected"], true);
+    assert!(rig.staging_leftovers().is_empty(), "staging is removed");
+}
+
+#[tokio::test]
+async fn a_context_package_is_not_resolved_from_a_schema_1_index() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+
+    let (code, document) = rig.install(CONTEXT_PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "plugin_index_package_not_found");
+    rig.assert_nothing_installed().await;
+}
+
+#[tokio::test]
+async fn a_runtime_entry_never_authorizes_a_context_archive() {
+    let rig = Rig::start().await;
+    let context = context_archive("0.1.0");
+    // A runtime entry that lists the context archive's digest.
+    let listing = rig.listing("0.1.0");
+    let mut entry = listing.entry();
+    entry.kind = Some(IndexEntryKind::Runtime);
+    entry.digest = context.digest.clone();
+    rig.publish_v2(vec![entry], &[("0.1.0", &context)]);
+
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "package_untrusted", "{document}");
+    rig.assert_nothing_installed().await;
+}
+
+#[tokio::test]
+async fn a_context_entry_never_authorizes_a_runtime_archive() {
+    let rig = Rig::start().await;
+    let runtime = archive("0.1.0");
+    let mut entry = rig.context_entry(&runtime, "0.1.0");
+    entry.digest = runtime.digest.clone();
+    rig.publish_v2(vec![entry], &[("0.1.0", &runtime)]);
+
+    let (code, document) = rig.install(CONTEXT_PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "package_untrusted", "{document}");
+    rig.assert_nothing_installed().await;
+}
+
+#[tokio::test]
+async fn a_schema_2_index_still_installs_runtime_packages() {
+    let rig = Rig::start().await;
+    let listing = rig.listing("0.1.0");
+    let mut entry = listing.entry();
+    entry.kind = Some(IndexEntryKind::Runtime);
+    rig.publish_v2(vec![entry], &[("0.1.0", &listing.archive)]);
+
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(rig.install.packages().await.len(), 1);
+}
+
+/// Serves `HostCapabilities` of a daemon that reads the plugin index but not
+/// its context entries, on `socket`, until the test process ends.
+fn serve_daemon_without_the_context_flag(socket: &std::path::Path) {
+    use protocol::{Request, Response, PROTOCOL_VERSION};
+
+    let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind the daemon socket");
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let request: Request =
+                        serde_json::from_str(line.trim_end()).expect("parse a request");
+                    let result = match request.method() {
+                        protocol::method::DAEMON_HEALTH => serde_json::json!({
+                            "status": "ok",
+                            "daemon_version": "fixture",
+                            "protocol_version": PROTOCOL_VERSION.get()
+                        }),
+                        protocol::method::HOST_INSPECT => serde_json::json!({
+                            "daemon_version": "fixture",
+                            "protocol_version": PROTOCOL_VERSION.get(),
+                            "supported_agents": [],
+                            "runtimes": [],
+                            "git_available": false,
+                            "worktree_supported": false,
+                            "terminal_read_supported": false,
+                            "output_read_supported": false,
+                            "session_wait_supported": false,
+                            "package_install_index_supported": true
+                        }),
+                        other => panic!("the CLI sent an unexpected request: {other}"),
+                    };
+                    let response = Response::ok(PROTOCOL_VERSION, request.id(), result)
+                        .expect("valid fixture response");
+                    writeln!(
+                        reader.get_mut(),
+                        "{}",
+                        serde_json::to_string(&response).expect("serialize the response")
+                    )
+                    .expect("write the fixture response");
+                }
+            });
+        }
+    });
+}
+
+/// A daemon that reads the index but not context entries refuses a context
+/// install before the CLI fetches anything.
+#[test]
+fn a_daemon_without_the_context_flag_refuses_a_context_install_before_any_fetch() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let env = pohunek_test_support::env::TestEnv::new().expect("private environment");
+    let runtime = env.runtime_dir().join("pohunek");
+    fs::create_dir(&runtime).expect("create the socket directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+        .expect("make the socket directory private");
+    serve_daemon_without_the_context_flag(&runtime.join("daemon.sock"));
+    let server = Server::start();
+
+    let output = env
+        .command(bin_exe("pohunek"))
+        .args([
+            "plugin",
+            "install",
+            CONTEXT_PACKAGE_ID,
+            "--index-url",
+            &server.url(INDEX_PATH),
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("run pohunek plugin install");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(
+        err_code(&document),
+        "plugin_index_context_unsupported",
+        "{document}"
+    );
+    assert!(
+        server.requests().is_empty(),
+        "nothing is fetched: {:?}",
+        server.requests()
     );
 }

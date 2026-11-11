@@ -117,13 +117,15 @@ pub use platform::host_platform;
 pub use plugin_index::{
     check_index_body, index_document_signing_message, index_key_record_signing_message,
     index_signing_message, parse_index_envelope, revocation_signing_message, verify_index,
-    verify_key_record_document, verify_revocation_document, IndexBody, IndexEntry,
+    verify_key_record_document, verify_revocation_document, IndexBody, IndexEntry, IndexEntryKind,
     IndexEntryRefusal, IndexEntryRejection, IndexEnvelope, IndexError, IndexKeyRecord, IndexLimit,
     IndexVerifierState, RevocationBody, SignedRevocations, VerifiedIndex,
-    INDEX_REFUSED_RUNTIME_IDS, INDEX_SCHEMA_VERSION, MAX_ENTRY_URL_BYTES, MAX_INDEX_BYTES,
-    MAX_INDEX_ENTRIES, MAX_INDEX_KEY_RECORDS, MAX_INDEX_KEY_WINDOW_SECONDS,
+    INDEX_REFUSED_RUNTIME_IDS, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2, MAX_ENTRY_URL_BYTES,
+    MAX_INDEX_BYTES, MAX_INDEX_ENTRIES, MAX_INDEX_KEY_RECORDS, MAX_INDEX_KEY_WINDOW_SECONDS,
     MAX_INDEX_LIFETIME_SECONDS, MAX_INDEX_SEQUENCE_SKEW_SECONDS, MAX_INDEX_SIGNATURES,
-    OFFICIAL_INDEX_FILE_NAME, OFFICIAL_NAMESPACE, OFFICIAL_RUNTIME_PACKAGE_PREFIX, OFFICIAL_SCOPE,
+    OFFICIAL_CONTEXT_PACKAGE_PREFIX, OFFICIAL_INDEX_FILE_NAME, OFFICIAL_INDEX_FILE_NAME_V2,
+    OFFICIAL_NAMESPACE, OFFICIAL_RUNTIME_PACKAGE_PREFIX, OFFICIAL_SCOPE,
+    SUPPORTED_INDEX_SCHEMA_VERSIONS,
 };
 pub use protocol::PackageDigest;
 pub use release::{

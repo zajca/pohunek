@@ -397,7 +397,7 @@ daemon method in this API version. It returns `daemon/method_not_found`.
 `session_new_branch_source_supported`,
 `session_new_input_ack_supported`,
 `session_new_secret_env_supported`, `session_new_request_id_supported`,
-`session_new_context_pin_supported`, `package_install_commands_supported`, `package_install_index_supported`, and `package_bind_profile_expected_supported` independently. Clients must check the relevant
+`session_new_context_pin_supported`, `package_install_commands_supported`, `package_install_index_supported`, `package_install_index_context_supported`, and `package_bind_profile_expected_supported` independently. Clients must check the relevant
 flag instead of assuming that a reachable daemon or an attach-capable session
 supports every observation method. A daemon that predates `session.wait_turn`
 omits `session_wait_turn_supported`, which decodes as `false`; it answers the
@@ -504,7 +504,13 @@ Shared payloads:
   `{"kind":"index","index_path":...}` names a signed plugin index at an
   absolute path on the daemon host. A client sends the `index` kind only to a
   daemon that reports `package_install_index_supported`; an older daemon
-  rejects it at params decoding.
+  rejects it at params decoding. A plugin index of schema 2 may also authorize a
+  context package (`pohunek.context.*`, no runtime and no commands) through the
+  same kind; a client resolves one only against a daemon that reports
+  `package_install_index_context_supported`, because a daemon that reads schema 1
+  only refuses the document, and the daemon authorizes a context archive only
+  through a `context` entry and a runtime archive only through a `runtime`
+  entry.
 
 | Method | Params | Result | Behavior |
 |---|---|---|---|
@@ -2949,8 +2955,13 @@ without an installed `service.toml` is planned with the launch environment `serv
 install` gives its daemon: the default allowlist over the process environment. An
 existing service file that is unreadable or malformed still refuses, and a plain
 dry run still refuses a missing file. Its
-`gaps` list, one per runtime with `runtime`, `code` and a `detail` that names the
-one next step: `agent_not_on_search_path` (the program is not on the search path;
+`gaps` list, one per runtime with `runtime`, `code`, a `detail` that names the
+one next step, and, for a gap about a host profile, that profile's name in
+`profile` (absent for a gap about the runtime or its default home). Two kinds of
+gap name a profile: the config-home gaps of the profile, and the gap that the
+profile cannot be served by the package it names, whose `code` is then the
+profile resolver's own error code. `pohunek setup --hooks` uses `profile` to
+list only the gaps of selected homes: `agent_not_on_search_path` (the program is not on the search path;
 the runtime is planned only when the host uses it), `config_home_missing` (the
 declared config home does not exist; the package is still planned and the step
 never creates the home), `config_home_is_symlink` (the config home is a symlink; hooks

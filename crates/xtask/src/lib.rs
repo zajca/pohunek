@@ -816,6 +816,11 @@ enum IndexAction {
             conflicts_with_all = ["revocations", "key_record", "sequence", "expires_at", "output"]
         )]
         print_source: bool,
+        /// Schema of the document: 1 lists runtime entries only and is read by
+        /// every release since 0.40; 2 also lists `context` entries and is read
+        /// from 0.42.
+        #[arg(long, value_name = "VERSION", default_value_t = 1)]
+        schema_version: u64,
         /// Signed revocation list to embed.
         #[arg(long, value_name = "FILE", required_unless_present = "print_source")]
         revocations: Option<PathBuf>,
@@ -1260,6 +1265,7 @@ fn run_index_build(action: IndexAction) -> Result<(), XtaskError> {
     let IndexAction::Build {
         entries,
         print_source,
+        schema_version,
         revocations,
         key_record,
         sequence,
@@ -1289,6 +1295,7 @@ fn run_index_build(action: IndexAction) -> Result<(), XtaskError> {
                 sequence,
                 expires_at,
                 output,
+                schema_version,
             },
             catalog::unix_now()?,
         )?;

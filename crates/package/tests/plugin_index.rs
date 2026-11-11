@@ -13,13 +13,13 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use package::{
     index_key_record_signing_message, index_signing_message, parse_index_envelope,
     revocation_signing_message, sign_catalog, verify_catalog, verify_index, BinarySet, Catalog,
-    CatalogError, CatalogSignature, IndexBody, IndexEntry, IndexEntryRefusal, IndexEntryRejection,
-    IndexEnvelope, IndexError, IndexKeyRecord, IndexLimit, IndexVerifierState, KeyId,
-    PackageDigest, Release, RevocationBody, RootKey, Sha256Digest, SignedRevocations, TrustAnchor,
-    CATALOG_SCHEMA_VERSION, INDEX_SCHEMA_VERSION, MAX_ENTRY_URL_BYTES, MAX_INDEX_BYTES,
-    MAX_INDEX_ENTRIES, MAX_INDEX_KEY_RECORDS, MAX_INDEX_KEY_WINDOW_SECONDS,
-    MAX_INDEX_LIFETIME_SECONDS, MAX_INDEX_SEQUENCE_SKEW_SECONDS, MAX_INDEX_SIGNATURES,
-    MAX_REVOKED_KEYS,
+    CatalogError, CatalogSignature, IndexBody, IndexEntry, IndexEntryKind, IndexEntryRefusal,
+    IndexEntryRejection, IndexEnvelope, IndexError, IndexKeyRecord, IndexLimit, IndexVerifierState,
+    KeyId, PackageDigest, Release, RevocationBody, RootKey, Sha256Digest, SignedRevocations,
+    TrustAnchor, CATALOG_SCHEMA_VERSION, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
+    MAX_ENTRY_URL_BYTES, MAX_INDEX_BYTES, MAX_INDEX_ENTRIES, MAX_INDEX_KEY_RECORDS,
+    MAX_INDEX_KEY_WINDOW_SECONDS, MAX_INDEX_LIFETIME_SECONDS, MAX_INDEX_SEQUENCE_SKEW_SECONDS,
+    MAX_INDEX_SIGNATURES, MAX_REVOKED_KEYS,
 };
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde_json::Value;
@@ -68,7 +68,8 @@ fn digest(index: u64) -> PackageDigest {
 fn entry(package: &str, runtime: &str, version: &str, digest_index: u64) -> IndexEntry {
     IndexEntry {
         package_id: PackageId::parse(package).expect("package id"),
-        runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
+        kind: None,
+        runtime_id: Some(RuntimeId::parse(runtime).expect("runtime id")),
         version: PackageVersion::parse(version).expect("version"),
         digest: digest(digest_index),
         url: format!("https://example.test/{package}-{version}.tar.zst"),
@@ -138,6 +139,8 @@ struct Fixture {
     records: Vec<IndexKeyRecord>,
     signatures: Vec<CatalogSignature>,
     revocations: SignedRevocations,
+    /// The schema version the envelope declares.
+    envelope_schema: u64,
 }
 
 impl Fixture {
@@ -155,6 +158,7 @@ impl Fixture {
             records: vec![record(&r, &k, "official", KEY_START, KEY_END)],
             signatures: vec![sign_body(&k, &body)],
             revocations: revocations(&r, 1, Vec::new()),
+            envelope_schema: INDEX_SCHEMA_VERSION,
             c: signing_key("ci-root"),
             k2: signing_key("index-key-2"),
             body,
@@ -185,9 +189,18 @@ impl Fixture {
         self
     }
 
+    /// Turns the document into a schema 2 one listing `entries`, re-signed.
+    fn schema_2(mut self, entries: Vec<IndexEntry>) -> Self {
+        self.envelope_schema = INDEX_SCHEMA_VERSION_2;
+        self.with_body(|body| {
+            body.schema_version = INDEX_SCHEMA_VERSION_2;
+            body.entries = entries;
+        })
+    }
+
     fn envelope(&self) -> IndexEnvelope {
         IndexEnvelope {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version: self.envelope_schema,
             index: self.body.clone(),
             key_records: self.records.clone(),
             signatures: self.signatures.clone(),
@@ -873,7 +886,7 @@ fn another_schema_version_is_unsupported_in_each_member() {
         "/revocations/revocations/schema_version",
     ] {
         let other = mutate(&bytes, |value| {
-            *value.pointer_mut(pointer).unwrap() = Value::from(2);
+            *value.pointer_mut(pointer).unwrap() = Value::from(3);
         });
         assert_eq!(
             verify(&other, &endorser).unwrap_err(),
@@ -1134,9 +1147,11 @@ fn a_catalog_is_not_an_index() {
     let signed = sign_catalog(catalog, &fixture.r).unwrap();
     let bytes = serde_json::to_vec(&signed).unwrap();
 
+    // The catalog's schema version is also an index schema version; its shape
+    // and its signature domain are not an index's.
     assert_eq!(
         verify(&bytes, &fixture.endorser()).unwrap_err(),
-        IndexError::UnsupportedSchemaVersion
+        IndexError::Schema
     );
 }
 
@@ -1147,7 +1162,7 @@ fn authorize(
 ) -> Result<(), IndexEntryRefusal> {
     verified.authorize(
         &entry.package_id,
-        &entry.runtime_id,
+        entry.runtime_id.as_ref().expect("a runtime entry"),
         &entry.version,
         &entry.digest,
         &semver::Version::parse(core).unwrap(),
@@ -1308,7 +1323,7 @@ fn refused_runtime_ids_are_never_authorized() {
             authorize(&verified, refused_entry, "0.40.0"),
             Err(IndexEntryRefusal::RuntimeRefused),
             "{}",
-            refused_entry.runtime_id
+            refused_entry.runtime_id.as_ref().expect("a runtime entry")
         );
     }
 }
@@ -1397,5 +1412,161 @@ fn a_catalog_signature_under_the_index_domain_does_not_verify_as_a_catalog() {
     assert_eq!(
         verify_catalog(&serde_json::to_vec(&forged).unwrap(), &anchor, NOW, None).unwrap_err(),
         CatalogError::BadSignature
+    );
+}
+
+// --- schema 2: the `context` entry kind -------------------------------------
+
+fn context_entry(package: &str, version: &str, digest_index: u64) -> IndexEntry {
+    IndexEntry {
+        package_id: PackageId::parse(package).expect("package id"),
+        kind: Some(IndexEntryKind::Context),
+        runtime_id: None,
+        version: PackageVersion::parse(version).expect("version"),
+        digest: digest(digest_index),
+        url: format!("https://example.test/{package}-{version}.tar.zst"),
+        platforms: vec![PLATFORM.to_owned()],
+        core: ">=0.42.0".to_owned(),
+    }
+}
+
+fn kinded(mut entry: IndexEntry) -> IndexEntry {
+    entry.kind = Some(IndexEntryKind::Runtime);
+    entry
+}
+
+fn assistant() -> IndexEntry {
+    context_entry("pohunek.context.assistant", "1.0.0", 7)
+}
+
+fn authorize_context(
+    verified: &package::VerifiedIndex,
+    entry: &IndexEntry,
+    core: &str,
+) -> Result<(), IndexEntryRefusal> {
+    verified.authorize_context(
+        &entry.package_id,
+        &entry.version,
+        &entry.digest,
+        &semver::Version::parse(core).unwrap(),
+        PLATFORM,
+    )
+}
+
+#[test]
+fn a_schema_2_index_lists_runtime_and_context_entries() {
+    let fixture = Fixture::new().schema_2(vec![kinded(muse()), assistant()]);
+    let verified = verify_fixture(&fixture).expect("a schema 2 index verifies");
+
+    assert_eq!(verified.entries().len(), 2);
+    assert_eq!(authorize_context(&verified, &assistant(), "0.42.0"), Ok(()));
+    assert_eq!(
+        authorize_context(&verified, &assistant(), "0.41.0"),
+        Err(IndexEntryRefusal::CoreExcluded)
+    );
+    assert_eq!(authorize(&verified, &muse(), "0.42.0"), Ok(()));
+}
+
+#[test]
+fn no_entry_kind_authorizes_the_other() {
+    let fixture = Fixture::new().schema_2(vec![kinded(muse()), assistant()]);
+    let verified = verify_fixture(&fixture).expect("a schema 2 index verifies");
+
+    // The runtime entry's digest under the context rule, and the reverse.
+    let mut as_context = assistant();
+    as_context.digest = muse().digest;
+    assert_eq!(
+        authorize_context(&verified, &as_context, "0.42.0"),
+        Err(IndexEntryRefusal::KindMismatch)
+    );
+    let mut as_runtime = muse();
+    as_runtime.digest = assistant().digest;
+    assert_eq!(
+        authorize(&verified, &as_runtime, "0.42.0"),
+        Err(IndexEntryRefusal::KindMismatch)
+    );
+}
+
+#[test]
+fn entry_kind_and_runtime_id_must_fit_the_schema() {
+    // A schema 1 entry has no kind.
+    let mut kinded_v1 = muse();
+    kinded_v1.kind = Some(IndexEntryKind::Runtime);
+    let fixture = Fixture::new().with_body(|body| body.entries = vec![kinded_v1]);
+    assert_eq!(
+        error_of(&fixture),
+        IndexError::Entry {
+            index: 0,
+            reason: IndexEntryRejection::Kind
+        }
+    );
+
+    // A schema 2 entry has one.
+    let fixture = Fixture::new().schema_2(vec![muse()]);
+    assert_eq!(
+        error_of(&fixture),
+        IndexError::Entry {
+            index: 0,
+            reason: IndexEntryRejection::Kind
+        }
+    );
+
+    // A context entry has no runtime id, a runtime entry has one.
+    let mut context_with_runtime = assistant();
+    context_with_runtime.runtime_id = Some(RuntimeId::parse("assistant").expect("runtime id"));
+    let mut runtime_without = kinded(muse());
+    runtime_without.runtime_id = None;
+    for bad in [context_with_runtime, runtime_without] {
+        let fixture = Fixture::new().schema_2(vec![bad]);
+        assert_eq!(
+            error_of(&fixture),
+            IndexError::Entry {
+                index: 0,
+                reason: IndexEntryRejection::Kind
+            }
+        );
+    }
+}
+
+#[test]
+fn the_package_id_prefix_belongs_to_the_entry_kind() {
+    let context_under_runtime_prefix = context_entry("pohunek.runtime.assistant", "1.0.0", 7);
+    let context_without_tail = context_entry("pohunek.context.", "1.0.0", 8);
+    let runtime_under_context_prefix = kinded(entry("pohunek.context.muse", "muse", "0.2.0", 9));
+    for bad in [
+        context_under_runtime_prefix,
+        context_without_tail,
+        runtime_under_context_prefix,
+    ] {
+        let fixture = Fixture::new().schema_2(vec![bad]);
+        assert_eq!(
+            error_of(&fixture),
+            IndexError::Entry {
+                index: 0,
+                reason: IndexEntryRejection::PackageIdKind
+            }
+        );
+    }
+}
+
+#[test]
+fn a_schema_1_signature_never_verifies_a_schema_2_body() {
+    let fixture = Fixture::new();
+    let v1_signature = fixture.signatures.clone();
+    let fixture = fixture
+        .schema_2(vec![kinded(muse())])
+        .with_signatures(v1_signature);
+
+    assert_eq!(error_of(&fixture), IndexError::BadSignature);
+}
+
+#[test]
+fn a_schema_3_document_is_unsupported() {
+    let bytes = mutate(&Fixture::new().bytes(), |value| {
+        value["schema_version"] = Value::from(3);
+    });
+    assert_eq!(
+        verify(&bytes, &Fixture::new().endorser()).expect_err("schema 3"),
+        IndexError::UnsupportedSchemaVersion
     );
 }

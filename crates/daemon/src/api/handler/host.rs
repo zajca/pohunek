@@ -37,6 +37,8 @@ pub(super) async fn handle_host_inspect(
         capabilities.protocol_version = protocol_version;
         capabilities.package_install_index_supported =
             sessions.package_authority().index_install_supported();
+        capabilities.package_install_index_context_supported =
+            capabilities.package_install_index_supported;
         return ok_value(request, &capabilities);
     }
     let sessions = sessions.clone();
@@ -52,6 +54,8 @@ pub(super) async fn handle_host_inspect(
             capabilities.protocol_version = protocol_version;
             capabilities.package_install_index_supported =
                 sessions.package_authority().index_install_supported();
+            capabilities.package_install_index_context_supported =
+                capabilities.package_install_index_supported;
             Ok(capabilities)
         },
         "host_inspect_task_panicked",

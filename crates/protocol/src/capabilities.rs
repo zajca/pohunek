@@ -186,6 +186,16 @@ pub struct HostCapabilities {
     /// the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub package_install_index_supported: bool,
+    /// Whether the plugin index the daemon reads may carry `context` entries
+    /// (index schema 2), so `package.install` with `PackageTrust::Index` can
+    /// authorize a context package such as `pohunek.context.assistant`.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; it
+    /// reads schema 1 only and refuses a context package under the index
+    /// trust kind, so a client resolves a context package through the index
+    /// only when this is `true`. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub package_install_index_context_supported: bool,
     /// Whether `package.bind_profile` accepts `expected_previous` and refuses a
     /// bind whose expected pin is not the profile's current one.
     ///

@@ -17,9 +17,9 @@
 use std::path::{Path, PathBuf};
 
 use package::{
-    check_index_body, parse_core_range, IndexBody, IndexEntry, INDEX_REFUSED_RUNTIME_IDS,
-    INDEX_SCHEMA_VERSION, MAX_INDEX_BYTES, MAX_INDEX_ENTRIES, OFFICIAL_RUNTIME_PACKAGE_PREFIX,
-    OFFICIAL_SCOPE,
+    check_index_body, parse_core_range, IndexBody, IndexEntry, IndexEntryKind,
+    INDEX_REFUSED_RUNTIME_IDS, INDEX_SCHEMA_VERSION_2, MAX_INDEX_BYTES, MAX_INDEX_ENTRIES,
+    OFFICIAL_CONTEXT_PACKAGE_PREFIX, OFFICIAL_RUNTIME_PACKAGE_PREFIX, OFFICIAL_SCOPE,
 };
 use semver::{Comparator, Op, Version};
 
@@ -30,6 +30,10 @@ use crate::XtaskError;
 /// First core release that carries the index verifier. An entry's core range
 /// must not admit anything below it.
 const FIRST_INDEX_CORE: Version = Version::new(0, 40, 0);
+
+/// First core release that reads schema 2 and so `context` entries. A context
+/// entry's core range must not admit anything below it.
+const FIRST_CONTEXT_INDEX_CORE: Version = Version::new(0, 42, 0);
 
 /// Seconds the probe document used for the structural check stays valid. Any
 /// positive value works: the document is never written.
@@ -61,7 +65,8 @@ pub(crate) enum Predicate {
     Schema,
     /// Refused when the admitted tree does not read, or holds a version that is not semver.
     ExistingTree,
-    /// Refused when the package id is not `pohunek.runtime.` plus the runtime id.
+    /// Refused when the package id is not `pohunek.runtime.` plus the runtime id
+    /// (`runtime` entry) or not `pohunek.context.` plus a tail (`context` entry).
     PackageIdBinding,
     /// Refused when the runtime id is one the daemon refuses.
     RefusedRuntimeId,
@@ -162,6 +167,7 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
 
     let entry = IndexEntry {
         package_id: added.package_id.clone(),
+        kind: Some(added.kind()),
         runtime_id: added.runtime_id.clone(),
         version: added.version.clone(),
         digest: added.digest.clone(),
@@ -171,41 +177,14 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
     };
     probe(std::slice::from_ref(&entry)).map_err(|error| refuse(Predicate::Schema, error))?;
 
-    let expected_package = format!("{OFFICIAL_RUNTIME_PACKAGE_PREFIX}{}", added.runtime_id);
-    if added.package_id.as_str() != expected_package {
-        return Err(refuse(
-            Predicate::PackageIdBinding,
-            format!(
-                "package_id `{}` must be `{expected_package}`",
-                added.package_id
-            ),
-        ));
-    }
-    if INDEX_REFUSED_RUNTIME_IDS.contains(&added.runtime_id.as_str()) {
-        return Err(refuse(
-            Predicate::RefusedRuntimeId,
-            format!("runtime id `{}` cannot be claimed", added.runtime_id),
-        ));
-    }
+    check_identity_binding(added)?;
     if !added.url.bytes().all(is_url_safe) {
         return Err(refuse(
             Predicate::UrlCharset,
             "url may hold only letters, digits and `:/._+-`",
         ));
     }
-    for other in &existing {
-        let same_package = other.package_id == added.package_id;
-        let same_runtime = other.runtime_id == added.runtime_id;
-        if same_package != same_runtime {
-            return Err(refuse(
-                Predicate::IdentityConflict,
-                format!(
-                    "`{}` and runtime id `{}` are already bound to `{}` and `{}`",
-                    added.package_id, added.runtime_id, other.package_id, other.runtime_id
-                ),
-            ));
-        }
-    }
+    check_identity_conflicts(added, &existing)?;
     if existing.iter().any(|other| other.digest == added.digest) {
         return Err(refuse(
             Predicate::DuplicateDigest,
@@ -217,20 +196,103 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
 
     let merged: Vec<IndexEntry> = existing
         .into_iter()
-        .map(index_entry)
+        .map(|other| index_entry(other, INDEX_SCHEMA_VERSION_2))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .chain(std::iter::once(entry))
         .collect();
     probe(&merged).map_err(|error| refuse(Predicate::Schema, error))?;
 
+    let runtime_id = added
+        .runtime_id
+        .as_ref()
+        .map_or_else(String::new, ToString::to_string);
     Ok(format!(
-        "package_id={}\nruntime_id={}\nversion={}\ndigest={}\nurl={}\nplatforms={}\n",
+        "package_id={}\nruntime_id={runtime_id}\nversion={}\ndigest={}\nurl={}\nplatforms={}\n",
         added.package_id,
-        added.runtime_id,
         added.version,
         added.digest,
         added.url,
         added.platforms.join(",")
     ))
+}
+
+/// Binds the package id to the entry kind and refuses reserved runtime ids.
+fn check_identity_binding(added: &EntryFile) -> Result<(), XtaskError> {
+    match (added.kind(), added.runtime_id.as_ref()) {
+        (IndexEntryKind::Runtime, Some(runtime_id)) => {
+            let expected_package = format!("{OFFICIAL_RUNTIME_PACKAGE_PREFIX}{runtime_id}");
+            if added.package_id.as_str() != expected_package {
+                return Err(refuse(
+                    Predicate::PackageIdBinding,
+                    format!(
+                        "package_id `{}` must be `{expected_package}`",
+                        added.package_id
+                    ),
+                ));
+            }
+            if INDEX_REFUSED_RUNTIME_IDS.contains(&runtime_id.as_str()) {
+                return Err(refuse(
+                    Predicate::RefusedRuntimeId,
+                    format!("runtime id `{runtime_id}` cannot be claimed"),
+                ));
+            }
+        }
+        (IndexEntryKind::Context, None) => {
+            let bound = added
+                .package_id
+                .as_str()
+                .strip_prefix(OFFICIAL_CONTEXT_PACKAGE_PREFIX)
+                .is_some_and(|tail| !tail.is_empty());
+            if !bound {
+                return Err(refuse(
+                    Predicate::PackageIdBinding,
+                    format!(
+                        "package_id `{}` must be `{OFFICIAL_CONTEXT_PACKAGE_PREFIX}` plus a name",
+                        added.package_id
+                    ),
+                ));
+            }
+        }
+        _ => {
+            return Err(refuse(
+                Predicate::Schema,
+                "the entry kind and its runtime_id do not fit",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses an entry whose package id or runtime id is already bound to another identity.
+fn check_identity_conflicts(added: &EntryFile, existing: &[EntryFile]) -> Result<(), XtaskError> {
+    for other in existing {
+        let same_package = other.package_id == added.package_id;
+        if other.kind() != added.kind() {
+            if same_package {
+                return Err(refuse(
+                    Predicate::IdentityConflict,
+                    format!(
+                        "`{}` is already admitted as a {:?} entry",
+                        added.package_id,
+                        other.kind()
+                    ),
+                ));
+            }
+            continue;
+        }
+        let same_runtime = added.runtime_id.is_some() && other.runtime_id == added.runtime_id;
+        if added.runtime_id.is_some() && same_package != same_runtime {
+            return Err(refuse(
+                Predicate::IdentityConflict,
+                format!(
+                    "`{}` and runtime id `{:?}` are already bound to `{}` and `{:?}`",
+                    added.package_id, added.runtime_id, other.package_id, other.runtime_id
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Requires the added version to be a release semver above every admitted
@@ -287,7 +349,7 @@ fn probe(entries: &[IndexEntry]) -> Result<(), XtaskError> {
     }
     let now = unix_now()?;
     let body = IndexBody {
-        schema_version: INDEX_SCHEMA_VERSION,
+        schema_version: INDEX_SCHEMA_VERSION_2,
         scope: OFFICIAL_SCOPE.to_owned(),
         sequence: now,
         expires_at: now + PROBE_LIFETIME_SECONDS,
@@ -367,10 +429,15 @@ fn core_range(added: &EntryFile, core_version: &Version) -> Result<String, Xtask
         .filter_map(lower_bound)
         .max()
         .unwrap_or_else(|| Version::new(0, 0, 0));
-    if lowest < FIRST_INDEX_CORE {
+    let first = if added.kind() == IndexEntryKind::Context {
+        FIRST_CONTEXT_INDEX_CORE
+    } else {
+        FIRST_INDEX_CORE
+    };
+    if lowest < first {
         return Err(refuse(
             Predicate::CoreLowerBound,
-            format!("core range admits {lowest}, below the first index core {FIRST_INDEX_CORE}"),
+            format!("core range admits {lowest}, below the first index core {first}"),
         ));
     }
     Ok(format!("core range ok: lower_bound={lowest}\n"))
