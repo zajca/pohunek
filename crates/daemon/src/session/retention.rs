@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
+use pohunek_platform::filesystem::{FsError, TrustedDir};
 use protocol::{
     ErrorClass, ProtocolError, RuntimeState, SessionInfo, SessionRetentionCandidate,
     SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
@@ -32,9 +32,6 @@ use crate::worktree::WorktreeWork;
 
 /// File name of the durable session policy below the daemon data directory.
 pub const POLICY_FILE_NAME: &str = "session-policy.json";
-
-/// Temporary name used for the atomic policy replace.
-const POLICY_TEMP_FILE_NAME: &str = "session-policy.json.tmp";
 
 /// Exact mode required of the policy file and accepted on read.
 pub(super) const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
@@ -83,7 +80,7 @@ pub(super) const MAX_WORKTREE_PROBES_PER_SWEEP: usize = 64;
 pub(super) struct RetentionState {
     /// Durable policy document, absent when persistence is not configured.
     path: Option<PathBuf>,
-    /// Current policy, authoritative for both the task and the public API.
+    /// Current policy, read by the sweep task and by a manual sweep.
     policy: RwLock<SessionRetentionPolicy>,
     /// Serializes sweeps so an automatic and a manual one cannot interleave
     /// their removals and double-report the same session.
@@ -128,35 +125,6 @@ impl SessionRegistry {
             return Ok(self.retention_policy());
         };
         let policy = blocking(move || read_policy(&path)).await?;
-        *self
-            .inner
-            .retention
-            .policy
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = policy.clone();
-        Ok(policy)
-    }
-
-    /// Validates, persists, and applies a replacement retention policy.
-    ///
-    /// The new policy takes effect on the next sweep; no daemon restart is
-    /// needed. When persistence is not configured the policy is applied in
-    /// memory only.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `bad_request` [`ProtocolError`] for a policy outside the
-    /// accepted bounds, and a `runtime` error when the document cannot be
-    /// written.
-    pub async fn set_retention_policy(
-        &self,
-        policy: SessionRetentionPolicy,
-    ) -> Result<SessionRetentionPolicy, ProtocolError> {
-        validate_policy(&policy)?;
-        if let Some(path) = self.inner.retention.path.clone() {
-            let persisted = policy.clone();
-            blocking(move || write_policy(&path, &persisted)).await?;
-        }
         *self
             .inner
             .retention
@@ -548,7 +516,7 @@ pub(super) fn invalid_policy(message: String) -> ProtocolError {
 
 /// Reads the durable policy, falling back to the default when absent.
 fn read_policy(path: &Path) -> Result<SessionRetentionPolicy, ProtocolError> {
-    let (directory, name) = open_policy_dir(path, false)?;
+    let (directory, name) = open_policy_dir(path)?;
     let bytes = match directory.read_file(name, OWNER_PRIVATE_FILE_MODE, MAX_POLICY_BYTES) {
         Ok(bytes) => bytes,
         Err(error) if error.io_kind() == Some(io::ErrorKind::NotFound) => {
@@ -566,50 +534,16 @@ fn read_policy(path: &Path) -> Result<SessionRetentionPolicy, ProtocolError> {
     Ok(policy)
 }
 
-/// Atomically replaces the durable policy document.
-fn write_policy(path: &Path, policy: &SessionRetentionPolicy) -> Result<(), ProtocolError> {
-    let (directory, name) = open_policy_dir(path, true)?;
-    let mut body = serde_json::to_vec_pretty(policy).map_err(|error| {
-        policy_error(format!("session policy could not be serialized: {error}"))
-    })?;
-    body.push(b'\n');
-    match directory.replace_file(name, POLICY_TEMP_FILE_NAME, &body, OWNER_PRIVATE_FILE_MODE) {
-        Ok(()) => Ok(()),
-        Err(AtomicReplaceError::BeforeCommit(error)) => Err(policy_io_error(path, &error)),
-        // The new document is already authoritative; only the directory entry's
-        // crash durability is unproven, which does not fail the request.
-        Err(AtomicReplaceError::CommittedDurabilityUncertain(error)) => {
-            warn!(
-                path = %path.display(),
-                error = %error,
-                "session policy committed but durability is uncertain"
-            );
-            Ok(())
-        }
-        Err(error) => Err(policy_error(format!(
-            "session policy at {} could not be replaced: {error}",
-            path.display()
-        ))),
-    }
-}
-
 /// Opens the trusted directory holding the policy document.
-pub(super) fn open_policy_dir(
-    path: &Path,
-    create: bool,
-) -> Result<(TrustedDir, &str), ProtocolError> {
+pub(super) fn open_policy_dir(path: &Path) -> Result<(TrustedDir, &str), ProtocolError> {
     let parent = path.parent().ok_or_else(|| {
         policy_error(format!(
             "session policy path {} has no parent",
             path.display()
         ))
     })?;
-    let directory = if create {
-        TrustedDir::open_or_create_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
-    } else {
-        TrustedDir::open_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
-    }
-    .map_err(|error| policy_io_error(parent, &error))?;
+    let directory = TrustedDir::open_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
+        .map_err(|error| policy_io_error(parent, &error))?;
     // The policy file name is a crate constant, so the only reason this is not
     // the expected name is a caller passing a different path.
     let name = path
@@ -665,7 +599,7 @@ mod tests {
 
     use super::{
         invalid_policy, read_policy, removal_budget, report_sweep, select_candidates,
-        validate_policy, write_policy, POLICY_FILE_NAME,
+        validate_policy, POLICY_FILE_NAME,
     };
 
     /// The policy store requires an owner-private directory, so fixtures create one.
@@ -939,24 +873,6 @@ mod tests {
 
         assert_eq!(policy, SessionRetentionPolicy::default());
         assert!(!policy.enabled, "automatic sweeps must be opt-in");
-    }
-
-    #[test]
-    fn a_written_policy_round_trips() {
-        let dir = private_policy_root();
-        let path = dir.path().join(POLICY_FILE_NAME);
-        let stored = SessionRetentionPolicy {
-            enabled: true,
-            sweep_interval_secs: 900,
-            terminal_ttl_secs: 7_200,
-            lost_ttl_secs: 14_400,
-            max_removals_per_sweep: 3,
-            ..Default::default()
-        };
-
-        write_policy(&path, &stored).expect("write policy");
-
-        assert_eq!(read_policy(&path).expect("read policy"), stored);
     }
 
     #[test]

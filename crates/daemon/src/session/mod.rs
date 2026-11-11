@@ -527,8 +527,8 @@ pub struct SessionRegistryConfig {
     /// [`pohunek_service_config::DEFAULT_NOTIFICATION_SETTINGS`].
     pub notification_settings: pohunek_service_config::NotificationSettings,
     /// Durable session policy document (`<data_dir>/session-policy.json`).
-    /// `None` keeps the retention policy in memory only, which is what unit
-    /// tests that never persist a policy use.
+    /// `None` keeps the default retention policy, which is what registries
+    /// that never read a policy file use.
     pub retention_policy_path: Option<PathBuf>,
     /// Directory containing bounded structured logs. When set, removing a
     /// stopped session also removes its owner-private worker log family.

@@ -21127,6 +21127,9 @@ fn build_retention_registry(
         SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "true"]),
             stop_grace: Duration::from_millis(50),
+            retention_policy_path: Some(retention_policy_file(
+                store.parent().expect("store parent"),
+            )),
             store_path: Some(store),
             worktree_root: Some(worktree_root.clone()),
             log_dir,
@@ -21135,6 +21138,26 @@ fn build_retention_registry(
         inspector,
     );
     (registry, worktree_root)
+}
+
+/// The policy file of a registry whose data directory is `data_dir`.
+fn retention_policy_file(data_dir: &Path) -> PathBuf {
+    data_dir.join(super::retention::POLICY_FILE_NAME)
+}
+
+/// Applies [`sweep_policy`] the way an operator does: the owner-private policy
+/// file in the data directory, read by the registry's startup load.
+async fn apply_sweep_policy(registry: &SessionRegistry, data_dir: &Path) {
+    let path = retention_policy_file(data_dir);
+    let document = serde_json::to_vec_pretty(&sweep_policy()).expect("policy JSON");
+    fs::write(&path, document).expect("write the policy file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .expect("make the policy file private");
+    let loaded = registry
+        .load_retention_policy()
+        .await
+        .expect("load the policy file");
+    assert_eq!(loaded, sweep_policy());
 }
 
 /// PID of the first scripted unreadable candidate of
@@ -21406,12 +21429,9 @@ async fn session_ids(registry: &SessionRegistry) -> Vec<String> {
 
 #[tokio::test]
 async fn retention_sweep_removes_terminal_and_lost_sessions_and_keeps_an_in_ttl_one() {
-    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-e2e");
+    let (registry, data_dir, _worktree_root) = retention_registry("sweep-e2e");
     let repo = init_git_repo("sweep-e2e");
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    apply_sweep_policy(&registry, &data_dir).await;
 
     let terminal = exited_session(&registry, None).await;
     age_terminal(&registry, &terminal.id, past_ttl()).await;
@@ -21455,12 +21475,9 @@ async fn retention_sweep_removes_terminal_and_lost_sessions_and_keeps_an_in_ttl_
 
 #[tokio::test]
 async fn retention_sweep_keeps_a_session_whose_worktree_has_uncommitted_work() {
-    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-dirty");
+    let (registry, data_dir, _worktree_root) = retention_registry("sweep-dirty");
     let repo = init_git_repo("sweep-dirty");
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    apply_sweep_policy(&registry, &data_dir).await;
 
     let session = exited_session(&registry, Some(&repo)).await;
     let worktree = session.worktree_path.clone().expect("session worktree");
@@ -21491,11 +21508,8 @@ async fn retention_sweep_keeps_a_session_whose_worktree_has_uncommitted_work() {
 
 #[tokio::test]
 async fn retention_sweep_stops_at_the_removal_budget() {
-    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-budget");
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    let (registry, data_dir, _worktree_root) = retention_registry("sweep-budget");
+    apply_sweep_policy(&registry, &data_dir).await;
 
     for _ in 0..2 {
         let session = exited_session(&registry, None).await;
@@ -21522,10 +21536,7 @@ async fn retention_sweep_stops_at_the_removal_budget() {
 #[tokio::test]
 async fn retention_sweep_counts_a_removal_it_could_not_complete() {
     let (registry, data_dir, _worktree_root) = retention_registry("sweep-failed");
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    apply_sweep_policy(&registry, &data_dir).await;
     let session = exited_session(&registry, None).await;
     age_terminal(&registry, &session.id, past_ttl()).await;
 
@@ -22535,14 +22546,11 @@ async fn a_refused_removal_is_completed_by_a_retry_with_consent() {
 #[tokio::test]
 async fn retention_sweep_never_consents_to_unconfirmed_cleanup() {
     let inspector = Arc::new(UnreadableCandidateHost::live());
-    let (registry, _data_dir, _worktree_root) = retention_registry_over(
+    let (registry, data_dir, _worktree_root) = retention_registry_over(
         "sweep-never-consents",
         Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
     );
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    apply_sweep_policy(&registry, &data_dir).await;
     let session = record_only_session(&registry).await;
     age_terminal(&registry, &session.id, past_ttl()).await;
     inspector.set_candidate(true);
@@ -22566,12 +22574,9 @@ async fn retention_sweep_never_consents_to_unconfirmed_cleanup() {
 
 #[tokio::test]
 async fn retention_sweep_reports_a_worktree_it_could_not_delete() {
-    let (registry, _data_dir, worktree_root) = retention_registry("sweep-debris");
+    let (registry, data_dir, worktree_root) = retention_registry("sweep-debris");
     let repo = init_git_repo("sweep-debris");
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    apply_sweep_policy(&registry, &data_dir).await;
     let session = exited_session(&registry, Some(&repo)).await;
     let worktree = session.worktree_path.clone().expect("session worktree");
     age_terminal(&registry, &session.id, past_ttl()).await;
@@ -22603,11 +22608,8 @@ async fn retention_sweep_reports_a_worktree_it_could_not_delete() {
 
 #[tokio::test]
 async fn concurrent_sweeps_are_serialised_by_the_sweep_lock() {
-    let (registry, _data_dir, _worktree_root) = retention_registry("sweep-lock");
-    registry
-        .set_retention_policy(sweep_policy())
-        .await
-        .expect("apply policy");
+    let (registry, data_dir, _worktree_root) = retention_registry("sweep-lock");
+    apply_sweep_policy(&registry, &data_dir).await;
     for _ in 0..2 {
         let session = exited_session(&registry, None).await;
         age_terminal(&registry, &session.id, past_ttl()).await;
