@@ -550,16 +550,6 @@ impl VersionProbePolicy {
         Self::build(args, min, Some(below), ProbeVersion::parse, BARE_SHAPE)
     }
 
-    /// The policy of a range without an upper bound: every release from `min`
-    /// on is supported. The other fields follow [`Self::new`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`VersionProbeError`] naming the offending field.
-    pub fn open_ended(args: Vec<String>, min: &str) -> Result<Self, VersionProbeError> {
-        Self::build(args, min, None, ProbeVersion::parse, BARE_SHAPE)
-    }
-
     fn build(
         args: Vec<String>,
         min: &str,
@@ -718,7 +708,7 @@ impl VersionProbePolicy {
     ///
     /// Returns [`VersionRefusal::Unparseable`] when the first line does not
     /// follow this policy's grammar, and [`VersionRefusal::OutOfRange`] when the
-    /// release it carries lies outside `[min, below)`.
+    /// release it carries lies outside `[min, below)`, or below `min` when the range has no upper bound.
     pub fn check_output(&self, output: &str) -> Result<ProbeVersion, VersionRefusal> {
         let version = self
             .read_output(output)

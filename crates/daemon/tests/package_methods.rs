@@ -1513,14 +1513,9 @@ fn open_range_descriptor(program: &Path, version: &str, min: &str, requires: &st
 }
 
 #[tokio::test]
-async fn an_open_ended_range_installs_only_with_its_feature_and_admits_every_release_from_min() {
+async fn an_open_ended_range_installs_only_with_its_feature_and_as_a_bound_policy() {
     let servers = spawn_servers("pkg-open-range").await;
     let mut local = connect_unix(&servers.socket).await;
-    let cwd = servers
-        .plugins
-        .parent()
-        .expect("the socket directory")
-        .to_path_buf();
     let program = probe_program(&servers.plugins, "probe-open-gate", "fixture 1.4.13");
 
     // The omission of `below` belongs to the feature: without it the package
@@ -1570,6 +1565,20 @@ async fn an_open_ended_range_installs_only_with_its_feature_and_admits_every_rel
         listed.packages.is_empty(),
         "a refused descriptor records nothing"
     );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn an_open_ended_range_admits_every_release_from_min_and_names_the_minimum_it_refuses() {
+    let servers = spawn_servers("pkg-open-range-read").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
 
     // (printed release, supported): the lower bound is inclusive and nothing
     // above it is refused, however far the major moves.
@@ -1670,14 +1679,18 @@ async fn a_version_probe_receives_the_launch_env_and_one_that_outlasts_its_deadl
     // never otherwise, as a program that waits for an unreachable service.
     let script = "#!/bin/sh\nif [ \"$PI_QUICK_VERSION\" = 1 ]; then printf '%s\\n' 'fixture 1.4.13'; else exec sleep 600; fi\n";
     let program = write_program(&servers.plugins, "probe-needs-flag", script);
-    let with_flag = |value: &str, version: &str| {
-        probed_descriptor(
+    let with_flag = |value: &str, version: &str| -> String {
+        let mut document = probed_descriptor(
             &program,
             version,
             "semver-line-v1",
             ("1.0.0", "2.0.0"),
             LAUNCH_ENV_FEATURE,
-        ) + &launch_env_table(&[format!("PI_QUICK_VERSION = \"{value}\"")])
+        );
+        document.push_str(&launch_env_table(&[format!(
+            "PI_QUICK_VERSION = \"{value}\""
+        )]));
+        document
     };
 
     let (_digest, result) = install_descriptor(

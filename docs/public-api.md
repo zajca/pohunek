@@ -1682,8 +1682,8 @@ release (ASCII digits only, no leading zeros, no pre-release or build suffix;
 bare for `semver-v1`, inside the `line` template for `semver-line-v1`).
 Standard error is discarded. The probe runs with a cleared environment, a
 private `HOME`, XDG and temporary directories and a private working directory,
-a 2 second deadline and a 4 KiB output cap. Its environment holds only the
-launch `PATH` and the runtime's `[launch_env]` pairs (`launch-env-v1`), so an
+a 2 second deadline and a 4 KiB output cap. The only values forwarded from
+outside are the launch `PATH` and the runtime's `[launch_env]` pairs (`launch-env-v1`), so an
 interpreter script such as `#!/usr/bin/env node` resolves the interpreter from
 the same `PATH` that the default agent environment allowlist forwards to the
 launched agent (an allowlist without `PATH` leaves the agent without one), and a

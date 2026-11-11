@@ -1986,7 +1986,7 @@ strategy = "none"
         };
         for invalid in [
             r#"{ parser = "semver-v1" }"#,
-            r#"{ parser = "semver-v1", args = ["--version"], min = "1.0.0" }"#,
+            r#"{ parser = "semver-v1", args = ["--version"], below = "1.1.0" }"#,
             r#"{ parser = "not-compiled", args = ["--version"], min = "1.0.0", below = "1.1.0" }"#,
             r#"{ parser = "semver-v1", args = ["--version"], min = "1.1.0", below = "1.0.0" }"#,
         ] {

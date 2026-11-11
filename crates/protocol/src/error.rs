@@ -504,7 +504,7 @@ impl ProtocolError {
     }
 
     /// The canonical rejection for an agent executable that exists but fails
-    /// its runtime's version probe: a failing or timed-out probe, or a probe
+    /// its runtime's version probe: a failing probe, or a probe
     /// parser this daemon does not provide. A program that does not resolve is
     /// `agent_binary_missing`; a release outside the supported range, output
     /// that does not parse and a probe that ran to its deadline have their own
