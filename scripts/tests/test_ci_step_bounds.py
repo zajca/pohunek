@@ -43,6 +43,20 @@ class StepBoundTests(unittest.TestCase):
                         self.assertRegex(step, r"(?m)^        timeout-minutes: \d+$")
                         self.assertIn("Acquire::http::Timeout=", step)
 
+    def test_the_prune_step_bounds_every_df_call(self):
+        steps = [
+            step
+            for step in steps_of((ROOT / ".github" / "workflows" / "gate-tests.yml").read_text())
+            if "Free preinstalled toolchains" in step
+        ]
+        self.assertEqual(len(steps), 1)
+        step = steps[0]
+        df_calls = [line for line in step.splitlines() if "df -h" in line]
+        self.assertEqual(len(df_calls), 2, df_calls)
+        for line in df_calls:
+            self.assertRegex(line, r'timeout "\$DF_TIMEOUT_SECONDS" df -h ')
+        self.assertRegex(step, r'(?m)^          DF_TIMEOUT_SECONDS: "\d+"$')
+
     def test_the_composite_bounds_its_local_steps(self):
         text = SETUP_MOLD_ACTION.read_text()
         self.assertIn("LOCAL_STEP_TIMEOUT_SECONDS", text)
