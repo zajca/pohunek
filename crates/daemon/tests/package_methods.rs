@@ -1635,7 +1635,7 @@ async fn an_open_ended_range_admits_every_release_from_min_and_names_the_minimum
 }
 
 #[tokio::test]
-async fn the_revision_parser_takes_an_open_range_and_orders_revisions_against_min() {
+async fn the_revision_parser_takes_an_open_range_and_a_closed_range_with_the_feature_listed() {
     let servers = spawn_servers("pkg-open-revision").await;
     let mut local = connect_unix(&servers.socket).await;
     let cwd = servers
@@ -1643,9 +1643,13 @@ async fn the_revision_parser_takes_an_open_range_and_orders_revisions_against_mi
         .parent()
         .expect("the socket directory")
         .to_path_buf();
-    for (index, (printed, supported)) in [("1.4.13-R2", true), ("1.4.12-R9", false)]
-        .into_iter()
-        .enumerate()
+    for (index, (printed, supported)) in [
+        ("1.4.13-R2", true),
+        ("1.4.12-R9", false),
+        ("127.0.0-R1", true),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let program = probe_program(
             &servers.plugins,

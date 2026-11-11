@@ -188,16 +188,20 @@ impl Rig {
     /// the worker verifies stays open until the worker has decided.
     fn hold_the_socket_until_answered(&self) {
         const BUDGET: &str = "SOCKET_TIMEOUT_SECS = 0.5";
+        let mut rewritten = 0_usize;
         for entry in fs::read_dir(self.cline_home.join("hooks")).expect("the hooks directory") {
             let path = entry.expect("a hook entry").path();
-            let Ok(body) = fs::read_to_string(&path) else {
-                continue;
-            };
+            let body = fs::read_to_string(&path).expect("read the installed reporter");
             if body.contains(BUDGET) {
                 let held = format!("SOCKET_TIMEOUT_SECS = {}", HANG_GUARD.as_secs());
                 fs::write(&path, body.replace(BUDGET, &held)).expect("rewrite the reporter");
+                rewritten += 1;
             }
         }
+        assert!(
+            rewritten > 0,
+            "no installed reporter carries the socket budget"
+        );
     }
 
     /// Asserts that exactly `count` hook files ran and every one exited 0
