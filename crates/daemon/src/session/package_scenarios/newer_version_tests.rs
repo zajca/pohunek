@@ -149,7 +149,7 @@ impl Kind {
         fs::write(
             path,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{line}'\n  exit 0\nfi\nsleep 600\n"
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{line}'\n  exit 0\nfi\nprintf '%s\\n' \"$*\" >> \"$0.launches\"\nsleep 600\n"
             ),
         )
         .expect("write the agent");
@@ -394,6 +394,73 @@ async fn a_newer_package_version_adopts_a_stopped_codex_session_whose_profile_mo
 #[tokio::test]
 async fn a_newer_package_version_adopts_a_stopped_pi_session_whose_profile_moved_to_it() {
     assert_resume_adopted("newer-adopts-pi", &PI).await;
+}
+
+/// The argument the newer Pi package's `[placement]` adds to every launch.
+const KEEP_LOCAL_ARG: &str = "--keep-local";
+
+/// The launches `agent` recorded, one line of arguments each.
+fn recorded_launches(agent: &Path) -> Vec<String> {
+    let mut log = agent.as_os_str().to_owned();
+    log.push(".launches");
+    fs::read_to_string(PathBuf::from(log))
+        .map(|text| text.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// A session created while its package declared no `[placement]` is adopted by
+/// the newer version that does: the relaunch carries the newer version's
+/// `keep_local_args`, which the stored resume snapshot never holds.
+#[tokio::test]
+async fn a_session_created_before_the_package_declared_placement_resumes_with_keep_local_args() {
+    let kind = &PI;
+    let old = kind.package(kind.old_version, kind.old_below, |text| {
+        let stripped = text
+            .replace("\"placement-v1\", ", "")
+            .replace("[placement]\nmode = \"in_process\"\n", "");
+        assert!(
+            !stripped.contains("placement"),
+            "the older package declares no placement"
+        );
+        stripped
+    });
+    let new = kind.package(kind.new_version, kind.new_below, |text| {
+        text.replace(
+            "[placement]\nmode = \"in_process\"\n",
+            &format!(
+                "[placement]\nmode = \"in_process\"\nkeep_local_args = [\"{KEEP_LOCAL_ARG}\"]\n"
+            ),
+        )
+    });
+    let session = stopped_on("newer-placement-keep-local", kind, &old, kind.old_version).await;
+    kind.write_agent(&session.agent, kind.only_new);
+    install(&session.fixture, kind, &new, kind.new_version, 6).await;
+    pin_profile(&session.fixture.registry, &new.digest).await;
+
+    let restarted = restart(&session.fixture).await;
+    restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect("the newer version adopts the session");
+    assert_eq!(pinned_digest(&session.store_path, &session.id), new.digest);
+    let resumed = pohunek_test_support::wait::wait_until("the resumed agent to start", || async {
+        let launches = recorded_launches(&session.agent);
+        (launches.len() == 2).then_some(launches)
+    })
+    .await;
+    assert!(resumed[1].contains(KEEP_LOCAL_ARG), "{resumed:?}");
+    assert!(
+        !fs::read_to_string(&session.store_path)
+            .expect("read the metadata store")
+            .contains(KEEP_LOCAL_ARG),
+        "the stored resume snapshot holds no keep-local argument"
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
 }
 
 #[tokio::test]

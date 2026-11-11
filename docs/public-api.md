@@ -1092,7 +1092,8 @@ the documented values `clean`, `escaped` and `unobservable`, and `processes`,
 `{pid, comm}` ordered by pid and bounded at 8, empty unless `escaped`); the field
 is absent for a session whose runtime declares no placement, a session that is
 not live, and every list entry, stored record and event never receive it. `unobservable` means the host withheld the PTY
-child's session or the process table, so the generation is not reported clean.
+child's session or the process table, or a process that carries the generation's
+marker could not be classified, so the generation is not reported clean.
 `daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
 naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`
 otherwise. The check signals nothing. Human `session inspect` adds a `placement`
