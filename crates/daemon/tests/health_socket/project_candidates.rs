@@ -61,6 +61,8 @@ impl Rig {
             ..SessionRegistryConfig::default()
         };
         config.candidates.temp_roots = vec![scratch.clone()];
+        // Far above any host load; only the scenario about time lowers it.
+        config.candidates.deadline = HANG_GUARD;
         configure(&mut config);
         let (shutdown, server, _) = spawn_server_serving_official_runtimes_in(
             &socket,
@@ -204,11 +206,21 @@ fn assert_documented_shape(result: &Value) {
         "undocumented result fields: {:?}",
         keys(result)
     );
+    assert!(keys(result).contains("candidates") && keys(result).contains("dropped"));
     let allowed: BTreeSet<&str> = CANDIDATE_KEYS.into_iter().collect();
     for candidate in result["candidates"].as_array().expect("candidates") {
         assert!(
             keys(candidate).is_subset(&allowed),
             "undocumented candidate fields: {:?}",
+            keys(candidate)
+        );
+        let required: BTreeSet<&str> = CANDIDATE_KEYS
+            .into_iter()
+            .filter(|key| *key != "origin")
+            .collect();
+        assert!(
+            required.is_subset(&keys(candidate)),
+            "missing candidate fields: {:?}",
             keys(candidate)
         );
         for counts in candidate["sessions"]
@@ -297,6 +309,25 @@ fn assert_nothing_leaked(result: &Value, unread: &[&PathBuf]) {
             unread.display()
         );
     }
+}
+
+/// Writes history that must count once or not at all: a symlinked working
+/// directory, an empty one, and a session's auxiliary log.
+fn write_edge_history(home: &Path, work: &Path, both_repo: &Path, claude_repo: &Path) {
+    let path = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
+    // A symlinked working directory collapses onto its repository.
+    let link = work.join("link-to-both");
+    symlink(both_repo, &link).expect("link the repository");
+    write_claude(home, "-link", "a", &[claude_user(&path(&link))]);
+    // An empty working directory is skipped before any filesystem access.
+    write_claude(home, "-empty", "a", &[claude_user("")]);
+    // The auxiliary logs of a session are not sessions.
+    write_claude(
+        home,
+        "-claude-app/one/subagents",
+        "agent-1",
+        &[claude_user(&path(claude_repo))],
+    );
 }
 
 #[tokio::test]
@@ -439,7 +470,7 @@ async fn history_is_read_from_declared_locations_for_two_fields_only() {
     write_codex(&home, "codex-one", &path(&codex_repo));
     write_codex(&home, "codex-both", &path(&both_repo));
     write_claude(&home, "-both", "a", &[claude_user(&path(&both_repo))]);
-
+    write_edge_history(&home, &work, &both_repo, &claude_repo);
     write_unreachable_history(&home, &unlisted_via_link, &decoy);
 
     rig.add_project(&codex_repo).await;
@@ -475,7 +506,7 @@ async fn history_is_read_from_declared_locations_for_two_fields_only() {
     assert_eq!(
         candidate(&result, &both_repo)["sessions"],
         serde_json::json!({
-            "claude": { "owned": 0, "history": 1 },
+            "claude": { "owned": 0, "history": 2 },
             "codex": { "owned": 0, "history": 1 },
         })
     );
@@ -484,6 +515,76 @@ async fn history_is_read_from_declared_locations_for_two_fields_only() {
         &result,
         &[&unlisted_via_link, &decoy, &foreign, &temporary, &deleted],
     );
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn owned_and_history_merge_newest_first_and_a_deleted_repository_is_dropped() {
+    let mut rig = Rig::start("pcand-merge").await;
+    let home = rig.home_dir();
+    let work = home.join("work");
+    let merged = make_repo(&rig.home, &work.join("merged"), None);
+    let newest = make_repo(&rig.home, &work.join("newest"), None);
+    let deleted = make_repo(&rig.home, &work.join("deleted-session"), None);
+    let hour = Duration::from_secs(3600);
+    let merged_at = SystemTime::now() + hour;
+    let newest_at = SystemTime::now() + 2 * hour;
+    for (dir, repo, at) in [
+        ("-merged", &merged, merged_at),
+        ("-newest", &newest, newest_at),
+    ] {
+        let file = write_claude(
+            &home,
+            dir,
+            "a",
+            &[claude_user(repo.to_str().expect("utf-8 path"))],
+        );
+        touch(&file, at);
+    }
+    for cwd in [merged.clone(), deleted.clone()] {
+        ok_payload(create_session_with_params(&mut rig.control, session_params_in(cwd)).await);
+    }
+    std::fs::remove_dir_all(&deleted).expect("delete the repository");
+
+    let result = rig
+        .candidates(serde_json::json!({ "sources": ["pohunek", "history"] }))
+        .await;
+    assert_documented_shape(&result);
+    assert_eq!(
+        roots(&result)[..],
+        {
+            let mut both = [merged.clone(), newest.clone()];
+            both.sort();
+            both
+        }[..]
+    );
+    let order: Vec<&str> = result["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|candidate| candidate["repo_root"].as_str().expect("repo_root"))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            newest.to_str().expect("utf-8"),
+            merged.to_str().expect("utf-8")
+        ],
+        "newest activity first"
+    );
+    let found = candidate(&result, &merged);
+    let sessions = found["sessions"].as_object().expect("sessions");
+    assert_eq!(sessions.len(), 2, "{found}");
+    assert!(sessions.values().any(|counts| counts["owned"] == 1));
+    assert!(sessions.values().any(|counts| counts["history"] == 1));
+    let last = OffsetDateTime::parse(found["last_used_at"].as_str().expect("time"), &Rfc3339)
+        .expect("RFC 3339 time");
+    assert_eq!(
+        last,
+        OffsetDateTime::from(merged_at),
+        "the newest of the session update and the history file"
+    );
+    assert_eq!(result["dropped"], 1, "the deleted repository: {result}");
     rig.finish().await;
 }
 

@@ -128,7 +128,8 @@ pub(crate) fn scan(
 }
 
 /// Collects the regular `.jsonl` files below `root` into `found`, newest names
-/// first, without following a symlink.
+/// first, without following a symlink. `entries_left` and `directories_left`
+/// are the budget of this root alone.
 fn walk(
     root: &TranscriptRoot,
     index: usize,
@@ -154,6 +155,7 @@ fn walk(
             continue;
         };
         let mut subdirectories = Vec::new();
+        let mut session_files = BTreeSet::new();
         for entry in entries {
             if *entries_left == 0 {
                 limits.insert(CandidateLimit::Entries);
@@ -179,6 +181,9 @@ fn walk(
                 let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
                     continue;
                 };
+                if let Some(stem) = path.file_stem() {
+                    session_files.insert(stem.to_owned());
+                }
                 found.push(Found {
                     path,
                     modified,
@@ -186,6 +191,13 @@ fn walk(
                 });
             }
         }
+        // A directory named like a sibling session file holds that session's
+        // auxiliary logs (a Claude conversation's `subagents/*.jsonl`), not
+        // sessions of their own, so it is not entered.
+        subdirectories.retain(|dir| {
+            dir.file_name()
+                .is_none_or(|name| !session_files.contains(name))
+        });
         // Reversed so the first (newest-named) directory is popped first.
         stack.extend(
             subdirectories

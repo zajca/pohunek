@@ -26,10 +26,10 @@ use crate::worktree::canonical_or_original;
 /// [`DEFAULT_HEAD_BYTES`], so this bounds the bytes a scan reads.
 const DEFAULT_MAX_FILES: usize = 5_000;
 
-/// Most directory entries one scan lists across all history trees.
+/// Most directory entries the scan lists in each history tree.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
-/// Most directories one scan enters across all history trees.
+/// Most directories the scan enters in each history tree.
 const DEFAULT_MAX_DIRECTORIES: usize = 8_192;
 
 /// Bytes read from the head of one history file (64 KiB). A record cut by this
@@ -60,9 +60,9 @@ const DEFAULT_TEMP_ROOTS: &[&str] = &[
 pub struct CandidateConfig {
     /// Most history files read.
     pub max_files: usize,
-    /// Most directory entries listed.
+    /// Most directory entries listed in each history tree.
     pub max_entries: usize,
-    /// Most directories entered.
+    /// Most directories entered in each history tree.
     pub max_directories: usize,
     /// Bytes read from the head of one history file.
     pub head_bytes: usize,
@@ -146,10 +146,19 @@ pub(crate) fn resolve(
     deadline: Instant,
     mut limits: BTreeSet<CandidateLimit>,
 ) -> ProjectCandidatesResult {
+    // Both spellings of the home: a history path is matched textually before
+    // the filesystem is touched, and by its canonical form afterwards.
     let home = inputs
         .history
         .as_ref()
         .map(|(_scan, home)| canonical_or_original(home));
+    let home_spellings: Vec<PathBuf> = inputs
+        .history
+        .as_ref()
+        .map(|(_scan, raw)| raw.clone())
+        .into_iter()
+        .chain(home.clone())
+        .collect();
     let observed = observe(inputs.owned, inputs.history, &mut limits);
     let temp_roots: Vec<PathBuf> = config
         .temp_roots
@@ -162,6 +171,17 @@ pub(crate) fn resolve(
         if Instant::now() >= deadline {
             limits.insert(CandidateLimit::Time);
             break;
+        }
+        // A history path outside the home is counted without a stat or a git
+        // process, so a foreign mount is never touched.
+        let inside_home = in_any(&cwd, &home_spellings);
+        let observations: Vec<Observation> = observations
+            .into_iter()
+            .filter(|o| o.origin == Origin::Owned || inside_home)
+            .collect();
+        if observations.is_empty() {
+            dropped = dropped.saturating_add(1);
+            continue;
         }
         let Some((project, canonical_cwd)) = resolve_cwd(&cwd, &temp_roots) else {
             dropped = dropped.saturating_add(1);

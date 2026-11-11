@@ -9,7 +9,8 @@ export type CandidateSessions = {
    */
   owned: number;
   /**
-   * History files of the agent that name the repository.
+   * Session files in the agent's history that name the repository; the
+   * auxiliary logs of a session are not counted.
    */
   history: number;
 };

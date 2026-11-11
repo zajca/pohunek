@@ -3466,7 +3466,10 @@ exit; procwatch remains the Codex release backstop.
   config home, parser `jsonl-head-v1`); no other location is opened. Without
   `history` in `sources` no history file is opened. The `history` source is
   served on the local control socket only; a remote connection that names it
-  gets `local_only_method` before anything is read.
+  gets `local_only_method` before anything is read. The `history` source also
+  needs an absolute `HOME` other than `/` in the daemon's launch environment to
+  bound the scan; without one the call fails with `candidates_home_unavailable`
+  (class `daemon`), and setting `HOME` for the daemon is the recovery.
 - **What is read.** From each history file only the head is read, within the
   daemon's byte and record bounds: the working directory of the first record
   that carries one (a top-level `cwd` key, or for the first record the runtime's
@@ -3486,9 +3489,10 @@ exit; procwatch remains the Codex release backstop.
   `/private/tmp`, `/private/var/folders`, `/dev/shm`, the daemon's temporary directory) and a path
   outside a git repository are counted in `dropped` and never named. The home
   restriction applies to history paths only; a pohunek session is a directory
-  the user started on purpose. `exists` is `false` when git still resolves a
-  pohunek session path to a repository whose main checkout is gone (for example
-  a separate git dir); a path git can no longer resolve is dropped.
+  the user started on purpose. A pohunek session whose directory is gone, or
+  that git can no longer resolve to a repository, is dropped too, so a listed
+  candidate's `exists` reports whether `repo_root` is still there at the time of
+  the scan.
 - **Bounds.** The scan is bounded in files, directory entries, head bytes,
   records per file and time; a file whose head holds no working directory within
   the record bound contributes nothing. The daemon sets the bounds; a client cannot raise
@@ -3496,6 +3500,9 @@ exit; procwatch remains the Codex release backstop.
   so far and is named in `limits_reached` (`files`, `entries`, `line_length`,
   `time`), never as an error. A newer daemon may name a bound this client does
   not know; it reads as `unknown`.
+- **Counting.** `history` counts session files. A directory named like a
+  sibling session file (a Claude conversation's `subagents/` logs) is not
+  entered, so auxiliary logs do not count as sessions.
 - **Ordering.** Candidates are newest activity first.
 
 ### Session and Project Filters
@@ -4259,7 +4266,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `overlay_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner`, `session_new_secret_env_relay_refused` |
-| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `session_new_secret_env_unsupported`, `session_new_request_id_unsupported`, `session_new_context_pin_unsupported`, `command_unsupported`, `package_install_commands_unsupported`, `notifications_unavailable` |
+| `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `candidates_home_unavailable`, `session_new_secret_env_unsupported`, `session_new_request_id_unsupported`, `session_new_context_pin_unsupported`, `command_unsupported`, `package_install_commands_unsupported`, `notifications_unavailable` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `session_request_in_progress`, `session_request_conflict`, `agent_profile_not_found`, `invalid_profile`, `secret_env_not_declared`, `secret_env_missing`, `secret_env_invalid`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_package_missing`, `assistant_daemon_outdated`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible`, `launch_input_invalid`, `launch_input_unavailable`, `integration_overlay_unavailable`, `integration_launch_arg_conflict`, `integration_hook_path_conflict`, `cline_launch_arg_refused`, `cline_launch_env_refused`, `cline_data_root_invalid`, `cline_config_home_missing`, `command_package_not_installed`, `command_not_selected`, `command_not_declared`, `command_not_exposed`, `command_package_disabled`, `command_busy`, `command_failed`, `command_timed_out`, `command_output_too_large`, `command_output_not_utf8`, `command_unavailable` |
 

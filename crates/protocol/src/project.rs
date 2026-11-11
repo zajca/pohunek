@@ -479,7 +479,8 @@ crate::tolerant_enum!(CandidateLimit);
 pub struct CandidateSessions {
     /// Sessions pohunek owns (or owned) in the repository.
     pub owned: u32,
-    /// History files of the agent that name the repository.
+    /// Session files in the agent's history that name the repository; the
+    /// auxiliary logs of a session are not counted.
     pub history: u32,
 }
 
