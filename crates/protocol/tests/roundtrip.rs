@@ -4573,6 +4573,7 @@ fn session_remove_result_carries_accepted_processes_as_decimal_identities() {
         worktrees_failed: 0,
         accepted_unconfirmed_processes: Vec::new(),
         accepted_unconfirmed_total: None,
+        identity_proof_skipped: false,
         warnings: Vec::new(),
     };
     assert_eq!(
@@ -5640,6 +5641,53 @@ fn a_runtime_state_from_a_newer_daemon_is_possibly_live_and_never_stoppable_or_r
     );
     assert!(!session.can_stop());
     assert!(!session.can_remove());
+}
+
+/// A client reads `can_stop`/`can_remove` off the decoded wire form: a conflict
+/// that names its worker and worker instance is offered the actions the daemon
+/// accepts after its identity proof, any other conflict is not, and a result
+/// that skipped the proof says so on the wire.
+#[test]
+fn a_conflict_naming_its_worker_is_stoppable_and_removable_to_a_client() {
+    let decode = |runtime: serde_json::Value| -> SessionInfo {
+        let mut value =
+            serde_json::to_value(running_shell_session(None)).expect("serialize session info");
+        value["runtime"] = runtime;
+        serde_json::from_value(value).expect("decode session info")
+    };
+    let named = decode(json!({
+        "state": "conflict",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "resume_binding_shape_mismatch"
+    }));
+    assert!(named.can_stop());
+    assert!(named.can_remove());
+
+    for runtime in [
+        json!({"state": "conflict", "runtime_generation": "1"}),
+        json!({"state": "conflict", "runtime_generation": "1", "worker_id": "w-1"}),
+        json!({"state": "conflict", "runtime_generation": "1", "worker_instance_id": "r-1"}),
+    ] {
+        let unnamed = decode(runtime);
+        assert!(!unnamed.can_stop());
+        assert!(!unnamed.can_remove());
+    }
+
+    let skipped: SessionRemoveResult = serde_json::from_value(json!({
+        "removed": true,
+        "stopped": false,
+        "worktrees_removed": 0,
+        "worktrees_failed": 0,
+        "identity_proof_skipped": true
+    }))
+    .expect("decode a result that skipped the proof");
+    assert!(skipped.identity_proof_skipped);
+    assert_eq!(
+        serde_json::to_value(&skipped).expect("serialize")["identity_proof_skipped"],
+        json!(true)
+    );
 }
 
 #[test]

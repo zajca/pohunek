@@ -1939,6 +1939,7 @@ impl SessionRegistry {
                 generation,
                 None,
                 UnconfirmedCleanup::Refuse,
+                false,
             )
             .await
         {
@@ -2855,6 +2856,93 @@ impl SessionRegistry {
             .map_err(crate::runtime::lifecycle::PreviousLive::into_error)
     }
 
+    /// Refuses a consented removal that would skip the identity proof while
+    /// the daemon holds evidence that a worker of the session may still run.
+    ///
+    /// The evidence is a worker answering or claiming the session's slot (the
+    /// slot sockets under the runtime root), an unreadable or mismatched
+    /// journal, or a non-terminal journal whose worker process runs. The record and the
+    /// journals are kept in every refused case.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_identity_mismatch` for a worker that answers, claims
+    /// the slot or still runs, and `runtime_supervision_ambiguous` when the
+    /// evidence cannot be read.
+    pub(super) async fn ensure_no_worker_may_run(
+        &self,
+        id: &SessionId,
+    ) -> Result<(), ProtocolError> {
+        let error = |code: &'static str, detail: String| {
+            ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                code,
+                format!(
+                    "session {} runtime cannot be removed without its identity proof: {detail}",
+                    id.0
+                ),
+                None,
+            )
+        };
+        let record = self
+            .load_durable_session_record(id)
+            .await?
+            .ok_or_else(|| error(SUPERVISION_AMBIGUOUS, "its record is not stored".to_owned()))?;
+        match self.session_socket_evidence(&record).await {
+            SocketEvidence::Absent => {}
+            SocketEvidence::Unknown(detail) => return Err(error(SUPERVISION_AMBIGUOUS, detail)),
+            SocketEvidence::Worker(_) | SocketEvidence::Unusable(..) | SocketEvidence::Multiple => {
+                return Err(error(
+                    IDENTITY_MISMATCH,
+                    "a worker answers or claims the session's runtime slot".to_owned(),
+                ));
+            }
+        }
+        let scan = self
+            .session_journals(&id.0)
+            .await
+            .map_err(|detail| error(SUPERVISION_AMBIGUOUS, detail))?;
+        if scan.conflict {
+            return Err(error(
+                SUPERVISION_AMBIGUOUS,
+                "the session has an unreadable or mismatched worker journal".to_owned(),
+            ));
+        }
+        for journal in scan.evidence.iter().filter(|journal| {
+            !matches!(
+                journal.phase,
+                JournalPhase::Terminal | JournalPhase::NeverInitialized
+            )
+        }) {
+            let identity = journal
+                .worker()
+                .identity()
+                .map_err(|detail| error(IDENTITY_MISMATCH, detail))?;
+            match self.inner.inspector.is_running(identity) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(error(
+                        IDENTITY_MISMATCH,
+                        format!(
+                            "worker {} of its journal is still running",
+                            journal.worker_id
+                        ),
+                    ));
+                }
+                Err(inspect) => {
+                    return Err(error(
+                        SUPERVISION_AMBIGUOUS,
+                        format!(
+                            "worker {} cannot be inspected: {inspect}",
+                            journal.worker_id
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Confirms cleanup of the exact journaled runtime before native recovery.
     ///
     /// The record's runtime id is not a signal permit by itself: only a
@@ -2932,6 +3020,10 @@ impl SessionRegistry {
     /// once every worker of the generation is proven gone, so no live
     /// worker is still starting marked processes.
     ///
+    /// With `proof_skipped` (a consented removal that had no recorded
+    /// generation to prove) the journals of every generation of the session
+    /// are swept, each runtime within its worker's bounds.
+    ///
     /// Under [`UnconfirmedCleanup::Accept`] a runtime whose sweep is
     /// unconfirmed solely because of unreadable-marker processes does not
     /// fail the sweep: those processes are returned (all runtimes
@@ -2950,6 +3042,7 @@ impl SessionRegistry {
         generation: Option<&super::Generation>,
         worker_instance_id: Option<&str>,
         cleanup: UnconfirmedCleanup,
+        proof_skipped: bool,
     ) -> Result<Vec<(UnconfirmedProcess, String)>, ProtocolError> {
         let ambiguous = |detail: String| {
             ProtocolError::new(
@@ -2962,18 +3055,16 @@ impl SessionRegistry {
         self.clear_unreadable_blockers(id);
         // The marker requirement applies only to a runtime no journal names.
         let mut runtimes: Vec<(String, WorkerBounds, bool)> = Vec::new();
-        if let Some(generation) = generation {
+        if generation.is_some() || proof_skipped {
             let scan = self.session_journals(&id.0).await.map_err(ambiguous)?;
             if scan.conflict {
                 return Err(ambiguous(
                     "the session has an unreadable or mismatched worker journal".to_owned(),
                 ));
             }
-            for journal in scan
-                .evidence
-                .iter()
-                .filter(|journal| journal.generation == generation.generation())
-            {
+            for journal in scan.evidence.iter().filter(|journal| {
+                generation.is_none_or(|generation| journal.generation == generation.generation())
+            }) {
                 let worker = journal.worker();
                 let Some(journaled) = worker.worker_instance_id else {
                     continue;
@@ -3104,6 +3195,7 @@ impl SessionRegistry {
                 generation,
                 worker_instance_id.as_deref(),
                 UnconfirmedCleanup::Refuse,
+                false,
             )
             .await
         {
@@ -4256,6 +4348,7 @@ impl SessionRegistry {
             not_durable_logged: HashSet::new(),
             runtime: RuntimeHandle::Worker(worker.clone()),
             job,
+            generation_malformed: false,
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
             detector_resize,
@@ -4575,6 +4668,8 @@ impl SessionRegistry {
         let (detector_preview, _) = mpsc::channel::<super::DetectionPreviewRequest>(1);
         let (_, input_ready) = watch::channel(false);
         let info = record.info.clone();
+        let recorded_generation =
+            super::Generation::from_record(&record.session_id, &record.runtime);
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
@@ -4594,9 +4689,8 @@ impl SessionRegistry {
             runtime: RuntimeHandle::Unavailable(state),
             // A malformed job reference is not adoptable evidence; the runtime is
             // already classified unavailable, so the entry keeps no job.
-            job: super::Generation::from_record(&record.session_id, &record.runtime)
-                .ok()
-                .flatten(),
+            job: recorded_generation.clone().ok().flatten(),
+            generation_malformed: recorded_generation.is_err(),
             desired_state: record.desired_state,
             detector_cancel: CancellationToken::new(),
             detector_resize,
@@ -20424,6 +20518,52 @@ generation "$1"
                 }
                 server_task.abort();
             }
+        }
+
+        /// A conflict that names no generation because a worker still answers on
+        /// the session's slot is refused under the consent and keeps its record.
+        #[tokio::test]
+        async fn the_consent_does_not_remove_a_conflict_whose_slot_still_answers() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let session = "s-5236";
+            let (controller, instance, _child, server_task) = spawn_initialized_worker(
+                &fixture.root,
+                &runtime_root,
+                session,
+                &format!("worker-{session}"),
+            )
+            .await;
+            let mut record = persist_record(&fixture.root, session, Some(instance.as_str()));
+            record.runtime.service_id = None;
+            record.runtime.generation = None;
+            record.runtime.executable = None;
+            drop(controller);
+            assert!(
+                fixture
+                    .registry
+                    .insert_unavailable_record(record, RuntimeState::Conflict, IDENTITY_MISMATCH)
+                    .await
+            );
+
+            let error = fixture
+                .registry
+                .remove_with(
+                    &SessionId(session.to_owned()),
+                    crate::session::UnconfirmedCleanup::Accept,
+                )
+                .await
+                .expect_err("an answering worker is never removed under the consent");
+            assert_eq!(error.code, IDENTITY_MISMATCH, "{error:?}");
+            assert!(
+                Store::new(fixture.root.join("data/metadata.jsonl"))
+                    .load_sessions()
+                    .expect("read durable sessions")
+                    .iter()
+                    .any(|record| record.session_id == session),
+                "the record survives"
+            );
+            server_task.abort();
         }
 
         #[tokio::test]

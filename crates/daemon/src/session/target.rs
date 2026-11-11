@@ -1126,6 +1126,7 @@ impl SessionRegistry {
             not_durable_logged: HashSet::new(),
             runtime: started.handle.clone(),
             job: Some(generation.clone()),
+            generation_malformed: false,
             desired_state: DesiredState::Running,
             detector_cancel: detector_cancel.clone(),
             detector_resize,

@@ -1046,6 +1046,10 @@ struct SessionEntry {
     runtime: RuntimeHandle,
     /// Worker job of the current runtime, when the record names one.
     job: Option<Generation>,
+    /// Whether the record named a partial, malformed or foreign worker
+    /// generation when the entry was classified. Such a runtime has no job to
+    /// prove, yet it is not one that names no generation. In memory only.
+    generation_malformed: bool,
     desired_state: DesiredState,
     detector_cancel: CancellationToken,
     detector_resize: watch::Sender<(u16, u16)>,
@@ -6695,15 +6699,8 @@ impl SessionRegistry {
         if self.is_retried_conflict_removal(id).await? {
             return Box::pin(self.remove_retried_conflict_intent(id, cleanup)).await;
         }
-        let should_stop = {
-            let sessions = self.inner.sessions.lock().await;
-            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
-            if let Some(state) = unreachable_live_state(entry) {
-                ensure_retirable(id, entry, state)?;
-            }
-            !is_terminal(entry.info.state) && matches!(entry.runtime, RuntimeHandle::Worker(_))
-        };
-
+        let (should_stop, identity_proof_skipped) =
+            self.plan_unreachable_removal(id, cleanup).await?;
         let stopped = if should_stop {
             let stopped = self
                 .stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove, None)
@@ -6751,7 +6748,13 @@ impl SessionRegistry {
             )
         };
         let released = self
-            .release_removed_session(id, job.as_ref(), worker_instance_id.as_deref(), cleanup)
+            .release_removed_session(
+                id,
+                job.as_ref(),
+                worker_instance_id.as_deref(),
+                cleanup,
+                identity_proof_skipped,
+            )
             .await?;
         let (accepted_unconfirmed_processes, accepted_unconfirmed_total) =
             supervision::bound_accepted_listing(released.accepted_unconfirmed);
@@ -6762,8 +6765,45 @@ impl SessionRegistry {
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
             accepted_unconfirmed_processes,
             accepted_unconfirmed_total,
+            identity_proof_skipped,
             warnings: released.warnings,
         })
+    }
+
+    /// Decides how the removal of `id` proceeds past its runtime.
+    ///
+    /// Returns whether the session must be stopped first and whether the
+    /// identity proof is skipped (see [`conflict_without_generation_consented`]);
+    /// a skipped proof is allowed only while no evidence says a worker of the
+    /// session may still run ([`Self::ensure_no_worker_may_run`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of [`ensure_retirable`] or of the evidence check.
+    async fn plan_unreachable_removal(
+        &self,
+        id: &SessionId,
+        cleanup: UnconfirmedCleanup,
+    ) -> Result<(bool, bool), ProtocolError> {
+        let (should_stop, identity_proof_skipped) = {
+            let sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            let mut skipped = false;
+            if let Some(state) = unreachable_live_state(entry) {
+                skipped = conflict_without_generation_consented(entry, state, cleanup);
+                if !skipped {
+                    ensure_retirable(id, entry, state)?;
+                }
+            }
+            (
+                !is_terminal(entry.info.state) && matches!(entry.runtime, RuntimeHandle::Worker(_)),
+                skipped,
+            )
+        };
+        if identity_proof_skipped {
+            self.ensure_no_worker_may_run(id).await?;
+        }
+        Ok((should_stop, identity_proof_skipped))
     }
 
     /// Deletes everything a removed session owns once its workers are proven
@@ -6794,9 +6834,10 @@ impl SessionRegistry {
         generation: Option<&Generation>,
         worker_instance_id: Option<&str>,
         cleanup: UnconfirmedCleanup,
+        proof_skipped: bool,
     ) -> Result<ReleasedSession, ProtocolError> {
         let accepted_unconfirmed = self
-            .sweep_removed_runtimes(id, generation, worker_instance_id, cleanup)
+            .sweep_removed_runtimes(id, generation, worker_instance_id, cleanup, proof_skipped)
             .await?;
         // Every runtime is judged and the cap passed, so the removal proceeds
         // past these processes; logged before the first destructive step so
@@ -6866,9 +6907,10 @@ impl SessionRegistry {
         // The record is gone, so nothing replays this removal any more. Logs
         // and the temporary directory go before the record; the journals go
         // after it, because a replayed removal proves its workers gone from
-        // them. A cleanup accepted without confirmation, or a record delete a
-        // crash could undo, keeps its journals for the startup collection.
-        if record_durably_gone && accepted_unconfirmed.is_empty() {
+        // them. A cleanup accepted without confirmation, a removal that skipped
+        // the identity proof, or a record delete a crash could undo, keeps its
+        // journals for the startup collection.
+        if record_durably_gone && accepted_unconfirmed.is_empty() && !proof_skipped {
             self.delete_session_journals(id).await;
         }
         if let Some(entry) = &evicted {
@@ -9720,6 +9762,24 @@ fn unreachable_live_state(entry: &SessionEntry) -> Option<RuntimeState> {
         | RuntimeHandle::Worker(_) => None,
         RuntimeHandle::Unavailable(state) => Some(state),
     }
+}
+
+/// Whether the caller's consent lets the removal of `entry` skip the identity
+/// proof: a conflict whose record names no worker generation has no journal or
+/// job to prove, so only the operator's explicit unconfirmed-cleanup consent
+/// lets the record go, and the result says the proof was skipped.
+/// A partial, malformed or foreign generation fixed at classification
+/// (`generation_malformed`) is never skipped for as long as the entry
+/// classified from that record stays in memory; the flag is not persisted.
+fn conflict_without_generation_consented(
+    entry: &SessionEntry,
+    state: RuntimeState,
+    cleanup: UnconfirmedCleanup,
+) -> bool {
+    state == RuntimeState::Conflict
+        && entry.job.is_none()
+        && !entry.generation_malformed
+        && cleanup == UnconfirmedCleanup::Accept
 }
 
 /// Refuses the removal of an unreachable runtime its session cannot retire.

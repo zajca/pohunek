@@ -2751,6 +2751,11 @@ fn render_remove_human(session_id: &str, result: &SessionRemoveResult) -> String
             }
         }
     }
+    if result.identity_proof_skipped {
+        output.push_str(
+            "  identity proof skipped: the runtime named no worker generation to prove; the runtime the record names and every runtime the session's journals name were swept by ownership marker\n",
+        );
+    }
     write_warnings(&mut output, &result.warnings);
     output
 }
@@ -3815,6 +3820,7 @@ mod tests {
                     },
                 ],
                 accepted_unconfirmed_total: None,
+                identity_proof_skipped: false,
                 warnings: Vec::new(),
             },
         );
@@ -3845,6 +3851,7 @@ mod tests {
                     command: None,
                 }],
                 accepted_unconfirmed_total: Some(335),
+                identity_proof_skipped: false,
                 warnings: Vec::new(),
             },
         );
@@ -3866,6 +3873,7 @@ mod tests {
                 worktrees_failed: 2,
                 accepted_unconfirmed_processes: Vec::new(),
                 accepted_unconfirmed_total: None,
+                identity_proof_skipped: false,
                 warnings: Vec::new(),
             },
         );
@@ -3887,6 +3895,7 @@ mod tests {
                 worktrees_failed: 0,
                 accepted_unconfirmed_processes: Vec::new(),
                 accepted_unconfirmed_total: None,
+                identity_proof_skipped: false,
                 warnings: vec![protocol::SessionWarning {
                     kind: protocol::SessionWarningKind::Hook,
                     message: "pre-remove hook failed".to_owned(),
@@ -4194,6 +4203,7 @@ mod tests {
                 command: Some("gpg-agent".to_owned()),
             }],
             accepted_unconfirmed_total: None,
+            identity_proof_skipped: false,
             warnings: Vec::new(),
         };
 

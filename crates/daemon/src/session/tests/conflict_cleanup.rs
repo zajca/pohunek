@@ -11,7 +11,10 @@ use pohunek_platform::supervisor::{
 use pohunek_session_worker::{Journal, JournalRecord, RuntimePhase, WorkerOrigin};
 use protocol::{RuntimeGeneration, RuntimeState, SessionId, SessionRuntime};
 
-use super::{hermetic_shell, temp_dir, UnreadableCandidateHost, UNREADABLE_CANDIDATE_PID};
+use super::{
+    hermetic_shell, temp_dir, RemovalMarkedProcess, UnreadableCandidateHost,
+    UNREADABLE_CANDIDATE_PID,
+};
 use crate::procwatch::readable_host::ReadableHost;
 use crate::procwatch::{HostInspector, ProcessIdentity, ProcessInspector};
 use crate::runtime::lifecycle::tests::{InspectStep, JobScript, ScriptedSupervisor};
@@ -27,6 +30,17 @@ const GENERATION: &str = "abcd2345";
 const RUNTIME: &str = "r-fixture";
 const OTHER_RUNTIME: &str = "r-other-fixture";
 const WORKER_EXECUTABLE: &str = "/opt/pohunek/libexec/pohunek/0.33.0/pohunek-sessiond";
+
+/// How much of a worker generation a fixture record names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordedGeneration {
+    /// Service id, generation and executable.
+    Full,
+    /// The executable only: a partial generation no job can be read from.
+    Partial,
+    /// Nothing but the worker and its instance.
+    None,
+}
 
 struct Fixture {
     store: PathBuf,
@@ -51,6 +65,22 @@ impl Fixture {
     async fn new_over(
         journal_runtime: &str,
         inspector: Arc<dyn crate::procwatch::ProcessInspector>,
+    ) -> Self {
+        Self::build(
+            journal_runtime,
+            inspector,
+            "launch_identity_reference_kind_mismatch",
+            RecordedGeneration::Full,
+        )
+        .await
+    }
+
+    /// A conflict over `reason` whose record names `generation` of the worker.
+    async fn build(
+        journal_runtime: &str,
+        inspector: Arc<dyn crate::procwatch::ProcessInspector>,
+        reason: &str,
+        generation: RecordedGeneration,
     ) -> Self {
         let root = temp_dir("previous-release-conflict-cleanup");
         let data = root.join("data");
@@ -84,10 +114,14 @@ impl Fixture {
             Some(crate::agent::SessionRefKind::Id),
             "the current migration restored the historical launch kind"
         );
-        record.runtime.service_id = Some(service_id().to_string());
-        record.runtime.generation = Some(GENERATION.to_owned());
+        // The migrated fixture carries a generation of its own, so every
+        // field is set or cleared explicitly.
+        let full = generation == RecordedGeneration::Full;
+        record.runtime.service_id = full.then(|| service_id().to_string());
+        record.runtime.generation = full.then(|| GENERATION.to_owned());
         record.runtime.worker_instance_id = Some(RUNTIME.to_owned());
-        record.runtime.executable = Some(PathBuf::from(WORKER_EXECUTABLE));
+        record.runtime.executable =
+            (generation != RecordedGeneration::None).then(|| PathBuf::from(WORKER_EXECUTABLE));
         record.info.runtime = Some(SessionRuntime {
             state: RuntimeState::Live,
             runtime_generation: RuntimeGeneration::new(1),
@@ -113,11 +147,7 @@ impl Fixture {
         );
         assert!(
             registry
-                .insert_unavailable_record(
-                    record,
-                    RuntimeState::Conflict,
-                    "launch_identity_reference_kind_mismatch"
-                )
+                .insert_unavailable_record(record, RuntimeState::Conflict, reason)
                 .await
         );
         Self {
@@ -813,4 +843,242 @@ fn foreign_definition() -> DefinitionFacts {
         executable: PathBuf::from("/opt/other/pohunek-sessiond"),
         arguments: Vec::new(),
     }
+}
+
+const SHAPE_MISMATCH: &str = "resume_binding_shape_mismatch";
+
+/// A client decides from the listed session whether to offer stop and remove:
+/// a resume-binding conflict that names its worker is offered both, and the
+/// daemon then ends it by the proven recorded identity.
+#[tokio::test]
+async fn a_resume_binding_shape_conflict_is_offered_and_removed_by_its_proven_identity() {
+    let fixture = Fixture::build(
+        RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::Full,
+    )
+    .await;
+    let listed = fixture.registry.inspect(&fixture.id).await.expect("listed");
+    let runtime = listed.runtime.as_ref().expect("runtime");
+    assert_eq!(runtime.state, RuntimeState::Conflict);
+    assert_eq!(runtime.loss_reason.as_deref(), Some(SHAPE_MISMATCH));
+    assert!(listed.can_stop(), "{listed:?}");
+    assert!(listed.can_remove(), "{listed:?}");
+
+    let removed = fixture
+        .registry
+        .remove(&fixture.id)
+        .await
+        .expect("the journal-proven dead generation can be removed");
+    assert!(removed.removed);
+    assert!(!removed.identity_proof_skipped);
+    assert_eq!(fixture.record_count(), 0);
+}
+
+/// The proof is not bypassed by the helpers: a shape conflict whose journal
+/// names another runtime is offered the actions, refused by the daemon, and
+/// kept.
+#[tokio::test]
+async fn a_resume_binding_shape_conflict_with_another_runtime_in_its_journal_is_refused() {
+    let fixture = Fixture::build(
+        OTHER_RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::Full,
+    )
+    .await;
+    let listed = fixture.registry.inspect(&fixture.id).await.expect("listed");
+    assert!(listed.can_remove());
+    let error = fixture
+        .registry
+        .remove(&fixture.id)
+        .await
+        .expect_err("an unproven identity is not removed");
+    assert_eq!(error.code, "runtime_identity_mismatch", "{error:?}");
+    assert_eq!(fixture.record_count(), 1);
+    let error = fixture
+        .registry
+        .stop(&fixture.id)
+        .await
+        .expect_err("an unproven identity is not stopped");
+    assert_eq!(error.code, "runtime_identity_mismatch", "{error:?}");
+    assert_eq!(fixture.record_count(), 1);
+}
+
+/// A conflict that names no worker generation has no journal or job to
+/// prove: removal and stop refuse it, and only the operator's explicit
+/// unconfirmed-cleanup consent removes it, with a result that says the
+/// proof was skipped.
+#[tokio::test]
+async fn a_conflict_without_a_generation_is_removed_only_with_consent_and_says_so() {
+    let fixture = Fixture::build(
+        RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::None,
+    )
+    .await;
+    let listed = fixture.registry.inspect(&fixture.id).await.expect("listed");
+    assert_eq!(
+        listed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(RuntimeState::Conflict)
+    );
+    // The wire form carries no service generation, so a client still sees the
+    // actions; the daemon refuses them below.
+    assert!(listed.can_stop() && listed.can_remove());
+
+    for error in [
+        fixture
+            .registry
+            .remove(&fixture.id)
+            .await
+            .expect_err("no proof, no consent"),
+        fixture
+            .registry
+            .stop(&fixture.id)
+            .await
+            .expect_err("a stop needs the proof"),
+    ] {
+        assert_eq!(error.code, "session_runtime_conflict", "{error:?}");
+    }
+    assert_eq!(fixture.record_count(), 1);
+    assert!(fixture.supervisor.retired().is_empty());
+
+    let removed = fixture
+        .registry
+        .remove_with(&fixture.id, crate::session::UnconfirmedCleanup::Accept)
+        .await
+        .expect("the consent removes a conflict without a generation");
+    assert!(removed.removed);
+    assert!(removed.identity_proof_skipped, "{removed:?}");
+    assert_eq!(fixture.record_count(), 0);
+    assert!(
+        fixture.supervisor.retired().is_empty(),
+        "no job is retired without a proven generation"
+    );
+    fixture.registry.inspect(&fixture.id).await.unwrap_err();
+}
+
+/// The consent never replaces a proof the record could give: a conflict that
+/// names a generation, or only part of one, is refused and kept.
+#[tokio::test]
+async fn the_consent_does_not_skip_the_proof_of_a_recorded_or_partial_generation() {
+    let accept = crate::session::UnconfirmedCleanup::Accept;
+    let mismatching = Fixture::build(
+        OTHER_RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::Full,
+    )
+    .await;
+    let error = mismatching
+        .registry
+        .remove_with(&mismatching.id, accept)
+        .await
+        .expect_err("a named generation is proven even with consent");
+    assert_eq!(error.code, "runtime_identity_mismatch", "{error:?}");
+    assert_eq!(mismatching.record_count(), 1);
+
+    let partial = Fixture::build(
+        RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::Partial,
+    )
+    .await;
+    partial
+        .registry
+        .remove_with(&partial.id, accept)
+        .await
+        .expect_err("a partial generation is not an absent one");
+    assert_eq!(partial.record_count(), 1);
+}
+
+/// The consent never removes a record while the daemon's evidence says a
+/// worker of the session still runs: a non-terminal journal naming a running
+/// worker refuses the removal, and the record and the journal survive.
+#[tokio::test]
+async fn the_consent_refuses_a_conflict_whose_journaled_worker_still_runs() {
+    let fixture = Fixture::build(
+        RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::None,
+    )
+    .await;
+    let stand_in = LiveWorkerStandIn::spawn();
+    write_live_journal(&fixture.state_root, RUNTIME, &stand_in);
+
+    let error = fixture
+        .registry
+        .remove_with(&fixture.id, crate::session::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("a running journaled worker is never removed under the consent");
+    assert_eq!(error.code, "runtime_identity_mismatch", "{error:?}");
+    assert_eq!(fixture.record_count(), 1);
+    assert!(fixture.journal.is_file(), "the journal survives");
+}
+
+/// The skipped proof sweeps every runtime the session's journals name, not
+/// only the one the record names, and keeps the journals for the startup
+/// collection.
+#[tokio::test]
+async fn the_consent_sweeps_a_journaled_runtime_the_record_does_not_name() {
+    let fixture = Fixture::build(
+        OTHER_RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::None,
+    )
+    .await;
+    let mut marked = RemovalMarkedProcess::spawn(OTHER_RUNTIME, Some(SESSION)).await;
+
+    let removed = fixture
+        .registry
+        .remove_with(&fixture.id, crate::session::UnconfirmedCleanup::Accept)
+        .await
+        .expect("the consent removes the conflict");
+    assert!(
+        removed.removed && removed.identity_proof_skipped,
+        "{removed:?}"
+    );
+    assert!(!marked.alive(), "the journaled runtime's process was swept");
+    assert_eq!(fixture.record_count(), 0);
+    assert!(fixture.journal.is_file(), "the journals are kept");
+}
+
+/// A partial generation stays a partial generation after the entry rewrites
+/// its record: the consent decides from what classification found.
+#[tokio::test]
+async fn a_rewritten_record_does_not_turn_a_partial_generation_into_an_absent_one() {
+    let fixture = Fixture::build(
+        RUNTIME,
+        Arc::new(ReadableHost::new()),
+        SHAPE_MISMATCH,
+        RecordedGeneration::Partial,
+    )
+    .await;
+    fixture
+        .registry
+        .write_entry_record(&fixture.id, |entry| {
+            SessionRegistry::session_record(&fixture.id, entry, entry.desired_state, None)
+        })
+        .await
+        .expect("rewrite the record from the entry");
+    let stored = Store::new(fixture.store.clone())
+        .load_sessions()
+        .expect("read durable sessions")
+        .remove(0);
+    assert!(
+        stored.runtime.executable.is_none() && stored.runtime.generation.is_none(),
+        "the rewrite erased the partial generation"
+    );
+
+    fixture
+        .registry
+        .remove_with(&fixture.id, crate::session::UnconfirmedCleanup::Accept)
+        .await
+        .expect_err("the classified partial generation still refuses the skip");
+    assert_eq!(fixture.record_count(), 1);
 }
