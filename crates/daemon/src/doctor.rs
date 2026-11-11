@@ -15,6 +15,7 @@ use protocol::{
 };
 
 use crate::agent::host::VersionRefusal;
+use crate::capabilities::ProbeClock;
 use crate::catalog_anchor::{AnchorFault, CatalogTrust, IndexTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::session::{ActiveSupervision, RejectedLinesState};
@@ -63,6 +64,7 @@ pub(crate) async fn report(
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
     placements: &[(protocol::SessionId, protocol::SessionPlacement)],
+    probe_clock: &ProbeClock,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
@@ -98,9 +100,10 @@ pub(crate) async fn report(
     .map_err(|_error| DoctorReportError)?;
     checks.extend(listener_checks);
     let profiles = profiles.clone();
+    let probe_clock = probe_clock.clone();
     checks.extend(
         tokio::task::spawn_blocking(move || {
-            profile_checks(&profiles, &base_env, include_profile_homes)
+            profile_checks(&profiles, &base_env, include_profile_homes, &probe_clock)
         })
             .await
             .unwrap_or_else(|_| vec![check("agent_profiles", DoctorStatus::Fail, "Configured agent profiles could not be inspected; check daemon logs and profile ownership.")]),
@@ -162,15 +165,27 @@ fn supervision_mode(active: Option<&ActiveSupervision>) -> Supervision {
     }
 }
 
+/// The version probes of one doctor run: when the first could start, which
+/// bounds the budget they share, and the clock their deadlines are read from.
+#[derive(Clone, Copy)]
+struct DoctorProbes<'a> {
+    started: Instant,
+    clock: &'a ProbeClock,
+}
+
 /// Check configured profile resolution and the readiness of optional providers.
 fn profile_checks(
     profiles: &crate::agent::ProfileRegistry,
     base_env: &pohunek_worker_protocol::BaseEnv,
     include_profile_homes: bool,
+    clock: &ProbeClock,
 ) -> Vec<DoctorCheck> {
     let mut checks = embedded_manifest_checks();
     checks.extend(manifest_override_checks(profiles));
-    let probe_started = Instant::now();
+    let probes = DoctorProbes {
+        started: Instant::now(),
+        clock,
+    };
     let configured = match profiles.doctor_profiles() {
         Ok(configured) => configured,
         Err(detail) => {
@@ -185,7 +200,7 @@ fn profile_checks(
         include_profile_homes,
         configured,
         checks,
-        probe_started,
+        probes,
     )
 }
 
@@ -198,7 +213,7 @@ fn configured_checks(
         Result<crate::agent::ResolvedAgent, crate::agent::DoctorProfileError>,
     )>,
     mut checks: Vec<DoctorCheck>,
-    probe_started: Instant,
+    probes: DoctorProbes<'_>,
 ) -> Vec<DoctorCheck> {
     let configured_names: std::collections::HashSet<String> =
         configured.iter().map(|(name, _)| name.clone()).collect();
@@ -210,16 +225,13 @@ fn configured_checks(
         })
         .collect();
     checks.extend(configured_profile_checks(
-        profiles,
-        base_env,
-        configured,
-        probe_started,
+        profiles, base_env, configured, probes,
     ));
     checks.extend(optional_runtime_checks(
         profiles,
         base_env,
         &configured_names,
-        probe_started,
+        probes,
     ));
     checks.extend(integration_checks(
         profiles,
@@ -237,14 +249,14 @@ fn configured_profile_checks(
         String,
         Result<crate::agent::ResolvedAgent, crate::agent::DoctorProfileError>,
     )>,
-    probe_started: Instant,
+    probes: DoctorProbes<'_>,
 ) -> Vec<DoctorCheck> {
     configured
         .into_iter()
         .map(|(name, result)| {
             let (result, readiness_lost) = match result {
                 Ok(agent) => (
-                    profile_runtime_check(profiles, &agent, base_env, probe_started),
+                    profile_runtime_check(profiles, &agent, base_env, probes),
                     agent.override_lacks_screen_readiness(),
                 ),
                 Err(crate::agent::DoctorProfileError::RuntimeUnavailable) => {
@@ -356,7 +368,7 @@ fn optional_runtime_checks(
     profiles: &crate::agent::ProfileRegistry,
     base_env: &pohunek_worker_protocol::BaseEnv,
     configured_names: &std::collections::HashSet<String>,
-    probe_started: Instant,
+    probes: DoctorProbes<'_>,
 ) -> Vec<DoctorCheck> {
     crate::agent::host::RESERVED_RUNTIME_IDS
         .iter()
@@ -366,7 +378,7 @@ fn optional_runtime_checks(
             let result = profiles
                 .resolve_agent(name)
                 .map_or(Err(RuntimeFailure::OptionalMissing), |agent| {
-                    profile_runtime_check(profiles, &agent, base_env, probe_started)
+                    profile_runtime_check(profiles, &agent, base_env, probes)
                 });
             let (status, detail) = optional_runtime_result(result);
             DoctorCheck::new(format!("agent_runtime_{name}"), status, detail)
@@ -631,7 +643,7 @@ fn profile_runtime_check(
     profiles: &crate::agent::ProfileRegistry,
     agent: &crate::agent::ResolvedAgent,
     base_env: &pohunek_worker_protocol::BaseEnv,
-    probe_started: Instant,
+    probes: DoctorProbes<'_>,
 ) -> Result<(), RuntimeFailure> {
     profiles
         .runtimes()
@@ -650,7 +662,7 @@ fn profile_runtime_check(
         ));
     }
     let probe_timeout = if agent.definition.version_probe_parser().is_some() {
-        hostcheck::AGENT_RUNTIME_PROBE_BUDGET.saturating_sub(probe_started.elapsed())
+        hostcheck::AGENT_RUNTIME_PROBE_BUDGET.saturating_sub(probes.started.elapsed())
     } else {
         Duration::ZERO
     };
@@ -662,6 +674,7 @@ fn profile_runtime_check(
         agent.spawn(),
         launch_path.as_deref(),
         probe_timeout,
+        probes.clock,
     )
     .map_err(|error| match error {
         crate::capabilities::LaunchValidationFailure::Missing => {
@@ -1192,6 +1205,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
+            &ProbeClock::default(),
         )
         .await
         .expect("doctor report");
@@ -1274,6 +1288,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
+            &ProbeClock::default(),
         )
         .await
         .expect("doctor report");

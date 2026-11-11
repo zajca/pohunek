@@ -1718,6 +1718,11 @@ async fn the_revision_parser_takes_an_open_range_and_a_closed_range_with_the_fea
 async fn a_version_probe_receives_the_descriptors_launch_env() {
     let servers = spawn_servers("pkg-probe-env").await;
     let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
     // The program prints an in-range release only when the runtime's launch
     // flag is set, so the printed release shows what the probe's environment held.
     let script = "#!/bin/sh\nif [ \"$PI_QUICK_VERSION\" = 1 ]; then printf '%s\\n' 'fixture 1.4.13'; else printf '%s\\n' 'fixture 0.0.1'; fi\n";
@@ -1751,7 +1756,83 @@ async fn a_version_probe_receives_the_descriptors_launch_env() {
             (Some(version), Some(supported)),
             "the probe sees the descriptor's launch env (flag {value})"
         );
+        // The launch gate probes under the same pairs: the runtime is admitted
+        // with its flag and refused without it.
+        if supported {
+            let id = start_session(&mut local, RUNTIME, &cwd).await;
+            let _: protocol::SessionStopResult =
+                call(&mut local, method::SESSION_STOP, json!(id)).await;
+        } else {
+            let error = refused_launch(&mut local, &cwd).await;
+            assert_eq!(error.code, "agent_runtime_unsupported", "flag {value}");
+            assert!(
+                error.msg.contains(
+                    "reports version 0.0.1, outside its runtime's supported range [1.0.0, 2.0.0)"
+                ),
+                "flag {value}: {error:?}"
+            );
+        }
     }
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// The check `name` of the daemon's doctor report.
+async fn doctor_check<S>(framed: &mut Framed<S, LinesCodec>, name: &str) -> protocol::DoctorCheck
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let report: protocol::DaemonDoctorResult =
+        call(framed, method::DAEMON_DOCTOR, Value::Null).await;
+    report
+        .report
+        .checks
+        .into_iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| panic!("the doctor report carries no {name} check"))
+}
+
+/// Writes the host profile `name` over the installed fixture package.
+fn write_package_profile(servers: &Servers, name: &str, digest: &PackageDigest) {
+    std::fs::write(
+        servers.agents.join(format!("{name}.toml")),
+        format!(
+            "base = \"{RUNTIME}\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\n",
+            digest.as_str()
+        ),
+    )
+    .expect("write the profile");
+}
+
+#[tokio::test]
+async fn the_doctor_names_the_minimum_an_open_ended_range_refuses_for_a_profile() {
+    let servers = spawn_servers("pkg-doctor-open-range").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let program = probe_program(&servers.plugins, "probe-below", "fixture 0.9.9");
+    let (digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "below-min",
+        &open_range_descriptor(&program, "1.0.0", "1.0.0", OPEN_RANGE_FEATURE),
+        false,
+    )
+    .await;
+    result.expect("the open range installs");
+    write_package_profile(&servers, "below", &digest);
+
+    let check = doctor_check(&mut local, "agent_profile_below").await;
+    assert_eq!(check.status, protocol::DoctorStatus::Fail);
+    assert!(
+        check.detail.starts_with(
+            "The configured executable reports version 0.9.9, below its runtime's supported minimum 1.0.0;"
+        ),
+        "{check:?}"
+    );
+    assert!(
+        !check.detail.contains('['),
+        "an open range names no interval: {check:?}"
+    );
 
     drop(local);
     servers.stop().await;

@@ -25333,6 +25333,7 @@ generation "$1"
                     &inputs,
                     &PreflightOptions {
                         probe_budget: PROBE_BUDGET,
+                        probe_clock: crate::capabilities::ProbeClock::default(),
                         entry: std::time::Instant::now(),
                         release: Some(ReleaseInputs {
                             release_dir: release.clone(),

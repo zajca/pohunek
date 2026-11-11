@@ -83,6 +83,7 @@ use crate::agent::{
     parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
     ReferenceExistence, RefusalPhase, ResolvedAgent, ValidatedLaunchProgram,
 };
+use crate::capabilities::ProbeClock;
 use crate::capabilities::{
     probe_timed_out_error, unsupported_version_error, LaunchValidationFailure,
 };
@@ -150,6 +151,9 @@ pub struct PreflightOptions {
     /// `entry`. A probe that would start at or after the deadline is judged
     /// [`CODE_PROBE_BUDGET_EXHAUSTED`].
     pub probe_budget: Duration,
+    /// The clock the deadline of each version probe is read from. Defaults to
+    /// the system clock.
+    pub probe_clock: ProbeClock,
     /// The launch environment of the installed daemon, or the reason the
     /// installed `service.toml` cannot be read. The integration homes are read
     /// with it and the version probe runs under it. An unreadable file refuses
@@ -165,6 +169,7 @@ impl Default for PreflightOptions {
             host_state_dir: None,
             entry: Instant::now(),
             probe_budget: PROBE_BUDGET,
+            probe_clock: ProbeClock::default(),
             launch: Ok(LaunchEnvironment::subprocess_default()),
         }
     }
@@ -245,7 +250,7 @@ pub fn run_with(
         .entry
         .checked_add(options.probe_budget)
         .unwrap_or(options.entry);
-    let probes = ProbeLedger::new(deadline, options.probe_budget);
+    let probes = ProbeLedger::new(deadline, options.probe_budget, options.probe_clock.clone());
     let dry = Store::new(inputs.store_path.clone()).dry_run_migration();
     let store_from = dry.as_ref().ok().and_then(|dry| match dry.state {
         DryRunState::WouldMigrate { from } => Some(from),
@@ -1493,6 +1498,8 @@ struct ProbeLedger {
     deadline: Instant,
     /// The budget the deadline was computed from, for the messages that name it.
     budget: Duration,
+    /// The clock the deadline and each probe's own deadline are read from.
+    clock: ProbeClock,
     outcomes: RefCell<HashMap<ProbeKey, ProbeOutcome>>,
 }
 
@@ -1510,10 +1517,11 @@ struct ProbeKey {
 }
 
 impl ProbeLedger {
-    fn new(deadline: Instant, budget: Duration) -> Self {
+    fn new(deadline: Instant, budget: Duration, clock: ProbeClock) -> Self {
         Self {
             deadline,
             budget,
+            clock,
             outcomes: RefCell::new(HashMap::new()),
         }
     }
@@ -1575,6 +1583,7 @@ fn run_probe(
         Spawn::Program(program),
         launch_path,
         remaining,
+        &ledger.clock,
     );
     let outcome = match result {
         Ok(_) => Ok(()),

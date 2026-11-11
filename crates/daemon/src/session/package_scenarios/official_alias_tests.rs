@@ -4231,6 +4231,7 @@ fn stopped_preflight_report_entered(
         },
         &crate::session::upgrade_preflight::PreflightOptions {
             probe_budget: PROBE_BUDGET,
+            probe_clock: crate::capabilities::ProbeClock::default(),
             entry,
             release: None,
             profiles_dir: Some(fixture.agents.clone()),
