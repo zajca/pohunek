@@ -16,7 +16,7 @@ use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdenti
 
 use super::settle::{Applying, CloseOnDrop, RescanSignal};
 use super::{
-    agent_kind_label, clear_active_agent, is_terminal, report_is_current, same_pin,
+    agent_kind_label, clear_active_agent, clear_activity, is_terminal, report_is_current, same_pin,
     send_detector_config, timestamp_now, ActiveAgentReport, CancellationToken, ClaimOrigin,
     MatchedDefinition, ObservedAgent, Ordering, RuntimeWatchIdentity, SessionEntry, SessionId,
     SessionRegistry, TurnEvents,
@@ -1956,7 +1956,7 @@ pub(super) fn apply_observed_transition(
     entry.info.active_agent_session_path = None;
     if report_activity_was_current || entry.info.state_source == protocol::StateSource::OscProgress
     {
-        entry.info.activity = None;
+        clear_activity(&mut entry.info);
         entry.info.state_source = protocol::StateSource::Process;
     }
     let config = DetectorConfig::for_definition(&observed.definition.0);

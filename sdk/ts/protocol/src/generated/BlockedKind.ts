@@ -3,4 +3,4 @@
 /**
  * What a blocked agent waits for, as the agent reports it.
  */
-export type BlockedKind = "permission" | "question" | "auth";
+export type BlockedKind = "permission" | "question" | "auth" | "unspecified";

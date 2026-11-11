@@ -54,6 +54,9 @@ pub enum BlockedKind {
     Question,
     /// An authentication step.
     Auth,
+    /// The program's status record reported `blocked` without naming what it
+    /// waits for.
+    Unspecified,
     /// A value a newer daemon sent that this build does not know. Only the
     /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
     /// rejects the value and the daemon never holds or emits one.
@@ -64,6 +67,20 @@ pub enum BlockedKind {
 }
 
 crate::tolerant_enum!(BlockedKind);
+
+impl BlockedKind {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Auth => "auth",
+            Self::Unspecified => "unspecified",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 /// Lifecycle of one provider-managed subagent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -3070,6 +3087,12 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub activity: Option<AgentActivity>,
+    /// What the agent waits for, present only while [`Self::activity`] is
+    /// `blocked` and the program's status record reported the wait. Derived
+    /// from the live detector: stored records never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub blocked_kind: Option<BlockedKind>,
     /// Durable provider-managed subagents, including bounded recent history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentInfo>,
@@ -3857,6 +3880,7 @@ mod tests {
     /// the daemon's socket/TCP integration tests.
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
+            blocked_kind: None,
             spawned_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),

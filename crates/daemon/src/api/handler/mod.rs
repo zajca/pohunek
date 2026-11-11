@@ -637,6 +637,7 @@ mod tests {
     fn session(id: &str, state: SessionState) -> SessionInfo {
         let path = PathBuf::from(format!("/work/{id}"));
         SessionInfo {
+            blocked_kind: None,
             spawned_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),

@@ -1204,6 +1204,7 @@ impl Fixture {
     ) {
         let now = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
+            blocked_kind: None,
             spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),

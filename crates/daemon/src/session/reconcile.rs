@@ -32,15 +32,15 @@ use super::supervision::{
 };
 use super::tmpdir::TmpdirOwners;
 use super::{
-    current_time_millis, event, event_payload, event_runtime, identity_claim_expiry_is_valid, mpsc,
-    present_lost_runtime, preserve_durable_worker_metadata, preserve_newer_updated_at,
-    runtime_error, sort_subagents, terminalize_running_subagents, timestamp_now, watch,
-    ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig, DetectorConfigUpdate,
-    DetectorInputs, DetectorScope, LossCause, LossProof, Mutex, ObservedAgent, ProtocolError,
-    ResumeSnapshot, RuntimeHandle, RuntimeState, RuntimeWatchIdentity, SessionEntry, SessionId,
-    SessionRecord, SessionRef, SessionRefKind, SessionRegistry, SessionRuntime, SessionState,
-    StateSource, TurnEvents, Unavailability, UnconfirmedCleanup, Worker, WorkerError,
-    WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
+    clear_activity, current_time_millis, event, event_payload, event_runtime,
+    identity_claim_expiry_is_valid, mpsc, present_lost_runtime, preserve_durable_worker_metadata,
+    preserve_newer_updated_at, runtime_error, sort_subagents, terminalize_running_subagents,
+    timestamp_now, watch, ActiveAgentReport, CancellationToken, DesiredState, DetectorConfig,
+    DetectorConfigUpdate, DetectorInputs, DetectorScope, LossCause, LossProof, Mutex,
+    ObservedAgent, ProtocolError, ResumeSnapshot, RuntimeHandle, RuntimeState,
+    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRecord, SessionRef, SessionRefKind,
+    SessionRegistry, SessionRuntime, SessionState, StateSource, TurnEvents, Unavailability,
+    UnconfirmedCleanup, Worker, WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
@@ -818,7 +818,7 @@ impl SessionRegistry {
         let activity_ends = projection.release_names_held && claim_reported_activity;
         let end_reported_activity = |record: &mut SessionRecord| {
             if activity_ends {
-                record.info.activity = None;
+                clear_activity(&mut record.info);
                 record.info.state_source = StateSource::Process;
             }
         };
@@ -1983,7 +1983,7 @@ impl SessionRegistry {
         record.transaction = None;
         record.info.state = SessionState::Stopped;
         record.info.state_source = StateSource::Process;
-        record.info.activity = None;
+        clear_activity(&mut record.info);
         clear_active_identity(&mut record);
         if !self
             .insert_unavailable_record(record, RuntimeState::Terminal, "")
@@ -5479,7 +5479,7 @@ fn adopt_projected_claim(
             .as_ref()
             .is_some_and(|previous| previous.activity_reported)
         {
-            entry.info.activity = None;
+            clear_activity(&mut entry.info);
             entry.info.state_source = StateSource::Process;
         }
         let pending = projection.release.as_ref().and_then(|release| {
@@ -9460,6 +9460,7 @@ while os.getppid() == parent:
 
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
+            blocked_kind: None,
             spawned_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
@@ -11020,6 +11021,7 @@ while os.getppid() == parent:
             active_agent_origin: None,
             native_identity_ordering: None,
             info: SessionInfo {
+                blocked_kind: None,
                 spawned_by: None,
                 id: SessionId("s-identity".to_owned()),
                 external: Some(false),

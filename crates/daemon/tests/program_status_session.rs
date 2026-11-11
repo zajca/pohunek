@@ -31,7 +31,7 @@ use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
-    AgentActivity, NotificationKind, NotificationListParams, NotificationRecord,
+    AgentActivity, BlockedKind, NotificationKind, NotificationListParams, NotificationRecord,
     NotificationStatus, SessionId, SessionInfo, SessionInputParams, SessionInputWait,
     SessionNewParams, StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
@@ -95,8 +95,9 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// terminal (`stdin` source) runs on Enter, as a submitted prompt does; one
 /// read from the `cmd` FIFO (`fifo` source) runs at once. The commands: `g`
 /// reports working, `d` done, `i` idle, `b`, `u` and `a` blocked for a
-/// permission, a question and an authentication, `n` blocked without a kind and
-/// `q` exits; `t` is a turn that
+/// permission, a question and an authentication, `n` blocked without a kind,
+/// `K` the same blocked record under a screen dialog, `Y` an idle record and
+/// then the end of that dialog, and `q` exits; `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
 /// an `id` and a `title`, then a bare `clear`); `m` draws a marker line. In the `screen` mode the
@@ -160,7 +161,9 @@ run() {{
     i) emit idle ;;
     k) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n' ;;
     P) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit 'blocked:kind=permission' ;;
+    K) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit blocked ;;
     y) printf '\033[2J\033[H'; box ;;
+    Y) emit idle; printf '\033[2J\033[H'; box ;;
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
@@ -387,6 +390,34 @@ impl Fixture {
     async fn activity(&self, id: &SessionId) -> Option<(AgentActivity, StateSource)> {
         let info = self.registry.inspect(id).await.expect("inspect session");
         info.activity.map(|activity| (activity, info.state_source))
+    }
+
+    /// The blocked kind of `id` in `session.inspect`, which must equal the one
+    /// in `session.list`.
+    async fn blocked_kind(&self, id: &SessionId) -> Option<BlockedKind> {
+        let inspected = self
+            .registry
+            .inspect(id)
+            .await
+            .expect("inspect session")
+            .blocked_kind;
+        let listed = self
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .find(|info| &info.id == id)
+            .expect("the session is listed")
+            .blocked_kind;
+        assert_eq!(inspected, listed, "inspect and list agree");
+        inspected
+    }
+
+    async fn wait_blocked_kind(&self, id: &SessionId, expected: Option<BlockedKind>) {
+        wait_until(&format!("the session to show {expected:?}"), || async {
+            (self.blocked_kind(id).await == expected).then_some(())
+        })
+        .await;
     }
 
     async fn wait_activity(&self, id: &SessionId, expected: (AgentActivity, StateSource)) {
@@ -1236,6 +1267,13 @@ struct Attention {
 
 impl Attention {
     fn start(fixture: &Fixture) -> Self {
+        let attention = Self::spawn(fixture);
+        fixture.registry.spawn_agent_state_hooks();
+        attention
+    }
+
+    /// Spawns the projector and the coordinator on the current runtime.
+    fn spawn(fixture: &Fixture) -> Self {
         let notifications = NotificationService::open_with_settings(
             &fixture.env.root().join("daemon-data"),
             pohunek_service_config::NotificationSettings {
@@ -1253,7 +1291,6 @@ impl Attention {
             notifications.clone(),
             coordinator,
         );
-        fixture.registry.spawn_agent_state_hooks();
         Self {
             notifications,
             projector,
@@ -1295,11 +1332,31 @@ async fn a_blocked_records_kind_chooses_the_attention_record() {
     }
     let fixture = Fixture::new(true).await;
     let attention = Attention::start(&fixture);
-    for (byte, kind, reason) in [
-        (b'b', NotificationKind::ApprovalRequired, "permission"),
-        (b'u', NotificationKind::AgentBlocked, "question"),
-        (b'a', NotificationKind::AgentBlocked, "auth"),
-        (b'n', NotificationKind::AgentBlocked, "blocked"),
+    for (byte, kind, reason, snapshot_kind) in [
+        (
+            b'b',
+            NotificationKind::ApprovalRequired,
+            "permission",
+            BlockedKind::Permission,
+        ),
+        (
+            b'u',
+            NotificationKind::AgentBlocked,
+            "question",
+            BlockedKind::Question,
+        ),
+        (
+            b'a',
+            NotificationKind::AgentBlocked,
+            "auth",
+            BlockedKind::Auth,
+        ),
+        (
+            b'n',
+            NotificationKind::AgentBlocked,
+            "blocked",
+            BlockedKind::Unspecified,
+        ),
     ] {
         let created = fixture.start("fake-reply-fifo").await;
         fixture
@@ -1313,6 +1370,11 @@ async fn a_blocked_records_kind_chooses_the_attention_record() {
             )
             .await;
 
+        assert_eq!(
+            fixture.blocked_kind(&created.id).await,
+            Some(snapshot_kind),
+            "{reason}: the snapshot names what the agent waits for"
+        );
         let record = attention.first_record(&created.id).await;
         assert_eq!(record.kind, kind, "{reason}");
         assert_eq!(
@@ -1341,7 +1403,13 @@ async fn a_blocked_records_kind_chooses_the_attention_record() {
     command(&fixture, b'u');
     let first = attention.first_record(&created.id).await;
     assert_eq!(first.kind, NotificationKind::AgentBlocked);
+    fixture
+        .wait_blocked_kind(&created.id, Some(BlockedKind::Question))
+        .await;
     command(&fixture, b'b');
+    fixture
+        .wait_blocked_kind(&created.id, Some(BlockedKind::Permission))
+        .await;
     wait_until("the permission record to replace the question", || async {
         let records = attention.records(&created.id);
         let unread: Vec<_> = records
@@ -1376,11 +1444,20 @@ async fn a_blocked_record_followed_by_an_idle_record_resolves_the_attention() {
     command(&fixture, b'b');
     let record = attention.first_record(&created.id).await;
     assert_eq!(record.status, NotificationStatus::Unread);
+    assert_eq!(
+        fixture.blocked_kind(&created.id).await,
+        Some(BlockedKind::Permission)
+    );
 
     command(&fixture, b'i');
     fixture
         .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
         .await;
+    assert_eq!(
+        fixture.blocked_kind(&created.id).await,
+        None,
+        "an idle record ends the blocked kind"
+    );
     wait_until("the attention record to resolve", || async {
         attention
             .records(&created.id)
@@ -1416,6 +1493,11 @@ async fn a_screen_dialog_over_a_permission_record_is_an_approval() {
         .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
         .await;
 
+    assert_eq!(
+        fixture.blocked_kind(&created.id).await,
+        Some(BlockedKind::Permission),
+        "a screen dialog reports the record's kind"
+    );
     let record = attention.first_record(&created.id).await;
     assert_eq!(record.kind, NotificationKind::ApprovalRequired);
     assert_eq!(
@@ -1452,6 +1534,11 @@ async fn an_idle_record_after_a_screen_only_dialog_leaves_the_attention_open() {
         .await;
     let record = attention.first_record(&created.id).await;
     assert_eq!(record.kind, NotificationKind::AgentBlocked);
+    assert_eq!(
+        fixture.blocked_kind(&created.id).await,
+        None,
+        "a dialog only the screen saw names no kind"
+    );
 
     command(&fixture, b'y');
     fixture
@@ -1476,4 +1563,199 @@ async fn an_idle_record_after_a_screen_only_dialog_leaves_the_attention_open() {
         fixture.registry.stop(id).await.expect("stop the session");
     }
     attention.end().await;
+}
+
+/// A `blocked` record that names no kind, under a dialog the screen rules also
+/// read, is still backed by the record: an idle record after it closes the
+/// attention record, and the snapshot reports the kind `unspecified`.
+#[tokio::test]
+async fn an_idle_record_after_a_kindless_record_under_a_dialog_resolves_the_attention() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'K');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::AgentBlocked);
+    assert_eq!(record.status, NotificationStatus::Unread);
+    let listed = fixture
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .find(|info| info.id == created.id)
+        .expect("the session is listed");
+    assert_eq!(
+        serde_json::to_value(&listed).expect("serialize the snapshot")["blocked_kind"],
+        "unspecified",
+        "the snapshot carries the kind on the wire"
+    );
+
+    command(&fixture, b'Y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    wait_until("the attention record to resolve", || async {
+        attention
+            .records(&created.id)
+            .iter()
+            .all(|record| record.status != NotificationStatus::Unread)
+            .then_some(())
+    })
+    .await;
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// A projector that lags past the `kind=permission` event re-reads the session
+/// snapshot, and the snapshot still says what the agent waits for: the record is
+/// an approval, not a generic block. The projector runs on a runtime nobody
+/// drives while the events pass, so its receiver overflows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_projector_that_lags_past_a_permission_event_still_derives_an_approval() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let idle_runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime that is driven on demand");
+    let attention = std::thread::scope(|scope| {
+        scope
+            .spawn(|| idle_runtime.block_on(async { Attention::spawn(&fixture) }))
+            .join()
+            .expect("spawn the projector")
+    });
+    fixture.registry.spawn_agent_state_hooks();
+
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    for round in 0..LAG_OVERFLOW_EVENTS {
+        fixture
+            .registry
+            .rename(&created.id, Some(format!("lag-{round}")))
+            .await
+            .expect("rename the session");
+    }
+
+    let record = std::thread::scope(|scope| {
+        scope
+            .spawn(|| idle_runtime.block_on(attention.first_record(&created.id)))
+            .join()
+            .expect("drive the projector")
+    });
+    assert_eq!(record.kind, NotificationKind::ApprovalRequired);
+    assert_eq!(
+        record.metadata.get("reason").map(String::as_str),
+        Some("permission")
+    );
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| idle_runtime.block_on(attention.end()))
+            .join()
+            .expect("stop the projector");
+    });
+    // A runtime cannot be dropped inside an async context.
+    idle_runtime.shutdown_background();
+}
+
+/// Events the session registry keeps for a lagging subscriber (the capacity of
+/// its produced-event channel is 128); twice that many renames overflow it.
+const LAG_OVERFLOW_EVENTS: usize = 256;
+
+/// The blocked kind is derived, not stored: a restarted daemon that re-adopts
+/// the worker shows it again once the detector reads the held record.
+#[tokio::test]
+async fn a_session_reattached_after_a_daemon_restart_shows_its_blocked_kind_again() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let env = Arc::new(TestEnv::new().expect("create the test environment"));
+    let scratch = prepare_agents(&env, true, Some(CLAUDE_FLOOR));
+    let launcher = Arc::new(SubprocessWorkerLauncher::new());
+    let store = Some(env.state_home().join("metadata.jsonl"));
+    let hosted = |registry| Fixture {
+        env: Arc::clone(&env),
+        registry,
+        scratch: scratch.clone(),
+    };
+    let shell = || ShellCommand::new("/bin/sh", ["-c", "sleep 600"]);
+
+    let id = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("first daemon runtime");
+                runtime.block_on(async {
+                    let registry =
+                        registry_over(&env, shell(), store.clone(), Arc::clone(&launcher), true)
+                            .await;
+                    let first = hosted(registry);
+                    let created = first.start("fake-reply-fifo").await;
+                    first
+                        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+                        .await;
+                    command(&first, b'b');
+                    first
+                        .wait_blocked_kind(&created.id, Some(BlockedKind::Permission))
+                        .await;
+                    first.registry.begin_daemon_shutdown();
+                    created.id
+                })
+            })
+            .join()
+            .expect("first daemon thread")
+    });
+
+    let restarted = hosted(registry_over(&env, shell(), store, launcher, false).await);
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("the restarted daemon adopts the worker");
+    restarted
+        .wait_blocked_kind(&id, Some(BlockedKind::Permission))
+        .await;
+    restarted
+        .wait_activity(&id, (AgentActivity::Blocked, StateSource::OscProgress))
+        .await;
+
+    command(&restarted, b'i');
+    restarted.wait_blocked_kind(&id, None).await;
+    restarted
+        .registry
+        .stop(&id)
+        .await
+        .expect("stop the session");
 }

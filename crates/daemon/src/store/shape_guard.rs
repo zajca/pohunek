@@ -454,6 +454,7 @@ fn assert_every_field_is_reviewed(
         state,
         state_source,
         activity,
+        blocked_kind: _,
         subagents,
         background,
         active_agent: _,

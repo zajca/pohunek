@@ -5727,11 +5727,7 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     let dir = crate::test_support::scoped_dir("ph-alias-retry-e2e-");
     let notifications = crate::notifications::NotificationService::open(&dir.join("data"))
         .expect("notification service");
-    let (attention, _attention_task) = crate::notifications::AttentionCoordinator::spawn(
-        &crate::shutdown::DaemonShutdown::default(),
-        notifications.clone(),
-        &released.restarted.registry,
-    );
+    let (attention, mut deferred) = crate::notifications::AttentionCoordinator::probed();
     let state = crate::api::DaemonState::new(
         crate::api::HealthInfo::new("test"),
         released.restarted.registry.clone(),
@@ -5788,6 +5784,11 @@ async fn a_claude_hook_retries_until_the_unpinned_sessions_worker_is_back() {
     let refused = text.matches("the hook report is refused").count();
     assert!(refused >= 1, "the first attempt is refused: {text}");
     assert_eq!(attempts, refused + 1, "one accepted report: {text}");
+    assert_eq!(
+        deferred.defers(),
+        1,
+        "the accepted report reaches the attention coordinator once: {text}"
+    );
     let recorded = notifications
         .list(protocol::NotificationListParams::default())
         .expect("list notifications")

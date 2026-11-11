@@ -6,7 +6,8 @@ use protocol::{AgentActivity, BlockedKind, StateSource};
 pub struct ActivityEvidence {
     pub activity: AgentActivity,
     pub source: StateSource,
-    /// What a blocked agent waits for, when its status record says so.
+    /// What a blocked agent waits for, when its status record says so
+    /// (`Unspecified` for a record that names no kind).
     pub blocked_kind: Option<BlockedKind>,
 }
 
@@ -14,7 +15,8 @@ pub struct ActivityEvidence {
 pub struct ActivityTransition {
     pub activity: AgentActivity,
     pub source: StateSource,
-    /// What a blocked agent waits for, when its status record says so.
+    /// What a blocked agent waits for, when its status record says so
+    /// (`Unspecified` for a record that names no kind).
     pub blocked_kind: Option<BlockedKind>,
 }
 
