@@ -386,6 +386,9 @@ the opened descriptor (a regular file of at most 4 MiB) and read through that de
 up to the bound, so a file that grows after the check refuses without being read further;
 all declared files together may hold at most 64 MiB. The contents of every file are
 hashed by one git process. A larger file, a special file or a symbolic link refuses.
+A launch stops waiting for an evaluation that has not finished at the 30 second deadline, for
+example one stalled in a file system call on a hung mount: it logs one
+`checkout_trust.failed` warning and launches without the arguments.
 
 The keys join the digest of a built-in descriptor only while declared. A core
 older than 0.40 refuses the descriptor with `runtime_feature_unsupported`.

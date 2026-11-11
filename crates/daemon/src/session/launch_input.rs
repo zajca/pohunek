@@ -7,7 +7,7 @@
 
 // Rust guideline compliant 2026-10-27
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use protocol::{ErrorClass, ProtocolError, RuntimeRef, SessionId};
@@ -20,6 +20,7 @@ use crate::checkout_trust::CheckoutFacts;
 use crate::integration::launch_input::{
     place, LaunchInput, LaunchInputContext, LaunchKind, LAUNCH_INPUT_UNAVAILABLE_CODE,
 };
+use crate::project::ProjectManager;
 use crate::runtime::environment::effective_variable;
 use crate::store::ResumeBinding;
 
@@ -117,6 +118,26 @@ impl SessionRegistry {
         Vec::new()
     }
 
+    /// Whether an abandoned evaluation of `checkout` is still blocked, which
+    /// refuses a new one; an unreadable record counts as stalled. Logs the
+    /// refusal.
+    fn checkout_is_stalled(&self, checkout: &Path) -> bool {
+        let stalled = self
+            .inner
+            .stalled_checkouts
+            .lock()
+            .map_or(true, |stalled| stalled.contains(checkout));
+        if stalled {
+            warn!(
+                event = "checkout_trust.failed",
+                checkout = %checkout.display(),
+                reason = "an earlier evaluation of this checkout is still stalled",
+                "the checkout trust predicate could not be evaluated; the checkout is not trusted"
+            );
+        }
+        stalled
+    }
+
     /// The runtime's `trusted_checkout_args` when the checkout at `cwd` is
     /// trusted, else empty.
     ///
@@ -162,41 +183,58 @@ impl SessionRegistry {
             .lock()
             .ok()
             .and_then(|observer| observer.clone());
+        let checkout = cwd.to_path_buf();
+        if self.checkout_is_stalled(&checkout) {
+            return Vec::new();
+        }
         let (cwd, project_id, paths) = (
-            cwd.to_path_buf(),
+            checkout.clone(),
             project_id.to_owned(),
             trust.paths().to_vec(),
         );
-        let trusted = tokio::task::spawn_blocking(move || {
-            let record = match projects.resolve(&project_id) {
-                Ok(record) => record,
-                Err(error) => {
-                    warn!(
-                        event = "checkout_trust.project_unavailable",
-                        error = %error.msg,
-                        "the launch's project record cannot be read; the checkout is not trusted"
-                    );
-                    return false;
-                }
-            };
-            crate::checkout_trust::is_trusted(&CheckoutFacts {
-                cwd: &cwd,
-                stored_origin: record.origin_url.as_deref(),
-                trusted_repositories: &repositories,
-                paths: &paths,
-                scratch_root: &scratch_root,
-                remote_source: remote_source.as_ref(),
-                read_observer: read_observer.as_ref(),
-            })
-        })
-        .await
-        .unwrap_or_else(|_join_error| {
-            warn!(
-                event = "checkout_trust.task_failed",
-                "the checkout trust predicate task failed; the checkout is not trusted"
+        let run = Arc::new(EvaluationRun::default());
+        let (task_run, stalled) = (Arc::clone(&run), Arc::clone(&self.inner.stalled_checkouts));
+        let task_checkout = checkout.clone();
+        let evaluation = tokio::task::spawn_blocking(move || {
+            let trusted = evaluate_checkout(
+                &projects,
+                &project_id,
+                &CheckoutFacts {
+                    cwd: &cwd,
+                    stored_origin: None,
+                    trusted_repositories: &repositories,
+                    paths: &paths,
+                    scratch_root: &scratch_root,
+                    remote_source: remote_source.as_ref(),
+                    read_observer: read_observer.as_ref(),
+                    abandoned: Some(&task_run.abandoned),
+                },
             );
-            false
+            task_run.finish(&stalled, &task_checkout);
+            trusted
         });
+        let trusted = match tokio::time::timeout(crate::checkout_trust::TOTAL_DEADLINE, evaluation)
+            .await
+        {
+            Ok(Ok(trusted)) => trusted,
+            Ok(Err(_join_error)) => {
+                warn!(
+                    event = "checkout_trust.task_failed",
+                    "the checkout trust predicate task failed; the checkout is not trusted"
+                );
+                false
+            }
+            Err(_elapsed) => {
+                run.abandon(&self.inner.stalled_checkouts, &checkout);
+                warn!(
+                    event = "checkout_trust.failed",
+                    checkout = %checkout.display(),
+                    reason = "the evaluation did not finish within its total deadline",
+                    "the checkout trust predicate could not be evaluated; the checkout is not trusted"
+                );
+                false
+            }
+        };
         if trusted {
             trust.args().to_vec()
         } else {
@@ -394,4 +432,80 @@ fn unavailable_state_root() -> ProtocolError {
         "the runtime needs launch input but the daemon has no worker state directory",
         None,
     )
+}
+
+/// Reads the project record of `project_id` and evaluates the checkout of
+/// `facts` against its stored origin; any failure is not trusted.
+fn evaluate_checkout(
+    projects: &ProjectManager,
+    project_id: &str,
+    facts: &CheckoutFacts<'_>,
+) -> bool {
+    let record = match projects.resolve(project_id) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(
+                event = "checkout_trust.project_unavailable",
+                error = %error.msg,
+                "the launch's project record cannot be read; the checkout is not trusted"
+            );
+            return false;
+        }
+    };
+    crate::checkout_trust::is_trusted(&CheckoutFacts {
+        stored_origin: record.origin_url.as_deref(),
+        ..*facts
+    })
+}
+
+/// How far one blocking evaluation of a checkout has come, shared between the
+/// launch that waits for it and the thread that runs it.
+#[derive(Default)]
+struct EvaluationRun {
+    /// Set once the launch stopped waiting; the evaluation then logs nothing.
+    abandoned: std::sync::atomic::AtomicBool,
+    state: std::sync::Mutex<RunState>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum RunState {
+    #[default]
+    Running,
+    Abandoned,
+    Finished,
+}
+
+impl EvaluationRun {
+    /// Records that the launch stopped waiting for a run of `checkout` that is
+    /// still blocked, unless the run has just ended.
+    fn abandon(
+        &self,
+        stalled: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+        checkout: &Path,
+    ) {
+        let (Ok(mut state), Ok(mut stalled)) = (self.state.lock(), stalled.lock()) else {
+            return;
+        };
+        if *state == RunState::Running {
+            *state = RunState::Abandoned;
+            self.abandoned
+                .store(true, std::sync::atomic::Ordering::Release);
+            stalled.insert(checkout.to_path_buf());
+        }
+    }
+
+    /// Records that the run ended and lifts the refusal it caused.
+    fn finish(
+        &self,
+        stalled: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+        checkout: &Path,
+    ) {
+        let (Ok(mut state), Ok(mut stalled)) = (self.state.lock(), stalled.lock()) else {
+            return;
+        };
+        if *state == RunState::Abandoned {
+            stalled.remove(checkout);
+        }
+        *state = RunState::Finished;
+    }
 }

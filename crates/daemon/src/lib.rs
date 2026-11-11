@@ -54,7 +54,7 @@ pub mod store;
 pub(crate) mod time;
 pub mod worktree;
 
-pub use checkout_trust::CheckoutReadStep;
+pub use checkout_trust::{CheckoutReadStep, TOTAL_DEADLINE as CHECKOUT_TRUST_DEADLINE};
 pub use error::DaemonError;
 pub use paths::Paths;
 

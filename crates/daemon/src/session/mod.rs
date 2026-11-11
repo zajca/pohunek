@@ -840,6 +840,10 @@ struct SessionRegistryInner {
     /// Observer of the trusted-checkout predicate's read of the declared paths;
     /// `None` observes nothing.
     checkout_read_observer: std::sync::Mutex<Option<crate::checkout_trust::ReadObserver>>,
+    /// Launch directories whose trusted-checkout evaluation was abandoned at
+    /// its deadline and is still blocked; a new evaluation of one is refused
+    /// until the blocked one ends.
+    stalled_checkouts: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     /// Cancellation signal for the event-log drain, fired by
     /// [`SessionRegistry::shutdown_event_log`] so the drain flushes its backlog
     /// and exits cleanly at shutdown.
@@ -2654,6 +2658,7 @@ impl SessionRegistry {
                 projects,
                 checkout_remote_source: std::sync::Mutex::new(None),
                 checkout_read_observer: std::sync::Mutex::new(None),
+                stalled_checkouts: Arc::default(),
                 event_log_shutdown: CancellationToken::new(),
                 event_log_task: std::sync::Mutex::new(None),
                 agent_state_hook_shutdown: CancellationToken::new(),

@@ -36,8 +36,9 @@ use pohunek_daemon::catalog_anchor::{CatalogTrust, IndexTrust};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{HostTrustAnchor, SessionRegistry, SessionRegistryConfig};
-use pohunek_daemon::CheckoutReadStep;
+use pohunek_daemon::{CheckoutReadStep, CHECKOUT_TRUST_DEADLINE};
 use pohunek_test_support::catalog::{root_of, test_key, WINDOW_END, WINDOW_START};
+use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use pohunek_test_support::worker_binary;
 
 /// Runtime id of the fixture package.
@@ -4602,6 +4603,279 @@ async fn a_declared_file_that_grows_after_the_size_check_is_refused_without_a_fa
     assert!(hook.lock().expect("read hook").is_none(), "the growth ran");
     assert_eq!(failure_lines(&log, &dir), 0, "a refusal is not a failure");
 
+    drop(local);
+    servers.stop().await;
+}
+
+/// Installs the argv-printing runtime that adds [`TRUST_ARG`] to a trusted
+/// checkout and declares only `paths`.
+async fn install_runtime_declaring<S>(
+    servers: &Servers,
+    local: &mut Framed<S, LinesCodec>,
+    paths: &[&str],
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let program = argv_program(&servers.plugins);
+    let quoted: Vec<String> = paths.iter().map(|path| format!("\"{path}\"")).collect();
+    let keys = format!(
+        "trusted_checkout_args = [\"{TRUST_ARG}\"]\ntrusted_checkout_paths = [{}]\n",
+        quoted.join(", ")
+    );
+    let document = checkout_trust_descriptor(&program, CHECKOUT_TRUST_FEATURE, &keys);
+    let (_digest, installed) =
+        install_descriptor(local, &servers.plugins, "agent-trusting", &document, false).await;
+    installed.expect("the package installs");
+}
+
+#[tokio::test]
+async fn an_evaluation_stalled_in_a_file_system_call_is_abandoned_at_its_deadline_and_not_trusted()
+{
+    let captured = captured_log();
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-stall",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let hook = read_hook(&servers);
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "stalled", "https://github.com/acme/widgets.git");
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+    assert!(
+        carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "the unmodified checkout is trusted"
+    );
+
+    // A read that never returns: the observer blocks the evaluation's thread
+    // right before the bytes of a declared file are read, and holds it until
+    // `release` is sent or dropped. The ceiling only keeps an evaluation that
+    // is not abandoned from hanging the test.
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let signal = Arc::clone(&reached);
+    on_read(
+        &hook,
+        CheckoutReadStep::BeforeRead,
+        dir.join(".muse/hooks.json"),
+        Box::new(move || {
+            signal.notify_one();
+            let _ = released.recv_timeout(pohunek_test_support::wait::HANG_GUARD);
+        }),
+    );
+
+    // The deadline runs on the paused clock: it moves only when the test
+    // advances it, once the evaluation is stalled. The clock runs again as
+    // soon as the deadline passed, so the rest of the launch is real time.
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
+    let past_deadline = async {
+        reached.notified().await;
+        tokio::time::advance(CHECKOUT_TRUST_DEADLINE + TIMER_TICK).await;
+        tokio::time::resume();
+        inhibitor.release().await;
+    };
+    let (id, ()) = tokio::join!(
+        start_named_session(&mut local, RUNTIME, &dir, None),
+        past_deadline
+    );
+    // While the abandoned evaluation is still blocked, another launch of the
+    // checkout is refused at once instead of starting a second one.
+    assert!(
+        !carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "a checkout with a stalled evaluation is not trusted"
+    );
+    drop(release);
+
+    let argv = printed_argv(&mut local, &id).await;
+    let _: protocol::SessionStopResult = call(&mut local, method::SESSION_STOP, json!(id)).await;
+    assert!(
+        !carries_trust_arg(&argv),
+        "a stalled evaluation does not trust the checkout"
+    );
+    assert!(hook.lock().expect("read hook").is_none(), "the stall ran");
+    let log = captured_text(captured);
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("checkout_trust.failed")
+                && line.contains("did not finish within its total deadline")
+                && line.contains(&*dir.to_string_lossy()))
+            .count(),
+        1,
+        "one trace line for the abandoned evaluation: {log}"
+    );
+
+    assert!(
+        log.contains("an earlier evaluation of this checkout is still stalled"),
+        "the refused launch is traced: {log}"
+    );
+
+    // Once the blocked evaluation ends, the checkout is trusted again.
+    let shared = tokio::sync::Mutex::new(&mut local);
+    let (shared, dir_ref) = (&shared, &dir);
+    pohunek_test_support::wait::wait_until("the stalled evaluation to end", || async move {
+        let mut local = shared.lock().await;
+        carries_trust_arg(&launched_argv(&mut **local, dir_ref).await).then_some(())
+    })
+    .await;
+    // The abandoned evaluation's late outcome adds no second warning.
+    let log = captured_text(captured);
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("checkout_trust.failed")
+                && line.contains("passed its total deadline")
+                && line.contains(&*dir.to_string_lossy()))
+            .count(),
+        0,
+        "the abandoned evaluation stays silent: {log}"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn an_ancestor_of_a_nested_declared_path_swapped_for_a_link_is_not_trusted() {
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-ancestor",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_runtime_declaring(&servers, &mut local, &["outer/mid/inner"]).await;
+    let hook = read_hook(&servers);
+    let root = servers.plugins.parent().expect("the socket directory");
+
+    // The runtime declares only a three-component path, so the swapped
+    // component is an ancestor that the lookup of the declared path opens,
+    // not a path the walk of the declared tree reaches. The link leads to a
+    // copy with the very same bytes.
+    for (name, swapped) in [("outermost", "outer"), ("middle", "outer/mid")] {
+        let dir = checkout(root, name, "https://github.com/acme/widgets.git");
+        std::fs::create_dir_all(dir.join("outer/mid/inner")).expect("create the declared path");
+        std::fs::write(dir.join("outer/mid/inner/file.md"), "inner\n").expect("write a file");
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-q", "-m", "nested"]);
+        git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+        assert!(
+            carries_trust_arg(&launched_argv(&mut local, &dir).await),
+            "{name}: the unmodified checkout is trusted"
+        );
+
+        let target = dir.join(swapped);
+        let outside = root.join(format!("{name}-outside"));
+        copy_tree(&target, &outside);
+        let original = root.join(format!("{name}-original"));
+        let swapped_path = target.clone();
+        on_read(
+            &hook,
+            CheckoutReadStep::BeforeOpen,
+            target,
+            Box::new(move || {
+                std::fs::rename(&swapped_path, &original).expect("move the original aside");
+                std::os::unix::fs::symlink(&outside, &swapped_path).expect("link");
+            }),
+        );
+        assert!(
+            !carries_trust_arg(&launched_argv(&mut local, &dir).await),
+            "{name}: an ancestor swapped for a link is not trusted"
+        );
+        assert!(
+            hook.lock().expect("read hook").is_none(),
+            "{name}: the swap ran"
+        );
+    }
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn many_declared_files_are_hashed_by_one_git_process_and_each_hash_belongs_to_its_file() {
+    use std::io::Write as _;
+
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let servers = spawn_servers_trusting_repositories(
+        "pkg-trust-hash-once",
+        Some(""),
+        CatalogTrust::Absent,
+        host_trusting(&["acme/widgets"]),
+    )
+    .await;
+    let mut local = connect_unix(&servers.socket).await;
+    install_trusting_runtime(&servers, &mut local).await;
+    let root = servers.plugins.parent().expect("the socket directory");
+    let dir = checkout(root, "many-files", "https://github.com/acme/widgets.git");
+    let names: Vec<String> = (0..8)
+        .map(|index| format!(".agents/rule-{index}.md"))
+        .collect();
+    for name in &names {
+        std::fs::write(dir.join(name), format!("rule {name}\n")).expect("write a declared file");
+    }
+    git_in(&dir, &["add", "."]);
+    git_in(&dir, &["commit", "-q", "-m", "many"]);
+    git_in(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    announce_remote_source(&servers, Some(remote_snapshot(&dir)));
+
+    // A `git` first on the daemon's PATH that records each `fast-import` run
+    // and then runs the real one. The fixtures above are built before the
+    // environment is taken: the test's own git runs resolve `PATH` under the
+    // same lock.
+    let real_git = pohunek_test_support::process_env::command("git")
+        .get_program()
+        .to_owned();
+    let wrapper_dir = pohunek_test_support::tempdir_with_prefix("ph-gitwrap-")
+        .expect("create the wrapper directory");
+    let record = wrapper_dir.path().join("fast-import-runs");
+    let wrapper = wrapper_dir.path().join("git");
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fast-import ]; then printf 'run\\n' >> '{}'; fi\ndone\nexec '{}' \"$@\"\n",
+        record.display(),
+        real_git.to_string_lossy()
+    );
+    std::fs::File::create(&wrapper)
+        .and_then(|mut file| file.write_all(script.as_bytes()))
+        .expect("write the git wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("make the wrapper executable");
+    let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs = vec![wrapper_dir.path().to_path_buf()];
+    dirs.extend(std::env::split_paths(&search));
+    env.set("PATH", std::env::join_paths(dirs).expect("join PATH"));
+
+    let runs = || std::fs::read_to_string(&record).map_or(0, |text| text.lines().count());
+    assert!(
+        carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "the unmodified checkout is trusted"
+    );
+    assert_eq!(runs(), 1, "eight declared files are hashed by one process");
+
+    // Two files trade their contents: the set of contents is still the one
+    // the remote holds, so only the pairing of each file with its own hash
+    // can tell.
+    let (first, second) = (dir.join(&names[1]), dir.join(&names[6]));
+    let (kept, other) = (
+        std::fs::read(&first).expect("read the first"),
+        std::fs::read(&second).expect("read the second"),
+    );
+    std::fs::write(&first, other).expect("write the first");
+    std::fs::write(&second, kept).expect("write the second");
+    assert!(
+        !carries_trust_arg(&launched_argv(&mut local, &dir).await),
+        "files with exchanged contents are not trusted"
+    );
+    assert_eq!(runs(), 2, "the second evaluation hashes in one process too");
+
+    drop(env);
     drop(local);
     servers.stop().await;
 }

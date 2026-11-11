@@ -33,7 +33,9 @@
 //! runs in the private repository through the bounded runner with a cleared
 //! environment, no user or system configuration, no hooks, no pager and no
 //! lazy fetch. The walk of the declared paths on disk and all git commands of
-//! one evaluation share one deadline.
+//! one evaluation share one deadline, and the launch stops waiting for an
+//! evaluation that outlives it (a stalled file system call), which means not
+//! trusted.
 //!
 //! The launch directory is opened once; every component below it is opened
 //! relative to the descriptor of its parent without following a symbolic link,
@@ -64,8 +66,10 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Longest one evaluation may take across all its git commands and the
 /// checks between its file system calls. A single file system call that never
-/// returns (a stalled mount) is not interrupted.
-pub(crate) const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
+/// returns (a stalled mount) cannot be interrupted, so the caller stops waiting
+/// for the evaluation after this long and treats the checkout as not trusted;
+/// the blocked thread and its scratch directory stay until the call returns.
+pub const TOTAL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Most stdout bytes one git command may produce; the runner lowers a larger
 /// cap to its own maximum. A larger answer is a failure, which means not
@@ -273,6 +277,9 @@ pub(crate) struct CheckoutFacts<'a> {
     pub(crate) remote_source: Option<&'a RemoteSourceResolver>,
     /// Observer of the read of the declared paths.
     pub(crate) read_observer: Option<&'a ReadObserver>,
+    /// Set once the caller stopped waiting for this evaluation; its late
+    /// outcome is then not logged.
+    pub(crate) abandoned: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Why the predicate could not reach an answer.
@@ -342,7 +349,14 @@ impl GitResult {
 /// expected answer for most checkouts.
 #[must_use]
 pub(crate) fn is_trusted(facts: &CheckoutFacts<'_>) -> bool {
-    match evaluate(facts) {
+    let verdict = evaluate(facts);
+    if facts
+        .abandoned
+        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+    {
+        return false;
+    }
+    match verdict {
         Ok(Verdict::Trusted) => true,
         Ok(Verdict::Untrusted(why)) => {
             debug!(
