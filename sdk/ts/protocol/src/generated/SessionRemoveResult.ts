@@ -46,6 +46,15 @@ export type SessionRemoveResult = {
    */
   accepted_unconfirmed_total?: number;
   /**
+   * Whether the removal skipped the worker-journal identity proof because
+   * the session's `conflict` runtime names no worker generation and the
+   * caller consented to unconfirmed cleanup. The runtime the record names
+   * was swept by its ownership marker, and so was every runtime any
+   * journal of the session names, within the journaled worker's bounds.
+   * Omitted when `false`.
+   */
+  identity_proof_skipped?: boolean;
+  /**
    * Non-fatal warnings the removal raised, such as a failing `pre-remove`
    * or `post-remove` worktree hook. The session record is gone once the
    * result is returned, so this is the only place they are reported.

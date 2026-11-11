@@ -2771,6 +2771,14 @@ pub struct SessionRuntime {
     pub loss_cause: Option<String>,
 }
 
+impl SessionRuntime {
+    /// Whether the runtime names both the worker and the worker instance the
+    /// daemon proves before it stops or removes a conflicted session.
+    fn names_recorded_worker(&self) -> bool {
+        self.worker_id.is_some() && self.worker_instance_id.is_some()
+    }
+}
+
 /// The end of a worker as recorded by the service manager.
 ///
 /// `cause` is an open string: clients must tolerate a value they do not
@@ -3272,30 +3280,38 @@ impl SessionInfo {
     /// An external observe-only entry has no PTY to stop, a terminal session has
     /// already stopped, and a runtime that is neither connected nor on its way
     /// back cannot be asked to shut one down; neither can a runtime in a state
-    /// this build does not know. A session with no runtime at all predates
-    /// worker-backed runtimes and is treated as stoppable.
+    /// this build does not know. A [`RuntimeState::Conflict`] runtime that names
+    /// its worker and worker instance is stoppable, because the daemon stops it
+    /// by that recorded identity once the worker journal and the service
+    /// manager's job prove it; the call can still be refused when the proof
+    /// fails. A session with no runtime at all predates worker-backed runtimes
+    /// and is treated as stoppable.
     #[must_use]
     pub fn can_stop(&self) -> bool {
         if self.external == Some(true) || self.state.is_terminal() {
             return false;
         }
-        self.runtime.as_ref().is_none_or(|runtime| {
-            matches!(
-                runtime.state,
-                RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting
-            )
-        })
+        self.runtime
+            .as_ref()
+            .is_none_or(|runtime| match runtime.state {
+                RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting => true,
+                RuntimeState::Conflict => runtime.names_recorded_worker(),
+                _ => false,
+            })
     }
 
     /// Whether `session.remove` can evict this session.
     ///
-    /// Removal is refused for an external entry the daemon does not own, and for
-    /// a [`RuntimeState::Conflict`], [`RuntimeState::Incompatible`] or
-    /// [`RuntimeState::Unknown`] runtime, where the identity backing the session
-    /// is unresolved or unknown and evicting the record could strand a live
-    /// PTY. Everything else is removable once it is
-    /// terminal, still stoppable, or lost. This is the single eligibility rule
-    /// shared by client remove affordances and the daemon's retention sweep.
+    /// Removal is refused for an external entry the daemon does not own, for an
+    /// [`RuntimeState::Incompatible`] or [`RuntimeState::Unknown`] runtime, and
+    /// for a [`RuntimeState::Conflict`] runtime that does not name its worker and
+    /// worker instance: the identity backing such a session is unresolved and
+    /// evicting the record could strand a live PTY. A conflict that does name
+    /// them is removable, because the daemon proves the recorded identity before
+    /// it retires anything; the call can still be refused when the proof fails.
+    /// Everything else is removable once it is terminal, still stoppable, or
+    /// lost. The daemon's retention sweep applies this rule and additionally
+    /// never selects a conflict.
     #[must_use]
     pub fn can_remove(&self) -> bool {
         if self.external == Some(true) {
@@ -3304,8 +3320,8 @@ impl SessionInfo {
         if self.runtime.as_ref().is_some_and(|runtime| {
             matches!(
                 runtime.state,
-                RuntimeState::Conflict | RuntimeState::Incompatible | RuntimeState::Unknown
-            )
+                RuntimeState::Incompatible | RuntimeState::Unknown
+            ) || (runtime.state == RuntimeState::Conflict && !runtime.names_recorded_worker())
         }) {
             return false;
         }
@@ -3550,6 +3566,14 @@ pub struct SessionRemoveResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub accepted_unconfirmed_total: Option<u32>,
+    /// Whether the removal skipped the worker-journal identity proof because
+    /// the session's `conflict` runtime names no worker generation and the
+    /// caller consented to unconfirmed cleanup. The runtime the record names
+    /// was swept by its ownership marker, and so was every runtime any
+    /// journal of the session names, within the journaled worker's bounds.
+    /// Omitted when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub identity_proof_skipped: bool,
     /// Non-fatal warnings the removal raised, such as a failing `pre-remove`
     /// or `post-remove` worktree hook. The session record is gone once the
     /// result is returned, so this is the only place they are reported.

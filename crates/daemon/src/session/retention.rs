@@ -410,8 +410,17 @@ fn candidate_for(
     if session.external != Some(false) {
         return None;
     }
-    // Same eligibility rule clients use to offer a remove action; it rejects a
-    // conflicting or protocol-incompatible runtime.
+    // A conflicted runtime is removable on an operator's request after the
+    // daemon proves its identity; no timer ever decides that.
+    if session
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.state == RuntimeState::Conflict)
+    {
+        return None;
+    }
+    // Same eligibility rule clients use to offer a remove action; it also
+    // rejects a protocol-incompatible runtime.
     if !session.can_remove() {
         return None;
     }

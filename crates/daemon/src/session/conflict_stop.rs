@@ -578,6 +578,7 @@ impl SessionRegistry {
             Some(&target.generation),
             target.worker_instance_id.as_deref(),
             cleanup,
+            false,
         ))
         .await?;
         let (accepted_unconfirmed_processes, accepted_unconfirmed_total) =
@@ -589,6 +590,7 @@ impl SessionRegistry {
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
             accepted_unconfirmed_processes,
             accepted_unconfirmed_total,
+            identity_proof_skipped: false,
             warnings: released.warnings,
         })
     }
@@ -701,6 +703,7 @@ impl SessionRegistry {
             Some(&target.generation),
             target.worker_instance_id.as_deref(),
             cleanup,
+            false,
         ))
         .await?;
         let (accepted_unconfirmed_processes, accepted_unconfirmed_total) =
@@ -712,6 +715,7 @@ impl SessionRegistry {
             worktrees_failed: u32::try_from(released.worktrees.failed).unwrap_or(u32::MAX),
             accepted_unconfirmed_processes,
             accepted_unconfirmed_total,
+            identity_proof_skipped: false,
             warnings: released.warnings,
         })
     }
@@ -764,6 +768,7 @@ impl SessionRegistry {
             Some(&target.generation),
             None,
             UnconfirmedCleanup::Refuse,
+            false,
         )
         .await
         .map(|_accepted| ())
