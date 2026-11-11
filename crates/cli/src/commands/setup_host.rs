@@ -483,12 +483,19 @@ fn selected_hermes_homes(
         .collect())
 }
 
-/// Keeps in `report` only the hook homes `hooks` selects, so the preview, the
-/// apply and the checks against later plans all see the same homes.
+/// Keeps in `report` only the hook homes `hooks` selects, and the gaps about
+/// the config home of a selected profile, so the preview, the apply and the
+/// checks against later plans all see the same homes. A gap about the runtime
+/// or its default home is kept whatever the selection.
 fn select_hooks(mut report: EnsureReport, hooks: &HookSelection) -> EnsureReport {
     report.integrations.retain(|integration| {
         let label = home_label(&integration.runtime, integration.profile.as_deref());
         hooks.selects(&label, &integration.runtime)
+    });
+    report.gaps.retain(|gap| {
+        gap.profile.as_deref().is_none_or(|profile| {
+            hooks.selects(&home_label(&gap.runtime, Some(profile)), &gap.runtime)
+        })
     });
     report
 }

@@ -1650,6 +1650,54 @@ async fn a_fresh_host_is_set_up_by_one_run_and_a_rerun_changes_nothing() {
     );
 }
 
+/// A positive selection changes only the selected home: with `claude` selected
+/// the Claude hook is installed and the Codex home, which holds a hook on a
+/// default run, stays byte-identical.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn a_positive_hook_selection_installs_only_the_selected_home() {
+    let host = FreshHost::new();
+    let codex_home = host.home.join(".codex");
+    let codex_before = state_of(std::slice::from_ref(&codex_home));
+    let selection: HookSelection = "claude".parse().expect("a valid selection");
+
+    let planned = plan_selecting(
+        &host.installation.context,
+        &host.release,
+        &host.planner,
+        &selection,
+    )
+    .await
+    .expect("plan the selection");
+    assert_eq!(previewed_homes(&planned), ["claude"]);
+    let outcome = apply(&host.installation.context, planned, &host.planner)
+        .await
+        .expect("the selection applies");
+
+    let attempted: Vec<&str> = outcome
+        .hooks
+        .iter()
+        .map(|hook| hook.integration.as_str())
+        .collect();
+    assert_eq!(attempted, ["claude"], "{:?}", outcome.hooks);
+    assert!(outcome.verdict.hooks_failed.is_empty());
+    assert!(
+        fs::read_to_string(host.home.join(".claude").join("settings.json"))
+            .expect("claude settings")
+            .contains(STATE_HOOK),
+        "claude's settings register the hook"
+    );
+    assert_eq!(
+        state_of(std::slice::from_ref(&codex_home)),
+        codex_before,
+        "the Codex home is byte-identical"
+    );
+    assert!(!codex_home.join(STATE_HOOK).exists());
+}
+
 /// A planner report that serves Hermes and lists the Claude default home and a
 /// Claude profile home as hook homes.
 fn hooks_report() -> EnsureReport {
@@ -1780,6 +1828,49 @@ async fn a_hook_selection_lists_exactly_the_selected_homes() {
             .await
             .expect("plan the selection");
         assert_eq!(previewed_homes(&host_plan), expected, "{selection:?}");
+    }
+}
+
+/// Gaps follow the selection: a gap about the config home of a profile that is
+/// not selected is not previewed, a gap about the runtime or its default home
+/// always is.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
+async fn hook_home_gaps_follow_the_selection() {
+    let installation = Installation::new();
+    let release = release(&installation);
+    let mut report = hooks_report();
+    report.gaps = serde_json::from_value(json!([
+        {"runtime": "claude", "code": "config_home_missing",
+         "detail": "its config home /h/.claude does not exist"},
+        {"runtime": "claude", "code": "config_home_missing", "profile": "work",
+         "detail": "the config home of profile `work` /h/work does not exist"},
+    ]))
+    .expect("gaps");
+    let planner = ScriptedPlanner::new(vec![report]);
+
+    for (selection, expected) in [("all", 2), ("claude:work", 2), ("claude", 1), ("none", 1)] {
+        let selection: HookSelection = selection.parse().expect("a valid selection");
+        let host_plan = plan_selecting(&installation.context, &release, &planner, &selection)
+            .await
+            .expect("plan the selection");
+        assert_eq!(
+            host_plan.preview.gaps.len(),
+            expected,
+            "{selection:?}: {:?}",
+            host_plan.preview.gaps
+        );
+        assert!(
+            host_plan
+                .preview
+                .gaps
+                .iter()
+                .any(|gap| gap.profile.is_none()),
+            "the default-home gap is always kept"
+        );
     }
 }
 

@@ -409,10 +409,20 @@ impl Report {
     }
 
     fn gap(&mut self, runtime: &str, code: &str, detail: &str) {
+        self.gap_for(runtime, None, code, detail);
+    }
+
+    /// Records a gap about the config home of host profile `profile`.
+    fn profile_gap(&mut self, runtime: &str, profile: &str, code: &str, detail: &str) {
+        self.gap_for(runtime, Some(profile), code, detail);
+    }
+
+    fn gap_for(&mut self, runtime: &str, profile: Option<&str>, code: &str, detail: &str) {
         self.gaps.push(Gap {
             runtime: runtime.to_owned(),
             code: code.to_owned(),
             detail: detail.to_owned(),
+            profile: profile.map(str::to_owned),
         });
     }
 
@@ -1917,7 +1927,7 @@ fn report_home_gap(
             ),
         ),
     };
-    report.gap(runtime, code, &detail);
+    report.gap_for(runtime, profile, code, &detail);
 }
 
 /// Gaps a runtime whose declared config home is not admitted. The package is
@@ -2003,8 +2013,9 @@ fn detected_integrations(
             let agent = match resolved {
                 Ok(agent) => agent,
                 Err(error) => {
-                    report.gap(
+                    report.profile_gap(
                         runtime,
+                        name,
                         &error.code,
                         &format!(
                             "profile `{name}` cannot be served by the package it names ({}); \
@@ -2021,8 +2032,9 @@ fn detected_integrations(
             let home = match Home::resolve(declared, base, &resolved_profile.env) {
                 Ok(home) => home,
                 Err(error) => {
-                    report.gap(
+                    report.profile_gap(
                         runtime,
+                        name,
                         CODE_GAP_CONFIG_HOME_MISSING,
                         &format!(
                             "the config home of profile `{name}` cannot be resolved ({}); fix \

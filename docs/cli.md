@@ -305,7 +305,9 @@ list of `agent` and `agent:profile`. `claude` names the default Claude home;
 `claude:work` names the home of the host profile `work`; `hermes` and
 `hermes:work` name the default Hermes home and a named Hermes profile. The
 preview, the `--json` result and `--dry-run --json` list only the selected
-homes (`integrations` and `hermes_homes`), and the apply touches no other agent
+homes (`integrations`, `hermes_homes` and the `gaps` about the config home of a
+selected profile; a gap about the runtime or its default home is always
+listed), and the apply touches no other agent
 home: `--hooks none` leaves every agent home byte-identical. Packages, profile
 pins and config files do not depend on the selection. A selection naming an
 agent or profile that has no home on this host fails with the usage exit status

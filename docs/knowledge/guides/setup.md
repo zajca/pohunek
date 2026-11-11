@@ -251,7 +251,12 @@ layout) is not verified by setup: such a directory cannot be told from an
 archive stripped of both, and the download's attestation or the package
 manager's checksum is what rules out tampering. It never upgrades an installed service: a
 different installed version is a gap, and `pohunek service upgrade` runs first.
-Every Hermes home the run acts on is listed in the preview. A marked home
+`--hooks none|all|<agent[:profile]>,...` (default `all`) limits the hooks to
+none or to the listed agent homes: the preview, the result and `--dry-run
+--json` then list only the selected homes (and the gaps about their profile
+homes), `--hooks none` leaves every agent home untouched, and a home the host
+does not have is a usage error (`setup_hooks_unknown`); see "Host setup" in
+`docs/cli.md`. Every Hermes home the run acts on is listed in the preview. A marked home
 whose plugin is already current is kept as it is, and setup runs the
 `hermes` found on the daemon job's `PATH`. A home without the
 pohunek marker is a gap that names the

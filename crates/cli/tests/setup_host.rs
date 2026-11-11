@@ -802,6 +802,11 @@ const HOOK_HOMES_REPORT: &str = r#"{
     {"runtime": "claude", "profile": "work"},
     {"runtime": "codex", "profile": null}
   ],
+  "gaps": [
+    {"runtime": "claude", "code": "config_home_missing", "detail": "its config home does not exist"},
+    {"runtime": "claude", "code": "config_home_missing", "profile": "work",
+     "detail": "the config home of profile `work` does not exist"}
+  ],
   "refusals": []
 }"#;
 
@@ -853,6 +858,14 @@ fn the_dry_run_preview_lists_only_the_selected_hook_homes() {
             previewed_hook_homes(&document["ok"]),
             expected,
             "{selection:?}"
+        );
+        let gaps = document["ok"]["gaps"].as_array().expect("gaps array").len();
+        let work_selected =
+            expected.contains(&"claude:work") || selection.is_none_or(|s| s == "all");
+        assert_eq!(
+            gaps,
+            if work_selected { 2 } else { 1 },
+            "{selection:?}: the gap about an unselected profile home is not listed"
         );
     }
     assert_eq!(tree(env.root()), before, "a dry run writes nothing");
