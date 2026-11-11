@@ -4,11 +4,6 @@
 //! worker over `POHUNEK_WORKER_SOCKET_PATH`, and the worker forwards to a daemon
 //! socket served by the real request dispatcher.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
 use pohunek_worker_protocol::{
     Dimensions, Initialize, InitializeLimits, InputPolicy, LaunchIdentity, SecretEnv, SessionId,
@@ -16,6 +11,9 @@ use pohunek_worker_protocol::{
 };
 use protocol::method;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -29,6 +27,32 @@ const WORKER_ID: &str = "worker-notify";
 /// reads no rc file of the host's `$SHELL`.
 const HELD_SESSION_SCRIPT: &str = "exec /bin/sleep 30";
 
+/// Request id prefix of a notification the worker forwards.
+const FORWARD_ID_PREFIX: &str = "worker-hook:";
+
+/// Request id prefix of a notification the hook dials the daemon with itself.
+const HOOK_ID_PREFIX: &str = "hook:";
+
+/// How the stub daemon admits a request to the dispatcher.
+#[derive(Clone, Copy)]
+enum Admission {
+    /// Every request is dispatched when it arrives.
+    OnArrival,
+    /// No request is dispatched before `arrived` requests have arrived, and the
+    /// hook's own request only after the worker's forward was dispatched, so
+    /// the forward is the one that creates the notification. Requests are
+    /// recorded in dispatch order.
+    ForwardFirst { arrived: usize },
+}
+
+/// Whether the request `line` has an id that starts with `prefix`.
+fn request_id_starts_with(line: &str, prefix: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|request| request["id"].as_str().map(|id| id.starts_with(prefix)))
+        .unwrap_or(false)
+}
+
 /// Daemon socket served by the real dispatcher; records every request line.
 struct DaemonStub {
     lines: Arc<Mutex<Vec<String>>>,
@@ -39,12 +63,11 @@ struct DaemonStub {
 
 impl DaemonStub {
     fn spawn(root: &Path, notification_dir: &Path) -> Self {
-        Self::spawn_delaying(root, notification_dir, Duration::ZERO)
+        Self::spawn_admitting(root, notification_dir, Admission::OnArrival)
     }
 
-    /// Like [`Self::spawn`], but dispatches every request `reply_delay` after
-    /// it was received, which holds back the reply the caller waits for.
-    fn spawn_delaying(root: &Path, notification_dir: &Path, reply_delay: Duration) -> Self {
+    /// Like [`Self::spawn`], with requests dispatched as `admission` says.
+    fn spawn_admitting(root: &Path, notification_dir: &Path, admission: Admission) -> Self {
         let notifications = crate::notifications::NotificationService::open_with_settings(
             notification_dir,
             pohunek_service_config::NotificationSettings {
@@ -80,15 +103,20 @@ impl DaemonStub {
         );
         let lines = Arc::new(Mutex::new(Vec::new()));
         let replies = Arc::new(Mutex::new(Vec::new()));
+        // Requests that have arrived, and whether a forward was dispatched.
+        let arrivals = Arc::new(tokio::sync::watch::Sender::new(0_usize));
+        let forwarded = Arc::new(tokio::sync::watch::Sender::new(false));
         let listener = UnixListener::bind(root.join("daemon.sock")).expect("bind daemon socket");
         let (serve_state, serve_lines, serve_replies) =
             (Arc::clone(&state), Arc::clone(&lines), Arc::clone(&replies));
         tokio::spawn(async move {
             while let Ok((stream, _addr)) = listener.accept().await {
-                let (state, lines, replies) = (
+                let (state, lines, replies, arrivals, forwarded) = (
                     Arc::clone(&serve_state),
                     Arc::clone(&serve_lines),
                     Arc::clone(&serve_replies),
+                    Arc::clone(&arrivals),
+                    Arc::clone(&forwarded),
                 );
                 tokio::spawn(async move {
                     let (read, mut write) = stream.into_split();
@@ -96,12 +124,26 @@ impl DaemonStub {
                     if BufReader::new(read).read_line(&mut line).await.is_err() {
                         return;
                     }
+                    arrivals.send_modify(|count| *count += 1);
+                    if let Admission::ForwardFirst { arrived } = admission {
+                        let mut count = arrivals.subscribe();
+                        if count.wait_for(|count| *count >= arrived).await.is_err() {
+                            return;
+                        }
+                        let mut done = forwarded.subscribe();
+                        if request_id_starts_with(&line, HOOK_ID_PREFIX)
+                            && done.wait_for(|done| *done).await.is_err()
+                        {
+                            return;
+                        }
+                    }
                     lines.lock().expect("lines lock").push(line.clone());
-                    // timing-allowed: #1345 the injected daemon latency is the scenario input; the test waits on the replies, not on this sleep
-                    tokio::time::sleep(reply_delay).await;
                     let Dispatch::Reply(reply) = dispatch_line(&line, &state, None).await else {
                         return;
                     };
+                    if request_id_starts_with(&line, FORWARD_ID_PREFIX) {
+                        forwarded.send_replace(true);
+                    }
                     replies.lock().expect("replies lock").push(reply.clone());
                     let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
                 });
@@ -330,7 +372,7 @@ async fn deliver_through_worker(
     args: &str,
     public_version: u32,
 ) -> (Value, Value, String) {
-    let delivery = deliver(agent, args, public_version, Duration::ZERO, 1).await;
+    let delivery = deliver(agent, args, public_version, 1, 1).await;
     (
         delivery.requests[0].clone(),
         delivery.replies[0].clone(),
@@ -338,18 +380,25 @@ async fn deliver_through_worker(
     )
 }
 
-/// Runs the real notify asset of `agent` against a daemon that answers
-/// `reply_delay` late and waits until it has replied `replies` times.
+/// Runs the real notify asset of `agent` against a daemon that dispatches no
+/// request before `arrived` requests arrived and the worker's forward before
+/// the hook's own request ([`Admission::ForwardFirst`]), and waits until it
+/// has replied `replies` times.
+///
+/// The hook dials the daemon itself when the worker has not answered within
+/// the hook's `SOCKET_TIMEOUT_SECS`, which a loaded host can cause on its own,
+/// so the admission, not the arrival order, decides which request is first.
 async fn deliver(
     agent: &str,
     args: &str,
     public_version: u32,
-    reply_delay: Duration,
+    arrived: usize,
     replies: usize,
 ) -> Delivery {
     let root = crate::test_support::scoped_dir("ph-notify-worker-");
     let notifications = crate::test_support::scoped_dir("ph-notify-data-");
-    let daemon = DaemonStub::spawn_delaying(&root, &notifications, reply_delay);
+    let daemon =
+        DaemonStub::spawn_admitting(&root, &notifications, Admission::ForwardFirst { arrived });
     // The piped provider payload closes the hook's stdin; `; true` keeps the
     // shell from exec-ing the hook, so the hook's parent is the PTY root the
     // worker attests.
@@ -391,9 +440,10 @@ async fn deliver(
     delivery
 }
 
-/// The hook gives the worker `SOCKET_TIMEOUT_SECS` (0.5 s) to answer before it
-/// dials the daemon itself; a daemon this late forces that fallback.
-const REPLY_DELAY_PAST_HOOK_TIMEOUT: Duration = Duration::from_millis(1_200);
+/// The worker's forward and the hook's own request: the daemon answers
+/// neither before both arrived, so the worker cannot answer the hook within
+/// the hook's `SOCKET_TIMEOUT_SECS` and the hook dials the daemon itself.
+const BOTH_DELIVERIES: usize = 2;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notification() {
@@ -401,15 +451,15 @@ async fn a_hook_that_outwaits_the_worker_falls_back_without_a_second_notificatio
         "codex",
         "permission_request",
         protocol::PROTOCOL_VERSION.get(),
-        REPLY_DELAY_PAST_HOOK_TIMEOUT,
-        2,
+        BOTH_DELIVERIES,
+        BOTH_DELIVERIES,
     )
     .await;
     assert!(
         delivery.requests[0]["id"]
             .as_str()
-            .is_some_and(|id| id.starts_with("worker-hook:")),
-        "the worker's forward arrives first: {:?}",
+            .is_some_and(|id| id.starts_with(FORWARD_ID_PREFIX)),
+        "the worker's forward is dispatched first: {:?}",
         delivery.requests
     );
     assert!(
