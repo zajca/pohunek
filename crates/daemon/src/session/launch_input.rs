@@ -70,8 +70,9 @@ impl SessionRegistry {
 
     /// Runs `observe` at each step of the trusted-checkout predicate's read of
     /// the declared paths (right before a path is opened, and before a file's
-    /// bytes are read) with the absolute path concerned, for an embedder or a
-    /// test that must change the checkout at an exact point of the read.
+    /// bytes are read) with the absolute path concerned, and once with the
+    /// launch directory after the evaluation recorded its answer, for an
+    /// embedder or a test that must act at an exact point of the evaluation.
     pub fn set_checkout_read_observer<F>(&self, observe: F)
     where
         F: Fn(crate::checkout_trust::CheckoutReadStep, &Path) + Send + Sync + 'static,
@@ -212,10 +213,14 @@ impl SessionRegistry {
                     read_observer: read_observer.as_ref(),
                 },
             );
-            if !task_run.finish(&stalled, &task_checkout) {
+            let trusted = outcome.trusted();
+            if !task_run.finish(&stalled, &task_checkout, trusted) {
                 outcome.log(&cwd);
             }
-            outcome.trusted()
+            if let Some(observer) = read_observer.as_ref() {
+                observer.observe(crate::checkout_trust::CheckoutReadStep::Evaluated, &cwd);
+            }
+            trusted
         });
         let trusted = match tokio::time::timeout(crate::checkout_trust::TOTAL_DEADLINE, evaluation)
             .await
@@ -228,17 +233,20 @@ impl SessionRegistry {
                 );
                 false
             }
-            Err(_elapsed) => {
-                if run.abandon(&self.inner.stalled_checkouts, &checkout) {
+            Err(_elapsed) => match run.abandon(&self.inner.stalled_checkouts, &checkout) {
+                AtDeadline::Abandoned => {
                     warn!(
                         event = "checkout_trust.failed",
                         checkout = %checkout.display(),
                         reason = "the evaluation did not finish within its total deadline",
                         "the checkout trust predicate could not be evaluated; the checkout is not trusted"
                     );
+                    false
                 }
-                false
-            }
+                // The run recorded its answer, and logged it, before the
+                // deadline; only its thread had not returned yet.
+                AtDeadline::Finished { trusted } => trusted,
+            },
         };
         if trusted {
             trust.args().to_vec()
@@ -439,6 +447,12 @@ fn naming_args(definition: &RuntimeDefinition, name: Option<&str>, id: &SessionI
 /// of the trusted-checkout predicate.
 const CHECKOUT_TRUST_SCRATCH_DIR: &str = "checkout-trust";
 
+/// Removes the scratch repositories a stopped daemon left below
+/// `worker_state_root`; called once at startup, before any launch.
+pub(super) fn sweep_checkout_trust_scratch(worker_state_root: &Path) {
+    crate::checkout_trust::sweep_scratch(&worker_state_root.join(CHECKOUT_TRUST_SCRATCH_DIR));
+}
+
 fn unavailable_state_root() -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -485,7 +499,17 @@ enum RunState {
     #[default]
     Running,
     Abandoned,
-    Finished,
+    Finished {
+        trusted: bool,
+    },
+}
+
+/// What [`EvaluationRun::abandon`] found when the launch's deadline passed.
+enum AtDeadline {
+    /// The run is still blocked; the launch stopped waiting for it.
+    Abandoned,
+    /// The run had already recorded `trusted` as its answer.
+    Finished { trusted: bool },
 }
 
 /// Directories whose abandoned evaluation is still blocked.
@@ -493,24 +517,27 @@ type StalledCheckouts = std::sync::Mutex<std::collections::HashSet<PathBuf>>;
 
 impl EvaluationRun {
     /// Records that the launch stopped waiting for a run of `checkout` that is
-    /// still blocked. `false` when the run has just ended, which logged its
-    /// own outcome.
-    fn abandon(&self, stalled: &StalledCheckouts, checkout: &Path) -> bool {
+    /// still blocked, or returns the answer of a run that has just ended and
+    /// logged its own outcome.
+    fn abandon(&self, stalled: &StalledCheckouts, checkout: &Path) -> AtDeadline {
         let (Ok(mut state), Ok(mut stalled)) = (self.state.lock(), stalled.lock()) else {
-            return true;
+            return AtDeadline::Abandoned;
         };
-        if *state != RunState::Running {
-            return false;
+        match *state {
+            RunState::Finished { trusted } => AtDeadline::Finished { trusted },
+            RunState::Abandoned => AtDeadline::Abandoned,
+            RunState::Running => {
+                *state = RunState::Abandoned;
+                stalled.insert(checkout.to_path_buf());
+                AtDeadline::Abandoned
+            }
         }
-        *state = RunState::Abandoned;
-        stalled.insert(checkout.to_path_buf());
-        true
     }
 
-    /// Records that the run ended, lifts the refusal an abandoned run caused,
-    /// and returns whether the launch had abandoned it (its outcome is then
-    /// not logged).
-    fn finish(&self, stalled: &StalledCheckouts, checkout: &Path) -> bool {
+    /// Records that the run ended with `trusted` as its answer, lifts the
+    /// refusal an abandoned run caused, and returns whether the launch had
+    /// abandoned it (its outcome is then not logged).
+    fn finish(&self, stalled: &StalledCheckouts, checkout: &Path, trusted: bool) -> bool {
         let (Ok(mut state), Ok(mut stalled)) = (self.state.lock(), stalled.lock()) else {
             return true;
         };
@@ -518,7 +545,7 @@ impl EvaluationRun {
         if abandoned {
             stalled.remove(checkout);
         }
-        *state = RunState::Finished;
+        *state = RunState::Finished { trusted };
         abandoned
     }
 }

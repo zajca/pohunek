@@ -345,7 +345,9 @@ timeout, ambiguity or missing fact means they are not appended:
    entry.
 2. The daemon fetches `HEAD` of `https://github.com/<owner>/<repo>.git` (one commit,
    trees only, every object verified) into a private bare repository it creates for the
-   evaluation below the worker state root (never in a directory a session can write). The fetch uses https only, no configuration, no credential helper and no
+   evaluation below the worker state root (never in a directory a session can write) and
+   removes it when the evaluation ends; daemon start removes any such repository a daemon
+   that stopped during a stalled evaluation left behind. The fetch uses https only, no configuration, no credential helper and no
    redirect, so only a public repository can be trusted, and a host that cannot reach
    GitHub (or needs a proxy variable the daemon does not pass) trusts nothing.
 3. For each declared path, the files on disk are exactly the blobs that commit's tree

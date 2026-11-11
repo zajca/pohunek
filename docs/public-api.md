@@ -1132,6 +1132,7 @@ scheme, host and owner are case-insensitive) whose lower-cased `owner/repo` is i
 content object id, with executable bits) that the tree of the commit `HEAD` names on
 `https://github.com/<owner>/<repo>.git` holds there. The daemon fetches that commit
 (one commit, trees only, https only, objects verified) into a private bare repository below the worker state root
+(removed when the evaluation ends, or at the next daemon start when a stalled evaluation outlived the daemon)
 and runs no git command against the checkout, so its refs, index, objects and
 configuration cannot influence the answer; symbolic links, submodules, special files,
 untracked or ignored files, letter-case collisions, an entry on disk that differs from a
