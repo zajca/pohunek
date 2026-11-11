@@ -17,9 +17,10 @@ use pohunek_daemon::store::{
 const SCHEMA_10: &str = include_str!("../src/store/fixtures/schema-10/metadata.jsonl");
 
 /// The bytes the daemon built before the store snapshot (main `4c7d2e9b8`) wrote
-/// after the first step of [`golden_steps`], with only the schema 12, 13 and 14
-/// changes applied (`schema_version` 14; `refuse_while_blocked` from schema 12 in
-/// the rewritten session's `input_rules`).
+/// after the first step of [`golden_steps`], with only the schema 12, 13, 14 and 19
+/// changes applied (`schema_version` 19; `refuse_while_blocked` from schema 12 in
+/// the rewritten session's `input_rules`; `ended_at` of a finished session, which
+/// the schema 19 migration backfills from the frozen record's `updated_at`).
 const GOLDEN_AFTER_SESSION: &str = include_str!("fixtures/store-memo/after-session.jsonl");
 
 /// The same bytes after the second step of [`golden_steps`], with the same

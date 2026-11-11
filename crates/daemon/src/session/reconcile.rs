@@ -24672,6 +24672,10 @@ generation "$1"
                 protocol::SessionState::Running,
                 "the previous worker still answers, so nothing proves the end"
             );
+            assert_eq!(
+                session.ended_at, None,
+                "an unproven loss has not ended the session"
+            );
             assert_eq!(session.activity, None);
             worker.server_task.abort();
             drop(worker.reporter);

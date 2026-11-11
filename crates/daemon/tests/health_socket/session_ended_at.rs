@@ -66,6 +66,42 @@ fn copy_tree(from: &Path, to: &Path) {
     assert!(copied.success(), "copy {}", from.display());
 }
 
+/// Whether every journal below `journals` is sealed as acknowledged and no
+/// journal rewrite is in flight.
+///
+/// The worker rewrites its sealed journal through a dot-prefixed temporary
+/// file and a rename once the daemon acknowledges the terminal state, so a copy
+/// taken before that settles can list a name that is gone by the time it is read.
+fn journals_settled(journals: &Path) -> bool {
+    let Ok(sessions) = std::fs::read_dir(journals) else {
+        return false;
+    };
+    let mut seen = 0;
+    for session in sessions.flatten() {
+        let Ok(files) = std::fs::read_dir(session.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                return false;
+            }
+            let Ok(text) = std::fs::read_to_string(file.path()) else {
+                return false;
+            };
+            let Ok(journal) = serde_json::from_str::<Value>(&text) else {
+                return false;
+            };
+            if journal.get("terminal_acknowledged") != Some(&Value::Bool(true)) {
+                return false;
+            }
+            seen += 1;
+        }
+    }
+    seen > 0
+}
+
 /// Runs a session that ends on its own, keeps its worker journal and stops
 /// the daemon.
 async fn finished_session_and_stopped_daemon(
@@ -101,10 +137,12 @@ async fn finished_session_and_stopped_daemon(
             "the edit is a record update"
         );
     }
-    copy_tree(
-        &worker_home.join(JOURNALS),
-        &socket.dir.join(KEPT_JOURNALS).join("workers"),
-    );
+    let journals = worker_home.join(JOURNALS);
+    wait_until("the worker journal to be acknowledged", || async {
+        journals_settled(&journals).then_some(())
+    })
+    .await;
+    copy_tree(&journals, &socket.dir.join(KEPT_JOURNALS).join("workers"));
     drop(control);
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -304,4 +342,42 @@ async fn a_lost_session_reached_a_moment_ago_is_kept_whatever_its_end_time() {
         "the lost window counts from the last connection: {:?}",
         selection.sessions
     );
+}
+
+#[tokio::test]
+async fn a_lost_session_that_never_connected_ages_from_its_end_time() {
+    let socket = temp_socket("ended-lost-never-connected");
+    let store_path = socket.dir.join("metadata.jsonl");
+    let config = registry_config(&socket);
+    let id = finished_session_and_stopped_daemon(&socket, &config, false).await;
+    rewrite_session_lines(&store_path, |line| {
+        let info = info_of(line);
+        info.insert("ended_at".to_owned(), Value::from(LONG_AGO));
+        let runtime = info
+            .get_mut("runtime")
+            .and_then(Value::as_object_mut)
+            .expect("the session has a runtime");
+        runtime.remove("last_connected_at");
+    });
+
+    let (session, selection) = restart_and_select(&socket, config(), &id, Journal::Missing).await;
+
+    assert_eq!(
+        session.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Lost)
+    );
+    assert_eq!(
+        session
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.last_connected_at.as_deref()),
+        None
+    );
+    let candidate = selection
+        .sessions
+        .iter()
+        .find(|candidate| candidate.session_id == id)
+        .expect("the lost session is selected from its end time");
+    assert_eq!(candidate.reason, SessionRetentionReason::Lost);
+    assert!(candidate.age_secs > 90 * 24 * 3600);
 }
