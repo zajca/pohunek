@@ -219,10 +219,10 @@ impl ProtocolError {
 
     /// The canonical `daemon/daemon_protocol_too_old` error.
     ///
-    /// A client refuses a method before sending it because the daemon it is
-    /// connected to negotiated a protocol version that never defined the
-    /// method. `host` is the route of a remote daemon, `None` for the local
-    /// daemon. Code is stable: `daemon_protocol_too_old`.
+    /// A client refuses a method before sending it because the connection's
+    /// protocol version is below the one the method needs. `host` is the route
+    /// of a remote daemon, `None` for the local daemon. Code is stable:
+    /// `daemon_protocol_too_old`.
     #[must_use]
     pub fn daemon_protocol_too_old(
         host: Option<&str>,
