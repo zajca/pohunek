@@ -134,8 +134,11 @@ start or a launch.
 
 Releases 0.41 and 0.42 both speak protocol 5, so during a staggered multi-host
 upgrade a CLI of one release talks to a daemon of the other without an adapter.
-A method or field added in the newer release is refused by the client before it
-is sent, through its `HostCapabilities` flag or `daemon/method_not_found`.
+A field added in the newer release is refused by the client before it is sent:
+its `HostCapabilities` flag, which a daemon that predates the field does not
+advertise, makes the client refuse the call or leave the field out. A method
+added in the newer release is sent, and the older daemon answers
+`daemon/method_not_found`.
 A CLI, Rust client or TypeScript SDK refuses a daemon that answers in another
 protocol version, and a daemon refuses a client outside its window, both with
 `daemon/version_mismatch`; host discovery classes such a peer as
