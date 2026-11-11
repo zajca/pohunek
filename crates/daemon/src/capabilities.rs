@@ -558,10 +558,17 @@ pub(crate) fn validate_definition_launch_with_timeout(
                 ProtocolError::agent_binary_missing(reported_program(definition, spawn))
             }
             LaunchValidationFailure::Refused(refusal) => unsupported_version_error(refusal),
+            LaunchValidationFailure::ProbeDeadline => probe_timed_out_error(),
             LaunchValidationFailure::Unsupported | LaunchValidationFailure::ProbeTimedOut => {
                 ProtocolError::agent_runtime_unsupported()
             }
         })
+}
+
+/// The `agent_runtime_unsupported` refusal for a probe that ran to its full
+/// deadline, naming [`VERSION_PROBE_TIMEOUT`].
+pub(crate) fn probe_timed_out_error() -> ProtocolError {
+    ProtocolError::agent_runtime_probe_timed_out(VERSION_PROBE_TIMEOUT.as_secs())
 }
 
 /// The `agent_runtime_unsupported` refusal for probe output that ran to
@@ -574,7 +581,7 @@ pub(crate) fn unsupported_version_error(refusal: VersionRefusal) -> ProtocolErro
             version,
             min,
             below,
-        } => ProtocolError::agent_runtime_version_out_of_range(&version, &min, &below),
+        } => ProtocolError::agent_runtime_version_out_of_range(&version, &min, below.as_ref()),
     }
 }
 
@@ -597,10 +604,12 @@ pub(crate) enum LaunchValidationFailure {
     /// The probe exited successfully, and its output names no supported
     /// release.
     Refused(VersionRefusal),
-    /// The probe failed (a non-zero exit, its full deadline, or a setup
-    /// failure), or the definition names a parser this daemon does not
-    /// provide.
+    /// The probe failed (a non-zero exit or a setup failure), or the
+    /// definition names a parser this daemon does not provide.
     Unsupported,
+    /// The probe ran to its full [`VERSION_PROBE_TIMEOUT`] deadline without
+    /// exiting.
+    ProbeDeadline,
     /// The probe outran a budget shorter than [`VERSION_PROBE_TIMEOUT`].
     ProbeTimedOut,
 }
@@ -657,7 +666,8 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
             .map(|version| Some(program.with_version(version)))
             .map_err(LaunchValidationFailure::Refused),
         ProbeOutcome::TimedOut if shortened_budget => Err(LaunchValidationFailure::ProbeTimedOut),
-        ProbeOutcome::TimedOut | ProbeOutcome::Failed | ProbeOutcome::Unavailable => {
+        ProbeOutcome::TimedOut => Err(LaunchValidationFailure::ProbeDeadline),
+        ProbeOutcome::Failed | ProbeOutcome::Unavailable => {
             Err(LaunchValidationFailure::Unsupported)
         }
     }

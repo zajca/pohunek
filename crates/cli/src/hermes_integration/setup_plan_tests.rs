@@ -378,7 +378,12 @@ fn a_hermes_outside_the_package_range_does_not_leave_a_home_current() {
     );
     fs::write(
         &host.version,
-        format!("Hermes Agent v{} (future)\n", policy.below()),
+        format!(
+            "Hermes Agent v{} (future)\n",
+            policy
+                .below()
+                .expect("the official runtime bounds its range")
+        ),
     )
     .expect("a release above the range");
 

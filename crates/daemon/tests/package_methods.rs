@@ -1497,6 +1497,238 @@ async fn revision_versions_are_read_by_inspect_and_the_launch_gate() {
     servers.stop().await;
 }
 
+const OPEN_RANGE_FEATURE: &str = "\"version-probe-open-range-v1\"";
+
+/// [`probed_descriptor`] for the open-ended range `[min, ..)`: `below` is
+/// omitted.
+fn open_range_descriptor(program: &Path, version: &str, min: &str, requires: &str) -> String {
+    probed_descriptor(
+        program,
+        version,
+        "semver-line-v1",
+        (min, "99.0.0"),
+        requires,
+    )
+    .replace(", below = \"99.0.0\"", "")
+}
+
+#[tokio::test]
+async fn an_open_ended_range_installs_only_with_its_feature_and_admits_every_release_from_min() {
+    let servers = spawn_servers("pkg-open-range").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    let program = probe_program(&servers.plugins, "probe-open-gate", "fixture 1.4.13");
+
+    // The omission of `below` belongs to the feature: without it the package
+    // is refused the way a core that does not know the feature refuses it.
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "open-no-requires",
+        &open_range_descriptor(&program, "1.0.0", "1.0.0", ""),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("an open range needs its feature").code,
+        "runtime_feature_unsupported"
+    );
+    // An upper bound without a lower one, and a probe without a bound at all,
+    // are not policies.
+    for (name, document) in [
+        (
+            "below-only",
+            probed_descriptor(
+                &program,
+                "1.0.0",
+                "semver-line-v1",
+                ("1.0.0", "2.0.0"),
+                OPEN_RANGE_FEATURE,
+            )
+            .replace(", min = \"1.0.0\"", ""),
+        ),
+        (
+            "neither",
+            open_range_descriptor(&program, "1.0.0", "1.0.0", OPEN_RANGE_FEATURE)
+                .replace(", min = \"1.0.0\"", ""),
+        ),
+    ] {
+        let (_digest, result) =
+            install_descriptor(&mut local, &servers.plugins, name, &document, false).await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    // (printed release, supported): the lower bound is inclusive and nothing
+    // above it is refused, however far the major moves.
+    let cases = [
+        ("1.0.0", true),
+        ("1.0.1", true),
+        ("2.0.0", true),
+        ("27.3.1", true),
+        ("0.9.9", false),
+    ];
+    for (index, (printed, supported)) in cases.into_iter().enumerate() {
+        let program = probe_program(
+            &servers.plugins,
+            &format!("probe-open-{index}"),
+            &format!("fixture {printed}"),
+        );
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            &format!("open-{index}"),
+            &open_range_descriptor(
+                &program,
+                &format!("1.0.{index}"),
+                "1.0.0",
+                OPEN_RANGE_FEATURE,
+            ),
+            false,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{printed}: the open range installs: {error:?}"));
+
+        let runtime = inspected_runtime(&mut local).await;
+        assert_eq!(runtime.version.as_deref(), Some(printed), "{printed}");
+        assert_eq!(runtime.supported, Some(supported), "{printed}");
+        if !supported {
+            let error = refused_launch(&mut local, &cwd).await;
+            assert_eq!(error.code, "agent_runtime_unsupported", "{printed}");
+            assert!(
+                error
+                    .msg
+                    .contains("reports version 0.9.9, below its runtime's supported minimum 1.0.0"),
+                "{printed}: {error:?}"
+            );
+            assert!(
+                !error.msg.contains('['),
+                "an open range names no interval: {error:?}"
+            );
+            assert!(error.recover.is_some(), "{printed}: {error:?}");
+        }
+    }
+
+    // Listing the feature does not oblige a descriptor to leave `below` out.
+    let program = probe_program(&servers.plugins, "probe-closed", "fixture 2.0.0");
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "closed-with-feature",
+        &probed_descriptor(
+            &program,
+            "1.1.0",
+            "semver-line-v1",
+            ("1.0.0", "2.0.0"),
+            OPEN_RANGE_FEATURE,
+        ),
+        false,
+    )
+    .await;
+    result.expect("a closed range installs with the feature listed");
+    let runtime = inspected_runtime(&mut local).await;
+    assert_eq!(
+        runtime.supported,
+        Some(false),
+        "2.0.0 is the first release outside"
+    );
+    let error = refused_launch(&mut local, &cwd).await;
+    assert!(
+        error.msg.contains(
+            "reports version 2.0.0, outside its runtime's supported range [1.0.0, 2.0.0)"
+        ),
+        "{error:?}"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_version_probe_receives_the_launch_env_and_one_that_outlasts_its_deadline_is_refused_distinctly(
+) {
+    let servers = spawn_servers("pkg-probe-deadline").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let cwd = servers
+        .plugins
+        .parent()
+        .expect("the socket directory")
+        .to_path_buf();
+    // The version answers at once when the runtime's launch flag is set and
+    // never otherwise, as a program that waits for an unreachable service.
+    let script = "#!/bin/sh\nif [ \"$PI_QUICK_VERSION\" = 1 ]; then printf '%s\\n' 'fixture 1.4.13'; else exec sleep 600; fi\n";
+    let program = write_program(&servers.plugins, "probe-needs-flag", script);
+    let with_flag = |value: &str, version: &str| {
+        probed_descriptor(
+            &program,
+            version,
+            "semver-line-v1",
+            ("1.0.0", "2.0.0"),
+            LAUNCH_ENV_FEATURE,
+        ) + &launch_env_table(&[format!("PI_QUICK_VERSION = \"{value}\"")])
+    };
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "flag-set",
+        &with_flag("1", "1.0.0"),
+        false,
+    )
+    .await;
+    result.expect("the descriptor with the launch flag installs");
+    let runtime = inspected_runtime(&mut local).await;
+    assert_eq!(
+        (runtime.version.as_deref(), runtime.supported),
+        (Some("1.4.13"), Some(true)),
+        "the probe sees the descriptor's launch env"
+    );
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "flag-unset",
+        &with_flag("0", "1.0.1"),
+        false,
+    )
+    .await;
+    result.expect("the descriptor with the flag cleared installs");
+    let error = refused_launch(&mut local, &cwd).await;
+    assert_eq!(error.code, "agent_runtime_unsupported");
+    assert!(
+        error
+            .msg
+            .contains("version check did not finish within 2 seconds"),
+        "{error:?}"
+    );
+    assert!(
+        !error.msg.contains("fixture") && !error.msg.contains("sleep"),
+        "probe text never reaches the refusal: {error:?}"
+    );
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("launcher")),
+        "{error:?}"
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
 const LAUNCH_ENV_FEATURE: &str = "\"launch-env-v1\"";
 
 /// A `[launch_env]` table with the given `KEY = "value"` lines.

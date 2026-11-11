@@ -83,7 +83,9 @@ use crate::agent::{
     parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
     ReferenceExistence, RefusalPhase, ResolvedAgent, ValidatedLaunchProgram,
 };
-use crate::capabilities::{unsupported_version_error, LaunchValidationFailure};
+use crate::capabilities::{
+    probe_timed_out_error, unsupported_version_error, LaunchValidationFailure,
+};
 use crate::catalog_anchor::CatalogTrust;
 use crate::detect::Manifest;
 use crate::procwatch::ProcessInspector;
@@ -1585,6 +1587,10 @@ fn run_probe(
         }
         Err(LaunchValidationFailure::Refused(refusal)) => {
             let error = unsupported_version_error(refusal);
+            Err((error.code, error.msg))
+        }
+        Err(LaunchValidationFailure::ProbeDeadline) => {
+            let error = probe_timed_out_error();
             Err((error.code, error.msg))
         }
         Err(LaunchValidationFailure::Unsupported) => {

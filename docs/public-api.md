@@ -1628,9 +1628,18 @@ except Pi, which accepts from 1.0.0 and is verified on 1.4.0, with the 1.0.2 cap
 the next major release (codex `[0.164.0, 1.0.0)`, claude
 `[2.1.309, 3.0.0)`, hermes `[0.20.0, 1.0.0)`, pi `[1.0.0, 2.0.0)`), because hosts
 update the agent CLIs independently of pohunek. The
-declaration is rejected unless `args`, `min` and `below` are all present, `min`
-is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH` (for
-`semver-revision-line-v1`, also `MAJOR.MINOR.PATCH-R<n>[.<m>]`). The daemon
+declaration is rejected unless `args` and `min` are present, `min` is below
+`below` when `below` is declared, and each bound is exactly `MAJOR.MINOR.PATCH`
+(for `semver-revision-line-v1`, also `MAJOR.MINOR.PATCH-R<n>[.<m>]`); `below`
+alone is rejected. Omitting `below` declares an open-ended range `[min, ..)`:
+every release from `min` on is supported, so a later major release is admitted
+until the package is updated. A descriptor that omits `below` lists the runtime
+feature `version-probe-open-range-v1` in `requires`; without it the package is
+refused with `runtime_feature_unsupported`, and a core that predates the feature
+refuses the package for the same reason before it reads the probe. A release
+below `min` is refused with a message that names the minimum (`reports version
+0.9.9, below its runtime's supported minimum 1.0.0`) and the same `recover` hint
+as a closed range. The daemon
 compiles only the data-driven `semver-v1`, `semver-line-v1` and
 `semver-revision-line-v1` parsers; a
 descriptor that names any other parser id still parses, but its runtime reports
@@ -1673,11 +1682,15 @@ release (ASCII digits only, no leading zeros, no pre-release or build suffix;
 bare for `semver-v1`, inside the `line` template for `semver-line-v1`).
 Standard error is discarded. The probe runs with a cleared environment, a
 private `HOME`, XDG and temporary directories and a private working directory,
-a 2 second deadline and a 4 KiB output cap; only `PATH` is inherited from the
-daemon, so an interpreter script such as `#!/usr/bin/env node` resolves the
-interpreter from the same `PATH` that the default agent environment allowlist
-forwards to the launched agent (an allowlist without `PATH` leaves the agent
-without one). A program that does not resolve to an executable refuses the launch with
+a 2 second deadline and a 4 KiB output cap. Its environment holds only the
+launch `PATH` and the runtime's `[launch_env]` pairs (`launch-env-v1`), so an
+interpreter script such as `#!/usr/bin/env node` resolves the interpreter from
+the same `PATH` that the default agent environment allowlist forwards to the
+launched agent (an allowlist without `PATH` leaves the agent without one), and a
+program whose version command is slow unless a launch flag is set sees that flag
+during the probe. Nothing else is forwarded: the probe never sees the user's
+home, config home or settings, and the deadline is the daemon's, not a package
+field. A program that does not resolve to an executable refuses the launch with
 `agent_binary_missing` before any probe runs. Every other refusal is
 `agent_runtime_unsupported`, and the exact probed executable is the one
 launched. Its message tells the cases apart without echoing probe output: a
@@ -1685,10 +1698,17 @@ release outside the range names the parsed release and the declared
 `[min, below)` (`reports version 1.0.0, outside its runtime's supported range
 [0.164.0, 1.0.0)`); output that exits successfully but does not match the
 grammar says the output does not match the runtime's declared format; a
-failing or timed-out probe, or a parser id this daemon does not compile in,
-keeps the generic message. The first two carry a `recover` hint. `pohunek
-doctor` reports the same three cases in the profile and optional-runtime
-checks.
+failing probe, or a parser id this daemon does not compile in, keeps the
+generic message. A probe that runs to its deadline without exiting is
+also `agent_runtime_unsupported`, with its own message (`the selected agent
+executable's version check did not finish within 2 seconds`) and a `recover`
+hint that says the version command must finish offline in the cleared
+environment and suggests a launcher whose version command answers without the
+network. The first three carry a `recover` hint. A probe cut short by the
+shortened budget of `pohunek doctor` or an upgrade preflight is not this case:
+it reports that the budget was exhausted. `pohunek
+doctor` reports the release, unparseable-output and deadline cases in the
+profile and optional-runtime checks.
 
 The `host.inspect` inventory reads its probes through a daemon-wide cache. A
 cache entry is keyed by the probed program's canonical path and file identity

@@ -201,7 +201,10 @@ pub(crate) fn probe_upstream_within(
         "upstream {} reports {version}, outside the supported range [{}, {}) of the package",
         facts.program,
         facts.probe.min(),
-        facts.probe.below()
+        facts
+            .probe
+            .below()
+            .map_or_else(String::new, |below| below.to_string())
     );
     version.to_string()
 }

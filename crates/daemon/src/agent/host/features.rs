@@ -39,22 +39,35 @@ pub(super) enum GateRule {
     /// The descriptor key at this dotted path names this compiled parser or
     /// handler id.
     Value(&'static str, &'static str),
+    /// The descriptor key at `present` exists and the key at `absent` does
+    /// not: the feature owns the omission, such as a range without a bound.
+    Missing {
+        /// Dotted path of the key that has to be declared.
+        present: &'static str,
+        /// Dotted path of the key whose omission the feature owns.
+        absent: &'static str,
+    },
 }
 
 impl GateRule {
+    /// The key path a refusal names: the declared key, or for an omission the
+    /// omitted one.
     fn path(self) -> &'static str {
         match self {
             Self::Key(path) | Self::Value(path, _) => path,
+            Self::Missing { absent, .. } => absent,
         }
     }
 
     fn matches(self, descriptor: &Table) -> bool {
-        let Some(found) = lookup(descriptor, self.path()) else {
-            return false;
-        };
         match self {
-            Self::Key(_) => true,
-            Self::Value(_, value) => found.as_str() == Some(value),
+            Self::Key(path) => lookup(descriptor, path).is_some(),
+            Self::Value(path, value) => {
+                lookup(descriptor, path).is_some_and(|found| found.as_str() == Some(value))
+            }
+            Self::Missing { present, absent } => {
+                lookup(descriptor, present).is_some() && lookup(descriptor, absent).is_none()
+            }
         }
     }
 }
@@ -138,6 +151,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: "package-context-v1",
         since: "0.41.0",
     },
+    RuntimeFeature {
+        id: "version-probe-open-range-v1",
+        since: "0.42.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -220,6 +237,13 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
     FeatureGate {
         feature: "integration-cline-hook-v1",
         rule: GateRule::Value("integration.handler", "cline-hook-v1"),
+    },
+    FeatureGate {
+        feature: "version-probe-open-range-v1",
+        rule: GateRule::Missing {
+            present: "runtime.version_probe.min",
+            absent: "runtime.version_probe.below",
+        },
     },
 ];
 

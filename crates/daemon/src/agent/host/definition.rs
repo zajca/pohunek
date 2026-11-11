@@ -1041,7 +1041,7 @@ fn validate_version_probe(
     match (data_driven, policy) {
         (true, None) => Err(DefinitionError::Field {
             field: "runtime.version_probe",
-            reason: "this parser requires args, min and below",
+            reason: "this parser requires args and min",
         }),
         (false, Some(_)) => Err(DefinitionError::Field {
             field: "runtime.version_probe",

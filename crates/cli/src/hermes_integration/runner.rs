@@ -1633,7 +1633,12 @@ mod tests {
         let root = fixture("version");
         let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
         let policy = test_package::version_policy().expect("the package version policy");
-        let (min, below) = (policy.min(), policy.below());
+        let (min, below) = (
+            policy.min(),
+            policy
+                .below()
+                .expect("the official runtime bounds its range"),
+        );
         let verify = |line: &str| {
             runner(&root.0, &format!("printf '%b\\n' '{line}'")).verify_version(&selected, &policy)
         };

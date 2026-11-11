@@ -506,10 +506,12 @@ impl ProtocolError {
     /// The canonical rejection for an agent executable that exists but fails
     /// its runtime's version probe: a failing or timed-out probe, or a probe
     /// parser this daemon does not provide. A program that does not resolve is
-    /// `agent_binary_missing`; a release outside the supported range and
-    /// output that does not parse have their own detailed forms of this code
+    /// `agent_binary_missing`; a release outside the supported range, output
+    /// that does not parse and a probe that ran to its deadline have their own
+    /// detailed forms of this code
     /// ([`Self::agent_runtime_version_out_of_range`],
-    /// [`Self::agent_runtime_version_unparseable`]).
+    /// [`Self::agent_runtime_version_unparseable`],
+    /// [`Self::agent_runtime_probe_timed_out`]).
     #[must_use]
     pub fn agent_runtime_unsupported() -> Self {
         Self::observation(
@@ -519,7 +521,8 @@ impl ProtocolError {
     }
 
     /// `agent_runtime_unsupported` for an executable whose probe reported a
-    /// release outside its runtime's supported `[min, below)`.
+    /// release outside its runtime's supported `[min, below)`, or below `min`
+    /// when the range has no upper bound (`below` is `None`).
     ///
     /// The arguments are the normalized releases the probe parsed and the
     /// runtime declares; raw probe output never reaches the error.
@@ -527,14 +530,20 @@ impl ProtocolError {
     pub fn agent_runtime_version_out_of_range(
         version: &impl std::fmt::Display,
         min: &impl std::fmt::Display,
-        below: &impl std::fmt::Display,
+        below: Option<&impl std::fmt::Display>,
     ) -> Self {
+        let msg = match below {
+            Some(below) => format!(
+                "the selected agent executable reports version {version}, outside its runtime's supported range [{min}, {below})"
+            ),
+            None => format!(
+                "the selected agent executable reports version {version}, below its runtime's supported minimum {min}"
+            ),
+        };
         Self::new(
             ErrorClass::Runtime,
             "agent_runtime_unsupported",
-            format!(
-                "the selected agent executable reports version {version}, outside its runtime's supported range [{min}, {below})"
-            ),
+            msg,
             Some(
                 "install a release in the supported range, or update the runtime package"
                     .to_owned(),
@@ -552,6 +561,27 @@ impl ProtocolError {
             "the selected agent executable's version output does not match its runtime's declared format",
             Some(
                 "the configured program must print its release in the format its runtime package declares; if the configured program is a wrapper, it must answer the runtime package's version-probe arguments without the profile's fixed arguments"
+                    .to_owned(),
+            ),
+        )
+    }
+
+    /// `agent_runtime_unsupported` for an executable whose version probe ran
+    /// to its full deadline of `deadline_secs` seconds without exiting.
+    ///
+    /// The probe runs in a cleared environment, so a program that reaches a
+    /// network service at start can outlast the deadline where the user's own
+    /// shell would not. Probe output never reaches the error.
+    #[must_use]
+    pub fn agent_runtime_probe_timed_out(deadline_secs: u64) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_runtime_unsupported",
+            format!(
+                "the selected agent executable's version check did not finish within {deadline_secs} seconds"
+            ),
+            Some(
+                "the runtime's version command must finish offline within the check's deadline in a cleared environment; if the program is a wrapper or reaches a network service at start, point the profile's program at a launcher whose version command answers without it"
                     .to_owned(),
             ),
         )

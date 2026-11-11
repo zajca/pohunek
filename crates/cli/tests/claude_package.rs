@@ -1179,7 +1179,13 @@ fn the_supported_range_equals_the_compatibility_lock() {
     assert_eq!(lock["package"], PACKAGE_ID);
     assert_eq!(lock["runtime"], definition.runtime_id().as_str());
     assert_eq!(lock["supported"]["min"], policy.min().to_string());
-    assert_eq!(lock["supported"]["below"], policy.below().to_string());
+    assert_eq!(
+        lock["supported"]["below"],
+        policy
+            .below()
+            .expect("the official runtime bounds its range")
+            .to_string()
+    );
 
     let release =
         ProbeVersion::parse(&locked_release()).expect("the locked release is MAJOR.MINOR.PATCH");
@@ -1197,7 +1203,11 @@ fn the_supported_range_equals_the_compatibility_lock() {
         "the locked release lies in the supported range"
     );
     assert!(
-        !policy.supports(policy.below()),
+        !policy.supports(
+            policy
+                .below()
+                .expect("the official runtime bounds its range")
+        ),
         "the first release above the range is unsupported"
     );
     let next_major = policy
@@ -1209,7 +1219,10 @@ fn the_supported_range_equals_the_compatibility_lock() {
         .expect("the minimum's major release")
         + 1;
     assert_eq!(
-        policy.below().to_string(),
+        policy
+            .below()
+            .expect("the official runtime bounds its range")
+            .to_string(),
         format!("{next_major}.0.0"),
         "the range runs from the verified minimum to the next major release"
     );

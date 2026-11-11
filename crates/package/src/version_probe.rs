@@ -6,9 +6,10 @@
 //!
 //! A runtime descriptor that names the [`SEMVER_PARSER_ID`],
 //! [`SEMVER_LINE_PARSER_ID`] or [`SEMVER_REVISION_LINE_PARSER_ID`] parser
-//! declares the probe arguments and the half-open release range
-//! `[min, below)` the runtime is supported for, so a package update can move
-//! the range without a daemon release.
+//! declares the probe arguments and the release range the runtime is supported
+//! for, so a package update can move the range without a daemon release. The
+//! range is half-open, `[min, below)`, or open-ended, `[min, ..)`, when the
+//! descriptor omits `below` (runtime feature `version-probe-open-range-v1`).
 //!
 //! `semver-v1` reads a first output line that is exactly one release,
 //! `MAJOR.MINOR.PATCH`. `semver-line-v1` reads a first output line of the shape
@@ -79,7 +80,8 @@ pub struct VersionProbeDeclaration {
     /// Lowest supported release, inclusive; the data-driven parsers only.
     #[serde(default)]
     pub min: Option<String>,
-    /// First unsupported release; the data-driven parsers only.
+    /// First unsupported release; the data-driven parsers only. Absent means
+    /// the range has no upper bound.
     #[serde(default)]
     pub below: Option<String>,
     /// Output template; the `semver-line-v1` parser only.
@@ -93,30 +95,55 @@ impl VersionProbeDeclaration {
     ///
     /// # Errors
     ///
-    /// Returns a [`VersionProbeError`] when `args`, `min` and `below` are not
-    /// declared together, or when [`VersionProbePolicy::new`] or
-    /// [`VersionProbePolicy::with_line_template`] rejects them.
+    /// Returns a [`VersionProbeError`] when `args` and `min` are not declared
+    /// together or `below` is declared without them, or when the
+    /// [`VersionProbePolicy`] constructors reject the fields.
     pub fn policy(&self) -> Result<Option<VersionProbePolicy>, VersionProbeError> {
         let revisions = self.parser == SEMVER_REVISION_LINE_PARSER_ID;
         match (&self.args, &self.min, &self.below) {
             (None, None, None) if self.line.is_none() => Ok(None),
-            (Some(args), Some(min), Some(below)) => match (&self.line, revisions) {
-                (Some(line), true) => {
-                    VersionProbePolicy::with_revision_line_template(args.clone(), min, below, line)
+            (Some(args), Some(min), below) => {
+                let below = below.as_deref();
+                match (&self.line, revisions) {
+                    (Some(line), true) => VersionProbePolicy::build(
+                        args.clone(),
+                        min,
+                        below,
+                        ProbeVersion::parse_revision,
+                        REVISION_SHAPE,
+                    )
+                    .and_then(|policy| policy.with_template(line, true)),
+                    (Some(line), false) => VersionProbePolicy::build(
+                        args.clone(),
+                        min,
+                        below,
+                        ProbeVersion::parse,
+                        BARE_SHAPE,
+                    )
+                    .and_then(|policy| policy.with_template(line, false)),
+                    (None, _) => VersionProbePolicy::build(
+                        args.clone(),
+                        min,
+                        below,
+                        ProbeVersion::parse,
+                        BARE_SHAPE,
+                    ),
                 }
-                (Some(line), false) => {
-                    VersionProbePolicy::with_line_template(args.clone(), min, below, line)
-                }
-                (None, _) => VersionProbePolicy::new(args.clone(), min, below),
+                .map(Some)
             }
-            .map(Some),
             _ => Err(VersionProbeError {
                 field: "runtime.version_probe",
-                reason: "args, min and below are declared together",
+                reason: "args and min are declared together",
             }),
         }
     }
 }
+
+/// Shape a `min` or `below` bound of the bare and line grammars must have.
+const BARE_SHAPE: &str = "must be MAJOR.MINOR.PATCH";
+
+/// Shape a `min` or `below` bound of the revision grammar must have.
+const REVISION_SHAPE: &str = "must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-R<n>[.<m>]";
 
 /// Maximum number of probe arguments.
 ///
@@ -456,14 +483,15 @@ impl LineTemplate {
 pub enum VersionRefusal {
     /// The first output line does not follow the declared grammar.
     Unparseable,
-    /// The output names a release outside the declared `[min, below)`.
+    /// The output names a release outside the declared range.
     OutOfRange {
         /// The release the output names.
         version: ProbeVersion,
         /// Lowest supported release, inclusive.
         min: ProbeVersion,
-        /// First release that is no longer supported.
-        below: ProbeVersion,
+        /// First release that is no longer supported; `None` for a range
+        /// without an upper bound.
+        below: Option<ProbeVersion>,
     },
 }
 
@@ -476,11 +504,16 @@ impl fmt::Display for VersionRefusal {
             Self::OutOfRange {
                 version,
                 min,
-                below,
+                below: Some(below),
             } => write!(
                 f,
                 "version {version} is outside the supported range [{min}, {below})"
             ),
+            Self::OutOfRange {
+                version,
+                min,
+                below: None,
+            } => write!(f, "version {version} is below the supported minimum {min}"),
         }
     }
 }
@@ -502,7 +535,7 @@ enum OutputGrammar {
 pub struct VersionProbePolicy {
     args: Vec<String>,
     min: ProbeVersion,
-    below: ProbeVersion,
+    below: Option<ProbeVersion>,
     grammar: OutputGrammar,
 }
 
@@ -514,19 +547,23 @@ impl VersionProbePolicy {
     ///
     /// Returns a [`VersionProbeError`] naming the offending field.
     pub fn new(args: Vec<String>, min: &str, below: &str) -> Result<Self, VersionProbeError> {
-        Self::build(
-            args,
-            min,
-            below,
-            ProbeVersion::parse,
-            "must be MAJOR.MINOR.PATCH",
-        )
+        Self::build(args, min, Some(below), ProbeVersion::parse, BARE_SHAPE)
+    }
+
+    /// The policy of a range without an upper bound: every release from `min`
+    /// on is supported. The other fields follow [`Self::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`VersionProbeError`] naming the offending field.
+    pub fn open_ended(args: Vec<String>, min: &str) -> Result<Self, VersionProbeError> {
+        Self::build(args, min, None, ProbeVersion::parse, BARE_SHAPE)
     }
 
     fn build(
         args: Vec<String>,
         min: &str,
-        below: &str,
+        below: Option<&str>,
         parse: fn(&str) -> Option<ProbeVersion>,
         shape: &'static str,
     ) -> Result<Self, VersionProbeError> {
@@ -552,11 +589,15 @@ impl VersionProbePolicy {
             field: "runtime.version_probe.min",
             reason: shape,
         })?;
-        let below = parse(below).ok_or(VersionProbeError {
-            field: "runtime.version_probe.below",
-            reason: shape,
-        })?;
-        if min >= below {
+        let below = below
+            .map(|text| {
+                parse(text).ok_or(VersionProbeError {
+                    field: "runtime.version_probe.below",
+                    reason: shape,
+                })
+            })
+            .transpose()?;
+        if below.is_some_and(|below| min >= below) {
             return Err(VersionProbeError {
                 field: "runtime.version_probe.below",
                 reason: "must be greater than min",
@@ -582,13 +623,22 @@ impl VersionProbePolicy {
         below: &str,
         line: &str,
     ) -> Result<Self, VersionProbeError> {
-        let mut policy = Self::new(args, min, below)?;
+        Self::new(args, min, below)?.with_template(line, false)
+    }
+
+    /// Reads the output through the `line` template; `revisions` lets its
+    /// release carry a numeric `-R<n>[.<m>]` revision.
+    fn with_template(mut self, line: &str, revisions: bool) -> Result<Self, VersionProbeError> {
         let template = LineTemplate::parse(line).map_err(|error| VersionProbeError {
             field: "runtime.version_probe.line",
             reason: error.reason(),
         })?;
-        policy.grammar = OutputGrammar::Line(template);
-        Ok(policy)
+        self.grammar = if revisions {
+            OutputGrammar::RevisionLine(template)
+        } else {
+            OutputGrammar::Line(template)
+        };
+        Ok(self)
     }
 
     /// Like [`Self::with_line_template`], for a release that may carry a
@@ -603,19 +653,14 @@ impl VersionProbePolicy {
         below: &str,
         line: &str,
     ) -> Result<Self, VersionProbeError> {
-        let mut policy = Self::build(
+        Self::build(
             args,
             min,
-            below,
+            Some(below),
             ProbeVersion::parse_revision,
-            "must be MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-R<n>[.<m>]",
-        )?;
-        let template = LineTemplate::parse(line).map_err(|error| VersionProbeError {
-            field: "runtime.version_probe.line",
-            reason: error.reason(),
-        })?;
-        policy.grammar = OutputGrammar::RevisionLine(template);
-        Ok(policy)
+            REVISION_SHAPE,
+        )?
+        .with_template(line, true)
     }
 
     /// Whether the output is read through a `line` template.
@@ -645,16 +690,18 @@ impl VersionProbePolicy {
         self.min
     }
 
-    /// First release that is no longer supported.
+    /// First release that is no longer supported, or `None` for a range
+    /// without an upper bound.
     #[must_use]
-    pub fn below(&self) -> ProbeVersion {
+    pub fn below(&self) -> Option<ProbeVersion> {
         self.below
     }
 
-    /// Whether `version` lies in `[min, below)`.
+    /// Whether `version` lies in `[min, below)`, or at or above `min` when the
+    /// range has no upper bound.
     #[must_use]
     pub fn supports(&self, version: ProbeVersion) -> bool {
-        self.min <= version && version < self.below
+        self.min <= version && self.below.is_none_or(|below| version < below)
     }
 
     /// Reads the release from probe output: the trimmed first line must be
