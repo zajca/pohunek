@@ -2606,7 +2606,8 @@ impl Fixture {
     }
 
     /// Waits until the session's detected activity is `activity` and returns
-    /// the session record that matched.
+    /// the session record that matched. Panics with the record as soon as the
+    /// session is `stopped`, `done` or `failed`.
     async fn wait_activity(&self, id: &str, activity: &str) -> Value {
         wait_until(&format!("activity {activity} of {id}"), || async {
             let (code, waited) = self
@@ -2622,6 +2623,11 @@ impl Fixture {
                 ])
                 .await;
             assert_eq!(code, 0, "{waited}");
+            let state = waited["ok"]["session"]["state"].as_str();
+            assert!(
+                !matches!(state, Some("stopped" | "done" | "failed")),
+                "session {id} ended while waiting for activity {activity}: {waited}"
+            );
             (waited["ok"]["reason"] == "activity_matched").then(|| waited["ok"]["session"].clone())
         })
         .await
@@ -3195,13 +3201,16 @@ async fn two_real_codex_sessions_on_one_codex_home_do_not_share_a_daemon() {
         .as_str()
         .expect("first session id")
         .to_owned();
+    // Two codex processes starting together on a fresh home race in Codex's
+    // own database migration and one exits 1; the second starts once the
+    // first is idle.
+    fixture.wait_activity(&first, "idle").await;
     let other_cwd = fixture.harness.env.root().join("other-work");
     fs::create_dir(&other_cwd).expect("second working directory");
     let second = fixture.new_session_in("second", &other_cwd).await["id"]
         .as_str()
         .expect("second session id")
         .to_owned();
-    fixture.wait_activity(&first, "idle").await;
     fixture.wait_activity(&second, "idle").await;
 
     let mut references = Vec::new();
