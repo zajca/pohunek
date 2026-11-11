@@ -72,8 +72,8 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
-    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REQUEST_CONFLICT_CODE,
-    SESSION_REQUEST_IN_PROGRESS_CODE,
+    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
+    SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
 };
 #[doc(inline)]
 pub use governance::{

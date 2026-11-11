@@ -834,10 +834,15 @@ impl Client {
             .connect_dedicated(self.options.with_request_timeout(timeout))
             .await?;
         // A daemon that predates `secret_env` drops the field and would start the
-        // agent without its credential, and one that predates `client_request_id`
-        // would create a second session on a retry, so the flags are checked on
-        // the same connection before either leaves the process.
-        if !params.secret_env.is_empty() || params.client_request_id.is_some() {
+        // agent without its credential, one that predates `client_request_id`
+        // would create a second session on a retry, and one that predates
+        // `context_package_digest` would leave the context files unpinned, so the
+        // flags are checked on the same connection before any of them leaves the
+        // process.
+        if !params.secret_env.is_empty()
+            || params.client_request_id.is_some()
+            || params.context_package_digest.is_some()
+        {
             let capabilities = client
                 .host_inspect_with(protocol::HostInspectParams {
                     skip_runtime_probes: Some(true),
@@ -852,6 +857,13 @@ impl Client {
             {
                 return Err(ClientError::Protocol(
                     ProtocolError::session_new_request_id_unsupported(self.remote_host()),
+                ));
+            }
+            if params.context_package_digest.is_some()
+                && !capabilities.session_new_context_pin_supported
+            {
+                return Err(ClientError::Protocol(
+                    ProtocolError::session_new_context_pin_unsupported(self.remote_host()),
                 ));
             }
         }

@@ -83,6 +83,9 @@ struct Daemon {
     inspect_delay: Arc<Mutex<Option<Duration>>>,
     /// The `content_hash` `assistant.materialize` reports.
     content_hash: Arc<Mutex<String>>,
+    /// The `host.inspect` answer, replaceable to model a daemon swapped for
+    /// another release.
+    capabilities: Arc<Mutex<Value>>,
     /// Keeps the fixture directory alive for the daemon's lifetime.
     _fixture: Box<dyn std::any::Any>,
 }
@@ -141,14 +144,17 @@ impl Daemon {
         let remote = matches!(listener, Listener::Tcp(_));
         let script = Arc::new(Mutex::new(VecDeque::from(steps)));
         let creates = Arc::new(Mutex::new(Vec::new()));
-        let capabilities = serde_json::to_value(capabilities(request_id_supported, pin_supported))
-            .expect("serialize the capability snapshot");
+        let capabilities = Arc::new(Mutex::new(
+            serde_json::to_value(capabilities(request_id_supported, pin_supported))
+                .expect("serialize the capability snapshot"),
+        ));
         let (hang_signal, hangs) = tokio::sync::mpsc::unbounded_channel();
         let inspect_delay = Arc::new(Mutex::new(None));
         let content_hash = Arc::new(Mutex::new(SERVED_DIGEST.to_owned()));
         let (accept_script, accept_creates) = (Arc::clone(&script), Arc::clone(&creates));
         let accept_delay = Arc::clone(&inspect_delay);
         let accept_hash = Arc::clone(&content_hash);
+        let accept_capabilities = Arc::clone(&capabilities);
         tokio::spawn(async move {
             loop {
                 match &listener {
@@ -156,7 +162,7 @@ impl Daemon {
                         let (stream, _) = listener.accept().await.expect("accept a connection");
                         tokio::spawn(serve(
                             stream,
-                            capabilities.clone(),
+                            Arc::clone(&accept_capabilities),
                             Arc::clone(&accept_script),
                             Arc::clone(&accept_creates),
                             hang_signal.clone(),
@@ -168,7 +174,7 @@ impl Daemon {
                         let (stream, _) = listener.accept().await.expect("accept a connection");
                         tokio::spawn(serve(
                             stream,
-                            capabilities.clone(),
+                            Arc::clone(&accept_capabilities),
                             Arc::clone(&accept_script),
                             Arc::clone(&accept_creates),
                             hang_signal.clone(),
@@ -187,6 +193,7 @@ impl Daemon {
             hangs,
             inspect_delay,
             content_hash,
+            capabilities,
             _fixture: fixture,
         }
     }
@@ -220,6 +227,17 @@ impl Daemon {
         content_hash.clone_into(&mut self.content_hash.lock().expect("hash lock"));
     }
 
+    /// Makes every later `host.inspect` answer as a release that predates
+    /// `session_new_context_pin_supported`, which omits the flag.
+    fn answer_as_older_release(&self) {
+        self.capabilities
+            .lock()
+            .expect("capabilities lock")
+            .as_object_mut()
+            .expect("capabilities are an object")
+            .remove("session_new_context_pin_supported");
+    }
+
     /// Makes the next `host.inspect` answer after `delay`.
     fn delay_next_inspect(&self, delay: Duration) {
         *self.inspect_delay.lock().expect("delay lock") = Some(delay);
@@ -239,7 +257,7 @@ impl Daemon {
 
 async fn serve<S>(
     stream: S,
-    capabilities: Value,
+    capabilities: Arc<Mutex<Value>>,
     script: Arc<Mutex<VecDeque<Step>>>,
     creates: Arc<Mutex<Vec<Value>>>,
     hang_signal: tokio::sync::mpsc::UnboundedSender<()>,
@@ -273,7 +291,8 @@ async fn serve<S>(
                     // timing-allowed: #1340 parked on the paused test clock until the scenario advances it.
                     tokio::time::sleep(delay).await;
                 }
-                ok(&request, capabilities.clone())
+                let snapshot = capabilities.lock().expect("capabilities lock").clone();
+                ok(&request, snapshot)
             }
             method::ASSISTANT_MATERIALIZE => {
                 let hash = content_hash.lock().expect("hash lock").clone();
@@ -915,4 +934,22 @@ async fn a_pin_capable_host_reporting_a_content_hash_that_is_no_digest_fails_the
 
     assert_eq!(error.code, "materialization_failed");
     assert!(daemon.creates.lock().expect("creates lock").is_empty());
+}
+
+#[tokio::test]
+async fn a_daemon_replaced_by_an_older_release_before_the_create_is_refused_before_session_new() {
+    let daemon = Daemon::start_pinned(vec![Step::Session { replayed: false }], true, true);
+    let prepared = prepare(&daemon, None).await.expect("the launch prepares");
+    daemon.answer_as_older_release();
+
+    let error = protocol_error(
+        start_prepared_with_options(&daemon.host(), prepared, options())
+            .await
+            .expect_err("an older daemon would drop the pin and leave the files unpinned"),
+    );
+
+    assert_eq!(error.code, "session_new_context_pin_unsupported");
+    assert_eq!(error.class, ErrorClass::Daemon);
+    assert!(daemon.creates.lock().expect("creates lock").is_empty());
+    assert_eq!(daemon.unused_steps(), 1);
 }

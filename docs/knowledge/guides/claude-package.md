@@ -215,9 +215,11 @@ screens in `compat/claude/screens/named/`):
 A client that draws between two PTY reads (the Android companion is one) can
 show a half-drawn frame, torn rows while scrolling, unless Claude Code wraps its
 frames in synchronized output (DEC private mode 2026). Setting
-`CLAUDE_CODE_FORCE_SYNC_OUTPUT` to `1` makes Claude wrap them; a real-phone
-check with the companion app showed no torn rows with it and torn rows without
-it (pohunekd/pohunek-companion-android#193). The package does not set it:
+`CLAUDE_CODE_FORCE_SYNC_OUTPUT` to `1` makes Claude wrap them when it runs
+outside tmux (read from the binary of Claude Code 2.1.310, not run); what the
+variable does inside tmux is not verified. A real-phone check with the
+companion app showed no torn rows with it and torn rows without it
+(pohunekd/pohunek-companion-android#193). The package does not set it:
 enable it on the profile that launches Claude, in the profile `[env]`:
 
 ```toml

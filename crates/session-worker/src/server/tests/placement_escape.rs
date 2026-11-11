@@ -15,10 +15,10 @@ use std::path::Path;
 
 use pohunek_platform::process::{HostInspector, ProcessInspector as _};
 use pohunek_test_support::hold;
-use pohunek_test_support::wait::{poll_until, wait_until};
+use pohunek_test_support::wait::{poll_until, wait_until, HANG_GUARD};
 use pohunek_worker_protocol::{
-    PlacementOutcome, PlacementReport, ResponseKind, RuntimeScope, SessionId, TransactionId,
-    WorkerId, CURRENT_VERSION,
+    PlacementOutcome, PlacementReport, ResponseKind, RuntimeScope, SessionId, StopPolicy,
+    TransactionId, WorkerId, CURRENT_VERSION,
 };
 
 use crate::placement::Armed;
@@ -268,6 +268,16 @@ struct StartedRuntime {
 /// Returns once the immediate check ran and found nothing, so a later
 /// `Escaped` result can only come from a check made after the daemon exists.
 async fn initialized_runtime(after: &str) -> StartedRuntime {
+    initialized_runtime_with_grace(after, None).await
+}
+
+/// [`initialized_runtime`] with the stop grace of `stop_grace` instead of the
+/// fixture's, for a scenario whose root needs time to end before the stop
+/// kills it.
+async fn initialized_runtime_with_grace(
+    after: &str,
+    stop_grace: Option<std::time::Duration>,
+) -> StartedRuntime {
     let images = pohunek_test_support::tempdir().expect("image directory");
     let directory = pohunek_test_support::tempdir().expect("fixture directory");
     let script = format!(
@@ -284,6 +294,10 @@ async fn initialized_runtime(after: &str) -> StartedRuntime {
     initialize.executable = std::path::PathBuf::from("/bin/sh");
     initialize.arguments = vec!["-c".to_owned(), script];
     initialize.cwd = directory.path().to_path_buf();
+    if let Some(grace) = stop_grace {
+        let grace_ms = u64::try_from(grace.as_millis()).expect("grace in milliseconds");
+        initialize.stop_policy = StopPolicy::new(grace_ms).expect("a nonzero stop grace");
+    }
     initialize.placement_check_interval_ms = Some(
         u64::try_from(MAX_PLACEMENT_CHECK_INTERVAL.as_millis()).expect("an interval in millis"),
     );
@@ -387,12 +401,15 @@ async fn a_daemon_left_at_a_stop_is_reported_by_the_check_the_stop_runs() {
     // On the stop's signal the root ends and reaps the daemon, so the check
     // that runs when the runtime ends finds nothing: only the check the stop
     // itself runs, before it signals, can have seen the daemon.
-    let runtime = initialized_runtime(
+    // The stop waits for the trap as long as a hung scenario would, so the
+    // trap ends before the stop kills the root however loaded the host is.
+    let runtime = initialized_runtime_with_grace(
         "trap 'kill -KILL $(cat daemon.pid); wait $(cat daemon.pid); while kill -0 $(cat daemon.pid) 2>/dev/null; do sleep 0.02; done; exit 0' HUP TERM\n\
          : > trapped\nsleep 600 &\nwait $!",
+        Some(HANG_GUARD),
     )
     .await;
-    let daemon = runtime.release_daemon();
+    runtime.release_daemon();
     assert_eq!(escape_warnings(&capture), 0, "no check saw the daemon yet");
     poll_until("the root to install its trap", || {
         runtime
@@ -404,8 +421,16 @@ async fn a_daemon_left_at_a_stop_is_reported_by_the_check_the_stop_runs() {
     });
 
     assert!(matches!(runtime.stop().await, ResponseKind::Stopped { .. }));
-    end(daemon);
 
+    // `Stopped` follows the terminal commit, which is written after the check
+    // that ends the runtime. The grace outlasts the trap, so a clean commit
+    // proves the root reaped the daemon and the one WARN came from the stop's
+    // own check.
+    assert_eq!(
+        latest(&runtime.server).await.map(|report| report.outcome),
+        Some(PlacementOutcome::Clean),
+        "the root killed the daemon within the stop grace"
+    );
     assert_eq!(escape_warnings(&capture), 1);
 }
 

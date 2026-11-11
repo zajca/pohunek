@@ -4363,6 +4363,10 @@ async fn a_host_that_trusts_no_repository_never_adds_the_trusted_args() {
     servers.stop().await;
 }
 
+/// The `event` of the record [`DaemonLog::start`] writes to prove the capture
+/// receives WARN records of the daemon target.
+const LOG_PROBE_EVENT: &str = "daemon_log.probe";
+
 /// The production JSON log of the daemon, captured for the lifetime of one
 /// test.
 ///
@@ -4381,10 +4385,21 @@ impl DaemonLog {
         let dir = pohunek_test_support::tempdir().expect("log directory");
         let capture = pohunek_daemon::logging::capture(&dir.path().join("daemon-logs"))
             .expect("daemon logging initializes");
-        Self {
+        let log = Self {
             _capture: capture,
             dir,
-        }
+        };
+        // The capture takes its filter from `RUST_LOG`. A WARN record of the
+        // daemon's target that does not arrive would make every zero-count
+        // assertion pass whatever the daemon does, so the log proves it
+        // records before a scenario relies on it.
+        tracing::warn!(target: "pohunek_daemon", event = LOG_PROBE_EVENT, "log capture probe");
+        assert_eq!(
+            log.event_records(LOG_PROBE_EVENT).len(),
+            1,
+            "the daemon log capture drops WARN records of the daemon target; unset RUST_LOG or let it enable them"
+        );
+        log
     }
 
     fn path(&self) -> PathBuf {
