@@ -4812,7 +4812,7 @@ notification server is introduced.
 
 ## Attach Stream
 
-The attach byte stream is part of public protocol v4. It is not an implementation
+The attach byte stream is part of public protocol 5. It is not an implementation
 detail of the CLI.
 
 Sequence:

@@ -22,18 +22,21 @@ and the TypeScript SDK advertise the same window. Protocol 5 removed the
 `notification.update`, `notification.delete`, `notification.policy.*` and
 `notification.retention.prune` methods, a semantic change no shape adapter can
 express, so a client, hook or plugin that announces protocol 3 or 4 is refused
-with `daemon/version_mismatch` before any method runs. A client of the previous
-release does not keep working against this daemon, and a CLI of this release
-does not work against a daemon of the previous release.
-Before replacing any component, inventory every CLI, SDK, custom client, managed
-hook and local or overlay-reachable daemon that must talk to another peer. Drain
-cross-host automation, upgrade every daemon and every client of those peers in
-one pass, and then verify every host with
+with `daemon/version_mismatch` before any method runs. The window has held only
+protocol 5 since release 0.41, so peers of 0.41 and later interoperate; a field
+added after 0.41 is gated by a `HostCapabilities` flag that the client checks
+first. Only peers of release 0.40.x or earlier (protocol 4 and below) are
+refused, and the window narrows or moves again only when
+`MIN_PROTOCOL_VERSION` does.
+Before replacing any component on a host at 0.40.x or earlier, inventory every
+CLI, SDK, custom client, managed hook and local or overlay-reachable daemon that
+must talk to another peer. Drain cross-host automation, upgrade every daemon and
+every client of those peers in one pass, and then verify every host with
 `pohunek health --json` and `pohunek host inspect <host> --json`. The reported
 `protocol_version` is the version negotiated for that connection (`5` for a
-current CLI). A session launched before the upgrade carries
+current CLI). A session launched by release 0.40.x or earlier carries
 `POHUNEK_PROTOCOL_VERSION=4` for its life, so its managed hooks are refused
-until the session is relaunched.
+until the session is relaunched; a session launched by 0.41 carries protocol 5.
 
 Protocol 4 spelled the worker instance identifier `worker_instance_id` where
 protocol 3 spelled it `runtime_id`; protocol 5 accepts only the current spelling
@@ -129,12 +132,16 @@ start or a launch.
 
 ## Mixed releases across hosts
 
-The public protocol window holds one version, so there is no mixed-release
-pair. A CLI, Rust client or TypeScript SDK of this release refuses a daemon that
-answers in an older protocol, and a daemon of this release refuses an older
-client, both with `daemon/version_mismatch`; host discovery classes such a
-peer as `version_mismatch`. During a staggered multi-host upgrade, upgrade the pohunek install on that host
-first, then retry; cross-host commands stay unavailable for it until then.
+Releases 0.41 and 0.42 both speak protocol 5, so during a staggered multi-host
+upgrade a CLI of one release talks to a daemon of the other without an adapter.
+A method or field added in the newer release is refused by the client before it
+is sent, through its `HostCapabilities` flag or `daemon/method_not_found`.
+A CLI, Rust client or TypeScript SDK refuses a daemon that answers in another
+protocol version, and a daemon refuses a client outside its window, both with
+`daemon/version_mismatch`; host discovery classes such a peer as
+`version_mismatch`. For a host at 0.40.x or earlier, upgrade the pohunek install
+on that host first, then retry; cross-host commands stay unavailable for it
+until then.
 
 ## Upgrade window and the metadata store
 
