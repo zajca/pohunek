@@ -35,7 +35,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 18;
+pub const STORE_SCHEMA_VERSION: u32 = 19;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -121,6 +121,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 17,
         apply: migrate_v17_to_v18,
+    },
+    Migration {
+        from: 18,
+        apply: migrate_v18_to_v19,
     },
 ];
 
@@ -273,6 +277,32 @@ fn migrate_v16_to_v17(record: &mut Map<String, Value>) {
 /// every schema 17 session reads: its files were never retained, and the pin is
 /// never backfilled from the package installed now.
 fn migrate_v17_to_v18(_record: &mut Map<String, Value>) {}
+
+/// Schema 18 to 19: session records gain the optional `info.ended_at`.
+///
+/// A finished session of schema 18 has no end time, and a schema 18 daemon
+/// re-stamps its `updated_at` on every start, so the record's last update is the
+/// best age the store holds. The step copies it into `ended_at` for a record in a terminal
+/// state, which keeps the next start from resetting the retention clock again.
+/// A record that has not ended gets none.
+fn migrate_v18_to_v19(record: &mut Map<String, Value>) {
+    if record.get("kind").and_then(Value::as_str) != Some("session") {
+        return;
+    }
+    let Some(Value::Object(info)) = record.get_mut("info") else {
+        return;
+    };
+    let ended = matches!(
+        info.get("state").and_then(Value::as_str),
+        Some("stopped" | "done" | "failed")
+    );
+    if !ended || info.contains_key("ended_at") {
+        return;
+    }
+    if let Some(updated_at) = info.get("updated_at").cloned() {
+        info.insert("ended_at".to_owned(), updated_at);
+    }
+}
 
 /// Removes the fork keys from one native launch spec.
 #[expect(

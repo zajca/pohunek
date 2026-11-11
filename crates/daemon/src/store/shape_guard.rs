@@ -80,6 +80,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (16, include_str!("fixtures/shape/schema-16.txt")),
     (17, include_str!("fixtures/shape/schema-17.txt")),
     (18, include_str!("fixtures/shape/schema-18.txt")),
+    (19, include_str!("fixtures/shape/schema-19.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -315,6 +316,7 @@ fn session_json_with(recovery: &Value) -> Value {
     });
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
+    record["info"]["ended_at"] = json!("2026-01-01T00:00:01Z");
     record
 }
 
@@ -482,6 +484,7 @@ fn assert_every_field_is_reviewed(
         spawned_by: _,
         created_at: _,
         updated_at: _,
+        ended_at: _,
         exit_code: _,
     } = info;
     let _: &Option<CwdSource> = cwd_source;
@@ -875,6 +878,7 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.info.spawned_by.daemon_id",
     "session.info.created_at",
     "session.info.updated_at",
+    "session.info.ended_at",
     "session.info.background.revision",
     "session.info.background.items[].id",
     "session.info.background.items[].provider_kind",

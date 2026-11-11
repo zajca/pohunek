@@ -722,6 +722,7 @@ fn session_minimal() -> SessionInfo {
         metadata: BTreeMap::new(),
         created_at: CREATED_AT.to_owned(),
         updated_at: UPDATED_AT.to_owned(),
+        ended_at: None,
         exit_code: None,
     }
 }
@@ -836,6 +837,7 @@ fn session_full() -> SessionInfo {
         }),
         created_at: CREATED_AT.to_owned(),
         updated_at: UPDATED_AT.to_owned(),
+        ended_at: Some(UPDATED_AT.to_owned()),
         exit_code: Some(SUCCESS_EXIT_CODE),
     }
 }

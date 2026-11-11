@@ -178,8 +178,8 @@ orchestrated by manager tooling or by a plugin, through the public contracts.
 Core keeps only two primitives for it, and no herd definition, limit or
 admission policy: the `spawned_by` attribution of a session
 ([#1300](https://github.com/zajca/pohunek/issues/1300)) and durable session
-metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); neither has
-shipped yet. Metadata stays opaque to the daemon, and attribution is never an
+metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); both have
+shipped. Metadata stays opaque to the daemon, and attribution is never an
 authorization input.
 
 ### Shipped host identity and local governance
@@ -2001,6 +2001,11 @@ Durability tiers (honest about limits):
    a worker that answers again re-adopts the session as `running`. A `failed`
    session with a lost runtime stays resumable (resume keys on the runtime) and
    ages under the lost retention window, aged from the last connection.
+   A session that is terminal and not lost ages under the terminal window from
+   `ended_at`, the time it entered `stopped`, `done` or `failed`; the daemon
+   sets it once at that transition and no later record update, metadata edit or
+   restart moves it. A record that has no `ended_at` (store schema 18 or older)
+   was given its last update as `ended_at` by the schema 19 migration.
    Operations that need a running session still refuse it with
    `session_runtime_lost` and its recovery hint. When the service manager still
    holds the failed worker job, the daemon reads its verdict before it retires

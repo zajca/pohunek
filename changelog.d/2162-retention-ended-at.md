@@ -1,0 +1,4 @@
+---
+kind: fixed
+---
+A finished session now ages for retention from `ended_at`, the moment it entered `stopped`, `done` or `failed`, instead of from its last record update. Every daemon start rewrote the update time of each finished session, so a restart reset the retention clock and a sweep selected none of them. `SessionInfo` reports `ended_at`, and the schema 19 store migration gives an existing finished session its last update as `ended_at`. The `terminal_ttl_secs` and `lost_ttl_secs` keys of `session-policy.json` (30 and 90 days by default) are documented with the clock each one uses. ([#2162](https://github.com/zajca/pohunek/issues/2162))

@@ -835,6 +835,7 @@ impl Installation {
             metadata: BTreeMap::new(),
             created_at: now.clone(),
             updated_at: now,
+            ended_at: None,
             exit_code: None,
         };
         self.store()

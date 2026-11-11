@@ -1258,6 +1258,7 @@ impl Fixture {
             metadata: BTreeMap::new(),
             created_at: now.clone(),
             updated_at: now,
+            ended_at: None,
             exit_code: None,
         };
         let store = Store::new(self.data_home.join("pohunek/metadata.jsonl"));

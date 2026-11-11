@@ -240,6 +240,13 @@ export type SessionInfo = {
    */
   updated_at: string;
   /**
+   * When the session entered a terminal state (`stopped`, `done` or
+   * `failed`), in the daemon's wire timestamp format. Set once at that
+   * transition and unaffected by later record updates; retention ages a
+   * finished session from it. Omitted while the session has not ended.
+   */
+  ended_at?: string;
+  /**
    * Process exit code, when the session has exited with one.
    */
   exit_code?: number;

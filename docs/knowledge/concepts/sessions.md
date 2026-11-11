@@ -1266,6 +1266,11 @@ The policy is a stored file at `<data_dir>/session-policy.json`. `pohunek sessio
 retention sweep` uses it. The daemon reads the file at startup, so an edit takes
 effect after a daemon restart.
 
+A terminal session ages from `ended_at`, the moment it ended, which a daemon
+restart, a metadata edit or any other record update does not move. A session
+whose runtime is `lost` ages from the last time the daemon reached the runtime
+(`last_connected_at`). A record without `ended_at` ages from its `updated_at`.
+
 The shipped default is deliberately conservative: sweeps are **disabled**, and
 once enabled they run every 6 hours, keep a terminal (`stopped`/`done`/`failed`)
 session for 30 days, keep a session whose runtime is `lost` for 90 days, and

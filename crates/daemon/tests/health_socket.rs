@@ -27,6 +27,8 @@ mod readable_host;
 mod required_hooks;
 #[path = "support/root_reporter.rs"]
 mod root_reporter;
+#[path = "health_socket/session_ended_at.rs"]
+mod session_ended_at;
 #[path = "health_socket/session_metadata.rs"]
 mod session_metadata;
 #[path = "health_socket/session_request.rs"]

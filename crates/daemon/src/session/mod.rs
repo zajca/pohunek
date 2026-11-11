@@ -1768,6 +1768,19 @@ fn clear_entry_agent(entry: &mut SessionEntry) {
     entry.bound_reporter = None;
 }
 
+/// Keeps `ended_at` in step with the session state.
+///
+/// A session that is terminal and has no end time yet ends at `now`; a session
+/// that is not terminal has not ended. An end time already recorded is never
+/// moved, so later record updates and restarts leave the retention clock alone.
+fn settle_ended_at(info: &mut SessionInfo, now: &str) {
+    if !info.state.is_terminal() {
+        info.ended_at = None;
+    } else if info.ended_at.is_none() {
+        info.ended_at = Some(now.to_owned());
+    }
+}
+
 /// Applies the session presentation of a `Lost` classification to `info`.
 ///
 /// No detector is attached to a lost runtime, so the activity is always
@@ -1856,7 +1869,9 @@ fn exit_transition(
     if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
         candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Terminal);
     }
-    candidate.info.updated_at = timestamp_now();
+    let now = timestamp_now();
+    settle_ended_at(&mut candidate.info, &now);
+    candidate.info.updated_at = now;
     let acknowledge = match &candidate.runtime {
         RuntimeHandle::Worker(worker) if candidate.desired_state != DesiredState::Removed => {
             Some(terminal_ack::TerminalAcknowledgement {
@@ -7331,7 +7346,9 @@ impl SessionRegistry {
                     clear_entry_agent(&mut candidate);
                 }
             }
-            candidate.info.updated_at = timestamp_now();
+            let now = timestamp_now();
+            settle_ended_at(&mut candidate.info, &now);
+            candidate.info.updated_at = now;
             (base, candidate)
         };
         let lost_owner = candidate.turn_owner();
@@ -8482,6 +8499,7 @@ fn external_session_info(
         spawned_by: None,
         created_at: now.clone(),
         updated_at: now,
+        ended_at: None,
         exit_code: None,
     }
 }
@@ -8700,6 +8718,7 @@ fn create_intent_record(
         output_force_closed: false,
         created_at: created_at.clone(),
         updated_at: created_at,
+        ended_at: None,
         exit_code: None,
     };
     Ok(SessionRecord {

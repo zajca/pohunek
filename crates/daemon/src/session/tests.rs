@@ -21400,7 +21400,9 @@ fn uuid_like() -> String {
 async fn age_terminal(registry: &SessionRegistry, id: &SessionId, age: time::Duration) {
     let mut sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get_mut(id).expect("session entry");
-    entry.info.updated_at = backdated_stamp(age);
+    let stamp = backdated_stamp(age);
+    entry.info.ended_at = Some(stamp.clone());
+    entry.info.updated_at = stamp;
 }
 
 /// Turn an exited session into a backdated `running` + `lost` one, the state a

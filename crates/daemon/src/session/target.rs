@@ -917,6 +917,7 @@ impl SessionRegistry {
             output_force_closed: false,
             created_at: created_at.clone(),
             updated_at: created_at.clone(),
+            ended_at: None,
             exit_code: None,
         };
         let mut preparing_record = SessionRecord {
@@ -1105,6 +1106,7 @@ impl SessionRegistry {
             output_force_closed: false,
             created_at,
             updated_at: now,
+            ended_at: None,
             exit_code: None,
         };
 
