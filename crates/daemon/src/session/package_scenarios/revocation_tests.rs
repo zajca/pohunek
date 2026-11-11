@@ -242,6 +242,51 @@ async fn a_live_session_keeps_running_is_flagged_and_cannot_be_resumed_from_a_re
     );
 }
 
+/// The session list reads the registry and the revocation set once for every
+/// session: sessions that share a revoked digest are all flagged, and a
+/// session on a digest that is not revoked is not.
+#[tokio::test]
+async fn the_session_list_flags_exactly_the_sessions_pinned_to_a_revoked_digest() {
+    let official = official("revoked-list").await;
+    let registry = &official.fixture.registry;
+    let first = registry.create(official.launch()).await.expect("first");
+    let sibling = registry.create(official.launch()).await.expect("sibling");
+    let second = official.revoke_first().await;
+    official
+        .fixture
+        .registry
+        .packages()
+        .package_select(select(&second.digest))
+        .await
+        .expect("select the version that is not revoked");
+    let current = registry
+        .create(official.launch())
+        .await
+        .expect("a launch from the new selection");
+
+    let listed = registry.list().await;
+    let flagged = |id: &protocol::SessionId| {
+        listed
+            .iter()
+            .find(|session| &session.id == id)
+            .expect("listed")
+            .warnings
+            .iter()
+            .filter(|warning| {
+                warning.detail.as_deref()
+                    == Some(format!("package_revoked digest={}", official.first.digest).as_str())
+            })
+            .count()
+    };
+    assert_eq!(flagged(&first.id), 1);
+    assert_eq!(flagged(&sibling.id), 1);
+    assert_eq!(flagged(&current.id), 0);
+
+    for id in [&first.id, &sibling.id, &current.id] {
+        registry.stop(id).await.expect("stop");
+    }
+}
+
 #[tokio::test]
 async fn a_profile_pinned_to_a_revoked_digest_refuses_launches_and_new_pins() {
     let official = official("revoked-pinned").await;
@@ -399,6 +444,17 @@ async fn an_unreadable_revocation_file_refuses_official_launches() {
         .await
         .expect_err("enforcement fails closed");
     assert_eq!(refused.code, "runtime_incompatible");
+    let listed = official
+        .fixture
+        .registry
+        .packages()
+        .package_list()
+        .await
+        .expect("the package list stays readable");
+    assert!(
+        listed.packages.iter().all(|package| !package.revoked),
+        "an unreadable set flags nothing"
+    );
     assert_eq!(
         official
             .fixture

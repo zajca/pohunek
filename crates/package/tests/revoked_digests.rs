@@ -235,6 +235,34 @@ fn a_damaged_revocation_file_is_reported_and_never_replaced() {
     );
 }
 
+/// The repair the `package_revocations_unreadable` recover text names: with a
+/// damaged or newer-schema file removed, the catalog at the recorded
+/// sequence records its revocations again.
+#[test]
+fn removing_a_damaged_revocation_file_lets_the_recorded_catalog_restore_its_revocations() {
+    let fixture = PluginFixture::new();
+    let registry = fixture.open();
+    let catalog = verified(3, &['a']);
+    registry.record_catalog(&catalog).unwrap();
+    let good = std::fs::read_to_string(revoked_file(&fixture)).unwrap();
+
+    for damage in [
+        b"{ not json".to_vec(),
+        good.replace("\"schema\":1", "\"schema\":2").into_bytes(),
+    ] {
+        std::fs::write(revoked_file(&fixture), damage).unwrap();
+        registry.record_catalog(&catalog).unwrap_err();
+
+        std::fs::remove_file(revoked_file(&fixture)).unwrap();
+        registry
+            .record_catalog(&catalog)
+            .expect("the catalog at the recorded sequence records again");
+
+        assert!(registry.revoked_digests().unwrap().contains(&digest('a')));
+        assert_eq!(registry.catalog_state().unwrap().high_water(), Some(3));
+    }
+}
+
 #[test]
 fn the_accumulated_set_is_capped_and_a_refused_record_writes_nothing() {
     let fixture = PluginFixture::new();
@@ -277,4 +305,36 @@ fn a_stale_temporary_does_not_block_the_next_revocation_write() {
     registry.record_catalog(&verified(2, &['c'])).unwrap();
 
     assert!(registry.revoked_digests().unwrap().contains(&digest('c')));
+}
+
+/// Case table row 1 of #2099: a failure between the two writes of a record
+/// leaves the revocation in force under the old watermark, and the same
+/// catalog records again. Writing the state file first would lose it.
+#[test]
+fn a_failure_between_the_two_writes_keeps_the_revocation_and_the_catalog_records_again() {
+    let fixture = PluginFixture::new();
+    let registry = fixture.open();
+    registry.record_catalog(&verified(1, &['a'])).unwrap();
+    let state_before = std::fs::read(state_file(&fixture)).unwrap();
+
+    let interrupted = registry.record_catalog_with(&verified(2, &['b']), || {
+        // The digests file is already complete when the hook runs.
+        assert!(registry.revoked_digests().unwrap().contains(&digest('b')));
+        Err(RegistryError::CommitUncertain)
+    });
+
+    assert_eq!(interrupted.unwrap_err(), RegistryError::CommitUncertain);
+    let revoked = fixture.open().revoked_digests().unwrap();
+    assert!(revoked.contains(&digest('a')));
+    assert!(revoked.contains(&digest('b')));
+    assert_eq!(std::fs::read(state_file(&fixture)).unwrap(), state_before);
+    assert!(!fixture.plugins().join("revoked-digests.json.tmp").exists());
+    assert!(!fixture.plugins().join("catalog-state.json.tmp").exists());
+
+    let state = fixture
+        .open()
+        .record_catalog(&verified(2, &['b']))
+        .expect("the same catalog records again");
+    assert_eq!(state.high_water(), Some(2));
+    assert_eq!(fixture.open().revoked_digests().unwrap().len(), 2);
 }

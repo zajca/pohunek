@@ -392,10 +392,13 @@ a sibling of `catalog-state.json` so that file keeps its schema and a rollback
 still reads it. `revoked_digests()` reads the set without the lock;
 `record_catalog` unites the catalog's digests with it under the same lock and
 writes the digests file before `catalog-state.json`, so a crash between the
-two writes never loses a revocation. An equal-sequence catalog with new digests
-is recorded; a lower sequence changes nothing; a union above the cap is
-`TooManyRevokedDigests` and writes nothing; a damaged file is a typed error and
-is never replaced.
+two writes never loses a revocation (`record_catalog_with` runs a caller hook
+between the two writes; a fault scenario fails that hook to stand in for a
+crash). An equal-sequence catalog with new digests is recorded; a lower
+sequence changes nothing; a union above the cap is `TooManyRevokedDigests` and
+writes nothing; a damaged file is a typed error and is never replaced by the
+daemon. The operator clears it by removing the file and installing the latest
+release catalog again, which records its revocations anew.
 
 ### Index state
 

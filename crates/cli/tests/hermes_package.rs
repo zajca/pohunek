@@ -2268,30 +2268,25 @@ async fn assert_damaged_roots_are_refused(
     }
 }
 
-/// A later catalog that revokes the selected Hermes digest is learned offline
-/// of the daemon's launch path too: the operator source refuses the revoked
-/// package with a hint that names `plugin select`, and nothing is selected on
-/// its own.
-#[tokio::test]
-async fn a_later_catalog_that_revokes_the_selected_package_refuses_the_operator_source() {
-    let key = test_key();
-    let harness = trusted_harness(&key).await;
-    let (_, digest, _, _) = install_official(&harness, &key).await;
-    let hermes = HermesFixture::new(&harness.env);
-    hermes.install(&harness).await;
-
+/// Records catalog sequence 2, which revokes `revoked`, by installing Hermes
+/// 1.3.1 through it unselected, and returns the digest of 1.3.1.
+async fn record_revoking_catalog(
+    harness: &Harness,
+    key: &ed25519_dalek::SigningKey,
+    revoked: &PackageDigest,
+) -> PackageDigest {
     let mut alternate = package_entries();
     set_version(&mut alternate, "1.3.1");
     let (bytes, alternate_digest) = archive_of(&alternate);
-    let archive = write_archive(&harness, "hermes-1.3.1.tar.zst", &bytes);
+    let archive = write_archive(harness, "hermes-1.3.1.tar.zst", &bytes);
     let mut revoking = catalog_of(
         2,
         WINDOW_END,
         vec![catalog_entry("1.3.1", &alternate_digest)],
     );
-    revoking.revoked_digests = vec![digest.clone()];
+    revoking.revoked_digests = vec![revoked.clone()];
     let catalog = harness.env.root().join("runtime-catalog-revoking.json");
-    fs::write(&catalog, signed(&key, revoking)).expect("write the revoking catalog");
+    fs::write(&catalog, signed(key, revoking)).expect("write the revoking catalog");
     let (code, installed) = harness
         .json(&[
             "plugin",
@@ -2304,6 +2299,22 @@ async fn a_later_catalog_that_revokes_the_selected_package_refuses_the_operator_
         ])
         .await;
     assert_eq!(code, 0, "record the revoking catalog: {installed:#}");
+    alternate_digest
+}
+
+/// A later catalog that revokes the selected Hermes digest is learned offline
+/// of the daemon's launch path too: the operator source refuses the revoked
+/// package with a hint that names `plugin select`, and nothing is selected on
+/// its own.
+#[tokio::test]
+async fn a_later_catalog_that_revokes_the_selected_package_refuses_the_operator_source() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    let hermes = HermesFixture::new(&harness.env);
+    hermes.install(&harness).await;
+
+    record_revoking_catalog(&harness, &key, &digest).await;
 
     assert_source_findings(
         &harness,
@@ -2333,13 +2344,40 @@ async fn a_later_catalog_that_revokes_the_selected_package_refuses_the_operator_
     let text = String::from_utf8_lossy(&text.stdout).into_owned();
     assert!(
         text.contains("revoked") && text.contains("pohunek plugin select"),
-        "the doctor table names the recovery for the only installed version: {text}"
+        "the doctor table names the select recovery: {text}"
     );
     let (code, refused_select) = harness
         .json(&["plugin", "select", PACKAGE_ID, "--digest", digest.as_str()])
         .await;
     assert_ne!(code, 0, "{refused_select:#}");
     assert_eq!(refused_select["err"]["code"], "package_revoked");
+}
+
+/// A revoked digest that is the only installed version of its package has no
+/// version to select: the doctor table names the install of a release that
+/// carries a new package (case table row 4 of #2080).
+#[tokio::test]
+async fn a_revoked_package_that_is_the_only_installed_version_names_the_release_recovery() {
+    let key = test_key();
+    let harness = trusted_harness(&key).await;
+    let (_, digest, _, _) = install_official(&harness, &key).await;
+    let alternate_digest = record_revoking_catalog(&harness, &key, &digest).await;
+    uninstall_package(&harness, &alternate_digest).await;
+
+    let (code, listed) = harness.json(&["plugin", "list"]).await;
+    assert_eq!(code, 0, "{listed:#}");
+    assert_eq!(
+        listed["ok"]["packages"].as_array().map(Vec::len),
+        Some(1),
+        "the revoked digest is the only installed version: {listed:#}"
+    );
+    let doctor = harness.run(&["plugin", "doctor"]).await;
+    let text = String::from_utf8_lossy(&doctor.stdout).into_owned();
+    assert!(
+        text.contains("revoked") && text.contains("install a release that carries a new package"),
+        "the doctor table names the release recovery: {text}"
+    );
+    harness.stop().await;
 }
 
 /// Losing the recorded package keeps status informative, refuses update, and allows uninstall.

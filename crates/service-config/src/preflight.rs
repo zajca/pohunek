@@ -232,10 +232,11 @@ pub enum Verdict {
     /// The worker is not adopted: its runtime is lost, quarantined or left
     /// unmanaged.
     WouldNotBeAdopted,
-    /// The stopped session's native reference is missing or relocated, and
-    /// the upgrade does not change that, or the package digest it was launched
-    /// from was revoked by a recorded catalog: resume refuses it on the
-    /// running release as well, so the upgrade loses no recovery.
+    /// The stopped session's native reference is missing or relocated and the
+    /// upgrade does not change that, or the package digest a session was
+    /// launched from, stopped or live with an adopted worker, was revoked by a
+    /// recorded catalog: resume refuses it on the running release as well, so
+    /// the upgrade loses no recovery.
     AlreadyNotResumable,
 }
 

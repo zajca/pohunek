@@ -926,6 +926,64 @@ async fn a_package_file_modified_after_install_is_not_run() {
     servers.stop().await;
 }
 
+/// A catalog-authorized package that declares commands is unreachable through
+/// `package.install`, but a registry record can hold one; the command gate
+/// still refuses it once a recorded catalog revoked its digest.
+#[tokio::test]
+async fn a_command_of_a_revoked_catalog_authorized_package_is_not_run() {
+    let servers = spawn_servers("cmd-revoked").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let (bytes, digest) = archive_of(&command_entries(&servers.work));
+    let registry = package::registry::Registry::open_at(&servers.plugins, Limits::DEFAULT)
+        .expect("open the plugin root the daemon created");
+    registry
+        .install(&package::registry::InstallRequest {
+            archive: &bytes,
+            expected: &digest,
+            identity: serde_json::from_value(json!({ "id": PACKAGE, "version": "1.0.0" }))
+                .expect("package identity"),
+            source: package::registry::PackageSource::Official,
+            enabled: true,
+            select: true,
+            installed_at_unix_seconds: 1,
+        })
+        .expect("record the official package");
+    run_command(&mut local, PACKAGE, "ok", json!({}))
+        .await
+        .expect("an official package that no catalog revoked runs");
+    std::fs::remove_file(servers.work.join("ok.ran")).expect("reset the marker");
+
+    let revoked = servers.plugins.join("revoked-digests.json");
+    std::fs::write(
+        &revoked,
+        json!({ "schema": 1, "revoked_digests": [digest.as_str()] }).to_string(),
+    )
+    .expect("record the revocation");
+    std::fs::set_permissions(&revoked, std::fs::Permissions::from_mode(0o600))
+        .expect("private revocation file");
+
+    let refused = expect_code(&mut local, PACKAGE, "ok", json!({})).await;
+    assert_eq!(refused.code, "command_unavailable");
+    assert!(
+        !servers.work.join("ok.ran").exists(),
+        "the program did not start"
+    );
+    // The doctor reads the same file: a revoked finding proves the refusal is
+    // the revocation and not an unreadable set.
+    let doctor: protocol::PackageDoctorResult =
+        call(&mut local, method::PACKAGE_DOCTOR, json!(null)).await;
+    assert!(
+        doctor.findings.iter().any(|finding| {
+            finding.kind == protocol::PackageFindingKind::Revoked && finding.digest == digest
+        }),
+        "{:?}",
+        doctor.findings
+    );
+
+    drop(local);
+    servers.stop().await;
+}
+
 #[tokio::test]
 async fn daemon_shutdown_stops_a_run_and_refuses_new_ones() {
     let captured = captured_log();
