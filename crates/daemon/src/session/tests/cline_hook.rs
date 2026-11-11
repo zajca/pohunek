@@ -231,13 +231,13 @@ impl Rig {
         .await;
     }
 
-    /// The hook trace lines that name something other than a reply that did not
-    /// arrive within the reporter's socket budget.
+    /// The hook trace lines that name something other than a missed socket
+    /// budget.
     ///
-    /// A hook that waits for the worker's answer for longer than that budget
-    /// traces `worker_timeout` although the worker has applied the report; a
-    /// caller that waited for the report's effect (`wait_identity`) knows the
-    /// report was delivered, so the timeout says nothing about it.
+    /// The reporter traces `worker_timeout` whenever the worker does not answer
+    /// within its budget, whether or not the request reached the worker. A
+    /// caller that waited for the report's effect (`wait_identity`) knows it
+    /// did, so the timeout says nothing about that report.
     fn trace_without_reply_timeouts(&self) -> String {
         self.trace()
             .lines()
