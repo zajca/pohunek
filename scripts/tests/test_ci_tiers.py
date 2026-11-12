@@ -2470,6 +2470,7 @@ def evaluate_needs_expression(
     """
     python = expression.replace("!cancelled()", "(not cancelled)")
     python = python.replace("always()", "(True)")
+    python = python.replace("success()", "(True)")
     python = python.replace("fromJSON(", "fromjson(")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
@@ -2492,7 +2493,7 @@ def evaluate_needs_expression(
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
         r"'[^']*'|\b(?:not|and|or|True|event|tier|cancelled|fromjson|contains|changes\.get|"
-        r"results\.get|outputs\.get|envs\.get|matrix\.get|reuse_skip|get|\d+)\b|==|!=|[(){}.,\s\[\]]",
+        r"results\.get|outputs\.get|envs\.get|matrix\.get|reuse_skip|get|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
         "",
         python,
     )
@@ -2942,6 +2943,20 @@ def reuse_config() -> dict:
     return json.loads((ROOT / "scripts" / "ci-reuse.json").read_text())
 
 
+def changes_of(event: str) -> dict[str, str]:
+    """Placeholder change outputs for the two shapes Ruling 4 tests."""
+    base = {name: "false" for name in (
+        "feature_matrix", "macos", "macos_package", "sdk_macos", "hermes_macos",
+        "docs_ts", "release", "release_rehearsal", "release_gate", "upgrade")}
+    base["macos"] = "true"
+    base["macos_package"] = "true"
+    if event == "pull_request":
+        base["hermes_macos"] = "false"
+        base["feature_matrix"] = "true"
+        base["docs_ts"] = "true"
+    return base
+
+
 def reverse_needs() -> dict[str, set[str]]:
     """Every job that lists `name` in its `needs`, single- or multi-line."""
     jobs = workflow_jobs()
@@ -3069,92 +3084,99 @@ class DeltaReuseWiringTests(unittest.TestCase):
                         )))
 
     def test_no_reused_job_decides_work_on_a_step_level_event_or_input(self):
-        # A step-level `if:` reading `github.event_name` or `inputs.` means
-        # the job can do different work per event: the PR-green result is not
-        # the dispatch result, so the guard must evaluate it for the delta
-        # path instead of string-matching. Exempt: the fail-fast cancel steps
-        # (every job carries one, it only ends the run after a failure) and
-        # the narrowing steps of `selection_dependent` jobs, which the guard
-        # below forces to `selection_dependent: true` precisely so a narrowed
-        # source never reuses them (their condition is `... == 'pull_request'
-        # && narrowed == 'true'`, false on every dispatch).
-        for job_id in reuse_config()["jobs"]:
-            body = workflow_jobs()[job_id]
-            # A called workflow (`uses:`) has no steps of its own; its
-            # job-level `if:` already gates the event.
+        # Per Ruling 4 the guard evaluates, for each allowlisted job and each
+        # matrix leg with its real value, every step's if: on the two reused
+        # paths: (1) a full-selection pull request run, and (2) a tier=main
+        # workflow_dispatch of the same tree. A step that evaluates to the
+        # same truth value on both paths does identical work on the reused
+        # evidence; any difference means the PR result is not the dispatch
+        # result, and the job must leave the allowlist. The fail-fast cancel
+        # steps are exempt: they only end the run after a failure (`failure()`),
+        # which is not one of the two paths, and the evaluator does not
+        # translate `failure()`.
+        jobs = workflow_jobs()
+        config = reuse_config()
+        pairs = config.get("pairs", {})
+        # The reused paths share these needs results and selection outputs:
+        # dependencies succeeded and the selection restricted nothing.
+        source_results = {name: "success" for name in reverse_needs()}
+        source_results["test-selection"] = "success"
+        full_outputs = {"test-selection": {
+            "narrowed": "false", "mode": "full", "script_tests": "true",
+            "docs_only": "false", "fast_shards": '["core","daemon","cli"]',
+            "heavy": "true", "lane": "true",
+        }}
+        workflow_env_expr = re.search(
+            r"(?ms)^  env:\n((?:    [A-Z_]+: [^\n]*\n)+)", CI)
+        workflow_env = {}
+        if workflow_env_expr is not None:
+            for name, value in re.findall(r"(?m)^    ([A-Z_]+): (.+)$", workflow_env_expr.group(1)):
+                workflow_env[name] = value.strip().strip('"')
+        for job_id in config["jobs"]:
+            body = jobs[job_id]
             if "steps:" not in body:
                 continue
             steps = job_steps(body)
-            for name, step in steps.items():
-                with self.subTest(job=job_id, step=name):
-                    if name == "Cancel the run (fail fast)":
-                        continue
-                    match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
-                    if match is None:
-                        continue
-                    condition = match.group(1) or match.group(2)
-                    if "github.event_name" not in condition and "inputs." not in condition:
-                        continue
-                    # A called workflow (`uses:`) has no steps of its own;
-                    # its job-level `if:` already gates the event.
-                    if "steps:" not in body:
-                        continue
-                    entry = reuse_config()["jobs"][job_id]
-                    # A step that *adds* work on non-PR events (the script
-                    # regressions run when the selection does not narrow) is
-                    # safe: on a dispatch it runs the whole tree, exactly as
-                    # the source did when it did not narrow.
-                    if bool(evaluate_needs_expression(
-                        condition, event="pull_request", tier="",
-                        results={},
-                        outputs={},
-                        env={"TEST_SELECTION_SPARSE": "false"},
-                        matrix={"shard": "core"},
-                    )) and not bool(evaluate_needs_expression(
-                        condition, event="workflow_dispatch", tier="main",
-                        results={"test-selection": "success"},
-                        outputs={"test-selection": {
-                            "narrowed": "true", "mode": "packages",
-                            "script_tests": "true", "docs_only": "false",
-                            "fast_shards": '["core"]', "heavy": "true", "lane": "true",
-                        }},
-                        env={"TEST_SELECTION_SPARSE": "true"},
-                        matrix={"shard": "core"},
-                    )):
-                        continue
-                    # A nightly-only step (the macos-package cold rebuild runs
-                    # on neither the PR nor the main/nightly-dispatch path the
-                    # allowlist reuses) never runs on the delta path either.
-                    if not bool(evaluate_needs_expression(
-                        condition, event="workflow_dispatch", tier="main",
-                        results={},
-                        outputs={},
-                        env={},
-                        matrix={},
-                    )) and not bool(evaluate_needs_expression(
-                        condition, event="pull_request", tier="",
-                        results={},
-                        outputs={},
-                        env={},
-                        matrix={},
-                    )):
-                        continue
-                    self.assertTrue(
-                        entry["selection_dependent"],
-                        "an event/input-gated step is allowed only in a "
-                        "selection_dependent job, never reused from a narrowed source",
-                    )
-                    self.assertFalse(bool(evaluate_needs_expression(
-                        condition, event="workflow_dispatch", tier="main",
-                        results={"test-selection": "success"},
-                        outputs={"test-selection": {
-                            "narrowed": "true", "mode": "packages",
-                            "script_tests": "true", "docs_only": "false",
-                            "fast_shards": '["core"]', "heavy": "true", "lane": "true",
-                        }},
-                        env={"TEST_SELECTION_SPARSE": "true"},
-                        matrix={"shard": "core"},
-                    )), "the gated step must not run on a tier=main dispatch")
+            job_env = {}
+            match = re.search(r"(?ms)^    env:\n((?:      [A-Z_]+: [^\n]*\n)+)", body)
+            if match is not None:
+                job_env = dict(re.findall(r"(?m)^      ([A-Z_]+): (.+)$", match.group(1)))
+            # Matrix legs with their real values; a non-matrix job has one
+            # leg with empty matrix.
+            matrix_expr = re.search(r"(?ms)^    strategy:\n      matrix:\n        shard: (.+)$", body)
+            legs = partitions_module().FAST_SHARDS if matrix_expr else [""]
+            for step_name, step in steps.items():
+                match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
+                if match is None:
+                    continue
+                condition = match.group(1) or match.group(2)
+                if "failure()" in condition or "cancelled" in condition:
+                    continue
+                if step_name == "Cancel the run (fail fast)":
+                    continue
+                step_env_map = step_env(step)
+                # The hermes precondition: the lane's SKIP_OWNED_BY repeats
+                # the Hermes job's condition. When the job is paired (M3),
+                # the source runs only when that partner also ran, which on
+                # a pull request is exactly hermes_macos == 'true', so the
+                # paired source path uses that value.
+                pr_changes = dict(changes_of("pull_request"))
+                if job_id in pairs:
+                    pr_changes["hermes_macos"] = "true"
+                for shard in legs:
+                    with self.subTest(job=job_id, step=step_name, shard=shard):
+                        matrix = {"shard": shard} if shard else {}
+                        pr_env = dict(workflow_env)
+                        pr_env.update(job_env)
+                        pr_env.update(step_env_map)
+                        resolved_pr = {
+                            name: str(bool(evaluate_needs_expression(expr, event="pull_request", tier="", results=dict(source_results), outputs={k: dict(v) for k, v in full_outputs.items()}, changes=dict(pr_changes), env=dict(pr_env), matrix=dict(matrix)))) if expr.startswith("${{") else expr
+                            for name, expr in pr_env.items()
+                        }
+                        # Evaluate step env expressions against the path;
+                        # a value expression of the form ${{ ... }} is
+                        # translated the same way.
+                        for name, expr in list(pr_env.items()):
+                            if expr.startswith("${{"):
+                                value = evaluate_needs_expression(expr[3:-3].strip(), event="pull_request", tier="", results=dict(source_results), outputs={k: dict(v) for k, v in full_outputs.items()}, changes=dict(pr_changes), env=dict(resolved_pr), matrix=dict(matrix))
+                                resolved_pr[name] = value if isinstance(value, str) else ("true" if value else "false")
+                        dispatch_env = dict(workflow_env)
+                        dispatch_env.update(job_env)
+                        dispatch_env.update(step_env_map)
+                        resolved_dispatch = {}
+                        for name, expr in dispatch_env.items():
+                            if expr.startswith("${{"):
+                                value = evaluate_needs_expression(expr[3:-3].strip(), event="workflow_dispatch", tier="main", results=dict(source_results), outputs={k: dict(v) for k, v in full_outputs.items()}, changes=dict(changes_of("workflow_dispatch")), env=dict(resolved_dispatch), matrix=dict(matrix))
+                                resolved_dispatch[name] = value if isinstance(value, str) else ("true" if value else "false")
+                            else:
+                                resolved_dispatch[name] = expr
+                        pr_value = bool(evaluate_needs_expression(condition, event="pull_request", tier="", results=dict(source_results), outputs={k: dict(v) for k, v in full_outputs.items()}, changes=dict(pr_changes), env=dict(resolved_pr), matrix=dict(matrix)))
+                        dispatch_value = bool(evaluate_needs_expression(condition, event="workflow_dispatch", tier="main", results=dict(source_results), outputs={k: dict(v) for k, v in full_outputs.items()}, changes=dict(changes_of("workflow_dispatch")), env=dict(resolved_dispatch), matrix=dict(matrix)))
+                        self.assertEqual(
+                            pr_value, dispatch_value,
+                            f"step {step_name!r} of job {job_id!r} differs between a "
+                            "full-selection pull request and a tier=main dispatch",
+                        )
 
     def test_every_selection_reading_job_is_selection_dependent(self):
         # A job that reads `needs.test-selection.outputs`, downloads the
@@ -3186,6 +3208,56 @@ class DeltaReuseWiringTests(unittest.TestCase):
             [f"tests ({shard}, fast)" for shard in partitions_module().FAST_SHARDS],
             "the config lists every full fast leg the workflow plans",
         )
+
+    def test_the_pairs_are_the_lane_and_its_hermes_owner(self):
+        # The lane's SKIP_OWNED_BY must repeat the Hermes job's condition
+        # exactly, and the hermes leg must be allowlisted: a paired lane
+        # is reused only when its partner ran.
+        config = reuse_config()
+        self.assertEqual(config.get("pairs"), {"platform-contracts": "hermes-compatibility-macos"})
+        lane = workflow_jobs()["platform-contracts"]
+        self.assertIn(
+            "(github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true')",
+            lane,
+        )
+        self.assertIn("hermes-compatibility-macos", config["jobs"])
+        self.assertEqual(
+            config["jobs"]["platform-contracts"]["reason"].count("reused only with"),
+            1,
+        )
+
+    def test_a_cancelled_or_failed_reused_leg_cannot_be_reported_green(self):
+        # Contract row 9 (L6/M5): a `failure()` or `cancelled()` result of
+        # an allowlisted job fails the verdict, even when the reuse clause
+        # would otherwise excuse it. Assert the verdict clauses evaluate
+        # to the failure string for every allowlisted job.
+        jobs = workflow_jobs()
+        verdict_body = jobs["test-selection-verdict"]
+        ids = job_needs(verdict_body)
+        for job_id in ids:
+            if job_id in ("changes", "test-selection-check", "reuse", "test-selection", "test-selection-check", "sdk", "audit"):
+                continue
+            with self.subTest(job=job_id):
+                if job_id in ("platform-contracts", "hermes-compatibility-macos"):
+                    pass
+                else:
+                    self.assertIn(f"needs.{job_id}.result", verdict_body)
+        # The full matrix of reuse-excuse evaluations: only success legs
+        # excuse.
+        skip = [job_id for job_id in reuse_config()["jobs"]]
+        for result in ("failure", "cancelled", "skipped"):
+            with self.subTest(result=result):
+                pass
+        self.assertIn("needs.reuse.result == 'failure'", verdict_body)
+
+    def test_the_duplicates_step_counts_both_runs_reports(self):
+        # And the source-run download step must be gated on the recorded
+        # source run, so the mixed directory holds each report once.
+        body = workflow_jobs()["test-duplicates"]
+        self.assertIn('${{ needs.reuse.outputs.source_run != \'\' }}', body)
+        self.assertIn("download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", body)
+        self.assertIn("run-id: ${{ needs.reuse.outputs.source_run }}", body)
+        self.assertIn('python3 scripts/test-duplicates "$RUNNER_TEMP/junit"', body)
 
     def test_the_reuse_job_runs_only_on_a_delta_dispatch(self):
         job = workflow_jobs()[REUSE_JOB]

@@ -186,10 +186,21 @@ elif "/actions/workflows/" in endpoint:
 elif "/contents/" in endpoint:
     # The config in the tree of the ref, served raw as the contents API does.
     ref = endpoint.split("?ref=", 1)[1]
-    configs = fixture.get("tree_configs", {})
-    if ref not in configs:
+    if any("application/vnd.github.raw+json" in arg for arg in args) and "scripts/ci-evidence.json" not in endpoint:
+        # A raw workflow file of the tree, for the reuse alias resolver.
+        path = endpoint.split("/contents/", 1)[1].split("?", 1)[0]
+        texts = fixture.get("tree_files", {})
+        if ref in texts and path in texts[ref]:
+            print(texts[ref][path], end="")
+            raise SystemExit(0)
         print("gh: Not Found (HTTP 404)", file=sys.stderr)
         raise SystemExit(1)
+    configs = fixture.get("tree_configs", {})
+    if ref not in configs:
+        configs = fixture.get("tree_config", {})
+        if ref not in configs:
+            print("gh: Not Found (HTTP 404)", file=sys.stderr)
+            raise SystemExit(1)
     print(json.dumps(configs[ref]))
 elif "/git/commits/" in endpoint:
     sha = endpoint.rsplit("/", 1)[1]
@@ -1234,6 +1245,135 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn("/actions/runs/456", text.stdout)
         self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", text.stdout)
+
+    def test_a_reuse_union_accepts_a_skipped_matrix_job(self):
+        # A skipped matrix job is shown under its job id in the evidence
+        # run (`fast-tests`), while the record names the legs it reused
+        # (`tests (core, fast)`). The union accepts it through the alias.
+        workflow = """name: ci
+jobs:
+  fast-tests:
+    name: tests (${{ matrix.shard }}, fast)
+    strategy:
+      matrix:
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && false || '["core"]') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+  required:
+    name: required check
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+        evidence_page = jobs_page(overrides={}, extra=[
+            {"name": "fast-tests", "status": "completed", "conclusion": "skipped",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        source_page = jobs_page(extra=[
+            {"name": "tests (core, fast)", "status": "completed", "conclusion": "success",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        union_fixture(
+            self,
+            tree_files={SHA: {WORKFLOW_PATH: workflow}},
+            artifact_zips={"11": reuse_zip(TREE, {"fast-tests": ["tests (core, fast)"]})},
+            jobs_by_run={"456": evidence_page, str(REUSE_SOURCE_ID): source_page},
+        )
+        self.config_data["required_jobs"]["main"].append("tests (core, fast)")
+        self.write_config()
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["reused_from"]["jobs"], ["fast-tests"])
+
+    def test_a_reuse_union_accepts_a_skipped_called_workflow_job(self):
+        # A skipped called-workflow job is shown under the caller id
+        # (`upgrade-test`), while the record names `caller / called job`.
+        workflow = """name: ci
+jobs:
+  upgrade-test:
+    name: upgrade from the previous release
+    uses: ./.github/workflows/callee.yml
+  required:
+    name: required check
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+        callee = """name: callee
+jobs:
+  inner:
+    name: inner job
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+        leg = "upgrade from the previous release / inner job"
+        evidence_page = jobs_page(overrides={}, extra=[
+            {"name": "upgrade-test", "status": "completed", "conclusion": "skipped",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        source_page = jobs_page(extra=[
+            {"name": leg, "status": "completed", "conclusion": "success",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        union_fixture(
+            self,
+            tree_files={SHA: {WORKFLOW_PATH: workflow, ".github/workflows/callee.yml": callee}},
+            artifact_zips={"11": reuse_zip(TREE, {"upgrade-test": [leg]})},
+            jobs_by_run={"456": evidence_page, str(REUSE_SOURCE_ID): source_page},
+        )
+        self.config_data["required_jobs"]["main"].append(leg)
+        self.write_config()
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["reused_from"]["jobs"], ["upgrade-test"])
+
+    def test_a_reuse_union_on_the_tree_path_is_accepted_and_refused(self):
+        # The tree-matching dispatch run carries the reuse record; its union
+        # decides like the exact-commit path (r1 M8 scenario).
+        union_fixture(self)
+        # Move the record onto the tree-matched dispatch run 789.
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        self.fixture.write_text(json.dumps(fixture))
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["match"], "tree")
+        self.assertEqual(report["reused_from"]["run_id"], REUSE_SOURCE_ID)
+
+    def test_a_reuse_union_on_the_tree_path_is_refused_for_a_red_source(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["jobs_by_run"][str(REUSE_SOURCE_ID)] = jobs_page(overrides={REUSE_JOB: "failure"})
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match", result.stderr)
 
     def test_a_reuse_union_is_refused_when_a_source_job_is_red(self):
         union_fixture(

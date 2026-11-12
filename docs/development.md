@@ -195,10 +195,13 @@ they are looked up by job name with the same `tested-tree-*` record the
 evidence script uses, so a renamed job cannot be silently skipped and a
 renamed matrix leg falls back to running. `scripts/ci-reuse`
 decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
-`scripts/tests/test_ci_tiers.py` guards); a `mode != \"full\"` selection excludes the
-selection-dependent jobs, and an ambiguous source runs everything. A full
+`scripts/tests/test_ci_tiers.py` guards); the source selection must be `mode == "full"`,
+and an ambiguous source runs everything. A full
 dispatch (`delta: false`) stays the default, and `scripts/release` keeps
-dispatching full runs. `scripts/ci-evidence` accepts the union of the evidence
+dispatching full runs. A job of the allowlist whose `needs:` names a reusable
+job but that can never run on a tier=main dispatch is not a reuse consumer:
+such jobs are listed in the config's `not_dispatch_consumers` with the reason,
+and the guards derive the restriction from the workflow rather than this text. `scripts/ci-evidence` accepts the union of the evidence
 run and the recorded source run as evidence for the commit, and names both
 runs in its report.
 

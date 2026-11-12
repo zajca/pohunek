@@ -1,13 +1,17 @@
 """Scenarios for the delta-reuse decision of `scripts/ci-reuse` (issue #2203).
 
-The tests drive the script as a process against a fake `gh` on PATH, the
-same technique `test_ci_evidence.py` uses: each scenario writes a fixture of
-workflow runs, their artifacts and their jobs, runs `scripts/ci-reuse` with
-`GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_OUTPUT` and `RUNNER_TEMP` set, and
+The tests import `scripts/ci-reuse` as a module and call its `main()` with an
+injected `now` (the clock is a scenario input, never the wall clock) against
+a fake `gh` on PATH, the same technique `test_ci_evidence.py` uses: each
+scenario writes a fixture of workflow runs, their artifacts and their jobs,
+sets `GITHUB_REPOSITORY`, `GITHUB_SHA`, `GITHUB_OUTPUT` and `RUNNER_TEMP`, and
 asserts the `skip`/`source_run` outputs, the `ci-reuse-<tree>` record, and the
-warning text. No seam parameters: the production code paths (`list_runs`,
+warning text. The only stub is `commit_tree` (the local git object store
+would otherwise fix the tree); the production code paths (`list_runs`,
 `run_jobs`, `run_artifacts`, `download_artifact`, `source_selection_narrowed`)
-all run.
+all run. The fake `gh` honours `--paginate --slurp`: a paginated listing is
+a JSON array of page objects, so an artifact that lives on the second page
+is visible to the script exactly as the API serves it.
 """
 
 import base64
@@ -30,7 +34,9 @@ CONFIG = json.loads((ROOT / "scripts" / "ci-reuse.json").read_text())
 SHA = "a" * 40
 TREE = "c" * 40
 REPO = "example/pohunek"
-NOW = "2026-11-12T12:00:00Z"
+# The injected clock of every scenario; fixture timestamps are relative to
+# it, never to the wall clock, so no scenario expires when the calendar moves.
+NOW = datetime.datetime(2026, 11, 12, 12, 0, tzinfo=datetime.timezone.utc)
 FRESH = "2026-11-12T11:00:00Z"
 STALE = "2026-11-10T11:00:00Z"
 
@@ -48,7 +54,27 @@ args = sys.argv[1:]
 
 if args[:2] == ["api", "--method"]:
     endpoint = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
+    # `--paginate --slurp` returns a JSON array of pages (gh 2.x); `--paginate`
+    # alone concatenates them. The fixtures carry real artifacts on later
+    # pages, so a script that reads only the first page misses them.
+    slurped = "--paginate" in args and "--slurp" in args
+    def listing(key):
+        pages = fixture.get("pages", {}).get(key)
+        if pages is None:
+            pages = fixture.get(f"{key}_pages")
+        if pages is None:
+            return None
+        if slurped:
+            print(json.dumps(pages))
+        elif "--paginate" in args:
+            for page in pages:
+                print(json.dumps(page))
+        else:
+            print(json.dumps(pages[0] if pages else {}))
+        return True
     if "/actions/workflows/" in endpoint and "/runs" in endpoint:
+        if listing("runs") is not None:
+            raise SystemExit(0)
         page = {"workflow_runs": fixture.get("runs", [])}
         fixture["queried_runs"] = fixture.get("queried_runs", 0) + 1
         fixture_path.write_text(json.dumps(fixture))
@@ -66,7 +92,8 @@ if args[:2] == ["api", "--method"]:
                 })
             else:
                 artifacts.append({"name": entry, "id": 1, "expired": False})
-        print(json.dumps([{"artifacts": artifacts}]))
+        if listing("artifacts") is None:
+            print(json.dumps([{"artifacts": artifacts}]))
     elif "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
         artifact_id = str(endpoint.split("/")[-2])
         zips = {str(key): value for key, value in fixture.get("artifact_zips", {}).items()}
@@ -76,7 +103,8 @@ if args[:2] == ["api", "--method"]:
         sys.stdout.buffer.write(base64.b64decode(zips[artifact_id]))
     elif "/actions/runs/" in endpoint and "/jobs" in endpoint:
         run_id = str(endpoint.split("/")[-2])
-        print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get(run_id, [])}]))
+        if listing("jobs") is None:
+            print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get(run_id, [])}]))
     else:
         raise SystemExit("unexpected Actions API endpoint: " + repr(endpoint))
 else:
@@ -95,7 +123,7 @@ def run_doc(run_id=777, event="pull_request", head_repo=REPO):
         "repository": {"full_name": REPO},
         "head_repository": {"full_name": head_repo},
         "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
-        "created_at": NOW,
+        "created_at": NOW.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
 
@@ -182,7 +210,7 @@ class CiReuseProcessTests(unittest.TestCase):
         original = module.commit_tree
         module.commit_tree = lambda sha: tree
         try:
-            rc = module.main()
+            rc = module.main(now=NOW)
         finally:
             module.commit_tree = original
         return rc
@@ -200,21 +228,28 @@ class CiReuseProcessTests(unittest.TestCase):
         return json.loads(path.read_text())
 
     def test_a_full_green_pull_request_run_skips_every_reusable_job(self):
+        # The source run is full: the test-selection artifact holds id 2 with
+        # a full selection, so selection_dependent jobs are reused. The
+        # selection artifact lives on the second page of the artifact
+        # listing: without `--paginate --slurp` the script never sees it and
+        # counts the source as narrowed, so this scenario pins the real
+        # pagination (it fails on a script that lists one page).
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": green_jobs()},
-            artifacts={"777": [f"tested-tree-{TREE}", "test-selection"],
-                        "777-zip": []},
-            artifact_zips={},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
         )
-        # The test-selection artifact holds id 2 with a full selection: a
-        # full source never narrows, so selection_dependent jobs are reused.
         fixture = json.loads(self.fixture.read_text())
-        fixture["artifacts"]["777"] = [
-            {"name": f"tested-tree-{TREE}", "id": 1},
-            {"name": "test-selection", "id": 2},
-        ]
-        fixture["artifact_zips"] = {"2": selection_zip("full")}
+        fixture["pages"] = {
+            "artifacts": [
+                {"artifacts": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False}]},
+                {"artifacts": [{"name": "test-selection", "id": 2, "expired": False}]},
+            ],
+        }
         self.fixture.write_text(json.dumps(fixture))
         rc = self.run_script_with_tree(TREE)
         self.assertEqual(rc, 0)
@@ -349,6 +384,51 @@ class CiReuseProcessTests(unittest.TestCase):
         rc = self.run_script_with_tree(TREE)
         self.assertEqual(rc, 0)
         self.assertEqual(self.outputs()["skip"], "[]")
+
+
+
+    def test_a_paired_lane_is_dropped_without_its_hermes_partner(self):
+        # M3: the macOS lane preempts the Hermes tests unless the Hermes job
+        # ran in the source. When the source did not run hermes-compatibility-macos
+        # (hermes_macos false on the PR), reusing the lane on the dispatch
+        # would run the Hermes tests in the lane while test-duplicates sees
+        # both macos-lane-junit and hermes-macos-junit for one test.
+        jobs = green_jobs()
+        jobs = [entry for entry in jobs if entry["name"] != "pinned Hermes compatibility (macOS arm64, model-free)"]
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertNotIn("platform-contracts", skip)
+        self.assertNotIn("hermes-compatibility-macos", skip)
+        self.assertIn("test", skip)
+
+    def test_a_paired_lane_is_kept_with_its_hermes_partner(self):
+        # When both the lane and the Hermes job are green in a full source,
+        # the source lane skipped the Hermes tests exactly as the dispatch
+        # lane will, so both may be reused.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertIn("platform-contracts", skip)
+        self.assertIn("hermes-compatibility-macos", skip)
 
 
 if __name__ == "__main__":

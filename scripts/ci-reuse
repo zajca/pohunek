@@ -11,16 +11,19 @@ whose `tested-tree-*` artifact record is exactly that tree.
 For every job of `scripts/ci-reuse.json` it reports `skip` when all of these
 hold: every listed leg's newest attempt concluded `success`, `completed_at` is
 within `max_age_hours` of now, and, when the job is `selection_dependent`, the
-source selection has `mode != "full"`. A source run without a readable
-`selection.json` counts as narrowed. Then every job with a consumer outside
+source selection is `full` (`mode == "full"`): only a run that planned every
+test can be reused for work that must run every test. A source run without a
+readable `selection.json` counts as narrowed, so its selection-dependent jobs
+are not reused. Then every job with a consumer outside
 `skip` is removed from `skip`, iterated to a fixed point, so a reused job's
 same-run producers are reused with it and no running job downloads an artifact
 its producer did not upload in this run.
 
 Outputs: `skip` is a compact JSON array of job ids (`[]` when nothing
-applies), `source_run` is the run id or empty; the workflow step writes the
-`ci-reuse-<tree>` record artifact from those outputs and prints a job
-summary table. Any API
+applies), `source_run` is the run id or empty. The script writes the
+`ci-reuse-<tree>` record file under `$RUNNER_TEMP` (the workflow step uploads
+it as the record artifact) and appends a job summary table to
+`$GITHUB_STEP_SUMMARY`. Any API
 error, missing record or ambiguity gives `skip=[]`: run everything, and emit
 `::warning` with the reason. The only red outcome is an internal bug.
 
@@ -155,14 +158,11 @@ def parse_time(value) -> datetime.datetime | None:
 
 def list_runs(repo: str, workflow_file: str, sha: str) -> list[dict]:
     """Runs of ci.yml with `head_sha` of SHA, any state, in API order."""
-    try:
-        pages = read_json([
-            "api", "--method", "GET", "--paginate", "--slurp",
-            f"repos/{repo}/actions/workflows/{workflow_file}/runs",
-            "-f", f"head_sha={sha}", "-f", "per_page=100",
-        ])
-    except ReuseError as error:
-        raise error
+    pages = read_json([
+        "api", "--method", "GET", "--paginate", "--slurp",
+        f"repos/{repo}/actions/workflows/{workflow_file}/runs",
+        "-f", f"head_sha={sha}", "-f", "per_page=100",
+    ])
     if not isinstance(pages, list):
         raise ReuseError("Actions API returned an invalid workflow-run list")
     runs: list[dict] = []
@@ -176,14 +176,11 @@ def list_runs(repo: str, workflow_file: str, sha: str) -> list[dict]:
 
 
 def run_jobs(repo: str, run_id: int) -> list[dict]:
-    try:
-        pages = read_json([
-            "api", "--method", "GET", "--paginate", "--slurp",
-            f"repos/{repo}/actions/runs/{run_id}/jobs",
-            "-f", "per_page=100",
-        ])
-    except ReuseError as error:
-        raise error
+    pages = read_json([
+        "api", "--method", "GET", "--paginate", "--slurp",
+        f"repos/{repo}/actions/runs/{run_id}/jobs",
+        "-f", "per_page=100",
+    ])
     if not isinstance(pages, list):
         raise ReuseError("Actions API returned an invalid job list")
     jobs: list[dict] = []
@@ -197,18 +194,15 @@ def run_jobs(repo: str, run_id: int) -> list[dict]:
 
 
 def list_artifact_pages(repo: str, run_id: int) -> list:
-    try:
-        return read_json([
-            "api", "--method", "GET", "--paginate", "--slurp",
-            f"repos/{repo}/actions/runs/{run_id}/artifacts",
-            "-f", "per_page=100",
-        ])
-    except ReuseError as error:
-        raise error
+    return read_json([
+        "api", "--method", "GET", "--paginate", "--slurp",
+        f"repos/{repo}/actions/runs/{run_id}/artifacts",
+        "-f", "per_page=100",
+    ])
 
 
-def artifact_names(repo: str, run_id: int, list_pages=None) -> list[str]:
-    pages = (list_pages or list_artifact_pages)(repo, run_id)
+def artifact_names(repo: str, run_id: int) -> list[str]:
+    pages = list_artifact_pages(repo, run_id)
     if not isinstance(pages, list):
         raise ReuseError("Actions API returned an invalid artifact list")
     names: list[str] = []
@@ -224,7 +218,7 @@ def artifact_names(repo: str, run_id: int, list_pages=None) -> list[str]:
 
 
 def run_artifacts(repo: str, run_id: int) -> list[str]:
-    return artifact_names(repo, run_id, list_artifact_pages)
+    return artifact_names(repo, run_id)
 
 
 def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
@@ -269,7 +263,7 @@ def source_selection_narrowed(repo: str, run_id: int) -> bool | None:
     unreadable, False when the selection is `full`, None when the artifact
     lookup failed. The output (job-level `needs.test-selection.outputs.mode`)
     names the mode the planned jobs read: a `full` selection runs every test,
-    so a `selection_dependent` job is reused only from a non-full one."""
+    so a `selection_dependent` job is reused only from a full selection."""
     names: list[str] | None = None
     try:
         names = run_artifacts(repo, run_id)
@@ -299,9 +293,6 @@ def decide(
     repo: str,
 ) -> tuple[list[str], dict | None, str]:
     """The skip list, the source run, and why not (`""` when reused)."""
-    jobs_of = run_jobs
-    names_of = run_artifacts
-    narrowed_of = source_selection_narrowed
     window = datetime.timedelta(hours=config["max_age_hours"])
     candidates = [
         run for run in runs
@@ -318,7 +309,7 @@ def decide(
     )
     for run in candidates:
         try:
-            names = names_of(repo, run["id"])
+            names = run_artifacts(repo, run["id"])
         except ReuseError as error:
             return [], None, f"cannot list artifacts of run {run['id']}: {error}"
         trees = {
@@ -329,7 +320,7 @@ def decide(
         if trees != {tree}:
             continue
         try:
-            jobs = jobs_of(repo, run["id"])
+            jobs = run_jobs(repo, run["id"])
         except ReuseError as error:
             return [], None, f"cannot list jobs of run {run['id']}: {error}"
         by_name: dict[str, list[dict]] = {}
@@ -355,14 +346,20 @@ def decide(
                 continue
             if job["selection_dependent"]:
                 if narrowed is None:
-                    narrowed = narrowed_of(repo, run["id"])
+                    narrowed = source_selection_narrowed(repo, run["id"])
                     if narrowed is None:
                         return [], None, f"cannot read the selection of run {run['id']}"
                 if narrowed:
                     continue
             skip.append(job_id)
-        # Closure: drop every job with a consumer outside skip.
         skip_set = set(skip)
+        # Pairs: a pair member is reused only together with its partner
+        # (closure rules apply to the union, so drop both if one is out).
+        pairs = config.get("pairs", {})
+        for job_id, partner in pairs.items():
+            if job_id in skip_set and partner not in skip_set:
+                skip_set.discard(job_id)
+        # Closure: drop every job with a consumer outside skip.
         changed = True
         while changed:
             changed = False
@@ -378,18 +375,18 @@ def decide(
     return [], None, "no same-tree pull request run"
 
 
-def summarize(config: dict, skip: list[str], source: dict | None, tree: str) -> str:
+def summarize(config: dict, skip: list[str], source: dict | None, reason: str) -> str:
     lines = ["| job | decision |", "| --- | --- |"]
     link = f"[run {source['id']}]({source.get('html_url')})" if source else "none"
     for job_id in config["jobs"]:
         if job_id in skip and source is not None:
             lines.append(f"| {job_id} | reused from {link} |")
         else:
-            lines.append(f"| {job_id} | runs here |")
+            lines.append(f"| {job_id} | runs ({reason})" if reason else f"| {job_id} | runs here |")
     return "\n".join(lines)
 
 
-def main() -> int:
+def main(now: datetime.datetime | None = None) -> int:
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     sha = os.environ.get("GITHUB_SHA", "")
     if not REPO_PATTERN.fullmatch(repo):
@@ -410,27 +407,30 @@ def main() -> int:
         print(f"ci-reuse: {error}", file=sys.stderr)
         return 1
     workflow_file = os.environ["WORKFLOW_FILE"]
-    now = datetime.datetime.now(datetime.timezone.utc)
+    moment = now or datetime.datetime.now(datetime.timezone.utc)
+    reason = ""
+    listed = True
     try:
         runs = list_runs(repo, workflow_file, sha)
     except ReuseError as error:
-        warn(str(error))
+        warn(f"cannot list candidate runs: {error}; running everything")
         runs = []
+        listed = False
     if runs:
         try:
-            skip, source, _ = decide(config, tree, runs, now, sha, repo)
+            skip, source, reason = decide(config, tree, runs, moment, sha, repo)
         except ReuseError as error:
             warn(str(error))
-            skip, source = [], None
+            skip, source, reason = [], None, str(error)
         except KeyError as error:
             warn(f"missing Actions field: {error}")
-            skip, source = [], None
+            skip, source, reason = [], None, f"missing Actions field: {error}"
+        if source is None and reason:
+            warn(f"{reason}; running everything")
     else:
         skip, source = [], None
-    if not runs:
-        warn("cannot list candidate runs; running everything")
-    elif not skip and source is None:
-        warn("no same-tree green pull request run; running everything")
+        if listed:
+            warn("no same-tree pull request run; running everything")
     record = {
         "schema_version": SCHEMA_VERSION,
         "tree": tree,
@@ -484,20 +484,16 @@ def main() -> int:
                     "source_job_ids": [entry["source_job_id"] for entry in entries],
                     "completed_at": [entry["completed_at"] for entry in entries],
                 }
-    try:
-        output("skip", json.dumps(skip, separators=(",", ":")))
-        output("source_run", str(source["id"]) if source else "")
-    except ReuseError as error:
-        print(f"ci-reuse: {error}", file=sys.stderr)
-        return 1
+    output("skip", json.dumps(skip, separators=(",", ":")))
+    output("source_run", str(source["id"]) if source else "")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as stream:
             stream.write(f"### Delta reuse (tree `{tree}`)\n\n")
-            stream.write(summarize(config, skip, source, tree))
+            stream.write(summarize(config, skip, source, reason))
             stream.write("\n")
     else:
-        print(summarize(config, skip, source, tree))
+        print(summarize(config, skip, source, reason))
     record_name = f"ci-reuse-{tree}"
     record_path = Path(os.environ["RUNNER_TEMP"]) / f"{record_name}.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n")

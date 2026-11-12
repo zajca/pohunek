@@ -127,6 +127,137 @@ def local_commit_file(sha: str, path: str) -> str | None:
     return result.stdout
 
 
+def _leg_names(name: str, matrix: Any) -> list[str]:
+    """The display names of a job: the name itself for a plain job; one name
+    per matrix combination, with `${{ matrix.<key> }}` substituted, otherwise
+    the combination values appended. A dynamic matrix keeps the unexpanded
+    name (its legs are expressions, not names the API shows)."""
+    if matrix is None or matrix == "dynamic":
+        return [name]
+    names = []
+    for combo in matrix:
+        if "${{" in name:
+            names.append(re.sub(
+                r"\$\{\{ *matrix\.([a-z_]+) *\}\}",
+                lambda key: combo.get(key.group(1), key.group(0)),
+                name,
+            ))
+        else:
+            names.append(f"{name} ({', '.join(combo.values())})")
+    return names
+
+
+def _static_matrix(block: str) -> Any:
+    """The combinations of a job's literal `strategy.matrix`; None without a
+    matrix, "dynamic" for an expression such as `fromJSON(...)`. A key whose
+    expression ends in a literal JSON list fallback (`|| '[...]'`) takes that
+    list, the values of the run that selects nothing away."""
+    head = re.search(r"(?m)^      matrix:(.*)$", block)
+    if head is None:
+        return None
+    if head.group(1).strip():
+        return "dynamic"
+    lists: dict[str, list[str]] = {}
+    include: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in block[head.end():].splitlines()[1:]:
+        if line.strip().startswith("#") or not line.strip():
+            continue
+        if not line.startswith("        "):
+            break
+        entry = re.fullmatch(r"( *)(- )?([a-z_]+): *(.*)", line)
+        if entry is None:
+            continue
+        key, value = entry.group(3), entry.group(4).strip()
+        if key == "include" and not entry.group(2):
+            continue
+        if value.startswith("${{"):
+            fallback = re.search(r"\|\| '(\[[^']*\])'\) \}\}\Z", value)
+            if fallback is None:
+                return "dynamic"
+            lists[key] = json.loads(fallback.group(1))
+        elif value.startswith("["):
+            lists[key] = [item.strip().strip('"') for item in value.strip("[]").split(",")]
+        elif entry.group(2):
+            current = {key: value.strip('"')}
+            include.append(current)
+        elif current is not None:
+            current[key] = value.strip('"')
+    combos = [{}]
+    for key, values in lists.items():
+        combos = [dict(combo, **{key: value}) for combo in combos for value in values]
+    return include if include and not lists else combos
+
+
+def _workflow_jobs(repo: str, sha: str, path: str) -> list[tuple[str, str, Any, str | None]]:
+    """The jobs of a workflow in the tree of `sha`: (job id, display name,
+    matrix, called workflow or None). A job without `name:` is shown under
+    its id, as Actions shows it."""
+    text = local_commit_file(sha, path)
+    if text is None:
+        try:
+            text = gh(
+                "api", "--method", "GET", "-H",
+                "Accept: application/vnd.github.raw+json",
+                f"repos/{repo}/contents/{path}?ref={sha}",
+            )
+        except EvidenceError as error:
+            raise EvidenceError(f"cannot read {path} in {sha}: {error}") from error
+    if "jobs:\n" not in text:
+        return []
+    job_text = text.split("jobs:\n", 1)[1]
+    matches = list(re.finditer(r"(?m)^  ([a-z][a-z0-9-]*):\n", job_text))
+    jobs = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(job_text)
+        block = job_text[match.end():end]
+        name = re.search(r"(?m)^    name: (.+)$", block)
+        uses = re.search(r"(?m)^    uses: \./(\.github/workflows/\S+)$", block)
+        jobs.append((
+            match.group(1),
+            name.group(1) if name else match.group(1),
+            _static_matrix(block),
+            uses.group(1) if uses else None,
+        ))
+    return jobs
+
+
+def reuse_aliases(repo: str, sha: str, workflow_path: str, reused_names: set[str]) -> dict[str, str]:
+    """The evidence-run display name for each reused leg name.
+
+    A matrix or called-workflow job that is skipped in the evidence run is
+    shown under its job id (or id-less name); the record names the legs it
+    reused. The alias maps each leg name onto the name Actions shows for
+    that job in the evidence run, derived from the workflow definition of
+    the same tree. A leg that is itself a required job of the evidence run
+    needs no alias and is absent from the map."""
+    try:
+        jobs = _workflow_jobs(repo, sha, workflow_path)
+    except EvidenceError:
+        return {}
+    aliases: dict[str, str] = {}
+    for job_id, name, matrix, uses in jobs:
+        if uses:
+            try:
+                inner = _workflow_jobs(repo, sha, uses)
+            except EvidenceError:
+                inner = []
+            inner_legs = {
+                f"{name} / {leg}"
+                for _iid, iname, imatrix, _iu in inner
+                for leg in _leg_names(iname, imatrix)
+            }
+            for leg in reused_names:
+                if leg in inner_legs and leg not in aliases:
+                    aliases[leg] = job_id
+        else:
+            legs = set(_leg_names(name, matrix))
+            for leg in reused_names:
+                if leg in legs and leg != name and leg not in aliases:
+                    aliases[leg] = job_id
+    return aliases
+
+
 def config_of_commit(repo: str, sha: str) -> tuple[str, str]:
     """The text of the config in the tree of `sha` and where it was read."""
     source = f"{sha}:{CONFIG_IN_TREE}"
@@ -465,24 +596,24 @@ def verify_reuse(
     as before."""
     reuse = config.get("reuse")
     if not isinstance(reuse, dict):
-        return set(), [], None
+        return set(), [], None, {}
     try:
         tree = commit_tree(repo, sha, cache)
     except EvidenceError:
-        return set(), [], None
+        return set(), [], None, {}
     try:
         record = reuse_record(repo, run["id"], tree)
     except EvidenceError as error:
         url = run.get("html_url") or f"run {run.get('id', 'unknown')}"
-        return set(), [f"cannot read the reuse record of {url}: {error}"], None
+        return set(), [f"cannot read the reuse record of {url}: {error}"], None, {}
     if record is None:
-        return set(), [], None
+        return set(), [], None, {}
     evidence_url = run.get("html_url") or f"run {run.get('id', 'unknown')}"
     source_id = record["source_run_id"]
     try:
         source = read_source_run(repo, source_id)
     except EvidenceError as error:
-        return set(), [f"cannot read source run {source_id} reused by {evidence_url}: {error}"], None
+        return set(), [f"cannot read source run {source_id} reused by {evidence_url}: {error}"], None, {}
     source_url = source.get("html_url") or f"run {source_id}"
     failures = []
     if (source.get("repository") or {}).get("full_name") != repo or (
@@ -516,8 +647,15 @@ def verify_reuse(
             job.get("conclusion") or "missing"
         )
     reused_names = {name for entry in record["jobs"].values() for name in entry["names"]}
+    # A skipped matrix or called-workflow job is shown under its job id in
+    # the evidence run, while the record names the legs it reused. Without
+    # the alias the union is refused: the evidence job looks like it ran
+    # under a name the record never mentions.
+    alias = reuse_aliases(repo, sha, config["workflow_path"], reused_names)
     for name in sorted(reused_names):
         conclusions = evidence_by_name.get(name)
+        if conclusions is None and name in alias:
+            conclusions = evidence_by_name.get(alias[name])
         if conclusions is not None and any(conclusion != "skipped" for conclusion in conclusions):
             failures.append(
                 f"reuse record names {name}, but it ran in {evidence_url} "
@@ -574,14 +712,17 @@ def verify_reuse(
                         f"(evidence {evidence_url})"
                     )
     if failures:
-        return set(), failures, None
+        return set(), failures, None, alias
     reused = {
         name
         for name in reused_names
-        if name in evidence_by_name
-        and all(conclusion == "skipped" for conclusion in evidence_by_name[name])
+        if (name in evidence_by_name or alias.get(name) in evidence_by_name)
+        and all(
+            conclusion == "skipped"
+            for conclusion in evidence_by_name.get(name) or evidence_by_name.get(alias.get(name, ""), [])
+        )
     }
-    return reused, [], {"run_id": source_id, "url": source_url, "jobs": sorted(record["jobs"])} 
+    return reused, [], {"run_id": source_id, "url": source_url, "jobs": sorted(record["jobs"])}, alias 
 
 
 def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str, Any]]:
@@ -667,6 +808,7 @@ def verify_steps(
     jobs: list[dict[str, Any]],
     required_steps: list[dict[str, str]],
     reused: set[str] = frozenset(),
+    alias: dict[str, str] | None = None,
 ) -> list[str]:
     """Why the required steps did not pass; jobs in `reused` passed in the
     reuse source run, so their steps are verified there, not here."""
@@ -678,7 +820,7 @@ def verify_steps(
         name = required["job"]
         if name in reused:
             continue
-        matching = by_name.get(name, [])
+        matching = by_name.get(name, []) or (by_name.get((alias or {}).get(name, ""), []) if name in (alias or {}) else [])
         if not matching:
             failures.append(f"missing job for required step {name}: {required['step']}")
             continue
@@ -701,6 +843,7 @@ def verify_jobs(
     jobs: list[dict[str, Any]],
     required_jobs: list[str],
     reused: set[str] = frozenset(),
+    alias: dict[str, str] | None = None,
 ) -> list[str]:
     """Why the required jobs did not pass; a job in `reused` is evidence
     when every attempt is `skipped`, because its green legs were verified
@@ -711,7 +854,12 @@ def verify_jobs(
     failures = []
     for name in required_jobs:
         conclusions = by_name.get(name)
+        if not conclusions and alias and name in alias:
+            conclusions = by_name.get(alias[name])
         if not conclusions:
+            # A required leg may be shown in the evidence run under its
+            # job-id alias (matrix/called-workflow skip); the alias map
+            # carries the check in `reused`, not here.
             failures.append(f"missing required job: {name}")
         elif name in reused:
             if any(conclusion != "skipped" for conclusion in conclusions):
@@ -819,14 +967,14 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         # look for the union before refusing. Green runs without failures
         # read no reuse artifact.
         jobs = get_jobs(args.repo, run["id"])
-        reused, reuse_failures, reused_from = verify_reuse(
+        reused, reuse_failures, reused_from, alias = verify_reuse(
             args.repo, run, config, args.tier, args.sha, {}, jobs
         )
         if reuse_failures:
             failures = [*reuse_failures, *failures]
             reused_from = None
         elif reused:
-            failures = run_failures(args.repo, run, config, args.tier, reused=reused)
+            failures = run_failures(args.repo, run, config, args.tier, reused=reused, alias=alias)
     if failures:
         raise EvidenceError(f"{args.tier} tier failed for {args.sha}: {'; '.join(failures)} ({url})")
     return evidence(args, run, config, match="sha", reused_from=reused_from)
@@ -856,13 +1004,14 @@ def run_failures(
     config: dict[str, Any],
     tier: str,
     reused: set[str] = frozenset(),
+    alias: dict[str, str] | None = None,
 ) -> list[str]:
     """Why a completed run is not evidence for `tier`; empty when it is.
     Jobs in `reused` passed in the reuse source run, so here they only need
     to be skipped."""
     jobs = get_jobs(repo, run["id"])
-    failures = verify_jobs(jobs, config["required_jobs"][tier], reused)
-    failures.extend(verify_steps(jobs, config["required_steps"][tier], reused))
+    failures = verify_jobs(jobs, config["required_jobs"][tier], reused, alias)
+    failures.extend(verify_steps(jobs, config["required_steps"][tier], reused, alias))
     if run.get("conclusion") != "success":
         failures.insert(0, f"workflow conclusion is {run.get('conclusion')}")
     return failures
@@ -906,14 +1055,14 @@ def tree_evidence(
             reused_from = None
             if recorded == {tree} and failures and run.get("conclusion") == "success":
                 jobs = get_jobs(args.repo, run["id"])
-                reused, reuse_failures, reused_from = verify_reuse(
-                    args.repo, run, config, args.tier, run["head_sha"], cache, jobs
+                reused, reuse_failures, reused_from, alias = verify_reuse(
+                    args.repo, run, config, args.tier, args.sha, cache, jobs
                 )
                 if reuse_failures:
                     failures = [*reuse_failures, *failures]
                     reused_from = None
                 elif reused:
-                    failures = run_failures(args.repo, run, config, args.tier, reused=reused)
+                    failures = run_failures(args.repo, run, config, args.tier, reused=reused, alias=alias)
         except EvidenceError as error:
             return None, f"tree match {url} could not be read: {error}"
         if recorded != {tree}:

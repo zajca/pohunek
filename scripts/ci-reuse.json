@@ -1,5 +1,5 @@
 {
-  "_comment": "Delta reuse allowlist (issue #2203): jobs of ci.yml that a tier=main dispatch with delta=true may skip when the newest same-tree pull_request run has them green. Reasoning: the never-list holds jobs whose inputs live outside the tree (audit: the RustSec advisory DB; changes/test-selection/package-selection/package-version-bump: the selectors whose delta path never runs; test-selection-verdict/test-duplicates/every cancel-after-*: aggregators and watchers that must see the delta run itself; the reuse job itself). The runtime package jobs (hermes/pi/codex/claude-package) and sdk stay out: they read the release baseline digest from the pull_request-only package-selection, so on a dispatch they would run without it, which is not the pull request's green result. A job whose needs: names a reusable job but that can never run on a tier=main dispatch (test-selection-check is pull_request-only, test-selection-audit is nightly-only) is not a consumer for the closure: it never reads the artifact on the dispatch path, so it lives in not_dispatch_consumers, and the guard requires its job-level if: to restrict it to pull_request or schedule. Dynamic-matrix fast-tests lists the legs of the FULL selection one by one and is selection_dependent: a narrowed source never reuses them, so the full leg list is the only one that can be reused, and the guard derives it from the same matrix source the workflow uses. Consumers include non-allowlisted jobs too (for example sdk of build-bins): the closure must drop a producer whose artifact a running job still downloads in the same run.",
+  "_comment": "Delta reuse allowlist (issue #2203): jobs of ci.yml that a tier=main dispatch with delta=true may skip when the newest same-tree pull_request run has them green. The never-list (never allowlisted): jobs whose inputs live outside the tree (audit: the RustSec advisory DB; changes/test-selection/package-selection/package-version-bump: the selectors whose delta path never runs; test-selection-verdict/test-duplicates/every cancel-after-*: aggregators that must see the delta run itself) and the reuse job itself, plus the runtime package jobs and sdk (they read the release baseline digest from the pull_request-only package-selection). A consumer whose job-level if: cannot run on a tier=main dispatch (test-selection-check: pull_request-only, test-selection-audit: nightly-only) is listed in not_dispatch_consumers with the reason; the guard derives it from the workflow. The closure to a fixed point drops every producer whose consumer is outside skip. Pairs: platform-contracts is reused only together with hermes-compatibility-macos (the lane's SKIP_OWNED_BY repeats that job's condition, so the lane ran the Hermes tests unless that job ran).",
   "max_age_hours": 24,
   "source_events": [
     "pull_request"
@@ -7,6 +7,9 @@
   "not_dispatch_consumers": {
     "test-selection-check": "pull_request-only: its job-level if: requires github.event_name == 'pull_request' (a guard also derives this from the workflow, it is not only a string here)",
     "test-selection-audit": "nightly-only: its job-level if: requires schedule or (workflow_dispatch with tier == 'nightly') (a guard also derives this from the workflow, it is not only a string here)"
+  },
+  "pairs": {
+    "platform-contracts": "hermes-compatibility-macos"
   },
   "jobs": {
     "build-bins": {
@@ -121,7 +124,7 @@
       ],
       "selection_dependent": true,
       "consumers": [],
-      "reason": "macOS lane runs identically when the selection does not narrow the lane away"
+      "reason": "macOS lane runs identically when the selection does not narrow the lane away; reused only with hermes-compatibility-macos, whose absence means the source lane ran the Hermes tests itself"
     },
     "release-build": {
       "names": [
