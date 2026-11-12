@@ -273,6 +273,7 @@ async fn a_daemon_started_over_rejected_lines_keeps_them_through_write_rpcs() {
             metadata: std::collections::BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
+            fetch_ref: None,
         })
         .await
         .expect("create a session over a store holding rejected lines");

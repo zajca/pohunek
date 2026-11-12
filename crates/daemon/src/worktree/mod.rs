@@ -45,8 +45,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    BranchSource, ErrorClass, OnDiverged, ProtocolError, SessionRetentionHold, SessionWarning,
-    SessionWarningKind, WorktreeSource,
+    BranchSource, ErrorClass, FetchRefRequest, FetchedRef, OnDiverged, ProtocolError,
+    SessionRetentionHold, SessionWarning, SessionWarningKind, WorktreeSource,
 };
 use tracing::{debug, info, warn};
 
@@ -142,6 +142,10 @@ pub struct WorktreeRequest {
     /// Resolution of a local branch that diverged from `origin/<branch>`; only
     /// meaningful with [`BranchSource::Remote`].
     pub on_diverged: Option<OnDiverged>,
+    /// An extra ref to fetch from `origin` without checking it out, pinned
+    /// under `refs/pohunek/sessions/<session_id>/fetched`. Applied exactly
+    /// once per session: a reused worktree reports it without refetching.
+    pub fetch_ref: Option<FetchRefRequest>,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -163,6 +167,9 @@ pub struct WorktreeBound {
     pub stderr_tails: Vec<HookStderrTail>,
     /// The commit a [`BranchSource::Remote`] worktree was built from.
     pub source: Option<WorktreeSource>,
+    /// The extra ref a `fetch_ref` request fetched and pinned, on a fresh
+    /// bind; a reused worktree reports the ref that is already there.
+    pub fetched: Option<FetchedRef>,
 }
 
 /// The rendered stderr tail of one failing hook.
@@ -235,6 +242,286 @@ impl Drop for FetchedBase {
             );
         }
     }
+}
+
+/// Namespace of the per-session refs a `fetch_ref` fetch pins.
+///
+/// The caller names the source ref and the expected commit; the daemon chooses
+/// the destination, `refs/pohunek/sessions/<session_id>/fetched`, so a request
+/// can neither overwrite another session's ref nor address a ref outside this
+/// namespace. The ref lives as long as the worktree binding: binding cleanup
+/// deletes it.
+const SESSION_FETCHED_REF_NAMESPACE: &str = "refs/pohunek/sessions";
+
+/// The daemon-chosen destination of a `fetch_ref` fetch for `session_id`.
+fn session_fetched_ref_name(session_id: &str) -> String {
+    format!("{SESSION_FETCHED_REF_NAMESPACE}/{session_id}/fetched")
+}
+
+/// A fetched commit promoted to its session ref.
+///
+/// Dropping deletes the session ref, but only while it still points at
+/// [`Self::commit`], so a ref this request did not promote is never removed.
+/// A bind that settles disarms the guard: the ref then lives with the session
+/// until binding cleanup deletes it.
+#[derive(Debug)]
+struct SessionFetchedRef {
+    repository: PathBuf,
+    ref_name: String,
+    commit: String,
+    keep: bool,
+}
+
+impl SessionFetchedRef {
+    /// The ref survives this guard: binding cleanup owns it from here on.
+    fn keep(mut self) -> FetchedRef {
+        self.keep = true;
+        FetchedRef {
+            fetched_ref: self.ref_name.clone(),
+            // Filled by the caller: the guard only pins the commit.
+            source_ref: String::new(),
+            commit: self.commit.clone(),
+        }
+    }
+}
+
+impl Drop for SessionFetchedRef {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        if let Err(message) = git_run(
+            &self.repository,
+            &["update-ref", "-d", &self.ref_name, &self.commit],
+        ) {
+            warn!(
+                fetch_ref = %self.ref_name,
+                error = %message,
+                "could not delete the session fetch ref of an abandoned bind"
+            );
+        }
+    }
+}
+
+/// Whether `commit` is a full lowercase hex object id, 40 (SHA-1) or 64
+/// (SHA-256) digits: the only shape a `fetch_ref` commit takes.
+fn is_full_commit_id(commit: &str) -> bool {
+    matches!(commit.len(), 40 | 64)
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Reject a `fetch_ref` request whose shape can never fetch: a source ref that
+/// is not a full `refs/` name git accepts, or a commit that is not a full
+/// lowercase hex id.
+///
+/// Runs at the trust boundary (a socket string becomes a `git` argument), so
+/// the refspec stays positional and no flag injection reaches `git`. The
+/// strict `check-ref-format` (no `--allow-onelevel`) runs here rather than in
+/// [`check_fetch_source`] because a one-level name is never a full ref.
+pub(crate) fn check_session_fetch_request(
+    source_ref: &str,
+    commit: &str,
+) -> Result<(), ProtocolError> {
+    if !source_ref.starts_with("refs/") {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new fetch_ref source_ref must start with 'refs/': {source_ref:?}"
+        )));
+    }
+    if source_ref.starts_with('-') || source_ref.starts_with('+') {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new fetch_ref source_ref cannot begin with '-' or '+': {source_ref:?}"
+        )));
+    }
+    if !is_full_commit_id(commit) {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new fetch_ref commit must be a full lowercase hex commit id (40 or 64 digits): {commit:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The `git check-ref-format` half of [`check_session_fetch_request`]: runs
+/// where a repository is at hand, before any fetch. The default rules (no
+/// `--allow-onelevel`, unlike [`check_fetch_source`]) require a full ref, so
+/// a one-level name is rejected here.
+fn check_session_fetch_ref_name(repo: &Path, source_ref: &str) -> Result<(), ProtocolError> {
+    let mut cmd = match git_command(repo) {
+        Ok(cmd) => cmd,
+        Err(message) => return Err(fetch_ref_failed(source_ref, &message)),
+    };
+    // No `--end-of-options`: `check-ref-format` takes a single pattern and
+    // rejects that flag. Argv injection is already excluded: a source ref
+    // that does not start with `refs/` never reaches `git`.
+    cmd.args(["check-ref-format", source_ref]);
+    match run_output_bounded(cmd, GIT_COMMAND_TIMEOUT) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(_) => Err(ProtocolError::bad_request(format!(
+            "session.new fetch_ref source_ref is not a valid git ref name: {source_ref:?}"
+        ))),
+        Err(message) => Err(fetch_ref_failed(source_ref, &message)),
+    }
+}
+
+/// Fetch `fetch.source_ref` from `origin` into the session ref of `session_id`
+/// and check it peels to `fetch.commit`.
+///
+/// Runs before any hook, so a refused request leaves no session, binding,
+/// worktree, temp ref or session ref behind: the temp ref dies with its
+/// [`FetchedBase`] guard and the session ref dies with the returned guard
+/// unless the bind settles and disarms it. `FETCH_HEAD` is left untouched.
+///
+/// # Errors
+///
+/// `bad_request` for a malformed request, `fetch_ref_not_found` when there is
+/// no `origin` or it has no such ref, `fetch_ref_commit_mismatch` when the
+/// fetched ref peels to another commit, `fetch_ref_failed` otherwise.
+fn fetch_session_ref(
+    repo: &Path,
+    session_id: &str,
+    fetch: &FetchRefRequest,
+) -> Result<SessionFetchedRef, ProtocolError> {
+    check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
+    check_session_fetch_ref_name(repo, &fetch.source_ref)?;
+    if !has_origin(repo) {
+        return Err(fetch_ref_not_found(
+            &fetch.source_ref,
+            "the repository has no origin remote",
+        ));
+    }
+    let temp = fetch_ref_name().map_err(|message| fetch_ref_failed(&fetch.source_ref, &message))?;
+    let fetched = match fetch_into_ref_without_fetch_head(repo, &fetch.source_ref, &temp) {
+        Ok(fetched) => fetched,
+        Err(message) if message.contains("timed out") => {
+            return Err(fetch_ref_failed(&fetch.source_ref, &message));
+        }
+        Err(message) => match remote_has_session_source(repo, &fetch.source_ref) {
+            Ok(false) => {
+                return Err(fetch_ref_not_found(
+                    &fetch.source_ref,
+                    "origin has no such ref",
+                ));
+            }
+            Ok(true) | Err(_) => return Err(fetch_ref_failed(&fetch.source_ref, &message)),
+        },
+    };
+    if fetched.commit != fetch.commit {
+        return Err(fetch_ref_commit_mismatch(
+            &fetch.source_ref,
+            &fetch.commit,
+            &fetched.commit,
+        ));
+    }
+    let ref_name = session_fetched_ref_name(session_id);
+    if let Err(message) = git_run(repo, &["update-ref", &ref_name, &fetched.commit]) {
+        return Err(fetch_ref_failed(&fetch.source_ref, &message));
+    }
+    // The temp ref dies here; the session ref below is owned by the guard
+    // until the bind settles.
+    drop(fetched);
+    Ok(SessionFetchedRef {
+        repository: repo.to_path_buf(),
+        ref_name,
+        commit: fetch.commit.clone(),
+        keep: false,
+    })
+}
+
+/// Whether `origin` advertises exactly `source_ref`.
+///
+/// A failed fetch is `fetch_ref_not_found` only when `git ls-remote` proves
+/// the ref absent; any other failure, including an unreachable remote, is
+/// `fetch_ref_failed`.
+fn remote_has_session_source(repo: &Path, source_ref: &str) -> Result<bool, String> {
+    let mut cmd = git_command(repo)?;
+    cmd.args([
+        "ls-remote",
+        "--exit-code",
+        "origin",
+        "--end-of-options",
+        source_ref,
+    ]);
+    let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
+    match output.status.code() {
+        Some(0) => Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            line.split_once('\t')
+                .is_some_and(|(_, name)| name == source_ref)
+        })),
+        // `--exit-code` reports "no matching refs" as 2.
+        Some(2) => Ok(false),
+        _ => Err(output_failure_message(&output)),
+    }
+}
+
+/// Read the commit the session ref of `session_id` holds, if any.
+///
+/// An absent ref is `Ok(None)`; a present but unreadable repository is an
+/// error like any other git failure of the bind.
+fn read_session_fetched_ref(
+    repo: &Path,
+    session_id: &str,
+    source_ref: &str,
+) -> Result<Option<String>, ProtocolError> {
+    let ref_name = session_fetched_ref_name(session_id);
+    let mut cmd = match git_command(repo) {
+        Ok(cmd) => cmd,
+        Err(message) => return Err(fetch_ref_failed(source_ref, &message)),
+    };
+    cmd.args(["rev-parse", "--verify", "--quiet", &ref_name]);
+    match run_output_bounded(cmd, GIT_COMMAND_TIMEOUT) {
+        Ok(output) if output.status.success() => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        )),
+        Ok(_) => Ok(None),
+        Err(message) => Err(fetch_ref_failed(source_ref, &message)),
+    }
+}
+
+/// Delete the session ref of `session_id`, best-effort: binding cleanup owns
+/// the ref once the bind settled, so every path that drops a binding drops
+/// the ref with it. A missing repository (or ref) is not an error.
+fn delete_session_fetched_ref(repo: &Path, session_id: &str) {
+    if !repo.is_dir() {
+        return;
+    }
+    let ref_name = session_fetched_ref_name(session_id);
+    if let Err(message) = git_run(repo, &["update-ref", "-d", &ref_name]) {
+        debug!(
+            fetch_ref = %ref_name,
+            error = %message,
+            "could not delete the session fetch ref during binding cleanup"
+        );
+    }
+}
+
+fn fetch_ref_not_found(source_ref: &str, why: &str) -> ProtocolError {
+    error(
+        ErrorClass::Runtime,
+        "fetch_ref_not_found",
+        format!("cannot fetch {source_ref:?} from origin: {why}"),
+        Some("push the ref first, or start without the extra fetch".to_owned()),
+    )
+}
+
+fn fetch_ref_failed(source_ref: &str, message: &str) -> ProtocolError {
+    error(
+        ErrorClass::Runtime,
+        "fetch_ref_failed",
+        format!("fetching {source_ref:?} from origin failed: {message}"),
+        Some("check the remote, or start without the extra fetch".to_owned()),
+    )
+}
+
+fn fetch_ref_commit_mismatch(source_ref: &str, expected: &str, actual: &str) -> ProtocolError {
+    error(
+        ErrorClass::Runtime,
+        "fetch_ref_commit_mismatch",
+        format!(
+            "fetching {source_ref:?} from origin found commit {actual} but the request expected {expected}"
+        ),
+        Some("fetch the ref and pass the commit it points to".to_owned()),
+    )
 }
 
 /// Outcome of [`WorktreeManager::cleanup_project`].
@@ -404,6 +691,11 @@ impl WorktreeManager {
         if let Some(base) = req.base_branch.as_deref() {
             validate_git_ref_arg(base, "base branch")?;
         }
+        // The extra ref arrives from the socket and becomes a fetch refspec;
+        // reject a shape that can never fetch at this trust boundary.
+        if let Some(fetch) = req.fetch_ref.as_ref() {
+            check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
+        }
         let repository = canonical_or_original(&req.repo);
         if !is_git_repo(&repository) {
             return Err(error(
@@ -458,6 +750,22 @@ impl WorktreeManager {
                         path = %path.display(),
                         "reusing owned worktree"
                     );
+                    // A reused worktree was bound with its session ref already
+                    // pinned (or no fetch requested): report what is there
+                    // without refetching.
+                    let fetched = match req.fetch_ref.as_ref() {
+                        Some(fetch) => read_session_fetched_ref(
+                            repository,
+                            &req.session_id,
+                            &fetch.source_ref,
+                        )?
+                        .map(|commit| FetchedRef {
+                            fetched_ref: session_fetched_ref_name(&req.session_id),
+                            source_ref: fetch.source_ref.clone(),
+                            commit,
+                        }),
+                        None => None,
+                    };
                     Ok(Some(WorktreeBound {
                         path: binding.path,
                         repository: repository.to_path_buf(),
@@ -467,6 +775,7 @@ impl WorktreeManager {
                         warnings: Vec::new(),
                         stderr_tails: Vec::new(),
                         source: None,
+                        fetched,
                     }))
                 }
                 Some(_) => {
@@ -532,6 +841,13 @@ impl WorktreeManager {
 
         let mut warnings = Vec::new();
         let mut stderr_tails = Vec::new();
+        // The extra ref fetch runs before any hook: a refused request leaves
+        // no session, binding, worktree, temp ref or session ref behind. The
+        // guard below deletes the session ref until the bind settles.
+        let session_fetched = match req.fetch_ref.as_ref() {
+            Some(fetch) => Some(fetch_session_ref(&repository, &req.session_id, fetch)?),
+            None => None,
+        };
         let resolved_base = Self::resolve_request_base(&repository, req)?;
         let base_branch = resolved_base.name;
         // Resolve the start-point for a new branch: the commit id pinned by a
@@ -639,6 +955,18 @@ impl WorktreeManager {
             ));
         }
 
+        // The checkout stands and the binding stays: disarm the guard so the
+        // session ref lives with the session until binding cleanup. Every
+        // `Err` return above drops the guard and deletes the session ref.
+        let fetched = session_fetched.map(|guard| {
+            let mut reported = guard.keep();
+            reported.source_ref = req
+                .fetch_ref
+                .as_ref()
+                .map(|fetch| fetch.source_ref.clone())
+                .unwrap_or_default();
+            reported
+        });
         Ok(WorktreeBound {
             path,
             repository,
@@ -648,6 +976,7 @@ impl WorktreeManager {
             warnings,
             stderr_tails,
             source,
+            fetched,
         })
     }
 
@@ -1033,6 +1362,11 @@ impl WorktreeManager {
                 false
             }
         };
+        // The session ref lives with the binding, not the checkout: drop it
+        // whenever the binding is dropped, even when the checkout survived
+        // (compensation keeps the session record then). A later compensation
+        // retry only removes, never re-binds, so no refetch can observe this.
+        delete_session_fetched_ref(&binding.repository, &binding.session_id);
         // post-remove fires IN the repository (the worktree is gone). If the
         // repository itself is gone, skip with a warning rather than spawn in a
         // non-existent cwd.
@@ -1580,13 +1914,25 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
 /// The `git fetch` of `source` from `origin` into `fetch_ref`.
 ///
 /// Automatic maintenance is disabled: its `git gc` runs `worktree prune`, which
-/// can overlap a locked add and inspect its incomplete admin entry.
-fn fetch_command(repo: &Path, source: &str, fetch_ref: &str) -> Result<Command, String> {
+/// can overlap a locked add and inspect its incomplete admin entry. With
+/// `write_fetch_head` the fetch records the tip in `FETCH_HEAD`, like every
+/// other fetch of this daemon; without it (a `fetch_ref` fetch) `FETCH_HEAD`
+/// is left untouched and a git that predates `--no-write-fetch-head` (2.29)
+/// fails the fetch instead of writing it.
+fn fetch_command(
+    repo: &Path,
+    source: &str,
+    fetch_ref: &str,
+    write_fetch_head: bool,
+) -> Result<Command, String> {
     let mut cmd = git_command(repo)?;
     cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .arg("fetch")
-        .arg("--no-tags")
-        .arg("origin")
+        .arg("--no-tags");
+    if !write_fetch_head {
+        cmd.arg("--no-write-fetch-head");
+    }
+    cmd.arg("origin")
         .arg("--end-of-options")
         .arg(format!("{source}:{fetch_ref}"));
     Ok(cmd)
@@ -1600,6 +1946,33 @@ fn fetch_command(repo: &Path, source: &str, fetch_ref: &str) -> Result<Command, 
 /// if a caller forgets the leading-dash guard (defense in depth against argv
 /// flag injection).
 fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
+    fetch_into_ref_with(repo, source, fetch_ref, true)
+}
+
+/// [`fetch_into_ref`] without the `FETCH_HEAD` write: the tip lands in
+/// `fetch_ref` only, so a sibling fetch that reads `FETCH_HEAD` never observes
+/// it.
+fn fetch_into_ref_without_fetch_head(
+    repo: &Path,
+    source: &str,
+    fetch_ref: &str,
+) -> Result<FetchedBase, String> {
+    fetch_into_ref_with(repo, source, fetch_ref, false)
+}
+
+/// [`fetch_origin`] into the named destination ref.
+///
+/// The refspec has no `+` and the destination must not exist beforehand, so a
+/// ref this request did not create is never overwritten, and a failed fetch
+/// never deletes anything. `--end-of-options` keeps the refspec positional even
+/// if a caller forgets the leading-dash guard (defense in depth against argv
+/// flag injection).
+fn fetch_into_ref_with(
+    repo: &Path,
+    source: &str,
+    fetch_ref: &str,
+    write_fetch_head: bool,
+) -> Result<FetchedBase, String> {
     check_fetch_source(repo, source)?;
     let mut probe = git_command(repo)?;
     probe.args(["rev-parse", "--verify", "--quiet", fetch_ref]);
@@ -1609,7 +1982,7 @@ fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedB
         Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
         _ => return Err(output_failure_message(&probed)),
     }
-    let cmd = fetch_command(repo, source, fetch_ref)?;
+    let cmd = fetch_command(repo, source, fetch_ref, write_fetch_head)?;
     // The fetch's connectivity check reads every `worktrees/<name>/HEAD`, and
     // `git worktree add` first writes a null-oid placeholder there, which fails
     // the check with `bad object worktrees/<name>/HEAD`. Holding the admin lock

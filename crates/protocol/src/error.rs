@@ -26,6 +26,8 @@ pub const SESSION_REQUEST_IN_PROGRESS_CODE: &str = "session_request_in_progress"
 pub const SESSION_REQUEST_CONFLICT_CODE: &str = "session_request_conflict";
 /// Error code a client raises when the daemon cannot honor `client_request_id`.
 pub const SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE: &str = "session_new_request_id_unsupported";
+/// Error code a client raises when the daemon cannot honor `fetch_ref`.
+pub const SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE: &str = "session_new_fetch_ref_unsupported";
 /// Error code a client raises when the daemon cannot honor
 /// `context_package_digest`.
 pub const SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE: &str = "session_new_context_pin_unsupported";
@@ -1474,6 +1476,23 @@ impl ProtocolError {
             format!(
                 "{target} predates client_request_id and would drop it silently; nothing was sent"
             ),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_new_fetch_ref_unsupported` error a client raises
+    /// before it sends `session.new` to a daemon that cannot honor
+    /// `fetch_ref`.
+    #[must_use]
+    pub fn session_new_fetch_ref_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
+            format!("{target} predates fetch_ref and would drop it silently; nothing was sent"),
             Some("upgrade the daemon, then retry".to_owned()),
         )
     }

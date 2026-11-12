@@ -274,6 +274,7 @@ pub async fn prepare_with_options(
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest,
+        fetch_ref: None,
     };
 
     Ok(PreparedLaunch {

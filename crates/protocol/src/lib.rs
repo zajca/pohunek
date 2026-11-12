@@ -72,8 +72,9 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
-    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
-    SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
+    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
+    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REQUEST_CONFLICT_CODE,
+    SESSION_REQUEST_IN_PROGRESS_CODE,
 };
 #[doc(inline)]
 pub use governance::{
@@ -160,9 +161,9 @@ pub use session::{
     is_valid_client_request_id, AgentActivity, AgentStateEvent, AttachEvent, AttachHeader,
     AuthorityGate, AuthorityGateReason, BackgroundItem, BackgroundKind, BackgroundStateEvent,
     BackgroundStatus, BlockedKind, BranchSource, CwdSource, DetectionRegionKind,
-    DetectionRegionPreview, DetectionStatus, ObservationParamsError, OnDiverged, RuntimeExit,
-    RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus, RuntimeState,
-    SessionAttachParams, SessionAttachResult, SessionBackground, SessionCapabilities,
+    DetectionRegionPreview, DetectionStatus, FetchRefRequest, FetchedRef, ObservationParamsError,
+    OnDiverged, RuntimeExit, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
+    RuntimeState, SessionAttachParams, SessionAttachResult, SessionBackground, SessionCapabilities,
     SessionCapabilityRefusals, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
     SessionDetectionResult, SessionDiffParams, SessionDiffResult, SessionEvent, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter,

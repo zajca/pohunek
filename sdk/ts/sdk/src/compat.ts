@@ -65,6 +65,11 @@ export function carriesContextPackageDigest(params: unknown): boolean {
   return isObject(params) && isSet(params["context_package_digest"]);
 }
 
+/** Whether `params` carries a `fetch_ref` the daemon must fetch and pin. */
+export function carriesFetchRef(params: unknown): boolean {
+  return isObject(params) && isObject(params["fetch_ref"]);
+}
+
 function requireCurrent(version: number): void {
   if (version !== PROTOCOL_VERSION) {
     throw new CompatError({ kind: "unsupportedVersion", version });

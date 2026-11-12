@@ -309,6 +309,7 @@ impl Fixture {
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
+                fetch_ref: None,
             })
             .await
             .expect("create the stand-in agent session")
@@ -608,6 +609,7 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
+                fetch_ref: None,
             })
             .await
             .expect("create the shell session")

@@ -873,6 +873,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
+            fetch_ref: None,
         })
         .expect("serialize session.new params"),
     );
@@ -1402,6 +1403,7 @@ impl SecretEnvHost {
             secret_env: protocol::SessionSecretEnv::default(),
             client_request_id: None,
             context_package_digest: None,
+            fetch_ref: None,
         })
         .expect("serialize session.new params");
         params["secret_env"] = secret_env;

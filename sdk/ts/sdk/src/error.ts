@@ -46,6 +46,7 @@ export const ClientErrorCode = {
   SessionNewSecretEnvRelayRefused: "session_new_secret_env_relay_refused",
   SessionNewRequestIdUnsupported: "session_new_request_id_unsupported",
   SessionNewContextPinUnsupported: "session_new_context_pin_unsupported",
+  SessionNewFetchRefUnsupported: "session_new_fetch_ref_unsupported",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
@@ -71,6 +72,7 @@ export type ClientErrorKind =
   | "sessionNewSecretEnvRelayRefused"
   | "sessionNewRequestIdUnsupported"
   | "sessionNewContextPinUnsupported"
+  | "sessionNewFetchRefUnsupported"
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
 
@@ -344,6 +346,25 @@ export class ClientError extends Error {
       protocolError(
         ClientErrorClass.Daemon,
         ClientErrorCode.SessionNewContextPinUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_new_fetch_ref_supported`, so it
+   * would drop `fetch_ref` silently and start a session without the extra ref.
+   */
+  public static sessionNewFetchRefUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates fetch_ref and would drop it silently; nothing was sent`;
+    return new ClientError(
+      "sessionNewFetchRefUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionNewFetchRefUnsupported,
         msg,
         "upgrade the daemon, then retry",
       ),

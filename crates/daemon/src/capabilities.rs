@@ -367,6 +367,7 @@ fn capability_snapshot(
         session_new_secret_env_supported: true,
         session_new_request_id_supported: true,
         session_new_context_pin_supported: true,
+        session_new_fetch_ref_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,

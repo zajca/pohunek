@@ -3,6 +3,7 @@
 import type { AgentActivity } from "./AgentActivity";
 import type { BlockedKind } from "./BlockedKind";
 import type { CwdSource } from "./CwdSource";
+import type { FetchedRef } from "./FetchedRef";
 import type { RuntimeRef } from "./RuntimeRef";
 import type { SessionBackground } from "./SessionBackground";
 import type { SessionCapabilities } from "./SessionCapabilities";
@@ -43,6 +44,13 @@ export type SessionNewResult = {
    * session started with `branch_source: remote`.
    */
   worktree_source?: WorktreeSource;
+  /**
+   * The extra ref the worktree create fetched and pinned. Present on the
+   * first response of a worktree session started with
+   * [`SessionNewParams::fetch_ref`], like `worktree_source`; absent on a
+   * replay and never persisted on [`SessionInfo`].
+   */
+  fetched_ref?: FetchedRef;
   /**
    * With [`SessionNewParams::input_ack_timeout_ms`]: `true` when the agent
    * showed `working` activity after the initial input was submitted within

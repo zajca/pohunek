@@ -676,6 +676,7 @@ fn session_new_params_json_shape_roundtrips() {
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -714,6 +715,7 @@ fn session_new_params_roundtrips_with_metadata() {
         metadata: metadata(&[("owner", "cli"), ("ticket", "DMD-1356")]),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -756,6 +758,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -796,6 +799,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -812,6 +816,77 @@ fn session_new_params_roundtrips_with_initial_input() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_new_params_roundtrips_with_fetch_ref() {
+    let params = SessionNewParams {
+        client_request_id: None,
+        agent: "claude".to_owned(),
+        name: None,
+        cwd: None,
+        cols: 80,
+        rows: 24,
+        project: None,
+        repo: Some(PathBuf::from("/workspace/project")),
+        branch: Some("feature/pr-42".to_owned()),
+        base_branch: None,
+        input: None,
+        extended_input_ready_wait: None,
+        branch_source: None,
+        on_diverged: None,
+        input_ack_timeout_ms: None,
+        metadata: BTreeMap::new(),
+        secret_env: protocol::SessionSecretEnv::default(),
+        context_package_digest: None,
+        fetch_ref: Some(protocol::FetchRefRequest {
+            source_ref: "refs/pull/42/head".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        }),
+    };
+
+    let value = serde_json::to_value(&params).expect("serialize params");
+    assert_eq!(
+        value,
+        json!({
+            "agent": "claude",
+            "cols": 80,
+            "rows": 24,
+            "repo": "/workspace/project",
+            "branch": "feature/pr-42",
+            "fetch_ref": {
+                "source_ref": "refs/pull/42/head",
+                "commit": "0123456789abcdef0123456789abcdef01234567"
+            }
+        })
+    );
+
+    let back = line_roundtrip(&params);
+    assert_eq!(back, params);
+}
+
+#[test]
+fn session_new_result_roundtrips_with_fetched_ref() {
+    let result: protocol::SessionNewResult = serde_json::from_value(json!({
+        "id": "s-1", "agent": "shell", "agent_base": "shell",
+        "capabilities": {"fork": false, "resume": false},
+        "cwd": "/work", "pid": 1, "state": "running", "state_source": "process",
+        "cols": 80, "rows": 24,
+        "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:01Z",
+        "fetched_ref": {
+            "ref": "refs/pohunek/sessions/s-1/fetched",
+            "source_ref": "refs/pull/42/head",
+            "commit": "0123456789abcdef0123456789abcdef01234567"
+        }
+    }))
+    .expect("a result with fetched_ref");
+    let fetched = result.fetched_ref.as_ref().expect("fetched_ref present");
+    assert_eq!(fetched.fetched_ref, "refs/pohunek/sessions/s-1/fetched");
+    assert_eq!(fetched.source_ref, "refs/pull/42/head");
+    assert_eq!(fetched.commit, "0123456789abcdef0123456789abcdef01234567");
+
+    let back = line_roundtrip(&result);
+    assert_eq!(back, result);
 }
 
 #[test]
@@ -3246,6 +3321,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_secret_env_supported: true,
         session_new_request_id_supported: true,
         session_new_context_pin_supported: true,
+        session_new_fetch_ref_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
@@ -3287,6 +3363,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_secret_env_supported": true,
             "session_new_request_id_supported": true,
             "session_new_context_pin_supported": true,
+            "session_new_fetch_ref_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true,
             "package_create_profile_supported": true,

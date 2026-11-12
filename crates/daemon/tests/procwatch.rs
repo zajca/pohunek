@@ -406,6 +406,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
+                fetch_ref: None,
             })
             .await
             .expect("create shell session")
@@ -497,6 +498,7 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
+                fetch_ref: None,
             })
             .await
             .expect("create shell session")
@@ -605,6 +607,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                                 metadata: BTreeMap::new(),
                                 secret_env: protocol::SessionSecretEnv::default(),
                                 context_package_digest: None,
+                                fetch_ref: None,
                             })
                             .await
                             .expect("create shell session")
@@ -768,6 +771,7 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
+                fetch_ref: None,
             })
             .await
             .expect("create shell session")
@@ -855,6 +859,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             metadata: BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
+            fetch_ref: None,
         })
         .await
         .expect("create shell session");

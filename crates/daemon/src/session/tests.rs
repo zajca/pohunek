@@ -214,6 +214,7 @@ pub(super) fn params() -> SessionNewParams {
         metadata: BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     }
 }
 

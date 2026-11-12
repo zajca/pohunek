@@ -340,6 +340,7 @@ impl Fixture {
                 metadata: BTreeMap::new(),
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
+                fetch_ref: None,
             })
             .await
             .expect("create the stand-in agent session")

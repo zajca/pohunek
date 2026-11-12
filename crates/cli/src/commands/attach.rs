@@ -885,6 +885,7 @@ fn build_menu_new_session_request(
             metadata: std::collections::BTreeMap::new(),
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
+            fetch_ref: None,
         },
     )
 }

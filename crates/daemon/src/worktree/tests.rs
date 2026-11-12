@@ -188,6 +188,7 @@ fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
         agent: "claude".to_owned(),
         branch_source: protocol::BranchSource::Local,
         on_diverged: None,
+        fetch_ref: None,
     }
 }
 
@@ -1310,7 +1311,7 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
 #[test]
 fn fetch_disables_automatic_maintenance() {
     let repo = init_repo("fetch-maintenance");
-    let cmd = super::fetch_command(&repo, "main", "refs/pohunek/fetch/x").expect("command");
+    let cmd = super::fetch_command(&repo, "main", "refs/pohunek/fetch/x", true).expect("command");
     let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
     let fetch = args
         .iter()
