@@ -186,6 +186,18 @@ because a failed selection runs everything instead of ending the run. A fork or
 Dependabot pull request has a read-only token, so the cancel call is refused and
 the run keeps its real failure.
 
+**Delta dispatch.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
+accepts `delta: true`: the `delta reuse` job finds the newest green pull
+request run of the same tree (within 24 hours) and the reusable jobs it names
+skip, reusing those legs instead of running them again. `scripts/ci-reuse`
+decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
+`scripts/tests/test_ci_tiers.py` guards); a narrowed selection excludes the
+selection-dependent jobs, and an ambiguous source runs everything. A full
+dispatch (`delta: false`) stays the default, and `scripts/release` keeps
+dispatching full runs. `scripts/ci-evidence` accepts the union of the evidence
+run and the recorded source run as evidence for the commit, and names both
+runs in its report.
+
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the
 `.github/actions/setup-mold` composite (never an inline `apt-get`): curl has
