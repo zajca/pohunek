@@ -5,9 +5,7 @@
 //! stdin and stdout on a real PTY, exactly as the operator's foot or Claude
 //! Code session runs it. Every key is sent in the encoding its terminal uses
 //! and the menu selection is read back from the compositor's own highlight
-//! marks in the output. On the pre-fix decoder the event-typed and SS3
-//! encodings did nothing at all: their parameter or `O` bytes were delivered
-//! to the menu as literal keys (Escape, then text in the rename buffer).
+//! marks in the output.
 
 #![cfg(unix)]
 
@@ -46,9 +44,9 @@ const MENU_KEY: u8 = 0x1c;
 /// through `poll_until`, only this fixed settle window remains.
 const KEY_PAUSE: Duration = Duration::from_millis(300);
 
-/// Menu item text as rendered on a line: the compositor writes the
-/// highlight attributes before the line text but a leading `+` border gap,
-/// so the marker is the plain label text.
+/// Menu item text as rendered on a line: the compositor writes the highlight
+/// attributes immediately before the line text, so the visible marker is the
+/// label text itself.
 const HIGHLIGHTED_KILL: &str = "k  Kill session";
 const HIGHLIGHTED_REMOVE: &str = "t  Terminate and delete session";
 const HIGHLIGHTED_DETACH: &str = "d  Detach";
@@ -82,6 +80,9 @@ const KITTY_DOWN_RELEASE: &[u8] = b"\x1b[1;1:3B";
 /// Kitty CSI-u Escape press (the encoding Claude Code always sends once it
 /// pushes kitty flags `>5u`).
 const KITTY_ESCAPE_PRESS: &[u8] = b"\x1b[27u";
+/// Kitty CSI-u Escape press on a terminal that always carries the event-type
+/// subparameter (foot at `>7u`).
+const KITTY_ESCAPE_PRESS_EVENT: &[u8] = b"\x1b[27;1:1u";
 /// Kitty CSI-u Escape release: it must not leak to the attached program after
 /// the menu closed in response to the press.
 const KITTY_ESCAPE_RELEASE: &[u8] = b"\x1b[27;1:3u";
@@ -96,6 +97,9 @@ const SS3_DOWN: &[u8] = b"\x1bOB";
 const LEGACY_DOWN: &[u8] = b"\x1b[B";
 /// Legacy lone Escape closes the menu.
 const LEGACY_ESCAPE: &[u8] = b"\x1b";
+/// Lone Escape immediately followed by a legacy arrow in the same read: the
+/// Escape closes the menu and the arrow is re-parsed.
+const LEGACY_ESCAPE_ARROW: &[u8] = b"\x1b\x1b[B";
 /// Focus-in report (`ESC [ I`): its `I` byte must not act as a menu key.
 const FOCUS_IN: &[u8] = b"\x1b[I";
 /// Mode-report answer (`ESC [ ? 2031 ; 0 $ y`): consumed whole.
@@ -119,6 +123,8 @@ struct Fixture {
     program_input: Arc<Mutex<Vec<u8>>>,
     /// The client's raw attach stream closed (detach sent).
     stream_closed: Arc<Mutex<bool>>,
+    /// `session.rename` parameters, in arrival order.
+    renames: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Clone for Fixture {
@@ -127,6 +133,7 @@ impl Clone for Fixture {
             methods: Arc::clone(&self.methods),
             program_input: Arc::clone(&self.program_input),
             stream_closed: Arc::clone(&self.stream_closed),
+            renames: Arc::clone(&self.renames),
         }
     }
 }
@@ -145,6 +152,11 @@ impl Fixture {
     /// Whether the client's raw attach stream closed (detach sent).
     fn stream_closed(&self) -> bool {
         *self.stream_closed.lock().expect("closed lock")
+    }
+
+    /// `session.rename` parameters in arrival order.
+    fn renames(&self) -> Vec<Value> {
+        self.renames.lock().expect("renames lock").clone()
     }
 }
 
@@ -168,8 +180,10 @@ impl Attach {
     }
 
     /// Reports which menu item carries the compositor's reverse-video mark in
-    /// the most recently completed repaint: the title starts each repaint, so
-    /// only the bytes after the last title belong to the current frame.
+    /// the most recently completed repaint. Every full repaint starts with a
+    /// home move, so only the bytes after the last home move belong to the
+    /// live frame; the highlighted line is the marker text plus reverse
+    /// video attributes.
     fn highlighted(&self) -> Option<&'static str> {
         let output = self.output.lock().expect("output lock");
         // Every full repaint starts with a home move (`\x1b[1;1H`), so only
@@ -203,11 +217,10 @@ impl Attach {
 
     /// Waits until the menu highlights `label`.
     fn expect_highlighted(&self, final_label: &str, what: &str) {
-        let label = final_label;
         poll_until(what, || {
             if self
                 .highlighted()
-                .is_some_and(|highlighted| highlighted == label)
+                .is_some_and(|highlighted| highlighted == final_label)
             {
                 return Some(());
             }
@@ -217,22 +230,21 @@ impl Attach {
         // already panics with the message above.
     }
 
-    /// Waits until the menu stops highlighting any item (it closed): the
-    /// compositor repaints with no menu frame, so the live frame carries no
-    /// highlight. The close repaint is the final paint, so the condition is
-    /// checked on the current frame directly; callers pass the output
-    /// length captured before the closing key as `before_close` and this
-    /// waits until the frame grew past it (the close repaint itself).
+    /// Waits until the live repaint frame carries no highlight, i.e. the
+    /// menu closed. `before_close` is the output length captured before the
+    /// closing key was typed: the close repaint must grow the output past
+    /// it, so a stale open frame cannot satisfy the check.
     fn expect_menu_closed(&self, before_close: usize, what: &str) {
         poll_until(what, || {
-            if self.highlighted().is_none() {
+            if self.output.lock().expect("output lock").len() > before_close
+                && self.highlighted().is_none()
+            {
                 return Some(());
             }
             None
         });
         // On success the live frame carries no highlight. A timeout from
         // `poll_until` already panics with the message above.
-        let _ = before_close;
     }
 }
 
@@ -357,6 +369,13 @@ fn serve_connection(stream: UnixStream, fixture: &Fixture) {
             .lock()
             .expect("methods lock")
             .push(request.method().to_owned());
+        if request.method() == protocol::method::SESSION_RENAME {
+            fixture
+                .renames
+                .lock()
+                .expect("renames lock")
+                .push(request.params().clone());
+        }
         let response = Response::ok(PROTOCOL_VERSION, request.id(), result_for(&request))
             .expect("valid fixture response");
         writeln!(
@@ -536,23 +555,24 @@ fn csi_u_and_report_bytes_never_become_menu_keys() {
         "the mode report bytes do not act as menu keys",
     );
 
-    // Typing must still work afterwards: `r` opens the rename buffer and
-    // nothing the sequences carried may sit in it.
+    // Nothing the reports carried may enter the rename buffer: `r` opens it,
+    // `ab` is typed, and Enter must rename to exactly `ab`.
     attach.type_key(b"r");
-    attach.type_key(b"ok");
-    let output = attach.output.lock().expect("output lock");
-    let rename_at = output
-        .windows(b"Rename session".len())
-        .rposition(|window| window == b"Rename session")
-        .expect("the rename buffer renders");
-    let tail = &output[rename_at..];
-    assert!(
-        tail.windows(2).any(|window| window == b"ok")
-            && !tail.windows(7).any(|window| window == b"[^I]"),
-        "the rename buffer holds exactly the typed text: {:?}",
-        String::from_utf8_lossy(tail)
+    attach.type_key(b"a");
+    attach.type_key(b"b");
+    attach.type_key(FOCUS_IN);
+    attach.type_key(KITTY_DOWN_PRESS);
+    attach.type_key(b"\r");
+    poll_until("the rename request to reach the fixture", || {
+        attach.fixture.renames().first().cloned().map(|_| ())
+    });
+    let renames = attach.fixture.renames();
+    assert_eq!(renames.len(), 1, "one rename request: {renames:?}");
+    assert_eq!(
+        renames[0].get("name").and_then(Value::as_str),
+        Some("ab"),
+        "the rename carries exactly the typed text: {renames:?}"
     );
-    drop(output);
 
     attach.type_key(LEGACY_ESCAPE);
     attach.expect_highlighted("Kill session", "Escape returns to the root list");
@@ -561,25 +581,88 @@ fn csi_u_and_report_bytes_never_become_menu_keys() {
 }
 
 #[test]
-fn escape_closes_the_menu_in_csi_u_form_and_its_release_does_not_reach_the_program() {
-    let mut attach = attach_with_fixture();
-    open_menu(&mut attach);
-    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+fn escape_close_per_encoding_never_leaks_its_release_to_the_program() {
+    // CSI-u Escape press (Claude Code at `>5u` never sends a release).
+    {
+        let mut attach = attach_with_fixture();
+        open_menu(&mut attach);
+        attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+        let before_close = attach.output.lock().expect("output lock").len();
+        attach.type_key(KITTY_ESCAPE_PRESS);
+        attach.expect_menu_closed(before_close, "the CSI-u Escape press closes the menu");
+        assert_only_sentinel("the CSI-u Escape close leaks no release", &mut attach);
+        detach(&mut attach);
+    };
+    // Lone legacy Escape, in its own read.
+    {
+        let mut attach = attach_with_fixture();
+        open_menu(&mut attach);
+        attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+        let before_close = attach.output.lock().expect("output lock").len();
+        attach.type_key(LEGACY_ESCAPE);
+        attach.expect_menu_closed(before_close, "a lone Escape closes the menu");
+        assert_only_sentinel("a lone Escape close leaks no release", &mut attach);
+        detach(&mut attach);
+    };
+    // Lone Escape and a legacy arrow in the same read: the Escape is handled
+    // on its own and the arrow is re-parsed instead of being swallowed.
+    {
+        let mut attach = attach_with_fixture();
+        open_menu(&mut attach);
+        attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+        let before_close = attach.output.lock().expect("output lock").len();
+        attach.type_key(LEGACY_ESCAPE_ARROW);
+        attach.expect_menu_closed(before_close, "a lone Escape closes the menu first");
+        assert_only_sentinel("a lone Escape close leaks no release", &mut attach);
+        detach(&mut attach);
+    };
+    // The event-typed foot Escape pair in one read.
+    {
+        let mut attach = attach_with_fixture();
+        open_menu(&mut attach);
+        attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+        let before_close = attach.output.lock().expect("output lock").len();
+        let mut pair = KITTY_ESCAPE_PRESS_EVENT.to_vec();
+        pair.extend_from_slice(KITTY_ESCAPE_RELEASE);
+        attach.type_key(&pair);
+        attach.expect_menu_closed(before_close, "the event-typed Escape pair closes the menu");
+        assert_only_sentinel("the event-typed Escape pair leaks no release", &mut attach);
+        detach(&mut attach);
+    };
+    // The event-typed foot Escape pair in separate reads.
+    {
+        let mut attach = attach_with_fixture();
+        open_menu(&mut attach);
+        attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+        let before_close = attach.output.lock().expect("output lock").len();
+        attach.type_key(KITTY_ESCAPE_PRESS_EVENT);
+        attach.expect_menu_closed(before_close, "the event-typed Escape press closes the menu");
+        attach.type_key(KITTY_ESCAPE_RELEASE);
+        assert_only_sentinel(
+            "the event-typed Escape release leaks no release",
+            &mut attach,
+        );
+        detach(&mut attach);
+    };
+}
 
-    let before_close = attach.output.lock().expect("output lock").len();
-    attach.type_key(KITTY_ESCAPE_PRESS);
-    attach.expect_menu_closed(before_close, "the CSI-u Escape press closes the menu");
-
-    attach.type_key(KITTY_ESCAPE_RELEASE);
-    // timing-allowed: #2281 a settle window is enough for a leak to arrive if one existed.
-    thread::sleep(KEY_PAUSE);
-    assert!(
-        !attach.fixture.program_input().contains(&0x1b),
-        "the Escape release must not leak to the program: {:?}",
+fn assert_only_sentinel(what: &str, attach: &mut Attach) {
+    attach.type_key(b"q");
+    poll_until(
+        &format!("{what}: the sentinel byte reaches the program"),
+        || {
+            if attach.fixture.program_input() == b"q" {
+                return Some(());
+            }
+            None
+        },
+    );
+    assert_eq!(
+        attach.fixture.program_input(),
+        b"q",
+        "{what}: only the sentinel may reach the program: {:?}",
         attach.fixture.program_input()
     );
-
-    detach(&mut attach);
 }
 
 #[test]
@@ -593,6 +676,32 @@ fn an_unconsumed_release_is_forwarded_to_the_program() {
         }
         None
     });
+
+    detach(&mut attach);
+}
+
+#[test]
+fn an_held_rollover_release_does_not_leak_after_close() {
+    let mut attach = attach_with_fixture();
+    open_menu(&mut attach);
+    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+
+    attach.type_key(KITTY_DOWN_PRESS);
+    attach.expect_highlighted(
+        "Terminate and delete session",
+        "kitty down press moves once",
+    );
+
+    // The foot `>7u` pair, in separate reads: Down is still held when the
+    // event-typed Escape press closes the menu, so its release must be
+    // swallowed together with the Escape release that follows.
+    let before_close = attach.output.lock().expect("output lock").len();
+    attach.type_key(KITTY_ESCAPE_PRESS_EVENT);
+    attach.expect_menu_closed(before_close, "the event-typed Escape press closes the menu");
+
+    attach.type_key(KITTY_DOWN_RELEASE);
+    attach.type_key(KITTY_ESCAPE_RELEASE);
+    assert_only_sentinel("held-key and Escape releases must not leak", &mut attach);
 
     detach(&mut attach);
 }

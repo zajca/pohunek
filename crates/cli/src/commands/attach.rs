@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use self::buffered_output::{BufferedOutput, OUTPUT_QUEUE_BYTES};
-use self::shortcut::{MenuInputMode, Shortcut, ShortcutDecoder};
+use self::shortcut::{parse_decimal, MenuInputMode, Shortcut, ShortcutDecoder};
 use crate::client::{Client, PinnedHost, RawStream};
 use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
@@ -124,12 +124,21 @@ const MENU_CSI_FINAL_END: u8 = 0x7e;
 const MENU_EVENT_RELEASE: u32 = 3;
 /// Kitty event type `1` is a key press and is omitted when it is the default.
 const MENU_EVENT_PRESS: u32 = 1;
-/// Decimal terminal parameters use base ten.
-const MENU_DECIMAL_RADIX: u32 = 10;
+/// Parameter bytes of a CSI stop at the first byte below the parameter range.
+const MENU_CSI_PARAM_START: u8 = 0x20;
+/// Parameter bytes of a CSI stop at the first byte above the parameter range.
+const MENU_CSI_PARAM_END: u8 = 0x3f;
+/// Bracketed-paste parameters that open and close pasted text.
+const MENU_PASTE_OPEN_PARAMS: &[u8] = b"200";
+/// Bracketed-paste close parameters.
+const MENU_PASTE_CLOSE_PARAMS: &[u8] = b"201";
 /// CSI `~` final shared by bracketed-paste markers.
 const MENU_PASTE_FINAL: u8 = b'~';
-/// SGR mouse reports use `ESC [ < ...`.
-const MENU_SGR_MOUSE_MARKER: u8 = b'<';
+/// Largest incomplete menu CSI retained between reads.
+///
+/// A CSI longer than this cannot be a key report, so it is abandoned the
+/// same way the shortcut decoder abandons an oversized pending sequence.
+const MENU_MAX_PENDING_CSI: usize = 64;
 /// Up-arrow CSI final byte.
 const MENU_ARROW_UP: u8 = b'A';
 /// Down-arrow CSI final byte.
@@ -1426,26 +1435,37 @@ fn parse_ss3_menu_key(input: &[u8]) -> ParsedMenuKey {
 }
 
 fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
-    let Some(final_index) = input[2..]
+    // The CSI body runs over ECMA-48 parameter and intermediate bytes only.
+    // A byte outside the parameter range before any final byte (CR, DEL, a
+    // fresh ESC, ...) aborts the sequence: only `ESC [` is consumed and the
+    // rest is re-parsed, so a stray byte can no longer buffer Escape, Enter,
+    // Backspace or digits indefinitely.
+    let Some(body_end) = input[2..]
         .iter()
-        .position(|byte| MENU_CSI_FINAL_START <= *byte && *byte <= MENU_CSI_FINAL_END)
-        .map(|offset| offset + 2)
+        .position(|byte| !(MENU_CSI_PARAM_START..=MENU_CSI_PARAM_END).contains(byte))
     else {
+        return pending_menu_csi(input);
+    };
+    let body_end = body_end + 2;
+    let body = &input[2..body_end];
+    let final_byte = input[body_end];
+    let is_final = (MENU_CSI_FINAL_START..=MENU_CSI_FINAL_END).contains(&final_byte);
+    if !is_final {
+        if matches!(final_byte, MENU_ARROW_UP | MENU_ARROW_DOWN) {
+            return pending_menu_csi(input);
+        }
         return ParsedMenuKey {
-            consumed: 0,
-            pending: true,
+            consumed: 2,
+            pending: false,
             key: None,
         };
-    };
-    let consumed = final_index + 1;
-    let final_byte = input[final_index];
-    let params = &input[2..final_index];
-
+    }
+    let consumed = body_end + 1;
     match final_byte {
         MENU_ARROW_UP | MENU_ARROW_DOWN => {
             // Kitty event-typed arrows (`ESC [ 1 ; <mods> [ : <event> ] A`) are
             // a press, a repeat, or a release to swallow.
-            if menu_arrow_event(params) == MENU_EVENT_RELEASE {
+            if menu_arrow_event(body) == MENU_EVENT_RELEASE {
                 return ParsedMenuKey {
                     consumed,
                     pending: false,
@@ -1462,10 +1482,9 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
                 }),
             }
         }
-        MENU_SGR_MOUSE_MARKER => parse_sgr_menu_mouse(input),
         MENU_SGR_EVENT_FINAL | MENU_SGR_RELEASE_FINAL => {
             // A bare `ESC [ M` is a legacy mouse head, never an SGR report.
-            if final_index == 2 {
+            if body.is_empty() {
                 ParsedMenuKey {
                     consumed: input.len().min(MENU_LEGACY_MOUSE_REPORT_LEN),
                     pending: input.len() < MENU_LEGACY_MOUSE_REPORT_LEN,
@@ -1475,7 +1494,7 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
                 parse_sgr_menu_mouse(input)
             }
         }
-        MENU_PASTE_FINAL => parse_paste_menu_key(input, consumed),
+        MENU_PASTE_FINAL => parse_paste_menu_key(body, consumed),
         _ => ParsedMenuKey {
             // A complete unrecognized CSI is swallowed whole: focus reports
             // (`ESC [ I/O`), colour-scheme reports and other finals must not
@@ -1487,15 +1506,37 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
     }
 }
 
-fn parse_paste_menu_key(input: &[u8], consumed: usize) -> ParsedMenuKey {
-    // The only `~` finals the menu decoder sees are bracketed-paste markers,
-    // whose skipping happens before this parser. Anything else is still
-    // swallowed whole.
-    let _ = input;
+fn parse_paste_menu_key(params: &[u8], consumed: usize) -> ParsedMenuKey {
+    if params == MENU_PASTE_OPEN_PARAMS || params == MENU_PASTE_CLOSE_PARAMS {
+        return ParsedMenuKey {
+            consumed,
+            pending: false,
+            key: None,
+        };
+    }
     ParsedMenuKey {
         consumed,
         pending: false,
         key: None,
+    }
+}
+
+fn pending_menu_csi(input: &[u8]) -> ParsedMenuKey {
+    // An incomplete CSI waits for more bytes only while it can still become
+    // a key report. Once it grows past the largest valid report it is
+    // abandoned and re-parsed from the first parameter byte.
+    if input.len() <= MENU_MAX_PENDING_CSI {
+        ParsedMenuKey {
+            consumed: 0,
+            pending: true,
+            key: None,
+        }
+    } else {
+        ParsedMenuKey {
+            consumed: 2,
+            pending: false,
+            key: None,
+        }
     }
 }
 
@@ -1508,24 +1549,7 @@ fn menu_arrow_event(params: &[u8]) -> u32 {
             let mut parts = field.split(|byte| *byte == b':');
             let _ = parts.next();
             match parts.next() {
-                Some(bytes) => {
-                    let mut value: u32 = 0;
-                    let mut valid = !bytes.is_empty();
-                    for byte in bytes {
-                        if !byte.is_ascii_digit() {
-                            valid = false;
-                            break;
-                        }
-                        value = value
-                            .saturating_mul(MENU_DECIMAL_RADIX)
-                            .saturating_add(u32::from(*byte - b'0'));
-                    }
-                    if valid {
-                        value
-                    } else {
-                        MENU_EVENT_PRESS
-                    }
-                }
+                Some(bytes) => parse_decimal(bytes).unwrap_or(MENU_EVENT_PRESS),
                 None => MENU_EVENT_PRESS,
             }
         }
@@ -1836,6 +1860,7 @@ where
             Shortcut::Menu => {
                 ctx.menu.generation = next_menu_generation(ctx.menu.generation);
                 ctx.menu.decoder = MenuInputDecoder::new();
+                ctx.shortcuts.clear_pending_releases();
                 if let Some(state) = ctx.menu.state.as_mut() {
                     *state = MenuState::open_root();
                     sync_menu_view(state, ctx.modal, ctx.stdout).await?;

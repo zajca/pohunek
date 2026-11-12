@@ -8,6 +8,22 @@ const ESC: u8 = 0x1b;
 const CSI_OPEN: u8 = b'[';
 /// Kitty keyboard reports terminate with lowercase `u`.
 const CSI_U_FINAL: u8 = b'u';
+/// SS3 reports continue with `O` after Escape.
+const SS3_OPEN: u8 = b'O';
+/// Up-arrow final byte shared by CSI and SS3 reports.
+const ARROW_UP_FINAL: u8 = b'A';
+/// Down-arrow final byte shared by CSI and SS3 reports.
+const ARROW_DOWN_FINAL: u8 = b'B';
+/// SGR mouse reports open with `<` in their parameter bytes (`ESC [ < ...`).
+const SGR_MOUSE_MARKER: u8 = b'<';
+/// Legacy mouse head `ESC [ M ...` and SGR mouse final byte.
+const MOUSE_FINAL: u8 = b'M';
+/// Bracketed-paste open parameters (`ESC [ 200 ~`).
+const PASTE_OPEN_PARAMS: &[u8] = b"200";
+/// Bracketed-paste close parameters (`ESC [ 201 ~`).
+const PASTE_CLOSE_PARAMS: &[u8] = b"201";
+/// CSI `~` final shared by bracketed-paste markers.
+const PASTE_FINAL: u8 = b'~';
 /// CSI final bytes occupy the inclusive ECMA-48 `0x40..=0x7e` range.
 const CSI_FINAL_START: u8 = 0x40;
 const CSI_FINAL_END: u8 = 0x7e;
@@ -40,6 +56,10 @@ const EVENT_RELEASE: u32 = 3;
 /// Kitty keyboard reports are normally short. Sixty-four bytes leaves room for
 /// alternate key codes while bounding state independently of the outer timer.
 const MAX_PENDING_BYTES: usize = 64;
+/// Keys remembered for release suppression after rollover. The kitty
+/// protocol reports releases for every key held at once, and a person cannot
+/// hold more keys than this at the same time.
+const MAX_TRACKED_RELEASES: usize = 8;
 
 /// Attach-menu state relevant to shortcut decoding and key normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,15 +92,18 @@ pub(super) struct DecodedInput {
 
 /// Preserves split CSI sequences while decoding attach-local shortcuts.
 ///
-/// While the menu is open it also remembers the key whose press the menu
+/// While the menu is open it also remembers every key whose press the menu
 /// consumed, so a release report arriving after the menu closed (for example
-/// the Escape release that follows the press which closed it) is swallowed
-/// once instead of being forwarded to the attached program.
+/// the Escape release that follows the press which closed it, or the release
+/// of a key still held when another key closed the menu) is swallowed once
+/// instead of being forwarded to the attached program.
 #[derive(Debug, Default)]
 pub(super) struct ShortcutDecoder {
     pending: Vec<u8>,
-    /// Key of the last actionable press the open menu consumed.
-    pending_release: Option<PendingRelease>,
+    /// Keys the open menu consumed whose release has not arrived yet.
+    pending_releases: Vec<PendingRelease>,
+    /// Set when a flushed lone Escape may be pending inside `pending`.
+    deferred_escape: bool,
 }
 
 /// Key whose release report the shortcut decoder must swallow once.
@@ -103,9 +126,20 @@ impl ShortcutDecoder {
     /// Bytes after the first shortcut are intentionally dropped, matching the
     /// historical single-byte shortcut behavior. A suffix that can still be a
     /// split CSI sequence remains pending until the next push or timeout.
+    /// A flushed lone Escape is already decoded, so while it is deferred a
+    /// read starting with its own Escape is decoded on its own first byte
+    /// instead of merging into the flushed bytes.
     pub(super) fn push(&mut self, input: &[u8], menu_mode: MenuInputMode) -> DecodedInput {
         let mut joined = std::mem::take(&mut self.pending);
+        // A lone Escape flushed after its timeout was decoded on its own
+        // already. The next read that begins with its own Escape must be
+        // decoded on its own first byte too, not joined to the flushed byte,
+        // or the two merge into one (wrong) sequence.
+        if self.deferred_escape && input.first() == Some(&ESC) {
+            joined.clear();
+        }
         joined.extend_from_slice(input);
+        self.deferred_escape = false;
 
         let mut bytes = Vec::with_capacity(joined.len());
         let mut index = 0;
@@ -160,21 +194,40 @@ impl ShortcutDecoder {
 
     /// Records a press the open menu consumed.
     fn remember_press(&mut self, release: PendingRelease) {
-        self.pending_release = Some(release);
+        if self.pending_releases.contains(&release) {
+            return;
+        }
+        if self.pending_releases.len() == MAX_TRACKED_RELEASES {
+            self.pending_releases.remove(0);
+        }
+        self.pending_releases.push(release);
     }
 
     /// Reports whether a release report names the remembered key, clearing it.
     fn take_matching_release(&mut self, release: PendingRelease) -> bool {
-        if self.pending_release == Some(release) {
-            self.pending_release = None;
-            return true;
-        }
-        false
+        let Some(position) = self.pending_releases.iter().position(|key| *key == release) else {
+            return false;
+        };
+        self.pending_releases.remove(position);
+        true
+    }
+
+    /// Forgets every remembered release after the menu closed.
+    ///
+    /// The next press starts a fresh set, so a stale release from a terminal
+    /// that never reports event types cannot swallow an unrelated release
+    /// of a later physical press.
+    pub(super) fn clear_pending_releases(&mut self) {
+        self.pending_releases.clear();
     }
 
     /// Releases an incomplete sequence unchanged after its ambiguity timeout.
     pub(super) fn flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending)
+        let flushed = std::mem::take(&mut self.pending);
+        // The next read that begins with its own Escape must be decoded on
+        // its own first byte instead of joining the flushed byte.
+        self.deferred_escape = flushed.len() == 1;
+        flushed
     }
 }
 
@@ -204,6 +257,7 @@ struct CsiUKey {
     key: u32,
     modifiers: u32,
     event: u32,
+    event_field_present: bool,
 }
 
 fn parse_at(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecoder) -> Parse {
@@ -224,7 +278,14 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecod
         return Parse::Pending;
     }
     if input[1] != CSI_OPEN {
-        return parse_ss3(input, menu_mode, decoder);
+        if input[1] == SS3_OPEN {
+            return parse_ss3(input, menu_mode);
+        }
+        // Any other `ESC x` is a lone Escape followed by a new key, or a Meta
+        // prefix: the Escape is handled on its own and the next byte is
+        // re-parsed, so a CSI typed right after a lone Escape cannot swallow
+        // it, and a shortcut byte right after Escape is not left pending.
+        return Parse::Pass;
     }
     let Some(final_offset) = input[2..]
         .iter()
@@ -241,8 +302,8 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecod
     // skips pasted text wholesale; a mouse report is consumed there too. A
     // bare `ESC [ M` is a legacy mouse head, not an arrow or paste report.
     if is_paste_control(params, final_byte)
-        || params.first() == Some(&b'<')
-        || (final_byte == b'M' && final_index == 2)
+        || params.first() == Some(&SGR_MOUSE_MARKER)
+        || (final_byte == MOUSE_FINAL && final_index == 2)
     {
         return Parse::Pass;
     }
@@ -255,7 +316,7 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecod
     // event-typed `ESC [ 1 ; <mods> [ : <event> ] A` (foot always sends the
     // `:1` subparameter). Release reports are swallowed, presses and repeats
     // become the canonical legacy report.
-    if matches!(final_byte, b'A' | b'B') {
+    if matches!(final_byte, ARROW_UP_FINAL | ARROW_DOWN_FINAL) {
         return parse_arrow_sequence(params, final_byte, consumed, menu_mode, decoder);
     }
 
@@ -269,7 +330,7 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecod
 }
 
 fn is_paste_control(params: &[u8], final_byte: u8) -> bool {
-    (params == b"200" || params == b"201") && final_byte == b'~'
+    (params == PASTE_OPEN_PARAMS || params == PASTE_CLOSE_PARAMS) && final_byte == PASTE_FINAL
 }
 
 fn parse_arrow_sequence(
@@ -292,8 +353,11 @@ fn parse_arrow_sequence(
         let _ = decoder.take_matching_release(PendingRelease::Arrow(final_byte));
         return Parse::Consumed { consumed };
     }
-    decoder.remember_press(PendingRelease::Arrow(final_byte));
-    let bytes = if final_byte == b'A' {
+    // A legacy report with no event field carries no release to suppress.
+    if !params.is_empty() {
+        decoder.remember_press(PendingRelease::Arrow(final_byte));
+    }
+    let bytes = if final_byte == ARROW_UP_FINAL {
         LEGACY_UP
     } else {
         LEGACY_DOWN
@@ -322,28 +386,24 @@ fn arrow_event(params: &[u8]) -> u32 {
     }
 }
 
-fn parse_ss3(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecoder) -> Parse {
+fn parse_ss3(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     if input.len() < 3 {
         return Parse::Pending;
     }
     if menu_mode != MenuInputMode::Open {
         return Parse::Pass;
     }
+    // SS3 reports carry no event field, so nothing here can be followed by a
+    // release and no press needs remembering for release suppression.
     match input[2] {
-        b'A' => {
-            decoder.remember_press(PendingRelease::Arrow(b'A'));
-            Parse::Emit {
-                bytes: LEGACY_UP,
-                consumed: 3,
-            }
-        }
-        b'B' => {
-            decoder.remember_press(PendingRelease::Arrow(b'B'));
-            Parse::Emit {
-                bytes: LEGACY_DOWN,
-                consumed: 3,
-            }
-        }
+        ARROW_UP_FINAL => Parse::Emit {
+            bytes: LEGACY_UP,
+            consumed: 3,
+        },
+        ARROW_DOWN_FINAL => Parse::Emit {
+            bytes: LEGACY_DOWN,
+            consumed: 3,
+        },
         _ => Parse::Consumed { consumed: 3 },
     }
 }
@@ -387,7 +447,11 @@ fn parse_csi_u_sequence(
         return Parse::Consumed { consumed };
     }
     if key.is_actionable() {
-        decoder.remember_press(PendingRelease::Unicode(key.key));
+        // Only an event-typed press can be followed by a release to suppress;
+        // a bare CSI-u press carries no release and must not prime the slot.
+        if key.event_is_reported() {
+            decoder.remember_press(PendingRelease::Unicode(key.key));
+        }
         if key.modifiers == 0 {
             if let Ok(byte) = u8::try_from(key.key) {
                 return Parse::Normalized { byte, consumed };
@@ -403,24 +467,24 @@ fn parse_csi_u_sequence(
 fn parse_csi_u(params: &[u8]) -> Option<CsiUKey> {
     let mut fields = params.split(|byte| *byte == b';');
     let key = parse_decimal(fields.next()?.split(|byte| *byte == b':').next()?)?;
-    let (modifiers, event) = match fields.next() {
+    let (modifiers, event, event_field_present) = match fields.next() {
         Some(field) => {
             let mut modifier_fields = field.split(|byte| *byte == b':');
             let encoded_modifiers = parse_decimal(modifier_fields.next()?)?;
             let modifiers = encoded_modifiers.checked_sub(MODIFIER_OFFSET)?;
-            let event = match modifier_fields.next() {
-                Some(bytes) => parse_decimal(bytes)?,
-                None => EVENT_PRESS,
-            };
-            (modifiers, event)
+            match modifier_fields.next() {
+                Some(bytes) => (modifiers, parse_decimal(bytes)?, true),
+                None => (modifiers, EVENT_PRESS, false),
+            }
         }
-        None => (0, EVENT_PRESS),
+        None => (0, EVENT_PRESS, false),
     };
 
     Some(CsiUKey {
         key,
         modifiers,
         event,
+        event_field_present,
     })
 }
 
@@ -432,9 +496,16 @@ impl CsiUKey {
     fn is_actionable(self) -> bool {
         matches!(self.event, EVENT_PRESS | EVENT_REPEAT)
     }
+
+    /// Whether the report carried an explicit event-type field. The pressed
+    /// event omits it, so only a press or repeat with an explicit field can
+    /// be followed by a matching release.
+    fn event_is_reported(self) -> bool {
+        self.event_field_present
+    }
 }
 
-fn parse_decimal(bytes: &[u8]) -> Option<u32> {
+pub(super) fn parse_decimal(bytes: &[u8]) -> Option<u32> {
     if bytes.is_empty() {
         return None;
     }
