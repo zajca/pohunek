@@ -14,6 +14,8 @@
 mod agent_skill;
 #[path = "assistant.rs"]
 mod assistant;
+#[path = "attach_menu_keys.rs"]
+mod attach_menu_keys;
 #[path = "attach_stream_input.rs"]
 mod attach_stream_input;
 #[path = "claude_package.rs"]

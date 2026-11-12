@@ -29,6 +29,12 @@ const EVENT_PRESS: u32 = 1;
 const EVENT_REPEAT: u32 = 2;
 /// Decimal terminal parameters use base ten.
 const DECIMAL_RADIX: u32 = 10;
+/// Legacy up-arrow canonical CSI sequence emitted to the open menu.
+const LEGACY_UP: &[u8] = b"\x1b[A";
+/// Legacy down-arrow canonical CSI sequence emitted to the open menu.
+const LEGACY_DOWN: &[u8] = b"\x1b[B";
+/// Kitty event type `3` is a key release.
+const EVENT_RELEASE: u32 = 3;
 /// Largest incomplete terminal sequence retained between stdin reads.
 ///
 /// Kitty keyboard reports are normally short. Sixty-four bytes leaves room for
@@ -65,9 +71,25 @@ pub(super) struct DecodedInput {
 }
 
 /// Preserves split CSI sequences while decoding attach-local shortcuts.
+///
+/// While the menu is open it also remembers the key whose press the menu
+/// consumed, so a release report arriving after the menu closed (for example
+/// the Escape release that follows the press which closed it) is swallowed
+/// once instead of being forwarded to the attached program.
 #[derive(Debug, Default)]
 pub(super) struct ShortcutDecoder {
     pending: Vec<u8>,
+    /// Key of the last actionable press the open menu consumed.
+    pending_release: Option<PendingRelease>,
+}
+
+/// Key whose release report the shortcut decoder must swallow once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRelease {
+    /// A CSI-u key code (for example `27` for Escape).
+    Unicode(u32),
+    /// An arrow key, by final byte (`A` for up, `B` for down).
+    Arrow(u8),
 }
 
 impl ShortcutDecoder {
@@ -88,7 +110,7 @@ impl ShortcutDecoder {
         let mut bytes = Vec::with_capacity(joined.len());
         let mut index = 0;
         while index < joined.len() {
-            match parse_at(&joined[index..], menu_mode) {
+            match parse_at(&joined[index..], menu_mode, self) {
                 Parse::Shortcut { shortcut } => {
                     return DecodedInput {
                         bytes,
@@ -106,6 +128,13 @@ impl ShortcutDecoder {
                 }
                 Parse::Normalized { byte, consumed } => {
                     bytes.push(byte);
+                    index += consumed;
+                }
+                Parse::Emit {
+                    bytes: emitted,
+                    consumed,
+                } => {
+                    bytes.extend_from_slice(emitted);
                     index += consumed;
                 }
                 Parse::Consumed { consumed } => {
@@ -129,6 +158,20 @@ impl ShortcutDecoder {
         !self.pending.is_empty()
     }
 
+    /// Records a press the open menu consumed.
+    fn remember_press(&mut self, release: PendingRelease) {
+        self.pending_release = Some(release);
+    }
+
+    /// Reports whether a release report names the remembered key, clearing it.
+    fn take_matching_release(&mut self, release: PendingRelease) -> bool {
+        if self.pending_release == Some(release) {
+            self.pending_release = None;
+            return true;
+        }
+        false
+    }
+
     /// Releases an incomplete sequence unchanged after its ambiguity timeout.
     pub(super) fn flush(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
@@ -137,9 +180,21 @@ impl ShortcutDecoder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Parse {
-    Shortcut { shortcut: Shortcut },
-    Normalized { byte: u8, consumed: usize },
-    Consumed { consumed: usize },
+    Shortcut {
+        shortcut: Shortcut,
+    },
+    Normalized {
+        byte: u8,
+        consumed: usize,
+    },
+    /// Canonical replacement bytes for the open menu, e.g. `ESC [ A`.
+    Emit {
+        bytes: &'static [u8],
+        consumed: usize,
+    },
+    Consumed {
+        consumed: usize,
+    },
     Pending,
     Pass,
 }
@@ -151,7 +206,7 @@ struct CsiUKey {
     event: u32,
 }
 
-fn parse_at(input: &[u8], menu_mode: MenuInputMode) -> Parse {
+fn parse_at(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecoder) -> Parse {
     match input[0] {
         DETACH_BYTE => Parse::Shortcut {
             shortcut: Shortcut::Detach,
@@ -159,17 +214,17 @@ fn parse_at(input: &[u8], menu_mode: MenuInputMode) -> Parse {
         MENU_BYTE if menu_mode == MenuInputMode::Closed => Parse::Shortcut {
             shortcut: Shortcut::Menu,
         },
-        ESC => parse_csi(input, menu_mode),
+        ESC => parse_csi(input, menu_mode, decoder),
         _ => Parse::Pass,
     }
 }
 
-fn parse_csi(input: &[u8], menu_mode: MenuInputMode) -> Parse {
+fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecoder) -> Parse {
     if input.len() == 1 {
         return Parse::Pending;
     }
     if input[1] != CSI_OPEN {
-        return Parse::Pass;
+        return parse_ss3(input, menu_mode, decoder);
     }
     let Some(final_offset) = input[2..]
         .iter()
@@ -178,14 +233,130 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode) -> Parse {
         return Parse::Pending;
     };
     let final_index = final_offset + 2;
-    if input[final_index] != CSI_U_FINAL {
+    let consumed = final_index + 1;
+    let final_byte = input[final_index];
+    let params = &input[2..final_index];
+
+    // Bracketed-paste control sequences belong to the menu decoder, which
+    // skips pasted text wholesale; a mouse report is consumed there too. A
+    // bare `ESC [ M` is a legacy mouse head, not an arrow or paste report.
+    if is_paste_control(params, final_byte)
+        || params.first() == Some(&b'<')
+        || (final_byte == b'M' && final_index == 2)
+    {
         return Parse::Pass;
     }
 
-    let Some(key) = parse_csi_u(&input[2..final_index]) else {
+    if final_byte == CSI_U_FINAL {
+        return parse_csi_u_sequence(params, consumed, menu_mode, decoder);
+    }
+
+    // Arrow finals accept every CSI form: legacy `ESC [ A`, and the kitty
+    // event-typed `ESC [ 1 ; <mods> [ : <event> ] A` (foot always sends the
+    // `:1` subparameter). Release reports are swallowed, presses and repeats
+    // become the canonical legacy report.
+    if matches!(final_byte, b'A' | b'B') {
+        return parse_arrow_sequence(params, final_byte, consumed, menu_mode, decoder);
+    }
+
+    // Every other complete CSI is consumed whole by the open menu, so none of
+    // its bytes (focus reports, colour-scheme reports, releases of other keys)
+    // can act as a hotkey or enter the rename buffer. Closed input forwards.
+    if menu_mode == MenuInputMode::Open {
+        return Parse::Consumed { consumed };
+    }
+    Parse::Pass
+}
+
+fn is_paste_control(params: &[u8], final_byte: u8) -> bool {
+    (params == b"200" || params == b"201") && final_byte == b'~'
+}
+
+fn parse_arrow_sequence(
+    params: &[u8],
+    final_byte: u8,
+    consumed: usize,
+    menu_mode: MenuInputMode,
+    decoder: &mut ShortcutDecoder,
+) -> Parse {
+    let event = arrow_event(params);
+    if menu_mode != MenuInputMode::Open {
+        if event == EVENT_RELEASE
+            && decoder.take_matching_release(PendingRelease::Arrow(final_byte))
+        {
+            return Parse::Consumed { consumed };
+        }
+        return Parse::Pass;
+    }
+    if event == EVENT_RELEASE {
+        let _ = decoder.take_matching_release(PendingRelease::Arrow(final_byte));
+        return Parse::Consumed { consumed };
+    }
+    decoder.remember_press(PendingRelease::Arrow(final_byte));
+    let bytes = if final_byte == b'A' {
+        LEGACY_UP
+    } else {
+        LEGACY_DOWN
+    };
+    if params.is_empty() {
+        Parse::Pass
+    } else {
+        Parse::Emit { bytes, consumed }
+    }
+}
+
+fn arrow_event(params: &[u8]) -> u32 {
+    let mut fields = params.split(|byte| *byte == b';');
+    // The first field carries the key number (`1`) and any subparameters.
+    let _ = fields.next();
+    match fields.next() {
+        Some(field) => {
+            let mut parts = field.split(|byte| *byte == b':');
+            let _ = parts.next();
+            match parts.next() {
+                Some(bytes) => parse_decimal(bytes).unwrap_or(EVENT_PRESS),
+                None => EVENT_PRESS,
+            }
+        }
+        None => EVENT_PRESS,
+    }
+}
+
+fn parse_ss3(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecoder) -> Parse {
+    if input.len() < 3 {
+        return Parse::Pending;
+    }
+    if menu_mode != MenuInputMode::Open {
+        return Parse::Pass;
+    }
+    match input[2] {
+        b'A' => {
+            decoder.remember_press(PendingRelease::Arrow(b'A'));
+            Parse::Emit {
+                bytes: LEGACY_UP,
+                consumed: 3,
+            }
+        }
+        b'B' => {
+            decoder.remember_press(PendingRelease::Arrow(b'B'));
+            Parse::Emit {
+                bytes: LEGACY_DOWN,
+                consumed: 3,
+            }
+        }
+        _ => Parse::Consumed { consumed: 3 },
+    }
+}
+
+fn parse_csi_u_sequence(
+    params: &[u8],
+    consumed: usize,
+    menu_mode: MenuInputMode,
+    decoder: &mut ShortcutDecoder,
+) -> Parse {
+    let Some(key) = parse_csi_u(params) else {
         return Parse::Pass;
     };
-    let consumed = final_index + 1;
 
     if key.is_actionable() && key.has_ctrl() {
         match key.key {
@@ -204,11 +375,23 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     }
 
     if menu_mode != MenuInputMode::Open {
+        if key.event == EVENT_RELEASE
+            && decoder.take_matching_release(PendingRelease::Unicode(key.key))
+        {
+            return Parse::Consumed { consumed };
+        }
         return Parse::Pass;
     }
-    if key.is_actionable() && key.modifiers == 0 {
-        if let Ok(byte) = u8::try_from(key.key) {
-            return Parse::Normalized { byte, consumed };
+    if key.event == EVENT_RELEASE {
+        let _ = decoder.take_matching_release(PendingRelease::Unicode(key.key));
+        return Parse::Consumed { consumed };
+    }
+    if key.is_actionable() {
+        decoder.remember_press(PendingRelease::Unicode(key.key));
+        if key.modifiers == 0 {
+            if let Ok(byte) = u8::try_from(key.key) {
+                return Parse::Normalized { byte, consumed };
+            }
         }
     }
 
