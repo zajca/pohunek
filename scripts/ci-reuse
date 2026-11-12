@@ -379,6 +379,8 @@ def decide(
                     skip_set.discard(job_id)
                     changed = True
         ordered = [job_id for job_id in config["jobs"] if job_id in skip_set]
+        if not ordered:
+            return [], None, "no same-tree green pull request run"
         return ordered, run, ""
     return [], None, "no same-tree pull request run"
 
