@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -131,6 +132,23 @@ def names_a_workflow_job(required, workflow_path):
             return True
     return False
 
+
+# Runs a Python script under a virtual clock: time only moves when the script
+# sleeps, so a timeout scenario cannot race host load. subprocess is imported
+# first, before time is patched, so it keeps the real monotonic clock it bound
+# at import for its own subprocess timeouts.
+VIRTUAL_CLOCK_RUNNER = r'''
+import subprocess
+import runpy
+import sys
+import time
+
+now = [0.0]
+time.monotonic = lambda: now[0]
+time.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+'''
 
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
@@ -366,7 +384,8 @@ class CiEvidenceCliTests(unittest.TestCase):
         # the commit it checks.
         config_arguments = [] if tree_config else ["--config", str(config or self.config)]
         return subprocess.run(
-            [str(script), "--repo", "example/pohunek", "--sha", sha,
+            [sys.executable, "-c", VIRTUAL_CLOCK_RUNNER, str(script),
+             "--repo", "example/pohunek", "--sha", sha,
              "--tier", tier, *config_arguments, *extra],
             capture_output=True,
             text=True,
