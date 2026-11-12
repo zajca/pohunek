@@ -834,7 +834,8 @@ pub(crate) async fn run_new(
     } else {
         None
     };
-    // A replay never carries the first response's `fetched_ref`.
+    // Fails with `fetch_ref_outcome_missing` when a first response
+    // omits the requested `fetched_ref`; the session already exists.
     let fetched_ref = requested_fetched_ref(host, &args, &result)?;
     if json {
         let mut value = serde_json::to_value(info)?;

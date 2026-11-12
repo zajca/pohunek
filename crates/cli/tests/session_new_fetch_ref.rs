@@ -391,7 +391,7 @@ fn fetch_ref_is_refused_by_a_daemon_that_ignores_it() {
 }
 
 #[test]
-fn a_replay_reports_no_fetched_ref_and_stays_green() {
+fn a_replay_succeeds_without_a_fetched_ref() {
     let keys = Arc::new(Keys::default());
     let env = private_environment();
     let root = env.root().to_path_buf();
@@ -400,18 +400,17 @@ fn a_replay_reports_no_fetched_ref_and_stays_green() {
         SUPPORTING,
         Arc::clone(&keys),
     );
-    let session_new = |extra: &[&str]| {
+    let session_new = || {
         let mut args = fetch_ref_args();
         args.extend(["--request-id", "fetch-1", "--json"]);
-        args.extend(extra.iter().copied());
         env.command(pohunek_test_support::bin_exe("pohunek"))
             .args(["session", "new", "--agent", "shell"])
             .args(&args)
             .output()
             .expect("run pohunek session new")
     };
-    let first = session_new(&[]);
-    let second = session_new(&[]);
+    let first = session_new();
+    let second = session_new();
 
     assert!(first.status.success(), "{first:?}");
     assert!(second.status.success(), "{second:?}");
