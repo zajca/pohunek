@@ -2065,6 +2065,22 @@ impl FreshHost {
             .collect()
     }
 
+    /// The assistant packages the daemon lists, as `(digest, selected, enabled)`.
+    /// Unlike `assistant_packages`, this keeps `selected` and `enabled`
+    /// separate, so a disabled selection is told apart from no selection.
+    async fn assistant_package_states(&self) -> Vec<(String, bool, bool)> {
+        let mut client = self.installation.client().await;
+        client
+            .call::<method::PackageList>(())
+            .await
+            .expect("list packages")
+            .packages
+            .into_iter()
+            .filter(|info| info.package.id.as_str() == assistant_index::ASSISTANT_PACKAGE)
+            .map(|info| (info.digest.as_str().to_owned(), info.selected, info.enabled))
+            .collect()
+    }
+
     /// `pohunek assistant help --print-prompt --json` against this host's
     /// daemon, as a fresh process with this installation's directories.
     fn print_assistant_prompt(&self) -> std::process::Output {
@@ -2539,23 +2555,23 @@ async fn an_installed_listed_digest_does_not_hide_a_serving_selection() {
         .await
         .expect_err("an installed digest the owner left disabled ends the run incomplete");
     assert_eq!(error.code(), "setup_incomplete");
-    let installed = host.assistant_packages().await;
+    let states = host.assistant_package_states().await;
     assert_eq!(
-        installed.len(),
+        states.len(),
         2,
-        "the gap run installs and removes nothing: {installed:?}"
+        "the gap run installs and removes nothing: {states:?}"
     );
     assert!(
-        installed
+        states
             .iter()
-            .any(|(_, digest, selected)| digest == listed && !*selected),
-        "the listed digest stays as the owner left it: {installed:?}"
+            .any(|(digest, selected, enabled)| digest == listed && !*selected && *enabled),
+        "the listed digest stays enabled and unselected: {states:?}"
     );
     assert!(
-        installed
-            .iter()
-            .any(|(_, digest, selected)| digest == newer.digest.as_str() && !*selected),
-        "the disabled selection stays recorded on its digest: {installed:?}"
+        states.iter().any(
+            |(digest, selected, enabled)| digest == newer.digest.as_str() && *selected && !*enabled
+        ),
+        "the disabled selection stays selected and disabled: {states:?}"
     );
 
     // Restoring the selection serves again, whatever the listed digest is.
@@ -2592,14 +2608,15 @@ async fn an_installed_listed_digest_does_not_hide_a_serving_selection() {
     assert!(
         installed
             .iter()
-            .any(|(_, digest, selected)| digest == listed && !*selected),
-        "the disabled listed digest stays as the owner left it: {installed:?}"
-    );
-    assert!(
-        installed
-            .iter()
             .any(|(_, digest, selected)| digest == newer.digest.as_str() && *selected),
         "the serving selection stays selected: {installed:?}"
+    );
+    let states = host.assistant_package_states().await;
+    assert!(
+        states
+            .iter()
+            .any(|(digest, selected, enabled)| digest == listed && !*selected && !*enabled),
+        "the listed digest stays disabled and unselected: {states:?}"
     );
 }
 
