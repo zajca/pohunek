@@ -1,0 +1,3 @@
+## Unreleased (2026-11-12, Skill refusal for a profile over a runtime without hooks, #2187)
+
+- `pohunek integration install --skill` and `integration uninstall --skill` (also `skill_only`) for a host profile whose runtime has no daemon-managed hook integration (a profile over Pi) answer `integration_agent_skill_unsupported` instead of `agent_not_installable`, as `--agent pi` already did; the message is `<runtime id or profile NAME> has no daemon-managed hook integration, so the daemon cannot install its agent skill` with the hint to drop `--skill`; a runtime with hooks but no skill location keeps the hint to install a package version that declares one. See [Runtime packages](guides/runtime-packages.md#agent-skill-location).
