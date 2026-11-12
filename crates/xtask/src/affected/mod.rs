@@ -497,6 +497,14 @@ const RULES: &[Rule] = &[
         "scripts executed by pohunek-cli tests (the Hermes plugin release smoke suite)",
     ),
     rule(
+        Pattern::File("scripts/gate-receipt"),
+        Effect::AlsoTests(&[readers(
+            "pohunek-session-worker",
+            "test(=server::receipt_guard_tests::receipt_class_one_matches_the_injected_session_environment)",
+        )]),
+        "receipt class-1 list read by the session-worker receipt guard test (also by the script suite through the scripts reminder)",
+    ),
+    rule(
         Pattern::Dir("packaging"),
         Effect::Packages(&["pohunek-cli", "xtask"]),
         "daemon packaging tested by pohunek-cli; xtask embeds stage-archive's release files",
@@ -1500,6 +1508,7 @@ mod tests {
             package("pohunek-relay-client", "crates/relay-client"),
             package("pohunek-knowledge", "crates/knowledge"),
             package("pohunek-daemon", "crates/daemon"),
+            package("pohunek-session-worker", "crates/session-worker"),
             package("pohunek-protocol", "crates/protocol"),
             package("pohunek-client", "crates/client"),
             Package {

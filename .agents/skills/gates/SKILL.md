@@ -124,6 +124,81 @@ change can affect daemon/worker behavior.
    explicitly skipped with why). Say plainly what actually ran. If all pass,
    say so plainly; if any fail or were skipped, say which and why, with output.
 
+## Receipts
+
+`scripts/gate-receipt run --gate <name> --max-age 24h -- <command>` wraps one
+canonical gate line so a second run on an unchanged tree skips the command.
+The first run executes the command and writes a receipt; the second verifies
+the receipt and exits 0 without running it. A receipt is local convenience,
+never CI evidence: CI and the Opus review marker stay the landing evidence.
+
+Wrap each gate with its canonical line, identical across sessions so the key
+matches (the argv after `--` is part of the key):
+
+```bash
+scripts/gate-receipt run --gate fmt --max-age 24h -- /tmp/heavy-run.sh cargo fmt --all --check
+scripts/gate-receipt run --gate toolchain-pin --max-age 24h -- /tmp/heavy-run.sh scripts/check-rust-toolchain-pin
+scripts/gate-receipt run --gate clippy --max-age 24h -- /tmp/heavy-run.sh cargo clippy --workspace --all-targets --all-features
+scripts/gate-receipt run --gate darwin --max-age 24h -- /tmp/heavy-run.sh scripts/darwin-check
+scripts/gate-receipt run --gate nextest --max-age 24h -- /tmp/heavy-run.sh cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+scripts/gate-receipt run --gate doctests --max-age 24h -- /tmp/heavy-run.sh cargo test --doc --workspace --all-features
+scripts/gate-receipt run --gate docs --max-age 24h -- /tmp/heavy-run.sh cargo xtask docs check
+```
+
+`gate-receipt` strips the daemon's session runtime names from the wrapped
+command's environment and keys no session runtime name, so no unsetting is
+needed around the invocation and receipts are shared across sessions.
+Every other `POHUNEK_*` name is contributor or CI configuration (for
+example `POHUNEK_PYTHON_BIN`, which selects the Hermes test interpreter):
+it passes through to the gate unchanged and is keyed by hash, so a changed
+value reruns the gate.
+
+The final gate before a push may use a receipt only when that receipt was
+written for the exact tree being pushed; a receipt never carries a gate
+across a changed tree.
+
+24h matches the lane rhythm: a receipt written during the day's work is still
+fresh for the evening's final gate or the next morning's re-run, while a
+tree that sits longer than a day re-runs its gates instead of trusting stale
+proof from a toolchain or dependency world that may have moved.
+
+A receipt is not accepted — the command runs again — when any of these holds:
+
+- No receipt file exists for the key, or it is not valid JSON of the known schema.
+- The key differs: a changed working tree (tracked, staged, unstaged, or
+  untracked-but-not-ignored files), a different gate name or argv, a
+  different working directory, different `rustc -vV`/`cargo -vV` output, a
+  different command-file hash, a different `CARGO_HOME` location, extra
+  compiler flags or wrappers (`RUSTC`, `RUSTC_WRAPPER`,
+  `RUSTC_WORKSPACE_WRAPPER`, `CARGO_ENCODED_RUSTFLAGS`, `RUSTC_BOOTSTRAP`),
+  or different tracked environment hashes. The daemon's session runtime
+  names are never keyed, so a second session reuses the receipt; every
+  other `POHUNEK_*` name is configuration and is keyed, so a changed
+  contributor setting reruns the gate.
+- It is older than `--max-age`, or it ends more than 60s in the future
+  (beyond the `CLOCK_SKEW_SECONDS` clock skew bound).
+- It is not owned by the current uid, or it is readable or writable by
+  group or others.
+- The store directory is not owned by the current uid, or is not mode 0700.
+  A wrong store mode is never repaired silently: both `run` and `check`
+  refuse the receipt, `run` runs the command and writes no receipt.
+- Ignored inputs are out of scope by construction: `target/`, local `.env`
+  files, and other ignored paths never enter the tree id, so changing only
+  them never invalidates a receipt.
+- A gate that needs the network or external state is never wrapped: the
+  two Hermes gates (`scripts/build-hermes-package`,
+  `cargo xtask hermes compatibility`) and `cargo audit` re-run every time.
+  Their inputs live outside the key — the package tarball, the `--bin-dir`
+  build outputs, the remote registry — so a receipt could skip a gate whose
+  real inputs have moved.
+- A gate whose output under an ignored path feeds a later gate is never
+  wrapped: `bins` builds `pohunek-sessiond`, which the nextest daemon tests
+  spawn from beside the test binaries, and `release-build` fills
+  `target/release`, which the Hermes compatibility gate reads through
+  `--bin-dir`. Both outputs live under the ignored `target/`, outside the
+  key, so a skipped producer would leave a missing or stale artifact that a
+  later gate consumes. Build them every time.
+
 ## Narrower loops while iterating
 
 Use these to shorten the feedback loop (see

@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Skip a repeated gate run when the working tree still matches a prior pass.
+
+    scripts/gate-receipt run   --gate NAME --max-age DURATION [--store DIR] -- COMMAND...
+    scripts/gate-receipt check --gate NAME --max-age DURATION [--store DIR] -- COMMAND...
+
+A receipt is local convenience, never CI evidence. CI and the Opus review
+marker stay the landing evidence. A second gate run on an unchanged tree
+verifies the receipt the first run wrote and skips the command; anything the
+key does not cover means the command runs again.
+
+Contract:
+
+* `run` verifies the receipt for the key. When it is valid, `run` prints the
+  receipt path, its write time and its session, then exits 0 without running
+  the command. Otherwise it prints why the receipt was rejected and runs the
+  command with inherited stdio, propagating its exit code.
+* A receipt is written only when the exit code is 0 and the working-tree id
+  after the run equals the id before it. A command that rewrote files gets no
+  receipt, with a printed reason.
+* `check` prints the verdict and the reason and exits 0 for a valid receipt,
+  1 for a missing or invalid one. It never runs the command.
+* `--store` defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/pohunek/gate-receipts`.
+  This is the XDG base-directory convention: per-user state that roams with
+  neither the repository nor the session. The store is created 0700 and
+  receipts are written 0600, atomically (a temporary file in the same
+  directory, then `os.replace`). An existing store is never repaired: a
+  store with the wrong mode or owner rejects the receipt in both verbs,
+  the command runs, and no receipt is written.
+* The key is sha256 over a canonical JSON of the working-tree id, the gate
+  name, the exact argv after `--`, the working directory relative to the
+  repository root, the toolchain outputs, a hash of the command file when it
+  lives inside the repository, and the hashes (never the values) of the
+  environment that can change a gate result. The daemon's session runtime
+  names (SESSION_RUNTIME_VARS) are never keyed and are stripped from the
+  wrapped command's environment, so receipts are shared across sessions;
+  every other POHUNEK_* name is configuration, passes through, and is keyed.
+  The HEAD commit is recorded in the receipt but not keyed, so committing
+  identical content keeps the key.
+* Raw environment values are never written anywhere, neither into the receipt
+  nor onto stdout.
+
+Exit codes: `run` propagates the command's exit code (0 when skipped);
+`check` exits 0 for a valid receipt and 1 otherwise; usage errors exit 2.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Version of the receipt schema. A reader that does not recognise it rejects
+# the receipt instead of guessing what its fields mean.
+SCHEMA_VERSION = 1
+# The store holds proof of passed gates; only its owner may list or read it.
+STORE_MODE = 0o700
+# A receipt is readable by its owner alone: environment hashes stay private.
+RECEIPT_MODE = 0o600
+# `--max-age` grammar: one or more `<number><unit>` groups, as in
+# `scripts/stress-run --deadline` (`90s`, `30m`, `24h`, `7d`).
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+DURATION_PATTERN = re.compile(r"(\d+)([smhd])")
+# A gate name becomes a file name, so it carries no path separators.
+GATE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+# Exact environment names that can change a gate result. RUSTC selects the
+# compiler binary (which may differ from `rustc -vV` on PATH); the WRAPPER
+# names interpose on every rustc invocation; CARGO_ENCODED_RUSTFLAGS carries
+# extra flags; RUSTC_BOOTSTRAP unlocks unstable features; CARGO_HOME is
+# keyed by location (fail-safe): a different location reruns the gate.
+# The content of $CARGO_HOME/config.toml is not covered — only the location.
+ENV_EXACT = (
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_BOOTSTRAP",
+    "CARGO_HOME",
+)
+# Environment prefixes that can change a gate result. Every match is recorded
+# as name to sha256(value), with an absent variable distinct from an empty one
+# (an absent variable simply has no entry).
+ENV_PREFIXES = ("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_", "NEXTEST_")
+# Every other POHUNEK_* name (contributor or CI configuration such as
+# POHUNEK_PYTHON_BIN, set by CI or the operator) is tracked by hash like any
+# other keyed variable: it passes through to the child and a changed value
+# reruns the gate. Session runtime names are excluded explicitly below.
+POHUNEK_PREFIX = "POHUNEK_"
+# Names deliberately outside the key, with the reason each is excluded:
+# - CARGO_TARGET_DIR: per-worktree build cache location; changes where build
+#   outputs go, not whether the gate passes. (It matches the CARGO_TARGET_
+#   prefix, so it is excluded explicitly.)
+# - TMPDIR: scratch location; nothing a gate asserts depends on it.
+# - PATH: differs per session (shims, wrappers); the toolchain strings pin
+#   the compiler, so a PATH-only change cannot silently pass a gate.
+# None of the remaining names matches ENV_EXACT or ENV_PREFIXES, and
+# CARGO_TARGET_DIR is listed here, so the exclusion is structural; the
+# reasons above explain why that is safe.
+ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
+# Session runtime variables the daemon or worker exports into a managed
+# session. The tool strips exactly these names from the wrapped command's
+# environment and never keys them, so two sessions share receipts written on
+# the same tree. This is the exact set the worker injects in
+# `crates/session-worker/src/server.rs::SESSION_ENVIRONMENT_NAMES` (the
+# session-owned names command_from_initialize injects) together with
+# `HOOK_RETRY_ENV_NAMES` from
+# `crates/worker-protocol/src/env.rs` (the only POHUNEK_* names a profile
+# environment may carry into the child). The Rust guard test
+# (receipt_guard_tests in session-worker, which runs on every worker PR)
+# compares the POHUNEK_* names production injects with this list; the
+# Python suite guards scripts-side edits. The entries carry no per-name
+# reason; the grouping comment states each name's source.
+SESSION_RUNTIME_VARS = frozenset({
+    # Session-owned names injected by the worker (SESSION_ENVIRONMENT_NAMES).
+    "POHUNEK_ENV",
+    "POHUNEK_SESSION_ID",
+    "POHUNEK_WORKER_ID",
+    "POHUNEK_WORKER_INSTANCE_ID",
+    "POHUNEK_WORKER_SOCKET_PATH",
+    "POHUNEK_WORKER_HOOK_PROTOCOL_VERSION",
+    "POHUNEK_SOCKET_PATH",
+    "POHUNEK_PROTOCOL_VERSION",
+    "POHUNEK_HOOK_TRACE_PATH",
+    "POHUNEK_HOOK_TRACE_MAX_BYTES",
+    "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
+    "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
+    # Injected conditionally when their Initialize fields are set.
+    "POHUNEK_DAEMON_ID",
+    "POHUNEK_NATIVE_REFERENCE_KIND",
+    # From HOOK_RETRY_ENV_NAMES (profile environment may carry them).
+    "POHUNEK_HOOK_ADMISSION_RETRY",
+    "POHUNEK_HOOK_RETRY_DEADLINE_MS",
+    "POHUNEK_HOOK_RETRY_BACKOFF_MS",
+    "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS",
+})
+# The authoring session, recorded in the receipt as provenance; never keyed.
+SESSION_ID_VAR = "POHUNEK_SESSION_ID"
+# A receipt ending less than this far in the future is accepted: NTP steps
+# and VM restores move the clock by seconds, not minutes.
+CLOCK_SKEW_SECONDS = 60
+
+
+class UsageError(Exception):
+    """Invalid arguments or an unusable checkout; nothing was started."""
+
+
+def parse_duration(text):
+    """Seconds in `text` (`90s`, `30m`, `24h`, `7d`); raises UsageError otherwise."""
+    position = 0
+    total = 0
+    for match in DURATION_PATTERN.finditer(text):
+        if match.start() != position:
+            raise UsageError(f"invalid duration {text!r}: use like 90s, 30m, 24h, 7d")
+        total += int(match.group(1)) * DURATION_UNITS[match.group(2)]
+        position = match.end()
+    if position != len(text) or total <= 0:
+        raise UsageError(f"invalid duration {text!r}: use like 90s, 30m, 24h, 7d")
+    return total
+
+
+def default_store():
+    """The default store under the XDG state directory."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(base, "pohunek", "gate-receipts")
+
+
+def run_git(root, *args, extra_env=None):
+    """Runs git in `root`; returns stdout stripped, raising UsageError on failure."""
+    env = dict(os.environ)
+    env.update(extra_env or {})
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise UsageError(f"cannot run git: {exc}") from exc
+    if completed.returncode != 0:
+        raise UsageError(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
+    return completed.stdout.strip()
+
+
+def repo_root():
+    """Top level of the repository holding the current directory."""
+    return run_git(os.getcwd(), "rev-parse", "--show-toplevel")
+
+
+def working_tree_id(root):
+    """Content id of HEAD plus the worktree: tracked, staged, unstaged and
+    untracked-but-not-ignored files. Computed through a temporary index, so
+    the real index and the worktree are never modified. Ignored files
+    (`target/`) are out of scope by construction: `git add` skips them."""
+    with tempfile.NamedTemporaryFile(prefix="gate-receipt-index-") as index:
+        env = {"GIT_INDEX_FILE": index.name}
+        run_git(root, "read-tree", "HEAD", extra_env=env)
+        run_git(root, "add", "-A", extra_env=env)
+        return run_git(root, "write-tree", extra_env=env)
+
+
+def head_commit(root):
+    """The current HEAD commit; a receipt always names the commit it was written for."""
+    return run_git(root, "rev-parse", "HEAD")
+
+
+def toolchain_output(root, program):
+    """The stdout of `<program> -vV` run in the repository root, so the
+    `rust-toolchain.toml` pin applies through rustup."""
+    env = dict(os.environ)
+    try:
+        completed = subprocess.run(
+            [program, "-vV"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise UsageError(f"cannot run {program} -vV: {exc}") from exc
+    if completed.returncode != 0:
+        raise UsageError(f"{program} -vV failed: {completed.stderr.strip()}")
+    return completed.stdout
+
+
+def tracked_environment():
+    """Name to sha256(value) for the environment that can change a gate result.
+    Session runtime names (SESSION_RUNTIME_VARS) are never keyed; every other
+    POHUNEK_* name is contributor or CI configuration and is keyed by hash."""
+    tracked = {}
+    for name, value in os.environ.items():
+        if name in SESSION_RUNTIME_VARS or name in ENV_EXCLUDE:
+            continue
+        if (name in ENV_EXACT or name.startswith(ENV_PREFIXES)
+                or name.startswith(POHUNEK_PREFIX)):
+            tracked[name] = hashlib.sha256(value.encode()).hexdigest()
+    return tracked
+
+
+def child_environment():
+    """The environment for the wrapped command: everything except the session
+    runtime names. Every other POHUNEK_* name passes through unchanged, so
+    contributor configuration such as POHUNEK_PYTHON_BIN still reaches the
+    gate. This differs from deliver-issue, which unsets every POHUNEK_*
+    (there the operator can re-export a name; here stripping keeps the
+    documented invocation to one line and receipts shared across sessions)."""
+    return {name: value for name, value in os.environ.items()
+            if name not in SESSION_RUNTIME_VARS}
+
+
+def command_file_hash(root, argv):
+    """sha256 of the command file when argv names one inside the repository
+    (argv[0], or argv[1] after `/tmp/heavy-run.sh`); None otherwise. The tree
+    id already covers that file; this is belt and braces."""
+    candidates = list(argv[:1])
+    if argv[:1] == ["/tmp/heavy-run.sh"] and len(argv) > 1:
+        candidates = list(argv[1:2])
+    for candidate in candidates:
+        path = Path(candidate)
+        if not path.is_absolute():
+            path = Path(os.getcwd()) / path
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        try:
+            inside = resolved.is_relative_to(Path(root).resolve())
+        except OSError:
+            continue
+        if inside and resolved.is_file():
+            return hashlib.sha256(resolved.read_bytes()).hexdigest()
+    return None
+
+
+def compute_key(root, gate, argv):
+    """The canonical key for this gate run, and the key object it hashes."""
+    tree = working_tree_id(root)
+    key_object = {
+        "gate": gate,
+        "argv": list(argv),
+        # argv means different things in different directories, so the
+        # working directory relative to the root is part of the key.
+        "cwd": os.path.relpath(os.getcwd(), root),
+        "tree": tree,
+        "rustc": toolchain_output(root, "rustc"),
+        "cargo": toolchain_output(root, "cargo"),
+        "command_file": command_file_hash(root, argv),
+        "env": tracked_environment(),
+    }
+    canonical = json.dumps(key_object, sort_keys=True, separators=(",", ":"))
+    key = hashlib.sha256(canonical.encode()).hexdigest()
+    # Recorded in the receipt for provenance, but not keyed: committing
+    # identical content keeps the key.
+    key_object["head"] = head_commit(root)
+    return key, key_object
+
+
+def receipt_path(store, gate, key):
+    """Receipt file for `gate` and `key` inside `store`."""
+    return os.path.join(store, f"{gate}-{key}.json")
+
+
+def check_store(store):
+    """Validity of an existing store directory; (ok, reason)."""
+    if not os.path.isdir(store):
+        return False, f"store {store} is not a directory"
+    info = os.stat(store)
+    if info.st_uid != os.getuid():
+        return False, f"store {store} is not owned by uid {os.getuid()}"
+    if info.st_mode & 0o777 != STORE_MODE:
+        return False, f"store {store} is not mode 0700"
+    return True, "store is owned by the current uid and mode 0700"
+
+
+def validate(store, gate, key, max_age_seconds):
+    """Validity of the receipt for `key`; (ok, reason, receipt or None)."""
+    path = receipt_path(store, gate, key)
+    try:
+        raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return False, f"no receipt at {path}", None
+    except OSError as exc:
+        return False, f"cannot read receipt at {path}: {exc}", None
+    try:
+        receipt = json.loads(raw.decode())
+    except (UnicodeDecodeError, ValueError) as exc:
+        return False, f"receipt at {path} is not valid JSON: {exc}", None
+    if not isinstance(receipt, dict) or receipt.get("schema") != SCHEMA_VERSION:
+        return False, f"receipt at {path} has an unknown schema", None
+    for field in ("key", "gate", "end"):
+        if field not in receipt:
+            return False, f"receipt at {path} misses {field!r}", None
+    if receipt["key"] != key or receipt["gate"] != gate:
+        return False, f"receipt at {path} is for a different key", None
+    try:
+        end = datetime.fromisoformat(receipt["end"])
+    except ValueError as exc:
+        return False, f"receipt at {path} has an unparsable end time: {exc}", None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - end).total_seconds()
+    if age > max_age_seconds:
+        return False, f"receipt at {path} is older than the max age", None
+    if age < -CLOCK_SKEW_SECONDS:
+        return False, f"receipt at {path} ends more than {CLOCK_SKEW_SECONDS}s in the future", None
+    info = os.stat(path)
+    if info.st_uid != os.getuid():
+        return False, f"receipt at {path} is not owned by uid {os.getuid()}", None
+    if info.st_mode & 0o077 != 0:
+        return False, f"receipt at {path} is readable or writable by group or others", None
+    ok, reason = check_store(store)
+    if not ok:
+        return False, reason, None
+    return True, f"receipt {path} matches the key and is within the max age", receipt
+
+
+def describe_receipt(path, receipt):
+    """The `(written <utc time>, session <id or "unknown">)` fragment."""
+    session = receipt.get("session") or "unknown"
+    return f"receipt {path} (written {receipt['end']}, session {session})"
+
+
+def write_receipt(store, gate, key, key_object, started, ended):
+    """Atomically writes the receipt for a passed gate; (ok, reason)."""
+    ok, reason = check_store(store)
+    if not ok:
+        return False, reason
+    receipt = {
+        "schema": SCHEMA_VERSION,
+        "key": key,
+        "gate": gate,
+        "argv": key_object["argv"],
+        "tree": key_object["tree"],
+        "head": key_object["head"],
+        "rustc": key_object["rustc"],
+        "cargo": key_object["cargo"],
+        "command_file": key_object["command_file"],
+        "env": key_object["env"],
+        "exit": 0,
+        "start": started.isoformat(),
+        "end": ended.isoformat(),
+        "duration_seconds": (ended - started).total_seconds(),
+        "host": socket.gethostname(),
+        "uid": os.getuid(),
+    }
+    session = os.environ.get(SESSION_ID_VAR)
+    if session is not None:
+        # Provenance only, read from gate-receipt's own environment (only the
+        # child's copy is filtered); the session id is never part of the key.
+        receipt["session"] = session
+    body = json.dumps(receipt, sort_keys=True, indent=2) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=store, prefix=".tmp-")
+    try:
+        os.fchmod(fd, RECEIPT_MODE)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(body)
+        os.replace(tmp, receipt_path(store, gate, key))
+    except OSError as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, f"cannot write receipt: {exc}"
+    return True, f"receipt {receipt_path(store, gate, key)} written"
+
+
+def ensure_store(store):
+    """Creates the store 0700 when missing; raises UsageError when it cannot
+    be created or the path is not a directory. An existing store is never
+    repaired: `validate` judges it as it is, so `run` and `check` agree. The
+    mode is enforced with chmod on creation only, because the process umask
+    may strip it."""
+    if os.path.isdir(store):
+        return
+    if os.path.lexists(store):
+        raise UsageError(f"store {store} is not a directory")
+    try:
+        os.makedirs(store, mode=STORE_MODE, exist_ok=False)
+    except FileExistsError:
+        # Raced with another creator; validate judges what is there.
+        return
+    except OSError as exc:
+        raise UsageError(f"cannot create store {store}: {exc}") from exc
+    try:
+        os.chmod(store, STORE_MODE)
+    except OSError as exc:
+        raise UsageError(f"cannot create store {store}: {exc}") from exc
+
+
+def cmd_run(gate, max_age_seconds, store, argv):
+    root = repo_root()
+    key, key_object = compute_key(root, gate, argv)
+    ensure_store(store)
+    ok, reason, receipt = validate(store, gate, key, max_age_seconds)
+    path = receipt_path(store, gate, key)
+    if ok:
+        print(f"gate-receipt: {gate}: {describe_receipt(path, receipt)} verified; skipping")
+        return 0
+    print(f"gate-receipt: {gate}: {reason}; running the command", flush=True)
+    started = datetime.now(timezone.utc)
+    try:
+        completed = subprocess.run(argv, env=child_environment(), check=False)
+    except OSError as exc:
+        print(f"gate-receipt: {gate}: cannot start the command: {exc}", file=sys.stderr)
+        return 2
+    ended = datetime.now(timezone.utc)
+    if completed.returncode != 0:
+        return completed.returncode
+    after = working_tree_id(root)
+    if after != key_object["tree"]:
+        print(
+            f"gate-receipt: {gate}: the command changed the working tree "
+            f"(before {key_object['tree']}, after {after}); no receipt written"
+        )
+        return 0
+    written, reason = write_receipt(store, gate, key, key_object, started, ended)
+    if not written:
+        print(f"gate-receipt: {gate}: {reason}; no receipt written")
+    else:
+        print(f"gate-receipt: {gate}: {reason}")
+    return 0
+
+
+def cmd_check(gate, max_age_seconds, store, argv):
+    root = repo_root()
+    key, _ = compute_key(root, gate, argv)
+    ok, reason, receipt = validate(store, gate, key, max_age_seconds)
+    path = receipt_path(store, gate, key)
+    if ok:
+        print(f"gate-receipt: {gate}: valid: {describe_receipt(path, receipt)}")
+        return 0
+    print(f"gate-receipt: {gate}: invalid: {reason}")
+    return 1
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Skip a repeated gate run when the working tree still matches a prior pass. "
+        "A receipt is local convenience, never CI evidence."
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in (
+        ("run", "run the command unless a valid receipt for the key exists"),
+        ("check", "print the receipt verdict without running the command"),
+    ):
+        child = sub.add_parser(name, help=help_text)
+        child.add_argument("--gate", required=True, help="stable gate name, e.g. docs-check")
+        child.add_argument(
+            "--max-age",
+            required=True,
+            help="how long a receipt stays valid, e.g. 24h (s/m/h/d)",
+        )
+        child.add_argument(
+            "--store",
+            default=default_store(),
+            help="receipt directory (default: ${XDG_STATE_HOME:-$HOME/.local/state}/pohunek/gate-receipts, "
+            "the XDG base-directory convention for per-user state)",
+        )
+        child.add_argument("argv", nargs=argparse.REMAINDER, help="the gate command after --")
+    args = parser.parse_args(argv)
+    if not GATE_PATTERN.fullmatch(args.gate):
+        parser.error("gate must match [A-Za-z0-9_-]+")
+    if args.argv[:1] == ["--"]:
+        args.argv = args.argv[1:]
+    if not args.argv:
+        parser.error("the gate command after -- is required")
+    try:
+        max_age_seconds = parse_duration(args.max_age)
+    except UsageError as exc:
+        parser.error(str(exc))
+    return args, max_age_seconds
+
+
+def main(argv=None):
+    args, max_age_seconds = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.command == "run":
+            return cmd_run(args.gate, max_age_seconds, args.store, args.argv)
+        return cmd_check(args.gate, max_age_seconds, args.store, args.argv)
+    except UsageError as exc:
+        print(f"gate-receipt: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

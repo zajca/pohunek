@@ -1114,4 +1114,7 @@ Validation: while iterating, run the checks the change affects (`cargo t -p <cra
 work done, run the applicable gate set listed above once, on the final
 revision — a later fix re-runs the checks whose inputs it changed, unchanged checks
 keep their evidence, and CI is the final landing evidence (a gate that cannot run
-locally is CI-only, never green).
+locally is CI-only, never green). To skip a repeated gate run on an unchanged
+tree, wrap the canonical gate line with `scripts/gate-receipt run` as
+documented in the "Receipts" section of the gates skill; a receipt is local
+convenience, never CI evidence.

@@ -245,6 +245,10 @@ PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites,
 and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
 and CLI integration tests; `--lib` alone is **not** a cost boundary.
 
+A repeated gate run on an unchanged tree can skip the command through
+`scripts/gate-receipt run` (see the "Receipts" section of the gates
+skill); the receipt is local convenience, never CI evidence.
+
 The `pohunek-cli` Hermes tests also need a test interpreter that stands in for
 the pinned Hermes runtime: a canonical Python >= 3.10 that imports `yaml`, owned
 by you or root with no group/other write bit on the file or any parent

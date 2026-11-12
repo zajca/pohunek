@@ -7441,6 +7441,80 @@ async fn write_handshake_file(
     }
 }
 
+/// `POHUNEK_*` names the worker itself injects into every managed session
+/// child (the session-owned identity: ids, socket paths, protocol versions,
+/// trace and background limits). `command_from_initialize` injects exactly
+/// these names: the unconditional ones (whose values come from
+/// `unconditional_session_value`), plus `POHUNEK_DAEMON_ID` and
+/// `POHUNEK_NATIVE_REFERENCE_KIND` when their `Initialize` fields are set.
+/// The four `HOOK_RETRY_ENV_NAMES` (the only `POHUNEK_*` names a profile
+/// environment may carry into the child through the filter in
+/// `command_from_initialize`) are deliberately not listed here: the guard
+/// tests compare the tool's list with the union of this const and
+/// `HOOK_RETRY_ENV_NAMES`, so a change on either side fails. The gate
+/// receipt tool strips exactly the union and never keys it
+/// (`scripts/gate-receipt` `SESSION_RUNTIME_VARS`). Sorted for the guard
+/// tests.
+pub(super) const SESSION_ENVIRONMENT_NAMES: &[&str] = &[
+    "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
+    "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
+    "POHUNEK_DAEMON_ID",
+    "POHUNEK_ENV",
+    "POHUNEK_HOOK_TRACE_MAX_BYTES",
+    "POHUNEK_HOOK_TRACE_PATH",
+    "POHUNEK_NATIVE_REFERENCE_KIND",
+    "POHUNEK_PROTOCOL_VERSION",
+    "POHUNEK_SESSION_ID",
+    "POHUNEK_SOCKET_PATH",
+    "POHUNEK_WORKER_HOOK_PROTOCOL_VERSION",
+    "POHUNEK_WORKER_ID",
+    "POHUNEK_WORKER_INSTANCE_ID",
+    "POHUNEK_WORKER_SOCKET_PATH",
+];
+
+/// Builds the PTY child command from a validated `Initialize`.
+/// Values the worker injects for the unconditionally present session names.
+///
+/// `command_from_initialize` looks each of these values up by the name in
+/// [`SESSION_ENVIRONMENT_NAMES`], so the names production really injects
+/// and the names the receipt guard tests read can never drift apart.
+fn unconditional_session_value(
+    name: &str,
+    shared: &Shared,
+    initialize: &Initialize,
+    worker_instance_id: &WorkerInstanceId,
+) -> Option<String> {
+    match name {
+        "POHUNEK_ENV" => Some("1".to_owned()),
+        "POHUNEK_SESSION_ID" => Some(shared.session_id.to_string()),
+        "POHUNEK_WORKER_ID" => Some(shared.worker_id.to_string()),
+        "POHUNEK_WORKER_INSTANCE_ID" => Some(worker_instance_id.to_string()),
+        "POHUNEK_WORKER_SOCKET_PATH" => Some(shared.socket_path.to_string_lossy().into_owned()),
+        "POHUNEK_WORKER_HOOK_PROTOCOL_VERSION" => {
+            Some(initialize.hook_protocol_version.to_string())
+        }
+        "POHUNEK_SOCKET_PATH" => Some(shared.daemon_socket_path.to_string_lossy().into_owned()),
+        // The public daemon RPC protocol version, required by the real
+        // provider hooks (`pohunek-agent-state.sh`, `pohunek-agent-notify.sh`)
+        // to build `session.report_native_id` / `notification.create`
+        // requests. Without it the hooks silently `exit 0` and never
+        // report native id or notifications for durable-worker-managed
+        // agents.
+        "POHUNEK_PROTOCOL_VERSION" => Some(initialize.public_protocol_version.to_string()),
+        "POHUNEK_HOOK_TRACE_PATH" => Some(shared.hook_trace_path.to_string_lossy().into_owned()),
+        "POHUNEK_HOOK_TRACE_MAX_BYTES" => {
+            Some(pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string())
+        }
+        "POHUNEK_BACKGROUND_LABEL_MAX_BYTES" => {
+            Some(protocol::BACKGROUND_LABEL_MAX_BYTES.to_string())
+        }
+        "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES" => {
+            Some(protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Builds the PTY child command from a validated `Initialize`.
 ///
 /// The child environment starts empty and is layered as base environment,
@@ -7471,64 +7545,26 @@ fn command_from_initialize(
             })
             .map(|(name, value)| (name.to_owned(), value.to_owned())),
     );
-    let mut reserved = BTreeMap::from([
-        ("POHUNEK_ENV".to_owned(), "1".to_owned()),
-        (
-            "POHUNEK_SESSION_ID".to_owned(),
-            shared.session_id.to_string(),
-        ),
-        ("POHUNEK_WORKER_ID".to_owned(), shared.worker_id.to_string()),
-        (
-            "POHUNEK_WORKER_INSTANCE_ID".to_owned(),
-            worker_instance_id.to_string(),
-        ),
-        (
-            "POHUNEK_WORKER_SOCKET_PATH".to_owned(),
-            shared.socket_path.to_string_lossy().into_owned(),
-        ),
-        (
-            "POHUNEK_WORKER_HOOK_PROTOCOL_VERSION".to_owned(),
-            initialize.hook_protocol_version.to_string(),
-        ),
-        (
-            "POHUNEK_SOCKET_PATH".to_owned(),
-            shared.daemon_socket_path.to_string_lossy().into_owned(),
-        ),
-        (
-            // The public daemon RPC protocol version, required by the real
-            // provider hooks (`pohunek-agent-state.sh`, `pohunek-agent-notify.sh`)
-            // to build `session.report_native_id` / `notification.create`
-            // requests. Without it the hooks silently `exit 0` and never
-            // report native id or notifications for durable-worker-managed
-            // agents.
-            "POHUNEK_PROTOCOL_VERSION".to_owned(),
-            initialize.public_protocol_version.to_string(),
-        ),
-        (
-            "POHUNEK_HOOK_TRACE_PATH".to_owned(),
-            shared.hook_trace_path.to_string_lossy().into_owned(),
-        ),
-        (
-            "POHUNEK_HOOK_TRACE_MAX_BYTES".to_owned(),
-            pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string(),
-        ),
-        (
-            "POHUNEK_BACKGROUND_LABEL_MAX_BYTES".to_owned(),
-            protocol::BACKGROUND_LABEL_MAX_BYTES.to_string(),
-        ),
-        (
-            "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES".to_owned(),
-            protocol::BACKGROUND_PROGRAM_MAX_BYTES.to_string(),
-        ),
-    ]);
-    if let Some(daemon_id) = &initialize.daemon_instance_id {
-        reserved.insert("POHUNEK_DAEMON_ID".to_owned(), daemon_id.to_string());
-    }
-    if let Some(reference_kind) = &initialize.launch.reference_kind {
-        reserved.insert(
-            "POHUNEK_NATIVE_REFERENCE_KIND".to_owned(),
-            reference_kind.clone(),
-        );
+    let mut reserved = BTreeMap::new();
+    for name in SESSION_ENVIRONMENT_NAMES {
+        if *name == "POHUNEK_DAEMON_ID" {
+            if let Some(daemon_id) = &initialize.daemon_instance_id {
+                reserved.insert((*name).to_owned(), daemon_id.to_string());
+            }
+        } else if *name == "POHUNEK_NATIVE_REFERENCE_KIND" {
+            if let Some(reference_kind) = &initialize.launch.reference_kind {
+                reserved.insert((*name).to_owned(), reference_kind.clone());
+            }
+        } else if let Some(value) =
+            unconditional_session_value(name, shared, initialize, worker_instance_id)
+        {
+            reserved.insert((*name).to_owned(), value);
+        } else {
+            debug_assert!(
+                false,
+                "SESSION_ENVIRONMENT_NAMES holds a name without a value: {name}",
+            );
+        }
     }
     environment.extend(reserved);
     environment.retain(|name, _| !protocol::is_denylisted(name));
@@ -8431,6 +8467,8 @@ where
 
 #[cfg(test)]
 mod launch_layout_tests;
+#[cfg(test)]
+mod receipt_guard_tests;
 
 #[cfg(test)]
 mod tests {
