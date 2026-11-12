@@ -246,6 +246,11 @@ scripts/stress-run --deadline 45m -- cargo nextest run -p pohunek-daemon --stres
 scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy  # stress the tests this diff adds or changes
 ```
 
+The nightly `ci-budgets` workflow checks per-step and per-job medians
+against `scripts/ci-budgets.json` and keeps the one `ci-budget`-labelled
+issue current. A pull request that makes a budgeted step faster lowers its
+budget in the same pull request; raising a budget needs a reason in its entry.
+
 Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
 for the shard helper. `profile.fast.default-filter` is the cost boundary;
 `scripts/test-partitions` subdivides it by package ownership, with an exact

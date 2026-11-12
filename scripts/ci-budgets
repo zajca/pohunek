@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Check CI critical-path budgets against step medians on `main` (issue #2209).
+
+Compares the per-budget medians from `scripts/ci-timings` with the checked-in
+budgets in `scripts/ci-budgets.json` and keeps one labelled issue current: the
+body always carries the latest table, and a comment is added only when the set
+of exceeded budgets changed since the body was last written.
+
+Exit codes: 0 means every measured median is within budget; 1 means a budget
+is exceeded or names a job/step absent from the window; 2 means a usage or
+API error. Nothing writes to an issue without `--report-issue`.
+"""
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_BUDGETS = ROOT / "scripts" / "ci-budgets.json"
+CI_TIMINGS = ROOT / "scripts" / "ci-timings"
+
+# Machine-readable marker in the issue body: the set of exceeded budget keys
+# the body was last written for. A comment goes out only when this set
+# changes between writes.
+MARKER_PREFIX = "<!-- ci-budgets:exceeded="
+
+
+class BudgetError(Exception):
+    """A usage or API error: exit 2, never an issue write."""
+
+
+def format_seconds(seconds):
+    """Render a duration as `9s`, `1m23s`, or `1h02m`."""
+    if seconds is None:
+        return "n/a"
+    total = int(round(seconds))
+    if total >= 3600:
+        return f"{total // 3600}h{total % 3600 // 60:02d}m"
+    if total >= 60:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total}s"
+
+
+def budget_key(budget):
+    """Stable identity of one budget entry: event, job, and step."""
+    return f"{budget.get('event')}|{budget.get('job')}|{budget.get('step')}"
+
+
+def load_budgets(path):
+    """Read and validate the checked-in budgets file."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except OSError as error:
+        raise BudgetError(f"cannot read budgets file {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise BudgetError(f"budgets file {path} is not valid JSON: {error}") from error
+    if not isinstance(data, dict):
+        raise BudgetError(f"budgets file {path} must hold a JSON object")
+    try:
+        window_runs = data["window_runs"]
+        issue_label = data["issue_label"]
+        budgets = data["budgets"]
+    except KeyError as error:
+        raise BudgetError(f"budgets file {path} misses required key {error}") from error
+    if (
+        not isinstance(window_runs, int)
+        or isinstance(window_runs, bool)
+        or window_runs <= 0
+    ):
+        raise BudgetError("window_runs must be a positive integer")
+    if not isinstance(issue_label, str) or not issue_label:
+        raise BudgetError("issue_label must be a non-empty string")
+    if not isinstance(budgets, list) or not budgets:
+        raise BudgetError("budgets must be a non-empty list")
+    seen = set()
+    for entry in budgets:
+        if not isinstance(entry, dict):
+            raise BudgetError("every budget must be an object")
+        for field in ("event", "job", "step", "median_seconds_max", "reason"):
+            if field not in entry:
+                raise BudgetError(f"budget {entry!r} misses required field {field!r}")
+        if entry["event"] not in ("push", "pull_request"):
+            raise BudgetError(
+                f"budget {budget_key(entry)}: event must be 'push' or 'pull_request'"
+            )
+        if entry["job"] is not None and not entry["job"]:
+            raise BudgetError(f"budget {budget_key(entry)}: job must be a name or null")
+        if entry["step"] is not None and not entry["step"]:
+            raise BudgetError(
+                f"budget {budget_key(entry)}: step must be a name or null"
+            )
+        limit = entry["median_seconds_max"]
+        if (
+            not isinstance(limit, (int, float))
+            or isinstance(limit, bool)
+            or limit <= 0
+        ):
+            raise BudgetError(
+                f"budget {budget_key(entry)}: median_seconds_max must be positive"
+            )
+        if not isinstance(entry["reason"], str) or not entry["reason"].strip():
+            raise BudgetError(f"budget {budget_key(entry)}: reason must be non-empty")
+        key = budget_key(entry)
+        if key in seen:
+            raise BudgetError(f"duplicate budget entry {key}")
+        seen.add(key)
+    return data
+
+
+def run_ci_timings(arguments):
+    """Run `scripts/ci-timings` as a subprocess and decode its JSON output."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(CI_TIMINGS), *arguments, "--json"],
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise BudgetError(f"cannot start scripts/ci-timings: {error}") from error
+    if result.returncode != 0:
+        raise BudgetError(f"scripts/ci-timings failed: {result.stderr.strip()}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise BudgetError(
+            f"scripts/ci-timings printed invalid JSON: {error}"
+        ) from error
+
+
+def selection(event, window_runs, *, input_path, branch):
+    """The `ci-timings` run-selection flags for one event's window.
+
+    Push budgets read green `ci.yml` runs on `branch`; the pull-request
+    window spans every head branch, so it carries no branch filter.
+    """
+    arguments = [
+        "--limit", str(window_runs),
+        "--event", event, "--conclusion", "success",
+    ]
+    if input_path is not None:
+        arguments += ["--input", input_path]
+    elif event == "push":
+        arguments += ["--branch", branch]
+    return arguments
+
+
+def fetch_medians(*, window_runs, input_path, branch):
+    """Per-budget medians over the newest green `ci.yml` runs per event.
+
+    Push budgets measure per-step medians (`steps` on `main`) and per-job
+    wall medians (`runs` on `main`); the pull-request budget measures the
+    run wall clock (`runs`, every head branch). With `--input` every call
+    reads the snapshot instead of `gh`, so offline runs stay reproducible.
+    """
+    push_steps = run_ci_timings(
+        ["steps", *selection("push", window_runs,
+                             input_path=input_path, branch=branch)]
+    )
+    push_walls = run_ci_timings(
+        ["runs", *selection("push", window_runs,
+                            input_path=input_path, branch=branch)]
+    )
+    pr_runs = run_ci_timings(
+        ["runs", *selection("pull_request", window_runs,
+                            input_path=input_path, branch=branch)]
+    )
+    push_step_runs = push_steps.get("runs")
+    push_wall_list = push_walls.get("runs") or []
+    pr_run_list = pr_runs.get("runs") or []
+    pr_walls = [
+        run["wall_seconds"]
+        for run in pr_run_list
+        if run.get("wall_seconds") is not None
+    ]
+    return {
+        "push_steps": push_steps.get("summary") or {},
+        "push_runs": (push_step_runs
+                         if isinstance(push_step_runs, int)
+                         else len(push_step_runs or [])),
+        "push_job_walls": (push_walls.get("summary") or {}).get("jobs") or {},
+        "pr_jobs": (pr_runs.get("summary") or {}).get("jobs") or {},
+        "pr_wall_median": statistics.median(pr_walls) if pr_walls else None,
+        "pr_runs": (pr_run_list if isinstance(pr_run_list, int)
+                      else len(pr_run_list)),
+    }
+
+
+def check_budgets(budgets, medians):
+    """Compare every budget with its median; absent entries fail the check.
+
+    A budget whose job or step is absent from the window fails with an update
+    message instead of passing silently: job names change as lanes land, and
+    a stale entry must be fixed in `scripts/ci-budgets.json`.
+    """
+    rows = []
+    for entry in budgets:
+        event, job, step = entry["event"], entry["job"], entry["step"]
+        limit = entry["median_seconds_max"]
+        median, window = None, 0
+        if event == "pull_request" and job is None and step is None:
+            median, window = medians["pr_wall_median"], medians["pr_runs"]
+        elif event == "pull_request":
+            per_job = (medians.get("pr_jobs") or {}).get(job)
+            if per_job is not None:
+                median, window = per_job["p50"], medians["pr_runs"]
+        elif step is None:
+            per_job = (medians.get("push_job_walls") or {}).get(job)
+            if per_job is not None:
+                median, window = per_job["p50"], per_job["runs"]
+        else:
+            per_step = ((medians.get("push_steps") or {}).get(job) or {}).get(step)
+            if per_step is not None:
+                median, window = per_step["p50"], per_step["runs"]
+        rows.append({
+            "budget": entry,
+            "key": budget_key(entry),
+            "median": median,
+            "runs": window,
+            "exceeded": median is not None and median > limit,
+            "missing": median is None,
+        })
+    return rows
+
+
+def slowest_runs(*, window_runs, input_path, branch, limit=5):
+    """The slowest runs per event, for links in the issue table."""
+    links = {}
+    for event in ("push", "pull_request"):
+        payload = run_ci_timings(
+            ["runs", *selection(event, limit,
+                                input_path=input_path, branch=branch)]
+        )
+        ordered = sorted(
+            (payload.get("runs") or []),
+            key=lambda run: run.get("wall_seconds") or 0,
+            reverse=True,
+        )
+        links[event] = [
+            {"id": run.get("id"), "wall_seconds": run.get("wall_seconds")}
+            for run in ordered[:limit]
+            if run.get("id") is not None
+        ]
+    return links
+
+
+def render_body(rows, *, window_runs, slowest):
+    """The full issue body: the budget table plus the marker line."""
+    lines = [
+        "# CI critical-path budgets",
+        "",
+        "Medians over the newest green `ci.yml` runs per event "
+        f"(window: {window_runs} runs). A budget whose job or step is absent "
+        "from the window fails the check: update `scripts/ci-budgets.json`.",
+        "",
+        "| Event | Job | Step | Budget | Median | Runs | Status |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        entry = row["budget"]
+        if row["missing"]:
+            status = "MISSING JOB/STEP"
+        elif row["exceeded"]:
+            status = "EXCEEDED"
+        else:
+            status = "within budget"
+        lines.append(
+            f"| {entry['event']} | {entry['job'] or '(run wall)'} | "
+            f"{entry['step'] or '(job wall)'} | "
+            f"{format_seconds(entry['median_seconds_max'])} | "
+            f"{format_seconds(row['median'])} | {row['runs']} | {status} |"
+        )
+    lines.append("")
+    lines.append("Slowest runs in the window:")
+    lines.append("")
+    for event, runs in slowest.items():
+        if not runs:
+            lines.append(f"- {event}: n/a")
+            continue
+        items = ", ".join(
+            f"{run['id']} ({format_seconds(run['wall_seconds'])})" for run in runs
+        )
+        lines.append(f"- {event}: {items}")
+    lines.append("")
+    lines.append("Reasons live in `scripts/ci-budgets.json`, one per budget entry.")
+    lines.append("")
+    keys = sorted(row["key"] for row in rows if row["exceeded"] or row["missing"])
+    lines.append(f"{MARKER_PREFIX}{','.join(keys)}-->")
+    return "\n".join(lines) + "\n"
+
+
+def read_marker(body):
+    """The exceedance set the issue body was last written for, if any."""
+    if not body:
+        return None
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith(MARKER_PREFIX) and line.endswith("-->"):
+            return set(filter(None, line[len(MARKER_PREFIX):-len("-->")].split(",")))
+    return None
+
+
+def gh(*arguments, input_text=None):
+    """Run `gh`; raise BudgetError on failure, else return the response."""
+    try:
+        result = subprocess.run(
+            ["gh", *arguments],
+            input=input_text,
+            cwd=ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise BudgetError(f"cannot start gh: {error}") from error
+    if result.returncode != 0:
+        raise BudgetError(
+            f"gh {' '.join(arguments)} failed: {result.stderr.strip()}"
+        )
+    return result
+
+
+def find_issue(label):
+    """The one open issue carrying the budget label, if any."""
+    result = gh(
+        "issue", "list", "--label", label, "--state", "open",
+        "--limit", "50", "--json", "number,title,body",
+    )
+    try:
+        issues = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise BudgetError(f"gh printed invalid JSON: {error}") from error
+    if len(issues) > 1:
+        numbers = ", ".join(f"#{issue['number']}" for issue in issues)
+        raise BudgetError(
+            f"more than one open issue carries label {label!r}: {numbers}"
+        )
+    return issues[0] if issues else None
+
+
+def ensure_label(label):
+    """Create the budget label when it does not exist yet."""
+    try:
+        names = {
+            entry["name"] for entry in json.loads(gh("label", "list").stdout)
+        }
+    except json.JSONDecodeError as error:
+        raise BudgetError(f"gh printed invalid JSON: {error}") from error
+    if label not in names:
+        gh(
+            "label", "create", label,
+            "--description", "CI critical-path budget exceeded",
+            "--color", "B60205",
+        )
+
+
+def report_issue(*, label, body, comment, dry_run):
+    """Create or update the one labelled issue; comment only on set change."""
+    if dry_run:
+        print("dry run: no issue write")
+        print("")
+        print(body)
+        if comment is not None:
+            print("would add comment:")
+            print(comment)
+        return "dry-run"
+    ensure_label(label)
+    issue = find_issue(label)
+    if issue is None:
+        created = gh(
+            "issue", "create", "--label", label,
+            "--title", "CI critical-path budget exceeded",
+            "--body-file", "-",
+            input_text=body,
+        )
+        number = created.stdout.strip().rsplit("/", 1)[-1]
+        gh("issue", "comment", number, "--body", comment)
+        return "created"
+    number = str(issue["number"])
+    previous = read_marker(issue.get("body") or "")
+    gh("issue", "edit", number, "--body", body)
+    if previous != read_marker(body):
+        gh("issue", "comment", number, "--body", comment)
+        return "updated+commented"
+    return "updated"
+
+
+def describe_row(row):
+    """One-line human summary of a checked budget row."""
+    entry = row["budget"]
+    where = (
+        f"{entry['event']} {entry['job'] or '(run wall)'} "
+        f"{entry['step'] or '(job wall)'}"
+    )
+    if row["missing"]:
+        return (
+            f"budget names a missing job/step: update scripts/ci-budgets.json "
+            f"({where})"
+        )
+    verdict = "over budget" if row["exceeded"] else "within budget"
+    return (
+        f"{verdict}: {where}: median {format_seconds(row['median'])} "
+        f"vs budget {format_seconds(entry['median_seconds_max'])}"
+    )
+
+
+def build_parser():
+    """Command-line parser for the budget check."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--budgets", default=str(DEFAULT_BUDGETS),
+        help="checked-in budgets file (default: scripts/ci-budgets.json)",
+    )
+    parser.add_argument(
+        "--input",
+        help="run snapshot JSON (a `gh run view --json` list) for offline runs",
+    )
+    parser.add_argument(
+        "--branch", default="main",
+        help="head branch for the push window (default: main)",
+    )
+    parser.add_argument(
+        "--report-issue", action="store_true",
+        help="create or update the one labelled issue on exceedance or repair",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="print what would be written without any `gh` write call",
+    )
+    return parser
+
+
+def main(argv=None):
+    """Compare medians with budgets; optionally keep the issue current."""
+    args = build_parser().parse_args(argv)
+    try:
+        config = load_budgets(args.budgets)
+        medians = fetch_medians(
+            window_runs=config["window_runs"],
+            input_path=args.input,
+            branch=args.branch,
+        )
+        rows = check_budgets(config["budgets"], medians)
+    except BudgetError as error:
+        print(f"ci-budgets: error: {error}", file=sys.stderr)
+        return 2
+    problems = [row for row in rows if row["exceeded"] or row["missing"]]
+    for row in rows:
+        print(f"ci-budgets: {describe_row(row)}")
+    if not problems:
+        return 0
+    if not args.report_issue and not args.dry_run:
+        return 1
+    try:
+        links = slowest_runs(
+            window_runs=config["window_runs"],
+            input_path=args.input, branch=args.branch,
+        )
+    except BudgetError as error:
+        print(f"ci-budgets: error: {error}", file=sys.stderr)
+        return 2
+    body = render_body(rows, window_runs=config["window_runs"], slowest=links)
+    names = ", ".join(
+        f"{row['budget']['event']} {row['budget']['job'] or '(run wall)'} "
+        f"{row['budget']['step'] or '(job wall)'}"
+        for row in problems
+    )
+    try:
+        action = report_issue(
+            label=config["issue_label"], body=body,
+            comment=f"CI budget check: exceeded or missing: {names}.",
+            dry_run=args.dry_run,
+        )
+    except BudgetError as error:
+        print(f"ci-budgets: error: {error}", file=sys.stderr)
+        return 2
+    print(f"ci-budgets: issue {action}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
