@@ -158,32 +158,33 @@ fast)`, the composite `.github/actions/cancel-run`) cancels the run, so the jobs
 that are still running free their runners for other work. The five jobs that
 call a reusable workflow have a `cancel-after-<job>` job instead, which cancels
 when the called workflow ends red. Push runs (`main` drains), scheduled runs,
-the advisory `cargo-audit` job and a job that was itself cancelled never
-trigger it. Read such a run accordingly: the job that failed and the run end as
+the advisory `cargo-audit` job and a job that was itself cancelled never trigger
+it. Read such a run accordingly: the job that failed and the run end as
 `cancelled`, while the failed step stays red in the job log and the step's
 `::error` annotation (`Fail fast`) names the job that failed first. The
-annotation and the job summary sit on the failed job's check run (not on the
-run page) and give the job's display name (for example `tests (cli, fast)`), its
-job id, a link by check run id and the step that failed. The name and step come
-from the jobs API on a best-effort basis, bounded to 20 seconds
+annotation and the job summary sit on the failed job's check run (not on the run
+page) and give the job's display name (for example `tests (cli, fast)`), its job
+id, a link by check run id and the step that failed. The name and step come from
+the jobs API on a best-effort basis, bounded to 20 seconds
 (`LOOKUP_TIMEOUT_SECONDS`, enforced by a bash watchdog because the macOS callers
 have no GNU `timeout`); without them the message falls back to the job id and
 the link, and with an empty `job.check_run_id` the lookup and the job link are
-skipped (the run link stays). The cancel happens in every case. The jobs with a sparse or relocated checkout copy
-the `cancel-run` action out of the checkout first, so every job uses the same
-script (`.github/actions/cancel-run/cancel-run.sh`). So a
-cancelled job in a pull request run can mean that another job failed first:
-open the cancelled jobs and look for the one whose step list has a red step
-followed by the executed `Cancel the run (fail fast)` step.
-The `test selection verdict` check still runs after the cancel and is red when
-a job it waits for failed or was cancelled; for a job that decides the pull
-request outside the verdict, look for the `Fail fast` annotation. A job that
-hits its `timeout-minutes` is cancelled by GitHub and does not trigger the
-step (a called workflow's watcher fires only when the call ends as failed, which
-a timeout inside it does not guarantee), and the two selector jobs (`test selection`, `runtime package selection`)
-do not carry it, because a failed selection runs everything instead of
-ending the run. A fork or Dependabot pull request has a read-only token, so the
-cancel call is refused and the run keeps its real failure.
+skipped (the run link stays). The cancel happens in every case. The jobs with a
+sparse or relocated checkout copy the `cancel-run` action out of the checkout
+first, so every job uses the same script
+(`.github/actions/cancel-run/cancel-run.sh`). So a cancelled job in a pull
+request run can mean that another job failed first: open the cancelled jobs and
+look for the one whose step list has a red step followed by the executed `Cancel
+the run (fail fast)` step. The `test selection verdict` check still runs after
+the cancel and is red when a job it waits for failed or was cancelled; for a job
+that decides the pull request outside the verdict, look for the `Fail fast`
+annotation. A job that hits its `timeout-minutes` is cancelled by GitHub and
+does not trigger the step (a called workflow's watcher fires only when the call
+ends as failed, which a timeout inside it does not guarantee), and the two
+selector jobs (`test selection`, `runtime package selection`) do not carry it,
+because a failed selection runs everything instead of ending the run. A fork or
+Dependabot pull request has a read-only token, so the cancel call is refused and
+the run keeps its real failure.
 
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the
