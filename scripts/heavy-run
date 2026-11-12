@@ -1,0 +1,221 @@
+#!/bin/sh
+# Slot-scoped heavy-run wrapper: TMPDIR on a size-limited tmpfs, a named
+# systemd scope per run, a sweep of the slot directory at slot release.
+#
+# usage: heavy-run <command> [arg ...]
+#
+# Configuration is a required file, never defaults in this script:
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/pohunek/heavy-run.conf
+# with one `key=value` per line (no inline comments; see docs/development.md
+# "Heavy runs" for what each key means):
+#   slots=2
+#   lock_dir=/var/tmp
+#   memory_max=8G
+#   tmpfs_root=/r
+#   poll_seconds=10
+#   require_tmpfs=true
+#
+# A missing file, or a missing, empty, malformed or unknown key, fails before
+# anything runs and names the file or the key. `require_tmpfs` exists only so
+# the test suite can drive the real script against a temporary root: the host
+# config sets it to true. `tmpfs_root` parents the per-slot `TMPDIR`s, and
+# each `<tmpfs_root>/<slot>` is a run base for the socket budget: every
+# slot path 1..`slots` must fit in 9 bytes (RUN_BASE_MAX_LENGTH in
+# scripts/test-partitions, from the 104-byte Darwin socket capacity). `/r`
+# with two slots gives `/r/1` and `/r/2`. A root whose longest slot path
+# (`<tmpfs_root>/<slots>`) is longer is refused before any lock is taken.
+#
+# Behaviour per slot: wait until a slot frees up, acquire its flock, sweep the
+# slot directory at acquisition (a crash may have skipped the release sweep),
+# create it 0700, run the command as a named scope
+# `systemd-run --user --scope --unit=pohunek-heavy-<slot>-<pid>`, then stop
+# the scope (leaked test workers die with it), sweep the slot directory,
+# release the lock, and exit with the command's status. A full pass over busy
+# slots sleeps `poll_seconds` and retries; the script never exits 0 without
+# having run the command. A "not loaded" stop is tolerated; any other stop
+# failure is reported but still releases the slot. SIGINT and SIGTERM stop
+# the scope, sweep, and release as well.
+
+set -u
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pohunek/heavy-run.conf"
+
+fail() {
+    echo "heavy-run: $1" >&2
+    exit "${2:-1}"
+}
+
+# Load the required config file; every value comes from there.
+[ -f "$CONFIG_FILE" ] || fail "config file is missing: $CONFIG_FILE"
+slots=""
+lock_dir=""
+memory_max=""
+tmpfs_root=""
+poll_seconds=""
+require_tmpfs=""
+seen=""
+while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+        ""|\#*) continue ;;
+    esac
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$line" in
+        *=*) ;;
+        *) fail "config $CONFIG_FILE: malformed line (want key=value): $line" ;;
+    esac
+    case "$key" in
+        slots|lock_dir|memory_max|tmpfs_root|poll_seconds|require_tmpfs) ;;
+        *) fail "config $CONFIG_FILE: unknown key: $key" ;;
+    esac
+    case "$seen" in
+        *" $key "*) fail "config $CONFIG_FILE: duplicate key: $key" ;;
+    esac
+    seen="$seen $key "
+    case "$value" in
+        "") fail "config $CONFIG_FILE: empty value for key: $key" ;;
+    esac
+    case "$key" in
+        slots) slots="$value" ;;
+        lock_dir) lock_dir="$value" ;;
+        memory_max) memory_max="$value" ;;
+        tmpfs_root) tmpfs_root="$value" ;;
+        poll_seconds) poll_seconds="$value" ;;
+        require_tmpfs) require_tmpfs="$value" ;;
+    esac
+done <"$CONFIG_FILE"
+for key in slots lock_dir memory_max tmpfs_root poll_seconds require_tmpfs; do
+    case "$seen" in
+        *" $key "*) ;;
+        *) fail "config $CONFIG_FILE: missing key: $key" ;;
+    esac
+done
+
+case "$slots" in
+    ''|*[!0-9]*|0) fail "config $CONFIG_FILE: slots must be a positive integer, got: $slots" ;;
+esac
+case "$poll_seconds" in
+    ''|*[!0-9]*|0) fail "config $CONFIG_FILE: poll_seconds must be a positive integer, got: $poll_seconds" ;;
+esac
+case "$memory_max" in
+    ''|*[!0-9A-Za-z]*) fail "config $CONFIG_FILE: memory_max is malformed: $memory_max" ;;
+esac
+case "$tmpfs_root" in
+    /*) ;;
+    *) fail "config $CONFIG_FILE: tmpfs_root must be absolute: $tmpfs_root" ;;
+esac
+[ "$tmpfs_root" != "/" ] || fail "config $CONFIG_FILE: tmpfs_root must not be /"
+# Each per-slot TMPDIR <tmpfs_root>/<slot> is a run base (see the header
+# comment), so every slot path must fit the socket budget: the longest one
+# is <tmpfs_root>/<slots>, and ${#} is POSIX.
+[ $(( ${#tmpfs_root} + 1 + ${#slots} )) -le 9 ] || fail "config $CONFIG_FILE: slot path $tmpfs_root/$slots is $(( ${#tmpfs_root} + 1 + ${#slots} )) bytes, exceeding the 9-byte socket budget for test roots (scripts/test-partitions RUN_BASE_MAX_LENGTH)"
+case "$require_tmpfs" in
+    true|false) ;;
+    *) fail "config $CONFIG_FILE: require_tmpfs must be true or false, got: $require_tmpfs" ;;
+esac
+
+[ "$#" -ge 1 ] || fail "usage: heavy-run <command> [arg ...]" 2
+
+# Fail before taking any lock when the root is not a tmpfs and one is
+# required: there is no silent fallback to disk.
+if [ "$require_tmpfs" = "true" ]; then
+    if ! mountpoint -q "$tmpfs_root" 2>/dev/null; then
+        fail "$tmpfs_root is not a mount point (require_tmpfs is true)"
+    fi
+    fstype="$(findmnt -n -o FSTYPE -- "$tmpfs_root" 2>/dev/null || true)"
+    [ "$fstype" = "tmpfs" ] || fail "$tmpfs_root is not a tmpfs (found: ${fstype:-unknown})"
+fi
+
+# Sweep the contents of exactly <tmpfs_root>/<slot>, never the root itself
+# and never another slot. Removal is refused unless this user owns the slot
+# directory; `root` stays quoted separately so an unset slot cannot widen it.
+sweep_slot() {
+    slot="$1"
+    dir="$tmpfs_root/$slot"
+    [ -n "$slot" ] || { echo "heavy-run: refusing to sweep an empty slot path" >&2; return 1; }
+    case "$slot" in
+        *[!0-9]*|""|.*|*/*) echo "heavy-run: refusing to sweep outside a numeric slot: $dir" >&2; return 1 ;;
+    esac
+    [ "$dir" != "$tmpfs_root" ] || { echo "heavy-run: refusing to sweep the root: $dir" >&2; return 1; }
+    [ -d "$dir" ] || return 0
+    [ -O "$dir" ] || { echo "heavy-run: refusing to sweep a directory this user does not own: $dir" >&2; return 1; }
+    # Only the top level is listed, so a mid-walk `rm -rf` never pulls a
+    # directory out from under `find` itself. A failed sweep keeps the
+    # command's status unless the command passed.
+    find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || {
+        echo "heavy-run: warning: sweep of $dir failed" >&2
+        [ "$slot_rc" -eq 0 ] || return 0
+        return 1
+    }
+}
+
+unit_name=""
+slot_dir=""
+
+stop_scope() {
+    [ -n "$unit_name" ] || return 0
+    out="$(systemctl --user stop "$unit_name" 2>&1)" || {
+        case "$out" in
+            *not*loaded*) return 0 ;;
+        esac
+        echo "heavy-run: $out" >&2
+        return 1
+    }
+}
+
+# Each trap path stops the scope, sweeps the slot, releases the lock with the
+# exit code of the command, and then leaves. The lock file descriptor is
+# closed by the exiting shell.
+slot_lock=""
+slot_rc=0
+finish() {
+    stop_scope
+    sweep_slot "$slot_lock" || slot_rc=1
+    flock -u 9 2>/dev/null || true
+    exit "$slot_rc"
+}
+
+# The outer loop waits until a slot frees up: a full pass over busy slots
+# sleeps once and retries, so the command always runs before any exit 0.
+while :; do
+    i=1
+    while [ "$i" -le "$slots" ]; do
+        lock="$lock_dir/pohunek-heavy-slot-$i.lock"
+        # Open the descriptor without clobbering: descriptor 9 survives the
+        # command, and flock on it is the slot.
+        eval "exec 9>>\"\$lock\"" 2>/dev/null || fail "cannot open lock file: $lock"
+        if flock -n 9; then
+            slot_lock="$i"
+            trap 'slot_rc=130; finish' INT
+            trap 'slot_rc=143; finish' TERM
+            # A slot that cannot be prepared never runs the command: the
+            # lock is released by the exiting shell.
+            sweep_slot "$slot_lock" || fail "cannot sweep slot directory: $tmpfs_root/$slot_lock"
+            mkdir -p "$tmpfs_root/$slot_lock" || fail "cannot create slot directory: $tmpfs_root/$slot_lock"
+            chmod 0700 "$tmpfs_root/$slot_lock" || fail "cannot chmod slot directory: $tmpfs_root/$slot_lock"
+            slot_dir="$tmpfs_root/$slot_lock"
+            unit_name="pohunek-heavy-$slot_lock-$$.scope"
+            # The command runs in the background with an explicit stdin
+            # (`0<&0` counts as explicit, so nothing is taken from
+            # /dev/null): a trapped INT/TERM interrupts `wait` at once and
+            # the trap owns the scope stop, and this single `wait` reaps
+            # the child and keeps its status. (`kill -0` must not guard
+            # the reap: a shell that reaps the child in its SIGCHLD
+            # handler makes `kill -0` fail while `wait` would still
+            # report the stored failure, and skipping the reap exits 0
+            # for a failed command.) A `systemd-run` that never starts
+            # (missing binary, refused unit) is already gone, and `wait`
+            # still collects its status instead of reporting a pass for a
+            # command that never ran.
+            systemd-run --user --scope --unit="$unit_name" -p MemoryMax="$memory_max" env TMPDIR="$slot_dir" "$@" 0<&0 &
+            cmd_pid=$!
+            slot_rc=0
+            wait "$cmd_pid" || slot_rc=$?
+            trap - INT TERM
+            finish
+        fi
+        eval "exec 9>&-" 2>/dev/null || true
+        i=$((i + 1))
+    done
+    sleep "$poll_seconds"
+done

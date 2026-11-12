@@ -220,7 +220,7 @@ Run the full set before calling anything done:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
-cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features  # the only 16-thread command; never plain cargo tw
 cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
 cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks/prompt-contract shape, doc commands vs the clap tree, crate table, package lists, doc index
@@ -245,6 +245,40 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-2
 scripts/stress-run --deadline 45m -- cargo nextest run -p pohunek-daemon --stress-count 100 -E 'test(/profile_freeze_tests/)'  # reproduce a timing failure under pinned CPU load (build first with --no-run)
 scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy  # stress the tests this diff adds or changes
 ```
+
+### Heavy runs
+
+The full-suite nextest gate above runs through `scripts/heavy-run`, a
+slot-scoped wrapper: `slots` flock slots, the slot directory itself as the
+per-run `TMPDIR`, the command as a named `systemd-run --user` scope with
+`MemoryMax`, then a scope stop, a slot sweep and the lock release. The
+fixture root must be a size-limited tmpfs, or this load pattern lands on
+disk (the 2026-10-13 metadata incident): the `/r` host mount is a tmpfs with
+`size=8G,mode=0700,uid=1000` (`/etc/fstab`, every `<tmpfs_root>/<slot>` at
+most 9 bytes per `scripts/test-partitions` `RUN_BASE_MAX_LENGTH`). Without
+the wrapper and
+the mount, 16 threads were never measured: do not raise the count on plain
+`TMPDIR`. 16 is sized for that host fixture root; CI shards still run on 4
+vCPUs with their profile defaults.
+
+The wrapper takes no defaults; it reads the required config file
+`${XDG_CONFIG_HOME:-$HOME/.config}/pohunek/heavy-run.conf` with one
+`key=value` per line:
+
+```ini
+slots=2
+lock_dir=/var/tmp
+memory_max=8G
+tmpfs_root=/r
+poll_seconds=10
+require_tmpfs=true
+```
+
+`slots` is the number of flock slots; `lock_dir` holds the
+`pohunek-heavy-slot-<n>.lock` files; `memory_max` is the `MemoryMax` of the
+per-run scope; `tmpfs_root` parents the per-slot `TMPDIR` as
+`<tmpfs_root>/<slot>`; `poll_seconds` is the wait between slot acquisition
+attempts; `require_tmpfs=true` fails when `tmpfs_root` is not a tmpfs mount.
 
 Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
 for the shard helper. `profile.fast.default-filter` is the cost boundary;
