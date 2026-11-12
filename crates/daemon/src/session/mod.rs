@@ -2,6 +2,69 @@
 //!
 //! Production sessions delegate PTY ownership to per-session workers. The
 //! daemon retains logical metadata and reconstructible semantic observers.
+//!
+//! ## Lock order
+//!
+//! Registry locks are taken from an outer level to an inner one, never the
+//! reverse; a guard of one level may be held while a lock of a later level is
+//! taken.
+//!
+//! 1. The retention `sweep_lock` serializes sweeps and is the outermost lock:
+//!    a sweep holds it across whole removals, each of which takes the removed
+//!    session's lifecycle lock (`sweep_retention_at` into `remove_with`).
+//! 2. `lifecycle_locks` holds one lifecycle authority per session id for
+//!    create, recover, stop, remove, terminal acknowledgement, and the
+//!    reconciliation of one session.
+//! 3. `identity_commit`, per entry, serializes a session's active-identity
+//!    commits and is held across their record and binding writes (the
+//!    forwarded-report send task and `apply_worker_metadata_snapshot`).
+//! 4. `persist_lock` serializes the unconditional session-record and
+//!    resume-binding writes. A writer holds it across the blocking store
+//!    I/O and re-reads the session under `sessions` instead of holding
+//!    `sessions` across the write.
+//! 5. `sessions` maps session ids to entries and is the lock every
+//!    read-mutate-commit of in-memory state takes. `set_metadata` holds it
+//!    across the blocking metadata store write, with `persist_lock` around
+//!    it, so a record writer cannot replace the merged metadata with an
+//!    older snapshot.
+//!
+//! The `std::sync` locks are never held across `.await` (clippy-enforced);
+//! tokio locks may be.
+//!
+//! `input_gate` and `procwatch_scan`, per entry, serialize one complete input
+//! transaction and one procwatch scan. No level 1-4 lock is held when one is
+//! taken, and none is taken under one: a transaction takes only the worker
+//! control mutex, `sessions`, leaves, and background admission, and the scan
+//! takes only `sessions` and leaves. Each gate is taken before `sessions`
+//! and never while holding it or `identity_commit`. The worker control mutex
+//! (`runtime::client`, taken by `reserve_write` and every worker request)
+//! precedes `sessions`: a reservation is taken first, then `sessions` is
+//! locked under it (`write_delayed_input`, `run_delayed_submit`). The control
+//! mutex is held until the worker's acknowledgement is read; an input
+//! transaction releases `sessions` in the send-start callback. For a
+//! forwarded report `identity_commit` precedes the control mutex: the send
+//! task holds it across the worker round trip.
+//!
+//! The remaining locks are leaves, except for two nested pairs: the hook
+//! task slot is held across background admission, which is held across the
+//! background `live` map (`spawn_agent_state_hooks` into
+//! `BackgroundTasks::spawn`), and the `TurnEvents` journal is held across the
+//! per-session `TurnProgress` table (`observe_state` into `abandon_all`).
+//! Otherwise each leaf guards one map, slot or task handle, each may be taken
+//! while `sessions` is held (the classification flags, the evidence-waiter
+//! lookup, and the `TurnEvents` table do), and no other lock is taken while
+//! one of them is held: the attach maps, the waiter counters, the
+//! classification maps, `launching`, `create_claims`, the create-task
+//! `admission`, the settle gates and session maps, the `TurnEvents` mutexes,
+//! the retention policy `RwLock`, `runtime_inventory`, `event_log_task`,
+//! `agent_state_hook_task`, background `admission` with the `live` map, and
+//! trusted-checkout slots.
+//!
+//! One lock outside the registry bounds this order: the package authority's
+//! launch hold (`crate::packages`) precedes the lifecycle lock.
+//!
+//! A new lock use follows this order or updates this section in the same
+//! change.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
