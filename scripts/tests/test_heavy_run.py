@@ -201,7 +201,7 @@ class Fixture(unittest.TestCase):
             ["sh", str(SCRIPT), *argv], capture_output=True, text=True, env=env, timeout=timeout
         )
         calls = self.log.read_text().splitlines()
-        if check_status and expected_rc is not None:
+        if check_status:
             self.assertEqual(result.returncode, expected_rc,
                                f"want rc {expected_rc}: {result.stderr}")
         if check_slot:
@@ -225,36 +225,45 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(stops), 1, calls)
         self.assertFalse(any(self.slot_dir().iterdir()))
 
-    def test_the_reap_collects_without_a_liveness_guard(self):
-        # The collect must not be guarded by a liveness check: `kill -0`
-        # reports a merely stopped child as alive (the probe pins `state=T
-        # alive=yes`), so the liveness signal carries no reap information
-        # -- it cannot distinguish a live child, a stopped one, or an
-        # unreaped zombie. The fixed script collects the child status
-        # once, without consulting `kill -0` first; the pre-fix script
-        # guarded its reap with `kill -0` and could skip the only collect
-        # after a reap landing in the gap, exiting 0 for a failed command.
-        probe = self.tmp / "liveness-window-probe.sh"
+    def test_the_guarded_reap_skips_the_collect_once_reaped(self):
+        # The reap must keep the command status even when the shell has
+        # already reaped the child: the model probe below runs the old
+        # guarded sequence verbatim under `bash` and asserts it exits 0
+        # for the failed command, then runs the single `wait` the script
+        # uses and asserts it reports 41. The behavioural rc check stays
+        # `test_a_failing_command_propagates_its_status_and_stops_the_scope`.
+        # The `assertNotIn` is a structural guard: the wrapper-level
+        # window cannot be forced, so the suite pins the guarded text
+        # instead of reproducing the race.
+        if shutil.which("bash") is None:
+            self.skipTest("the guarded-reap model needs bash")
+        probe = self.tmp / "guarded-reap-model.sh"
         probe.write_text(
-            "#!/bin/sh\n"
-            "sleep 30 &\n"
-            "cmd_pid=$!\n"
-            "sleep 0.2\n"
-            'kill -STOP "$cmd_pid"\n'
-            "sleep 0.2\n"
-            'stat=$(cut -d" " -f3 /proc/$cmd_pid/stat)\n'
-            'if kill -0 "$cmd_pid" 2>/dev/null; then alive=yes; else alive=no; fi\n'
-            'kill -KILL "$cmd_pid" 2>/dev/null\n'
-            'wait 2>/dev/null\n'
-            'echo "state=$stat alive=$alive"\n')
+            "#!/bin/bash\n"
+            "( exit 41 ) &\n"
+            "p=$!\n"
+            "deadline=$(( $(date +%s) + 10 ))\n"
+            'while kill -0 "$p" 2>/dev/null; do\n'
+            '    if [ "$(date +%s)" -ge "$deadline" ]; then exit 2; fi\n'
+            "done\n"
+            "slot_rc=0\n"
+            'while kill -0 "$p" 2>/dev/null; do\n'
+            '    wait "$p" || slot_rc=$?\n'
+            "done\n"
+            'echo "guarded=$slot_rc"\n'
+            "slot_rc=0\n"
+            'wait "$p" || slot_rc=$?\n'
+            'echo "single=$slot_rc"\n')
         result = subprocess.run(
-            ["sh", str(probe)], capture_output=True, text=True, timeout=WAIT_SECONDS)
+            ["bash", str(probe)], capture_output=True, text=True, timeout=WAIT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("state=T alive=yes", result.stdout.splitlines(),
-                      f"kill -0 must report the stopped child as alive: {result.stdout!r}")
-        script = SCRIPT.read_text()
-        self.assertNotIn("while kill", script,
-                         "the guarded reap loop must be gone from the script")
+        self.assertIn("guarded=0", result.stdout.splitlines(),
+                      f"the guarded loop must skip the collect: {result.stdout!r}")
+        self.assertIn("single=41", result.stdout.splitlines(),
+                      f"the single wait must report the stored status: {result.stdout!r}")
+        self.assertNotIn('while kill -0 "$cmd_pid"', SCRIPT.read_text(),
+                         "the guarded reap must be gone: the wrapper-level "
+                         "window cannot be forced, so the suite pins the text")
 
     def test_the_scope_is_stopped_after_success(self):
         self.write_config(slots=1)
