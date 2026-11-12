@@ -1,10 +1,13 @@
 """Behavioural checks for `scripts/ci-budgets` (stdlib only).
 
-Every case drives the real script against `--input` snapshots built in the
+Most cases drive the real script against `--input` snapshots built in the
 test, using the snapshot format `ci-timings --cache` writes, and a fake `gh`
-on PATH for the issue calls. The fake records its write calls (issue create,
-edit, comment, label create) so the tests assert which writes happened; no
-case touches the network or any host state.
+on PATH for the issue calls. The live-path scenario seeds the same fake
+with `run list`/`run view` payloads and runs without `--input`, so the
+cache-then-`--input` round trip shares one selection with the offline path.
+The fake records its write calls (issue create, edit, comment, label
+create) so the tests assert which writes happened; no case touches the
+network or any host state.
 """
 
 import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
@@ -75,7 +78,9 @@ class BudgetsHarness(unittest.TestCase):
             "    if '--json' not in args:\n"
             "        print('fake gh: issue list without --json', file=sys.stderr)\n"
             "        sys.exit(1)\n"
-            "    listed = [i for i in state['issues'] if not i.get('closed')]\n"
+            "    listed = state['issues']\n"
+            "    if isinstance(listed, list):\n"
+            "        listed = [i for i in listed if not i.get('closed')]\n"
             "    if '--state' in args:\n"
             "        i = args.index('--state')\n"
             "        if args[i + 1] != 'open':\n"
@@ -89,6 +94,28 @@ class BudgetsHarness(unittest.TestCase):
             "    print(json.dumps([{'name': n} for n in state['labels']]))\n"
             "elif args[:3] == ['repo', 'view', '--json']:\n"
             "    print(json.dumps({'nameWithOwner': 'o/r'}))\n"
+            "elif args[:2] == ['run', 'list']:\n"
+            "    if '--json' not in args:\n"
+            "        print('fake gh: run list without --json', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
+            "    runs = state.get('runs', [])\n"
+            "    if '--limit' in args:\n"
+            "        i = args.index('--limit')\n"
+            "        runs = runs[:int(args[i + 1])]\n"
+            "    fields = args[args.index('--json') + 1].split(',')\n"
+            "    print(json.dumps([{f: r.get(f) for f in fields} for r in runs]))\n"
+            "elif args[:2] == ['run', 'view']:\n"
+            "    run_id = int(args[2])\n"
+            "    attempt = 1\n"
+            "    if '--attempt' in args:\n"
+            "        attempt = int(args[args.index('--attempt') + 1])\n"
+            "    for r in state.get('runs', []):\n"
+            "        if r.get('databaseId') == run_id and r.get('attempt', 1) == attempt:\n"
+            "            print(json.dumps(r))\n"
+            "            break\n"
+            "    else:\n"
+            "        print(f'fake gh: no run {run_id} attempt {attempt}', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
             "elif args[:3] == ['label', 'create', 'ci-budget']:\n"
             "    state['labels'].append('ci-budget')\n"
             "    Path(STATE).write_text(json.dumps(state))\n"
@@ -129,6 +156,12 @@ class BudgetsHarness(unittest.TestCase):
 
     def write_state(self, state):
         self.state_path.write_text(json.dumps(state))
+
+    def write_runs_state(self, runs):
+        """Seed the fake `gh run list`/`run view` listing."""
+        state = json.loads(self.state_path.read_text())
+        state["runs"] = runs
+        self.write_state(state)
 
     def write_calls(self):
         if not self.calls_path.exists():
@@ -398,9 +431,10 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertEqual(self.write_calls(), [])
 
     def test_step_median_covers_the_whole_window(self):
-        # M1: the newest two greens run the lane step at 1000 s, the
+        # The newest two greens run the lane step at 1000 s, the
         # older two at 500 s, so the true window median is 750 s. A budget
-        # of 900 s must pass; the running-median merge reports 1000 s.
+        # of 900 s must pass; a median over only the newest runs
+        # reports 1000 s.
         snapshot = self.lane_snapshot(
             lane_seconds=[500, 500, 1000, 1000])
         budgets = self.write_budgets([
@@ -410,6 +444,38 @@ class BudgetCheckTests(BudgetsHarness):
         result = self.run_cli("--input", snapshot, "--budgets", budgets)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("median 12m30s", result.stdout)
+
+    def test_live_window_skips_non_green_first_attempts(self):
+        # The live fetch lists newest runs first, so a cancelled
+        # run, a failed run, and a green rerun sitting among the newest
+        # six listings must not shrink the four-green window. The window
+        # median over the surviving greens is 2500 s; a window-sized
+        # fetch limited to the newest four listings would report 3500 s.
+        listings = [
+            self.document(60, jobs=self.green_lane_jobs(5000, hour=15),
+                          created_minute=50),
+            self.document(50, jobs=self.green_lane_jobs(4000, hour=14),
+                          conclusion="failure", created_minute=40),
+            self.document(40, jobs=self.green_lane_jobs(3000, hour=13),
+                          conclusion="cancelled", created_minute=30),
+            self.document(30, jobs=self.green_lane_jobs(2000, hour=12),
+                          created_minute=20),
+            self.document(20, jobs=self.green_lane_jobs(2000, hour=11),
+                          conclusion="failure", attempt=2,
+                          created_minute=19),
+            self.document(20, jobs=self.green_lane_jobs(3000, hour=11),
+                          created_minute=10),
+            self.document(10, jobs=self.green_lane_jobs(1000, hour=10),
+                          created_minute=0),
+        ]
+        self.write_runs_state(listings)
+        budgets = self.write_budgets([
+            self.step_budget("platform contracts (arm64)",
+                             "Run macOS lane tests", 2600),
+        ], window_runs=4)
+        result = self.run_cli("--budgets", budgets)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("median 41m40s", result.stdout)
 
     def test_report_issue_creates_then_edits_with_a_comment_once(self):
         snapshot = self.lane_snapshot(lane_seconds=1200)
@@ -528,7 +594,7 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertIn("<!-- ci-budgets:exceeded=-->",
                       state["issues"][0]["body"])
         # The close removes the issue from the open list, so the
-        # regression opens a second issue and comments on it (L5).
+        # regression opens a second issue and comments on it.
         regressed = self.run_cli("--input", slow, "--budgets", budgets,
                                  "--report-issue")
         self.assertEqual(regressed.returncode, 1, regressed.stderr)
@@ -622,7 +688,7 @@ class BudgetCheckTests(BudgetsHarness):
                               "--report-issue")
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("over budget", result.stdout)
-        self.assertIn("gh issue list", result.stderr)
+        self.assertIn("invalid JSON", result.stderr)
         self.assertEqual(self.write_calls(), [])
 
     def test_missing_step_fails_with_the_update_message(self):
@@ -673,24 +739,38 @@ class BudgetWorkflowTests(unittest.TestCase):
         self.assertNotRegex(self.WORKFLOW, r"(?m)^\s*push\s*:")
 
     def test_workflow_permissions_are_minimal(self):
-        # L4: exact blocks, so an extra `contents: write` or a job-level
-        # `write-all` cannot hide behind a substring match.
-        self.assertRegex(self.WORKFLOW, r"(?m)^permissions: \{\}$")
-        self.assertRegex(
-            self.WORKFLOW,
-            r"(?m)^    permissions:\n"
-            r"      actions: read\n"
-            r"      contents: read\n"
-            r"      issues: write\n",
+        # Every `permissions:` mapping is parsed, so an extra grant on
+        # this job (`contents: write`, `pull-requests: write`, ...), a
+        # second job with its own write grant, or a top-level grant
+        # cannot hide behind a substring match.
+        blocks = []
+        lines = self.WORKFLOW.splitlines()
+        for index, line in enumerate(lines):
+            if "permissions:" not in line:
+                continue
+            indent = len(line) - len(line.lstrip())
+            rest = line.partition("permissions:")[2].strip()
+            if rest:
+                blocks.append((indent, rest))
+                continue
+            mapping = {}
+            for following in lines[index + 1:]:
+                if not following.strip():
+                    continue
+                depth = len(following) - len(following.lstrip())
+                if depth <= indent:
+                    break
+                key, _, value = following.strip().partition(":")
+                mapping[key.strip()] = value.strip()
+            blocks.append((indent, mapping))
+        self.assertEqual(len(blocks), 2, blocks)
+        self.assertEqual(blocks[0][1], "{}")
+        self.assertEqual(
+            blocks[1][1],
+            {"actions": "read", "contents": "read",
+             "issues": "write"},
         )
         self.assertNotRegex(self.WORKFLOW, r"write-all")
-        for line in self.WORKFLOW.splitlines():
-            stripped = line.strip()
-            if stripped.startswith(("actions:", "contents:",
-                                     "issues:")):
-                self.assertRegex(stripped, r": read$|: write$"
-                                 if stripped.startswith("issues:")
-                                 else r": read$")
 
     def test_workflow_uses_a_pinned_checkout_without_credentials(self):
         self.assertIn(

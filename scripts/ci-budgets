@@ -8,9 +8,11 @@ and a comment is added only when the set of exceeded budgets changed since
 the body was last written. A night with every budget within limits rewrites
 the body and closes the issue, so the next regression comments again.
 
-The window really is green runs: the fetch asks for a superset of runs and
-takes the newest `window_runs` green first attempts, so cancelled or failed
-runs inside the window never shrink the sample.
+The window really is green runs. Live, the run fetch fills a private
+snapshot from `gh` and every measurement reads that snapshot back with
+`--input --limit window_runs --conclusion success --attempts first`: the
+same filter-first selection the offline `--input` path uses, so cancelled,
+failed, or rerun attempts never shrink the sample.
 
 Exit codes: 0 means every measured median is within budget; 1 means a budget
 is exceeded or names a job/step absent from the window; 2 means a usage or
@@ -20,9 +22,11 @@ API error. Nothing writes to an issue without `--report-issue`.
 import argparse
 import datetime
 import json
+import os
 import statistics
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,11 +126,20 @@ def load_budgets(path):
     return data
 
 
-def run_ci_timings(arguments):
-    """Run `scripts/ci-timings` as a subprocess and decode its JSON output."""
+def run_ci_timings(arguments, *, cache=None):
+    """Run `scripts/ci-timings` as a subprocess and decode its JSON output.
+
+    `cache` names the private snapshot a live fetch accumulates into:
+    every live invocation passes its own file, never the shared
+    `target/ci-timings` cache, so concurrent runs cannot widen or
+    poison one another's window.
+    """
+    command = [sys.executable, str(CI_TIMINGS), *arguments, "--json"]
+    if cache is not None:
+        command += ["--cache", str(cache)]
     try:
         result = subprocess.run(
-            [sys.executable, str(CI_TIMINGS), *arguments, "--json"],
+            command,
             cwd=ROOT,
             check=False,
             stdout=subprocess.PIPE,
@@ -145,41 +158,39 @@ def run_ci_timings(arguments):
         ) from error
 
 
-def run_selection(event, fetch_limit, *, input_path, branch):
-    """The `ci-timings runs` selection flags for one event's fetch.
+def fetch_arguments(event, fetch_limit, *, branch):
+    """The `ci-timings runs` fetch flags for one private snapshot.
 
-    Push budgets read green `ci.yml` runs on `branch`; the pull-request
-    window spans every head branch, so it carries no branch filter. The
-    limit is a fetch superset, not the window: the caller keeps the newest
-    `window_runs` green first attempts out of what the fetch returns.
+    Only run-level filters travel here: `ci-timings` passes workflow,
+    event, and branch to `gh run list` and applies the conclusion and
+    attempt filters locally after loading the attempts. Push budgets
+    read green `ci.yml` runs on `branch`; the pull-request window spans
+    every head branch, so it carries no branch filter. The limit is a
+    fetch superset, not the window: the caller measures the newest
+    `window_runs` green first attempts out of the snapshot.
     """
-    arguments = [
-        "--limit", str(fetch_limit),
-        "--event", event, "--conclusion", "success",
-        "--attempts", "first",
-    ]
+    arguments = ["--limit", str(fetch_limit), "--event", event]
     if event == "push":
         arguments += ["--branch", branch]
-    if input_path is not None:
-        arguments += ["--input", input_path]
     return arguments
 
 
-def step_selection(fetch_limit, *, input_path, branch):
-    """The `ci-timings steps` selection flags for the push fetch.
+def selection_arguments(event, window_runs, *, input_path, branch):
+    """The `ci-timings` measurement flags over one fetched snapshot.
 
-    The limit names the whole fetch, and `ci-timings` applies the same
-    filters before it: a fetch holds exactly the newest green first
-    attempts, no more. The pull-request step window is not budgeted, so
-    the step fetch covers push only.
+    Filter first, then keep the newest `window_runs` green first
+    attempts: with `--input` this selection is exact, whatever `gh`
+    listed while the snapshot was fetched. The pull-request step window
+    is not budgeted, so only runs pass an event here.
     """
     arguments = [
-        "--limit", str(fetch_limit),
-        "--event", "push", "--conclusion", "success",
-        "--attempts", "first", "--branch", branch,
+        "--limit", str(window_runs),
+        "--event", event, "--conclusion", "success",
+        "--attempts", "first",
+        "--input", input_path,
     ]
-    if input_path is not None:
-        arguments += ["--input", input_path]
+    if event == "push":
+        arguments += ["--branch", branch]
     return arguments
 
 
@@ -218,24 +229,44 @@ def measured_window(documents, window_runs):
     return selected, len(selected) >= window_runs
 
 
-def fetch_event_runs(event, *, window_runs, input_path, branch):
+def fetch_snapshot(event, *, window_runs, branch):
+    """A private snapshot of one event's fetch superset, newest runs first.
+
+    The fetch asks `ci-timings` for `window_runs * FETCH_MULTIPLE` newest
+    runs into a file only this measurement owns: non-green first attempts
+    cost listing slots live, so the snapshot must be wider than the window
+    for the window to fill. The caller deletes the file afterwards. Each
+    event needs its own snapshot, because push and pull-request list
+different runs.
+    """
+    fetch_limit = window_runs * FETCH_MULTIPLE
+    descriptor, name = tempfile.mkstemp(prefix="ci-budgets-", suffix=".json")
+    os.close(descriptor)
+    cache = Path(name)
+    cache.unlink()
+    try:
+        run_ci_timings(
+            ["runs", *fetch_arguments(event, fetch_limit, branch=branch)],
+            cache=cache,
+        )
+        return str(cache)
+    except BaseException:
+        if cache.exists():
+            cache.unlink()
+        raise
+
+
+def measured_runs(input_path, event, *, window_runs, branch):
     """The newest green first-attempt run summaries for one event.
 
-    `ci-timings` caps a fetch at `--limit` newest matching runs, then keeps
-    the first attempts its conclusion filter passed. Non-green first
-    attempts cost fetch slots, so the fetch asks for a multiple of the
-    window and the window slices the newest green first attempts out of
-    it. With `--input` the snapshot stands in for `gh`, so offline runs
-    stay reproducible.
+    The measurement reads the fetched snapshot back with `--input --limit
+    window_runs`: filter first, then the newest slice. That selection is
+    exact on any snapshot, live or checked in, so both paths share it.
+    `ci-timings runs --json` prints the summaries as a list.
     """
-    # The window slices the newest green first attempts out of this
-    # fetch: `ci-timings` lists newest runs first and applies the
-    # conclusion locally after loading the attempts, so a superset
-    # fetch keeps the live and `--input` paths on the same selection.
-    fetch_limit = window_runs * FETCH_MULTIPLE
     payload = run_ci_timings(
-        ["runs", *run_selection(event, fetch_limit,
-                                 input_path=input_path, branch=branch)]
+        ["runs", *selection_arguments(event, window_runs,
+                                       input_path=input_path, branch=branch)]
     )
     documents = payload.get("runs") or []
     if not isinstance(documents, list):
@@ -245,21 +276,18 @@ def fetch_event_runs(event, *, window_runs, input_path, branch):
     return measured_window(documents, window_runs)
 
 
-def fetch_event_steps(*, window_runs, input_path, branch):
+def measured_steps(input_path, *, window_runs, branch):
     """Per-step medians and sample sizes over the push window.
 
-    The `steps` fetch carries the same selection as the run fetch: the
-    push branch with `--conclusion success --attempts first`. Live,
-    `ci-timings` passes only run-level filters to `gh run list` and
-    applies the conclusion locally after loading the attempts, so a
-    window-sized fetch holds exactly the newest green first attempts
-    (and a fuller fetch would fill the same window) — the live and
-    `--input` paths share one selection. A window the fetch cannot
-    fill stays short, and the table says so.
+    The `steps` measurement reads the same fetched snapshot with the same
+    `--limit window_runs --conclusion success --attempts first --branch`
+    selection as the run walls, so both cover exactly the window. A window
+    the fetch cannot fill stays short, and the table says so. The
+    pull-request step window is not budgeted.
     """
     payload = run_ci_timings(
-        ["steps", *step_selection(window_runs,
-                                   input_path=input_path, branch=branch)]
+        ["steps", *selection_arguments("push", window_runs,
+                                        input_path=input_path, branch=branch)]
     )
     runs = payload.get("runs")
     if not isinstance(runs, int):
@@ -278,19 +306,49 @@ def measure(*, window_runs, input_path, branch):
     """Medians over the newest green first attempts per event.
 
     Push budgets read green `ci.yml` runs on `branch`; the pull-request
-    window spans every head branch. One fetch per event names the
-    window's documents: run walls slice the fetch, step medians read
-    their own same-selected fetch, so both cover exactly the window.
-    With `--input` every call reads the snapshot instead of `gh`, so
-    offline runs stay reproducible.
+    window spans every head branch. Live, each event first fetches a
+    private snapshot, then both the run walls and the step medians are
+    measured from `--input` snapshots with `--limit window_runs`, so the
+    live path runs the same filter-first selection as `--input`. With
+    `--input` the given snapshot stands in for `gh`, so offline runs stay
+    reproducible.
     """
-    push_runs, push_filled = fetch_event_runs(
-        "push", window_runs=window_runs, input_path=input_path, branch=branch)
-    pr_runs, pr_filled = fetch_event_runs(
-        "pull_request", window_runs=window_runs,
-        input_path=input_path, branch=branch)
-    push_steps, push_step_runs, push_steps_filled = fetch_event_steps(
-        window_runs=window_runs, input_path=input_path, branch=branch)
+    if input_path is not None:
+        push_runs, push_filled = measured_runs(
+            input_path, "push", window_runs=window_runs, branch=branch)
+        pr_runs, pr_filled = measured_runs(
+            input_path, "pull_request", window_runs=window_runs,
+            branch=branch)
+        push_steps, push_step_runs, push_steps_filled = measured_steps(
+            input_path, window_runs=window_runs, branch=branch)
+        return measured_medians(push_runs, push_filled, pr_runs, pr_filled,
+                                push_steps, push_step_runs,
+                                push_steps_filled)
+    push_snapshot = fetch_snapshot("push", window_runs=window_runs,
+                                   branch=branch)
+    try:
+        pr_snapshot = fetch_snapshot("pull_request", window_runs=window_runs,
+                                     branch=branch)
+        try:
+            push_runs, push_filled = measured_runs(
+                push_snapshot, "push", window_runs=window_runs,
+                branch=branch)
+            pr_runs, pr_filled = measured_runs(
+                pr_snapshot, "pull_request", window_runs=window_runs,
+                branch=branch)
+            push_steps, push_step_runs, push_steps_filled = measured_steps(
+                push_snapshot, window_runs=window_runs, branch=branch)
+        finally:
+            Path(pr_snapshot).unlink(missing_ok=True)
+    finally:
+        Path(push_snapshot).unlink(missing_ok=True)
+    return measured_medians(push_runs, push_filled, pr_runs, pr_filled,
+                            push_steps, push_step_runs, push_steps_filled)
+
+
+def measured_medians(push_runs, push_filled, pr_runs, pr_filled,
+                     push_steps, push_step_runs, push_steps_filled):
+    """Assemble the medians dict from one event's measured windows."""
     return {
         "push_steps": push_steps,
         "push_step_runs": push_step_runs,
@@ -524,7 +582,7 @@ def report_issue(*, label, body, comment, dry_run, problems):
     stays unopened.
     """
     if dry_run:
-        # L3: the dry run reads the same issue state as the real one,
+        # The dry run reads the same issue state as the real one,
         # so the preview names the action the real run would take.
         issue = find_issue(label)
         if issue is None and not problems:

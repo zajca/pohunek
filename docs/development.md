@@ -150,18 +150,18 @@ passed, and a failing, cancelled or still pending check does not.
   nightly-only jobs (`test selection audit (G3)`) get their evidence only from the scheduled nightly run or a
   `tier=nightly` dispatch of `main` or of a maintainer branch.
 
-  The nightly `CI budgets` workflow then checks per-step and per-job medians over the
-  newest 30 green `ci.yml` runs per event against `scripts/ci-budgets.json`:
-  with `--report-issue` it keeps one `ci-budget`-labelled issue per regression
-  episode current, an exceedance writes the table and adds a comment, while a
-  recovered night rewrites the body and closes the issue, so the next regression
-  opens a new issue and comments again. A pull request that makes a budgeted step
-  faster lowers its budget in the same pull request; raising a budget needs a reason
-  in its entry.
-
   Before a release,
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
+
+The nightly `CI budgets` workflow then checks per-step and per-job medians over the
+newest 30 green `ci.yml` runs per event against `scripts/ci-budgets.json`:
+with `--report-issue` it keeps one `ci-budget`-labelled issue per regression
+episode current, an exceedance writes the table and adds a comment, while a
+recovered night rewrites the body and closes the issue, so the next regression
+opens a new issue and comments again. A pull request that makes a budgeted step
+faster lowers its budget in the same pull request; raising a budget needs a reason
+in its entry.
 
 **Fail fast.** When a required job of a pull request run or a
 `workflow_dispatch` run of `ci.yml` fails, its last step (`Cancel the run (fail
