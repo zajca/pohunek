@@ -145,10 +145,13 @@ scripts/gate-receipt run --gate doctests --max-age 24h -- /tmp/heavy-run.sh carg
 scripts/gate-receipt run --gate docs --max-age 24h -- /tmp/heavy-run.sh cargo xtask docs check
 ```
 
-`gate-receipt` runs the wrapped command with every `POHUNEK_*` variable
-removed from its environment (the `deliver-issue` local-environment rule)
-and keys no `POHUNEK_*` name, so no unsetting is needed around the
-invocation and receipts are shared across sessions.
+`gate-receipt` strips the daemon's session runtime names from the wrapped
+command's environment and keys no session runtime name, so no unsetting is
+needed around the invocation and receipts are shared across sessions.
+Every other `POHUNEK_*` name is contributor or CI configuration (for
+example `POHUNEK_PYTHON_BIN`, which selects the Hermes test interpreter):
+it passes through to the gate unchanged and is keyed by hash, so a changed
+value reruns the gate.
 
 The final gate before a push may use a receipt only when that receipt was
 written for the exact tree being pushed; a receipt never carries a gate
@@ -168,12 +171,12 @@ A receipt is not accepted — the command runs again — when any of these holds
   different command-file hash, a different `CARGO_HOME` location, extra
   compiler flags or wrappers (`RUSTC`, `RUSTC_WRAPPER`,
   `RUSTC_WORKSPACE_WRAPPER`, `CARGO_ENCODED_RUSTFLAGS`, `RUSTC_BOOTSTRAP`),
-  or different tracked environment hashes. No `POHUNEK_*` name is ever
-  keyed: `gate-receipt` strips every `POHUNEK_*` variable from the wrapped
-  command's environment, so a session variable can neither change a gate
-  result nor change the key.
+  or different tracked environment hashes. The daemon's session runtime
+  names are never keyed, so a second session reuses the receipt; every
+  other `POHUNEK_*` name is configuration and is keyed, so a changed
+  contributor setting reruns the gate.
 - It is older than `--max-age`, or it ends more than 60s in the future
-  (beyond clock skew).
+  (beyond the `CLOCK_SKEW_SECONDS` clock skew).
 - It is not owned by the current uid, or it is readable or writable by
   group or others.
 - The store directory is not owned by the current uid, or is not mode 0700.

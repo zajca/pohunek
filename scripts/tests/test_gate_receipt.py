@@ -7,8 +7,11 @@ appends to a marker file. A scenario asserts what an operator observes: the
 command ran (marker lines), the exit code, and the printed verdict.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,6 +25,62 @@ TOOL = ROOT / "scripts" / "gate-receipt"
 
 RUSTC_TEXT = "rustc 1.96.0 (fake abcdef)\nbinary: rustc\n"
 CARGO_TEXT = "cargo 1.96.0 (fake 123456)\nrelease: 1.96.0\n"
+# CI compiles with `-D warnings` (`.github/workflows/ci.yml`); the suite
+# runs every scenario under the same flag so receipt file-name sort order
+# (which follows the key hashes) matches CI.
+CI_RUSTFLAGS = "-D warnings"
+
+
+def load_gate_receipt():
+    """The gate-receipt script as an importable module (it has no side
+    effects on import: execution is guarded by `__name__ == "__main__"`)."""
+    spec = importlib.util.spec_from_file_location(
+        "gate_receipt", str(TOOL),
+        loader=importlib.machinery.SourceFileLoader("gate_receipt", str(TOOL)),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def gate_runtime_names():
+    """The session runtime list from the script under test."""
+    return set(load_gate_receipt().SESSION_RUNTIME_VARS)
+
+
+class SessionRuntimeListTests(unittest.TestCase):
+    """Guards the session runtime list against daemon drift.
+
+    The daemon owns which POHUNEK_* names are session runtime (injected into
+    every managed session) versus contributor configuration. When the daemon
+    gains a new session variable, this test fails until the name is added
+    to SESSION_RUNTIME_VARS in scripts/gate-receipt with its reason."""
+
+    WORKER_ENV = ROOT / "crates" / "session-worker" / "src" / "server.rs"
+    RETRY_ENV = ROOT / "crates" / "worker-protocol" / "src" / "env.rs"
+
+    def worker_injected_names(self):
+        """POHUNEK_* string literals inside command_from_initialize."""
+        source = self.WORKER_ENV.read_text()
+        start = source.index("fn command_from_initialize")
+        end = source.index("\nfn ", start)
+        return set(re.findall(r'"(POHUNEK_[A-Z0-9_]+)"', source[start:end]))
+
+    def retry_names(self):
+        source = self.RETRY_ENV.read_text()
+        start = source.index("HOOK_RETRY_ENV_NAMES")
+        end = source.index("];", start)
+        return set(re.findall(r'"(POHUNEK_[A-Z0-9_]+)"', source[start:end]))
+
+    def test_runtime_list_matches_what_the_daemon_injects(self):
+        gate_receipt = load_gate_receipt()
+        expected = self.worker_injected_names() | self.retry_names()
+        self.assertEqual(
+            set(gate_receipt.SESSION_RUNTIME_VARS), expected,
+            "SESSION_RUNTIME_VARS drifted from what the daemon injects; "
+            "add the new session name with its reason, or stop keying a "
+            "name the daemon no longer injects",
+        )
 
 
 class GateReceiptCase(unittest.TestCase):
@@ -78,7 +137,7 @@ class GateReceiptCase(unittest.TestCase):
         self.write_tool("rustc", RUSTC_TEXT)
         self.write_tool("cargo", CARGO_TEXT)
         self.write_command("ok", "exit 0")
-        self.env = dict(os.environ)
+        self.env = dict(os.environ, RUSTFLAGS=CI_RUSTFLAGS)
         for name in list(self.env):
             if name.startswith("POHUNEK_"):
                 del self.env[name]
@@ -230,6 +289,34 @@ class GateReceiptCase(unittest.TestCase):
         self.assertEqual(self.run_gate("ok").returncode, 0)
         self.assertEqual(self.marker_lines(), 2)
 
+    def test_configuration_reaches_the_gate_and_changes_the_key(self):
+        # POHUNEK_PYTHON_BIN is contributor configuration, not session
+        # runtime: it must reach the wrapped command, and changing its value
+        # must rerun the gate. The marker has one line per execution: the
+        # value the gate saw, or `unset`.
+        probe = self.bin / "probe"
+        probe.write_text(
+            "#!/bin/sh\n"
+            f'echo "${{POHUNEK_PYTHON_BIN-unset}}" >> "{self.marker}"\n'
+        )
+        probe.chmod(0o755)
+        first_env = dict(self.env, POHUNEK_PYTHON_BIN="/custom/python")
+        result = self.run_gate("probe", env=first_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.marker.read_text().splitlines(), ["/custom/python"])
+        other = dict(self.env, POHUNEK_PYTHON_BIN="/other/python")
+        result = self.run_gate("probe", env=other)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("running the command", result.stdout)
+        self.assertEqual(
+            self.marker.read_text().splitlines(),
+            ["/custom/python", "/other/python"],
+        )
+        self.assertEqual(len(self.receipts()), 2)
+        for receipt in self.receipts():
+            names = json.loads(receipt.read_text())["env"]
+            self.assertIn("POHUNEK_PYTHON_BIN", names)
+
     def test_session_state_neither_reaches_the_gate_nor_changes_the_key(self):
         # A gate that records whether POHUNEK_SESSION_ID reached it. The
         # marker has two lines per execution: `ran`, then the id or `unset`.
@@ -243,8 +330,8 @@ class GateReceiptCase(unittest.TestCase):
         first_env = dict(
             self.env,
             POHUNEK_SESSION_ID="s-first",
-            POHUNEK_FOO="non-identity-extra",
             POHUNEK_WORKER_ID="worker-first",
+            POHUNEK_NATIVE_REFERENCE_KIND="id",
         )
         result = self.run_gate("probe", env=first_env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -257,7 +344,8 @@ class GateReceiptCase(unittest.TestCase):
             self.env,
             POHUNEK_SESSION_ID="s-second",
             POHUNEK_WORKER_ID="worker-second",
-            POHUNEK_NEW_VARIABLE="never-seen",
+            POHUNEK_DAEMON_ID="d-second",
+            POHUNEK_HOOK_TRACE_PATH="/other/hooks.jsonl",
         )
         result = self.run_gate("probe", env=other)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -266,16 +354,7 @@ class GateReceiptCase(unittest.TestCase):
         self.assertEqual(self.marker.read_text().splitlines(), runs)
         receipt = self.read_receipt()
         for name in receipt["env"]:
-            self.assertFalse(name.startswith("POHUNEK_"))
-
-    def test_second_session_with_different_identity_reuses_the_receipt(self):
-        self.assertEqual(self.run_gate("ok").returncode, 0)
-        self.assertEqual(self.marker_lines(), 1)
-        env = dict(self.env, POHUNEK_SESSION_ID="s-clone")
-        result = self.run_gate("ok", env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.marker_lines(), 1)
-        self.assertIn("verified; skipping", result.stdout)
+            self.assertNotIn(name, gate_runtime_names())
 
     def test_malformed_receipt_is_rejected(self):
         for payload in ("not json\n", '{"schema": 1}\n'):
@@ -329,22 +408,26 @@ class GateReceiptCase(unittest.TestCase):
 
     def test_receipt_copied_under_another_key_is_rejected(self):
         self.assertEqual(self.run_gate("ok").returncode, 0)
+        first_path = self.receipts()[0]
+        first_key = json.loads(first_path.read_text())["key"]
         (self.repo / "untracked.txt").write_text("new\n")
         before = self.marker_lines()
         second = self.run_gate("ok")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.marker_lines(), before + 1)
-        first_receipt, second_receipt = self.receipts()
-        forged = second_receipt.read_text().replace(
-            json.loads(second_receipt.read_text())["key"],
-            json.loads(first_receipt.read_text())["key"],
+        second_path = next(
+            path for path in self.receipts() if path != first_path
         )
-        second_receipt.write_text(forged)
+        second_key = json.loads(second_path.read_text())["key"]
+        self.assertNotEqual(first_key, second_key)
+        forged = second_path.read_text().replace(second_key, first_key)
+        second_path.write_text(forged)
         try:
             result = self.run_gate("ok")
         finally:
-            second_receipt.unlink()
+            second_path.unlink()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.marker_lines(), before + 2)
         self.assertIn("is for a different key", result.stdout)
 
     def test_expired_receipt_is_rejected_without_sleep(self):
