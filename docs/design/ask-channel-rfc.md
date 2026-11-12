@@ -1,8 +1,6 @@
 # RFC: Ask channel and a Pohunek MCP server for agents
 
-- **Status:** Accepted 2026-11-06 (epic #1987, design issue #1982; the owner decisions of round ask-v1 are recorded in
-  section 12). Design-only: nothing here claims a shipped surface. Implementation is tracked by the
-  sub-issues of the epic (section 10).
+- **Status:** Withdrawn 2026-11-12 (see #1987). Not planned: nothing here will be implemented. The document stays as the record of the design and its measurements.
 - **Date:** 2026-11-06
 - **Scope:** Part A, a durable ask primitive between a running agent and its operator, with per-runtime
   emission, native permission prompt routing, surfaces and a secret answer kind. Part B, the Pohunek MCP

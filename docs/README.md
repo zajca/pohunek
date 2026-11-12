@@ -90,7 +90,8 @@ multi-team control plane without replacing either owner path.
   acceptance eligibility policy, and host-enforced human input control
   (`task.input_control`). Amended 2026-11-06 (design-only): the owner answers,
   routed asks as the addressed answer path, and the shared `task` and ask MCP server.
-- [Ask channel RFC](design/ask-channel-rfc.md) — accepted: a durable ask
+  This amendment is not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987).
+- [Ask channel RFC](design/ask-channel-rfc.md) — withdrawn 2026-11-12 (#1987), not planned: a durable ask
   primitive between a running agent and its operator (answer kinds, outcomes,
   expiry, refine), emission through the MCP server and a CLI ask command, routing
   of native permission prompts where a hook can answer them, owner surfaces, a
