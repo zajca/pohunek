@@ -1581,48 +1581,50 @@ A hook reports the conversation id through the worker, and the worker accepts it
 as the launch claim only from the launch process the session's hook schema
 declares. Under `NamedForProvider` (`identity-subagent-v1`; it is also the core
 default for a session without a schema, which is never reached because such a
-session admits no hook report) that is the process named for the provider (or a native-installer release image
-`<provider>/versions/<release>`) that
-started first below the PTY root, never an interpreter such as `node`. Under
+session admits no hook report) that is the process named for the provider (or a
+native-installer release image `<provider>/versions/<release>`) that started
+first below the PTY root, never an interpreter such as `node`. Under
 `FrozenRootEntrypoint` (`identity-v1`, used by Hermes, whose `hermes` entrypoint
 is a Python script) it is the PTY root alone, reporting in process: the worker
-requires the kernel peer of the report to be the root's PID and start time, so
-a report naming the root from any other process, a descendant included, is
+requires the kernel peer of the report to be the root's PID and start time, so a
+report naming the root from any other process, a descendant included, is
 refused, and it accepts the root's report only while the root still runs the
 exact entrypoint and shebang interpreter the worker froze before spawning it.
 Every later conversation id of the root is verified the same way before it is
 journaled. On the worker path only this rule binds the root's report to the
-root's own kernel peer. Under `NamedForProvider` a hook reports as a descendant of the launch
-process, and a descendant's report naming the launch process counts as that
-process's report; every process in the agent's PTY subtree runs as the owner,
-so this rule attributes reports and does not authenticate them. Under every
-schema the worker refuses a report from a process that is neither the process
-it names nor a descendant of it (`peer_outside_subject`). The rule requires
-the entrypoint's shebang interpreter to run the script itself. An interpreter that re-executes another image, such as a macOS
-framework Python stub or an `xcrun` shim like `/usr/bin/python3`, leaves the
-session without a launch identity: every claim is refused as
-`image_mismatch` or `cmdline_mismatch` (a `worker.launch_identity.rejected`
-warning in the worker log). The runtime still runs, but native resume is
-unavailable for that session. Under `NamedForProvider`, a process named for the
-provider that the launch process started directly is accepted as well only in the provider's hook-helper role, which is
-a command line whose second argument is `app-server` for Codex (it runs its
-hooks from a `codex app-server` child of the launched `codex`); a provider
-without a declared helper role gets no exemption. An independent same-provider
-child, a deeper process, a sibling, a process of another name, and a process
-whose PID or start time no longer matches are refused, so an agent a tool command starts never speaks for the session. The
-first accepted claim is the initial reference. A later switch replaces it only
-when the launch agent reports a newer verified conversation. Only the
-`SessionStart` identity report carries a conversation
-id; a subagent's `SubagentStart` and `SubagentStop` reports and Claude's
-main-`Stop` subagent snapshot are separate claim types that never touch the
-reference. The daemon's public `session.report_native_id` fallback is attested
-against the kernel peer of its local connection: only the session's PTY root
-itself is admitted, so a descendant of the root reporting the root's pid and
-start identity is refused with `native_report_unattested` and records nothing.
-A session on the `identity-v1` schema refuses that method for every report, the
-root included, so its native reference comes only from the worker. Its runtime,
-process-identity, ordering and expiry checks still apply to an admitted report.
-The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
+root's own kernel peer. Under `NamedForProvider` a hook reports as a descendant
+of the launch process, and a descendant's report naming the launch process
+counts as that process's report; every process in the agent's PTY subtree runs
+as the owner, so this rule attributes reports and does not authenticate them.
+Under every schema the worker refuses a report from a process that is neither
+the process it names nor a descendant of it (`peer_outside_subject`). The rule
+requires the entrypoint's shebang interpreter to run the script itself. An
+interpreter that re-executes another image, such as a macOS framework Python
+stub or an `xcrun` shim like `/usr/bin/python3`, leaves the session without a
+launch identity: every claim is refused as `image_mismatch` or
+`cmdline_mismatch` (a `worker.launch_identity.rejected` warning in the worker
+log). The runtime still runs, but native resume is unavailable for that session.
+Under `NamedForProvider`, a process named for the provider that the launch
+process started directly is accepted as well only in the provider's hook-helper
+role, which is a command line whose second argument is `app-server` for Codex
+(it runs its hooks from a `codex app-server` child of the launched `codex`); a
+provider without a declared helper role gets no exemption. An independent
+same-provider child, a deeper process, a sibling, a process of another name, and
+a process whose PID or start time no longer matches are refused, so an agent a
+tool command starts never speaks for the session. The first accepted claim is
+the initial reference. A later switch replaces it only when the launch agent
+reports a newer verified conversation. Only the `SessionStart` identity report
+carries a conversation id; a subagent's `SubagentStart` and `SubagentStop`
+reports and Claude's main-`Stop` subagent snapshot are separate claim types that
+never touch the reference. The daemon's public `session.report_native_id`
+fallback is attested against the kernel peer of its local connection: only the
+session's PTY root itself is admitted, so a descendant of the root reporting the
+root's pid and start identity is refused with `native_report_unattested` and
+records nothing. A session on the `identity-v1` schema refuses that method for
+every report, the root included, so its native reference comes only from the
+worker. Its runtime, process-identity, ordering and expiry checks still apply to
+an admitted report. The official Pi package is the worked example: see the
+[Pi runtime package](../guides/pi-package.md).
 
 Recovery records written by earlier releases are completed when the daemon
 starts, so every such session stays listed with its recovery record. The

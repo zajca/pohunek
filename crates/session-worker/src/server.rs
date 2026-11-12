@@ -8293,10 +8293,11 @@ fn is_provider_child_of_launch(
 /// ([`is_native_release_image`]). Interpreters (`node`, `bun`) never qualify by
 /// themselves, and neither does an interpreter's script argument: a wrapper
 /// install is accepted only when the process image that runs is itself named
-/// for the provider (a native binary or a launcher named for it). Anything else yields `None`, which
-/// leaves the claim unaccepted. This is the [`LaunchProcess::NamedForProvider`]
-/// rule; a schema declaring [`LaunchProcess::FrozenRootEntrypoint`] designates
-/// the frozen PTY root instead.
+/// for the provider (a native binary or a launcher named for it). Anything
+/// else yields `None`, which leaves the claim unaccepted. This is the
+/// [`LaunchProcess::NamedForProvider`] rule; a schema declaring
+/// [`LaunchProcess::FrozenRootEntrypoint`] designates the frozen PTY root
+/// instead.
 fn designated_launch_process_with(
     inspector: &dyn ProcessInspector,
     root: OsProcessIdentity,
