@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""Decide which CI jobs a delta dispatch reuses from a pull request run.
+
+A `tier=main` dispatch with `delta=true` runs this script in the `reuse` job.
+The script computes the tree of `GITHUB_SHA`, lists `ci.yml` runs of this
+repository whose `head_sha` is `GITHUB_SHA` and whose event is in the
+`source_events` of `scripts/ci-reuse.json` (never a fork: repository and
+head_repository must both equal `github.repository`), and takes the newest run
+whose `tested-tree-*` artifact record is exactly that tree.
+
+For every job of `scripts/ci-reuse.json` it reports `skip` when all of these
+hold: every listed leg's newest attempt concluded `success`, `completed_at` is
+within `max_age_hours` of now, and, when the job is `selection_dependent`, the
+source selection has `narrowed != true`. A source run without a readable
+`selection.json` counts as narrowed. Then every job with a consumer outside
+`skip` is removed from `skip`, iterated to a fixed point, so a reused job's
+same-run producers are reused with it and no running job downloads an artifact
+its producer did not upload in this run.
+
+Outputs: `skip` is a compact JSON array of job ids (`[]` when nothing
+applies), `source_run` is the run id or empty. The script also uploads the
+`ci-reuse-<tree>` record artifact and writes a job summary table. Any API
+error, missing record or ambiguity gives `skip=[]`: run everything, and emit
+`::warning` with the reason. The only red outcome is an internal bug.
+
+Issue #2203.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+CHECKOUT = Path(__file__).resolve().parents[1]
+CONFIG_IN_TREE = "scripts/ci-reuse.json"
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
+SCHEMA_VERSION = 1
+
+
+class ReuseError(Exception):
+    """An internal bug: the reuse job must fail so the verdict fails too."""
+
+
+def warn(message: str) -> None:
+    print(f"::warning::ci-reuse: {message}", flush=True)
+
+
+def output(name: str, value: str) -> None:
+    destination = os.environ.get("GITHUB_OUTPUT")
+    if not destination:
+        raise ReuseError("GITHUB_OUTPUT is not set")
+    with open(destination, "a") as stream:
+        stream.write(f"{name}={value}\n")
+
+
+def gh(*arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ["gh", *arguments], capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError as error:
+        raise ReuseError("gh is required to list Actions runs") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"gh exited with status {result.returncode}"
+        raise ReuseError(detail)
+    return result.stdout
+
+
+def read_json(arguments: list[str]):
+    try:
+        return json.loads(gh(*arguments))
+    except json.JSONDecodeError as error:
+        raise ReuseError("gh returned invalid JSON") from error
+
+
+def load_config(text: str, source: str) -> dict:
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ReuseError(f"cannot parse config {source}: {error}") from error
+    if not isinstance(config, dict):
+        raise ReuseError(f"config {source} must be a JSON object")
+    for field in ("max_age_hours", "source_events", "not_dispatch_consumers", "jobs"):
+        if field not in config:
+            raise ReuseError(f"config {source} is missing {field}")
+    if not isinstance(config["max_age_hours"], int) or config["max_age_hours"] <= 0:
+        raise ReuseError(f"config {source} max_age_hours must be a positive integer")
+    if (
+        not isinstance(config["source_events"], list)
+        or not config["source_events"]
+        or any(not isinstance(event, str) for event in config["source_events"])
+    ):
+        raise ReuseError(f"config {source} source_events must be a non-empty string list")
+    if not isinstance(config["not_dispatch_consumers"], dict):
+        raise ReuseError(f"config {source} not_dispatch_consumers must be an object")
+    if not isinstance(config["jobs"], dict) or not config["jobs"]:
+        raise ReuseError(f"config {source} jobs must be a non-empty object")
+    for job_id, job in config["jobs"].items():
+        if not isinstance(job, dict):
+            raise ReuseError(f"config {source} job {job_id} must be an object")
+        for field in ("names", "selection_dependent", "consumers", "reason"):
+            if field not in job:
+                raise ReuseError(f"config {source} job {job_id} is missing {field}")
+        if (
+            not isinstance(job["names"], list)
+            or not job["names"]
+            or any(not isinstance(name, str) for name in job["names"])
+        ):
+            raise ReuseError(f"config {source} job {job_id} names must be a non-empty string list")
+        if not isinstance(job["selection_dependent"], bool):
+            raise ReuseError(f"config {source} job {job_id} selection_dependent must be a boolean")
+        if not isinstance(job["consumers"], list) or any(
+            not isinstance(consumer, str) for consumer in job["consumers"]
+        ):
+            raise ReuseError(f"config {source} job {job_id} consumers must be a string list")
+        if not isinstance(job["reason"], str) or not job["reason"]:
+            raise ReuseError(f"config {source} job {job_id} reason must be a non-empty string")
+    return config
+
+
+def commit_tree(sha: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(CHECKOUT), "rev-parse", f"{sha}^{{tree}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not SHA_PATTERN.fullmatch(result.stdout.strip()):
+        raise ReuseError(f"cannot compute the tree of {sha}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def parse_time(value) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment
+
+
+def list_runs(repo: str, workflow_file: str, sha: str) -> list[dict]:
+    """Runs of ci.yml with `head_sha` of SHA, any state, in API order."""
+    try:
+        pages = read_json([
+            "api", "--method", "GET", "--paginate", "--slurp",
+            f"repos/{repo}/actions/workflows/{workflow_file}/runs",
+            "-f", f"head_sha={sha}", "-f", "per_page=100",
+        ])
+    except ReuseError as error:
+        raise error
+    if not isinstance(pages, list):
+        raise ReuseError("Actions API returned an invalid workflow-run list")
+    runs: list[dict] = []
+    for page in pages:
+        if isinstance(page, dict):
+            values = page.get("workflow_runs")
+            if not isinstance(values, list):
+                raise ReuseError("Actions API response has no workflow_runs list")
+            runs.extend(run for run in values if isinstance(run, dict))
+    return runs
+
+
+def run_jobs(repo: str, run_id: int) -> list[dict]:
+    try:
+        pages = read_json([
+            "api", "--method", "GET", "--paginate", "--slurp",
+            f"repos/{repo}/actions/runs/{run_id}/jobs",
+            "-f", "per_page=100",
+        ])
+    except ReuseError as error:
+        raise error
+    if not isinstance(pages, list):
+        raise ReuseError("Actions API returned an invalid job list")
+    jobs: list[dict] = []
+    for page in pages:
+        if isinstance(page, dict):
+            values = page.get("jobs")
+            if not isinstance(values, list):
+                raise ReuseError("Actions API response has no jobs list")
+            jobs.extend(job for job in values if isinstance(job, dict))
+    return jobs
+
+
+def list_artifact_pages(repo: str, run_id: int) -> list:
+    try:
+        return read_json([
+            "api", "--method", "GET", "--paginate", "--slurp",
+            f"repos/{repo}/actions/runs/{run_id}/artifacts",
+            "-f", "per_page=100",
+        ])
+    except ReuseError as error:
+        raise error
+
+
+def artifact_names(repo: str, run_id: int, list_pages=None) -> list[str]:
+    pages = (list_pages or list_artifact_pages)(repo, run_id)
+    if not isinstance(pages, list):
+        raise ReuseError("Actions API returned an invalid artifact list")
+    names: list[str] = []
+    for page in pages:
+        if isinstance(page, dict):
+            values = page.get("artifacts")
+            if not isinstance(values, list):
+                raise ReuseError("Actions API response has no artifacts list")
+            for artifact in values:
+                if isinstance(artifact, dict) and isinstance(artifact.get("name"), str):
+                    names.append(artifact["name"])
+    return names
+
+
+def run_artifacts(repo: str, run_id: int) -> list[str]:
+    return artifact_names(repo, run_id, list_artifact_pages)
+
+
+def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
+    result = subprocess.run(
+        [
+            "gh", "api", "--method", "GET",
+            f"repos/{repo}/actions/runs/{run_id}/artifacts",
+            "-f", "per_page=100",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    try:
+        pages = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    artifact_id = None
+    for page in pages if isinstance(pages, list) else []:
+        for artifact in (page.get("artifacts") or []) if isinstance(page, dict) else []:
+            if isinstance(artifact, dict) and artifact.get("name") == name and not artifact.get("expired"):
+                artifact_id = artifact.get("id")
+    if artifact_id is None:
+        return False
+    fetch = subprocess.run(
+        [
+            "gh", "api", "--method", "GET",
+            f"repos/{repo}/actions/artifacts/{artifact_id}/zip",
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if fetch.returncode != 0:
+        return False
+    target = Path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    archive = target / f"{name}.zip"
+    archive.write_bytes(fetch.stdout)
+    unzip = subprocess.run(
+        ["unzip", "-o", "-q", str(archive), "-d", str(target)],
+        capture_output=True,
+        check=False,
+    )
+    archive.unlink(missing_ok=True)
+    return unzip.returncode == 0
+
+
+def source_selection_narrowed(repo: str, run_id: int) -> bool | None:
+    """Whether the source run's selection narrowed it: True when narrowed or
+    unreadable, False when full, None when the artifact lookup failed."""
+    names: list[str] | None = None
+    try:
+        names = run_artifacts(repo, run_id)
+    except ReuseError:
+        return None
+    if "test-selection" not in (names or []):
+        return True
+    temporary = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"ci-reuse-selection-{run_id}"
+    if not download_artifact(repo, run_id, "test-selection", str(temporary)):
+        return None
+    selection_file = temporary / "selection.json"
+    try:
+        selection = json.loads(selection_file.read_text())
+    except (OSError, ValueError):
+        return True
+    if not isinstance(selection, dict):
+        return True
+    return selection.get("narrowed") is True
+
+
+def decide(
+    config: dict,
+    tree: str,
+    runs: list[dict],
+    now: datetime.datetime,
+    sha: str,
+    repo: str,
+    jobs_of=None,
+    names_of=None,
+    narrowed_of=None,
+) -> tuple[list[str], dict | None, str]:
+    """The skip list, the source run, and why not (`""` when reused)."""
+    jobs_of = jobs_of or run_jobs
+    names_of = names_of or run_artifacts
+    narrowed_of = narrowed_of or source_selection_narrowed
+    window = datetime.timedelta(hours=config["max_age_hours"])
+    candidates = [
+        run for run in runs
+        if run.get("head_sha") == sha
+        and run.get("event") in config["source_events"]
+        and isinstance(run.get("id"), int)
+        and (run.get("repository") or {}).get("full_name") == repo
+        and (run.get("head_repository") or {}).get("full_name") == repo
+    ]
+    # Newest first.
+    candidates.sort(
+        key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
+        reverse=True,
+    )
+    for run in candidates:
+        try:
+            names = names_of(repo, run["id"])
+        except ReuseError as error:
+            return [], None, f"cannot list artifacts of run {run['id']}: {error}"
+        trees = {
+            match.group(1)
+            for name in names
+            if (match := TESTED_TREE_ARTIFACT.fullmatch(name))
+        }
+        if trees != {tree}:
+            continue
+        try:
+            jobs = jobs_of(repo, run["id"])
+        except ReuseError as error:
+            return [], None, f"cannot list jobs of run {run['id']}: {error}"
+        by_name: dict[str, list[dict]] = {}
+        for job in jobs:
+            by_name.setdefault(job.get("name", ""), []).append(job)
+        narrowed: bool | None = None
+        skip: list[str] = []
+        for job_id, job in config["jobs"].items():
+            legs = []
+            for name in job["names"]:
+                attempts = by_name.get(name, [])
+                if not attempts:
+                    legs = []
+                    break
+                newest = max(attempts, key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)))
+                legs.append(newest)
+            if len(legs) != len(job["names"]):
+                continue
+            if any(leg.get("conclusion") != "success" for leg in legs):
+                continue
+            completed = [parse_time(leg.get("completed_at")) for leg in legs]
+            if any(moment is None or now - moment > window for moment in completed):
+                continue
+            if job["selection_dependent"]:
+                if narrowed is None:
+                    narrowed = narrowed_of(repo, run["id"])
+                    if narrowed is None:
+                        return [], None, f"cannot read the selection of run {run['id']}"
+                if narrowed:
+                    continue
+            skip.append(job_id)
+        # Closure: drop every job with a consumer outside skip.
+        skip_set = set(skip)
+        changed = True
+        while changed:
+            changed = False
+            for job_id in list(skip_set):
+                consumers = config["jobs"][job_id]["consumers"]
+                if any(consumer not in skip_set for consumer in consumers):
+                    skip_set.discard(job_id)
+                    changed = True
+        ordered = [job_id for job_id in config["jobs"] if job_id in skip_set]
+        return ordered, run, ""
+    return [], None, "no same-tree pull request run"
+
+
+def summarize(config: dict, skip: list[str], source: dict | None, tree: str) -> str:
+    lines = ["| job | decision |", "| --- | --- |"]
+    link = f"[run {source['id']}]({source.get('html_url')})" if source else "none"
+    for job_id in config["jobs"]:
+        if job_id in skip and source is not None:
+            lines.append(f"| {job_id} | reused from {link} |")
+        else:
+            reason = config["jobs"][job_id]["reason"]
+            lines.append(f"| {job_id} | runs: {reason} |")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    sha = os.environ.get("GITHUB_SHA", "")
+    if not REPO_PATTERN.fullmatch(repo):
+        print("ci-reuse: GITHUB_REPOSITORY is not in owner/name form", file=sys.stderr)
+        return 1
+    if not SHA_PATTERN.fullmatch(sha):
+        print("ci-reuse: GITHUB_SHA is not a full commit SHA", file=sys.stderr)
+        return 1
+    try:
+        text = (CHECKOUT / CONFIG_IN_TREE).read_text()
+    except OSError as error:
+        print(f"ci-reuse: cannot read {CONFIG_IN_TREE}: {error}", file=sys.stderr)
+        return 1
+    try:
+        config = load_config(text, CONFIG_IN_TREE)
+        tree = commit_tree(sha)
+    except ReuseError as error:
+        print(f"ci-reuse: {error}", file=sys.stderr)
+        return 1
+    workflow_file = os.environ.get("WORKFLOW_FILE", "ci.yml")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        runs = list_runs(repo, workflow_file, sha)
+    except ReuseError as error:
+        warn(str(error))
+        runs = []
+    if runs:
+        try:
+            skip, source, _ = decide(config, tree, runs, now, sha, repo)
+        except ReuseError as error:
+            warn(str(error))
+            skip, source = [], None
+        except KeyError as error:
+            warn(f"missing Actions field: {error}")
+            skip, source = [], None
+    else:
+        skip, source = [], None
+    if not runs:
+        warn("cannot list candidate runs; running everything")
+    elif not skip and source is None:
+        warn("no same-tree green pull request run; running everything")
+    record = {
+        "schema_version": SCHEMA_VERSION,
+        "tree": tree,
+        "source_run_id": source["id"] if source else None,
+        "source_url": (source.get("html_url") if source else None),
+        "source_event": (source.get("event") if source else None),
+        "source_head_sha": (source.get("head_sha") if source else None),
+        "jobs": {},
+    }
+    if source is not None:
+        try:
+            jobs = run_jobs(repo, source["id"])
+        except ReuseError as error:
+            warn(f"cannot list jobs of run {source['id']}: {error}; running everything")
+            skip, source = [], None
+            record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None}
+        else:
+            by_name: dict[str, list[dict]] = {}
+            for job in jobs:
+                by_name.setdefault(job.get("name", ""), []).append(job)
+            for job_id in skip:
+                job = config["jobs"][job_id]
+                entries = []
+                for name in job["names"]:
+                    newest = max(
+                        by_name.get(name, []),
+                        key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
+                    )
+                    entries.append({
+                        "run_id": source["id"],
+                        "name": name,
+                        "source_job_id": newest.get("id"),
+                        "completed_at": newest.get("completed_at"),
+                    })
+                record["jobs"][job_id] = {
+                    "run_id": source["id"],
+                    "names": job["names"],
+                    "source_job_ids": [entry["source_job_id"] for entry in entries],
+                    "completed_at": [entry["completed_at"] for entry in entries],
+                }
+    try:
+        output("skip", json.dumps(skip, separators=(",", ":")))
+        output("source_run", str(source["id"]) if source else "")
+    except ReuseError as error:
+        print(f"ci-reuse: {error}", file=sys.stderr)
+        return 1
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as stream:
+            stream.write(f"### Delta reuse (tree `{tree}`)\n\n")
+            stream.write(summarize(config, skip, source, tree))
+            stream.write("\n")
+    else:
+        print(summarize(config, skip, source, tree))
+    record_name = f"ci-reuse-{tree}"
+    record_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{record_name}.json"
+    record_path.write_text(json.dumps(record, indent=2) + "\n")
+    print(f"ci-reuse: skip={json.dumps(skip)} source_run={source['id'] if source else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

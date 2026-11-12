@@ -33,13 +33,18 @@ on:
         description: Correlates an automated evidence request with its workflow run
         required: false
         type: string
+      delta:
+        description: Reuse the green jobs of the pull request run of the same tree (opt-in; scripts/release dispatches stay full)
+        required: false
+        default: false
+        type: boolean
   # Daily sweep to catch regressions in jobs that are path-filtered out on
   # normal PRs (issue #125). Runs at 05:00 UTC; `pull_request_target`
   # is intentionally avoided to keep the default pull-request provenance model.
   schedule:
     - cron: '0 5 * * *'
 
-run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_id != '' && format('CI [tier={0}] [dispatch={1}]', inputs.tier, inputs.dispatch_id) || (github.event_name == 'workflow_dispatch' && format('CI [tier={0}]', inputs.tier)) || ' ' }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI [tier={0}]{1}{2}', inputs.tier, inputs.dispatch_id != '' && format(' [dispatch={0}]', inputs.dispatch_id) || '', inputs.delta && ' [delta]' || '') || ' ' }}
 
 
 # A required job that fails in a pull request or `workflow_dispatch` run cancels
@@ -196,8 +201,8 @@ jobs:
     # macOS runners are costly (issue #125): run in the main/nightly tiers or
     # on a PR when platform inputs change via the paths filter. A narrowed
     # selection whose lane part selects no lane package skips it (#1225).
-    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) }}
-    needs: [changes, test-selection]
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.macos == 'true' && (needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.lane != 'false'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') }}
+    needs: [changes, test-selection, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -394,7 +399,8 @@ jobs:
   macos-tier:
     name: macOS tier packages (arm64)
     # No pull_request branch: this job never starts on a pull request.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) }}
+    needs: reuse
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-tier') }}
     runs-on: macos-15
     permissions:
       contents: read
@@ -482,8 +488,8 @@ jobs:
   # either of them does.
   macos-release-build:
     name: macOS release daemon build (macos-15)
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true')) }}
-    needs: changes
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && (needs.changes.outputs.macos_package == 'true' || needs.changes.outputs.hermes_macos == 'true'))) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-release-build') }}
+    needs: [changes, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -550,8 +556,8 @@ jobs:
     # macOS 15 is the tested platform. The archives target macOS 14.0, a
     # supported build target that CI does not run (issue #1224).
     name: macOS package install and upgrade (macos-15)
-    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true') }}
-    needs: [changes, macos-release-build]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.macos_package == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'macos-package') }}
+    needs: [changes, macos-release-build, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -688,8 +694,8 @@ jobs:
   # `docs check`. Any other outcome of the selection runs it.
   test:
     name: fmt + clippy
-    needs: test-selection
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'test') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -747,8 +753,8 @@ jobs:
   # `docs check`. Any other outcome of the selection runs it.
   darwin-check:
     name: macOS lint from Linux (aarch64-apple-darwin clippy)
-    needs: test-selection
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'darwin-check') }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
@@ -909,7 +915,46 @@ jobs:
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection/
-          retention-days: 1
+          # A delta dispatch reuses the newest same-tree pull request run
+          # within 24 hours, and reads its selection record; keep it alive.
+          retention-days: 2
+          if-no-files-found: error
+
+  # Finds the newest green same-tree pull request run and decides which jobs
+  # a delta dispatch reuses from it (issue #2203). Runs only on a tier=main
+  # dispatch with delta=true; every other event skips it, and each reusable
+  # job skips only when this job succeeded and names it in `skip`.
+  reuse:
+    name: delta reuse
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta }}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      source_run: ${{ steps.decide.outputs.source_run }}
+      tree: ${{ steps.decide.outputs.tree }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Decide the reused jobs
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci-reuse
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the reuse record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-reuse-${{ steps.decide.outputs.tree }}
+          path: ${{ runner.temp }}/ci-reuse-${{ steps.decide.outputs.tree }}.json
+          retention-days: 2
           if-no-files-found: error
 
   # Compiles every workspace test binary exactly once for the fast shards, the
@@ -917,6 +962,8 @@ jobs:
   # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
+    needs: reuse
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -973,8 +1020,8 @@ jobs:
 
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
-    needs: [build-tests, test-selection]
-    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.fast_shards != '[]') }}
+    needs: [build-tests, test-selection, reuse]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.fast_shards != '[]') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1367,8 +1414,8 @@ jobs:
 
   integration:
     name: tests (heavy, PTY + Hermes)
-    needs: [build-tests, test-selection]
-    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') }}
+    needs: [build-tests, test-selection, reuse]
+    if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1480,6 +1527,8 @@ jobs:
   # not carry one.
   systemd-supervision:
     name: real systemd supervision
+    needs: reuse
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'systemd-supervision') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1616,8 +1665,8 @@ jobs:
   # changed.
   upgrade-test:
     name: upgrade from the previous release
-    needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.upgrade == 'true' }}
+    needs: [changes, reuse]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.upgrade == 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'upgrade-test') }}
     uses: ./.github/workflows/upgrade.yml
     permissions:
       contents: read
@@ -1790,12 +1839,18 @@ jobs:
   # macOS lane by its paths filter or a narrowed selection without lane tests.
   test-selection-verdict:
     name: test selection verdict
-    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos]
+    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos, reuse]
     if: ${{ always() }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
-      - name: Fail a test job that failed or was skipped without a narrowed selection
-        if: ${{ needs.build-tests.result != 'success' || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
+      - name: Fail the verdict when the reuse job failed
+        if: ${{ needs.reuse.result == 'failure' }}
+        shell: bash
+        run: |
+          echo "::error::the reuse job failed, so no skip is trusted"
+          exit 1
+      - name: Fail a test job that failed or was skipped without a narrowed selection or a reuse skip
+        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests')) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
         shell: bash
         env:
           RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }}"
@@ -1803,15 +1858,15 @@ jobs:
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1
       - name: Fail a gate job that failed or was skipped without the docs-only path
-        if: ${{ (needs.test.result != 'success' && !(needs.test.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.darwin-check.result != 'success' && !(needs.darwin-check.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.doctests.result != 'success' && !(needs.doctests.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.build-bins.result != 'success' && !(needs.build-bins.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.sdk.result != 'success' && !(needs.sdk.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.audit.result != 'success' && !(needs.audit.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.shear.result != 'success' && !(needs.shear.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
+        if: ${{ (needs.test.result != 'success' && !(needs.test.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'test') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.darwin-check.result != 'success' && !(needs.darwin-check.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'darwin-check') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.doctests.result != 'success' && !(needs.doctests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'doctests') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.build-bins.result != 'success' && !(needs.build-bins.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-bins') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.sdk.result != 'success' && !(needs.sdk.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.audit.result != 'success' && !(needs.audit.result == 'skipped' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) || (needs.shear.result != 'success' && !(needs.shear.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'shear') || github.event_name == 'pull_request') && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
         shell: bash
         env:
           RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} test=${{ needs.test.result }} darwin-check=${{ needs.darwin-check.result }} doctests=${{ needs.doctests.result }} build-bins=${{ needs.build-bins.result }} sdk=${{ needs.sdk.result }} audit=${{ needs.audit.result }} shear=${{ needs.shear.result }}"
         run: |
           echo "::error::gate jobs did not run as the selection requires: $RESULTS"
           exit 1
-      - name: Fail a macOS lane that failed or was skipped without a reason
-        if: ${{ needs.platform-contracts.result == 'failure' || needs.platform-contracts.result == 'cancelled' || (needs.platform-contracts.result == 'skipped' && !(github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.macos != 'true' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.lane == 'false')))) }}
+      - name: Fail a macOS lane that failed or was skipped without a reuse skip or a reason
+        if: ${{ needs.platform-contracts.result == 'failure' || needs.platform-contracts.result == 'cancelled' || (needs.platform-contracts.result == 'skipped' && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'platform-contracts') && !(github.event_name == 'pull_request' && (needs.changes.result != 'success' || needs.changes.outputs.macos != 'true' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.lane == 'false')))) }}
         shell: bash
         env:
           RESULTS: "lane=${{ needs.platform-contracts.result }} changes=${{ needs.changes.result }} macos=${{ needs.changes.outputs.macos }} selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} lane_plan=${{ needs.test-selection.outputs.lane }}"
@@ -1820,8 +1875,8 @@ jobs:
           exit 1
       # Under the lane's `SKIP_OWNED_BY` condition the lane leaves the
       # `hermes_package` tests to the Hermes macOS job, so that job must pass.
-      - name: Fail a Hermes macOS job that did not pass the tests the lane left to it
-        if: ${{ (github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true') && needs.hermes-compatibility-macos.result != 'success' }}
+      - name: Fail a Hermes macOS job that did not pass the tests the lane left to it and was not reused
+        if: ${{ (github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true') && needs.hermes-compatibility-macos.result != 'success' && !(needs.hermes-compatibility-macos.result == 'skipped' && contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos')) }}
         shell: bash
         env:
           RESULTS: "hermes-macos=${{ needs.hermes-compatibility-macos.result }} macos-release-build=${{ needs.macos-release-build.result }} hermes_macos=${{ needs.changes.outputs.hermes_macos }}"
@@ -1834,8 +1889,8 @@ jobs:
   # `docs check`. Any other outcome of the selection runs it.
   doctests:
     name: doctests
-    needs: test-selection
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'doctests') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1879,8 +1934,8 @@ jobs:
     permissions:
       contents: read
       actions: write
-    needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release == 'true' }}
+    needs: [changes, reuse]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release == 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'release-build') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -1961,7 +2016,7 @@ jobs:
   # a failure, cancellation or skip fails the run's evidence.
   release-rehearsal-scenarios:
     name: release rehearsal (archive smoke scenarios)
-    needs: [changes]
+    needs: changes
     if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
     uses: ./.github/workflows/release-smoke-scenarios.yml
     permissions:
@@ -2071,8 +2126,8 @@ jobs:
     permissions:
       contents: read
       actions: write
-    needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true' }}
+    needs: [changes, reuse]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'ts-drift') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -3189,8 +3244,8 @@ jobs:
     # A pull request runs it only for its narrow input filter (issue #1050);
     # core inputs are covered by the main and nightly tiers. The Linux
     # `hermes-package` job follows the runtime package selection instead.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true') }}
-    needs: [changes, macos-release-build]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.macos-release-build.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.hermes_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'hermes-compatibility-macos') }}
+    needs: [changes, macos-release-build, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -3542,6 +3597,7 @@ jobs:
       - codex-package
       - claude-package
       - hermes-compatibility-macos
+      - reuse
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
@@ -3564,6 +3620,18 @@ jobs:
           pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
           path: ${{ runner.temp }}/junit
 
+      # On a delta dispatch the reused jobs ran in the source run, so their
+      # JUnit reports live there; download them into the same directory.
+      - name: Download the reused jobs' JUnit reports from the source run
+        if: ${{ needs.reuse.outputs.source_run != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
+          path: ${{ runner.temp }}/junit
+          run-id: ${{ needs.reuse.outputs.source_run }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
       - name: Cancel the run (fail fast)
@@ -3577,8 +3645,8 @@ jobs:
   # `docs check`. Any other outcome of the selection runs it.
   build-bins:
     name: build bins (pohunekd + pohunek-sessiond + pohunek)
-    needs: test-selection
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-bins') }}
     runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
     permissions:
       contents: read
@@ -3769,8 +3837,8 @@ jobs:
   # pohunek-sessiond and pohunek.
   sdk-macos:
     name: SDK workspace (macOS arm64)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.sdk_macos == 'true') }}
-    needs: changes
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.tier == 'main' || inputs.tier == 'nightly')) || (github.event_name == 'pull_request' && needs.changes.outputs.sdk_macos == 'true')) && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'sdk-macos') }}
+    needs: [changes, reuse]
     runs-on: macos-15
     permissions:
       contents: read
@@ -3884,6 +3952,8 @@ jobs:
 
   docs:
     name: docs check (schema + drift + source-map + runbooks + secrets + release)
+    needs: reuse
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'docs') }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
@@ -3921,8 +3991,8 @@ jobs:
     # Expensive (issue #125): run only on schedule, push to main, manual
     # dispatch (always a full run), or when the dependency graph / feature
     # set / CI workflow changes.
-    needs: changes
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.feature_matrix == 'true' }}
+    needs: [changes, reuse]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.feature_matrix == 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'feature-matrix') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -3969,11 +4039,12 @@ jobs:
   # compiled out for the host (e.g. `#[cfg(target_os = "macos")]` on Linux).
   udeps:
     name: cargo-udeps (unused dependencies)
+    needs: reuse
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
       actions: write
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'udeps') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -4025,8 +4096,8 @@ jobs:
   # `docs check`. Any other outcome of the selection runs it.
   shear:
     name: cargo-shear (unused dependencies)
-    needs: test-selection
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'shear') }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read

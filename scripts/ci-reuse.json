@@ -1,0 +1,192 @@
+{
+  "_comment": "Delta reuse allowlist (issue #2203): jobs of ci.yml that a tier=main dispatch with delta=true may skip when the newest same-tree pull_request run has them green. Reasoning: the never-list holds jobs whose inputs live outside the tree (audit: the RustSec advisory DB; changes/test-selection/package-selection/package-version-bump: the selectors whose delta path never runs; test-selection-verdict/test-duplicates/every cancel-after-*: aggregators and watchers that must see the delta run itself; the reuse job itself). The runtime package jobs (hermes/pi/codex/claude-package) and sdk stay out: they read the release baseline digest from the pull_request-only package-selection, so on a dispatch they would run without it, which is not the pull request's green result. A job whose needs: names a reusable job but that can never run on a tier=main dispatch (test-selection-check is pull_request-only, test-selection-audit is nightly-only) is not a consumer for the closure: it never reads the artifact on the dispatch path, so it lives in not_dispatch_consumers, and the guard requires its job-level if: to restrict it to pull_request or schedule. Dynamic-matrix fast-tests lists the legs of the FULL selection one by one and is selection_dependent: a narrowed source never reuses them, so the full leg list is the only one that can be reused, and the guard derives it from the same matrix source the workflow uses. Consumers include non-allowlisted jobs too (for example sdk of build-bins): the closure must drop a producer whose artifact a running job still downloads in the same run.",
+  "max_age_hours": 24,
+  "source_events": [
+    "pull_request"
+  ],
+  "not_dispatch_consumers": {
+    "test-selection-check": "pull_request-only: its job-level if: requires github.event_name == 'pull_request'",
+    "test-selection-audit": "nightly-only: its job-level if: requires schedule or (workflow_dispatch with tier == 'nightly')",
+    "sdk": "its producers are not all reusable: hermes-package reads the release baseline digest from pull_request-only package-selection"
+  },
+  "jobs": {
+    "build-bins": {
+      "names": [
+        "build bins (pohunekd + pohunek-sessiond + pohunek)"
+      ],
+      "selection_dependent": false,
+      "consumers": [
+        "sdk"
+      ],
+      "reason": "compiles the workspace test archive from the lockfile; identical on the same tree"
+    },
+    "build-tests": {
+      "names": [
+        "build tests (nextest archive)"
+      ],
+      "selection_dependent": false,
+      "consumers": [
+        "fast-tests",
+        "integration"
+      ],
+      "reason": "default-feature build of the shipped binaries; the closure keeps it when sdk runs"
+    },
+    "darwin-check": {
+      "names": [
+        "macOS lint from Linux (aarch64-apple-darwin clippy)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "aarch64-apple-darwin clippy of the same tree"
+    },
+    "docs": {
+      "names": [
+        "docs check (schema + drift + source-map + runbooks + secrets + release)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "docs check of the same tree"
+    },
+    "doctests": {
+      "names": [
+        "doctests"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "documentation tests of the same tree"
+    },
+    "fast-tests": {
+      "names": [
+        "tests (core, fast)",
+        "tests (daemon, fast)",
+        "tests (cli, fast)"
+      ],
+      "selection_dependent": true,
+      "consumers": [],
+      "reason": "full-selection legs run every test of the shard; a narrowed source never reuses them"
+    },
+    "feature-matrix": {
+      "names": [
+        "cargo-hack (feature powerset)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "feature powerset of the same tree"
+    },
+    "hermes-compatibility-macos": {
+      "names": [
+        "pinned Hermes compatibility (macOS arm64, model-free)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "Hermes macOS job on the same tree; reused only with its daemon producer"
+    },
+    "integration": {
+      "names": [
+        "tests (heavy, PTY + Hermes)"
+      ],
+      "selection_dependent": true,
+      "consumers": [],
+      "reason": "heavy suite runs from the archive with the full selection only"
+    },
+    "macos-package": {
+      "names": [
+        "macOS package install and upgrade (macos-15)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "macOS package acceptance; its nightly-only cold-rebuild step runs on neither path"
+    },
+    "macos-release-build": {
+      "names": [
+        "macOS release daemon build (macos-15)"
+      ],
+      "selection_dependent": false,
+      "consumers": [
+        "hermes-compatibility-macos",
+        "macos-package"
+      ],
+      "reason": "release daemon build; the closure keeps it when its consumers run"
+    },
+    "macos-tier": {
+      "names": [
+        "macOS tier packages (arm64)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "tier archive built from the lockfile; no same-run artifacts"
+    },
+    "platform-contracts": {
+      "names": [
+        "platform contracts (arm64)"
+      ],
+      "selection_dependent": true,
+      "consumers": [],
+      "reason": "macOS lane runs identically when the selection does not narrow the lane away"
+    },
+    "release-build": {
+      "names": [
+        "release build"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "release build of the same tree"
+    },
+    "sdk-macos": {
+      "names": [
+        "SDK workspace (macOS arm64)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "SDK checks built from the same tree on macOS"
+    },
+    "shear": {
+      "names": [
+        "cargo-shear (unused dependencies)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "unused-dependency check of the same tree"
+    },
+    "systemd-supervision": {
+      "names": [
+        "real systemd supervision"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "builds the daemon, worker and CLI from the lockfile; nothing reads the selection"
+    },
+    "test": {
+      "names": [
+        "fmt + clippy"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "formatting and lints of the same tree"
+    },
+    "ts-drift": {
+      "names": [
+        "TS binding drift (xs check)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "TypeScript binding drift of the same tree"
+    },
+    "udeps": {
+      "names": [
+        "cargo-udeps (unused dependencies)"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "unused-dependency check of the same tree"
+    },
+    "upgrade-test": {
+      "names": [
+        "upgrade from the previous release"
+      ],
+      "selection_dependent": false,
+      "consumers": [],
+      "reason": "upgrade from the previous release on the same tree"
+    }
+  }
+}
