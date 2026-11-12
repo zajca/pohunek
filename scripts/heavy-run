@@ -6,22 +6,24 @@
 #
 # Configuration is a required file, never defaults in this script:
 #   ${XDG_CONFIG_HOME:-$HOME/.config}/pohunek/heavy-run.conf
-# with one `key=value` per line:
-#   slots=2                      # number of flock slots
-#   lock_dir=/var/tmp            # directory holding pohunek-heavy-slot-<n>.lock
-#   memory_max=8G                # MemoryMax of the per-run scope
-#   tmpfs_root=/r                # per-slot TMPDIR is <tmpfs_root>/<slot>
-#   poll_seconds=10              # wait between slot acquisition attempts
-#   require_tmpfs=true           # fail when tmpfs_root is not a tmpfs mount
+# with one `key=value` per line (no inline comments; see docs/development.md
+# "Heavy runs" for what each key means):
+#   slots=2
+#   lock_dir=/var/tmp
+#   memory_max=8G
+#   tmpfs_root=/r
+#   poll_seconds=10
+#   require_tmpfs=true
 #
 # A missing file, or a missing, empty, malformed or unknown key, fails before
 # anything runs and names the file or the key. `require_tmpfs` exists only so
 # the test suite can drive the real script against a temporary root: the host
-# config sets it to true. `tmpfs_root` is bounded by the socket budget: every
-# test root lives under `<tmpfs_root>/<slot>`, so the root itself must fit in
-# 9 bytes (RUN_BASE_MAX_LENGTH in scripts/test-partitions, from the 104-byte
-# Darwin socket capacity). `/r` is 2 bytes and leaves the full nesting budget
-# for the tests below it. A longer root is refused before any lock is taken.
+# config sets it to true. `tmpfs_root` parents the per-slot `TMPDIR`s, and
+# each `<tmpfs_root>/<slot>` is a run base for the socket budget: every
+# slot path 1..`slots` must fit in 9 bytes (RUN_BASE_MAX_LENGTH in
+# scripts/test-partitions, from the 104-byte Darwin socket capacity). `/r`
+# with two slots gives `/r/1` and `/r/2`. A root whose longest slot path
+# (`<tmpfs_root>/<slots>`) is longer is refused before any lock is taken.
 #
 # Behaviour per slot: wait until a slot frees up, acquire its flock, sweep the
 # slot directory at acquisition (a crash may have skipped the release sweep),
@@ -103,9 +105,10 @@ case "$tmpfs_root" in
     *) fail "config $CONFIG_FILE: tmpfs_root must be absolute: $tmpfs_root" ;;
 esac
 [ "$tmpfs_root" != "/" ] || fail "config $CONFIG_FILE: tmpfs_root must not be /"
-# The test roots live under this directory (see the header comment), so the
-# root itself must fit the socket budget: ${#} is POSIX.
-[ "${#tmpfs_root}" -le 9 ] || fail "config $CONFIG_FILE: tmpfs_root $tmpfs_root exceeds the 9-byte socket budget for test roots (scripts/test-partitions RUN_BASE_MAX_LENGTH)"
+# Each per-slot TMPDIR <tmpfs_root>/<slot> is a run base (see the header
+# comment), so every slot path must fit the socket budget: the longest one
+# is <tmpfs_root>/<slots>, and ${#} is POSIX.
+[ $(( ${#tmpfs_root} + 1 + ${#slots} )) -le 9 ] || fail "config $CONFIG_FILE: slot path $tmpfs_root/$slots is $(( ${#tmpfs_root} + 1 + ${#slots} )) bytes, exceeding the 9-byte socket budget for test roots (scripts/test-partitions RUN_BASE_MAX_LENGTH)"
 case "$require_tmpfs" in
     true|false) ;;
     *) fail "config $CONFIG_FILE: require_tmpfs must be true or false, got: $require_tmpfs" ;;

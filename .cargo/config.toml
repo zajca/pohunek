@@ -4,8 +4,9 @@ xtask = "run -p xtask --"
 # callers can narrow it with -p. Full/heavy runs need the documented fixtures.
 t = "nextest run --profile fast --all-features"
 ti = "nextest run --profile fast -p pohunek-daemon -p pohunek-client -p pohunek-session-worker --all-features"
-# The local gate thread count (see the gates skill for the current number).
-tw = "nextest run --profile local --all-features"
+# Main behaviour: four test processes on plain TMPDIR. The 16-thread gate
+# runs through scripts/heavy-run (see the gates skill), never through tw.
+tw = "nextest run --profile local --test-threads 4 --all-features"
 # `cargo t` narrowed to the packages the current change affects plus their
 # dependents; unmapped or workspace-wide changes still run everything.
 ta = "xtask affected"
