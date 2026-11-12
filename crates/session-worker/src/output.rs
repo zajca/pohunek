@@ -205,12 +205,11 @@ impl OutputHub {
             });
         }
         let terminal = TerminalTracker::new(rows, cols);
-        let terminal_snapshot = Arc::new(terminal.snapshot(0));
         Ok(Self {
             inner: Arc::new(Mutex::new(HubState {
                 ring: OutputRing::new(history_limit),
                 terminal,
-                terminal_snapshot,
+                terminal_snapshot: None,
                 subscribers: Vec::new(),
                 completion: None,
                 probe: None,
@@ -235,6 +234,7 @@ impl OutputHub {
             return Ok(chunk);
         }
         state.terminal.feed(bytes);
+        state.terminal_snapshot = None;
         let probes = state.terminal.take_probes();
         if let Some(responder) = state.probe.as_mut() {
             for span in probes {
@@ -243,17 +243,27 @@ impl OutputHub {
                 }
             }
         }
-        let snapshot = Arc::new(state.terminal.snapshot(state.ring.next_offset));
-        state.terminal_snapshot = Arc::clone(&snapshot);
-        let mut retained = Vec::with_capacity(state.subscribers.len());
-        for weak in state.subscribers.drain(..) {
+        let state = &mut *state;
+        let next_offset = state.ring.next_offset;
+        let terminal = &state.terminal;
+        let subscribers = &mut state.subscribers;
+        let mut built: Option<Arc<TerminalSnapshot>> = None;
+        let mut retained = Vec::with_capacity(subscribers.len());
+        for weak in subscribers.drain(..) {
             if let Some(queue) = weak.upgrade() {
-                queue.push_output(chunk.clone(), &snapshot);
+                queue.push_output(chunk.clone(), || {
+                    Arc::clone(
+                        built.get_or_insert_with(|| Arc::new(terminal.snapshot(next_offset))),
+                    )
+                });
                 retained.push(Arc::downgrade(&queue));
             }
         }
-        state.subscribers = retained;
-        drop(state);
+        *subscribers = retained;
+        if let Some(snapshot) = built {
+            state.terminal_snapshot = Some(snapshot);
+        }
+        let _ = state;
         self.observation.notify_waiters();
         Ok(chunk)
     }
@@ -308,7 +318,7 @@ impl OutputHub {
     pub fn subscribe_terminal_snapshot(&self) -> OutputSubscriber {
         let mut state = lock(&self.inner);
         let seed = QueueSeed::Snapshot {
-            terminal: Arc::clone(&state.terminal_snapshot),
+            terminal: state.current_snapshot(),
         };
         self.register_subscriber(&mut state, seed)
     }
@@ -376,7 +386,7 @@ impl OutputHub {
     pub fn resize(&self, rows: u16, cols: u16) {
         let mut state = lock(&self.inner);
         state.terminal.resize(rows, cols);
-        state.terminal_snapshot = Arc::new(state.terminal.snapshot(state.ring.next_offset));
+        state.terminal_snapshot = None;
     }
 
     /// Marks output EOF and wakes every subscriber.
@@ -433,8 +443,8 @@ impl OutputHub {
     /// Returns a complete current terminal snapshot.
     #[must_use]
     pub fn terminal_snapshot(&self) -> TerminalSnapshot {
-        let state = lock(&self.inner);
-        (*state.terminal_snapshot).clone()
+        let mut state = lock(&self.inner);
+        (*state.current_snapshot()).clone()
     }
 }
 
@@ -442,7 +452,12 @@ impl OutputHub {
 struct HubState {
     ring: OutputRing,
     terminal: TerminalTracker,
-    terminal_snapshot: Arc<TerminalSnapshot>,
+    /// Terminal state at `ring.next_offset`, or `None` after a feed or resize.
+    ///
+    /// A feed mutates the parser, so a snapshot stays valid only for the ring
+    /// end it was built at; `None` means the next consumer must materialize it
+    /// under this lock, which is the same lock that fed the parser.
+    terminal_snapshot: Option<Arc<TerminalSnapshot>>,
     subscribers: Vec<Weak<SubscriberQueue>>,
     completion: Option<OutputCompletion>,
     probe: Option<ProbeResponder>,
@@ -464,6 +479,18 @@ enum OutputCloseReason {
 }
 
 impl HubState {
+    /// Returns the terminal state at the current ring end.
+    ///
+    /// Builds and caches the snapshot when a feed or resize invalidated it.
+    fn current_snapshot(&mut self) -> Arc<TerminalSnapshot> {
+        if let Some(snapshot) = &self.terminal_snapshot {
+            return Arc::clone(snapshot);
+        }
+        let snapshot = Arc::new(self.terminal.snapshot(self.ring.next_offset));
+        self.terminal_snapshot = Some(Arc::clone(&snapshot));
+        snapshot
+    }
+
     fn observe(
         &self,
         after_offset: Option<u64>,
@@ -504,18 +531,18 @@ impl HubState {
             exited: self.completion.is_some(),
         })
     }
-    fn subscription_seed(&self, after_offset: Option<u64>) -> Result<QueueSeed, RingError> {
+    fn subscription_seed(&mut self, after_offset: Option<u64>) -> Result<QueueSeed, RingError> {
         let requested = self.validate_offset(after_offset)?;
         if requested < self.ring.start_offset {
             return Ok(QueueSeed::Gap {
                 missing: requested..self.ring.next_offset,
-                terminal: Arc::clone(&self.terminal_snapshot),
+                terminal: self.current_snapshot(),
             });
         }
         Ok(QueueSeed::Replay(requested..self.ring.next_offset))
     }
 
-    fn snapshot(&self, after_offset: Option<u64>) -> Result<OutputSnapshot, RingError> {
+    fn snapshot(&mut self, after_offset: Option<u64>) -> Result<OutputSnapshot, RingError> {
         // A fresh consumer starts at generation offset zero. If early bytes
         // were evicted, replaying only the retained suffix could begin inside
         // an escape sequence and cannot reconstruct the screen; emit the same
@@ -524,7 +551,7 @@ impl HubState {
         if requested < self.ring.start_offset {
             return Ok(OutputSnapshot::Gap {
                 missing: requested..self.ring.next_offset,
-                terminal: (*self.terminal_snapshot).clone(),
+                terminal: (*self.current_snapshot()).clone(),
             });
         }
         Ok(OutputSnapshot::Replay {
@@ -561,9 +588,9 @@ impl OutputSubscriber {
         loop {
             let notified = self.queue.notify.notified();
             {
-                let hub = lock(&self.hub);
+                let mut hub = lock(&self.hub);
                 let mut state = lock(&self.queue.state);
-                if let Some(event) = state.next_event(&hub, self.queue.event_limit) {
+                if let Some(event) = state.next_event(&mut hub, self.queue.event_limit) {
                     return Some(event);
                 }
                 if state.closed {
@@ -613,13 +640,14 @@ impl SubscriberQueue {
         }
     }
 
-    fn push_output(&self, chunk: OutputChunk, terminal: &Arc<TerminalSnapshot>) {
+    fn push_output(&self, chunk: OutputChunk, snapshot: impl FnOnce() -> Arc<TerminalSnapshot>) {
         let mut state = lock(&self.state);
         let required = chunk.bytes.len();
         if state.queued_bytes.saturating_add(required) > self.limit {
+            let terminal = snapshot();
             let missing = state.expected_offset..terminal.watermark;
             state.replay = None;
-            state.snapshot = Some(SnapshotCursor::new(missing, Arc::clone(terminal)));
+            state.snapshot = Some(SnapshotCursor::new(missing, terminal));
             state.events.clear();
             state.queued_bytes = 0;
         } else {
@@ -708,7 +736,7 @@ struct SubscriberState {
 }
 
 impl SubscriberState {
-    fn next_event(&mut self, hub: &HubState, event_limit: usize) -> Option<OutputEvent> {
+    fn next_event(&mut self, hub: &mut HubState, event_limit: usize) -> Option<OutputEvent> {
         if let Some(replay) = &mut self.replay {
             if replay.empty_pending {
                 replay.empty_pending = false;
@@ -730,10 +758,7 @@ impl SubscriberState {
 
             let missing = self.expected_offset..hub.ring.next_offset;
             self.replay = None;
-            self.snapshot = Some(SnapshotCursor::new(
-                missing,
-                Arc::clone(&hub.terminal_snapshot),
-            ));
+            self.snapshot = Some(SnapshotCursor::new(missing, hub.current_snapshot()));
             self.events.clear();
             self.queued_bytes = 0;
         }
