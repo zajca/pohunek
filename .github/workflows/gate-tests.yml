@@ -67,10 +67,12 @@ jobs:
           # left, and a removal that finds none left is skipped, so a slow
           # prune on a degraded runner becomes a warning, not a red gate.
           PRUNE_BUDGET_SECONDS: "480"
+          # Bounds each df call, so a hung filesystem stat cannot outlive the step.
+          DF_TIMEOUT_SECONDS: "30"
         run: |
           set -uo pipefail
           echo "disk: before pruning"
-          df -h / "$RUNNER_TEMP" || true
+          timeout "$DF_TIMEOUT_SECONDS" df -h / "$RUNNER_TEMP" || true
           deadline=$((SECONDS + PRUNE_BUDGET_SECONDS))
           for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; do
             if [ -d "$dir" ]; then
@@ -83,7 +85,7 @@ jobs:
             fi
           done
           echo "disk: after pruning"
-          df -h / || true
+          timeout "$DF_TIMEOUT_SECONDS" df -h / || true
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
