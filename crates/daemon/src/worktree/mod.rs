@@ -1637,38 +1637,70 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
     fetch_into_ref(repo, base_branch, &fetch_ref_name()?)
 }
 
+/// Which owner-visibility profile a single-ref `git fetch` from `origin` runs with.
+///
+/// The daemon has two fetch profiles. Its own base and remote-branch fetches
+/// run as [`FetchScope::Tracked`]: git defaults, so opportunistic
+/// remote-tracking updates move `refs/remotes/origin/*` like any owner's
+/// fetch (retention's `unpushed_hold` reads those refs). The fetch of an
+/// untrusted `fetch_ref` runs as [`FetchScope::Untrusted`]: it writes no
+/// `FETCH_HEAD` entry, recurses into no submodule and follows no configured
+/// `remote.origin.fetch` refspec, so it moves no ref outside the
+/// session-owned destination it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchScope {
+    /// The daemon's own fetch: `FETCH_HEAD` and submodule recursion as git
+    /// defaults, opportunistic remote-tracking updates enabled.
+    Tracked,
+    /// The fetch of an untrusted ref: `--no-write-fetch-head`,
+    /// `--no-recurse-submodules` and `--refmap=`.
+    Untrusted,
+}
+
+impl FetchScope {
+    /// Extra `git fetch` flags this scope adds after `--no-tags`.
+    fn extra_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Tracked => &[],
+            // `--no-write-fetch-head` needs git 2.29 or newer; older gits
+            // fail the fetch instead of writing. `--refmap=` exists since
+            // 2.1, so it adds no new minimum.
+            Self::Untrusted => &[
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--refmap=",
+            ],
+        }
+    }
+}
+
 /// The `git fetch` of `source` from `origin` into `fetch_ref`.
 ///
 /// Automatic maintenance is disabled: its `git gc` runs `worktree prune`, which
-/// can overlap a locked add and inspect its incomplete admin entry. With
-/// `write_fetch_head` the fetch records the tip in `FETCH_HEAD`, like every
-/// other fetch of this daemon; without it (a `fetch_ref` fetch) `FETCH_HEAD`
-/// is left untouched and a git that predates `--no-write-fetch-head` (2.29)
-/// fails the fetch instead of writing it. Without `recurse_submodules` the
-/// fetch also passes `--no-recurse-submodules`, so untrusted content never
-/// triggers a submodule fetch or moves refs inside the owner's submodules.
-/// `--refmap=` disables the repository's configured `remote.origin.fetch`
-/// refspecs, so the fetch writes only `fetch_ref` and never moves a
-/// remote-tracking ref outside the session-owned refs.
+/// can overlap a locked add and inspect its incomplete admin entry. A
+/// [`FetchScope::Tracked`] fetch (the daemon's own base and branch fetches)
+/// follows git defaults: it records the tip in `FETCH_HEAD`, may recurse
+/// into submodules, and lets opportunistic remote-tracking updates move
+/// `refs/remotes/origin/*`. A [`FetchScope::Untrusted`] fetch (an untrusted
+/// `fetch_ref`) additionally passes `--no-write-fetch-head` (a git that
+/// predates it, 2.29, fails the fetch instead of writing), `--no-recurse-submodules` (untrusted content never triggers a
+/// submodule fetch), and `--refmap=` (the repository's configured
+/// `remote.origin.fetch` refspecs are ignored, so the fetch writes only
+/// `fetch_ref`).
 fn fetch_command(
     repo: &Path,
     source: &str,
     fetch_ref: &str,
-    write_fetch_head: bool,
-    recurse_submodules: bool,
+    scope: FetchScope,
 ) -> Result<Command, String> {
     let mut cmd = git_command(repo)?;
     cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .arg("fetch")
         .arg("--no-tags");
-    if !write_fetch_head {
-        cmd.arg("--no-write-fetch-head");
+    for extra in scope.extra_args() {
+        cmd.arg(extra);
     }
-    if !recurse_submodules {
-        cmd.arg("--no-recurse-submodules");
-    }
-    cmd.arg("--refmap=")
-        .arg("origin")
+    cmd.arg("origin")
         .arg("--end-of-options")
         .arg(format!("{source}:{fetch_ref}"));
     Ok(cmd)
@@ -1678,24 +1710,25 @@ fn fetch_command(
 ///
 /// [`fetch_origin`] with `FETCH_HEAD` and submodule recursion as git defaults.
 fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
-    fetch_into_ref_with(repo, source, fetch_ref, true, true)
+    fetch_into_ref_with(repo, source, fetch_ref, FetchScope::Tracked)
 }
 
 /// [`fetch_origin`] into the named destination ref.
 ///
-/// `write_fetch_head` records the tip in `FETCH_HEAD` (as every other fetch
-/// of this daemon does); `recurse_submodules` lets the fetch follow
-/// submodules (as git defaults do). The refspec has no `+` and the
-/// destination must not exist beforehand, so a ref this request did not
-/// create is never overwritten, and a failed fetch never deletes anything.
+/// `scope` selects the owner-visibility profile of [`fetch_command`]:
+/// [`FetchScope::Tracked`] for the daemon's own fetches,
+/// [`FetchScope::Untrusted`] for an untrusted `fetch_ref`. The refspec has
+/// no `+` and the destination must not exist beforehand, so a ref this
+/// request did not create is never overwritten. A failed fetch deletes only
+/// the destination it was proven to create (see below); nothing else is
+/// removed.
 /// `--end-of-options` keeps the refspec positional even if a caller forgets
 /// the leading-dash guard (defense in depth against argv flag injection).
 pub(crate) fn fetch_into_ref_with(
     repo: &Path,
     source: &str,
     fetch_ref: &str,
-    write_fetch_head: bool,
-    recurse_submodules: bool,
+    scope: FetchScope,
 ) -> Result<FetchedBase, String> {
     check_fetch_source(repo, source)?;
     let mut probe = git_command(repo)?;
@@ -1706,13 +1739,7 @@ pub(crate) fn fetch_into_ref_with(
         Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
         _ => return Err(output_failure_message(&probed)),
     }
-    let cmd = fetch_command(
-        repo,
-        source,
-        fetch_ref,
-        write_fetch_head,
-        recurse_submodules,
-    )?;
+    let cmd = fetch_command(repo, source, fetch_ref, scope)?;
     // The fetch's connectivity check reads every `worktrees/<name>/HEAD`, and
     // `git worktree add` first writes a null-oid placeholder there, which fails
     // the check with `bad object worktrees/<name>/HEAD`. Holding the admin lock
@@ -1728,14 +1755,16 @@ pub(crate) fn fetch_into_ref_with(
         move || drop(guard),
     )?;
     if !output.status.success() {
-        // The probe above proved this request created `fetch_ref` when the
-        // fetch wrote it, so a failed fetch deletes its own temp ref: only
-        // the refspec's destination can name a session-owned ref while the
-        // fetch's opportunistic remote-tracking update is disabled by
-        // `--refmap=` on this fetch (a tracking update for another ref
-        // that git rejects still exits 1 after the destination was
-        // written).
-        let _ = git_run(repo, &["update-ref", "-d", fetch_ref]);
+        // The probe above proved the destination was absent, so a failed
+        // fetch deletes only the ref the fetch itself created: nothing else
+        // can name a session-owned ref here.
+        if let Err(delete) = git_run(repo, &["update-ref", "-d", fetch_ref]) {
+            warn!(
+                fetch_ref,
+                error = %delete,
+                "could not delete the temporary fetch ref after a failed fetch"
+            );
+        }
         return Err(output_failure_message(&output));
     }
     // The fetch created the ref (it was absent above), so this request owns it

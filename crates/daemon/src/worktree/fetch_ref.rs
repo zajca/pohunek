@@ -19,7 +19,7 @@ use tracing::warn;
 
 use super::{
     error, fetch_into_ref_with, fetch_ref_name, git_command, git_run, has_origin,
-    output_failure_message, run_output_bounded, worktree_add_error, FetchedBase,
+    output_failure_message, run_output_bounded, worktree_add_error, FetchScope, FetchedBase,
     GIT_COMMAND_TIMEOUT,
 };
 
@@ -124,7 +124,7 @@ pub(crate) fn fetch_session_temp(
         ));
     }
     let temp = fetch_ref_name().map_err(|message| fetch_ref_failed(&fetch.source_ref, &message))?;
-    let fetched = match fetch_into_ref_with(repo, &fetch.source_ref, &temp, false, false) {
+    let fetched = match fetch_into_ref_with(repo, &fetch.source_ref, &temp, FetchScope::Untrusted) {
         Ok(fetched) => fetched,
         Err(message) if message.contains("timed out") => {
             return Err(fetch_ref_failed(&fetch.source_ref, &message));
