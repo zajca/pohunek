@@ -244,6 +244,7 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-2
     --event pull_request --conclusion success   # reproduce CI timing evidence
 scripts/stress-run --deadline 45m -- cargo nextest run -p pohunek-daemon --stress-count 100 -E 'test(/profile_freeze_tests/)'  # reproduce a timing failure under pinned CPU load (build first with --no-run)
 scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy  # stress the tests this diff adds or changes
+scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy --slow-runner  # plus the slower macOS runner: 3 pinned CPUs, every fsync/fdatasync delayed by 8.3 ms (ptrace-sensitive tests from scripts/stress-slow-runner-untraced.json run pinned but untraced, reported as NOT SLOWED)
 ```
 
 Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11

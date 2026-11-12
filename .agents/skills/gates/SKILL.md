@@ -84,7 +84,8 @@ default features too: a test that exists only behind a Cargo feature is not in
 the list, because CI's macOS lane never builds it either. Without
 `--allow-missing-on-host` it fails by name; with the flag it is reported NOT
 STRESSED and belongs to the Linux run that builds it with `--all-features`.
-`--print` shows the selection without running anything. A test
+`--print` shows the selection without running anything (with `--slow-runner` it shows
+the SLOWED/NOT SLOWED split). A test
 the script cannot map or list fails the step by name; a `macro_rules!` that
 generates tests fails by the macro's name (stress the whole partition then). A
 diff that changes tests for two operating systems cannot pass on one host: run
@@ -99,6 +100,24 @@ A failure is a FLAKY result under the flaky-test policy: open or reuse an issue
 with the root cause, fix the test or the product race, and run the step again.
 Never retry the step to green and never lower `--count` to pass. A diff that
 adds no test in those lanes skips the step, and the report says so.
+
+Add `--slow-runner` when a changed test in a heavy or macOS-lane package
+persists state, or when any test was reported flaky only on the macOS runner.
+It reproduces the slower CI macOS runner on a Linux host: the run is pinned to
+3 CPUs and every `fsync`/`fdatasync` is delayed by 8.3 ms through
+`strace --seccomp-bpf --inject=...:delay_enter=8300`. Tests listed in
+`scripts/stress-slow-runner-untraced.json` are too ptrace-sensitive to run
+under strace, so they still run pinned to 3 CPUs but untraced, and the summary
+reports them as NOT SLOWED; every other selected test runs under strace and is
+reported as SLOWED. NOT SLOWED means "ran pinned but not slowed", never
+"skipped": a NOT SLOWED failure is a FLAKY result like any other. To extend
+the list, add one entry with `filter` (a nextest filterset matching the test),
+a non-empty `reason`, and `evidence` (the fable-ci report section or the issue
+with the hang); keep the filters exact so no other test loses its slowdown.
+`--slow-runner` is Linux-only and conflicts with `--unpinned`. A deadline
+overrun under `--slow-runner` hints that a newly hanging test may belong on
+the untraced list: rerun the suspect without `--slow-runner` to confirm, then
+list it with evidence.
 
 ## When the change touches the SDK workspace
 

@@ -628,7 +628,12 @@ Never start a detached load or test process (`nohup`, a trailing `&`, `setsid`,
 before you finish. Before push, `scripts/stress-changed-tests` stress-runs the
 tests a diff adds or changes in the heavy and macOS lanes (the
 "Stress the changed tests" step of the gates skill); a failure there is a FLAKY
-result, never retried to green.
+result, never retried to green. Add `--slow-runner` when a changed test in a
+heavy or macOS-lane package persists state, or when any test was reported flaky
+only on the macOS runner: the run is pinned to 3 CPUs and every
+`fsync`/`fdatasync` is delayed by 8.3 ms, while the tests listed in
+`scripts/stress-slow-runner-untraced.json` run pinned but untraced and are
+reported as NOT SLOWED.
 
 Hermetic tests: a test owns its fixtures and never touches host state.
 Directories come from `pohunek_test_support::tempdir()` or
