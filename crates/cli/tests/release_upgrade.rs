@@ -240,8 +240,9 @@ const SILENT_PROFILE: &str = "silent-claude";
 const CODEX_PROFILE: &str = "fake-codex";
 
 /// Column counts of the resizes the previous release's daemon applies to the
-/// live session. Its worker keeps the highest resize sequence it accepted, so
-/// more than one is needed to outrun the first resize of the head's daemon.
+/// live session, so it runs at a size other than the initial one before the
+/// upgrade. The head's daemon acquires its own controller lease, so its resize
+/// is not ordered against these.
 const RESIZES_BEFORE_UPGRADE_COLS: [u16; 2] = [90, 91];
 
 /// Size the head's daemon resizes the adopted live session to.
