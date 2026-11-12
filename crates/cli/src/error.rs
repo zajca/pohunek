@@ -207,6 +207,20 @@ pub(crate) enum CliError {
         daemon_version: String,
     },
 
+    /// The daemon advertised `session_new_fetch_ref_supported` but omitted
+    /// `fetched_ref` from a first (non-replayed) response: a contract break.
+    /// The session was created; only the outcome report is unusable.
+    #[error(
+        "host '{host}' advertises `session_new_fetch_ref_supported` but did not report `fetched_ref`; \
+         session {session_id} is running without a usable fetch outcome"
+    )]
+    SessionNewFetchRefMissing {
+        /// The host as the user typed it.
+        host: String,
+        /// Id the daemon reported for the created session.
+        session_id: String,
+    },
+
     /// A remote `project add` named no PATH. A local path is meaningless on
     /// another host, so a remote add must give a path valid on that host; fails
     /// fast before any connection is dialed.
@@ -539,6 +553,19 @@ impl CliError {
                         .to_owned(),
                 ),
             ),
+            CliError::SessionNewFetchRefMissing { session_id, .. } => ProtocolError::new(
+                ErrorClass::Daemon,
+                "fetch_ref_outcome_missing",
+                self.to_string(),
+                Some(
+                    "the session was created; inspect the session and the worktree before relying on the extra ref"
+                        .to_owned(),
+                ),
+            )
+            .with_details(protocol::ErrorDetails {
+                session_id: Some(protocol::SessionId(session_id.clone())),
+                ..protocol::ErrorDetails::default()
+            }),
             CliError::RemoteAddPathRequired => ProtocolError::new(
                 ErrorClass::Configuration,
                 "remote_add_path_required",

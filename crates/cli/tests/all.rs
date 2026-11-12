@@ -120,6 +120,8 @@ mod session_lifecycle_notice;
 mod session_metadata_filters;
 #[path = "session_new_cwd.rs"]
 mod session_new_cwd;
+#[path = "session_new_fetch_ref.rs"]
+mod session_new_fetch_ref;
 #[path = "session_new_input_ack.rs"]
 mod session_new_input_ack;
 #[path = "session_new_outcome.rs"]
