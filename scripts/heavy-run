@@ -199,14 +199,15 @@ while :; do
             # (`0<&0` counts as explicit, so nothing is taken from
             # /dev/null): a trapped INT/TERM interrupts `wait` at once and
             # the trap owns the scope stop, and this single `wait` reaps
-            # the child and keeps its status. (`kill -0` must not guard
-            # the reap: a shell that reaps the child in its SIGCHLD
-            # handler makes `kill -0` fail while `wait` would still
-            # report the stored failure, and skipping the reap exits 0
-            # for a failed command.) A `systemd-run` that never starts
-            # (missing binary, refused unit) is already gone, and `wait`
-            # still collects its status instead of reporting a pass for a
-            # command that never ran.
+            # the child and keeps its status. A liveness check must not
+            # guard the reap: it reports stopped children as alive and
+            # cannot tell a live child from one whose status is still
+            # waiting to be collected, so a guarded reap may skip the
+            # only collect and exit 0 for a failed command. A
+            # `systemd-run` that never starts (missing binary, refused
+            # unit) is already gone, and `wait` still collects its
+            # status instead of reporting a pass for a command that
+            # never ran.
             systemd-run --user --scope --unit="$unit_name" -p MemoryMax="$memory_max" env TMPDIR="$slot_dir" "$@" 0<&0 &
             cmd_pid=$!
             slot_rc=0

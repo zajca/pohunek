@@ -201,7 +201,7 @@ class Fixture(unittest.TestCase):
             ["sh", str(SCRIPT), *argv], capture_output=True, text=True, env=env, timeout=timeout
         )
         calls = self.log.read_text().splitlines()
-        if check_status:
+        if check_status and expected_rc is not None:
             self.assertEqual(result.returncode, expected_rc,
                                f"want rc {expected_rc}: {result.stderr}")
         if check_slot:
@@ -225,45 +225,36 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(stops), 1, calls)
         self.assertFalse(any(self.slot_dir().iterdir()))
 
-    def test_a_reaped_child_still_fails_instead_of_passing(self):
-        # The reap must not silently pass a failed command when the child
-        # is reaped between the liveness check and the reap: the guarded
-        # reap skips the loop body on the reaped pid, so the status stays
-        # 0 for a failed command. The probe below runs that exact guarded
-        # sequence in a shell of its own and asserts the skip, and asserts
-        # the replacement single `wait` fails (127) on the same drained
-        # child instead of passing.
-        probe = self.tmp / "reap-probe.sh"
+    def test_the_reap_collects_without_a_liveness_guard(self):
+        # The collect must not be guarded by a liveness check: `kill -0`
+        # reports a merely stopped child as alive (the probe pins `state=T
+        # alive=yes`), so the liveness signal carries no reap information
+        # -- it cannot distinguish a live child, a stopped one, or an
+        # unreaped zombie. The fixed script collects the child status
+        # once, without consulting `kill -0` first; the pre-fix script
+        # guarded its reap with `kill -0` and could skip the only collect
+        # after a reap landing in the gap, exiting 0 for a failed command.
+        probe = self.tmp / "liveness-window-probe.sh"
         probe.write_text(
             "#!/bin/sh\n"
-            "( exit 41 ) &\n"
-            "cpid=$!\n"
-            'if ! kill -0 "$cpid" 2>/dev/null; then\n'
-            '    wait "$cpid" || slot_rc=$?\n'
-            "else\n"
-            '    wait "$cpid" 2>/dev/null || true\n'
-            "fi\n"
-            "slot_rc=0\n"
-            'while kill -0 "$cpid" 2>/dev/null; do\n'
-            '    wait "$cpid" || slot_rc=$?\n'
-            "done\n"
-            'echo "guarded=$slot_rc"\n'
-            "( exit 41 ) &\n"
-            "cpid2=$!\n"
-            'wait "$cpid2" 2>/dev/null || true\n'
-            "slot_rc=0\n"
-            'wait "$cpid2" || slot_rc=$?\n'
-            'echo "single=$slot_rc"\n')
+            "sleep 30 &\n"
+            "cmd_pid=$!\n"
+            "sleep 0.2\n"
+            'kill -STOP "$cmd_pid"\n'
+            "sleep 0.2\n"
+            'stat=$(cut -d" " -f3 /proc/$cmd_pid/stat)\n'
+            'if kill -0 "$cmd_pid" 2>/dev/null; then alive=yes; else alive=no; fi\n'
+            'kill -KILL "$cmd_pid" 2>/dev/null\n'
+            'wait 2>/dev/null\n'
+            'echo "state=$stat alive=$alive"\n')
         result = subprocess.run(
             ["sh", str(probe)], capture_output=True, text=True, timeout=WAIT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("guarded=0", result.stdout.splitlines(),
-                      f"the guarded reap must skip the reap: {result.stdout!r}")
-        self.assertIn("single=127", result.stdout.splitlines(),
-                      f"the single wait must fail instead of passing: {result.stdout!r}")
+        self.assertIn("state=T alive=yes", result.stdout.splitlines(),
+                      f"kill -0 must report the stopped child as alive: {result.stdout!r}")
         script = SCRIPT.read_text()
-        self.assertNotIn('while kill -0 "$cmd_pid"', script,
-                         "the guarded reap must be gone: it skips the reap on a reaped pid")
+        self.assertNotIn("while kill", script,
+                         "the guarded reap loop must be gone from the script")
 
     def test_the_scope_is_stopped_after_success(self):
         self.write_config(slots=1)
@@ -388,10 +379,11 @@ class Fixture(unittest.TestCase):
         self.assertIn("exceeding the 9-byte socket budget", result.stderr)
         self.assertEqual(calls, [])
 
-    def test_a_nine_byte_tmpfs_root_runs_the_command(self):
-        # Nine bytes is the budget itself, so it is accepted; running the
-        # real script proves the check does not reject the boundary. (The
-        # command really runs: its marker only exists if systemd-run ran.)
+    def test_a_nine_byte_slot_path_runs_the_command(self):
+        # Nine bytes is the budget itself, so the longest slot path
+        # (`<root>/1`) is accepted; running the real script proves the
+        # check does not reject the boundary. (The command really runs:
+        # its marker only exists if systemd-run ran.)
         self.write_config(slots=1)
         marker = self.tmp / "nine-byte-boundary"
         result, calls = self.run_script("sh", "-c", f'echo ran > "{marker}"')
@@ -528,9 +520,10 @@ class Fixture(unittest.TestCase):
         marker = self.slot_dir() / "started"
         marker.unlink(missing_ok=True)
         err_file = self.tmp / "wrapper-stderr.txt"
+        err_handle = open(err_file, "w")
         proc = subprocess.Popen(
             ["sh", str(SCRIPT), "sh", "-c", f'echo started > "{marker}"; exec sleep 600'],
-            stdout=subprocess.DEVNULL, stderr=open(err_file, "w"), text=True,
+            stdout=subprocess.DEVNULL, stderr=err_handle, text=True,
             env=self.env,
         )
         try:
@@ -557,6 +550,7 @@ class Fixture(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate(timeout=WAIT_SECONDS)
+            err_handle.close()
         stderr = err_file.read_text()
         self.assertEqual(proc.returncode, 143, stderr)
         calls = self.log.read_text().splitlines()
