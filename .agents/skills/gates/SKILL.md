@@ -124,6 +124,56 @@ change can affect daemon/worker behavior.
    explicitly skipped with why). Say plainly what actually ran. If all pass,
    say so plainly; if any fail or were skipped, say which and why, with output.
 
+## Receipts
+
+`scripts/gate-receipt run --gate <name> --max-age 24h -- <command>` wraps one
+canonical gate line so a second run on an unchanged tree skips the command.
+The first run executes the command and writes a receipt; the second verifies
+the receipt and exits 0 without running it. A receipt is local convenience,
+never CI evidence: CI and the Opus review marker stay the landing evidence.
+
+Wrap each gate with its canonical line, identical across sessions so the key
+matches (the argv after `--` is part of the key):
+
+```bash
+scripts/gate-receipt run --gate fmt --max-age 24h -- /tmp/heavy-run.sh cargo fmt --all --check
+scripts/gate-receipt run --gate toolchain-pin --max-age 24h -- /tmp/heavy-run.sh scripts/check-rust-toolchain-pin
+scripts/gate-receipt run --gate clippy --max-age 24h -- /tmp/heavy-run.sh cargo clippy --workspace --all-targets --all-features
+scripts/gate-receipt run --gate darwin --max-age 24h -- /tmp/heavy-run.sh scripts/darwin-check
+scripts/gate-receipt run --gate bins --max-age 24h -- /tmp/heavy-run.sh cargo build -p pohunek-session-worker --bin pohunek-sessiond
+scripts/gate-receipt run --gate nextest --max-age 24h -- /tmp/heavy-run.sh cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+scripts/gate-receipt run --gate doctests --max-age 24h -- /tmp/heavy-run.sh cargo test --doc --workspace --all-features
+scripts/gate-receipt run --gate release-build --max-age 24h -- /tmp/heavy-run.sh cargo build --workspace --release
+scripts/gate-receipt run --gate docs --max-age 24h -- /tmp/heavy-run.sh cargo xtask docs check
+scripts/gate-receipt run --gate hermes-package --max-age 24h -- /tmp/heavy-run.sh scripts/build-hermes-package /abs/path/to/hermes.tar.zst
+scripts/gate-receipt run --gate hermes-compat --max-age 24h -- /tmp/heavy-run.sh cargo xtask hermes compatibility --bin-dir /abs/path/to/target/release --package /abs/path/to/hermes.tar.zst
+```
+
+The final gate before a push may use a receipt only when that receipt was
+written for the exact tree being pushed; a receipt never carries a gate
+across a changed tree.
+
+24h matches the lane rhythm: a receipt written during the day's work is still
+fresh for the evening's final gate or the next morning's re-run, while a
+tree that sits longer than a day re-runs its gates instead of trusting stale
+proof from a toolchain or dependency world that may have moved.
+
+A receipt is not accepted — the command runs again — when any of these holds:
+
+- No receipt file exists for the key, or it is not valid JSON of the known schema.
+- The key differs: a changed working tree (tracked, staged, unstaged, or
+  untracked-but-not-ignored files), a different gate name or argv, different
+  `rustc -vV`/`cargo -vV` output, a different command-file hash, or different
+  tracked environment hashes.
+- It is older than `--max-age`.
+- It is not owned by the current uid, or it is group- or world-writable.
+- The store directory is not owned by the current uid, or is not mode 0700.
+- Ignored inputs are out of scope by construction: `target/`, local `.env`
+  files, and other ignored paths never enter the tree id, so changing only
+  them never invalidates a receipt.
+- A gate that needs the network or external state is never wrapped: the Hermes
+  package gates and `cargo audit` re-run every time.
+
 ## Narrower loops while iterating
 
 Use these to shorten the feedback loop (see
