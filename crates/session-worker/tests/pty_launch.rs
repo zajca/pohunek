@@ -107,7 +107,7 @@ async fn output_until(pty: &PtyOwner, needle: &str) -> String {
         while !String::from_utf8_lossy(&collected).contains(needle) {
             match subscriber.recv().await {
                 Some(OutputEvent::Replay(chunk) | OutputEvent::Output(chunk)) => {
-                    collected.extend(chunk.bytes);
+                    collected.extend(chunk.bytes.iter().copied());
                 }
                 Some(_) => {}
                 None => break,

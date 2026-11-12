@@ -3864,9 +3864,9 @@ where
         stream_id,
         worker_instance_id,
         payload_limit,
-        OutputChunk {
+        &OutputChunk {
             offset: page.start_offset,
-            bytes: page.bytes,
+            bytes: Arc::from(page.bytes),
         },
         true,
     )
@@ -3925,7 +3925,7 @@ where
                 stream_id,
                 worker_instance_id,
                 payload_limit,
-                chunk,
+                &chunk,
                 true,
             )
             .await
@@ -3937,7 +3937,7 @@ where
                 stream_id,
                 worker_instance_id,
                 payload_limit,
-                chunk,
+                &chunk,
                 false,
             )
             .await
@@ -4029,7 +4029,7 @@ async fn write_output_chunks<W>(
     stream_id: &StreamId,
     worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
-    chunk: OutputChunk,
+    chunk: &OutputChunk,
     replay: bool,
 ) -> Result<(), WorkerError>
 where
@@ -8478,6 +8478,7 @@ mod tests {
     mod placement_escape;
     mod prompt_accepted;
 
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
@@ -11485,9 +11486,9 @@ mod tests {
             &stream_id,
             &worker_instance_id,
             MAX_DATA_PAYLOAD_BYTES,
-            crate::OutputChunk {
+            &crate::OutputChunk {
                 offset: 41,
-                bytes: payload.clone(),
+                bytes: Arc::from(payload.as_slice()),
             },
             true,
         )
