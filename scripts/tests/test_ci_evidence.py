@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
-import virtual_clock  # noqa: F401  (the virtual clock the scenarios invoke through)
+import virtual_clock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,7 +132,6 @@ def names_a_workflow_job(required, workflow_path):
         ):
             return True
     return False
-
 
 
 FAKE_GH = r'''#!/usr/bin/env python3
@@ -924,6 +923,29 @@ class CiEvidenceCliTests(unittest.TestCase):
         ]
         # Initial listing plus two polls; virtual time used is 2400 s < 3600 s.
         self.assertEqual(len(commit_listings), 3, commit_listings)
+
+    def test_a_wait_whose_deadline_never_arrives_times_out_on_the_virtual_clock(self):
+        # The polls advance the clock to the 3600 s deadline while the run
+        # stays in progress; a wall-clock deadline would spin instantly
+        # through the polls until the 60 s guard instead.
+        self.config_data["wait_timeout_seconds"] = 3600
+        self.config_data["poll_interval_seconds"] = 1200
+        self.write_config()
+        in_progress = run_doc(status="in_progress", conclusion=None)
+        self.write_fixture(
+            run_pages=[page([in_progress])],
+            jobs_page=jobs_page(),
+        )
+        result = self.invoke(timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timed out after 3600s", result.stderr)
+        commit_listings = [
+            call for call in self.calls_json()
+            if any("/actions/workflows/" in arg for arg in call)
+            and any(arg.startswith("head_sha=") for arg in call)
+        ]
+        # Initial listing plus polls at t=1200, 2400 and 3600.
+        self.assertEqual(len(commit_listings), 4, commit_listings)
 
     def test_manual_tier_requires_its_matching_run_title_marker(self):
         self.write_fixture(
