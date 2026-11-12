@@ -80,14 +80,17 @@ VIEW_FIELDS = (
 # GitHub bills each job's runner time rounded UP to a whole minute, so
 # every job's wall clock contributes one minute-quantized step.
 RUNNER_MINUTE = 60
-# A `gh` call that fails with a server error or a secondary rate limit is
-# retried this many times in total, waiting `GH_RETRY_DELAY_SECONDS` times the
+# A `gh` call that fails with a server error, a secondary rate limit or a
+# dropped HTTP/2 stream is retried this many times in total, waiting `GH_RETRY_DELAY_SECONDS` times the
 # attempt number between tries; `--gh-attempts`/`--gh-retry-delay` override
 # both. A primary rate limit, an auth error or a 4xx fails at once: retrying
 # within seconds cannot fix those.
 GH_ATTEMPTS = 5
 GH_RETRY_DELAY_SECONDS = 5.0
-GH_TRANSIENT = re.compile(r"HTTP 5\d\d\b|secondary rate limit", re.IGNORECASE)
+GH_TRANSIENT = re.compile(
+    r"HTTP 5\d\d\b|secondary rate limit|stream error.*CANCEL",
+    re.IGNORECASE,
+)
 # Conclusions of a run that reached a verdict. A run GitHub reports as
 # `completed` with an empty conclusion also counts; `cancelled`, `skipped`
 # and the remaining conclusions (`neutral`, `stale`, `action_required`) do not.
@@ -1062,6 +1065,37 @@ def wanted_attempts(latest, attempts):
 Fetch = collections.namedtuple("Fetch", ("documents", "truncated"))
 
 
+def selected_conclusion(args):
+    """The listing conclusion that keeps every selectable run.
+
+    `filter_runs` applies the `--conclusion` filter after attempt
+    selection, so a green first attempt with a red rerun must stay on
+    the listing. Only a single-attempt run whose listed conclusion
+    already differs from the requested one can be dropped: its one
+    document could never pass the filter, whatever `--attempts` says.
+    Without `--conclusion` every listing stays fetchable.
+    """
+    return getattr(args, "conclusion", None) or None
+
+
+def unselectable_listing(entry, wanted):
+    """Whether a listing can never feed the current selection.
+
+    The listing describes the run's latest attempt: a single-attempt run
+    whose listed conclusion is not the requested one has no selectible
+    attempt, so fetching its job document would only cost a `gh run
+    view` and, on a sick run, a fatal fetch error. Other listings
+    (including a rerun listed red) stay: attempt 1 may still be green.
+    """
+    if wanted is None:
+        return False
+    attempt = entry.get("attempt", 1) or 1
+    if attempt != 1:
+        return False
+    conclusion = entry.get("conclusion")
+    return bool(conclusion) and conclusion != wanted
+
+
 def list_documents(args, window=None):
     """Fetch the run documents the current `gh run list` names.
 
@@ -1079,14 +1113,29 @@ def list_documents(args, window=None):
     selected = {}
     changed = False
     try:
+        wanted = selected_conclusion(args)
         for entry in listed:
             # An unfinished run has no completed job timestamps to measure.
             if not entry.get("conclusion"):
+                continue
+            # A single-attempt run whose conclusion already rules out
+            # selection is never viewable: its document cannot feed the
+            # medians, and a sick run would fail the whole fetch.
+            if unselectable_listing(entry, wanted):
                 continue
             run_id = entry["databaseId"]
             latest = entry.get("attempt", 1) or 1
             view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
             for attempt in wanted_attempts(latest, args.attempts):
+                # The listing is enough to rule a single attempt out:
+                # attempt 1 of a run listed green is green, and attempt 1
+                # of a run listed red at attempt 1 is red, so one of the
+                # two documents `wanted_attempts` names can never be
+                # selected, whatever the fetch would find.
+                if attempt == 1 and latest == 1 and wanted is not None:
+                    listed_conclusion = entry.get("conclusion")
+                    if listed_conclusion != wanted:
+                        continue
                 document = by_key.get((run_id, attempt))
                 if document is None:
                     document = gh_json(view_command + ["--attempt", str(attempt)])

@@ -148,13 +148,11 @@ passed, and a failing, cancelled or still pending check does not.
   or relies on a later run on `main`: the post-merge `main` run is the main
   tier, while the release rehearsal, the release gate and the other
   nightly-only jobs (`test selection audit (G3)`) get their evidence only from the scheduled nightly run or a
-  `tier=nightly` dispatch of `main` or of a maintainer branch.
-
-  Before a release,
+  `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
 
-The nightly `CI budgets` workflow then checks per-step and per-job medians over the
+The nightly `CI budgets` workflow checks per-step and per-job medians over the
 newest 30 green `ci.yml` runs per event against `scripts/ci-budgets.json`:
 with `--report-issue` it keeps one `ci-budget`-labelled issue per regression
 episode current, an exceedance writes the table and adds a comment, while a

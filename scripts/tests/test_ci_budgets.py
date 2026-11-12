@@ -78,15 +78,20 @@ class BudgetsHarness(unittest.TestCase):
             "    if '--json' not in args:\n"
             "        print('fake gh: issue list without --json', file=sys.stderr)\n"
             "        sys.exit(1)\n"
-            "    listed = state['issues']\n"
-            "    if isinstance(listed, list):\n"
-            "        listed = [i for i in listed if not i.get('closed')]\n"
-            "    if '--state' in args:\n"
-            "        i = args.index('--state')\n"
-            "        if args[i + 1] != 'open':\n"
-            "            print('fake gh: issue list state must be open', file=sys.stderr)\n"
-            "            sys.exit(1)\n"
-            "    print(json.dumps(listed))\n"
+            "    raw = os.environ.get('GH_RAW_ISSUE_LIST')\n"
+            "    if raw is None:\n"
+            "        listed = state['issues']\n"
+            "        if isinstance(listed, list):\n"
+            "            listed = [i for i in listed if not i.get('closed')]\n"
+            "        if '--state' in args:\n"
+            "            i = args.index('--state')\n"
+            "            if args[i + 1] != 'open':\n"
+            "                print('fake gh: issue list state must be open',\n"
+            "                      file=sys.stderr)\n"
+            "                sys.exit(1)\n"
+            "        print(json.dumps(listed))\n"
+            "    else:\n"
+            "        print(raw)\n"
             "elif args[:2] == ['label', 'list']:\n"
             "    if '--json' not in args:\n"
             "        print('fake gh: label list without --json', file=sys.stderr)\n"
@@ -99,12 +104,27 @@ class BudgetsHarness(unittest.TestCase):
             "        print('fake gh: run list without --json', file=sys.stderr)\n"
             "        sys.exit(1)\n"
             "    runs = state.get('runs', [])\n"
+            "    if '--event' in args:\n"
+            "        wanted = args[args.index('--event') + 1]\n"
+            "        runs = [r for r in runs if r.get('event') == wanted]\n"
+            "    latest = {}\n"
+            "    for r in runs:\n"
+            "        key = r.get('databaseId')\n"
+            "        if key not in latest or r.get('attempt', 1) > latest[key].get('attempt', 1):\n"
+            "            latest[key] = r\n"
+            "    runs = list(latest.values())\n"
             "    if '--limit' in args:\n"
             "        i = args.index('--limit')\n"
             "        runs = runs[:int(args[i + 1])]\n"
             "    fields = args[args.index('--json') + 1].split(',')\n"
             "    print(json.dumps([{f: r.get(f) for f in fields} for r in runs]))\n"
             "elif args[:2] == ['run', 'view']:\n"
+            "    if os.environ.get('GH_FAIL_VIEW'):\n"
+            "        failing = os.environ['GH_FAIL_VIEW'].split(',')\n"
+            "        if args[2] in failing:\n"
+            "            print(f'fake gh: HTTP 502 (run {args[2]})',\n"
+            "                  file=sys.stderr)\n"
+            "            sys.exit(1)\n"
             "    run_id = int(args[2])\n"
             "    attempt = 1\n"
             "    if '--attempt' in args:\n"
@@ -446,11 +466,13 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertIn("median 12m30s", result.stdout)
 
     def test_live_window_skips_non_green_first_attempts(self):
-        # The live fetch lists newest runs first, so a cancelled
-        # run, a failed run, and a green rerun sitting among the newest
-        # six listings must not shrink the four-green window. The window
-        # median over the surviving greens is 2500 s; a window-sized
-        # fetch limited to the newest four listings would report 3500 s.
+        # The live fetch lists newest runs first: a failed first
+        # attempt with a green rerun (run 20, listed at attempt 2),
+        # a failed run, and a cancelled run sit among the newest
+        # listings but must not shrink the four-green window. The
+        # window median over the surviving greens is 2500 s; a
+        # window-sized fetch limited to the newest four listings would
+        # report 3500 s.
         listings = [
             self.document(60, jobs=self.green_lane_jobs(5000, hour=15),
                           created_minute=50),
@@ -461,8 +483,8 @@ class BudgetCheckTests(BudgetsHarness):
             self.document(30, jobs=self.green_lane_jobs(2000, hour=12),
                           created_minute=20),
             self.document(20, jobs=self.green_lane_jobs(2000, hour=11),
-                          conclusion="failure", attempt=2,
-                          created_minute=19),
+                          conclusion="failure", created_minute=19,
+                          attempt=2),
             self.document(20, jobs=self.green_lane_jobs(3000, hour=11),
                           created_minute=10),
             self.document(10, jobs=self.green_lane_jobs(1000, hour=10),
@@ -476,6 +498,35 @@ class BudgetCheckTests(BudgetsHarness):
         result = self.run_cli("--budgets", budgets)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("median 41m40s", result.stdout)
+
+    def test_live_broken_view_of_an_unselected_run_keeps_a_full_table(self):
+        # The live fetch must never view a run the selection cannot
+        # use: run 50 lists cancelled at attempt 1, so its job document
+        # cannot feed the medians, and on a sick run its `gh run view`
+        # would fail the whole night with a 502. The table still covers
+        # four greens with a 2500 s median.
+        listings = [
+            self.document(60, jobs=self.green_lane_jobs(5000, hour=15),
+                          created_minute=50),
+            self.document(50, jobs=self.green_lane_jobs(4000, hour=14),
+                          conclusion="cancelled", created_minute=40),
+            self.document(40, jobs=self.green_lane_jobs(3000, hour=13),
+                          created_minute=30),
+            self.document(30, jobs=self.green_lane_jobs(2000, hour=12),
+                          created_minute=20),
+            self.document(10, jobs=self.green_lane_jobs(1000, hour=10),
+                          created_minute=0),
+        ]
+        self.write_runs_state(listings)
+        budgets = self.write_budgets([
+            self.step_budget("platform contracts (arm64)",
+                             "Run macOS lane tests", 2600),
+        ], window_runs=4)
+        result = self.run_cli("--budgets", budgets,
+                              extra_env={"GH_FAIL_VIEW": "50"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("median 41m40s", result.stdout)
+        self.assertNotIn("HTTP 502", result.stderr)
 
     def test_report_issue_creates_then_edits_with_a_comment_once(self):
         snapshot = self.lane_snapshot(lane_seconds=1200)
@@ -676,8 +727,8 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertIn(["issue", "create"], self.write_call_kinds())
 
     def test_bad_issue_json_is_a_usage_error(self):
-        # Row 6: `gh issue list` printing text (a proxy that forgets
-        # `--json`) exits 2 before any write.
+        # Row 6: `gh issue list` printing a non-array JSON payload
+        # (`"not-a-list"` here) exits 2 before any write.
         snapshot = self.lane_snapshot(lane_seconds=1200)
         budgets = self.write_budgets([
             self.step_budget("platform contracts (arm64)",
@@ -686,6 +737,23 @@ class BudgetCheckTests(BudgetsHarness):
         self.write_state({"issues": "not-a-list", "labels": []})
         result = self.run_cli("--input", snapshot, "--budgets", budgets,
                               "--report-issue")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("over budget", result.stdout)
+        self.assertIn("invalid JSON", result.stderr)
+        self.assertEqual(self.write_calls(), [])
+
+    def test_undecodable_issue_list_is_a_usage_error(self):
+        # Row 6, the other half: `gh issue list` printing text that is
+        # not JSON at all also exits 2 before any write.
+        snapshot = self.lane_snapshot(lane_seconds=1200)
+        budgets = self.write_budgets([
+            self.step_budget("platform contracts (arm64)",
+                             "Run macOS lane tests", 1000),
+        ], window_runs=4)
+        self.write_state({"issues": [], "labels": []})
+        result = self.run_cli("--input", snapshot, "--budgets", budgets,
+                              "--report-issue",
+                              extra_env={"GH_RAW_ISSUE_LIST": "not json {"})
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("over budget", result.stdout)
         self.assertIn("invalid JSON", result.stderr)

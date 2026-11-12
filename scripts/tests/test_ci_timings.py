@@ -1356,6 +1356,29 @@ class FetchTests(unittest.TestCase):
 
     # -- conclusion filter after fetching ----------------------------------
 
+    def test_fetch_skips_single_attempt_runs_outside_the_conclusion(self):
+        # A cancelled single-attempt run can never pass `--conclusion
+        # success` under any `--attempts` mode, so it costs no `gh run
+        # view`; a red rerun still fetches attempt 1, which may be green.
+        self.set_listing([
+            {"databaseId": 41, "attempt": 1, "conclusion": "cancelled"},
+            {"databaseId": 42, "attempt": 2, "conclusion": "failure"},
+        ])
+        self.set_views({
+            "42:1": self.view_document(42, attempt=1, conclusion="success"),
+            "42:2": self.view_document(42, attempt=2, conclusion="failure"),
+        })
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21",
+            "--conclusion", "success",
+        )
+        self.assertEqual(
+            [(run["id"], run["attempt"], run["conclusion"])
+             for run in payload["runs"]],
+            [(42, 1, "success")],
+        )
+        self.assertEqual(self.view_attempts(), ["1", "2"])
+
     def test_fetch_then_filter_recovers_a_run_whose_rerun_failed(self):
         """The fetch-before-filter pipeline: listing shows only the rerun.
 
@@ -1479,6 +1502,7 @@ class FetchTests(unittest.TestCase):
         for message in (
             "HTTP 502: Server Error (https://api.github.com/repos/o/r/actions/runs/77)",
             "gh: You have exceeded a secondary rate limit",
+            "stream error: stream ID 5; CANCEL; received from peer",
         ):
             with self.subTest(message=message[:20]):
                 self.calls.write_text("")

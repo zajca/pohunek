@@ -22,7 +22,7 @@ API error. Nothing writes to an issue without `--report-issue`.
 import argparse
 import datetime
 import json
-import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -33,13 +33,22 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUDGETS = ROOT / "scripts" / "ci-budgets.json"
 CI_TIMINGS = ROOT / "scripts" / "ci-timings"
 
-# The fetch hands `ci-timings --limit` a superset of `window_runs`: every run
-# whose first attempt is not green (cancelled, failed, rerun green) still
-# costs a listing slot, so the limit must cover the worst realistic gap.
-FETCH_MULTIPLE = 4
+# Growth steps of a live fetch: the fetch asks for one batch at a time
+# and stops once the window filled, so a sparse stretch of red listings
+# costs listings, not job documents. Each pass reuses the same private
+# snapshot: the documents the earlier batches already fetched answer
+# from the snapshot, and only new listings add `gh run view` calls.
+FETCH_STEPS = (40, 80, 160, 320)
+
+# The `gh run list` fields the budget check reads directly. The PR run
+# wall comes from the listing alone, so these must carry the same
+# timestamps `ci-timings` uses for its `wall_seconds` definition.
+LISTING_FIELDS = (
+    "databaseId,conclusion,createdAt,updatedAt,event,headBranch,attempt,"
+    "startedAt,workflowName"
+)
 
 # Machine-readable marker in the issue body: the set of exceeded budget keys
-# the body was last written for. A comment goes out only when this set
 # changes between writes.
 MARKER_PREFIX = "<!-- ci-budgets:exceeded="
 
@@ -163,17 +172,18 @@ def fetch_arguments(event, fetch_limit, *, branch):
 
     Only run-level filters travel here: `ci-timings` passes workflow,
     event, and branch to `gh run list` and applies the conclusion and
-    attempt filters locally after loading the attempts. Push budgets
-    read green `ci.yml` runs on `branch`; the pull-request window spans
-    every head branch, so it carries no branch filter. The limit is a
-    fetch superset, not the window: the caller measures the newest
-    `window_runs` green first attempts out of the snapshot.
+    attempt filters locally after loading the attempts. The measured
+    selection is always green first attempts, so the fetch carries
+    `--conclusion success --attempts first`: a green first attempt with
+    a red rerun still lists (its latest attempt is what the listing
+    describes) and is still fetched by number, while a run the
+    selection could never use costs no job document.
     """
-    arguments = ["--limit", str(fetch_limit), "--event", event]
+    arguments = ["--limit", str(fetch_limit), "--event", event,
+                 "--conclusion", "success", "--attempts", "first"]
     if event == "push":
         arguments += ["--branch", branch]
     return arguments
-
 
 def selection_arguments(event, window_runs, *, input_path, branch):
     """The `ci-timings` measurement flags over one fetched snapshot.
@@ -230,30 +240,118 @@ def measured_window(documents, window_runs):
 
 
 def fetch_snapshot(event, *, window_runs, branch):
-    """A private snapshot of one event's fetch superset, newest runs first.
+    """A private snapshot holding at least one event's green window.
 
-    The fetch asks `ci-timings` for `window_runs * FETCH_MULTIPLE` newest
-    runs into a file only this measurement owns: non-green first attempts
-    cost listing slots live, so the snapshot must be wider than the window
-    for the window to fill. The caller deletes the file afterwards. Each
-    event needs its own snapshot, because push and pull-request list
-different runs.
+    The fetch grows in steps and stops once the snapshot holds
+    `window_runs` green first attempts: non-green listings cost slots
+    live, so one fixed limit either fetches too much on a green stretch
+    or fills nothing on a red one. The private directory owns both the
+    snapshot and its `.partial` staging files, so the caller deletes one
+    directory afterwards instead of racing `mkstemp` names.
     """
-    fetch_limit = window_runs * FETCH_MULTIPLE
-    descriptor, name = tempfile.mkstemp(prefix="ci-budgets-", suffix=".json")
-    os.close(descriptor)
-    cache = Path(name)
-    cache.unlink()
+    directory = Path(tempfile.mkdtemp(prefix="ci-budgets-"))
+    cache = directory / "snapshot.json"
     try:
-        run_ci_timings(
-            ["runs", *fetch_arguments(event, fetch_limit, branch=branch)],
-            cache=cache,
-        )
+        for fetch_limit in FETCH_STEPS:
+            run_ci_timings(
+                ["runs", *fetch_arguments(event, fetch_limit,
+                                            branch=branch)],
+                cache=cache,
+            )
+            filled = snapshot_holds_window(cache, event,
+                                             window_runs=window_runs,
+                                             branch=branch)
+            if filled:
+                return str(cache)
         return str(cache)
     except BaseException:
-        if cache.exists():
-            cache.unlink()
+        shutil.rmtree(directory, ignore_errors=True)
         raise
+
+
+def snapshot_holds_window(cache, event, *, window_runs, branch):
+    """Whether the fetched snapshot already holds a full green window."""
+    try:
+        documents = json.loads(Path(cache).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(documents, list):
+        return False
+    selected = green_first_attempts(documents, window_runs)
+    if event == "pull_request":
+        selected = [run for run in selected
+                    if run.get("event") == event]
+    else:
+        selected = [
+            run for run in selected
+            if run.get("event") == event
+            and (run.get("branch") or run.get("headBranch")) == branch
+        ]
+    return len(selected) >= window_runs
+
+
+def parse_listing_wall(entry):
+    """One listing's wall clock: `updatedAt` minus `startedAt`.
+
+    The same definition `ci-timings` uses for `wall_seconds`, so the
+    listing-based PR wall median matches the measured one. Returns None
+    when either timestamp is missing or unparsable.
+    """
+    try:
+        started = datetime.datetime.fromisoformat(
+            (entry.get("startedAt") or "").replace("Z", "+00:00"))
+        updated = datetime.datetime.fromisoformat(
+            (entry.get("updatedAt") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (updated - started).total_seconds()
+
+
+def list_pr_walls(*, window_runs, branch):
+    """Newest green pull-request first attempts from the listing alone.
+
+    The PR budget covers only the run wall, so the listing's own
+    `startedAt`/`updatedAt` fields feed the median: no job document is
+    ever fetched for a pull-request run, whatever its conclusion. The
+    listing names only the latest attempt per run, and the wall comes
+    from that attempt's timestamps. Grows like the snapshot fetch and
+    stops once the window filled.
+    """
+    walls = []
+    id_order = []
+    seen = set()
+    for fetch_limit in FETCH_STEPS:
+        result = gh("run", "list", "--workflow", "ci.yml",
+                    "--limit", str(fetch_limit),
+                    "--event", "pull_request",
+                    "--json", LISTING_FIELDS)
+        try:
+            listed = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise BudgetError(f"gh printed invalid JSON: {error}") from error
+        if not isinstance(listed, list):
+            raise BudgetError(
+                "gh printed invalid JSON: run list is not a JSON array")
+        for entry in listed:
+            run_id = entry.get("databaseId")
+            if run_id in seen:
+                continue
+            seen.add(run_id)
+            attempt = entry.get("attempt", 1) or 1
+            if attempt != 1:
+                continue
+            if entry.get("conclusion") != "success":
+                continue
+            wall = parse_listing_wall(entry)
+            if wall is None:
+                continue
+            walls.append(wall)
+            id_order.append(run_id)
+            if len(walls) >= window_runs:
+                break
+        if len(walls) >= window_runs:
+            break
+    return walls, id_order, len(walls) >= window_runs
 
 
 def measured_runs(input_path, event, *, window_runs, branch):
@@ -306,12 +404,14 @@ def measure(*, window_runs, input_path, branch):
     """Medians over the newest green first attempts per event.
 
     Push budgets read green `ci.yml` runs on `branch`; the pull-request
-    window spans every head branch. Live, each event first fetches a
-    private snapshot, then both the run walls and the step medians are
-    measured from `--input` snapshots with `--limit window_runs`, so the
-    live path runs the same filter-first selection as `--input`. With
-    `--input` the given snapshot stands in for `gh`, so offline runs stay
-    reproducible.
+    window spans every head branch. Live, the push leg fetches a private
+    snapshot in growing steps, then both the run walls and the step
+    medians are measured from that snapshot with `--input --limit
+    window_runs`, so the live path runs the same filter-first selection
+    as `--input`. The pull-request leg never fetches a job document:
+    it budgets only the run wall, which the listing's own
+    `startedAt`/`updatedAt` timestamps carry. With `--input` the given
+    snapshot stands in for `gh`, so offline runs stay reproducible.
     """
     if input_path is not None:
         push_runs, push_filled = measured_runs(
@@ -321,53 +421,76 @@ def measure(*, window_runs, input_path, branch):
             branch=branch)
         push_steps, push_step_runs, push_steps_filled = measured_steps(
             input_path, window_runs=window_runs, branch=branch)
-        return measured_medians(push_runs, push_filled, pr_runs, pr_filled,
-                                push_steps, push_step_runs,
+        return measured_medians(push_runs, push_filled, pr_runs, [],
+                                pr_filled, push_steps, push_step_runs,
                                 push_steps_filled)
     push_snapshot = fetch_snapshot("push", window_runs=window_runs,
                                    branch=branch)
     try:
-        pr_snapshot = fetch_snapshot("pull_request", window_runs=window_runs,
-                                     branch=branch)
-        try:
-            push_runs, push_filled = measured_runs(
-                push_snapshot, "push", window_runs=window_runs,
-                branch=branch)
-            pr_runs, pr_filled = measured_runs(
-                pr_snapshot, "pull_request", window_runs=window_runs,
-                branch=branch)
-            push_steps, push_step_runs, push_steps_filled = measured_steps(
-                push_snapshot, window_runs=window_runs, branch=branch)
-        finally:
-            Path(pr_snapshot).unlink(missing_ok=True)
+        push_runs, push_filled = measured_runs(
+            push_snapshot, "push", window_runs=window_runs,
+            branch=branch)
+        pr_walls, pr_ids, pr_filled = list_pr_walls(
+            window_runs=window_runs, branch=branch)
+        push_steps, push_step_runs, push_steps_filled = measured_steps(
+            push_snapshot, window_runs=window_runs, branch=branch)
     finally:
-        Path(push_snapshot).unlink(missing_ok=True)
-    return measured_medians(push_runs, push_filled, pr_runs, pr_filled,
-                            push_steps, push_step_runs, push_steps_filled)
+        shutil.rmtree(Path(push_snapshot).parent, ignore_errors=True)
+    return measured_medians(push_runs, push_filled, pr_walls, pr_ids,
+                            pr_filled, push_steps, push_step_runs,
+                            push_steps_filled)
 
 
-def measured_medians(push_runs, push_filled, pr_runs, pr_filled,
-                     push_steps, push_step_runs, push_steps_filled):
-    """Assemble the medians dict from one event's measured windows."""
+def measured_medians(push_runs, push_filled, pr_walls_or_runs, pr_ids_or_runs,
+                     pr_filled, push_steps, push_step_runs,
+                     push_steps_filled):
+    """Assemble the medians dict from one event's measured windows.
+
+    The pull-request leg arrives in two shapes: run summaries from an
+    `--input` snapshot, or listing wall clocks from the live listing
+    path. Both feed the same median; the live path additionally carries
+    the run ids for the slowest-run links.
+    """
+    if isinstance(pr_walls_or_runs, list) and (
+            not pr_walls_or_runs
+            or isinstance(pr_walls_or_runs[0], (int, float))):
+        pr_wall_median = (
+            statistics.median(pr_walls_or_runs) if pr_walls_or_runs else None)
+        pr_runs = len(pr_walls_or_runs)
+        slowest_pr = sorted(
+            ((run_id, wall) for run_id, wall
+             in zip(pr_ids_or_runs, pr_walls_or_runs)),
+            key=lambda pair: pair[1] or 0,
+            reverse=True,
+        )[:5]
+        slowest_pr = [
+            {"id": run_id, "wall_seconds": wall}
+            for run_id, wall in slowest_pr
+        ]
+    else:
+        pr_wall_median = wall_median(pr_walls_or_runs)
+        pr_runs = len(pr_walls_or_runs)
+        slowest_pr = sorted(
+            (run for run in pr_walls_or_runs
+             if run.get("id") is not None),
+            key=lambda run: run.get("wall_seconds") or 0,
+            reverse=True,
+        )[:5]
     return {
         "push_steps": push_steps,
         "push_step_runs": push_step_runs,
         "push_steps_filled": push_steps_filled,
         "push_job_walls": job_wall_medians(push_runs),
         "push_filled": push_filled,
-        "pr_wall_median": wall_median(pr_runs),
-        "pr_runs": len(pr_runs),
+        "pr_wall_median": pr_wall_median,
+        "pr_runs": pr_runs,
         "pr_filled": pr_filled,
         "slowest_push": sorted(
             (run for run in push_runs if run.get("id") is not None),
             key=lambda run: run.get("wall_seconds") or 0,
             reverse=True,
         )[:5],
-        "slowest_pr": sorted(
-            (run for run in pr_runs if run.get("id") is not None),
-            key=lambda run: run.get("wall_seconds") or 0,
-            reverse=True,
-        )[:5],
+        "slowest_pr": slowest_pr,
     }
 
 
