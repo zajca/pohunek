@@ -130,6 +130,59 @@ env:
   # seconds; two minutes leaves room for slow requests and larger packages. A
   # download that runs out of time counts as failed: every package job runs.
   PACKAGE_BASELINE_FETCH_TIMEOUT: 120s
+  # Retry bounds for `.github/scripts/ci-retry`, shared by every network
+  # install that runs through it (apt-get, npm ci, bun install, rustup, uv,
+  # cargo fetch; issue #2201). Three attempts with a 10 s backoff bound every
+  # class: each attempt carries its own connect/total timeout (apt 30/180 s,
+  # the rest 180 s), so a hung mirror fails an attempt instead of the step.
+  # The worst case (3 x (180 s + KILL_GRACE_SECONDS) + 10 s + 20 s backoff)
+  # fits the smallest 10-minute step limit with headroom.
+  # Attempt timeouts come from the one calibrated set of CI_RETRY_* values
+  # in this workflow's top-level env (p90 of 29 successful main runs plus
+  # headroom, per command class: cargo fetch 7 s, apt/oomd 17 s, bun 3 s,
+  # rustup 13 s, uv 8 s, zig 16 s; `scripts/ci-timings steps --limit 30`)
+  # and from the matching action/retry knobs named in each comment below:
+  # - apt: Acquire::http(s)::Timeout=30 already on every call (apt docs:
+  #   `man apt.conf`, the `Acquire::http::Timeout` option); the helper
+  #   bounds the total.
+  # - npm: the tool defaults stay in force (npm docs:
+  #   https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout and
+  #   #fetch-retries: --fetch-timeout=300000, --fetch-retries=2). npm's own
+  #   retries run inside one install; the helper bounds the total install
+  #   time and retries the whole install after npm's retries are exhausted.
+  # - bun: the tool default stays in force (BUN_CONFIG_HTTP_RETRY_COUNT=5,
+  #   bun docs: https://bun.sh/docs/installation#configuring-bun; bun has
+  #   no timeout knob). One timed-out request already ends the attempt,
+  #   so the helper retries the whole install instead.
+  # - rustup: RUSTUP_DOWNLOAD_TIMEOUT bounds each download from inside and
+  #   RUSTUP_MAX_RETRIES retries it (rustup docs:
+  #   https://rust-lang.github.io/rustup/devel/environment-variables.html);
+  #   RUSTUP_DOWNLOAD_TIMEOUT equals the helper attempt timeout, so the
+  #   helper always fires first and bounds a hung install whose request
+  #   never returns.
+  # - uv: the tool defaults stay in force (uv docs:
+  #   https://docs.astral.sh/uv/reference/settings/#http-timeout:
+  #   UV_HTTP_TIMEOUT/UV_HTTP_CONNECT_TIMEOUT, UV_HTTP_RETRIES); the
+  #   helper retries a hung download whose request never returns.
+  # - cargo: the tool defaults stay in force (cargo docs:
+  #   https://doc.rust-lang.org/cargo/reference/config.html#netretry:
+  #   CARGO_NET_RETRY, CARGO_HTTP_TIMEOUT). CARGO_NET_RETRY retries
+  #   spurious failures inside cargo and CARGO_HTTP_TIMEOUT bounds each
+  #   request; the helper retries a hung fetch whose request never
+  #   returns.
+  # - setup-zig: curl --connect-timeout/--max-time (mold parity, plus a
+  #   stall --speed-limit/--speed-time since curl retries only attempts that
+  #   return, curl docs: https://curl.se/docs/manpage.html) bound each
+  #   download; the helper is not wrapped around curl because a curl
+  #   transfer is already one bounded attempt.
+  CI_RETRY_ATTEMPTS: "3"
+  CI_RETRY_BACKOFF_SECONDS: "10"
+  CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS: "180"
+  CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS: "180"
+  CI_RETRY_ATTEMPT_TIMEOUT_BUN_SECONDS: "180"
+  CI_RETRY_ATTEMPT_TIMEOUT_RUSTUP_SECONDS: "180"
+  CI_RETRY_ATTEMPT_TIMEOUT_UV_SECONDS: "180"
+  CI_RETRY_ATTEMPT_TIMEOUT_CARGO_SECONDS: "180"
   # Releases listed by `package-version-bump` to find the last released
   # version at or below the workspace version. `gh release list` returns the
   # newest releases first, and the wanted release is the newest one at or
@@ -380,7 +433,15 @@ jobs:
       # xtask's dependency_policy test reads the registry sources of the locked
       # dependency graph, which an archive build does not fetch.
       - name: Fetch locked crate sources
-        run: cargo fetch --locked
+        run: |
+          # CARGO_NET_RETRY retries spurious failures inside cargo with a
+          # per-request CARGO_HTTP_TIMEOUT; the helper retries a hung fetch
+          # whose request never returns.
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label cargo-fetch \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_CARGO_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            cargo fetch --locked
 
       # Same contract as the lane: a launchd-backed test in these packages fails
       # when the `gui/<uid>` domain is absent, and never skips.
@@ -1339,7 +1400,15 @@ jobs:
         uses: ./relocated/.github/actions/setup-rust
 
       - name: Fetch locked dependency sources
-        run: cargo fetch --locked
+        run: |
+          # CARGO_NET_RETRY retries spurious failures inside cargo with a
+          # per-request CARGO_HTTP_TIMEOUT; the helper retries a hung fetch
+          # whose request never returns.
+          "$GITHUB_WORKSPACE/relocated/.github/scripts/ci-retry" --label cargo-fetch \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_CARGO_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            cargo fetch --locked
 
       - name: Download test archive
         uses: actions/download-artifact@v4
@@ -1461,8 +1530,15 @@ jobs:
       - name: Install and start systemd-oomd
         timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y systemd-oomd
+          # One retried unit: a DNS outage (#2192) must not fail the install
+          # when the next attempt would succeed. apt's own timeouts end a
+          # stalled connection inside each attempt; systemctl only runs after
+          # the install succeeds.
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label apt-systemd-oomd \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            sudo sh -c 'apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y systemd-oomd'
           sudo systemctl enable --now systemd-oomd
           systemctl is-active systemd-oomd
 
@@ -1609,7 +1685,15 @@ jobs:
           save-if: false
 
       - name: Fetch locked dependency sources
-        run: cargo fetch --locked
+        run: |
+          # CARGO_NET_RETRY retries spurious failures inside cargo with a
+          # per-request CARGO_HTTP_TIMEOUT; the helper retries a hung fetch
+          # whose request never returns.
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label cargo-fetch \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_CARGO_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            cargo fetch --locked
 
       # The copy keeps the selector out of target/, where the archive extracts.
       - name: Build the selector
@@ -2679,7 +2763,15 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/pi/npm"
-          if ! npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
+          # npm's own fetch retries run inside one install (npm defaults:
+          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
+          # and #fetch-retries); the helper bounds the total install time
+          # and retries the whole install after npm's retries are exhausted.
+          if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-pi \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
             echo "Failed to install the pinned Pi npm tree from $project/package-lock.json" >&2
             exit 1
           fi
@@ -2819,7 +2911,15 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/codex/npm"
-          if ! npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
+          # npm's own fetch retries run inside one install (npm defaults:
+          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
+          # and #fetch-retries); the helper bounds the total install time
+          # and retries the whole install after npm's retries are exhausted.
+          if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-codex \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
             echo "Failed to install the pinned Codex npm tree from $project/package-lock.json" >&2
             exit 1
           fi
@@ -2968,7 +3068,15 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/claude/npm"
-          if ! npm ci --prefix "$project" --ignore-scripts=false --no-audit --no-fund; then
+          # npm's own fetch retries run inside one install (npm defaults:
+          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
+          # and #fetch-retries); the helper bounds the total install time
+          # and retries the whole install after npm's retries are exhausted.
+          if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-claude \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            npm ci --prefix "$project" --ignore-scripts=false --no-audit --no-fund; then
             echo "Failed to install the pinned Claude Code npm tree from $project/package-lock.json" >&2
             exit 1
           fi
@@ -3574,7 +3682,16 @@ jobs:
             bun-${{ runner.os }}-1.3.11-
 
       - name: Install workspace dependencies
-        run: bun install --frozen-lockfile
+        run: |
+          # Bun retries a failed request (tool default
+          # BUN_CONFIG_HTTP_RETRY_COUNT=5, https://bun.sh/docs/installation#configuring-bun;
+          # bun has no timeout knob) but gives up after one timeout: the
+          # helper retries the whole install instead.
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label bun-install-sdk \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_BUN_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            bun install --frozen-lockfile
 
       - name: Typecheck workspace
         run: bun run typecheck
@@ -3700,7 +3817,16 @@ jobs:
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 
       - name: Install workspace dependencies
-        run: bun install --frozen-lockfile
+        run: |
+          # Bun retries a failed request (tool default
+          # BUN_CONFIG_HTTP_RETRY_COUNT=5, https://bun.sh/docs/installation#configuring-bun;
+          # bun has no timeout knob) but gives up after one timeout: the
+          # helper retries the whole install instead.
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label bun-install-sdk-macos \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_BUN_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            bun install --frozen-lockfile
 
       - name: Typecheck workspace
         run: bun run typecheck

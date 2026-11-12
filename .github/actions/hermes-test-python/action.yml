@@ -23,6 +23,8 @@ runs:
       with:
         enable-cache: true
 
+    # The workflow-level CI_RETRY_* values (documented in ci.yml) flow in
+    # through the caller's environment: composite steps accept no defaults.
     - name: Require the Hermes test interpreter
       shell: /bin/bash {0}
       run: |
@@ -63,12 +65,29 @@ runs:
         export UV_PYTHON_INSTALL_DIR="$private_root/install"
         export UV_PYTHON_BIN_DIR="$private_root/bin-links"
         install -d -m 700 "$UV_PYTHON_INSTALL_DIR" "$UV_PYTHON_BIN_DIR"
-        uv python install 3.12 --no-config
+        # uv retries transient HTTP failures inside (UV_HTTP_RETRIES,
+        # uv docs: https://docs.astral.sh/uv/reference/settings/#http-retries)
+        # with per-request UV_HTTP_TIMEOUT/UV_HTTP_CONNECT_TIMEOUT
+        # (https://docs.astral.sh/uv/reference/settings/#http-timeout);
+        # the helper retries a hung download whose request never returns.
+        "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label uv-python-hermes \
+          --attempts "$CI_RETRY_ATTEMPTS" \
+          --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_UV_SECONDS" \
+          --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+          uv python install 3.12 --no-config
         found="$(uv python find 3.12 --no-config --no-project --managed-python)"
         python_bin="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$found")"
         [[ "$python_bin" == "$private_root"/install/* ]] \
           || { echo "resolved interpreter escapes the private install: $found -> $python_bin" >&2; exit 1; }
-        uv pip install --no-config --link-mode copy --python "$python_bin" --break-system-packages pyyaml==6.0.2
+        # A finished interpreter with a missing PyYAML is discarded: the
+        # private root is removed and both helper calls retry from scratch
+        # on the next job attempt. The two retried installs are separate
+        # helper calls, so one can succeed while the other retries.
+        "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label uv-pip-hermes \
+          --attempts "$CI_RETRY_ATTEMPTS" \
+          --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_UV_SECONDS" \
+          --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+          uv pip install --no-config --link-mode copy --python "$python_bin" --break-system-packages pyyaml==6.0.2
         # Symlinks keep their targets' modes; only real entries are changed.
         find "$private_root" -not -type l -exec chmod go-w {} +
 

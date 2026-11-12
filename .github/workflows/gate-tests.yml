@@ -33,6 +33,12 @@ env:
   # gate-tests.yml, release.yml and release-build.yml.
   MOLD_VERSION: "2.42.1"
   MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
+  # Retry bounds for `.github/scripts/ci-retry` (issue #2201; the values and
+  # their calibration are documented in ci.yml). This workflow only needs the
+  # cargo class.
+  CI_RETRY_ATTEMPTS: "3"
+  CI_RETRY_BACKOFF_SECONDS: "10"
+  CI_RETRY_ATTEMPT_TIMEOUT_CARGO_SECONDS: "180"
 
 jobs:
   tests:
@@ -122,7 +128,15 @@ jobs:
       # xtask::dependency_policy resolves the locked graph with `--offline`, so
       # every locked package source must already be in the cargo registry.
       - name: Fetch locked dependency sources
-        run: cargo fetch --locked
+        run: |
+          # CARGO_NET_RETRY retries spurious failures inside cargo with a
+          # per-request CARGO_HTTP_TIMEOUT; the helper retries a hung fetch
+          # whose request never returns.
+          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label cargo-fetch \
+            --attempts "$CI_RETRY_ATTEMPTS" \
+            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_CARGO_SECONDS" \
+            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+            cargo fetch --locked
 
       - name: Check formatting
         run: cargo fmt --all --check

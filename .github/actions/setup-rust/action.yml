@@ -1,9 +1,9 @@
 name: Setup Rust
 description: >-
   Install the Rust toolchain pinned by rust-toolchain.toml, or an explicitly
-  dated nightly, through the SHA-pinned dtolnay/rust-toolchain action. The pin
-  is read from the repository tree this action belongs to (three directories
-  above it), so a job that checks the repository out into a subdirectory uses
+  dated nightly, with rustup directly. The pin is read from the repository
+  tree this action belongs to (three directories above it), so a job that
+  checks the repository out into a subdirectory uses
   `./<subdir>/.github/actions/setup-rust` and gets that tree's pin.
 
 inputs:
@@ -22,6 +22,28 @@ inputs:
     description: Comma-separated extra target triples (e.g. `aarch64-apple-darwin`).
     required: false
     default: ""
+  retry-attempts:
+    description: >-
+      Helper attempts for the rustup install. Defaults to the calibrated
+      value below; a caller workflow overrides it only to match its own
+      CI_RETRY_ATTEMPTS.
+    required: false
+    default: "3"
+  retry-backoff-seconds:
+    description: >-
+      Seconds before the first helper retry; doubles after every failure.
+      Defaults to the calibrated value below; a caller workflow overrides
+      it only to match its own CI_RETRY_BACKOFF_SECONDS.
+    required: false
+    default: "10"
+  retry-attempt-timeout-seconds:
+    description: >-
+      Seconds bounding one rustup attempt (p99 of successful main runs plus
+      headroom; calibrated next to the CI_RETRY_* values in the ci.yml
+      top-level env). A caller workflow overrides it only to match its own
+      CI_RETRY_ATTEMPT_TIMEOUT_RUSTUP_SECONDS.
+    required: false
+    default: "180"
 
 outputs:
   toolchain:
@@ -119,12 +141,92 @@ runs:
         } >> "$GITHUB_OUTPUT"
         echo "setup-rust: toolchain=$toolchain components=${components:-none} targets=${targets:-none}"
 
+    - name: Set $CARGO_HOME
+      # Exported so every runner sees the same CARGO* set: Swatinem/rust-cache
+      # hashes every non-empty CARGO* variable into its key, and the hosted
+      # images leave CARGO_HOME unset, so the value is always $HOME/.cargo.
+      run: echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> "$GITHUB_ENV"
+      shell: bash
+
     - name: Install Rust ${{ steps.resolve.outputs.toolchain }}
-      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-      with:
-        toolchain: ${{ steps.resolve.outputs.toolchain }}
-        components: ${{ steps.resolve.outputs.components }}
-        targets: ${{ steps.resolve.outputs.targets }}
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+        COMPONENTS: ${{ steps.resolve.outputs.components }}
+        TARGETS: ${{ steps.resolve.outputs.targets }}
+        RETRY_ATTEMPTS: ${{ inputs.retry-attempts }}
+        RETRY_BACKOFF_SECONDS: ${{ inputs.retry-backoff-seconds }}
+        RETRY_ATTEMPT_TIMEOUT_SECONDS: ${{ inputs.retry-attempt-timeout-seconds }}
+        # Quoted paths with spaces must still hard-link or copy when a
+        # cross-device rename is impossible (rustup#3741).
+        RUSTUP_PERMIT_COPY_RENAME: "1"
+        # rustup retries a failed request up to RUSTUP_MAX_RETRIES (a number
+        # the action controls) with a per-request RUSTUP_DOWNLOAD_TIMEOUT
+        # (documented at
+        # https://rust-lang.github.io/rustup/devel/environment-variables.html):
+        # each download attempt inside rustup stays bounded, and the helper
+        # below bounds a hung install whose request never returns. Both
+        # knobs mirror the matching helper bound; the defaulted `retry-*`
+        # inputs above carry the ci.yml class values, so a workflow without
+        # its own CI_RETRY_* still retries instead of failing with a usage
+        # error.
+        RUSTUP_DOWNLOAD_TIMEOUT: ${{ inputs.retry-attempt-timeout-seconds }}
+        RUSTUP_MAX_RETRIES: ${{ inputs.retry-attempts }}
+      # POSIX sh constructs and BSD-compatible commands only: the macOS
+      # runners run this with bash 3.2 and BSD userland.
+      run: |
+        set -eu
+        command -v rustup >/dev/null 2>&1 || { echo "::error::setup-rust: rustup not found" >&2; exit 1; }
+        # The values below reach the rustup command line only as one flag
+        # per word (shellcheck SC2086 by construction), so named components
+        # and targets validated in the resolve step cannot split words.
+        # Empty lists add no flag pair: `--component` with no following word
+        # would make rustup consume the next flag as its value.
+        args="--profile minimal --force-non-host --no-self-update"
+        for name in $(printf '%s' "$COMPONENTS" | tr ',' ' '); do
+          args="$args --component $name"
+        done
+        for name in $(printf '%s' "$TARGETS" | tr ',' ' '); do
+          args="$args --target $name"
+        done
+        # shellcheck disable=SC2086 # one flag per word by construction above
+        "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label rustup \
+          --attempts "$RETRY_ATTEMPTS" --attempt-timeout "$RETRY_ATTEMPT_TIMEOUT_SECONDS" \
+          --backoff "$RETRY_BACKOFF_SECONDS" -- sh -c \
+            'exec rustup toolchain install "$0" $1' "$TOOLCHAIN" "$args"
+
+    - name: Set the default toolchain
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+      # The directory override in rust-toolchain.toml outranks the rustup
+      # default, and RUSTUP_TOOLCHAIN outranks both, so nightly jobs keep
+      # their toolchain. `rustup default --help` lists `--force-non-host`;
+      # the flag is kept, and the toolchain comes from the resolve step so
+      # only the pinned channel can reach this command.
+      run: |
+        set -eu
+        rustup default --force-non-host "$TOOLCHAIN"
+
+    - name: Disable incremental compilation
+      shell: bash
+      # The action exports these only when unset, so a job-level override
+      # wins. The sparse-registry and curl-8.0 workarounds are left out:
+      # they apply only to rustc 1.66-1.71, and the pin in
+      # rust-toolchain.toml is newer.
+      run: |
+        set -eu
+        if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+          echo CARGO_INCREMENTAL=0 >> "$GITHUB_ENV"
+        fi
+
+    - name: Enable colors in Cargo output
+      shell: bash
+      run: |
+        set -eu
+        if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+          echo CARGO_TERM_COLOR=always >> "$GITHUB_ENV"
+        fi
 
     # Fails when cargo in the repository would run another toolchain than the
     # one just installed.
@@ -143,4 +245,4 @@ runs:
             exit 1
             ;;
         esac
-        (cd "$REPO_ROOT" && rustc --version)
+        (cd "$REPO_ROOT" && rustc --version --verbose)
