@@ -549,9 +549,13 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertNotIn("HTTP 502", result.stderr)
         views = [call for call in self.gh_calls()
                  if call["args"][:2] == ["run", "view"]]
-        self.assertFalse(any(
-            call["args"][3:] == ["--attempt", "2"]
-            for call in views))
+        # Read the attempt number by position, the same way
+        # `view_attempts()` does: a slice offset on `run view <id>
+        # --json <fields> --attempt N` would never match.
+        self.assertNotIn("2", [
+            call["args"][call["args"].index("--attempt") + 1]
+            for call in views
+        ])
 
     def test_live_fetch_stops_once_the_window_filled(self):
         # The stepped-growth fetch stops at the first limit whose
