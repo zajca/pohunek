@@ -91,10 +91,12 @@ multi-team control plane without replacing either owner path.
   (`task.input_control`). Amended 2026-11-06 (design-only): the owner answers,
   routed asks as the addressed answer path, and the shared `task` and ask MCP server.
   This amendment is not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987); only the ask parts
-  (routed asks, the ask tools) are affected, the task MCP server stays.
+  (routed asks, the ask tools) are affected, the task MCP server stays; per-session rights continue
+  rescoped as #2002 and #2005 in milestone 0.44.
 - [Ask channel RFC](design/ask-channel-rfc.md) — withdrawn 2026-11-12 (#1987): the ask channel (Part A) is not planned,
-  and its amendments to the delegated task runs RFC are not planned; the Part B per-session rights
-  (AC-17 to AC-20, #2002-#2005) are held without milestone pending an owner decision. The RFC keeps a durable ask
+  and its routed-ask and ask-tool amendments to the delegated task runs RFC are not planned. Part B per-session
+  rights continue rescoped as #2002 and #2005 in milestone 0.44 (#2003 and #2004 closed as not planned;
+  the MCP session tools and the worker-attested path dropped). The RFC keeps a durable ask
   primitive between a running agent and its operator (answer kinds, outcomes,
   expiry, refine), emission through the MCP server and a CLI ask command, routing
   of native permission prompts where a hook can answer them, owner surfaces, a

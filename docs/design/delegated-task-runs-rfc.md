@@ -16,10 +16,12 @@
   routed ask is the addressed answer path for Claude and Codex attentions
   (section 8.5), and `pohunek mcp` also hosts the ask tools and gains a
   worker-attested channel for session-bound calls (section 13.4).
-
-  This amendment is not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987).
   Design-only: nothing here claims a shipped surface, and none of it changes
   existing section numbering.
+
+  Only the routed asks and the ask tools of this amendment are not planned: the ask channel RFC
+  was withdrawn on 2026-11-12 (#1987). Per-session rights continue rescoped as #2002 and #2005
+  in milestone 0.44; the MCP session tools and the worker-attested path are dropped.
 - **Date:** 2026-09-24
 - **Scope:** A task layer over ordinary sessions that lets an orchestrating agent
   delegate bounded coding work to another agent on any owned host and receive a
@@ -2357,9 +2359,6 @@ to run `task gc --orphans` after a crashed manager session.
 tools of the [ask channel RFC](ask-channel-rfc.md) (`ask`, `ask_wait`,
 `ask_cancel`, `ask_get`) and, later, its rights-checked session tools are
 added to this command, never to a second server. It is a thin client of the public protocol: no state,
-
-*The ask tools and the rights-checked session tools are not planned: the ask channel RFC was withdrawn
-on 2026-11-12 (#1987); the task MCP server stays.*
 no daemon-side MCP, same host targeting and origin guard. It forwards the
 origin markers of the session it runs in, so origin, loop guards and
 investigation-mode monotonicity (sections 11.2, 13.1) apply to its calls; in
@@ -2369,6 +2368,9 @@ same daemon ceiling and by the MCP client's own tool timeout, which the
 adapter reports in its tool descriptions. A blocking tool call gives no
 background wake, so for agents that have one (section 13.3) the CLI wait is
 preferred.
+
+*The ask tools are not planned (ask channel RFC withdrawn 2026-11-12, #1987); the MCP session tools
+are dropped and per-session rights continue rescoped as #2002 and #2005 in milestone 0.44.*
 
 **Worker-attested channel (2026-11-06 amendment).** The task tools stay a thin
 client of the public protocol and forward origin markers, which are not
@@ -2381,8 +2383,8 @@ carries no token. The task tools keep their current path; the channel adds a
 second one beside it. The ask RFC (section 9.3) states the attestation rules
 and their limits.
 
-*The ask tools and the worker-attested channel are not planned: the ask channel RFC was withdrawn
-on 2026-11-12 (#1987); the task tools keep their current path.*
+*The ask tools and the worker-attested path are not planned: the ask channel RFC was withdrawn
+on 2026-11-12 (#1987); per-session rights continue rescoped as #2002 and #2005 in milestone 0.44.*
 
 This does not conflict with the universal assistant's "no MCP knowledge server"
 decision, which concerns serving documentation, not delegating work. The
