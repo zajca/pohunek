@@ -1508,6 +1508,7 @@ mod tests {
             package("pohunek-relay-client", "crates/relay-client"),
             package("pohunek-knowledge", "crates/knowledge"),
             package("pohunek-daemon", "crates/daemon"),
+            package("pohunek-session-worker", "crates/session-worker"),
             package("pohunek-protocol", "crates/protocol"),
             package("pohunek-client", "crates/client"),
             Package {
