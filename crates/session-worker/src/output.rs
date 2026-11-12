@@ -564,7 +564,7 @@ impl HubState {
         Ok(OutputSnapshot::Replay {
             chunk: OutputChunk {
                 offset: requested,
-                bytes: Arc::from(self.ring.bytes_from(requested)),
+                bytes: self.ring.bytes_shared_from(requested),
             },
             watermark: self.ring.next_offset,
         })
@@ -843,12 +843,6 @@ impl OutputRing {
         Ok(offset)
     }
 
-    fn bytes_from(&self, offset: u64) -> Vec<u8> {
-        let relative =
-            usize::try_from(offset.saturating_sub(self.start_offset)).unwrap_or(self.bytes.len());
-        self.bytes.iter().skip(relative).copied().collect()
-    }
-
     fn bytes_from_limited(&self, offset: u64, limit: usize) -> Vec<u8> {
         let relative =
             usize::try_from(offset.saturating_sub(self.start_offset)).unwrap_or(self.bytes.len());
@@ -860,23 +854,30 @@ impl OutputRing {
             .collect()
     }
 
+    /// Builds one `Arc` allocation directly from the ring slice.
+    ///
+    /// `VecDeque::range` plus `copied` is `TrustedLen`, so the `Arc`
+    /// `FromIterator` specialization allocates once instead of collecting a
+    /// `Vec` first.
+    fn bytes_shared_from(&self, offset: u64) -> Arc<[u8]> {
+        let relative =
+            usize::try_from(offset.saturating_sub(self.start_offset)).unwrap_or(self.bytes.len());
+        self.bytes.range(relative..).copied().collect()
+    }
+
     fn chunk(&self, offset: u64, end: u64, limit: usize) -> Option<OutputChunk> {
         if offset < self.start_offset || offset >= end || end > self.next_offset {
             return None;
         }
         let relative = usize::try_from(offset.checked_sub(self.start_offset)?).ok()?;
         let remaining = usize::try_from(end.checked_sub(offset)?).ok()?;
-        let bytes: Vec<u8> = self
+        let len = remaining.min(limit);
+        let bytes: Arc<[u8]> = self
             .bytes
-            .iter()
-            .skip(relative)
-            .take(remaining.min(limit))
+            .range(relative..relative + len)
             .copied()
             .collect();
-        Some(OutputChunk {
-            offset,
-            bytes: Arc::from(bytes),
-        })
+        Some(OutputChunk { offset, bytes })
     }
 }
 
@@ -891,6 +892,31 @@ mod tests {
     use super::{OutputCompletion, OutputEvent, OutputHub, OutputSnapshot, RingError};
     use pohunek_terminal::TerminalSnapshot;
     use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn one_push_shares_a_single_buffer_between_live_subscribers() {
+        let hub = OutputHub::new(64, 64, 2, 10).expect("hub");
+        let mut first = hub.subscribe(None).expect("first subscribe");
+        let mut second = hub.subscribe(None).expect("second subscribe");
+        hub.push(b"shared").expect("push");
+
+        // Each seed replays the empty range first; the push then arrives as
+        // a live `Output` event carrying the single shared chunk.
+        let (Some(OutputEvent::Replay(_)), Some(OutputEvent::Replay(_))) =
+            (first.recv().await, second.recv().await)
+        else {
+            panic!("both live subscribers must replay the empty seed range");
+        };
+        let (Some(OutputEvent::Output(first_chunk)), Some(OutputEvent::Output(second_chunk))) =
+            (first.recv().await, second.recv().await)
+        else {
+            panic!("both live subscribers must receive the single push");
+        };
+        assert_eq!(first_chunk.offset, 0);
+        assert_eq!(&*first_chunk.bytes, b"shared");
+        assert!(Arc::ptr_eq(&first_chunk.bytes, &second_chunk.bytes));
+    }
 
     #[test]
     fn offsets_advance_and_eviction_reports_gap() {

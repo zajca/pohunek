@@ -66,8 +66,7 @@ use crate::notification;
 use crate::output::OutputCompletion;
 use crate::{
     Command, ControllerLease, Exit, InputFragment, InputPlan, Journal, LeaseError, LeaseOwner,
-    OutputChunk, OutputEvent, OutputSubscriber, ProcessIdentity, PtyError, PtyOwner, WorkerConfig,
-    WorkerError,
+    OutputEvent, OutputSubscriber, ProcessIdentity, PtyError, PtyOwner, WorkerConfig, WorkerError,
 };
 
 /// How long an idle leased control connection may go unverified.
@@ -3864,10 +3863,8 @@ where
         stream_id,
         worker_instance_id,
         payload_limit,
-        &OutputChunk {
-            offset: page.start_offset,
-            bytes: Arc::from(page.bytes),
-        },
+        page.start_offset,
+        &page.bytes,
         true,
     )
     .await?;
@@ -3925,7 +3922,8 @@ where
                 stream_id,
                 worker_instance_id,
                 payload_limit,
-                &chunk,
+                chunk.offset,
+                &chunk.bytes,
                 true,
             )
             .await
@@ -3937,7 +3935,8 @@ where
                 stream_id,
                 worker_instance_id,
                 payload_limit,
-                &chunk,
+                chunk.offset,
+                &chunk.bytes,
                 false,
             )
             .await
@@ -4023,20 +4022,26 @@ where
     .await
 }
 
+/// Frames one output or replay payload; the framing caller keeps stream identity explicit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stream framing keeps authenticated stream identity and lease explicit"
+)]
 async fn write_output_chunks<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
     worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
-    chunk: &OutputChunk,
+    offset: u64,
+    bytes: &[u8],
     replay: bool,
 ) -> Result<(), WorkerError>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let mut chunk_offset = chunk.offset;
-    for bytes in chunk.bytes.chunks(payload_limit) {
+    let mut chunk_offset = offset;
+    for frame in bytes.chunks(payload_limit) {
         let kind = if replay {
             FrameKind::Replay {
                 offset: chunk_offset,
@@ -4052,11 +4057,11 @@ where
             stream_id,
             worker_instance_id,
             kind,
-            bytes.to_vec(),
+            frame.to_vec(),
         )
         .await?;
         chunk_offset = chunk_offset
-            .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+            .checked_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
             .ok_or_else(|| WorkerError::Protocol("output frame offset overflowed".to_owned()))?;
     }
     Ok(())
@@ -8478,7 +8483,6 @@ mod tests {
     mod placement_escape;
     mod prompt_accepted;
 
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
@@ -11486,10 +11490,8 @@ mod tests {
             &stream_id,
             &worker_instance_id,
             MAX_DATA_PAYLOAD_BYTES,
-            &crate::OutputChunk {
-                offset: 41,
-                bytes: Arc::from(payload.as_slice()),
-            },
+            41,
+            &payload,
             true,
         )
         .await
