@@ -4,11 +4,8 @@ xtask = "run -p xtask --"
 # callers can narrow it with -p. Full/heavy runs need the documented fixtures.
 t = "nextest run --profile fast --all-features"
 ti = "nextest run --profile fast -p pohunek-daemon -p pohunek-client -p pohunek-session-worker --all-features"
-# Sixteen test processes: measured ~150 s for the full workspace suite on the
-# 24-CPU host with the fixture root on /r tmpfs, against ~686 s at 4 threads
-# on btrfs. Twenty threads averaged slower and flaked (#2267, #2268; #2269 at
-# sixteen). See the gates skill for the current numbers.
-tw = "nextest run --profile local --test-threads 16 --all-features"
+# The local gate thread count (see the gates skill for the current number).
+tw = "nextest run --profile local --all-features"
 # `cargo t` narrowed to the packages the current change affects plus their
 # dependents; unmapped or workspace-wide changes still run everything.
 ta = "xtask affected"

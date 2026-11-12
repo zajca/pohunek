@@ -10,7 +10,9 @@ check is a dedicated scenario of its own, and the remaining scenarios set
 `require_tmpfs=false`.
 """
 
+import fcntl
 import os
+import stat
 from pathlib import Path
 import shutil
 import signal
@@ -25,6 +27,9 @@ import hermetic_git  # noqa: F401  (isolates git from the developer's configurat
 SCRIPT = Path(__file__).resolve().parents[1] / "heavy-run"
 # Upper bound for a scenario step that waits on another process.
 WAIT_SECONDS = 60
+# Absolute ceiling for the contention scenario: the wrapper sleeps
+# `poll_seconds` between full passes over busy slots.
+CONTEND_DEADLINE = 120
 
 FAKE_SYSTEMD_RUN = """\
 #!/bin/sh
@@ -86,8 +91,12 @@ class Fixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        self.root = self.tmp / "root"
-        self.root.mkdir()
+        # A short `tmpfs_root`: the script refuses roots longer than the
+        # 9-byte socket budget, and the temp dir path is far longer. The
+        # `/tmp/hNNN` dir (8 bytes) is the root itself.
+        self.root = Path("/tmp") / f"h{os.getpid() % 1000:03d}"
+        self.root.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, self.root, True)
         self.locks = self.tmp / "locks"
         self.locks.mkdir()
         (self.bin / "systemd-run").write_text(FAKE_SYSTEMD_RUN)
@@ -122,10 +131,10 @@ class Fixture(unittest.TestCase):
         ]
         (self.config_home / "pohunek" / "heavy-run.conf").write_text("\n".join(lines) + "\n")
 
-    def run_script(self, *argv, check_slot=True, extra_env=None):
+    def run_script(self, *argv, check_slot=True, extra_env=None, timeout=WAIT_SECONDS):
         env = dict(self.env, **(extra_env or {}))
         result = subprocess.run(
-            ["sh", str(SCRIPT), *argv], capture_output=True, text=True, env=env, timeout=WAIT_SECONDS
+            ["sh", str(SCRIPT), *argv], capture_output=True, text=True, env=env, timeout=timeout
         )
         calls = self.log.read_text().splitlines()
         if check_slot:
@@ -165,6 +174,90 @@ class Fixture(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((sibling / "keep").read_text(), "sibling fixture")
         self.assertFalse(any(self.slot_dir().iterdir()))
+
+    def test_a_held_sibling_lock_sends_the_run_to_the_free_slot(self):
+        self.write_config(slots=2)
+        sibling = self.slot_dir(2)
+        held = self.locks / "pohunek-heavy-slot-1.lock"
+        held.touch()
+        with open(held, "w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            marker = self.tmp / "used-slot"
+            result, calls = self.run_script("sh", "-c", f'echo "$TMPDIR" > "{marker}"')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text().strip(), str(sibling))
+            stops = [line for line in calls if line.startswith("--user stop pohunek-heavy-2-")]
+            self.assertEqual(len(stops), 1, calls)
+        self.assertFalse(any(sibling.iterdir()))
+
+    def test_a_busy_slot_waits_and_then_runs_the_command(self):
+        # Hold both slot locks from this process, release them after a
+        # delay, and prove the wrapper waits and then runs the command
+        # exactly once: no exit 0 without having run it.
+        self.write_config(slots=2)
+        markers = []
+        holders = []
+        try:
+            for slot in (1, 2):
+                path = self.locks / f"pohunek-heavy-slot-{slot}.lock"
+                path.touch()
+                holder = open(path, "w")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                holders.append(holder)
+            marker = self.tmp / "ran-after-wait"
+            markers.append(marker)
+            proc = subprocess.Popen(
+                ["sh", str(SCRIPT), "sh", "-c", f'echo ran > "{marker}"'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=self.env,
+            )
+            try:
+                time.sleep(3)
+                if proc.poll() is not None:
+                    _, early_err = proc.communicate(timeout=WAIT_SECONDS)
+                    self.fail(f"the wrapper exited rc={proc.returncode} while both slots were held: {early_err}")
+                for holder in holders:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                    holder.close()
+                holders.clear()
+                stdout, stderr = proc.communicate(timeout=CONTEND_DEADLINE)
+                self.assertEqual(proc.returncode, 0, stderr)
+                self.assertEqual(marker.read_text().strip(), "ran")
+                ran = [line for line in self.log.read_text().splitlines()
+                       if "TMPDIR=" in line and line.startswith("--user --scope")]
+                self.assertEqual(len(ran), 1, self.log.read_text())
+                self.assertTrue(stdout == "", f"unexpected wrapper output: {stdout!r}")
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate(timeout=WAIT_SECONDS)
+        finally:
+            for holder in holders:
+                try:
+                    fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                holder.close()
+
+    def test_the_slot_directory_stays_0700(self):
+        marker = self.tmp / "mode-was"
+        result, _ = self.run_script(
+            "sh", "-c", f'stat -c %a "$TMPDIR" > "{marker}"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(marker.read_text().strip(), "700")
+        self.assertEqual(stat.S_IMODE(self.slot_dir().stat().st_mode), 0o700)
+
+    def test_a_long_tmpfs_root_is_refused_before_any_lock(self):
+        long_root = self.tmp / "long-root-for-sockets"
+        lines = (self.config_home / "pohunek" / "heavy-run.conf").read_text().splitlines()
+        lines = [line if not line.startswith("tmpfs_root=") else f"tmpfs_root={long_root}"
+                 for line in lines]
+        (self.config_home / "pohunek" / "heavy-run.conf").write_text("\n".join(lines) + "\n")
+        result, calls = self.run_script("true", check_slot=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("9-byte", result.stderr)
+        self.assertEqual(calls, [])
 
     def test_the_acquisition_sweep_clears_a_stale_leftover(self):
         stale = self.slot_dir()
@@ -212,26 +305,24 @@ class Fixture(unittest.TestCase):
         self.assertIn("Access denied", result.stderr)
         self.assertFalse(any(self.slot_dir().iterdir()))
 
-    def test_sigterm_during_the_run_still_stops_the_scope_and_sweeps(self):
+    def test_sigterm_to_the_wrapper_only_still_stops_the_scope_and_sweeps(self):
         if not sys.platform.startswith("linux"):
-            self.skipTest("sends SIGTERM to the wrapper process group")
+            self.skipTest("sends SIGTERM to the wrapper PID only")
         marker = self.slot_dir() / "drop"
-        # `exec` keeps the sleep in the command's own process: killing it
-        # closes the pipes, the way the scope stop kills the whole tree.
         proc = subprocess.Popen(
-            ["sh", str(SCRIPT), "sh", "-c", f'echo leftover > "{marker}"; exec sleep 60'],
+            ["sh", str(SCRIPT), "sh", "-c", f'echo leftover > "{marker}"; sleep 60'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env=self.env, start_new_session=True,
+            env=self.env,
         )
         try:
             deadline = time.monotonic() + WAIT_SECONDS
             while time.monotonic() < deadline and not marker.exists():
                 time.sleep(0.1)
             self.assertTrue(marker.exists(), "the command never started")
-            # Signal the whole group, the way the scope stop kills the
-            # command tree: the wrapper defers its trap while the fake
-            # `systemd-run` runs in the foreground.
-            os.killpg(proc.pid, signal.SIGTERM)
+            # Signal the wrapper PID only: its trap must fire right away
+            # (the command is a background child) and the scope stop must
+            # kill the command tree underneath it.
+            os.kill(proc.pid, signal.SIGTERM)
             _, stderr = proc.communicate(timeout=WAIT_SECONDS)
         finally:
             if proc.poll() is None:

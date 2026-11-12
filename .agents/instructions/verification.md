@@ -8,11 +8,11 @@ cargo fmt --all --check
 scripts/check-rust-toolchain-pin                        # no floating Rust channel in CI
 cargo clippy --workspace --all-targets --all-features   # must be clean under -D warnings
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
-cargo nextest run --profile ci --test-threads 16 --workspace --all-features
-# Sixteen threads: measured ~150 s for the full workspace suite (7764 tests)
-# on the 24-CPU host with the fixture root on /r tmpfs, against ~686 s at 4
-# threads on btrfs. Twenty threads averaged slower (173 s) and flaked under
-# load (#2267, #2268; #2269 at sixteen).
+scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features
+# Sixteen threads through scripts/heavy-run (see docs/development.md, "Heavy
+# runs"): measured ~150 s for the full workspace suite (7764 tests) on the
+# 24-CPU host, against ~686 s at 4 threads. Twenty threads averaged slower
+# (173 s) and flaked under load (#2267, #2268; #2269 at sixteen).
 cargo test --doc --workspace --all-features              # nextest excludes doctests
 cargo build --workspace --release                        # release profile must build (CI: see below)
 cargo xtask docs check                                   # schema/log fragments/drift/source-map/prompt contract shape/verifier/secrets/runbooks/doc commands/crate table/package lists/doc index
