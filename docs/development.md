@@ -220,7 +220,7 @@ Run the full set before calling anything done:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
 cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
-cargo nextest run --profile ci --test-threads 4 --workspace --all-features
+cargo nextest run --profile ci --test-threads 16 --workspace --all-features
 cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
 cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks/prompt-contract shape, doc commands vs the clap tree, crate table, package lists, doc index
@@ -234,7 +234,7 @@ CI-timing variants):
 cargo t                        # all fast tests, no PTY/DB fixtures
 cargo t -p pohunek-daemon       # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
-cargo tw                       # unfiltered full suite, four test processes
+cargo tw                       # unfiltered full suite, sixteen test processes
 bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
 bacon                          # watcher: profile-fast nextest loop (bacon.toml)
 python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/cli/heavy)
@@ -278,7 +278,7 @@ fetches the uv version manifest. Raising the pin means changing `UV_VERSION`
 and the four checksums of `uv-<target>.tar.gz.sha256` together.
 
 CI runs three fast matrix shards and a separate heavy job without waiting for
-Clippy or release builds. Heavy uses four test processes and the real worker
+Clippy or release builds. Heavy uses sixteen test processes and the real worker
 binary. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
