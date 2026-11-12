@@ -69,14 +69,17 @@ is pinned to 3 CPUs and every `fsync`/`fdatasync` is delayed by 8.3 ms through
 CI macOS slowdown fits 93 ms plus 8.3 ms per sync call over 89 sampled daemon
 tests). Tests listed in `scripts/stress-slow-runner-untraced.json` are too
 ptrace-sensitive to run under strace, so they still run pinned to 3 CPUs but
-untraced, and the summary reports them as NOT SLOWED; every other selected
-test runs under strace and is reported as SLOWED. `--slow-runner` conflicts
+untraced, and the summary reports them as `NOT SLOWED <binary_id> <name>`;
+every other selected test runs under strace and is reported as
+`SLOWED <binary_id> <name>`. `--slow-runner` conflicts
 with `--unpinned`, and a deadline overrun hints that a new test may belong on
 the untraced list.
 
 `--print` prints the static selection (target, test, source line) and the
-filterset, then exits. With `--slow-runner` it also prints the
-SLOWED/NOT SLOWED split, which it derives by running `cargo nextest list`
+filterset, then exits. With `--slow-runner` it also prints the per-test
+SLOWED/NOT SLOWED assignment (`slow-runner: SLOWED <binary_id> <name>` /
+`slow-runner: NOT SLOWED <binary_id> <name>`) plus the two whole-selection
+split filters, which it derives by running `cargo nextest list`
 (`-E '(<selection>) and (<union>)'`), so it builds the selected test
 binaries.
 
@@ -1056,6 +1059,10 @@ def main(argv):
         if slow_split is not None:
             print(f"slow-runner: {slow_split[0]}")
             print(f"slow-runner: {slow_split[1]}")
+            for target, name, _, _ in sorted(traced, key=lambda s: (s[0].binary_id, s[1])):
+                print(f"slow-runner: SLOWED {target.binary_id} {name}")
+            for target, name, _, _ in sorted(untraced, key=lambda s: (s[0].binary_id, s[1])):
+                print(f"slow-runner: NOT SLOWED {target.binary_id} {name}")
         return 0
     packages = package_args(selected)
     try:
@@ -1168,8 +1175,8 @@ def run_slow_runner(root, args, selected, packages, strace_banner):
               f"{shlex.join(command)}", file=sys.stderr)
         traced_status = run_stress_run(root, command)
         status = traced_status or status
-        for _, name, _, _ in sorted(traced, key=lambda s: s[1]):
-            print(f"stress-changed-tests: SLOWED {name}", file=sys.stderr)
+        for target, name, _, _ in sorted(traced, key=lambda s: (s[0].binary_id, s[1])):
+            print(f"stress-changed-tests: SLOWED {target.binary_id} {name}", file=sys.stderr)
     if untraced:
         expression = f"({selection}) and ({union})"
         command = untraced_command(args, profile_flags, packages, args.count, expression)
@@ -1177,8 +1184,8 @@ def run_slow_runner(root, args, selected, packages, strace_banner):
               f"(pinned, untraced); {shlex.join(command)}", file=sys.stderr)
         untraced_status = run_stress_run(root, command)
         status = untraced_status or status
-        for _, name, _, _ in sorted(untraced, key=lambda s: s[1]):
-            print(f"stress-changed-tests: NOT SLOWED {name}", file=sys.stderr)
+        for target, name, _, _ in sorted(untraced, key=lambda s: (s[0].binary_id, s[1])):
+            print(f"stress-changed-tests: NOT SLOWED {target.binary_id} {name}", file=sys.stderr)
     if traced_status == 124:
         print("stress-changed-tests: the traced run's deadline overran; a test may "
               "be ptrace-sensitive: run it without --slow-runner to confirm, and "

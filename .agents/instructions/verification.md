@@ -637,7 +637,8 @@ heavy or macOS-lane package persists state, or when any test was reported flaky
 only on the macOS runner: the run is pinned to 3 CPUs and every
 `fsync`/`fdatasync` is delayed by 8.3 ms, while the tests listed in
 `scripts/stress-slow-runner-untraced.json` run pinned but untraced and are
-reported as NOT SLOWED. Each of the two slow-runner runs gets the full
+reported as `NOT SLOWED <binary_id> <name>` (traced ones as `SLOWED <binary_id>
+<name>`). Each of the two slow-runner runs gets the full
 `--deadline`, so wall time can reach twice the deadline.
 
 Hermetic tests: a test owns its fixtures and never touches host state.
