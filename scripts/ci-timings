@@ -1048,15 +1048,17 @@ def wanted_attempts(latest, attempts):
     """Which attempt numbers of a run the current selection needs.
 
     `gh run list` reports only the latest attempt, so every other attempt has
-    to be requested by number. `first` needs attempt 1 (the representative)
-    plus the latest one, whose metadata is what the listing described; `all`
-    needs the whole range, otherwise intermediate reruns of a run already on
+    to be requested by number. `first` needs attempt 1 only: the selection
+    keeps the lowest attempt number, so the latest document is never read
+    and fetching it would only cost a `gh run view` (and, on a sick run, a
+    fatal fetch error) for a document the medians cannot use. `all` needs
+    the whole range, otherwise intermediate reruns of a run already on
     attempt 3 would silently be missing from the aggregates.
     """
-    latest = latest or 1
     if attempts == "all":
+        latest = latest or 1
         return list(range(1, latest + 1))
-    return sorted({1, latest})
+    return [1]
 
 
 # What one fetch produced: the documents the current listing named, and
@@ -1127,8 +1129,10 @@ def list_documents(args, window=None):
             latest = entry.get("attempt", 1) or 1
             view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
             # `unselectable_listing` above already dropped every listing
-            # whose single attempt could never pass the filter, so every
-            # attempt named here is still selectable.
+            # whose single attempt could never pass the filter, and under
+            # `--attempts first` only attempt 1 is fetched: the latest
+            # document of a rerun is never selected, so viewing it would
+            # only risk a fatal fetch error for an unread document.
             for attempt in wanted_attempts(latest, args.attempts):
                 document = by_key.get((run_id, attempt))
                 if document is None:

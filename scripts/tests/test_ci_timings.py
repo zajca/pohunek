@@ -1285,13 +1285,14 @@ class FetchTests(unittest.TestCase):
         self.set_listing([{"databaseId": 77, "attempt": 2, "conclusion": "success"}])
         self.set_views({
             "77:1": self.view_document(77, attempt=1),
-            "77:2": self.view_document(77, attempt=2),
         })
         payload = self.run_json(
             "runs", "--window", "2026-09-19..2026-09-21"
         )
         self.assertEqual([run["attempt"] for run in payload["runs"]], [1])
-        self.assertEqual(self.view_attempts(), ["1", "2"])
+        # Under `first` only attempt 1 is fetched: the attempt-2
+        # document the listing described is never selected.
+        self.assertEqual(self.view_attempts(), ["1"])
 
     # -- cache reuse -------------------------------------------------------
 
@@ -1360,13 +1361,14 @@ class FetchTests(unittest.TestCase):
         # A cancelled single-attempt run can never pass `--conclusion
         # success` under any `--attempts` mode, so it costs no `gh run
         # view`; a red rerun still fetches attempt 1, which may be green.
+        # Attempt 2 is never viewed under `first`, so a 502 on that
+        # document must not fail the night: only attempt 1 is requested.
         self.set_listing([
             {"databaseId": 41, "attempt": 1, "conclusion": "cancelled"},
             {"databaseId": 42, "attempt": 2, "conclusion": "failure"},
         ])
         self.set_views({
             "42:1": self.view_document(42, attempt=1, conclusion="success"),
-            "42:2": self.view_document(42, attempt=2, conclusion="failure"),
         })
         payload = self.run_json(
             "runs", "--window", "2026-09-19..2026-09-21",
@@ -1377,7 +1379,7 @@ class FetchTests(unittest.TestCase):
              for run in payload["runs"]],
             [(42, 1, "success")],
         )
-        self.assertEqual(self.view_attempts(), ["1", "2"])
+        self.assertEqual(self.view_attempts(), ["1"])
 
     def test_fetch_then_filter_recovers_a_run_whose_rerun_failed(self):
         """The fetch-before-filter pipeline: listing shows only the rerun.

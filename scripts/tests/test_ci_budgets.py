@@ -5,9 +5,10 @@ test, using the snapshot format `ci-timings --cache` writes, and a fake `gh`
 on PATH for the issue calls. The live-path scenario seeds the same fake
 with `run list`/`run view` payloads and runs without `--input`, so the
 cache-then-`--input` round trip shares one selection with the offline path.
-The fake records its write calls (issue create, edit, comment, label
-create) so the tests assert which writes happened; no case touches the
-network or any host state.
+The fake records every `gh` call; `write_calls()` filters those down to
+issue and label writes in the offline cases, while the live-path cases
+read the same log for `run list` and `run view` calls. No case touches
+the network or any host state.
 """
 
 import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
@@ -123,7 +124,8 @@ class BudgetsHarness(unittest.TestCase):
             "elif args[:2] == ['run', 'view']:\n"
             "    if os.environ.get('GH_FAIL_VIEW'):\n"
             "        failing = os.environ['GH_FAIL_VIEW'].split(',')\n"
-            "        if args[2] in failing:\n"
+            "        view_attempt = args[args.index('--attempt') + 1] if '--attempt' in args else '1'\n"
+            "        if args[2] in failing or f'{args[2]}:{view_attempt}' in failing:\n"
             "            print(f'fake gh: HTTP 502 (run {args[2]})',\n"
             "                  file=sys.stderr)\n"
             "            sys.exit(1)\n"
@@ -187,7 +189,7 @@ class BudgetsHarness(unittest.TestCase):
         state["runs"] = runs
         self.write_state(state)
 
-    def write_calls(self):
+    def gh_calls(self):
         if not self.calls_path.exists():
             return []
         return [
@@ -195,6 +197,14 @@ class BudgetsHarness(unittest.TestCase):
             for line in self.calls_path.read_text().splitlines()
             if line.strip()
         ]
+
+    def write_calls(self):
+        return [call for call in self.gh_calls()
+                if call["args"][:2] in (
+                    ["issue", "create"], ["issue", "comment"],
+                    ["issue", "close"], ["issue", "edit"],
+                    ["label", "create"],
+                )]
 
     def rendered_body(self, snapshot, budgets):
         """Render the issue body without touching `gh` (no write calls)."""
@@ -503,14 +513,53 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("median 41m40s", result.stdout)
 
+    def test_live_fetch_never_views_a_reruns_latest_attempt(self):
+        # Under `--attempts first` only attempt 1 is fetched: a rerun
+        # listed at attempt 2 contributes its green attempt 1, and the
+        # attempt-2 view is never requested. On a sick run that view
+        # would fail the whole night with a 502 even though the
+        # selection never reads it, so the fake fails it here and the
+        # night must still cover four greens with a 2500 s median.
+        listings = [
+            self.document(60, jobs=self.green_lane_jobs(5000, hour=15),
+                          created_minute=50),
+            self.document(50, jobs=self.green_lane_jobs(4000, hour=14),
+                          conclusion="failure", created_minute=40),
+            self.document(40, jobs=self.green_lane_jobs(3000, hour=13),
+                          conclusion="cancelled", created_minute=30),
+            self.document(30, jobs=self.green_lane_jobs(2000, hour=12),
+                          created_minute=20),
+            self.document(20, jobs=self.green_lane_jobs(2000, hour=11),
+                          conclusion="failure", created_minute=19,
+                          attempt=2),
+            self.document(20, jobs=self.green_lane_jobs(3000, hour=11),
+                          created_minute=10),
+            self.document(10, jobs=self.green_lane_jobs(1000, hour=10),
+                          created_minute=0),
+        ]
+        self.write_runs_state(listings)
+        budgets = self.write_budgets([
+            self.step_budget("platform contracts (arm64)",
+                             "Run macOS lane tests", 2600),
+        ], window_runs=4)
+        result = self.run_cli("--budgets", budgets,
+                              extra_env={"GH_FAIL_VIEW": "20:2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("median 41m40s", result.stdout)
+        self.assertNotIn("HTTP 502", result.stderr)
+        views = [call for call in self.gh_calls()
+                 if call["args"][:2] == ["run", "view"]]
+        self.assertFalse(any(
+            call["args"][3:] == ["--attempt", "2"]
+            for call in views))
+
     def test_live_fetch_stops_once_the_window_filled(self):
         # The stepped-growth fetch stops at the first limit whose
         # snapshot holds the window: with 60 green push listings behind
         # 20 cancelled ones, the 40-fetch holds only 20 greens, so the
-        # 80-fetch must end the growth. Raw `gh run view` documents carry
-        # `databaseId`/`createdAt`, and an older helper read
-        # `id`/`created_at` instead, so it counted one run and grew to
-        # the 320 cap on every night.
+        # 80-fetch must end the growth. Raw `gh run view` documents
+        # carry `databaseId`/`createdAt`, and the stop condition counts
+        # them the same way the measurement selection does.
         head = [
             self.document(2000 + index, event="push", branch="main",
                           hour=9, created_minute=index % 20,
@@ -568,7 +617,7 @@ class BudgetCheckTests(BudgetsHarness):
                           hour=10, wall_minutes=20, created_minute=30,
                           conclusion="failure"),
             self.document(60, event="pull_request", branch="topic",
-                          hour=10, wall_minutes=60, created_minute=20,
+                          hour=10, wall_minutes=50, created_minute=20,
                           attempt=2),
             self.document(50, event="pull_request", branch="topic",
                           hour=10, wall_minutes=10, created_minute=10),
@@ -609,7 +658,7 @@ class BudgetCheckTests(BudgetsHarness):
                       "actions/runs/80) (30m00s), "
                       "[50](https://github.com/o/r/actions/runs/50) "
                       "(10m00s)", body)
-        views = [call for call in self.write_calls()
+        views = [call for call in self.gh_calls()
                  if call["args"][:2] == ["run", "view"]]
         self.assertEqual(
             sorted({int(call["args"][2]) for call in views}), [10, 11])

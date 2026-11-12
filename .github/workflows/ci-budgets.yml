@@ -32,10 +32,10 @@ jobs:
       actions: read
       contents: read
       issues: write
-    # A dry run with the fixed stop condition measured 395 s of wall time
-    # on 2026-11-12 (a developer host): the 40-fetch holds only 25 green
-    # single-attempt push runs, so the fetch grows to the 80 step and
-    # stops there at about 71 `gh run view` calls. Leave headroom for
+    # A dry run on a developer host measured 236 s of wall time
+    # on 2026-11-12: the 40-fetch holds only 25 green single-attempt
+    # push runs, so the fetch grows to the 80 step and stops there at
+    # about 67 `gh run view` calls, attempt 1 only. Leave headroom for
     # transient retries.
     timeout-minutes: 30
     steps:
