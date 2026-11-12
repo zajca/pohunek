@@ -466,14 +466,13 @@ fn bounded_token(token: Option<&[u8]>) -> String {
 /// is only read, never changed.
 fn journal_unmapped_program_status(payload: &[u8], report: Option<&ProgramStatusReport>) {
     let tokens = JournalTokens::of(payload);
-    let reason = match report {
-        None => "rejected",
-        Some(_) => {
-            if !tokens.kind_is_unknown() {
-                return;
-            }
-            "unknown_kind"
+    let reason = if report.is_none() {
+        "rejected"
+    } else {
+        if !tokens.kind_is_unknown() {
+            return;
         }
+        "unknown_kind"
     };
     tracing::debug!(
         target: UNMAPPED_PROGRAM_STATUS_TARGET,
