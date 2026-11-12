@@ -116,6 +116,8 @@ class BudgetsHarness(unittest.TestCase):
             "    if '--limit' in args:\n"
             "        i = args.index('--limit')\n"
             "        runs = runs[:int(args[i + 1])]\n"
+            "    calls.append({'args': args})\n"
+            "    Path(CALLS).write_text(''.join(json.dumps(c) + chr(10) for c in calls))\n"
             "    fields = args[args.index('--json') + 1].split(',')\n"
             "    print(json.dumps([{f: r.get(f) for f in fields} for r in runs]))\n"
             "elif args[:2] == ['run', 'view']:\n"
@@ -129,6 +131,8 @@ class BudgetsHarness(unittest.TestCase):
             "    attempt = 1\n"
             "    if '--attempt' in args:\n"
             "        attempt = int(args[args.index('--attempt') + 1])\n"
+            "    calls.append({'args': args})\n"
+            "    Path(CALLS).write_text(''.join(json.dumps(c) + chr(10) for c in calls))\n"
             "    for r in state.get('runs', []):\n"
             "        if r.get('databaseId') == run_id and r.get('attempt', 1) == attempt:\n"
             "            print(json.dumps(r))\n"
@@ -498,6 +502,120 @@ class BudgetCheckTests(BudgetsHarness):
         result = self.run_cli("--budgets", budgets)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("median 41m40s", result.stdout)
+
+    def test_live_fetch_stops_once_the_window_filled(self):
+        # The stepped-growth fetch stops at the first limit whose
+        # snapshot holds the window: with 60 green push listings behind
+        # 20 cancelled ones, the 40-fetch holds only 20 greens, so the
+        # 80-fetch must end the growth. Raw `gh run view` documents carry
+        # `databaseId`/`createdAt`, and an older helper read
+        # `id`/`created_at` instead, so it counted one run and grew to
+        # the 320 cap on every night.
+        head = [
+            self.document(2000 + index, event="push", branch="main",
+                          hour=9, created_minute=index % 20,
+                          conclusion="cancelled")
+            for index in range(20)
+        ]
+        tail = [
+            self.document(1000 + index, event="push", branch="main",
+                          hour=10, created_minute=index % 60,
+                          jobs=[self.job("tests (core, fast)", 600,
+                                         start_hour=10)])
+            for index in range(60)
+        ]
+        self.write_runs_state(head + tail)
+        budgets = self.write_budgets([
+            self.wall_budget(700, job="tests (core, fast)"),
+        ], window_runs=30)
+        result = self.run_cli("--budgets", budgets)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("median 10m00s", result.stdout)
+        push_limits = []
+        for line in self.calls_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            args = json.loads(line)["args"]
+            if args[:2] != ["run", "list"]:
+                continue
+            if "--branch" not in args:
+                continue
+            push_limits.append(int(args[args.index("--limit") + 1]))
+        self.assertEqual(push_limits, [40, 80])
+
+    def test_live_pr_leg_budgets_listing_walls_only(self):
+        # The pull-request leg never fetches a job document: it medians
+        # the listing's own `startedAt`/`updatedAt` wall over green
+        # first attempts. The fixture mixes two green PR runs with a
+        # failed one and a rerun listed at attempt 2, so the live median
+        # covers the 600 s and 1800 s walls (1200 s), the slowest-run
+        # links name the green pair, and no `gh run view` fetches a PR
+        # document.
+        push = [
+            self.document(11, event="push", branch="main", hour=10,
+                          created_minute=5,
+                          jobs=[self.job("tests (core, fast)", 600,
+                                         start_hour=10)]),
+            self.document(10, event="push", branch="main", hour=10,
+                          created_minute=0,
+                          jobs=[self.job("tests (core, fast)", 600,
+                                         start_hour=10)]),
+        ]
+        pr = [
+            self.document(80, event="pull_request", branch="topic",
+                          hour=10, wall_minutes=30, created_minute=40),
+            self.document(70, event="pull_request", branch="topic",
+                          hour=10, wall_minutes=20, created_minute=30,
+                          conclusion="failure"),
+            self.document(60, event="pull_request", branch="topic",
+                          hour=10, wall_minutes=60, created_minute=20,
+                          attempt=2),
+            self.document(50, event="pull_request", branch="topic",
+                          hour=10, wall_minutes=10, created_minute=10),
+        ]
+        self.write_runs_state(push + pr)
+        budgets = self.write_budgets([
+            self.wall_budget(700, job="tests (core, fast)"),
+            self.wall_budget(1600, event="pull_request"),
+        ], window_runs=2)
+        result = self.run_cli("--budgets", budgets, "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "within budget: pull_request (run wall) (job wall): "
+            "median 20m00s vs budget 26m40s", result.stdout)
+        namespaces = {"__file__": str(SCRIPT)}
+        source = SCRIPT.read_text().replace(
+            "if __name__ == ", "if False and __name__ == ")
+        exec(compile(source, str(SCRIPT), "exec"), namespaces)
+        config = namespaces["load_budgets"](budgets)
+        saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(self.bin) + os.pathsep + saved_path
+        try:
+            medians = namespaces["measure"](
+                window_runs=config["window_runs"], input_path=None,
+                branch="main",
+            )
+        finally:
+            os.environ["PATH"] = saved_path
+        rows = namespaces["check_budgets"](config["budgets"], medians)
+        body = namespaces["render_body"](
+            rows, window_runs=config["window_runs"], medians=medians,
+            slug="o/r",
+        )
+        self.assertIn(
+            "| pull_request | (run wall) | (job wall) | 26m40s | "
+            "20m00s | 2 |", body)
+        self.assertIn("- pull_request: [80](https://github.com/o/r/"
+                      "actions/runs/80) (30m00s), "
+                      "[50](https://github.com/o/r/actions/runs/50) "
+                      "(10m00s)", body)
+        views = [call for call in self.write_calls()
+                 if call["args"][:2] == ["run", "view"]]
+        self.assertEqual(
+            sorted({int(call["args"][2]) for call in views}), [10, 11])
+        self.assertFalse(any(
+            int(call["args"][2]) in (50, 60, 70, 80)
+            for call in views))
 
     def test_live_broken_view_of_an_unselected_run_keeps_a_full_table(self):
         # The live fetch must never view a run the selection cannot

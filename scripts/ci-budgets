@@ -9,10 +9,12 @@ the body was last written. A night with every budget within limits rewrites
 the body and closes the issue, so the next regression comments again.
 
 The window really is green runs. Live, the run fetch fills a private
-snapshot from `gh` and every measurement reads that snapshot back with
-`--input --limit window_runs --conclusion success --attempts first`: the
-same filter-first selection the offline `--input` path uses, so cancelled,
-failed, or rerun attempts never shrink the sample.
+snapshot from `gh` and every push measurement reads that snapshot back
+with `--input --limit window_runs --conclusion success --attempts first`:
+the same filter-first selection the offline `--input` path uses, so
+cancelled, failed, or rerun attempts never shrink the sample. The
+pull-request leg budgets only the run wall, so it reads that wall straight
+from the `gh run list` timestamps instead of fetching job documents.
 
 Exit codes: 0 means every measured median is within budget; 1 means a budget
 is exceeded or names a job/step absent from the window; 2 means a usage or
@@ -49,6 +51,7 @@ LISTING_FIELDS = (
 )
 
 # Machine-readable marker in the issue body: the set of exceeded budget keys
+# the body was last written for. A comment goes out only when this set
 # changes between writes.
 MARKER_PREFIX = "<!-- ci-budgets:exceeded="
 
@@ -185,6 +188,7 @@ def fetch_arguments(event, fetch_limit, *, branch):
         arguments += ["--branch", branch]
     return arguments
 
+
 def selection_arguments(event, window_runs, *, input_path, branch):
     """The `ci-timings` measurement flags over one fetched snapshot.
 
@@ -210,7 +214,9 @@ def green_first_attempts(documents, window_runs):
     `ci-timings` already applied `--conclusion success` to the attempts it
     selected, but old snapshots may predate an attempt field, and reruns
     share an id with the attempt they supersede: attempt 1 decides whether
-    the run counts, newer first by creation time, then by id.
+    the run counts, newer first by creation time, then by id. Raw `gh run
+    view` documents carry the same fields under their listing names, so
+    both shapes count.
     """
     first = {}
     for run in documents:
@@ -219,10 +225,14 @@ def green_first_attempts(documents, window_runs):
             continue
         if run.get("conclusion") != "success":
             continue
-        first[run.get("id")] = run
+        key = run.get("id", run.get("databaseId"))
+        first[key] = run
     ordered = sorted(
         first.values(),
-        key=lambda run: (run.get("created_at") or "", run.get("id") or 0),
+        key=lambda run: (
+            run.get("created_at") or run.get("createdAt") or "",
+            run.get("id", run.get("databaseId")) or 0,
+        ),
         reverse=True,
     )
     return ordered[:window_runs]
@@ -307,15 +317,16 @@ def parse_listing_wall(entry):
     return (updated - started).total_seconds()
 
 
-def list_pr_walls(*, window_runs, branch):
+def list_pr_walls(*, window_runs):
     """Newest green pull-request first attempts from the listing alone.
 
     The PR budget covers only the run wall, so the listing's own
     `startedAt`/`updatedAt` fields feed the median: no job document is
     ever fetched for a pull-request run, whatever its conclusion. The
     listing names only the latest attempt per run, and the wall comes
-    from that attempt's timestamps. Grows like the snapshot fetch and
-    stops once the window filled.
+    from that attempt's timestamps. Runs listed at attempt > 1 stay out:
+    the listing carries no attempt-1 timestamps to measure. Grows like
+    the snapshot fetch and stops once the window filled.
     """
     walls = []
     id_order = []
@@ -431,7 +442,7 @@ def measure(*, window_runs, input_path, branch):
             push_snapshot, "push", window_runs=window_runs,
             branch=branch)
         pr_walls, pr_ids, pr_filled = list_pr_walls(
-            window_runs=window_runs, branch=branch)
+            window_runs=window_runs)
         push_steps, push_step_runs, push_steps_filled = measured_steps(
             push_snapshot, window_runs=window_runs, branch=branch)
     finally:

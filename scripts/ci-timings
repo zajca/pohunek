@@ -1082,7 +1082,7 @@ def unselectable_listing(entry, wanted):
     """Whether a listing can never feed the current selection.
 
     The listing describes the run's latest attempt: a single-attempt run
-    whose listed conclusion is not the requested one has no selectible
+    whose listed conclusion is not the requested one has no selectable
     attempt, so fetching its job document would only cost a `gh run
     view` and, on a sick run, a fatal fetch error. Other listings
     (including a rerun listed red) stay: attempt 1 may still be green.
@@ -1126,16 +1126,10 @@ def list_documents(args, window=None):
             run_id = entry["databaseId"]
             latest = entry.get("attempt", 1) or 1
             view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
+            # `unselectable_listing` above already dropped every listing
+            # whose single attempt could never pass the filter, so every
+            # attempt named here is still selectable.
             for attempt in wanted_attempts(latest, args.attempts):
-                # The listing is enough to rule a single attempt out:
-                # attempt 1 of a run listed green is green, and attempt 1
-                # of a run listed red at attempt 1 is red, so one of the
-                # two documents `wanted_attempts` names can never be
-                # selected, whatever the fetch would find.
-                if attempt == 1 and latest == 1 and wanted is not None:
-                    listed_conclusion = entry.get("conclusion")
-                    if listed_conclusion != wanted:
-                        continue
                 document = by_key.get((run_id, attempt))
                 if document is None:
                     document = gh_json(view_command + ["--attempt", str(attempt)])
