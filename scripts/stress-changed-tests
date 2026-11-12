@@ -123,14 +123,6 @@ VARIANT_ATTRIBUTES = ("rstest", "test_case", "bench")
 # tier archives build default features, so the profiles below do the same.
 ALL_FEATURES_FLAGS = ("--all-features",)
 DEFAULT_FEATURE_PROFILES = ("macos",)
-def stress_run_argv0():
-    """`scripts/stress-run` by PATH lookup, else the sibling script."""
-    found = shutil.which("stress-run")
-    if found is not None:
-        return found
-    return str(Path(__file__).resolve().parent / "stress-run")
-
-
 STRESS_RUN = Path(__file__).resolve().parent / "stress-run"
 EXIT_UNMAPPED = 1
 EXIT_USAGE = 2
@@ -867,38 +859,41 @@ def load_untraced_list():
     return entries
 
 
-def entry_matches(target, name, entry):
-    """Whether a selected test belongs to an untraced-list entry.
+def untraced_union(entries):
+    """The list's filters as one nextest filterset (`(f1) or (f2) or ...`)."""
+    return " or ".join(f"({entry['filter']})" for entry in entries)
 
-    `filter` is a nextest filterset restricted to an optional
-    `package(=<name>)` head and a `test(...)` matcher (`=` for an exact
-    name, `/.../ ` for a regex).
+
+def split_untraced(root, profile, selected, entries, packages):
+    """`(traced, untraced)` split of `selected` by the untraced list.
+
+    The split is nextest's own evaluation of `(selection) and (union)`:
+    the binaries are already built by `verify_listed`, so this list call
+    answers which selected tests the list names, in whatever filterset
+    form an entry uses.
     """
-    package = re.search(r"package\(=(.*?)\)", entry["filter"])
-    if package is not None and package.group(1) not in (target.package, target.binary_id):
-        return False
-    exact = re.search(r"(?<![/=])test\(=(.*?)\)(?!\s*/)", entry["filter"])
-    if exact is not None:
-        return exact.group(1) == name
-    regex = re.search(r"test\(/(.*?)/\)", entry["filter"])
-    if regex is not None:
-        return re.search(regex.group(1), name) is not None
-    return False
-
-
-def split_untraced(selected, entries):
-    """`(traced, untraced)` split of `selected` by the untraced list."""
+    union = untraced_union(entries)
+    selection = build_filter(selected)
+    result = run(
+        ["cargo", "nextest", "list", "--profile", profile, *build_flags(profile),
+         *packages, "-E", f"({selection}) and ({union})", "--message-format", "json"],
+        root, check=False)
+    if result.returncode != 0:
+        raise SelectionError(
+            "cannot split the slow-runner run by the untraced list: "
+            f"`cargo nextest list` failed ({result.returncode}):\n{result.stderr.strip()}")
+    listed = set()
+    for suite in json.loads(result.stdout)["rust-suites"].values():
+        for name, case in suite["testcases"].items():
+            if case["filter-match"]["status"] == "matches":
+                listed.add(name)
     traced = []
     untraced = []
     for target, name, rel, line in selected:
-        reason = next(
-            (entry["reason"] for entry in entries
-             if entry_matches(target, name, entry)),
-            None)
-        if reason is None:
-            traced.append((target, name, rel, line))
+        if name in listed:
+            untraced.append((target, name, rel, line))
         else:
-            untraced.append((target, name, rel, line, reason))
+            traced.append((target, name, rel, line))
     return traced, untraced
 
 
@@ -908,13 +903,9 @@ def package_args(selected):
     Restricting the build to them keeps the list and the run from compiling
     every test binary of the workspace.
     """
-    seen = set()
     args = []
-    for target, _, _, _ in sorted(selected, key=lambda s: (s[0].package, s[1])):
-        if target.package in seen:
-            continue
-        seen.add(target.package)
-        args += ["-p", target.package]
+    for package in sorted({target.package for target, _, _, _ in selected}):
+        args += ["-p", package]
     return args
 
 
@@ -1013,6 +1004,15 @@ def build_parser():
 
 def main(argv):
     args = build_parser().parse_args(argv)
+    if args.slow_runner:
+        # Usage errors before any git or cargo work, so `--slow-runner`
+        # with `--unpinned`, off Linux, or without strace exits 2 even
+        # with an empty selection or `--print`.
+        try:
+            slow_runner_checks(args)
+        except SelectionError as error:
+            print(f"stress-changed-tests: {error}", file=sys.stderr)
+            return EXIT_USAGE
     root = Path(run(["git", "rev-parse", "--show-toplevel"], Path.cwd()).stdout.strip())
     try:
         selected, skipped = select(root, args.base)
@@ -1033,12 +1033,17 @@ def main(argv):
             except SelectionError as error:
                 print(f"stress-changed-tests: {error}", file=sys.stderr)
                 return EXIT_UNMAPPED
-            traced, untraced = split_untraced(selected, entries)
-            union = ' or '.join(entry['filter'] for entry in entries)
+            try:
+                traced, untraced = split_untraced(
+                    root, args.profile, selected, entries, package_args(selected))
+            except SelectionError as error:
+                print(f"stress-changed-tests: {error}", file=sys.stderr)
+                return EXIT_UNMAPPED
+            union = untraced_union(entries)
             slow_split = (f"SLOWED: ({build_filter(traced)}) and not ({union})"
                           if traced else "SLOWED: (nothing selected)",
-                          f"NOT SLOWED: ({build_filter([s[:4] for s in untraced])}) "
-                          f"and ({union})" if untraced else "NOT SLOWED: (nothing selected)")
+                          f"NOT SLOWED: ({build_filter(untraced)}) and ({union})"
+                          if untraced else "NOT SLOWED: (nothing selected)")
         for target, name, rel, line in sorted(selected, key=lambda s: (s[0].binary_id, s[1])):
             print(f"{target.binary_id} {name} ({rel}:{line})")
         print(f"filter: {expression}")
@@ -1103,7 +1108,7 @@ def traced_command(args, profile_flags, packages, count, expression):
     traced = ",".join(SLOW_RUNNER_SYSCALLS)
     inject = f"{traced}:delay_enter={SLOW_RUNNER_SYNC_DELAY_US}"
     return [
-        stress_run_argv0(), "--deadline", args.deadline, "--cpus", str(SLOW_RUNNER_CPUS),
+        str(STRESS_RUN), "--deadline", args.deadline, "--cpus", str(SLOW_RUNNER_CPUS),
         "--", "strace", "-f", "--seccomp-bpf", "-qq", "-o", "/dev/null",
         f"--trace={traced}", f"--inject={inject}",
         "cargo", "nextest", "run", "--profile", args.profile, *profile_flags,
@@ -1115,7 +1120,7 @@ def traced_command(args, profile_flags, packages, count, expression):
 def untraced_command(args, profile_flags, packages, count, expression):
     """The pinned 3-CPU stress-run argv without strace."""
     return [
-        stress_run_argv0(), "--deadline", args.deadline, "--cpus", str(SLOW_RUNNER_CPUS),
+        str(STRESS_RUN), "--deadline", args.deadline, "--cpus", str(SLOW_RUNNER_CPUS),
         "--", "cargo", "nextest", "run", "--profile", args.profile, *profile_flags,
         *packages, "--stress-count", str(count), "--retries", "0",
         "--no-tests=fail", "-E", expression,
@@ -1128,7 +1133,13 @@ def run_stress_run(root, command):
 
 
 def run_slow_runner(root, args, selected, packages):
-    """Run the slow-runner mode; the exit status is non-zero if either run fails."""
+    """Run the slow-runner mode; the exit status is non-zero if either run fails.
+
+    Each of the two runs gets the full `--deadline` (so wall time can
+    reach twice the deadline), and it is also the usage-check entry
+    point for the `--print` branch and any caller that has not run
+    `slow_runner_checks` yet.
+    """
     try:
         version = slow_runner_checks(args)
     except SelectionError as error:
@@ -1141,30 +1152,38 @@ def run_slow_runner(root, args, selected, packages):
     except SelectionError as error:
         print(f"stress-changed-tests: {error}", file=sys.stderr)
         return EXIT_UNMAPPED
-    traced, untraced = split_untraced(selected, entries)
+    try:
+        traced, untraced = split_untraced(root, args.profile, selected, entries, packages)
+    except SelectionError as error:
+        print(f"stress-changed-tests: {error}", file=sys.stderr)
+        return EXIT_UNMAPPED
     profile_flags = build_flags(args.profile)
+    union = untraced_union(entries)
     status = 0
+    traced_status = 0
     if traced:
-        expression = f"({build_filter(traced)}) and not ({' or '.join(e['filter'] for e in entries)})"
+        expression = f"({build_filter(traced)}) and not ({union})"
         command = traced_command(args, profile_flags, packages, args.count, expression)
         print(f"stress-changed-tests: {len(traced)} SLOWED test(s); "
               f"{shlex.join(command)}", file=sys.stderr)
-        status = run_stress_run(root, command) or status
+        traced_status = run_stress_run(root, command)
+        status = traced_status or status
         for _, name, _, _ in sorted(traced, key=lambda s: s[1]):
             print(f"stress-changed-tests: SLOWED {name}", file=sys.stderr)
     if untraced:
-        expression = f"({build_filter([s[:4] for s in untraced])}) and ({' or '.join(e['filter'] for e in entries)})"
+        expression = f"({build_filter(untraced)}) and ({union})"
         command = untraced_command(args, profile_flags, packages, args.count, expression)
         print(f"stress-changed-tests: {len(untraced)} NOT SLOWED test(s) "
               f"(pinned, untraced); {shlex.join(command)}", file=sys.stderr)
         untraced_status = run_stress_run(root, command)
         status = untraced_status or status
-        for _, name, _, _, _ in sorted(untraced, key=lambda s: s[1]):
+        for _, name, _, _ in sorted(untraced, key=lambda s: s[1]):
             print(f"stress-changed-tests: NOT SLOWED {name}", file=sys.stderr)
-    if status == 124:
-        print("stress-changed-tests: the deadline overran; a test may be ptrace-sensitive: "
-              "run it without --slow-runner to confirm, and add it to "
-              "scripts/stress-slow-runner-untraced.json with evidence", file=sys.stderr)
+    if traced_status == 124:
+        print("stress-changed-tests: the traced run's deadline overran; a test may "
+              "be ptrace-sensitive: run it without --slow-runner to confirm, and "
+              "add it to scripts/stress-slow-runner-untraced.json with evidence",
+              file=sys.stderr)
     return status
 
 

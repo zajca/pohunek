@@ -114,10 +114,12 @@ reported as SLOWED. NOT SLOWED means "ran pinned but not slowed", never
 the list, add one entry with `filter` (a nextest filterset matching the test),
 a non-empty `reason`, and `evidence` (the fable-ci report section or the issue
 with the hang); keep the filters exact so no other test loses its slowdown.
-`--slow-runner` is Linux-only and conflicts with `--unpinned`. A deadline
-overrun under `--slow-runner` hints that a newly hanging test may belong on
-the untraced list: rerun the suspect without `--slow-runner` to confirm, then
-list it with evidence.
+`--slow-runner` is Linux-only and conflicts with `--unpinned`. Each
+of the two runs gets the full `--deadline`, so the wall time can reach
+twice the deadline. A deadline
+overrun of the traced run under `--slow-runner` hints that a newly hanging
+test may belong on the untraced list: rerun the suspect without
+`--slow-runner` to confirm, then list it with evidence.
 
 ## When the change touches the SDK workspace
 
