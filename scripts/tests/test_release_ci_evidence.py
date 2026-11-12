@@ -9,6 +9,7 @@ import tempfile
 import unittest
 
 import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+import virtual_clock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -179,10 +180,19 @@ class ReleaseEvidenceTests(unittest.TestCase):
         self.events = self.root / "events.jsonl"
         self.state = self.root / "gh-state.json"
         self.config = json.loads(CONFIG.read_text())
-        self.config["wait_timeout_seconds"] = 4
-        self.config["poll_interval_seconds"] = 1
+        self.config["wait_timeout_seconds"] = 3600
+        self.config["poll_interval_seconds"] = 1200
         self.write_copy("scripts/release", SCRIPT.read_text(), executable=True)
-        self.write_copy("scripts/ci-evidence", EVIDENCE.read_text(), executable=True)
+        # ci-evidence keeps its real content in ci-evidence-real; the copy
+        # the release calls runs under the virtual clock, so the deadline
+        # and the dispatch sleeps cannot race host load.
+        self.write_copy("scripts/ci-evidence-real", EVIDENCE.read_text(), executable=True)
+        real = self.repo / "scripts" / "ci-evidence-real"
+        self.write_copy(
+            "scripts/ci-evidence",
+            virtual_clock.wrapper_for(real),
+            executable=True,
+        )
         self.write_copy("scripts/ci-evidence.json", json.dumps(self.config))
         self.write_copy("scripts/changelog", CHANGELOG_TOOL.read_text(), executable=True)
         self.write_copy(".github/changelog.json", '{"repository": "example/pohunek", "changelog": "CHANGELOG.md"}\n')
@@ -237,6 +247,8 @@ class ReleaseEvidenceTests(unittest.TestCase):
             env["REMOTE_SHA"] = remote_sha
         if advance_head_before_tag:
             env["ADVANCE_HEAD_BEFORE_TAG"] = "1"
+        # A lost virtual clock would sleep 1200 s per poll up to a 3600 s
+        # deadline; fail fast instead of blocking CI.
         return subprocess.run(
             [str(self.repo / "scripts/release"), "patch", *args],
             cwd=self.repo,
@@ -244,6 +256,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=120,
         )
 
     def read_events(self):

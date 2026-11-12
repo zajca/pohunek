@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 import hermetic_git  # noqa: F401  (isolates git from the developer's configuration)
+import virtual_clock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,23 +133,6 @@ def names_a_workflow_job(required, workflow_path):
             return True
     return False
 
-
-# Runs a Python script under a virtual clock: time only moves when the script
-# sleeps, so a timeout scenario cannot race host load. subprocess is imported
-# first, before time is patched, so it keeps the real monotonic clock it bound
-# at import for its own subprocess timeouts.
-VIRTUAL_CLOCK_RUNNER = r'''
-import subprocess
-import runpy
-import sys
-import time
-
-now = [0.0]
-time.monotonic = lambda: now[0]
-time.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
-sys.argv = sys.argv[1:]
-runpy.run_path(sys.argv[0], run_name="__main__")
-'''
 
 FAKE_GH = r'''#!/usr/bin/env python3
 import json
@@ -373,7 +357,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         base.update(values)
         self.fixture.write_text(json.dumps(base))
 
-    def invoke(self, tier="main", *extra, config=None, sha=SHA, script=SCRIPT, tree_config=False):
+    def invoke(self, tier="main", *extra, config=None, sha=SHA, script=SCRIPT, tree_config=False, timeout=None):
         env = os.environ.copy()
         env.update({
             "PATH": f"{self.bin_dir}{os.pathsep}{env['PATH']}",
@@ -384,7 +368,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         # the commit it checks.
         config_arguments = [] if tree_config else ["--config", str(config or self.config)]
         return subprocess.run(
-            [sys.executable, "-c", VIRTUAL_CLOCK_RUNNER, str(script),
+            [sys.executable, "-c", virtual_clock.VIRTUAL_CLOCK_RUNNER, str(script),
              "--repo", "example/pohunek", "--sha", sha,
              "--tier", tier, *config_arguments, *extra],
             capture_output=True,
@@ -392,6 +376,7 @@ class CiEvidenceCliTests(unittest.TestCase):
             check=False,
             cwd=self.directory,
             env=env,
+            timeout=timeout,
         )
 
     def checkout(self, committed: dict, working: dict) -> tuple[Path, str]:
@@ -917,6 +902,50 @@ class CiEvidenceCliTests(unittest.TestCase):
         )
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_wait_longer_than_any_test_budget_completes_on_the_virtual_clock(self):
+        # The deadline and the polls run on the virtual clock; a wall-clock
+        # run would hit the 60 s guard.
+        self.config_data["wait_timeout_seconds"] = 3600
+        self.config_data["poll_interval_seconds"] = 1200
+        self.write_config()
+        in_progress = run_doc(status="in_progress", conclusion=None)
+        self.write_fixture(
+            run_pages=[page([in_progress]), page([in_progress]), page([run_doc()])],
+            jobs_page=jobs_page(),
+        )
+        result = self.invoke(timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commit_listings = [
+            call for call in self.calls_json()
+            if any("/actions/workflows/" in arg for arg in call)
+            and any(arg.startswith("head_sha=") for arg in call)
+        ]
+        # Initial listing plus two polls; virtual time used is 2400 s < 3600 s.
+        self.assertEqual(len(commit_listings), 3, commit_listings)
+
+    def test_a_wait_whose_deadline_never_arrives_times_out_on_the_virtual_clock(self):
+        # The polls advance the clock to the 3600 s deadline while the run
+        # stays in progress; a wall-clock deadline would spin instantly
+        # through the polls until the 60 s guard instead.
+        self.config_data["wait_timeout_seconds"] = 3600
+        self.config_data["poll_interval_seconds"] = 1200
+        self.write_config()
+        in_progress = run_doc(status="in_progress", conclusion=None)
+        self.write_fixture(
+            run_pages=[page([in_progress])],
+            jobs_page=jobs_page(),
+        )
+        result = self.invoke(timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("timed out after 3600s", result.stderr)
+        commit_listings = [
+            call for call in self.calls_json()
+            if any("/actions/workflows/" in arg for arg in call)
+            and any(arg.startswith("head_sha=") for arg in call)
+        ]
+        # Initial listing plus polls at t=1200, 2400 and 3600.
+        self.assertEqual(len(commit_listings), 4, commit_listings)
 
     def test_manual_tier_requires_its_matching_run_title_marker(self):
         self.write_fixture(

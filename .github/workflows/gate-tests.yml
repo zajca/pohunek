@@ -62,12 +62,19 @@ jobs:
       - name: Free preinstalled toolchains
         timeout-minutes: 10
         env:
-          # The whole prune loop shares one budget below the step's
-          # timeout-minutes (600 s). Each removal gets the budget that is
-          # left, and a removal that finds none left is skipped, so a slow
-          # prune on a degraded runner becomes a warning, not a red gate.
+          # The whole prune loop shares one budget that leaves room for
+          # the two bounded df calls: PRUNE_BUDGET_SECONDS +
+          # 2 * DF_TIMEOUT_SECONDS < timeout-minutes * 60 (480 + 2 x 30 <
+          # 600), enforced by scripts/tests/test_ci_step_bounds.py. Each
+          # removal gets the budget that is left, and a removal that finds
+          # none left is skipped, so a slow prune on a degraded runner
+          # becomes a warning, not a red gate.
           PRUNE_BUDGET_SECONDS: "480"
-          # Bounds each df call, so a hung filesystem stat cannot outlive the step.
+          # Bounds each df call as a warning-only diagnostic: the step's
+          # timeout-minutes already ends a hung df, and the step stays within
+          # 600 s while PRUNE_BUDGET_SECONDS + 2 * DF_TIMEOUT_SECONDS <
+          # timeout-minutes * 60 (enforced by
+          # scripts/tests/test_ci_step_bounds.py).
           DF_TIMEOUT_SECONDS: "30"
         run: |
           set -uo pipefail
@@ -156,6 +163,8 @@ jobs:
       # another.
       - name: Test
         shell: bash
+        env:
+          DF_TIMEOUT_SECONDS: "30"
         run: |
           set -uo pipefail
           archive="$RUNNER_TEMP/nextest-archive.tar.zst"
@@ -166,7 +175,7 @@ jobs:
             python3 scripts/test-partitions --archive-file "$archive" run "$shard" || failed+=("$shard")
             echo "::endgroup::"
             echo "disk: after shard $shard"
-            df -h / || true
+            timeout "$DF_TIMEOUT_SECONDS" df -h / || true
             if [ "$shard" = heavy ]; then
               python3 scripts/junit-flaky-summary --label "$shard" target/nextest/heavy/junit.xml
             else

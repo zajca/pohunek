@@ -58,7 +58,31 @@ class StepBoundTests(unittest.TestCase):
         self.assertEqual(len(df_calls), 2, df_calls)
         for line in df_calls:
             self.assertRegex(line, r'timeout "\$DF_TIMEOUT_SECONDS" df -h ')
-        self.assertRegex(step, r'(?m)^          DF_TIMEOUT_SECONDS: "\d+"$')
+        budget = int(re.search(r'(?m)^          PRUNE_BUDGET_SECONDS: "(\d+)"$', step).group(1))
+        bound = int(re.search(r'(?m)^          DF_TIMEOUT_SECONDS: "(\d+)"$', step).group(1))
+        minutes = int(re.search(r'(?m)^        timeout-minutes: (\d+)$', step).group(1))
+        self.assertLess(
+            budget + len(df_calls) * bound, minutes * 60,
+            f"PRUNE_BUDGET_SECONDS={budget} + {len(df_calls)} * DF_TIMEOUT_SECONDS={bound} "
+            f"must stay below timeout-minutes={minutes} * 60",
+        )
+
+    def test_every_df_call_in_gate_tests_is_bounded(self):
+        text = (ROOT / ".github" / "workflows" / "gate-tests.yml").read_text()
+        checked = 0
+        for step in steps_of(text):
+            if "df -h" not in step:
+                continue
+            checked += 1
+            with self.subTest(step=step.splitlines()[0]):
+                if re.search(r"(?m)^        timeout-minutes: \d+$", step):
+                    continue
+                df_calls = [line for line in step.splitlines() if "df -h" in line]
+                self.assertTrue(df_calls)
+                for line in df_calls:
+                    self.assertRegex(line, r'timeout "\$DF_TIMEOUT_SECONDS" df -h ')
+                self.assertRegex(step, r'(?m)^          DF_TIMEOUT_SECONDS: "\d+"$')
+        self.assertGreater(checked, 0)
 
     def test_the_composite_bounds_its_local_steps(self):
         text = SETUP_MOLD_ACTION.read_text()
