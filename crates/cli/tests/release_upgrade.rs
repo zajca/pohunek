@@ -240,9 +240,12 @@ const SILENT_PROFILE: &str = "silent-claude";
 const CODEX_PROFILE: &str = "fake-codex";
 
 /// Column counts of the resizes the previous release's daemon applies to the
-/// live session, so it runs at a size other than the initial one before the
-/// upgrade. The head's daemon acquires its own controller lease, so its resize
-/// is not ordered against these.
+/// live session, so the surviving worker holds that daemon's sequences. The
+/// head's daemon numbers its resizes from the start under its own lease, and
+/// its resize is applied only because its source is the new lease, whose
+/// sequences are not ordered against the previous release's. One entry
+/// already pins the rule (`1 >= 1` drops); the other holds the sequence
+/// above 1, so the pin does not depend on the equal-sequence edge.
 const RESIZES_BEFORE_UPGRADE_COLS: [u16; 2] = [90, 91];
 
 /// Size the head's daemon resizes the adopted live session to.

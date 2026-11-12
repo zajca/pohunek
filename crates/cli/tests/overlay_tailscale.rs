@@ -700,13 +700,20 @@ fn a_name_shared_with_this_machine_is_ambiguous() {
     assert!(targets.is_empty(), "{targets:?}");
 }
 
-/// Replaces the fake CLI with one that records its pid and never answers.
+/// Replaces the fake CLI with one that records its own pid and its
+/// background sleep's pid, then never answers.
+///
+/// Each process records its own pid as its first statement: the parent shell
+/// writes `$$`, and the background child writes `$$` itself before becoming
+/// the sleep with the same pid via `exec`, so a missing or empty record
+/// means that process never completed its first statement and started
+/// nothing.
 fn install_hanging_cli(fixture: &Fixture) -> PathBuf {
     let pid = fixture.env.root().join("tailscale.pid");
     pohunek_test_support::fs::write_executable(
         fixture.fake.bin_dir().join("tailscale"),
         format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{pid}.child'\nwait\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{pid}'\n/bin/sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 3600' sh '{pid}.child' &\nwait\n",
             pid = pid.display()
         ),
     )
@@ -717,13 +724,34 @@ fn install_hanging_cli(fixture: &Fixture) -> PathBuf {
 /// Waits until the process whose pid `file` records is gone or only a zombie
 /// awaiting its reaper.
 ///
+/// A missing or empty record means that process never completed its first
+/// statement and started nothing: the redirect creates the file before
+/// `printf` writes the pid, so a kill landing between the two leaves it
+/// empty, and the check returns at once. The check runs at least the
+/// one-second deadline after the spawn, so a process the CLI failed to kill
+/// has written its record by then. A false pass needs both a regression and
+/// a process not yet started a second after its spawn.
+/// An escapee is caught only when it outlives this poll's hang guard: one
+/// that ends first is awaited, not reported.
+///
 /// `SIGKILL` is delivered asynchronously: the supervisor is reaped as soon as
 /// it dies, while another member of its process group can still be on its way
 /// out, so the end of the process is awaited rather than read once.
 fn assert_not_running(file: &std::path::Path) {
-    let recorded = fs::read_to_string(file).expect("the fake recorded its pid");
+    let Ok(recorded) = fs::read_to_string(file) else {
+        return;
+    };
+    // The redirect truncates the record before `printf` writes the pid, so
+    // an empty record is the same unfinished first statement as a missing
+    // one. A non-empty record must parse: polling an unrelated `/proc` file
+    // would hide a broken fake behind a passing or hanging check.
+    let trimmed = recorded.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let pid: u32 = trimmed.parse().expect("the fake recorded a pid");
     let stat_path = std::path::Path::new("/proc")
-        .join(recorded.trim())
+        .join(pid.to_string())
         .join("stat");
     pohunek_test_support::wait::poll_until(
         &format!("the process of {} to end", file.display()),
@@ -738,8 +766,9 @@ fn assert_not_running(file: &std::path::Path) {
 }
 
 /// A status probe that never answers ends at the configured deadline as
-/// `tailscale_state_unavailable` for listing and for `--host` resolution, and
-/// the CLI it started is gone.
+/// `tailscale_state_unavailable` for listing, the CLI it started is gone,
+/// and a CLI that exits while a helper holds its output is bounded the same
+/// way with the helper killed.
 #[test]
 fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     let fixture = Fixture::new(&tailnet());
@@ -761,12 +790,10 @@ fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     // A CLI that exits but leaves a helper holding its output is bounded and
     // its helper is killed too.
     let helper = fixture.env.root().join("tailscale.helper");
-    let runs = fixture.env.root().join("tailscale.runs");
     pohunek_test_support::fs::write_executable(
         fixture.fake.bin_dir().join("tailscale"),
         format!(
-            "#!/bin/sh\nprintf x >> '{runs}'\n/bin/sleep 3600 &\nprintf '%s' \"$!\" > '{helper}'\nexit 0\n",
-            runs = runs.display(),
+            "#!/bin/sh\n/bin/sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 3600' sh '{helper}' &\nexit 0\n",
             helper = helper.display()
         ),
     )

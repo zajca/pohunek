@@ -25,9 +25,12 @@ use pohunek_test_support::worker_binary;
 use protocol::{RuntimeState, SessionInfo, SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID};
 
 /// Resizes the first daemon sends before it shuts down, so the surviving
-/// worker runs at a size other than the initial one. The worker orders resizes
-/// per controller lease, and the restarted daemon acquires a new lease, so its
-/// own resize is not ordered against these.
+/// worker holds sequences 1-3 from that daemon's lease. The restarted daemon
+/// numbers its resizes from 1 again, and its resize is applied only because
+/// its source is the new lease, whose sequences are not ordered against the
+/// first daemon's. One entry already pins the rule (`1 >= 1` drops); the
+/// others hold the sequence above 1, so the pin does not depend on the
+/// equal-sequence edge.
 const RESIZES_BEFORE_RESTART: [(u16, u16); 3] = [(100, 30), (101, 31), (102, 32)];
 
 /// The size the restarted daemon asks for.
