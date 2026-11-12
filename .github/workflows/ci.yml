@@ -2016,7 +2016,7 @@ jobs:
   # a failure, cancellation or skip fails the run's evidence.
   release-rehearsal-scenarios:
     name: release rehearsal (archive smoke scenarios)
-    needs: changes
+    needs: [changes]
     if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') || (github.event_name == 'pull_request' && needs.changes.outputs.release_rehearsal == 'true')) && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
     uses: ./.github/workflows/release-smoke-scenarios.yml
     permissions:

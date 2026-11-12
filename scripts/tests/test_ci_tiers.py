@@ -329,13 +329,21 @@ def evaluate_job_condition(
     changes: dict[str, str] | None = None,
     result: str = "",
     outputs: dict[str, str] | None = None,
+    results: dict[str, str] | None = None,
+    reuse_skip: list[str] | None = None,
 ) -> bool:
     """`evaluate_condition` for a job that may also wait on other jobs: the
     package selection gives `result` and `outputs`, and every other job of
-    `needs` has no result, as when the selection has not narrowed anything."""
+    `needs` reads from `results`. Jobs the caller does not name read as
+    success, as when the producers that the scenario holds fixed ran; the
+    caller names a producer explicitly to exercise its failure."""
+    merged = {name: "success" for name in re.findall(r"needs\.([a-z][a-z0-9-]*)\.", expression)}
+    merged.update(results or {})
+    merged.setdefault(PACKAGE_SELECTOR, result)
+    merged_outputs = {PACKAGE_SELECTOR: outputs or {}}
     return bool(evaluate_needs_expression(
         expression, event=event, tier=tier, changes=changes,
-        results={PACKAGE_SELECTOR: result}, outputs={PACKAGE_SELECTOR: outputs or {}},
+        results=merged, outputs=merged_outputs, reuse_skip=reuse_skip,
     ))
 
 
@@ -348,14 +356,19 @@ def evaluate_condition(
     changes: dict[str, str] | None = None,
     result: str = "",
     outputs: dict[str, str] | None = None,
+    results: dict[str, str] | None = None,
+    reuse_skip: list[str] | None = None,
 ) -> bool:
     """Evaluate a job's `if:` in Python for the operators it may use.
 
     Only `!cancelled()`, `github.event_name`, `inputs.tier`, the `changes`
     job's `outputs.<name>`, the selector's `result` and `outputs.<name>`,
-    string literals, `==`, `!=`, `&&`, `||` and parentheses are understood;
-    anything else fails the translation. A missing output reads as the empty
-    string and string comparison ignores case, as in GitHub Actions.
+    `needs.<job>.result` (from `results`, defaulting to success as when the
+    producers ran), the reuse skip list (`reuse_skip`, defaulting to no
+    reuse as on a full run), string literals, `==`, `!=`, `&&`, `||` and
+    parentheses are understood; anything else fails the translation. A
+    missing output reads as the empty string and string comparison ignores
+    case, as in GitHub Actions.
     """
     # Tier selection assumes the rehearsal producer has succeeded; lifecycle
     # outcomes are exercised separately through evaluate_needs_expression.
@@ -370,22 +383,33 @@ def evaluate_condition(
         python,
     )
     python = re.sub(r"needs\.changes\.outputs\.([a-z_]+)", r"changes.get('\1', '')", python)
+    python = python.replace("needs.reuse.outputs.skip || '[]'", "reuse_skip")
+    python = python.replace("fromJSON(reuse_skip)", "reuse_skip")
+    python = re.sub(
+        r"needs\.([a-z][a-z0-9-]*)\.result",
+        r"results.get('\1', 'success')",
+        python,
+    )
     python = python.replace("&&", " and ").replace("||", " or ")
+    python = python.replace("!contains(", "not _contains(")
+    python = re.sub(r"!(?!=)", " not ", python)
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
-        r"'[^']*'|\b(?:not|and|or|event|tier|result|cancelled|outputs\.get|changes\.get)\b|==|!=|[()\s,]",
+        r"'[^']*'|\b(?:not|and|or|event|tier|result|cancelled|outputs\.get|changes\.get|results\.get|reuse_skip|_contains)\b|==|!=|[()\s,\[\]]",
         "",
         python,
     )
     if leftover:
         raise AssertionError(f"untranslated condition syntax {leftover!r} in {expression!r}")
-    return bool(eval(python, {"__builtins__": {}}, {
+    return bool(eval(python, {"__builtins__": {}, "_contains": _contains}, {
         "event": event.lower(),
         "cancelled": cancelled,
         "tier": tier.lower(),
         "changes": {name: value.lower() for name, value in (changes or {}).items()},
         "result": result.lower(),
         "outputs": {name: value.lower() for name, value in (outputs or {}).items()},
+        "results": {name: value.lower() for name, value in (results or {}).items()},
+        "reuse_skip": [name.lower() for name in (reuse_skip or [])],
     }))
 
 
@@ -615,7 +639,13 @@ class CiTierWorkflowTests(unittest.TestCase):
                 self.assertIsNotNone(expression, f"{name} has no explicit tier condition")
                 assert expression is not None
                 self.assertNotIn("pull_request", expression.group(1))
-                self.assertNotIn("needs.", expression.group(1))
+                # The only `needs.` read is the delta-reuse skip clause: the
+                # job never starts on a pull request, so the clause only
+                # matters on tier dispatches.
+                self.assertEqual(
+                    re.findall(r"needs\.([a-z][a-z0-9-]*)", expression.group(1)),
+                    ["reuse"],
+                )
                 for required in ("github.event_name == 'schedule'", "github.event_name == 'push'"):
                     self.assertIn(required, expression.group(1))
                 for tier in ("main", "nightly"):
@@ -714,7 +744,7 @@ class CiTierWorkflowTests(unittest.TestCase):
     def test_consumers_of_the_macos_release_build_download_it_and_never_build_version_a(self):
         jobs = workflow_jobs()
         builder = jobs["macos-release-build"]
-        self.assertRegex(builder, r"(?m)^    needs: changes$")
+        self.assertRegex(builder, r"(?m)^    needs: \[changes, reuse\]$")
         build = job_steps(builder)["Build the daemon component"]
         self.assertIn('bindir="$(packaging/macos/build-release daemon)"', step_script(build))
         self.assertNotIn("CARGO_LOCKED_FLAG", step_script(build))
@@ -725,7 +755,7 @@ class CiTierWorkflowTests(unittest.TestCase):
         for consumer in MACOS_BUILDER_JOBS["macos-release-build"]:
             with self.subTest(job=consumer):
                 definition = jobs[consumer]
-                self.assertRegex(definition, r"(?m)^    needs: \[changes, macos-release-build\]$")
+                self.assertRegex(definition, r"(?m)^    needs: \[changes, macos-release-build, reuse\]$")
                 steps = job_steps(definition)
                 download = steps["Download the daemon binaries"]
                 self.assertIn("uses: actions/download-artifact@", download)
@@ -1118,9 +1148,17 @@ class SameOsDuplicateTests(unittest.TestCase):
     @staticmethod
     def holds(expression, scenario, selection):
         result, outputs = selection
+        # The scenario holds the producers fixed at success so the tier and
+        # lane conditions compare on their own filters; lifecycle outcomes
+        # are exercised through evaluate_needs_expression elsewhere.
+        producers = {
+            name: "success"
+            for name in re.findall(r"needs\.([a-z][a-z0-9-]*)\.", expression)
+        }
+        producers.setdefault(TEST_SELECTOR, result)
         return bool(evaluate_needs_expression(
             expression, **scenario,
-            results={TEST_SELECTOR: result}, outputs={TEST_SELECTOR: outputs},
+            results=producers, outputs={TEST_SELECTOR: outputs},
         ))
 
     def test_the_hermes_macos_selection_is_what_the_hermes_job_runs(self):
@@ -1191,7 +1229,10 @@ class SameOsDuplicateTests(unittest.TestCase):
         self.assertEqual(set(config["artifacts"]), artifacts)
         check = self.jobs["test-duplicates"]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", block(check, "needs", indent=4)))
-        self.assertEqual(needs, set(uploads))
+        # The delta reuse job is a scheduling dependency, not a JUnit
+        # producer: the check still reads every artifact its jobs upload.
+        self.assertEqual(needs - {"reuse"}, set(uploads))
+        self.assertIn("reuse", needs, "the duplicate check waits for the reuse decision")
         pattern = re.search(r"(?m)^          pattern: '\{([^}']+)\}'$", check)
         self.assertIsNotNone(pattern, check)
         globs = pattern.group(1).split(",")
@@ -1333,8 +1374,8 @@ class SetupUvActionTests(unittest.TestCase):
 class FailFastTests(unittest.TestCase):
     """A required job that fails cancels the rest of a PR or dispatch run, and nothing else does (#1075)."""
 
-    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run.
-    EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection"}
+    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run. The reuse decision fails open too (no source means running everything), and every job it gates waits on it, so a failed decision already ends the run without a cancel.
+    EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection", "reuse"}
     REUSABLE = {
         "upgrade-test",
         "release-rehearsal-build",
@@ -1415,13 +1456,24 @@ class FailFastTests(unittest.TestCase):
         for name in self.EXCLUDED:
             with self.subTest(job=name):
                 self.assertNotIn(FAIL_FAST_STEP, jobs[name])
-                self.assertNotIn("actions", self.permissions(jobs[name]))
+                if name == "reuse":
+                    # The reuse decision reads other runs and their
+                    # artifacts, so it needs actions: read; it never
+                    # cancels, so write stays out.
+                    self.assertEqual(self.permissions(jobs[name]).get("actions"), "read")
+                else:
+                    self.assertNotIn("actions", self.permissions(jobs[name]))
 
     def test_actions_write_is_granted_only_to_jobs_that_carry_the_step_or_watch_a_called_workflow(self):
         direct = set(self.direct_jobs())
         watchers = {f"cancel-after-{name}" for name in self.REUSABLE}
         for name, job in workflow_jobs().items():
             with self.subTest(job=name):
+                # The reuse decision reads runs and artifacts but never
+                # cancels: actions: read without the fail-fast step.
+                if name == "reuse":
+                    self.assertEqual(self.permissions(job).get("actions"), "read")
+                    continue
                 self.assertEqual("actions" in self.permissions(job), name in direct | watchers)
 
     def test_each_called_workflow_has_a_watcher_that_fires_only_on_its_failure(self):
@@ -2380,6 +2432,17 @@ DOCS_ONLY_JOBS = ("test", "darwin-check", "doctests", "build-bins", "sdk", "audi
 DOCS_ONLY_PLAN = {"narrowed": "true", "mode": "none", "docs_only": "true"}
 
 
+def _contains(haystack, needle):
+    """GitHub `contains` over the translated operands: substring for a
+    string, membership for a list (what `fromJSON` of an array gives)."""
+    if isinstance(haystack, str):
+        return needle in haystack
+    try:
+        return needle in list(haystack)
+    except TypeError:
+        return False
+
+
 def evaluate_needs_expression(
     expression: str,
     *,
@@ -2391,16 +2454,19 @@ def evaluate_needs_expression(
     outputs: dict[str, dict[str, str]] | None = None,
     env: dict[str, str] | None = None,
     matrix: dict[str, str] | None = None,
+    reuse_skip: list[str] | None = None,
 ):
     """Evaluate an expression over `needs.<job>.result` and `.outputs.<name>`.
 
-    Understands `!cancelled()`, `always()`, `fromJSON`, `github.event_name`,
-    `inputs.tier`, `env.<NAME>`, `matrix.<name>`, `needs.<job>.result` and
+    Understands `!cancelled()`, `always()`, `fromJSON`, `contains`,
+    `github.event_name`, `inputs.tier`, `env.<NAME>`, `matrix.<name>`, `needs.<job>.result` and
     `needs.<job>.outputs.<name>`, string and integer literals, `==`, `!=`, `!`,
     `&&`, `||` and parentheses; anything else fails the translation. `&&` and
     `||` return an operand, as in GitHub Actions, so a value expression
     evaluates to its value. A missing result or output reads as the empty
-    string, and strings compare ignoring case.
+    string, and strings compare ignoring case. `reuse_skip` stands in for
+    the reuse job's skip list: the `fromJSON` of the `|| '[]'` default reads
+    it as a list, defaulting to no reuse as on a full run.
     """
     python = expression.replace("!cancelled()", "(not cancelled)")
     python = python.replace("always()", "(True)")
@@ -2415,13 +2481,15 @@ def evaluate_needs_expression(
         r"outputs.get('\1', {}).get('\2', '')",
         python,
     )
+    python = python.replace("needs.reuse.outputs.skip || '[]'", "reuse_skip")
+    python = python.replace("fromjson(reuse_skip)", "reuse_skip")
     python = re.sub(r"needs\.([a-z][a-z0-9-]*)\.result", r"results.get('\1', '')", python)
     python = python.replace("&&", " and ").replace("||", " or ")
     python = re.sub(r"!(?!=)", " not ", python)
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
-        r"'[^']*'|\b(?:not|and|or|True|event|tier|cancelled|fromjson|changes\.get|"
-        r"results\.get|outputs\.get|envs\.get|matrix\.get|get|\d+)\b|==|!=|[(){}.,\s]",
+        r"'[^']*'|\b(?:not|and|or|True|event|tier|cancelled|fromjson|contains|changes\.get|"
+        r"results\.get|outputs\.get|envs\.get|matrix\.get|reuse_skip|get|\d+)\b|==|!=|[(){}.,\s\[\]]",
         "",
         python,
     )
@@ -2432,6 +2500,8 @@ def evaluate_needs_expression(
         "cancelled": cancelled,
         "tier": tier.lower(),
         "fromjson": json.loads,
+        "contains": _contains,
+        "reuse_skip": [name.lower() for name in (reuse_skip or [])],
         # Literals are lowered with the rest of the expression, keys included.
         "envs": {name.lower(): value.lower() for name, value in (env or {}).items()},
         "matrix": {name.lower(): value.lower() for name, value in (matrix or {}).items()},
@@ -2731,7 +2801,7 @@ class TestSelectionWiringTests(unittest.TestCase):
             {TEST_SELECTOR, "build-tests", TEST_CHECK, *NARROWED_TEST_JOBS}, set(job_needs(job))
         )
         condition = step_condition(
-            job_steps(job)["Fail a test job that failed or was skipped without a narrowed selection"]
+            job_steps(job)["Fail a test job that failed or was skipped without a narrowed selection or a reuse skip"]
         )
 
         def fails(results, plan=None, selection="success", event="pull_request", narrowed=True):
@@ -3127,7 +3197,9 @@ class LaneSelectionTests(unittest.TestCase):
         ))
 
     def test_the_lane_waits_for_the_selection_and_its_paths_filter(self):
-        self.assertEqual(set(job_needs(workflow_jobs()[LANE_JOB])), {"changes", TEST_SELECTOR})
+        self.assertEqual(
+            set(job_needs(workflow_jobs()[LANE_JOB])), {"changes", TEST_SELECTOR, "reuse"},
+        )
 
     def test_a_narrowed_selection_without_lane_tests_skips_the_lane(self):
         self.assertFalse(self.runs())
@@ -3199,7 +3271,7 @@ class LaneSelectionTests(unittest.TestCase):
         job = workflow_jobs()[TEST_VERDICT]
         self.assertLessEqual({"changes", LANE_JOB}, set(job_needs(job)))
         condition = step_condition(
-            job_steps(job)["Fail a macOS lane that failed or was skipped without a reason"]
+            job_steps(job)["Fail a macOS lane that failed or was skipped without a reuse skip or a reason"]
         )
 
         def fails(lane, event="pull_request", macos="true", changes="success",
@@ -3237,7 +3309,7 @@ class LaneSelectionTests(unittest.TestCase):
         self.assertLessEqual({"changes", "macos-release-build", "hermes-compatibility-macos"},
                              set(job_needs(job)))
         condition = step_condition(job_steps(job)[
-            "Fail a Hermes macOS job that did not pass the tests the lane left to it"])
+            "Fail a Hermes macOS job that did not pass the tests the lane left to it and was not reused"])
         lane = job_steps(workflow_jobs()[LANE_JOB])["Run macOS lane tests"]
         skip = re.search(r"(?m)^          SKIP_OWNED_BY: \$\{\{ \((.+)\) && 'hermes-macos' \|\| '' \}\}$", lane)
         self.assertIsNotNone(skip)
