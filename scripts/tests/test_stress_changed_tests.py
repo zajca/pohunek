@@ -529,6 +529,20 @@ class Listing(Fixture):
         self.assertIn("excluded by profile 'fast'", result.stderr)
         self.assertNotIn('"run"', self.log.read_text(), "no stress run may start")
 
+    def test_a_test_falls_back_to_another_suite_by_name(self):
+        # M1: a selected test whose own binary is absent from the list
+        # must fail as "not in the nextest list", even when another
+        # suite has a test of the same name (the old fallback).
+        # Here the own binary `demo` is absent and `flow` (same package)
+        # carries the same-named case as selected.
+        result = self.run_script(list_json=listing({
+            "flow": {"tests::comment_edit": "matches"}}))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("not in the nextest list", result.stderr)
+        self.assertIn("tests::comment_edit", result.stderr)
+        self.assertNotIn('"run"', self.log.read_text() if self.log.exists() else "",
+                         "no stress run may start")
+
     def test_the_stress_run_uses_the_exact_filter_without_retries(self):
         result = self.run_script(
             list_json=listing({"demo": {"tests::comment_edit": "matches"}}))
@@ -1020,6 +1034,25 @@ class SlowRunner(Fixture):
         result = self.run_script("--slow-runner", "--unpinned", list_json=self.list_json)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("--unpinned", result.stderr)
+
+    def test_slow_runner_usage_is_checked_before_selection_or_print(self):
+        # L1: usage errors must win over an empty selection and over
+        # --print; no git/cargo work may happen first.
+        # Empty selection: amend the feature branch away so the diff
+        # vs main is empty.
+        git(self.root, "reset", "--hard", "-q", "main")
+        result = self.run_script("--slow-runner", "--unpinned", list_json=self.list_json)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--unpinned", result.stderr)
+        self.assertNotIn("changes no runnable Rust test", result.stdout)
+        self.assertFalse(self.log.exists())
+        # --print with a usage error: restore the demo edit.
+        self.edit("crates/demo/src/lib.rs", "// original comment", "// edit")
+        self.commit()
+        result = self.run_script("--slow-runner", "--print", "--unpinned")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--unpinned", result.stderr)
+        self.assertNotIn("filter:", result.stdout)
 
     def test_slow_runner_without_strace_is_a_usage_error(self):
         (self.tmp / "list.json").write_text(self.list_json)
