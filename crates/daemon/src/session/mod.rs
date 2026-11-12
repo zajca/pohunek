@@ -6215,6 +6215,7 @@ impl SessionRegistry {
                     .await
                     .map_err(worker_error_to_protocol)?;
                 let applied = update.dimensions();
+                // A concurrent resize with a higher sequence may have been applied instead.
                 if applied != dimensions {
                     warn!(
                         session_id = %id.0,
@@ -6223,7 +6224,7 @@ impl SessionRegistry {
                         requested_rows = rows,
                         applied_cols = applied.columns(),
                         applied_rows = applied.rows(),
-                        "worker kept its terminal size instead of applying the resize"
+                        "worker reported a terminal size other than the requested one"
                     );
                 }
                 update

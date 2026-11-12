@@ -24,9 +24,10 @@ use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use protocol::{RuntimeState, SessionInfo, SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID};
 
-/// Resizes the first daemon sends. The worker keeps the highest sequence it
-/// accepted, so several are needed to outrun the counter of a restarted
-/// daemon, which starts again at the beginning.
+/// Resizes the first daemon sends before it shuts down, so the surviving
+/// worker runs at a size other than the initial one. The worker orders resizes
+/// per controller lease, and the restarted daemon acquires a new lease, so its
+/// own resize is not ordered against these.
 const RESIZES_BEFORE_RESTART: [(u16, u16); 3] = [(100, 30), (101, 31), (102, 32)];
 
 /// The size the restarted daemon asks for.
