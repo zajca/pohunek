@@ -47,11 +47,11 @@ def gate_runtime_names():
 class SessionRuntimeListTests(unittest.TestCase):
     """Guards the shared list against scripts-side drift.
 
-    Compares SESSION_RUNTIME_VARS with SESSION_ENVIRONMENT_NAMES (the names
-    command_from_initialize injects, owned by server.rs) plus
+    Compares SESSION_RUNTIME_VARS with SESSION_ENVIRONMENT_NAMES in
+    server.rs (the names command_from_initialize injects) plus
     HOOK_RETRY_ENV_NAMES in env.rs. When the worker injects a new session
-    variable, add its name here (a name the worker no longer injects
-    becomes class 2 and is keyed)."""
+    variable, add its name to SESSION_RUNTIME_VARS in scripts/gate-receipt
+    (a name the worker no longer injects becomes class 2 and is keyed)."""
 
     WORKER_ENV = ROOT / "crates" / "session-worker" / "src" / "server.rs"
     RETRY_ENV = ROOT / "crates" / "worker-protocol" / "src" / "env.rs"
@@ -74,8 +74,8 @@ class SessionRuntimeListTests(unittest.TestCase):
         expected = self.worker_injected_names() | self.retry_names()
         self.assertEqual(
             set(gate_receipt.SESSION_RUNTIME_VARS), expected,
-            "SESSION_RUNTIME_VARS drifted from what the daemon injects; "
-            "add the new session name, or remove a name the daemon no longer "
+            "SESSION_RUNTIME_VARS drifted from what the worker injects; "
+            "add the new session name, or remove a name the worker no longer "
             "injects (an unlisted name becomes class 2 and is keyed)",
         )
 

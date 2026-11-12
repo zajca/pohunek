@@ -110,9 +110,9 @@ ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
 # session. The tool strips exactly these names from the wrapped command's
 # environment and never keys them, so two sessions share receipts written on
 # the same tree. This is the exact set the worker injects in
-# `crates/session-worker/src/server.rs::command_from_initialize` (the
-# authoritative `reserved` map plus the conditional daemon-id and
-# reference-kind inserts) together with `HOOK_RETRY_ENV_NAMES` from
+# `crates/session-worker/src/server.rs::SESSION_ENVIRONMENT_NAMES` (the
+# session-owned names command_from_initialize injects) together with
+# `HOOK_RETRY_ENV_NAMES` from
 # `crates/worker-protocol/src/env.rs` (the only POHUNEK_* names a profile
 # environment may carry into the child). The Rust guard test
 # (receipt_guard_tests in session-worker, which runs on every worker PR)
@@ -120,7 +120,7 @@ ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
 # Python suite guards scripts-side edits. The entries carry no per-name
 # reason; the grouping comment states each name's source.
 SESSION_RUNTIME_VARS = frozenset({
-    # Injected unconditionally by the worker (the `reserved` map).
+    # Session-owned names injected by the worker (SESSION_ENVIRONMENT_NAMES).
     "POHUNEK_ENV",
     "POHUNEK_SESSION_ID",
     "POHUNEK_WORKER_ID",
@@ -133,7 +133,7 @@ SESSION_RUNTIME_VARS = frozenset({
     "POHUNEK_HOOK_TRACE_MAX_BYTES",
     "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
     "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
-    # Injected conditionally (daemon-id and reference-kind inserts).
+    # Injected conditionally when their Initialize fields are set.
     "POHUNEK_DAEMON_ID",
     "POHUNEK_NATIVE_REFERENCE_KIND",
     # From HOOK_RETRY_ENV_NAMES (profile environment may carry them).

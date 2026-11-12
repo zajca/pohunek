@@ -7441,28 +7441,25 @@ async fn write_handshake_file(
     }
 }
 
-/// `POHUNEK_*` names the worker injects into every managed session child.
-///
-/// `command_from_initialize` injects exactly these names: the unconditional
-/// ones (whose values come from `unconditional_session_value`),
-/// `POHUNEK_DAEMON_ID` and `POHUNEK_NATIVE_REFERENCE_KIND` when their
-/// `Initialize` fields are set, and `HOOK_RETRY_ENV_NAMES` (the only
-/// `POHUNEK_*` names a profile environment may carry into the child through
-/// the filter in `command_from_initialize`, which references that single
-/// source). The gate receipt tool strips exactly these names and never keys
-/// them (`scripts/gate-receipt` `SESSION_RUNTIME_VARS`); the receipt guard
-/// tests read this same list from production, so they fail when the child's
-/// `POHUNEK_*` names and the tool's list differ, in either direction.
-/// Sorted for the guard tests.
+/// `POHUNEK_*` names the worker itself injects into every managed session
+/// child (the session-owned identity: ids, socket paths, protocol versions,
+/// trace and background limits). `command_from_initialize` injects exactly
+/// these names: the unconditional ones (whose values come from
+/// `unconditional_session_value`), plus `POHUNEK_DAEMON_ID` and
+/// `POHUNEK_NATIVE_REFERENCE_KIND` when their `Initialize` fields are set.
+/// The four `HOOK_RETRY_ENV_NAMES` (the only `POHUNEK_*` names a profile
+/// environment may carry into the child through the filter in
+/// `command_from_initialize`) are deliberately not listed here: the guard
+/// tests compare the tool's list with the union of this const and
+/// `HOOK_RETRY_ENV_NAMES`, so a change on either side fails. The gate
+/// receipt tool strips exactly the union and never keys it
+/// (`scripts/gate-receipt` `SESSION_RUNTIME_VARS`). Sorted for the guard
+/// tests.
 pub(super) const SESSION_ENVIRONMENT_NAMES: &[&str] = &[
     "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
     "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
     "POHUNEK_DAEMON_ID",
     "POHUNEK_ENV",
-    "POHUNEK_HOOK_ADMISSION_RETRY",
-    "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS",
-    "POHUNEK_HOOK_RETRY_BACKOFF_MS",
-    "POHUNEK_HOOK_RETRY_DEADLINE_MS",
     "POHUNEK_HOOK_TRACE_MAX_BYTES",
     "POHUNEK_HOOK_TRACE_PATH",
     "POHUNEK_NATIVE_REFERENCE_KIND",
@@ -7476,10 +7473,6 @@ pub(super) const SESSION_ENVIRONMENT_NAMES: &[&str] = &[
 ];
 
 /// Builds the PTY child command from a validated `Initialize`.
-///
-/// The child environment starts empty and is layered as base environment,
-/// worker `TERM`, profile environment, then the worker's authoritative
-/// `POHUNEK_*` identity. Service-manager variables are removed from the result.
 /// Values the worker injects for the unconditionally present session names.
 ///
 /// `command_from_initialize` looks each of these values up by the name in
@@ -7496,18 +7489,11 @@ fn unconditional_session_value(
         "POHUNEK_SESSION_ID" => Some(shared.session_id.to_string()),
         "POHUNEK_WORKER_ID" => Some(shared.worker_id.to_string()),
         "POHUNEK_WORKER_INSTANCE_ID" => Some(worker_instance_id.to_string()),
-        "POHUNEK_WORKER_SOCKET_PATH" => {
-            Some(shared.socket_path.to_string_lossy().into_owned())
-        }
+        "POHUNEK_WORKER_SOCKET_PATH" => Some(shared.socket_path.to_string_lossy().into_owned()),
         "POHUNEK_WORKER_HOOK_PROTOCOL_VERSION" => {
             Some(initialize.hook_protocol_version.to_string())
         }
-        "POHUNEK_SOCKET_PATH" => Some(
-            shared
-                .daemon_socket_path
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        "POHUNEK_SOCKET_PATH" => Some(shared.daemon_socket_path.to_string_lossy().into_owned()),
         // The public daemon RPC protocol version, required by the real
         // provider hooks (`pohunek-agent-state.sh`, `pohunek-agent-notify.sh`)
         // to build `session.report_native_id` / `notification.create`
@@ -7515,12 +7501,10 @@ fn unconditional_session_value(
         // report native id or notifications for durable-worker-managed
         // agents.
         "POHUNEK_PROTOCOL_VERSION" => Some(initialize.public_protocol_version.to_string()),
-        "POHUNEK_HOOK_TRACE_PATH" => {
-            Some(shared.hook_trace_path.to_string_lossy().into_owned())
+        "POHUNEK_HOOK_TRACE_PATH" => Some(shared.hook_trace_path.to_string_lossy().into_owned()),
+        "POHUNEK_HOOK_TRACE_MAX_BYTES" => {
+            Some(pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string())
         }
-        "POHUNEK_HOOK_TRACE_MAX_BYTES" => Some(
-            pohunek_logging::config::HOOK_TRACE_MAX_FILE_BYTES.to_string(),
-        ),
         "POHUNEK_BACKGROUND_LABEL_MAX_BYTES" => {
             Some(protocol::BACKGROUND_LABEL_MAX_BYTES.to_string())
         }
@@ -7531,6 +7515,11 @@ fn unconditional_session_value(
     }
 }
 
+/// Builds the PTY child command from a validated `Initialize`.
+///
+/// The child environment starts empty and is layered as base environment,
+/// worker `TERM`, profile environment, then the worker's authoritative
+/// `POHUNEK_*` identity. Service-manager variables are removed from the result.
 fn command_from_initialize(
     shared: &Shared,
     initialize: &Initialize,
@@ -7566,9 +7555,6 @@ fn command_from_initialize(
             if let Some(reference_kind) = &initialize.launch.reference_kind {
                 reserved.insert((*name).to_owned(), reference_kind.clone());
             }
-        } else if protocol::HOOK_RETRY_ENV_NAMES.contains(name) {
-            // Carried by the profile environment through the filter above;
-            // never injected here.
         } else if let Some(value) =
             unconditional_session_value(name, shared, initialize, worker_instance_id)
         {
