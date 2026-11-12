@@ -102,9 +102,9 @@ fn check_session_fetch_ref_name(repo: &Path, source_ref: &str) -> Result<(), Pro
 /// maintenance or a hook) until the caller promotes it or drops it; dropping
 /// deletes the temp ref. Runs after base resolution and before any hook, so a
 /// refused request leaves no session, binding, worktree, temp ref or session
-/// ref behind. The fetch writes no `FETCH_HEAD` entry and recurses into no
-/// submodule: untrusted content must not move refs outside the session-owned
-/// ones.
+/// ref behind. The fetch writes no `FETCH_HEAD` entry, recurses into no
+/// submodule, and follows no configured `remote.origin.fetch` refspec, so it
+/// moves no ref outside the session-owned temp ref it created.
 ///
 /// # Errors
 ///

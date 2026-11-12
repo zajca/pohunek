@@ -6783,6 +6783,7 @@ async fn a_symlinked_tmpdir_root_refuses_the_launch() {
     let _ = handle.await;
 }
 
+/// Writes a host-global `post-create` hook into `config_dir` and returns it.
 fn host_post_create_hook(socket: &TestSocket, body: &str) -> PathBuf {
     let config_dir = socket.dir.join("config");
     std::fs::create_dir_all(config_dir.join("hooks")).expect("create host hook directory");

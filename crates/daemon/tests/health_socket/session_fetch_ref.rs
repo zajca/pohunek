@@ -7,10 +7,9 @@
 //! composes with `branch_source: remote` (it draws its own ref, not the
 //! branch's), and that `FETCH_HEAD` is untouched by the fetch.
 
-// Rust guideline compliant 2026-11-12
-
 use super::*;
 
+use pohunek_service_config::RequiredHook;
 use protocol::{BranchSource, FetchRefRequest, FetchedRef, SessionNewResult};
 
 /// The source ref every scenario fetches.
@@ -31,15 +30,45 @@ struct Rig {
 
 impl Rig {
     async fn start(tag: &str) -> Self {
+        Self::start_with_hooks(tag, None, None, Vec::new()).await
+    }
+
+    /// `pre_create` is the body of a host-global `pre-create` hook (used as a
+    /// marker that a refused request never ran a hook), `post_create` the
+    /// body of a host-global `post-create` hook; `required` lists the hooks
+    /// `[hooks] required` names (row 9 needs a required post-create).
+    async fn start_with_hooks(
+        tag: &str,
+        pre_create: Option<&str>,
+        post_create: Option<&str>,
+        required: Vec<RequiredHook>,
+    ) -> Self {
         let repo = init_git_repo();
         let origin = temp_dir(&format!("{tag}-origin"));
         let worktree_root = temp_dir(&format!("{tag}-wt"));
         let state = temp_dir(&format!("{tag}-state"));
         let socket = temp_socket(tag);
+        let config_dir = match (pre_create, post_create) {
+            (None, None) => None,
+            (pre, post) => {
+                let config_dir = socket.dir.join("config");
+                std::fs::create_dir_all(config_dir.join("hooks"))
+                    .expect("create host hook directory");
+                if let Some(body) = pre {
+                    write_executable(&config_dir.join("hooks/pre-create"), body);
+                }
+                if let Some(body) = post {
+                    write_executable(&config_dir.join("hooks/post-create"), body);
+                }
+                Some(config_dir)
+            }
+        };
         let config = SessionRegistryConfig {
             shell_command: support::hermetic_shell(),
             worktree_root: Some(worktree_root.to_path_buf()),
             store_path: Some(state.join("metadata.jsonl")),
+            config_dir,
+            hook_required: required,
             ..SessionRegistryConfig::default()
         };
         let (shutdown, server, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -99,6 +128,18 @@ impl Rig {
 
     fn git(&self, args: &[&str]) -> String {
         self.git_in(self.repo.cwd(), args)
+    }
+
+    /// Raw `git` in `dir`: no success assertion, for probing refs the fetch
+    /// must not have moved.
+    fn git_raw(&self, dir: &Path, args: &[&str]) -> std::process::Output {
+        self.repo
+            .git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git")
     }
 
     /// The commit `name` resolves to in the working repository, if any.
@@ -171,17 +212,17 @@ impl Rig {
     /// Installs an uncommitted in-repo `pre-create` hook: the script file
     /// sits on disk in the repository checkout without any commit, so the
     /// base head stays put (the same pattern the `branch_source` CAS
-    /// scenario uses). Whether the fresh worktree sees the script depends on
-    /// where the daemon resolves in-repo hooks from; the hook scenarios
-    /// below assert what the daemon reports.
+    /// scenario uses). The hook scenarios below assert what the daemon
+    /// reports: the daemon runs `pre-create` in the repository checkout,
+    /// before it promotes the session ref.
     ///
-    /// `fail` makes the hook exit non-zero; otherwise the hook records the
-    /// commit the session ref holds at hook time through `seen`.
+    /// `fail` makes the hook exit non-zero without recording anything;
+    /// otherwise the hook records the commit the session ref holds at hook
+    /// time through `seen` (empty when the session ref is not promoted yet).
     fn in_repo_pre_create_hook(&self, fail: bool, seen: &Path) {
         if let Some(parent) = seen.parent() {
             std::fs::create_dir_all(parent).expect("create the seen directory");
         }
-        let _ = seen;
         let path = self.repo.cwd().join(".pohunek/hooks/pre-create");
         std::fs::create_dir_all(path.parent().expect("hook parent"))
             .expect("create the hooks directory");
@@ -318,8 +359,9 @@ async fn a_pull_request_head_is_fetched_without_checkout() {
         "the worktree checks out the requested branch, not the fetched ref"
     );
     // Row 1 pins that the checkout stands on the base head, not the
-    // fetched commit: the commit exists as an object in the shared
-    // repository but the new branch does not contain it.
+    // fetched commit: the commit exists as an object in the worktree (the
+    // case table's `cat-file -e` probe) but the new branch does not contain
+    // it.
     assert_eq!(
         rig.git_in(worktree, &["rev-parse", "HEAD"]),
         base,
@@ -329,13 +371,13 @@ async fn a_pull_request_head_is_fetched_without_checkout() {
         rig.repo
             .git_command()
             .arg("-C")
-            .arg(rig.repo.cwd())
+            .arg(worktree)
             .args(["cat-file", "-e", &format!("{expected}^{{commit}}")])
             .output()
             .expect("run git cat-file")
             .status
             .success(),
-        "the fetched commit exists in the repository"
+        "the fetched commit exists in the worktree"
     );
     assert!(
         !rig.repo
@@ -387,11 +429,20 @@ async fn a_pull_request_head_is_fetched_without_checkout() {
     rig.stop().await;
 }
 
-/// A source ref `origin` does not have fails with `fetch_ref_not_found` and
-/// leaves nothing behind.
+/// Row 3 of the case table: a source ref `origin` does not have fails with
+/// `fetch_ref_not_found` and leaves nothing behind, with no hook side effect:
+/// the host `pre-create` hook marker stays absent because the fetch runs
+/// before any hook.
 #[tokio::test]
 async fn an_unknown_source_ref_fails_without_leaving_anything() {
-    let mut rig = Rig::start("fetch-ref-absent").await;
+    let marker = temp_dir("fetch-ref-absent-marker").join("pre-create-ran");
+    let mut rig = Rig::start_with_hooks(
+        "fetch-ref-absent",
+        Some(&format!("#!/bin/sh\ntouch {}\n", marker.display())),
+        None,
+        Vec::new(),
+    )
+    .await;
     let main = rig.git(&["rev-parse", "HEAD"]);
 
     let error = err_payload(
@@ -400,6 +451,43 @@ async fn an_unknown_source_ref_fails_without_leaving_anything() {
     );
 
     assert_eq!(error.code, "fetch_ref_not_found", "{}", error.msg);
+    assert!(
+        !marker.exists(),
+        "the host pre-create hook never ran for a refused fetch"
+    );
+    rig.assert_nothing_left().await;
+    rig.stop().await;
+}
+
+/// Row 4 of the case table: a repository without an `origin` remote fails
+/// with `fetch_ref_not_found` (naming the missing remote, mirroring
+/// `remote_branch_not_found`) and leaves nothing behind, with no hook side
+/// effect.
+#[tokio::test]
+async fn a_repository_without_origin_fails_without_leaving_anything() {
+    let marker = temp_dir("fetch-ref-no-origin-marker").join("pre-create-ran");
+    let mut rig = Rig::start_with_hooks(
+        "fetch-ref-no-origin",
+        Some(&format!("#!/bin/sh\ntouch {}\n", marker.display())),
+        None,
+        Vec::new(),
+    )
+    .await;
+    rig.git(&["remote", "remove", "origin"]);
+    let main = rig.git(&["rev-parse", "HEAD"]);
+
+    let error = err_payload(rig.new_session(rig.params(SOURCE_REF, &main)).await);
+
+    assert_eq!(error.code, "fetch_ref_not_found", "{}", error.msg);
+    assert!(
+        error.msg.contains("no origin remote") || error.msg.contains("origin"),
+        "the error names the missing remote: {}",
+        error.msg
+    );
+    assert!(
+        !marker.exists(),
+        "the host pre-create hook never ran for a refused fetch"
+    );
     rig.assert_nothing_left().await;
     rig.stop().await;
 }
@@ -408,10 +496,16 @@ async fn an_unknown_source_ref_fails_without_leaving_anything() {
 /// naming both ids and leaves nothing behind.
 #[tokio::test]
 async fn a_commit_mismatch_fails_without_leaving_anything() {
-    let mut rig = Rig::start("fetch-ref-mismatch").await;
+    let marker = temp_dir("fetch-ref-mismatch-marker").join("pre-create-ran");
+    let mut rig = Rig::start_with_hooks(
+        "fetch-ref-mismatch",
+        Some(&format!("#!/bin/sh\ntouch {}\n", marker.display())),
+        None,
+        Vec::new(),
+    )
+    .await;
     let expected = rig.origin_source_ref();
     let other = rig.git(&["rev-parse", "HEAD"]);
-
     let error = err_payload(rig.new_session(rig.params(SOURCE_REF, &other)).await);
 
     assert_eq!(error.code, "fetch_ref_commit_mismatch", "{}", error.msg);
@@ -419,6 +513,10 @@ async fn a_commit_mismatch_fails_without_leaving_anything() {
         error.msg.contains(&other) && error.msg.contains(&expected),
         "the error names both the expected and the fetched commit: {}",
         error.msg
+    );
+    assert!(
+        !marker.exists(),
+        "the host pre-create hook never ran for a refused fetch"
     );
     rig.assert_nothing_left().await;
     rig.stop().await;
@@ -458,11 +556,26 @@ async fn a_keyed_retry_replays_without_the_fetched_ref() {
     assert_eq!(fetched.source_ref, SOURCE_REF);
 
     let result: SessionNewResult =
-        serde_json::from_value(ok_payload(rig.new_session(params).await))
+        serde_json::from_value(ok_payload(rig.new_session(params.clone()).await))
             .expect("session.new replay");
     assert_eq!(result.replayed, Some(true));
     assert_eq!(result.session.id, first.id);
     assert_eq!(result.fetched_ref, None, "a replay carries no fetched_ref");
+
+    // The same key with another commit names a different request, so the
+    // daemon refuses with `session_request_conflict` and creates nothing.
+    let mut conflict = params.clone();
+    conflict.fetch_ref = Some(FetchRefRequest {
+        source_ref: SOURCE_REF.to_owned(),
+        commit: rig.git(&["rev-parse", "HEAD"]),
+    });
+    let error = err_payload(rig.new_session(conflict).await);
+    assert_eq!(error.code, "session_request_conflict", "{}", error.msg);
+    assert_eq!(
+        rig.sessions().await.len(),
+        1,
+        "the conflict creates no second session"
+    );
     rig.stop().await;
 }
 
@@ -473,6 +586,13 @@ async fn a_malformed_fetch_ref_is_rejected() {
     let mut rig = Rig::start("fetch-ref-malformed").await;
     for (source_ref, commit) in [
         ("pull/42/head", "0123456789abcdef0123456789abcdef01234567"),
+        // Passes the `refs/` prefix check but fails `git check-ref-format`
+        // (a colon is not a valid ref character), so only the strict check
+        // rejects it.
+        (
+            "refs/pull/1/head:refs/heads/main",
+            "0123456789abcdef0123456789abcdef01234567",
+        ),
         (SOURCE_REF, "abc123"),
         (SOURCE_REF, "0123456789ABCDEF0123456789ABCDEF01234567"),
     ] {
@@ -483,7 +603,7 @@ async fn a_malformed_fetch_ref_is_rejected() {
     rig.stop().await;
 }
 
-/// Row 2 of the case table: the extra fetch composes with
+/// Row 8 of the case table: the extra fetch composes with
 /// `branch_source: remote` — the checkout follows the branch's remote head
 /// while the session ref pins the unrelated pull-request commit.
 #[tokio::test]
@@ -515,41 +635,40 @@ async fn fetch_ref_composes_with_a_remote_branch_source() {
     rig.stop().await;
 }
 
-/// Row 12 of the case table: the session ref is promoted before the
-/// `pre-create` hook, so a hook that reads the session ref at hook time sees
-/// the expected commit — here the harness cannot list any hook in
-/// `hooks.required` per scenario, so a failing hook reports the failure as a
-/// warning and the session ref stays.
+/// Row 9 of the case table: a required `post-create` hook that fails after
+/// promotion compensates the create, so the session ref is gone with the
+/// binding. The marker proves the hook ran after the session ref was
+/// promoted.
 #[tokio::test]
-async fn a_failing_pre_create_hook_warns_and_keeps_the_session_ref() {
-    let mut rig = Rig::start("fetch-ref-pre-fails").await;
+async fn a_failing_required_post_create_hook_compensates_the_session_ref() {
+    let marker_dir = temp_dir("fetch-ref-required-hook-marker");
+    let marker = marker_dir.join("post-create-ran");
+    let marker_body = format!(
+        "#!/bin/sh\ntouch {}\necho hook refused >&2\nexit 1\n",
+        marker.display()
+    );
+    let mut rig = Rig::start_with_hooks(
+        "fetch-ref-req-compensates",
+        None,
+        Some(&marker_body),
+        vec![RequiredHook::PostCreate],
+    )
+    .await;
     let expected = rig.origin_source_ref();
-    let seen = temp_dir("fetch-ref-hook-fails-seen").join("seen");
-    rig.in_repo_pre_create_hook(true, &seen);
-    // The harness cannot list the hook in `hooks.required` per scenario
-    // (that list lives in `service.toml`), so the daemon answers with the
-    // non-fatal warning instead of refusing: the hook still proves it ran
-    // while the session ref was promoted by recording it before refusing.
-    let (session, fetched) = started(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
+    let error = err_payload(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
 
+    assert_eq!(error.code, "hook_required_failed", "{}", error.msg);
     assert!(
-        session
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == SessionWarningKind::Hook),
-        "the failing hook is reported as a warning: {session:?}"
+        marker.exists(),
+        "the hook ran (so after promotion) before the create was refused"
     );
-    assert_eq!(
-        rig.rev(&fetched.fetched_ref),
-        Some(expected.clone()),
-        "the session ref stays after a non-required hook failure"
-    );
+    rig.assert_nothing_left().await;
     rig.stop().await;
 }
 
-/// Row 12's positive half: a `pre-create` hook runs after the extra fetch
-/// but before promotion, so the session ref is not there yet — the hook
-/// recording an empty resolve pins the order.
+/// Row 12 of the case table, second half: a `pre-create` hook runs after
+/// the extra fetch but before promotion, so the session ref is not there
+/// yet — the hook recording an empty resolve pins the order.
 #[tokio::test]
 async fn the_pre_create_hook_runs_before_promotion() {
     let mut rig = Rig::start("fetch-ref-pre-sees").await;
@@ -584,77 +703,318 @@ async fn the_pre_create_hook_runs_before_promotion() {
     rig.stop().await;
 }
 
-/// A repository with a submodule commits the fetch without recursing: the
-/// session ref pins the parent commit while no submodule objects are fetched.
+/// Row 5 of the case table: the `fetch_ref` fetch must not recurse into
+/// submodules (the daemon passes `--no-recurse-submodules`). The fixture
+/// records `submodule.recurse=true` like an owner's recursive checkout
+/// and populates the submodule, moves the gitlink to v2, and resets
+/// `.git/modules/sub`'s `origin/main` to v1 before the daemon fetch — so
+/// a recursing fetch would move it back to v2 while this fetch must
+/// leave it at v1. The parent store never holds v2; only the
+/// submodule's own store does.
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the row-5 scenario builds the two-commit submodule origin, the v1 gitlink, the populated store and the move commit in one flow"
+)]
 async fn fetch_ref_does_not_recurse_into_submodules() {
     let mut rig = Rig::start("fetch-ref-submodule").await;
-    let sub_source = temp_dir("fetch-ref-submodule-source");
-    let sub_bare = sub_source.join("sub.git");
+    // A submodule whose origin has two commits of which the parent records
+    // only v1: `sub.git` holds both, the parent's own store never learns
+    // either. The fixture-local `file://` url keeps submodule clones
+    // in-process; the daemon's `fetch_ref` fetch still goes to `origin`,
+    // never to this url.
+    let sub_src = temp_dir("fetch-ref-sub-src");
+    let sub_bare = temp_dir("fetch-ref-sub-bare");
+    let sub_src_path = sub_src.join("sub");
+    let sub_bare_path = sub_bare.join("sub.git");
+    for (dir, args) in [
+        (&sub_src_path, vec!["init", "-q", "-b", "main", "."]),
+        (&sub_bare_path, vec!["init", "-q", "--bare", "."]),
+    ] {
+        std::fs::create_dir_all(dir).expect("create the submodule repositories");
+        let out = rig.git_raw(dir, &args);
+        assert!(
+            out.status.success(),
+            "init the submodule repositories: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Signed commits (a developer's `commit.gpgsign=true` reaches test git
+    // through the repository-local config) fail here, so the submodule
+    // commits stay unsigned like every other repo here.
+    rig.git_in(&sub_src_path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(sub_src_path.join("sub.txt"), "v1\n").expect("write the submodule file");
+    rig.git_in(&sub_src_path, &["add", "."]);
+    rig.git_in(&sub_src_path, &["commit", "-q", "-m", "sub v1"]);
+    let sub_url = format!("file://{}", sub_bare_path.display());
+    rig.git_in(&sub_src_path, &["remote", "add", "origin", &sub_url]);
     rig.git_in(
-        rig.repo.cwd(),
-        &["init", "-q", "--bare", &sub_bare.display().to_string()],
+        &sub_src_path,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
     );
-    let sub_clone = temp_dir("fetch-ref-subclone");
-    let sub_dir = sub_clone.join("sub");
+    let sub_v1 = rig.git_in(&sub_src_path, &["rev-parse", "HEAD"]);
+    std::fs::write(sub_src_path.join("sub.txt"), "v2\n").expect("write the submodule update");
+    rig.git_in(&sub_src_path, &["commit", "-q", "-am", "sub v2"]);
+    let sub_v2 = rig.git_in(&sub_src_path, &["rev-parse", "HEAD"]);
     rig.git_in(
-        rig.repo.cwd(),
-        &[
-            "clone",
-            "-q",
-            &sub_bare.display().to_string(),
-            &sub_dir.display().to_string(),
-        ],
+        &sub_src_path,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
     );
-    rig.git_in(&sub_dir, &["config", "user.email", "test@example.com"]);
-    rig.git_in(&sub_dir, &["config", "user.name", "Test"]);
-    rig.git_in(&sub_dir, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(sub_dir.join("sub.txt"), "sub\n").expect("write file");
-    rig.git_in(&sub_dir, &["add", "."]);
-    rig.git_in(&sub_dir, &["commit", "-q", "-m", "sub"]);
-    let sub_head = rig.git_in(&sub_dir, &["rev-parse", "HEAD"]);
-    rig.git_in(&sub_dir, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
     assert!(
         rig.repo
             .git_command()
-            .arg(format!("--git-dir={}", sub_bare.display()))
+            .arg(format!("--git-dir={}", sub_bare_path.display()))
             .args(["symbolic-ref", "HEAD", "refs/heads/main"])
             .output()
-            .expect("point the submodule origin at main")
+            .expect("point the submodule bare HEAD at main")
             .status
             .success(),
         "point the submodule origin at main"
     );
-    let sub_origin = format!("file://{}", sub_bare.display());
+    // Register the submodule at v1 without checking it out: a later
+    // `update --init` on a missing path would clone v2's head, so only
+    // the gitlink and `.gitmodules` are recorded for now. The parent store
+    // learns neither v1 nor v2 — the gitlink is written through plumbing,
+    // not through a checkout.
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "submodule.sub.path",
+            "sub",
+        ],
+    );
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "submodule.sub.url",
+            &sub_url,
+        ],
+    );
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &sub_v1,
+            "sub",
+        ],
+    );
+    // The worktree has no `sub` path, so the `update-index` entry above
+    // stages the gitlink while `add` can only stage `.gitmodules`: `commit`
+    // then records both from the index together.
+    rig.git(&["add", ".gitmodules"]);
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "record the submodule at v1",
+        ],
+    );
+    assert_eq!(
+        rig.git(&["rev-parse", "HEAD:sub"]),
+        sub_v1,
+        "the parent records the submodule at v1"
+    );
+    rig.git(&["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    // The base tip must record no submodule of its own: the daemon's
+    // base fetch then recurses into nothing, and only the `fetch_ref`
+    // fetch under test can move the probe. The record above registers
+    // the submodule before the base checkpoint, so switch to a branch
+    // that keeps pointing at that checkpoint (`base`) before opting
+    // into recursion.
+    // Opt the fixture parent into recursive fetching, the way an owner's
+    // checkout with `submodule.recurse=true` behaves. The daemon's base
+    // fetch and the `fetch_ref` fetch below then both recurse without
+    // `--no-recurse-submodules`; only the flag under test keeps the
+    // latter from moving the ref back to v1. (Hermetic mode that forgets
+    // `-c protocol.file.allow=always` breaks `update --init` *and* the
+    // `fetch_ref` fetch itself, so it stays scoped to this one call.)
+    // Scoped to this one call (the hermetic `git` below would refuse the
+    // `file://` clone without it): the recursion knob it checks in on is
+    // the repository-local `submodule.recurse=true` set above, which the
+    // daemon's fetches inherit from the repo state like every owner
+    // checkout would.
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "-q",
+        ],
+    );
+    rig.git(&["config", "submodule.recurse", "true"]);
+    rig.git(&["checkout", "-q", "-b", "base"]);
+    // A populated submodule is what makes recursion observable: it teaches
+    // the parent store nothing, keeps the gitlink, and leaves `.git/modules`
+    // in exactly the state an owner's recursive checkout has.
+    let _modules_repo = rig.repo.cwd().join(".git/modules/sub");
+    // `git_raw` runs `git -C <dir>`, so submodule-store probes `-C` into
+    // the submodule *worktree*: git discovers `.git/modules/sub` from
+    // there. (Probing with `--git-dir` hits the repo-discovery ceiling
+    // instead and reads nothing.)
+    let submodule_main = |rig: &Rig| {
+        String::from_utf8_lossy(
+            &rig.git_raw(
+                &rig.repo.cwd().join("sub"),
+                &["rev-parse", "refs/remotes/origin/main"],
+            )
+            .stdout,
+        )
+        .trim()
+        .to_owned()
+    };
+    // `update --init` cloned the submodule's v2 head (the origin the url
+    // switch points at serves only v2), so the store tracks v2 and v2's
+    // objects are there: the mutation probe below is not vacuous.
+    assert_eq!(
+        submodule_main(&rig),
+        sub_v2,
+        "the submodule store tracks its origin at v2"
+    );
+    assert!(
+        !rig.git_raw(
+            rig.repo.cwd(),
+            &["cat-file", "-e", &format!("{sub_v2}^{{commit}}")]
+        )
+        .status
+        .success(),
+        "the parent store has no submodule commit yet"
+    );
+    // Test-control proof (inherited environment): with the url switched
+    // to `sub.git`, `sync` + `update --init` teaches the store the v2 its
+    // origin serves, exactly as an owner's checkout would after the switch.
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "sync",
+            "-q",
+        ],
+    );
+    // Move the gitlink the `update --init` checkout recorded: the `sub`
+    // origin the checkout cloned serves only v2, so it records v2 — so
+    // the `fetch_ref` fetch below follows a gitlink the parent store can
+    // never have pre-fetched. Publish the parent's `main` at the v1
+    // gitlink on `origin` first: the daemon's base fetch then follows
+    // nothing (the submodule registers nowhere in v1's history), and
+    // only the `fetch_ref` fetch under test can move the probe to v2.
+    // Keep the checkout itself at v1 so the parent store learns no
+    // submodule commit while the gitlink advances. A bare `commit sub`
+    // cannot see the checkout's gitlink change, so stage the worktree
+    // state first.
+    rig.git_in(&rig.repo.cwd().join("sub"), &["fetch", "-q", "origin"]);
+    rig.git_in(&rig.repo.cwd().join("sub"), &["checkout", "-q", &sub_v2]);
+    rig.git(&["add", "sub"]);
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "move the submodule to v2",
+        ],
+    );
+    assert_eq!(
+        rig.git(&["rev-parse", "HEAD:sub"]),
+        sub_v2,
+        "the move commit records the submodule at v2"
+    );
+    let expected = rig.git(&["rev-parse", "HEAD"]);
+    // Publish the move commit on `origin` under the source ref without
+    // pushing the submodule along with it (the move commit carries the
+    // v2 gitlink, so a recursing push would teach `origin` the
+    // submodule's v2 — after which the fetch below would recurse from
+    // the wrong end and never discriminate). `git -c
+    // push.recurseSubmodules=no` scopes the knob to this one call: the
+    // fixture's `submodule.recurse=true` still governs every fetch (that
+    // is the recursion under test). The source ref then resolves on
+    // `origin`, and the daemon's `fetch_ref` fetch follows the v2
+    // gitlink: without `--no-recurse-submodules` it moves the probe to
+    // v2, with the flag it leaves the probe at v1.
+    rig.git(&["update-ref", SOURCE_REF, "HEAD"]);
     rig.git(&[
         "-c",
-        "protocol.file.allow=always",
-        "submodule",
-        "add",
+        "push.recurseSubmodules=no",
+        "push",
         "-q",
-        &sub_origin,
-        "sub",
+        "origin",
+        &format!("{SOURCE_REF}:{SOURCE_REF}"),
     ]);
-    rig.git(&["commit", "-q", "-m", "add submodule"]);
-    let origin = rig.origin.join("origin.git").display().to_string();
-    rig.git(&["push", "-q", &origin, "HEAD:refs/heads/main"]);
-    let expected = rig.origin_source_ref();
+    rig.git_in(
+        &rig.repo.cwd().join("sub"),
+        &["update-ref", "refs/remotes/origin/main", &sub_v1],
+    );
+    assert_eq!(
+        submodule_main(&rig),
+        sub_v1,
+        "the submodule origin/main points at v1 before the fetch"
+    );
 
     let (session, fetched) = started(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
+    assert_eq!(fetched.commit, expected);
 
-    assert_eq!(
-        rig.rev(&fetched.fetched_ref),
-        Some(expected.clone()),
-        "the session ref holds the expected commit"
-    );
-    // The fetch must not recurse: the submodule commit lives only in the
-    // submodule's own origin and never in the parent repository.
-    assert_eq!(rig.rev(&sub_head), None, "no submodule commit was fetched");
+    // The parent's own commit arrived in the repo's object store (the
+    // checkout stays on the base branch, so `cat-file -e` probes the
+    // *repository*, not the worktree), but the submodule's `origin/main`
+    // did not move and v2 stayed out of the parent store: a recursing fetch
+    // would have updated both.
     let worktree = session.worktree_path.as_deref().expect("worktree path");
+    assert!(
+        rig.git_raw(
+            rig.repo.cwd(),
+            &["cat-file", "-e", &format!("{expected}^{{commit}}")]
+        )
+        .status
+        .success(),
+        "the fetched parent commit exists in the repository"
+    );
     assert_eq!(
-        rig.git_in(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        "feat-fetch",
-        "the worktree checks out the requested branch"
+        submodule_main(&rig),
+        sub_v1,
+        "the submodule origin/main still points at v1 after a non-recursing fetch"
+    );
+    // v2 reached the *submodule* store through the fixture's own
+    // `sync`/`fetch` above (that is how the gitlink could be moved); the
+    // non-recursion claim is about the `fetch_ref` fetch itself, which
+    // must not have *moved* `origin/main` there. The parent store — the
+    // one the daemon fetched into — still lacks v2.
+    assert!(
+        !rig.git_raw(
+            rig.repo.cwd(),
+            &["cat-file", "-e", &format!("{sub_v2}^{{commit}}")]
+        )
+        .status
+        .success(),
+        "the submodule v2 commit stayed out of the parent store"
+    );
+    // The worktree starts from the pin the fetched base resolved to (the
+    // scenario's base tip), not from the move commit: the checkout's
+    // gitlink pinning the v2 the daemon just fetched keeps the session
+    // reproducible, while the fetched session ref itself records the
+    // move commit the base branch did not have.
+    assert_eq!(
+        rig.git_in(worktree, &["rev-parse", "HEAD:sub"]),
+        sub_v2,
+        "the checkout starts from the fetched move commit"
     );
     rig.stop().await;
 }

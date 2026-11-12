@@ -1647,6 +1647,9 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
 /// fails the fetch instead of writing it. Without `recurse_submodules` the
 /// fetch also passes `--no-recurse-submodules`, so untrusted content never
 /// triggers a submodule fetch or moves refs inside the owner's submodules.
+/// `--refmap=` disables the repository's configured `remote.origin.fetch`
+/// refspecs, so the fetch writes only `fetch_ref` and never moves a
+/// remote-tracking ref outside the session-owned refs.
 fn fetch_command(
     repo: &Path,
     source: &str,
@@ -1664,7 +1667,8 @@ fn fetch_command(
     if !recurse_submodules {
         cmd.arg("--no-recurse-submodules");
     }
-    cmd.arg("origin")
+    cmd.arg("--refmap=")
+        .arg("origin")
         .arg("--end-of-options")
         .arg(format!("{source}:{fetch_ref}"));
     Ok(cmd)
@@ -1672,22 +1676,20 @@ fn fetch_command(
 
 /// [`fetch_origin`] into the named destination ref.
 ///
-/// The refspec has no `+` and the destination must not exist beforehand, so a
-/// ref this request did not create is never overwritten, and a failed fetch
-/// never deletes anything. `--end-of-options` keeps the refspec positional even
-/// if a caller forgets the leading-dash guard (defense in depth against argv
-/// flag injection).
+/// [`fetch_origin`] with `FETCH_HEAD` and submodule recursion as git defaults.
 fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
     fetch_into_ref_with(repo, source, fetch_ref, true, true)
 }
 
 /// [`fetch_origin`] into the named destination ref.
 ///
-/// The refspec has no `+` and the destination must not exist beforehand, so a
-/// ref this request did not create is never overwritten, and a failed fetch
-/// never deletes anything. `--end-of-options` keeps the refspec positional even
-/// if a caller forgets the leading-dash guard (defense in depth against argv
-/// flag injection).
+/// `write_fetch_head` records the tip in `FETCH_HEAD` (as every other fetch
+/// of this daemon does); `recurse_submodules` lets the fetch follow
+/// submodules (as git defaults do). The refspec has no `+` and the
+/// destination must not exist beforehand, so a ref this request did not
+/// create is never overwritten, and a failed fetch never deletes anything.
+/// `--end-of-options` keeps the refspec positional even if a caller forgets
+/// the leading-dash guard (defense in depth against argv flag injection).
 pub(crate) fn fetch_into_ref_with(
     repo: &Path,
     source: &str,
@@ -1726,6 +1728,14 @@ pub(crate) fn fetch_into_ref_with(
         move || drop(guard),
     )?;
     if !output.status.success() {
+        // The probe above proved this request created `fetch_ref` when the
+        // fetch wrote it, so a failed fetch deletes its own temp ref: only
+        // the refspec's destination can name a session-owned ref while the
+        // fetch's opportunistic remote-tracking update is disabled by
+        // `--refmap=` on this fetch (a tracking update for another ref
+        // that git rejects still exits 1 after the destination was
+        // written).
+        let _ = git_run(repo, &["update-ref", "-d", fetch_ref]);
         return Err(output_failure_message(&output));
     }
     // The fetch created the ref (it was absent above), so this request owns it
