@@ -1084,6 +1084,27 @@ pub(crate) fn cline_shaped_host_with(
     )
 }
 
+/// A host serving the Cline-shaped fixture runtime as an official package next
+/// to the built-in shell and the official Codex, Claude and Hermes packages of
+/// [`official_host`], so one request reaches a runtime with a hook handler and
+/// no skill location beside runtimes that declare both.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn cline_shaped_and_official_host(program: &Path, args: &[String]) -> RuntimeHost {
+    let document = cline_shaped_document(program, args, CLINE_REQUIRES);
+    let definition =
+        cline_shaped_definition(&document).expect("the Cline-shaped fixture document is valid");
+    let builtin = BuiltinSource::new("/bin/sh");
+    let official = OfficialDefinitionSource(definition);
+    RuntimeHost::new(
+        RuntimeRegistry::from_sources(&[&builtin, &OfficialFixtureSource, &official])
+            .expect("the mixed fixture registry builds"),
+    )
+}
+
 /// The `[config_home]` table a fixture runtime driven by `handler` declares so
 /// its integration has a directory to act on; empty for a handler whose
 /// lifecycle the daemon does not run.

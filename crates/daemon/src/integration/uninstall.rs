@@ -69,7 +69,9 @@ pub fn uninstall_in(
 ///
 /// # Errors
 ///
-/// The errors of [`uninstall_in`].
+/// The errors of [`uninstall_in`], and `integration_agent_skill_unsupported`
+/// for a named runtime that declares no skill location or has no daemon-managed
+/// hook integration.
 pub fn uninstall_in_with(
     homes: &ConfigHomes,
     agent: &RuntimeRef,
@@ -80,7 +82,9 @@ pub fn uninstall_in_with(
     let mut uninstalled = Vec::new();
     let mut failed = Vec::new();
     let targets = match homes.existing_targets(Some(agent), selection) {
-        Err(error) if skill_only => return Err(super::handler::skill_refusal(Some(agent), error)),
+        Err(error) if skill_only => {
+            return Err(super::handler::skill_refusal(Some(agent), selection, error))
+        }
         result => result?,
     };
     if skill_only {
