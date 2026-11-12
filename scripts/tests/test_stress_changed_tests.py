@@ -187,7 +187,7 @@ class Fixture(unittest.TestCase):
         git(self.root, "add", "-A")
         git(self.root, "commit", "-q", "-m", message)
 
-    def write_metadata(self, extra_targets=()):
+    def write_metadata(self, extra_targets=(), extra_packages=()):
         def target(name, kind, rel):
             return {"name": name, "kind": [kind], "test": True,
                     "src_path": str(self.root / rel)}
@@ -199,16 +199,19 @@ class Fixture(unittest.TestCase):
                 *extra_targets]},
             {"name": "pohunek-cli", "targets": [
                 target("all", "test", "crates/cli/tests/all.rs")]},
+            *extra_packages,
         ]
         (self.tmp / "metadata.json").write_text(json.dumps({"packages": packages}))
 
-    def run_script(self, *extra, base="main", list_json=None, run_rc=0, profile="heavy"):
+    def run_script(self, *extra, base="main", list_json=None, run_rc=0, profile="heavy",
+                   extra_env=None):
         if list_json is not None:
             (self.tmp / "list.json").write_text(list_json)
         env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
                    FAKE_METADATA=str(self.tmp / "metadata.json"),
                    FAKE_LIST=str(self.tmp / "list.json"),
                    FAKE_LOG=str(self.log), FAKE_RUN_RC=str(run_rc))
+        env.update(extra_env or {})
         argv = [sys.executable, str(SCRIPT), "--base", base, "--count", "3",
                 "--deadline", "60s", "--profile", profile, *extra]
         if not LINUX:
@@ -736,6 +739,209 @@ class Arguments(Fixture):
         self.assertEqual(result.returncode, 0)
         for token in ("heavy", "50", "moved", "deleted"):
             self.assertIn(token, result.stdout)
+
+
+def unit_slow_list():
+    """Direct `entry_matches` probes: the daemon regex also matches
+    a selected name only when the package guard allows it."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(
+        "stress_changed_unit",
+        str(Path(__file__).resolve().parents[1] / "stress-changed-tests"))
+    spec = importlib.util.spec_from_loader("stress_changed_unit", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    daemon = module.Target("pohunek-daemon", "pohunek-daemon", "lib",
+                           Path("crates/daemon/src/lib.rs"))
+    regex = {"filter": "package(=pohunek-daemon) and test(/::running_loss::/)",
+             "reason": "probe"}
+    assert module.entry_matches(
+        daemon, "session::reconcile::tests::running_loss::pinned_case", regex)
+    demo = module.Target("demo", "demo", "lib", Path("crates/demo/src/lib.rs"))
+    assert not module.entry_matches(
+        demo, "session::reconcile::tests::running_loss::pinned_case", regex)
+    return listing({
+        "demo": {"tests::comment_edit": "matches",
+                   "session::reconcile::tests::running_loss::pinned_case": "matches"}})
+
+
+class SlowRunner(Fixture):
+    """`--slow-runner` wraps the run in strace sync-delay injection (#2213)."""
+    def setUp(self):
+        super().setUp()
+        (self.bin / "stress-run").unlink(missing_ok=True)
+        fake_stress_run = self.bin / "stress-run"
+        fake_stress_run.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "with open(os.environ['FAKE_LOG'], 'a') as stream:\n"
+            "    stream.write(json.dumps(['stress-run'] + sys.argv[1:]) + '\\n')\n"
+            "sys.exit(int(os.environ.get('FAKE_STRESS_RUN_RC', '0')))\n")
+        fake_stress_run.chmod(0o755)
+        fake_strace = self.bin / "strace"
+        fake_strace.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "if sys.argv[1:] == ['-V']:\n"
+            "    print('strace -- version 7.3 (fake)')\n"
+            "    sys.exit(0)\n"
+            "with open(os.environ['FAKE_LOG'], 'a') as stream:\n"
+            "    stream.write(json.dumps(['strace'] + sys.argv[1:]) + '\\n')\n"
+            "sys.exit(int(os.environ.get('FAKE_STRACE_RC', '0')))\n")
+        fake_strace.chmod(0o755)
+        self.edit("crates/demo/src/lib.rs", "// original comment", "// edit")
+        self.commit()
+        self.list_json = listing({"demo": {"tests::comment_edit": "matches"}})
+
+    def slow_argv(self, *extra, list_json=None, **kwargs):
+        listed_arg = self.list_json if list_json is None else list_json
+        result = self.run_script("--slow-runner", *extra, list_json=listed_arg, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        listed = next(call for call in calls if call[:2] == ["nextest", "list"])
+        run = next(call for call in calls if call[0] == "stress-run")
+        self.assertEqual(run[1:5], ["--deadline", "60s", "--cpus", "3"])
+        self.assertIn("--", run)
+        return (listed, run[run.index("strace"):]), result
+
+    def untraced_filter_union(self):
+        return " or ".join(
+            entry["filter"] for entry in json.loads(
+                (Path(__file__).resolve().parents[1]
+                 / "stress-slow-runner-untraced.json").read_text()))
+
+    def test_a_mixed_selection_runs_the_traced_and_the_untraced_run(self):
+        listed = self.mixed_root()
+        self.log.unlink(missing_ok=True)
+        result = self.run_script("--slow-runner", list_json=listed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        runs = [call for call in calls if call[0] == "stress-run"]
+        self.assertEqual(len(runs), 2)
+        traced_run = next(call for call in runs if "strace" in call)
+        untraced_run = next(call for call in runs if "strace" not in call)
+        self.assertIn("and not", " ".join(traced_run))
+        self.assertIn("running_loss", " ".join(untraced_run))
+        self.assertIn("NOT SLOWED session::reconcile::tests::running_loss::pinned_case",
+                      result.stderr)
+        self.assertIn("SLOWED tests::comment_edit", result.stderr)
+
+    def test_the_slow_run_wraps_the_same_nextest_argv_in_strace(self):
+        (listed, run), result = self.slow_argv()
+        self.assertEqual(listed[1], "list")
+        self.assertEqual(run[0], "strace")
+        self.assertEqual(
+            run[:8],
+            ["strace", "-f", "--seccomp-bpf", "-qq", "-o", "/dev/null",
+             "--trace=fsync,fdatasync", "--inject=fsync,fdatasync:delay_enter=8300"])
+        stress = [line for line in result.stderr.splitlines() if "stress-run" in line]
+        self.assertEqual(len(stress), 1)
+        self.assertIn("--cpus 3", stress[0])
+        self.assertIn("strace", stress[0])
+        self.assertIn("strace -- version", result.stderr)
+        self.assertIn("--all-features", listed)
+        argv = run[run.index("cargo"):]
+        self.assertEqual(argv[:7], ["cargo", "nextest", "run", "--profile", "heavy",
+                                    "--all-features", "-p"])
+        self.assertEqual(argv[argv.index("--stress-count") + 1], "3")
+        self.assertEqual(argv[argv.index("--retries") + 1], "0")
+        self.assertEqual(
+            argv[argv.index("-E") + 1],
+            "((package(=demo) and kind(lib) and (test(=tests::comment_edit)))) "
+            f"and not ({self.untraced_filter_union()})")
+        self.assertIn("SLOWED", result.stderr)
+        self.assertIn("tests::comment_edit", result.stderr)
+
+    def mixed_root(self):
+        daemon = self.root / "crates/daemon/src"
+        daemon.mkdir(parents=True)
+        (daemon / "lib.rs").write_text(
+            "#[cfg(test)]\nmod session {\n"
+            "    #[cfg(test)]\n    pub mod reconcile {\n"
+            "        #[cfg(test)]\n        pub mod tests {\n"
+            "            #[cfg(test)]\n            pub mod running_loss {\n"
+            "                #[test]\n                pub fn pinned_case() {\n"
+            "                    assert!(true);\n                }\n            }\n        }\n    }\n}\n")
+        self.write_metadata(extra_packages=({
+            "name": "pohunek-daemon", "targets": [{
+                "name": "pohunek-daemon", "kind": ["lib"], "test": True,
+                "src_path": str(daemon / "lib.rs")}]},))
+        (daemon / "lib.rs").write_text(
+            (daemon / "lib.rs").read_text() + "\n// touch running_loss\n")
+        self.commit("add running_loss test")
+        return listing({
+            "demo": {"tests::comment_edit": "matches",
+                       "session::reconcile::tests::running_loss::pinned_case": "matches"}})
+
+    def test_the_untraced_matcher_pairs_package_and_pattern(self):
+        unit_slow_list()
+
+    def test_a_selection_on_the_list_runs_without_strace(self):
+        listed = self.mixed_root()
+        self.log.unlink(missing_ok=True)
+        probe = self.run_script("--slow-runner", "--print", list_json=listed)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertIn("NOT SLOWED", probe.stdout)
+        self.assertIn("running_loss", probe.stdout)
+        result = self.run_script("--slow-runner", list_json=listed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        runs = [call for call in calls if call[0] == "stress-run"]
+        self.assertEqual(len(runs), 2)
+        untraced_run = next(call for call in runs if "strace" not in call)
+        self.assertIn("running_loss", " ".join(untraced_run))
+        self.assertIn("NOT SLOWED session::reconcile::tests::running_loss::pinned_case",
+                      result.stderr)
+
+    def test_a_failing_slow_run_fails_the_gate(self):
+        result = self.run_script("--slow-runner", list_json=self.list_json,
+                                 extra_env={"FAKE_STRESS_RUN_RC": "100"})
+        self.assertEqual(result.returncode, 100, result.stderr)
+
+    def test_slow_runner_with_unpinned_is_a_usage_error(self):
+        result = self.run_script("--slow-runner", "--unpinned", list_json=self.list_json)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--unpinned", result.stderr)
+
+    def test_slow_runner_without_strace_is_a_usage_error(self):
+        (self.tmp / "list.json").write_text(self.list_json)
+        (self.bin / "strace").write_text("#!/bin/sh\nexit 127\n")
+        saved_path = os.environ["PATH"]
+        cleared = os.pathsep.join(
+            entry for entry in saved_path.split(os.pathsep)
+            if Path(entry).resolve() != self.bin.resolve())
+        env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{cleared}",
+                   FAKE_METADATA=str(self.tmp / "metadata.json"),
+                   FAKE_LIST=str(self.tmp / "list.json"),
+                   FAKE_LOG=str(self.log), FAKE_RUN_RC="0")
+        argv = [sys.executable, str(SCRIPT), "--base", "main", "--count", "3",
+                "--deadline", "60s", "--profile", "heavy", "--slow-runner"]
+        result = subprocess.run(argv, cwd=self.root, capture_output=True, text=True,
+                                env=env, timeout=WAIT_SECONDS)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("strace", result.stderr)
+
+    def test_slow_runner_deadline_overrun_names_ptrace(self):
+        result = self.run_script("--slow-runner", list_json=self.list_json,
+                                 extra_env={"FAKE_STRESS_RUN_RC": "124"})
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIn("ptrace", result.stderr)
+
+    def test_the_untraced_list_entries_carry_evidence(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader(
+            "stress_changed", str(Path(__file__).resolve().parents[1] / "stress-changed-tests"))
+        spec = importlib.util.spec_from_loader("stress_changed", loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        entries = module.load_untraced_list()
+        self.assertTrue(entries, "the untraced list must not be empty")
+        for entry in entries:
+            self.assertTrue(entry.get("filter"), entry)
+            self.assertTrue(entry.get("reason"), entry)
+            self.assertTrue(entry.get("evidence"), entry)
 
 
 if __name__ == "__main__":

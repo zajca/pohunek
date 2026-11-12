@@ -1,0 +1,22 @@
+[
+  {
+    "filter": "package(=pohunek-daemon) and test(/::running_loss::/)",
+    "reason": "the 58 running_loss tests hang under strace: the supervisor fixtures drive the real worker under the subprocess launcher and record a real worker process the test kills",
+    "evidence": "issue #2213 (E2): measured hazard, reconcile.rs running_loss module"
+  },
+  {
+    "filter": "package(=pohunek-session-worker) and test(=pty::tests::held_root_tracer)",
+    "reason": "the tracer seizes the held root with ptrace itself; a traced process cannot be seized by a second tracer",
+    "evidence": "issue #2213 (E2): measured hazard, crates/session-worker/src/pty.rs held_root_tracer"
+  },
+  {
+    "filter": "package(=pohunek-session-worker) and test(=pty::tests::stop_waits_for_a_killed_root_the_kernel_reports_late)",
+    "reason": "the scenario spawns the held-root fixture whose tracer seizes the root with ptrace; tracing it again under strace conflicts",
+    "evidence": "issue #2213 (E2): measured hazard, crates/session-worker/src/pty.rs stop scenario"
+  },
+  {
+    "filter": "package(=pohunek-session-worker) and test(=pty::tests::a_root_unreaped_past_the_post_kill_deadline_fails_the_stop_with_its_state)",
+    "reason": "the scenario spawns the held-root fixture whose tracer seizes the root with ptrace; tracing it again under strace conflicts",
+    "evidence": "issue #2213 (E2): measured hazard, crates/session-worker/src/pty.rs stop scenario"
+  }
+]

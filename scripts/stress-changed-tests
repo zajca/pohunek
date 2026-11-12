@@ -2,7 +2,7 @@
 """Stress the Rust tests a diff adds or changes under CPU contention (#364).
 
     scripts/stress-changed-tests --base REV --count N --deadline DURATION \\
-        --profile PROFILE [--unpinned] [--print]
+        --profile PROFILE [--unpinned] [--slow-runner] [--print]
 
 A new timing-sensitive test that passes once and merges later fails on other
 people's branches. This gate runs exactly the tests the change touches, N
@@ -63,6 +63,17 @@ STRESSED and belongs to the Linux run that builds it with `--all-features`.
 The stress run is `scripts/stress-run --cpus 4 -- cargo nextest run --stress-count
 N ...`.
 
+`--slow-runner` (Linux only) reproduces the slower CI macOS runner: the run
+is pinned to 3 CPUs and every `fsync`/`fdatasync` is delayed by 8.3 ms through
+`strace --seccomp-bpf --inject=...:delay_enter=8300` (fable-ci report 1.7: the
+CI macOS slowdown fits 93 ms plus 8.3 ms per sync call over 89 sampled daemon
+tests). Tests listed in `scripts/stress-slow-runner-untraced.json` are too
+ptrace-sensitive to run under strace, so they still run pinned to 3 CPUs but
+untraced, and the summary reports them as NOT SLOWED; every other selected
+test runs under strace and is reported as SLOWED. `--slow-runner` conflicts
+with `--unpinned`, and a deadline overrun hints that a new test may belong on
+the untraced list.
+
 `--print` prints the static selection (target, test, source line) and the
 filterset, then exits without running cargo nextest.
 
@@ -76,6 +87,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -85,6 +97,22 @@ SOURCE_ROOT = "crates"
 # Contention width. CI's Linux test jobs run on 4 vCPUs, so the gate stresses
 # on 4 pinned CPUs whatever the host has (see scripts/stress-run).
 STRESS_CPUS = 4
+# Slow-runner width. The macOS runner has 3 vCPUs; `--slow-runner` pins the
+# run to 3 CPUs (fable-ci report 1.7: CI's macOS slowdown fits 93 ms plus
+# 8.3 ms per sync call, r = 0.81, over 89 sampled daemon tests).
+SLOW_RUNNER_CPUS = 3
+# Excess delay per sync call on the macOS runner, in microseconds,
+# injected with strace `delay_enter` (same report section).
+SLOW_RUNNER_SYNC_DELAY_US = 8300
+# Product sync calls on Linux: `File::sync_all` (libc `fsync`) and
+# `rustix::fs::fsync` in `crates/platform/src/filesystem.rs::durable_sync`.
+# No caller issues `fdatasync`, `sync_file_range` or `msync`, but the
+# trace set lists the stable `fsync`/`fdatasync` pair so a future
+# `fdatasync` caller is delayed too.
+SLOW_RUNNER_SYSCALLS = ("fsync", "fdatasync")
+# Tests too ptrace-sensitive to run under strace: they still run, pinned to
+# `SLOW_RUNNER_CPUS`, but untraced, and the summary reports them as NOT SLOWED.
+UNTRACED_LIST = Path(__file__).resolve().parent / "stress-slow-runner-untraced.json"
 # `#[...]` last path segments that mark a plain libtest/tokio test. The
 # attributes below generate several named variants per function, which the
 # exact-name filter cannot select, so they fail the run by name.
@@ -95,6 +123,14 @@ VARIANT_ATTRIBUTES = ("rstest", "test_case", "bench")
 # tier archives build default features, so the profiles below do the same.
 ALL_FEATURES_FLAGS = ("--all-features",)
 DEFAULT_FEATURE_PROFILES = ("macos",)
+def stress_run_argv0():
+    """`scripts/stress-run` by PATH lookup, else the sibling script."""
+    found = shutil.which("stress-run")
+    if found is not None:
+        return found
+    return str(Path(__file__).resolve().parent / "stress-run")
+
+
 STRESS_RUN = Path(__file__).resolve().parent / "stress-run"
 EXIT_UNMAPPED = 1
 EXIT_USAGE = 2
@@ -809,15 +845,76 @@ def build_filter(selected):
     return " or ".join(clauses)
 
 
+def load_untraced_list():
+    """The ptrace-sensitive entries of `scripts/stress-slow-runner-untraced.json`."""
+    try:
+        entries = json.loads(UNTRACED_LIST.read_text())
+    except (OSError, ValueError) as error:
+        raise SelectionError(
+            f"cannot read the untraced list {UNTRACED_LIST.name}: {error}")
+    if not isinstance(entries, list) or not entries:
+        raise SelectionError(
+            f"the untraced list {UNTRACED_LIST.name} must be a non-empty list")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SelectionError(
+                f"the untraced list {UNTRACED_LIST.name} holds only objects: {entry!r}")
+        for key in ("filter", "reason", "evidence"):
+            if not entry.get(key):
+                raise SelectionError(
+                    f"the untraced list {UNTRACED_LIST.name} needs a non-empty "
+                    f"{key!r} on every entry: {entry!r}")
+    return entries
+
+
+def entry_matches(target, name, entry):
+    """Whether a selected test belongs to an untraced-list entry.
+
+    `filter` is a nextest filterset restricted to an optional
+    `package(=<name>)` head and a `test(...)` matcher (`=` for an exact
+    name, `/.../ ` for a regex).
+    """
+    package = re.search(r"package\(=(.*?)\)", entry["filter"])
+    if package is not None and package.group(1) not in (target.package, target.binary_id):
+        return False
+    exact = re.search(r"(?<![/=])test\(=(.*?)\)(?!\s*/)", entry["filter"])
+    if exact is not None:
+        return exact.group(1) == name
+    regex = re.search(r"test\(/(.*?)/\)", entry["filter"])
+    if regex is not None:
+        return re.search(regex.group(1), name) is not None
+    return False
+
+
+def split_untraced(selected, entries):
+    """`(traced, untraced)` split of `selected` by the untraced list."""
+    traced = []
+    untraced = []
+    for target, name, rel, line in selected:
+        reason = next(
+            (entry["reason"] for entry in entries
+             if entry_matches(target, name, entry)),
+            None)
+        if reason is None:
+            traced.append((target, name, rel, line))
+        else:
+            untraced.append((target, name, rel, line, reason))
+    return traced, untraced
+
+
 def package_args(selected):
     """`-p <package>` for each package a selected test lives in.
 
     Restricting the build to them keeps the list and the run from compiling
     every test binary of the workspace.
     """
+    seen = set()
     args = []
-    for package in sorted({target.package for target, _, _, _ in selected}):
-        args += ["-p", package]
+    for target, _, _, _ in sorted(selected, key=lambda s: (s[0].package, s[1])):
+        if target.package in seen:
+            continue
+        seen.add(target.package)
+        args += ["-p", target.package]
     return args
 
 
@@ -840,7 +937,12 @@ def verify_listed(root, profile, expression, selected, allow_missing, packages):
     missing = []
     runnable = []
     for target, name, rel, line in selected:
-        suite = suites.get(target.binary_id)
+        suite = suites.get(target.binary_id) or suites.get(target.package)
+        if suite is None:
+            suite = next(
+                (candidate for candidate in suites.values()
+                 if name in candidate.get("testcases", {})),
+                None)
         case = suite["testcases"].get(name) if suite else None
         if case is None:
             if allow_missing and (target.binary_id, name) in HOST_DEPENDENT:
@@ -900,6 +1002,11 @@ def build_parser():
                         help="nextest profile that owns the tests (heavy, macos, ...)")
     parser.add_argument("--unpinned", action="store_true",
                         help="pass --unpinned to stress-run (required on macOS)")
+    parser.add_argument("--slow-runner", action="store_true",
+                        help="pin 3 CPUs and delay every fsync/fdatasync with strace, "
+                        "like the 3-vCPU macOS runner with slow storage sync "
+                        "(Linux only; ptrace-sensitive tests from "
+                        "stress-slow-runner-untraced.json run pinned but untraced)")
     parser.add_argument("--allow-missing-on-host", action="store_true",
                         help="stress only the tests this host builds; name each one it does "
                         "not build (for example another OS's cfg) as NOT STRESSED, which the "
@@ -924,9 +1031,25 @@ def main(argv):
         return 0
     expression = build_filter(selected)
     if args.print_only:
+        slow_split = None
+        if args.slow_runner:
+            try:
+                entries = load_untraced_list()
+            except SelectionError as error:
+                print(f"stress-changed-tests: {error}", file=sys.stderr)
+                return EXIT_UNMAPPED
+            traced, untraced = split_untraced(selected, entries)
+            union = ' or '.join(entry['filter'] for entry in entries)
+            slow_split = (f"SLOWED: ({build_filter(traced)}) and not ({union})"
+                          if traced else "SLOWED: (nothing selected)",
+                          f"NOT SLOWED: ({build_filter([s[:4] for s in untraced])}) "
+                          f"and ({union})" if untraced else "NOT SLOWED: (nothing selected)")
         for target, name, rel, line in sorted(selected, key=lambda s: (s[0].binary_id, s[1])):
             print(f"{target.binary_id} {name} ({rel}:{line})")
         print(f"filter: {expression}")
+        if slow_split is not None:
+            print(f"slow-runner: {slow_split[0]}")
+            print(f"slow-runner: {slow_split[1]}")
         return 0
     packages = package_args(selected)
     try:
@@ -946,9 +1069,108 @@ def main(argv):
         *packages, "--stress-count", str(args.count), "--retries", "0", "--no-tests=fail",
         "-E", expression,
     ]
-    print(f"stress-changed-tests: {len(selected)} test(s); {shlex.join(command)}", file=sys.stderr)
-    os.chdir(root)
-    os.execv(command[0], command)
+    if not args.slow_runner:
+        print(f"stress-changed-tests: {len(selected)} test(s); {shlex.join(command)}",
+              file=sys.stderr)
+        os.chdir(root)
+        os.execv(command[0], command)
+    return run_slow_runner(root, args, selected, packages)
+
+
+def strace_version():
+    """`strace -V` first line, or None when strace is missing or fails."""
+    try:
+        result = subprocess.run(["strace", "-V"], capture_output=True, text=True)
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.splitlines()[0] if result.stdout else None
+
+
+def slow_runner_checks(args):
+    """Usage errors for `--slow-runner`; returns the strace banner line."""
+    if not sys.platform.startswith("linux"):
+        raise SelectionError(
+            "--slow-runner needs Linux: strace and CPU affinity are unavailable elsewhere")
+    if args.unpinned:
+        raise SelectionError("--slow-runner and --unpinned conflict: the slow runner pins 3 CPUs")
+    if shutil.which("strace") is None:
+        raise SelectionError("--slow-runner needs strace on PATH")
+    version = strace_version()
+    if version is None:
+        raise SelectionError("--slow-runner needs a working `strace -V`")
+    return version
+
+
+def traced_command(args, profile_flags, packages, count, expression):
+    """The stress-run argv wrapping nextest in strace sync-delay injection."""
+    traced = ",".join(SLOW_RUNNER_SYSCALLS)
+    inject = f"{traced}:delay_enter={SLOW_RUNNER_SYNC_DELAY_US}"
+    return [
+        stress_run_argv0(), "--deadline", args.deadline, "--cpus", str(SLOW_RUNNER_CPUS),
+        "--", "strace", "-f", "--seccomp-bpf", "-qq", "-o", "/dev/null",
+        f"--trace={traced}", f"--inject={inject}",
+        "cargo", "nextest", "run", "--profile", args.profile, *profile_flags,
+        *packages, "--stress-count", str(count), "--retries", "0",
+        "--no-tests=fail", "-E", expression,
+    ]
+
+
+def untraced_command(args, profile_flags, packages, count, expression):
+    """The pinned 3-CPU stress-run argv without strace."""
+    return [
+        stress_run_argv0(), "--deadline", args.deadline, "--cpus", str(SLOW_RUNNER_CPUS),
+        "--", "cargo", "nextest", "run", "--profile", args.profile, *profile_flags,
+        *packages, "--stress-count", str(count), "--retries", "0",
+        "--no-tests=fail", "-E", expression,
+    ]
+
+
+def run_stress_run(root, command):
+    """Run one stress-run command in `root`; returns its exit status."""
+    return subprocess.run(command, cwd=root).returncode
+
+
+def run_slow_runner(root, args, selected, packages):
+    """Run the slow-runner mode; the exit status is non-zero if either run fails."""
+    try:
+        version = slow_runner_checks(args)
+    except SelectionError as error:
+        print(f"stress-changed-tests: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    print(f"stress-changed-tests: slow-runner ({version}); "
+          f"{len(selected)} test(s) pinned to {SLOW_RUNNER_CPUS} CPUs", file=sys.stderr)
+    try:
+        entries = load_untraced_list()
+    except SelectionError as error:
+        print(f"stress-changed-tests: {error}", file=sys.stderr)
+        return EXIT_UNMAPPED
+    traced, untraced = split_untraced(selected, entries)
+    profile_flags = build_flags(args.profile)
+    status = 0
+    if traced:
+        expression = f"({build_filter(traced)}) and not ({' or '.join(e['filter'] for e in entries)})"
+        command = traced_command(args, profile_flags, packages, args.count, expression)
+        print(f"stress-changed-tests: {len(traced)} SLOWED test(s); "
+              f"{shlex.join(command)}", file=sys.stderr)
+        status = run_stress_run(root, command) or status
+        for _, name, _, _ in sorted(traced, key=lambda s: s[1]):
+            print(f"stress-changed-tests: SLOWED {name}", file=sys.stderr)
+    if untraced:
+        expression = f"({build_filter([s[:4] for s in untraced])}) and ({' or '.join(e['filter'] for e in entries)})"
+        command = untraced_command(args, profile_flags, packages, args.count, expression)
+        print(f"stress-changed-tests: {len(untraced)} NOT SLOWED test(s) "
+              f"(pinned, untraced); {shlex.join(command)}", file=sys.stderr)
+        untraced_status = run_stress_run(root, command)
+        status = untraced_status or status
+        for _, name, _, _, _ in sorted(untraced, key=lambda s: s[1]):
+            print(f"stress-changed-tests: NOT SLOWED {name}", file=sys.stderr)
+    if status == 124:
+        print("stress-changed-tests: the deadline overran; a test may be ptrace-sensitive: "
+              "run it without --slow-runner to confirm, and add it to "
+              "scripts/stress-slow-runner-untraced.json with evidence", file=sys.stderr)
+    return status
 
 
 if __name__ == "__main__":
