@@ -2849,6 +2849,173 @@ class TestSelectionWiringTests(unittest.TestCase):
                 )), runs)
 
 
+# The delta reuse wiring (issue #2203): a tier=main dispatch with delta=true
+# reuses the green jobs of the newest same-tree pull request run. The guards
+# below keep the allowlist, its consumers, and the skip clauses in lockstep.
+REUSE_JOB = "reuse"
+# Aggregators combine other jobs' results and never run as reused legs: the
+# selection verdict, the duplicates report both runs feed, and every
+# fail-fast cancellation.
+REUSE_AGGREGATORS = {"test-selection-verdict", "test-duplicates"}
+# Consumers that need a reusable job but can never run on a tier=main
+# dispatch: the check runs on pull requests only, the audit on nightly only.
+REUSE_NEVER_ON_DISPATCH = {"test-selection-check", "test-selection-audit"}
+
+
+def reuse_config() -> dict:
+    return json.loads((ROOT / "scripts" / "ci-reuse.json").read_text())
+
+
+def reverse_needs() -> dict[str, set[str]]:
+    """Every job that lists `name` in its `needs`, single- or multi-line."""
+    jobs = workflow_jobs()
+    reverse: dict[str, set[str]] = {}
+    for job, body in jobs.items():
+        match = re.search(r"(?m)^    needs: (?:\[(.*)\]|([a-z][a-z0-9-]*))$", body)
+        if match is not None:
+            listed = match.group(1)
+            needed = (
+                [name.strip() for name in listed.split(",")]
+                if listed is not None
+                else [match.group(2)]
+            )
+        else:
+            listed = re.search(r"(?ms)^    needs:\n((?:      - [a-z][a-z0-9-]*\n)+)", body)
+            needed = re.findall(r"(?m)^      - ([a-z][a-z0-9-]*)$", listed.group(1)) if listed else []
+        for name in needed:
+            reverse.setdefault(name, set()).add(job)
+    return reverse
+
+
+def cancel_after_jobs() -> set[str]:
+    return {name for name in workflow_jobs() if name.startswith("cancel-after-")}
+
+
+class DeltaReuseWiringTests(unittest.TestCase):
+    def test_the_reuse_config_has_the_expected_shape(self):
+        config = reuse_config()
+        self.assertEqual(config["max_age_hours"], 24)
+        self.assertEqual(config["source_events"], ["pull_request"])
+        self.assertEqual(
+            set(config["not_dispatch_consumers"]),
+            REUSE_NEVER_ON_DISPATCH | {"sdk"},
+            "the map documents every consumer that is not reusable on a dispatch",
+        )
+        for job_id, entry in config["jobs"].items():
+            with self.subTest(job=job_id):
+                self.assertTrue(entry["names"], "every reusable job names its legs")
+                self.assertIsInstance(entry["selection_dependent"], bool)
+                self.assertIsInstance(entry["consumers"], list)
+                self.assertTrue(entry["reason"], "every reusable job says why it is safe")
+        # The sdk entry explains why it is not reusable: its producers are
+        # not all reusable.
+        self.assertIn("producer", config["not_dispatch_consumers"]["sdk"])
+
+    def test_the_config_consumers_match_the_workflow_needs(self):
+        needed_by = reverse_needs()
+        aggregators = REUSE_AGGREGATORS | cancel_after_jobs()
+        self.assertTrue(
+            cancel_after_jobs(),
+            "the aggregator set must cover the fail-fast cancellations",
+        )
+        for job_id, entry in reuse_config()["jobs"].items():
+            with self.subTest(job=job_id):
+                self.assertEqual(
+                    set(entry["consumers"]),
+                    needed_by.get(job_id, set()) - aggregators - REUSE_NEVER_ON_DISPATCH,
+                )
+
+    def test_the_never_on_dispatch_consumers_cannot_run_on_a_main_dispatch(self):
+        for job_id in REUSE_NEVER_ON_DISPATCH:
+            with self.subTest(job=job_id):
+                condition = job_condition(job_id)
+                self.assertNotIn("inputs.tier == 'main'", condition)
+                # The job either runs on pull requests without a dispatch
+                # tier, or on nightly dispatches only.
+                self.assertTrue(
+                    "github.event_name == 'pull_request'" in condition
+                    or "inputs.tier == 'nightly'" in condition,
+                    condition,
+                )
+
+    def test_the_full_fast_legs_come_from_the_same_source_the_workflow_uses(self):
+        names = reuse_config()["jobs"]["fast-tests"]["names"]
+        self.assertEqual(
+            names,
+            [f"tests ({shard}, fast)" for shard in partitions_module().FAST_SHARDS],
+            "the config lists every full fast leg the workflow plans",
+        )
+
+    def test_the_reuse_job_runs_only_on_a_delta_dispatch(self):
+        job = workflow_jobs()[REUSE_JOB]
+        self.assertNotRegex(job, r"(?m)^    needs:")
+        self.assertEqual(
+            job_condition(REUSE_JOB),
+            "github.event_name == 'workflow_dispatch' "
+            "&& inputs.tier == 'main' && inputs.delta",
+        )
+        for output in ("skip", "source_run", "tree"):
+            self.assertIn(f"      {output}: ${{{{ steps.decide.outputs.{output} }}}}\n", job)
+
+    def test_every_reusable_job_needs_reuse_and_names_itself_in_skip(self):
+        jobs = workflow_jobs()
+        config = reuse_config()["jobs"]
+        for job_id in config:
+            with self.subTest(job=job_id):
+                self.assertIn(REUSE_JOB, job_needs(jobs[job_id]))
+                self.assertIn(
+                    f"!contains(fromJSON(needs.reuse.outputs.skip || '[]'), '{job_id}')",
+                    job_condition(job_id),
+                )
+
+    def test_only_reusable_jobs_and_the_verdict_depend_on_reuse(self):
+        needed_by = reverse_needs()
+        self.assertEqual(
+            needed_by.get(REUSE_JOB, set()),
+            set(reuse_config()["jobs"]) | REUSE_AGGREGATORS,
+            "only the reusable jobs and the aggregators wait on the reuse decision",
+        )
+
+    def test_a_skipped_reuse_job_never_skips_a_reusable_job(self):
+        # Every event but a delta dispatch skips the reuse job; its outputs
+        # are then empty, so `skip || '[]'` reads as no skip and each
+        # reusable job runs exactly as before. With an empty skip the
+        # clause is true, so replacing it with `true` must change nothing.
+        clause = re.compile(
+            r" && !contains\(fromJSON\(needs\.reuse\.outputs\.skip \|\| '\[\]'\), '[a-z-]+'\)"
+        )
+        for job_id in reuse_config()["jobs"]:
+            condition = job_condition(job_id)
+            self.assertEqual(len(clause.findall(condition)), 1, job_id)
+            without_reuse = clause.sub("", condition)
+            as_true = clause.sub(" && always()", condition)
+            for event, tier in (
+                ("pull_request", ""),
+                ("push", ""),
+                ("schedule", ""),
+                ("workflow_dispatch", "main"),
+                ("workflow_dispatch", "nightly"),
+            ):
+                with self.subTest(job=job_id, event=event, tier=tier):
+                    self.assertEqual(
+                        bool(evaluate_needs_expression(
+                            as_true, event=event, tier=tier,
+                            results={REUSE_JOB: "skipped"}, outputs={REUSE_JOB: {}},
+                        )),
+                        bool(evaluate_needs_expression(
+                            without_reuse, event=event, tier=tier,
+                            results={REUSE_JOB: "skipped"}, outputs={REUSE_JOB: {}},
+                        )),
+                    )
+
+    def test_the_delta_input_defaults_to_a_full_dispatch(self):
+        dispatch = block(block(CI.split("jobs:\n", 1)[0], "workflow_dispatch", indent=2),
+                         "inputs", indent=4)
+        delta = block(dispatch, "delta", indent=6)
+        self.assertIn("type: boolean", delta)
+        self.assertIn("default: false", delta)
+
+
 class DocsOnlyPathTests(unittest.TestCase):
     """A pull request whose every change is prose skips the build and lint gates."""
 
