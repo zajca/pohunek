@@ -234,7 +234,7 @@ CI-timing variants):
 cargo t                        # all fast tests, no PTY/DB fixtures
 cargo t -p pohunek-daemon       # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
-cargo tw                       # unfiltered full suite, four test processes (main behaviour)
+cargo tw                       # unfiltered full suite, four test processes
 bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
 bacon                          # watcher: profile-fast nextest loop (bacon.toml)
 python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/cli/heavy)

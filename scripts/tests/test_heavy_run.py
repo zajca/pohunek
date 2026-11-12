@@ -128,11 +128,11 @@ class Fixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        # A short `tmpfs_root`: the N4 per-slot budget keeps every
+        # A short `tmpfs_root`: the per-slot socket budget keeps every
         # `<root>/<slot>` within the 9-byte RUN_BASE_MAX_LENGTH, while the
         # temp dir path is far longer. The name is created exclusively
         # (the make_run_base pattern in scripts/test-partitions:
-        # RUN_BASE_PARENT is /tmp, the name fills RUN_BASE_NAME_LENGTH);
+        # RUN_BASE_PARENT is /tmp, the name is one letter after `h`);
         # only what this fixture created is ever removed.
         self.root = None
         alphabet = string.ascii_lowercase + string.digits
@@ -148,14 +148,14 @@ class Fixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.locks = self.tmp / "locks"
         self.locks.mkdir()
-        # `write_config` runs before `self.env` exists, so the fake
-        # `systemd-run` defaults to a per-fixture directory beside the
-        # log instead of reading the environment.
+        # The fakes carry the pid directory baked into their text (see
+        # `FAKE_SYSTEMD_RUN`/`FAKE_SYSTEMCTL` above), so no environment
+        # lookup is involved when they run.
         self.pid_dir = self.tmp / "pids"
         self.pid_dir.mkdir()
         (self.bin / "systemd-run").write_text(
             FAKE_SYSTEMD_RUN.replace("$FAKE_PID_DIR", str(self.pid_dir)))
-        for name in ("sh", "echo", "cat", "stat", "flock", "sleep", "find", "rm", "chmod", "mkdir", "mountpoint", "findmnt"):
+        for name in ("sh", "echo", "cat", "stat", "flock", "sleep", "find", "rm", "chmod", "mkdir", "mountpoint", "findmnt", "touch"):
             target = self.bin / name
             if not target.exists():
                 target.symlink_to(f"/usr/bin/{name}")
@@ -225,6 +225,46 @@ class Fixture(unittest.TestCase):
         self.assertEqual(len(stops), 1, calls)
         self.assertFalse(any(self.slot_dir().iterdir()))
 
+    def test_a_reaped_child_still_fails_instead_of_passing(self):
+        # The reap must not silently pass a failed command when the child
+        # is reaped between the liveness check and the reap: the guarded
+        # reap skips the loop body on the reaped pid, so the status stays
+        # 0 for a failed command. The probe below runs that exact guarded
+        # sequence in a shell of its own and asserts the skip, and asserts
+        # the replacement single `wait` fails (127) on the same drained
+        # child instead of passing.
+        probe = self.tmp / "reap-probe.sh"
+        probe.write_text(
+            "#!/bin/sh\n"
+            "( exit 41 ) &\n"
+            "cpid=$!\n"
+            'if ! kill -0 "$cpid" 2>/dev/null; then\n'
+            '    wait "$cpid" || slot_rc=$?\n'
+            "else\n"
+            '    wait "$cpid" 2>/dev/null || true\n'
+            "fi\n"
+            "slot_rc=0\n"
+            'while kill -0 "$cpid" 2>/dev/null; do\n'
+            '    wait "$cpid" || slot_rc=$?\n'
+            "done\n"
+            'echo "guarded=$slot_rc"\n'
+            "( exit 41 ) &\n"
+            "cpid2=$!\n"
+            'wait "$cpid2" 2>/dev/null || true\n'
+            "slot_rc=0\n"
+            'wait "$cpid2" || slot_rc=$?\n'
+            'echo "single=$slot_rc"\n')
+        result = subprocess.run(
+            ["sh", str(probe)], capture_output=True, text=True, timeout=WAIT_SECONDS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("guarded=0", result.stdout.splitlines(),
+                      f"the guarded reap must skip the reap: {result.stdout!r}")
+        self.assertIn("single=127", result.stdout.splitlines(),
+                      f"the single wait must fail instead of passing: {result.stdout!r}")
+        script = SCRIPT.read_text()
+        self.assertNotIn('while kill -0 "$cmd_pid"', script,
+                         "the guarded reap must be gone: it skips the reap on a reaped pid")
+
     def test_the_scope_is_stopped_after_success(self):
         self.write_config(slots=1)
         result, calls = self.run_script("true")
@@ -258,43 +298,50 @@ class Fixture(unittest.TestCase):
         self.assertFalse(any(sibling.iterdir()))
 
     def test_a_busy_slot_waits_and_then_runs_the_command(self):
-        # Hold both slot locks from this process, release them after a
-        # delay, and prove the wrapper waits and then runs the command
-        # exactly once: no exit 0 without having run it.
-        self.write_config(slots=2)
-        markers = []
+        # Hold the single slot lock from this process, release it after the
+        # wrapper settles into its wait sleep, and prove the wrapper waits
+        # and then runs the command exactly once: no exit 0 without having
+        # run it.
+        self.write_config(slots=1)
         holders = []
         try:
-            for slot in (1, 2):
-                path = self.locks / f"pohunek-heavy-slot-{slot}.lock"
-                path.touch()
-                holder = open(path, "w")
-                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                holders.append(holder)
+            path = self.locks / "pohunek-heavy-slot-1.lock"
+            path.touch()
+            holder = open(path, "w")
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            holders.append(holder)
             marker = self.tmp / "ran-after-wait"
-            markers.append(marker)
             proc = subprocess.Popen(
                 ["sh", str(SCRIPT), "sh", "-c", f'echo ran > "{marker}"'],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 env=self.env,
             )
             try:
-                # Wait for the wrapper's own sleep child to exist: the first
-                # full pass over both busy slots has finished, so the outer
-                # wait loop (r2) is engaged and any exit now is the bug.
+                # Wait until the wrapper's own wait sleep exists: the full
+                # pass over the busy slot has finished, so the outer wait
+                # loop is engaged and any exit now is the bug. The child
+                # must be `sleep` itself (read via /proc comm), not merely
+                # any child: with one slot there is no second slot whose
+                # lock attempt could be mistaken for the wait sleep.
                 deadline = time.monotonic() + WAIT_SECONDS
                 while True:
-                    children = Path(f"/proc/{proc.pid}/task").glob("*/children")
-                    sleepers = [child.read_text().split() for child in children
-                                if child.exists()]
-                    if any(sleepers):
+                    comms = []
+                    for child in Path(f"/proc/{proc.pid}/task").glob("*/children"):
+                        if not child.exists():
+                            continue
+                        for pid in child.read_text().split():
+                            try:
+                                comms.append(Path(f"/proc/{pid}/comm").read_text().strip())
+                            except OSError:
+                                pass
+                    if "sleep" in comms:
                         break
                     if proc.poll() is not None or time.monotonic() > deadline:
                         break
                     time.sleep(0.1)
                 if proc.poll() is not None:
                     _, early_err = proc.communicate(timeout=WAIT_SECONDS)
-                    self.fail(f"the wrapper exited rc={proc.returncode} while both slots were held: {early_err}")
+                    self.fail(f"the wrapper exited rc={proc.returncode} while the slot was held: {early_err}")
                 for holder in holders:
                     fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
                     holder.close()
@@ -349,9 +396,9 @@ class Fixture(unittest.TestCase):
         marker = self.tmp / "nine-byte-boundary"
         result, calls = self.run_script("sh", "-c", f'echo ran > "{marker}"')
         self.assertEqual(marker.read_text().strip(), "ran")
-        self.assertLessEqual(len(str(self.slot_dir())), 9)
+        self.assertEqual(len(str(self.slot_dir())), 9)
 
-    def test_an_unreadable_stale_dir_fails_the_release_sweep(self):
+    def test_an_unreadable_stale_dir_fails_the_acquisition_sweep(self):
         stale = self.slot_dir()
         stale.mkdir()
         (stale / "sub").mkdir()
@@ -360,21 +407,42 @@ class Fixture(unittest.TestCase):
         try:
             result, _ = self.run_script("sh", "-c", "exit 43", check_status=False, check_slot=False)
             self.assertEqual(result.returncode, 1, result.stderr)
-            self.assertIn("warning: sweep", result.stderr)
             self.assertIn("cannot sweep slot directory", result.stderr)
-            # The entry itself survives: a failed release sweep never
-            # deletes what it could not sweep (`rm` cannot touch the
-            # mode-0 directory, so it stays put).
+            # The entry itself survives: a failed acquisition sweep never
+            # runs the command (`rm` cannot touch the mode-0 directory,
+            # so it stays put and `exit 43` never runs).
             self.assertTrue((stale / "sub").exists())
         finally:
             (stale / "sub").chmod(0o755)
 
+    def test_a_failed_release_sweep_keeps_the_command_status(self):
+        # The command plants an unreadable entry and then fails: the
+        # release sweep cannot remove it, warns, and keeps the command's
+        # own status instead of masking it. Reverting the `slot_rc`
+        # branch in the release sweep breaks this scenario.
+        self.write_config(slots=1)
+        result, _ = self.run_script(
+            "sh", "-c",
+            'mkdir -p "$TMPDIR/sub" && touch "$TMPDIR/sub/drop"'
+            ' && chmod 0 "$TMPDIR/sub" && exit 41',
+            check_status=False, check_slot=False)
+        try:
+            self.assertEqual(result.returncode, 41, result.stderr)
+            self.assertIn("warning: sweep", result.stderr)
+            self.assertTrue((self.slot_dir() / "sub").exists())
+        finally:
+            (self.slot_dir() / "sub").chmod(0o755)
+
     def test_an_uncreatable_slot_dir_refuses_without_running(self):
-        blocker = self.tmp / "blocker"
+        blocker = self.root / "1"
         blocker.write_text("not a directory")
-        self.write_config(slots=1, tmpfs_root=str(blocker))
-        result, calls = self.run_script("true", check_slot=False, expected_rc=1)
-        self.assertEqual(calls, [])
+        try:
+            self.write_config(slots=1)
+            result, calls = self.run_script("true", check_slot=False, expected_rc=1)
+            self.assertIn("cannot create slot directory", result.stderr)
+            self.assertEqual(calls, [])
+        finally:
+            blocker.unlink()
 
     def test_the_acquisition_sweep_clears_a_stale_leftover(self):
         stale = self.slot_dir()
@@ -459,9 +527,10 @@ class Fixture(unittest.TestCase):
             self.skipTest("sends SIGTERM to the wrapper PID only")
         marker = self.slot_dir() / "started"
         marker.unlink(missing_ok=True)
+        err_file = self.tmp / "wrapper-stderr.txt"
         proc = subprocess.Popen(
-            ["sh", str(SCRIPT), "sh", "-c", f'echo started > "{marker}"; sleep 600'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            ["sh", str(SCRIPT), "sh", "-c", f'echo started > "{marker}"; exec sleep 600'],
+            stdout=subprocess.DEVNULL, stderr=open(err_file, "w"), text=True,
             env=self.env,
         )
         try:
@@ -469,17 +538,26 @@ class Fixture(unittest.TestCase):
             while time.monotonic() < deadline and not marker.exists():
                 time.sleep(0.1)
             self.assertTrue(marker.exists(), "the command never started")
+            # Wait for the fake `systemd-run` to record the command PID
+            # under the unit: the trap's stop must find the command alive.
+            # The unit name embeds the wrapper PID (`pohunek-heavy-1-<pid>`).
+            pid_file = self.pid_dir / f"pohunek-heavy-1-{proc.pid}.scope"
+            deadline = time.monotonic() + WAIT_SECONDS
+            while time.monotonic() < deadline and not pid_file.exists():
+                time.sleep(0.05)
+            self.assertTrue(pid_file.exists(), "the scope never recorded its command")
             # Signal the wrapper PID only: its trap must fire right away
             # (the command is a background child) and the scope stop must
-            # kill the command tree underneath it. The pipes go to DEVNULL,
-            # so `communicate` returns when the wrapper exits, not when the
-            # orphaned command ends: no wall-clock comparison is involved.
+            # kill the command underneath it. Stderr goes to a file, so
+            # `communicate` returns when the wrapper exits even if the
+            # command held a pipe: no wall-clock comparison is involved.
             os.kill(proc.pid, signal.SIGTERM)
-            _, stderr = proc.communicate(timeout=WAIT_SECONDS)
+            _, _ = proc.communicate(timeout=WAIT_SECONDS)
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate(timeout=WAIT_SECONDS)
+        stderr = err_file.read_text()
         self.assertEqual(proc.returncode, 143, stderr)
         calls = self.log.read_text().splitlines()
         alive = [line for line in calls if "stop found unit pohunek-heavy-1-" in line

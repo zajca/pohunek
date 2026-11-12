@@ -36,12 +36,12 @@ scripts/darwin-check                                    # macOS-only code; needs
 cargo build -p pohunek-session-worker --bin pohunek-sessiond
 scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features
 # Sixteen threads only through scripts/heavy-run (see "Heavy runs" in
-# docs/development.md).
-# `cargo tw` stays at four test processes (main behaviour) and never takes
-# the gate count:
-# measured ~150 s for the full workspace suite (7764 tests) on the 24-CPU
-# host, against ~686 s at 4 threads. Twenty threads averaged slower (173 s)
-# and flaked under load (#2267, #2268; #2269 at sixteen).
+# docs/development.md): measured ~150 s for the full workspace suite
+# (7764 tests) on the 24-CPU host, against ~686 s at 4 threads. Twenty
+# threads averaged slower (173 s) and flaked under load
+# (#2267, #2268; #2269 at sixteen).
+# `cargo tw` runs four test processes on plain `TMPDIR`; the gate count
+# never goes through `tw`.
 cargo test --doc --workspace --all-features             # nextest excludes doctests
 cargo build --workspace --release
 cargo xtask docs check
