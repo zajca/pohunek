@@ -1,0 +1,17 @@
+[
+  {
+    "filter": "package(=pohunek-daemon) and test(/::running_loss::/)",
+    "reason": "measured in fable-ci report Idea 2: under ptrace tracing the 58 running_loss tests hang (2,587 of the 2,645 daemon unit tests were traced, because the 58 running_loss tests were left out)",
+    "evidence": "https://github.com/zajca/pohunek/issues/2213#issuecomment-6833262398"
+  },
+  {
+    "filter": "package(=pohunek-session-worker) and test(=pty::tests::stop_waits_for_a_killed_root_the_kernel_reports_late)",
+    "reason": "reasoned ptrace semantics (not measured): the scenario spawns the held-root fixture whose tracer seizes the root; tracing it again under strace would let two tracers contend for one root",
+    "evidence": "crates/session-worker/src/pty.rs stop scenario (reasoned, not measured)"
+  },
+  {
+    "filter": "package(=pohunek-session-worker) and test(=pty::tests::a_root_unreaped_past_the_post_kill_deadline_fails_the_stop_with_its_state)",
+    "reason": "reasoned ptrace semantics (not measured): the scenario spawns the held-root fixture whose tracer seizes the root; tracing it again under strace would let two tracers contend for one root",
+    "evidence": "crates/session-worker/src/pty.rs stop scenario (reasoned, not measured)"
+  }
+]
