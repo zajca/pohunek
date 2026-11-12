@@ -4564,7 +4564,7 @@ sends one `session.new` request and never resends it by itself. Only its own
 refusals before that request (`cli_usage`, `confirmation_required`,
 `confirmation_declined`, `session_new_request_id_unsupported`,
 `session_new_fetch_ref_unsupported`) prove that
-nothing was created. Any other failure
+nothing was created. Any other failure except `fetch_ref_outcome_missing`
 leaves the outcome unknown:
 `request_timeout`, whose recovery hint says so; a transport error such as
 `framing` locally or `remote_daemon_unavailable` for a remote host, which may
