@@ -18,6 +18,10 @@
   worker-attested channel for session-bound calls (section 13.4).
   Design-only: nothing here claims a shipped surface, and none of it changes
   existing section numbering.
+
+  Only the routed asks and the ask tools of this amendment are not planned: the ask channel RFC
+  was withdrawn on 2026-11-12 (#1987). Per-session rights continue rescoped as #2002 and #2005
+  in milestone 0.44; the MCP session tools and the worker-attested path are dropped.
 - **Date:** 2026-09-24
 - **Scope:** A task layer over ordinary sessions that lets an orchestrating agent
   delegate bounded coding work to another agent on any owned host and receive a
@@ -185,6 +189,9 @@ the polling entirely.
   channel adds no daemon-side answerer; an expiry default is the asker's own
   declared choice applied by the store, never an answer (ask channel RFC,
   section 3.1).
+
+  Only the routed-ask exception and the ask kinds are not planned: the daemon never answers on its own,
+  the section 11.3 answer authority stays, and the ask channel RFC was withdrawn on 2026-11-12 (#1987).
 - Model or profile routing, experiments and A/B assignment.
 - A hostile-workload sandbox (owned by #88).
 - Replacing `session.wait`, `session.screen` or `session.output`; they remain
@@ -925,6 +932,8 @@ only once waiting is **confirmed**:
   `tasks.attention_confirm_ms` (see Routed asks below): the hook is the
   waiting point, but another hook or rule can still decide while it waits, so
   a routed ask is a pending decision until then;
+
+  *Routed asks are not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987).*
 - or, when the provider has no such signal (Codex), by a detection `blocked`
   transition after the pending decision with no tool progress within
   `tasks.attention_confirm_ms`.
@@ -966,6 +975,9 @@ the provider:
   returned as `task_attention_stale`. This and routed asks (below) are the
   paths on which a stale answer is **guaranteed** never to reach another
   question.
+
+  *Routed asks are not planned (ask channel RFC withdrawn 2026-11-12, #1987); addressed answers stay
+  the only path on which a stale answer is guaranteed never to reach another question.*
 - **Routed asks (`verification: provider_addressed`, Claude and Codex).**
   Where a core runtime handler routes the provider's own prompt through a hook
   that can return the decision (Claude `PermissionRequest`, Codex
@@ -993,8 +1005,10 @@ the provider:
   the hook exits or times out before an answer, the ask closes as
   `cancelled: hook_timeout`, and the native dialog is the only answer source
   again; the keystroke rules below apply to it.
+
+  *Routed asks are not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987).*
 - **Keystroke answers (`verification: unverified`).** Claude, Codex and
-  detection-only agents whose prompt no hook routes are answered by writing
+  detection-only agents are answered by writing
   keys into the PTY. No
   provider-side check ties those keys to request A; if the provider has
   already moved to B, they answer B. The daemon cannot close this window, so
@@ -2355,6 +2369,9 @@ adapter reports in its tool descriptions. A blocking tool call gives no
 background wake, so for agents that have one (section 13.3) the CLI wait is
 preferred.
 
+*The ask tools are not planned (ask channel RFC withdrawn 2026-11-12, #1987); the MCP session tools
+are dropped and per-session rights continue rescoped as #2002 and #2005 in milestone 0.44.*
+
 **Worker-attested channel (2026-11-06 amendment).** The task tools stay a thin
 client of the public protocol and forward origin markers, which are not
 authentication. The ask tools (and any other session-bound call) additionally
@@ -2365,6 +2382,9 @@ it to its own session id. The server sends no session id of its own and
 carries no token. The task tools keep their current path; the channel adds a
 second one beside it. The ask RFC (section 9.3) states the attestation rules
 and their limits.
+
+*The ask tools and the worker-attested path are not planned: the ask channel RFC was withdrawn
+on 2026-11-12 (#1987); per-session rights continue rescoped as #2002 and #2005 in milestone 0.44.*
 
 This does not conflict with the universal assistant's "no MCP knowledge server"
 decision, which concerns serving documentation, not delegating work. The
@@ -3136,6 +3156,8 @@ present, no detection-only settlement for OpenCode, and the share of
    provider-addressed attentions, while the ask channel RFC scopes the relay
    out (its assumption 1). Until decided, over the relay only a relay attach
    answers a routed ask; the owner path answers it as usual.
+
+   *Routed asks are not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987).*
 
 Resolved elsewhere: relay-path `task.answer` authority and relay delegation
 budget scopes are defined by the relay dark factory RFC (sections 7.3 and
