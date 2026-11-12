@@ -240,51 +240,53 @@ pub struct PtyOwner {
 
 /// Everything one worker-owned PTY runtime shares between its handles.
 ///
-/// A clone of [`PtyOwner`] is one `Arc` clone. The fields that keep an `Arc` of
-/// their own are the values a thread receives on its own: the reader thread
-/// holds `output_order`, `output_reader` and `output_readiness`, and the
-/// blocking resize and snapshot closures hold those three plus `master`,
-/// `tty_name` and `held_echo`. Each of those clones keeps only the value it
-/// uses alive, so a closure outliving a [`PtyOwner`] never holds `identity`,
-/// `exit_rx`, `output` or `input`.
+/// A clone of [`PtyOwner`] is one `Arc` clone. The fields that keep an `Arc`
+/// of their own are the values a thread receives on its own: the reader
+/// thread holds `output_order`, `output_reader`, `output_readiness` and an
+/// `OutputHub` clone, and the blocking resize and snapshot closures hold
+/// those plus `master`, `tty_name` and `held_echo`. Each of those clones
+/// keeps only the value it uses alive, so a thread outliving a [`PtyOwner`]
+/// never holds `identity`, `exit_rx` or `input`.
 ///
-/// Lock order, outermost first. A new lock use keeps this order:
+/// Lock order, outermost first. A new lock use keeps this order.
 ///
-/// 1. `resize`: the async gate of `resize` (`pty.rs:783`), `attach_snapshot`
-///    (`pty.rs:865`) and `dimensions` (`pty.rs:924`). `resize` and `commit_resize_before_resume`
-///    (`pty.rs:1325`) stay held across the blocking boundary closure.
-/// 2. `output_order`: taken inside the boundary closure (`pty.rs:803`,
-///    `pty.rs:880`) before the master reader. The reader thread takes the
-///    same lock for its unlocked batch reads (`pty.rs:606`).
-/// 3. `output_reader`: taken by the boundary drain (`drain_available_output`,
-///    `pty.rs:1951`) and the reader thread's batch reads (`pty.rs:606`),
-///    always while `output_order` is already held on boundary paths.
-/// 4. `master`: taken by the boundary closure after the drain (`pty.rs:815`,
-///    `pty.rs:892`) and by the input writer (`MasterWriter::write_within`,
-///    `pty.rs:1418`), never while another core lock is held.
-/// 5. `output`: the hub's own ring lock (`output.rs:180`), taken by
-///    `push` (`pty.rs:1954`), `resize` (`pty.rs:818`, `pty.rs:895`),
-///    `subscribe` (`pty.rs:1138`), `force_close` (`pty.rs:1155`) and
-///    `completion` (`pty.rs:1124`, `pty.rs:1130`). It is taken while
-///    `output_order` and `output_reader` are held on boundary paths, and
-///    while `cleanup` is held on stop paths.
-/// 6. `held_echo`: its state lock (`pty.rs:1707`), taken by `OutputPause::new`
-///    (before `output_order`, `pty.rs:802`) and by `resume`
-///    (`release_held_echo`, `pty.rs:1605`), never while another core lock is
-///    held.
-/// 7. `cleanup`: the async gate of `stop` (`pty.rs:953`) and `finish_natural`
-///    (`pty.rs:1058`). While held, at most one of the following is taken at a
-///    time, each released before the next (`pty.rs:1275-1300`): `reap_tx`,
-///    then `child_thread`, then `reader_thread`. No path holds `resize` and
-///    `cleanup` together.
+/// Edges between the core locks (`A -> B` means `A` is held while `B` is
+/// taken):
+///
+/// - `resize` -> `output_order`: the resize and attach-snapshot boundary
+///   closures hold the `resize` async guard across the blocking closure,
+///   which takes `output_order` before draining the master reader.
+/// - `resize` -> `held_echo`: `commit_resize_before_resume` and
+///   `OutputPause::resume` (also `OutputPause::drop` on the error path) reach
+///   `HeldEchoRelease::request` while the `resize` guard is still held.
+/// - `cleanup` -> `output`: `stop` and `finish_natural` hold the `cleanup`
+///   async guard while `subscribe`, `force_close`, `completion`,
+///   `subscribe_terminal_snapshot` or `mark_exit` take the hub's ring lock.
+/// - `cleanup` -> `reap_tx` -> `child_thread` -> `reader_thread`: `stop`,
+///   `finish_natural` and the sealed-cleanup helpers release each thread
+///   slot before taking the next one. No path holds two of them at once.
+/// - `output_order` -> `output_reader` -> `master` -> `output`: the
+///   boundary closure holds the ordering gate across the master-reader drain,
+///   takes the master descriptor to apply the resize, then resizes the
+///   terminal model in the hub. The reader thread takes the same two locks
+///   for its batch reads and pushes.
+/// - `output_order` -> `output_reader` -> `output`: the reader thread holds
+///   the ordering gate and the master reader while pushing into the hub.
+///
+/// Guards, leaf by leaf: `resize` is the async gate of `resize`,
+/// `attach_snapshot` and `dimensions`; `cleanup` is the async gate of `stop`
+/// and `finish_natural`. No path holds `resize` and `cleanup` together. The
+/// hub ring lock and the std mutexes are never held across an await. `master`
+/// guards the master descriptor a resize writes. `output` is the hub's own
+/// ring lock. `held_echo` is the deferred echo-release state lock. `reap_tx`,
+/// `child_thread` and `reader_thread` keep the process-group authority and
+/// the retained thread handles; at most one is held at a time.
 ///
 /// `output_readiness` holds no lock: it is a cancellation latch over
-/// descriptors (`OutputReadiness::cancel`, `pty.rs:1793`). `input` locks only
-/// its own coordinator state (`input.rs:140-151`: the plan and execution
-/// async gates plus the writer and dedup std mutexes), and takes the output
-/// `master` only through `MasterWriter::write_within` (`pty.rs:1418`), with
-/// no core lock held. No path here holds a lock of this core while it writes
-/// input.
+/// descriptors. `input` locks only its own coordinator state (the plan and
+/// execution async gates plus the writer and dedup std mutexes). Input
+/// writes go through the `MasterWriter`'s own duplicated descriptor, never
+/// through `PtyShared::master`, so `input` paths contend with no core lock.
 struct PtyShared {
     identity: ProcessIdentity,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,

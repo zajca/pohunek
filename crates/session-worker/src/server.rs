@@ -1980,7 +1980,7 @@ async fn stop_request(
             pty,
             grace,
             kill_reap,
-        } => (*pty, grace, kill_reap),
+        } => (pty, grace, kill_reap),
     };
     run_placement_check(shared).await;
     pty.stop(transaction_id.as_str(), grace, kill_reap)
@@ -2006,8 +2006,7 @@ async fn stop_request(
 enum StopPreparation {
     AlreadyCommitted(ExitStatus),
     Begin {
-        // Boxed: the owner is far larger than the committed exit status.
-        pty: Box<PtyOwner>,
+        pty: PtyOwner,
         grace: Duration,
         kill_reap: Duration,
     },
@@ -2038,7 +2037,7 @@ fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
     state.stop_requested = true;
     state.phase = WireRuntimePhase::Stopping;
     Ok(StopPreparation::Begin {
-        pty: Box::new(pty),
+        pty,
         grace: state.stop_grace,
         kill_reap: state.kill_reap_deadline,
     })
