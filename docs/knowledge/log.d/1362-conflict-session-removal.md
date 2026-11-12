@@ -1,3 +1,0 @@
-## Unreleased (2026-11-11, conflict session removal, #1362)
-
-- `SessionInfo::can_stop()` and `can_remove()` are true for a `conflict` runtime that names its worker and worker instance (the daemon proves the identity before it acts, so a refusal is still possible, and a conflict that names no generation is refused without the consent) and false for one that does not; the retention sweep still never selects a conflict. `session rm --accept-unconfirmed-cleanup` also removes a conflict that names no worker generation and reports `identity_proof_skipped`. See [Debug session runtime](runbooks/debug-session-runtime.md).

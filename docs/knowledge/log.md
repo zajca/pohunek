@@ -5,6 +5,111 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.42.0
+
+### 2026-11-11, conflict session removal, #1362
+
+- `SessionInfo::can_stop()` and `can_remove()` are true for a `conflict` runtime that names its worker and worker instance (the daemon proves the identity before it acts, so a refusal is still possible, and a conflict that names no generation is refused without the consent) and false for one that does not; the retention sweep still never selects a conflict. `session rm --accept-unconfirmed-cleanup` also removes a conflict that names no worker generation and reports `identity_proof_skipped`. See [Debug session runtime](runbooks/debug-session-runtime.md).
+
+### 2026-11-11, Muse handshake across /clear, #1924
+
+- The Muse reporter keeps the Pohunek route after `/clear`: the session worker writes a `0600` handshake file (`launch-input.muse-handshake.json`) before it starts Muse, the overlay passes the reporter its path, the session id and the hook trace location, and the reporter reads the file only when the `POHUNEK_*` environment is absent. `Initialize` gains the optional `handshake_file`; a worker that predates it writes nothing and the reporter traces `handshake_missing`. A handshake file the reporter refuses (missing, unsafe, unreadable, too large, malformed or written for another session) reports nothing and appends one `handshake_*` trace line; a session started before the upgrade keeps the reporter of its launch and stays silent after `/clear` until it is resumed or relaunched. See [Hook schemas and integration handlers](guides/runtime-packages.md#hook-schemas-and-integration-handlers).
+
+### 2026-11-11, version probe open range and deadline, #1963
+
+- `version_probe` may omit `below` (an open-ended range `[min, ..)`) when the descriptor requires `version-probe-open-range-v1`; a release below `min` is refused naming the minimum. A probe that runs to its 2 second deadline is `agent_runtime_unsupported` with its own message and `recover` hint (same code); the only values forwarded into the probe's otherwise private environment are the launch `PATH` and the runtime's `[launch_env]`. See [Runtime packages](guides/runtime-packages.md#version-probe-environment-and-deadline).
+
+### 2026-11-11, composer_absent detection matcher, #1968
+
+- A detection manifest rule may add `composer_absent = true` (runtime feature `detect-composer-absent-v1`): the rule applies only while the screen shows no prompt box, so a dialog that replaces the composer fails closed. See [Runtime packages](guides/runtime-packages.md#dialog-rules-that-fail-closed).
+
+### 2026-11-11, placement-v1 follow-ups, #1973
+
+- The placement escape check documents that a generation is also reported `unobservable` when a process that carries its marker cannot be classified, in `docs/public-api.md`, `docs/architecture.md` and [runtime-packages](guides/runtime-packages.md). No behavior changed.
+
+### 2026-11-11, Checkout trust descriptor-based read, #2025
+
+- The trusted-checkout check opens every component below the launch directory relative to its parent without following a symbolic link, reads each declared file up to 4 MiB (64 MiB in total) in-process, and hashes all files with one git process. Updated [runtime-packages](guides/runtime-packages.md).
+
+### 2026-11-11, Assistant context package pin, #2066
+
+- A session launched by `pohunek assistant` pins the digest of the assistant context package it reads by path: `session.new` takes `context_package_digest` (advertised by `session_new_context_pin_supported`), and `plugin uninstall` of that digest is refused with `package_referenced` while the session is live, lost or resumable, also after a newer release was selected and after a daemon restart. `session rm` or retention releases the pin. Updated [runtime-packages](guides/runtime-packages.md). The pin is a persisted-shape change: store schema 18, a no-op migration from 17 (a resume binding may record `context_pin`; a schema 17 line reads as unpinned and is never backfilled). A daemon that predates schema 18 refuses the newer store; roll back with the `metadata.jsonl.pre-schema-<old>` backup the migration takes (`<old>` is the oldest schema found, `-17` from 0.41, `-15` from 0.40.x; sessions created since are lost) or keep the newer release.
+
+### 2026-11-11, blocked kind in the session snapshot, #2097
+
+- `SessionInfo` carries an optional `blocked_kind` (`permission`, `question`, `auth`, `unspecified`) while `activity` is `blocked` and the program's OSC 7501 record reported the wait, so `session list`, `session inspect`, session events and a reconnect reseed show what a blocked agent waits for. It is derived from the live detector and never stored. `session list` shows `blocked/<kind>` in the ACTIVITY column and `session inspect` a `blocked_kind` row.
+- A `blocked` record that names no kind is reported as `unspecified` (the generic `agent_blocked` record), so an `idle` record after it resolves the attention record even under a dialog the screen rules read. The notification projector resyncs a lagged session from the snapshot kind instead of reading it as generic. See the `agent_state` event and the `SessionInfo` fields in `docs/public-api.md`.
+
+### 2026-11-11, Revoked package digest follow-ups, #2099
+
+- The `package_revocations_unreadable` repair now covers a damaged or newer-schema `revoked-digests.json`: remove it and install the latest release catalog again, which records its revocations anew; a revocation that no later catalog repeats is lost. Updated [runtime-packages](guides/runtime-packages.md) and [runtime-package-archive](concepts/runtime-package-archive.md).
+- `command.run` refuses a command of a catalog-authorized package whose digest a recorded catalog revoked with `command_unavailable`. Updated [runtime-packages](guides/runtime-packages.md).
+
+### 2026-11-11, Context pin capability check on the session.new connection, #2113
+
+- The Rust client checks `session_new_context_pin_supported` on the connection that carries `session.new` when the request has a `context_package_digest`, and fails with `daemon/session_new_context_pin_unsupported` without sending it. This covers an assistant launch whose daemon was replaced by an older release after the launch read its capabilities. Updated [runtime-packages](guides/runtime-packages.md).
+
+### 2026-11-11, Checkout trust stalled file system call, #2120
+
+- A launch stops waiting for a trusted-checkout evaluation that has not finished within its 30 second deadline, for example one stalled in a file system call on a hung mount below a declared path. It withholds the trusted arguments, logs one `checkout_trust.failed` warning and no longer holds the session launch for the stalled call. Updated [runtime-packages](guides/runtime-packages.md).
+
+### 2026-11-11, composer_absent limits, #2123
+
+- The `composer_absent` guidance now states that the prompt-box fact counts every horizontal-rule line on the visible grid, so the matcher only suits a dialog that draws no rule line of its own; a dialog that draws one rule is defeated by a single quoted rule line. See [Runtime packages](guides/runtime-packages.md#dialog-rules-that-fail-closed).
+
+### 2026-11-11, project candidates, #2131
+
+- New read-only `project.candidates` method and `pohunek project candidates [--sources pohunek,history] [--json]`: it proposes repositories from the host's pohunek sessions and, only when `history` is named, from the head of the agent CLI history files the installed runtime packages declare in `[transcripts]`. Only the working directory of the first record that names one and the file's modification time are read; symlinks are never followed, paths outside the home, missing, temporary or outside a git repository are counted in `dropped`, origins lose their userinfo, and reached bounds are reported in `limits_reached`. See [Projects](concepts/projects.md#project-candidates) and the `project.candidates` entry in `docs/public-api.md`.
+
+### 2026-11-11, plugin profile create, #2132
+
+- `pohunek plugin profile create` and the local-only `package.create_profile` method create a validated, pinned, 0600 host agent profile; `[env]` holds only the base runtime's config home variable and secrets stay `secret_env` names. `plugin profile list` reports `file_digest`, the value `--replace` expects. New error codes: `package_profile_exists`, `package_profile_digest_mismatch`, `package_profile_credential_literal`, `package_profile_home_invalid`, `package_profile_home_unsupported`, `package_profile_dir_unsafe`; capability `package_create_profile_supported`. See [Agent profiles](concepts/agent-profiles.md) and [Runtime packages](guides/runtime-packages.md).
+
+### 2026-11-11, setup hook selection, #2133
+
+- `pohunek setup --hooks none|all|<agent[:profile]>,...` limits the hooks setup installs to the selected agent homes (default `all`). The preview, the `--json` result and `--dry-run --json` list only the selected homes; an unknown agent or profile is a usage error with the code `setup_hooks_unknown`. See "Host setup" in `docs/cli.md`.
+
+### 2026-11-11, plugin index context entries, #2134
+
+- The plugin index has a schema 2 (`official-index-v2.json`, its own signature domain) whose entries carry a `kind` of `runtime` or `context`; `context` entries authorize context packages (`pohunek.context.<name>`, no runtime or commands) under a verifier rule with no cross-kind authorization. Schema 1 and its file stay as they are for hosts that read only schema 1. `HostCapabilities` gains `package_install_index_context_supported`, `pohunek plugin install pohunek.context.<name>` resolves from the schema 2 index, and the release daemon's gaps carry an optional `profile`. See [Plugin index](concepts/runtime-catalog.md#plugin-index). A revoked context package is no longer served to the assistant launch (`assistant_package_missing` names the publisher's revocation and points at `pohunek setup`), and `pohunek setup` keeps a serving selected assistant version that is not older than the listing and replaces one that is older or does not serve.
+
+### 2026-11-11, setup installs the assistant package, #2134
+
+- `pohunek setup` resolves `pohunek.context.assistant` for the release through the signed plugin index (schema 2), previews it with its digest in `assistant`, installs it under the same consent and ends a run that could not install it with `setup_incomplete` and the manual command; `setup --index-url` replaces the official index (CLI reference, host setup guide, install guide).
+
+### 2026-11-11, agent skill install, #2135
+
+- `integration install --skill`, `update --skill`, `uninstall [--skill]` and `status` install, refresh, remove and report the bundled agent skill per agent home, with the ownership marker `.pohunek-managed`. The runtime package declares the location in `[agent_skill]` (runtime feature `agent-skill-v1`): Claude `skills` in its config home, Codex the shared `~/.agents/skills`. New error codes `integration_agent_skill_unsupported`, `_foreign`, `_modified`, `_unsafe`; capability `integration_agent_skill_supported`. The skill artifact moved to `crates/knowledge/src/agent_skill/SKILL.md`. See [Runtime packages](guides/runtime-packages.md#agent-skill-location) and [Agent skill](guides/agent-skill.md).
+
+### 2026-11-11, input acknowledgement evidence, #2140
+
+- `session input --until working` and `session new --input-ack-timeout-ms` (`prompt_delivered`) no longer accept process-sourced activity (terminal output such as the startup banner or the composer repainting the typed text) as proof that an input started a turn on a session whose manifest declares a program status source (Claude, Codex, Pi). Program status records, hook reports, title or screen rules after the write, and a prompt acceptance still confirm it; otherwise the call ends in `session_input_timeout`, whose recovery hint says to read the screen before resending or pressing Enter. See [Sessions](concepts/sessions.md) and [the agent skill guide](guides/agent-skill.md).
+
+### 2026-11-11, checkout trust scratch sweep, #2141
+
+- Daemon start removes every `pohunek-trust-*` scratch repository below `<worker state root>/checkout-trust` (the daemon is its only writer, so each one is left over from a daemon that stopped during a stalled evaluation); other entries are kept, and a removal failure logs `checkout_trust.sweep_failed` without stopping the daemon. An evaluation that recorded its answer when the launch's deadline passed keeps that answer. See [Runtime packages](guides/runtime-packages.md).
+
+### 2026-11-11, retention ended_at, #2162
+
+- `SessionInfo.ended_at` records when a session entered `stopped`, `done` or `failed` (store schema 19; the migration copies `updated_at` into it for a finished record). A terminal session ages for retention from it, a `lost` runtime from `last_connected_at`, and a record without it from `updated_at`. See [Sessions](concepts/sessions.md). A release that predates schema 19 refuses the store; roll back by restoring the `metadata.jsonl.pre-schema-<old>` backup the migration wrote (`-17` from 0.41, `-15` from 0.40.x), which loses the sessions created since.
+
+### 2026-11-11, protocol window and upgrade docs, #2176, #2130
+
+- The update runbook, the architecture notes, the Hermes operator guide and skill, and the project instructions state the public protocol window as `5..=5`: protocol 5 (since 0.41) raised the minimum, so a client, hook or plugin of 0.40.x or earlier is refused with `daemon/version_mismatch`, while 0.41 and 0.42 peers interoperate. The runbook and `docs/install.md` gain the Claude Code floor step: upgrade Claude Code to 2.1.309 or later before `pohunek service check` and `pohunek service upgrade`. Other corrections: the store schema in `public-api.md`, the removed Claude completed-turn and title rules, the notification retention text (one `record_ttl_secs`, no policy), and who reinstalls hook assets.
+- The TypeScript SDK refuses `session.new` with a `context_package_digest` against a daemon that does not advertise `session_new_context_pin_supported`, with `session_new_context_pin_unsupported` (`ClientError.kind` `sessionNewContextPinUnsupported`), like the Rust client.
+
+### 2026-11-10, Revoked package digests, #2080
+
+- A catalog's `revoked_digests` are now persisted in `revoked-digests.json`, a sibling of `catalog-state.json` (which stays schema 1). An installed official package whose digest a later catalog revoked is refused with `package_revoked` for fresh launches, resume, relaunch, `plugin select`, enabling and profile pins; running sessions keep running and are flagged in `session list` (a `hook` warning) and `plugin doctor`. Updated [runtime-packages](guides/runtime-packages.md), [runtime-catalog](concepts/runtime-catalog.md) and [runtime-package-archive](concepts/runtime-package-archive.md).
+
+### 2026-11-10, Claude attention from the 7501 kind, #2084
+
+- `agent_state` events carry an optional `blocked_kind` (`permission`, `question`, `auth`) taken from the OSC 7501 `blocked` record, and the notification projector derives the attention record from it: `permission` is `approval_required`, `question` (AskUserQuestion, MCP elicitation) and `auth` are `agent_blocked` with `reason=question` / `reason=auth`. The kind applies to every program that reports 7501 records (Claude Code, Codex, Pi): a `kind=permission` dialog is `approval_required`, no longer `agent_blocked`. The Claude integration registers no `Notification` hook any more (integration version 17); reinstalling strips the earlier registrations. A record that leaves `blocked` for `idle` or `done` resolves the attention record. See [Claude package](guides/claude-package.md#program-status-osc-7501) and the `agent_state` event in `docs/public-api.md`.
+
+### 2026-11-10, Claude floor 2.1.309, #2084
+
+- The Claude package supports Claude Code from 2.1.309 (package version 2.0.0, range `[2.1.309, 3.0.0)`); an older release is refused at launch and resume with `agent_runtime_unsupported`. The manifest sets `authority_from = "2.1.309"`, drops the title rules and the completed-turn rule, and keeps the status-line and footer working rules marked `below_authority` as the fallback while no record is held (a lag resync, reconfigure or adoption mid-turn); the dialog rules and the prompt box stay. A shell session answers the probe of a listed program (`[process]` matchers of the runtimes with `answer_probe`) running in the PTY foreground, so a hand-started Claude reports through records (additive worker `Initialize.probe_foreground_programs`). See [Claude package](guides/claude-package.md#program-status-osc-7501).
+
 ## 0.41.0
 
 ### 2026-11-09, notification lifecycle cut, #2046, #2043, #2058

@@ -1,3 +1,0 @@
-## Unreleased (2026-11-11, input acknowledgement evidence, #2140)
-
-- `session input --until working` and `session new --input-ack-timeout-ms` (`prompt_delivered`) no longer accept process-sourced activity (terminal output such as the startup banner or the composer repainting the typed text) as proof that an input started a turn on a session whose manifest declares a program status source (Claude, Codex, Pi). Program status records, hook reports, title or screen rules after the write, and a prompt acceptance still confirm it; otherwise the call ends in `session_input_timeout`, whose recovery hint says to read the screen before resending or pressing Enter. See [Sessions](concepts/sessions.md) and [the agent skill guide](guides/agent-skill.md).

@@ -1,3 +1,0 @@
-## Unreleased (2026-11-11, agent skill install, #2135)
-
-- `integration install --skill`, `update --skill`, `uninstall [--skill]` and `status` install, refresh, remove and report the bundled agent skill per agent home, with the ownership marker `.pohunek-managed`. The runtime package declares the location in `[agent_skill]` (runtime feature `agent-skill-v1`): Claude `skills` in its config home, Codex the shared `~/.agents/skills`. New error codes `integration_agent_skill_unsupported`, `_foreign`, `_modified`, `_unsafe`; capability `integration_agent_skill_supported`. The skill artifact moved to `crates/knowledge/src/agent_skill/SKILL.md`. See [Runtime packages](guides/runtime-packages.md#agent-skill-location) and [Agent skill](guides/agent-skill.md).

@@ -1,4 +1,0 @@
----
-kind: fixed
----
-A Muse session keeps its Pohunek identity across `/clear`. Muse starts the hooks of the conversation `/clear` creates without the `POHUNEK_*` variables, so the reporter used to exit silently and `session resume` continued the wrong conversation. The session worker now writes an owner-only handshake file (session id, worker instance id, worker socket, hook trace) into the session's launch-input directory before it starts Muse, the overlay passes its path to the reporter, and the reporter reads it only when the environment is absent. A run without a usable handshake file (a worker that predates this change, a missing, foreign-owned, shared, linked or malformed file) reports nothing and appends one trace line naming the reason. A session started before the upgrade picks the fix up at its next relaunch.

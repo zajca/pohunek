@@ -1,4 +1,0 @@
-## Unreleased (2026-11-11, blocked kind in the session snapshot, #2097)
-
-- `SessionInfo` carries an optional `blocked_kind` (`permission`, `question`, `auth`, `unspecified`) while `activity` is `blocked` and the program's OSC 7501 record reported the wait, so `session list`, `session inspect`, session events and a reconnect reseed show what a blocked agent waits for. It is derived from the live detector and never stored. `session list` shows `blocked/<kind>` in the ACTIVITY column and `session inspect` a `blocked_kind` row.
-- A `blocked` record that names no kind is reported as `unspecified` (the generic `agent_blocked` record), so an `idle` record after it resolves the attention record even under a dialog the screen rules read. The notification projector resyncs a lagged session from the snapshot kind instead of reading it as generic. See the `agent_state` event and the `SessionInfo` fields in `docs/public-api.md`.
