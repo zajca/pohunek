@@ -67,7 +67,7 @@ export function carriesContextPackageDigest(params: unknown): boolean {
 
 /** Whether `params` carries a `fetch_ref` the daemon must fetch and pin. */
 export function carriesFetchRef(params: unknown): boolean {
-  return isObject(params) && isObject(params["fetch_ref"]);
+  return isObject(params) && isSet(params["fetch_ref"]);
 }
 
 function requireCurrent(version: number): void {

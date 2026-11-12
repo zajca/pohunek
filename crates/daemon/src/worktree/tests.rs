@@ -1311,7 +1311,8 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
 #[test]
 fn fetch_disables_automatic_maintenance() {
     let repo = init_repo("fetch-maintenance");
-    let cmd = super::fetch_command(&repo, "main", "refs/pohunek/fetch/x", true).expect("command");
+    let cmd =
+        super::fetch_command(&repo, "main", "refs/pohunek/fetch/x", true, true).expect("command");
     let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
     let fetch = args
         .iter()

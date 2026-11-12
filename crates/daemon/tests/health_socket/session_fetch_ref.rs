@@ -3,14 +3,15 @@
 //!
 //! The scenarios pin that the extra ref fetch lands the expected commit under
 //! the session ref without checking it out, that a refused request leaves no
-//! session, binding, worktree, temp ref or session ref behind, and that
-//! `FETCH_HEAD` is untouched by the fetch.
+//! session, binding, worktree, temp ref or session ref behind, that the fetch
+//! composes with `branch_source: remote` (it draws its own ref, not the
+//! branch's), and that `FETCH_HEAD` is untouched by the fetch.
 
 // Rust guideline compliant 2026-11-12
 
 use super::*;
 
-use protocol::{FetchRefRequest, FetchedRef, SessionNewResult};
+use protocol::{BranchSource, FetchRefRequest, FetchedRef, SessionNewResult};
 
 /// The source ref every scenario fetches.
 const SOURCE_REF: &str = "refs/pull/42/head";
@@ -144,6 +145,64 @@ impl Rig {
         head
     }
 
+    /// Publishes `commit` on `origin` under `source_ref` and returns it.
+    fn origin_publish_ref(&self, source_ref: &str, file: &str) -> String {
+        let clone = temp_dir("fetch-ref-origin-extra");
+        let dir = clone.join("clone-extra");
+        let origin = self.origin.join("origin.git").display().to_string();
+        self.git_in(
+            self.repo.cwd(),
+            &["clone", "-q", &origin, &dir.display().to_string()],
+        );
+        self.git_in(&dir, &["config", "user.email", "test@example.com"]);
+        self.git_in(&dir, &["config", "user.name", "Test"]);
+        self.git_in(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join(file), format!("{file}\n")).expect("write file");
+        self.git_in(&dir, &["add", "."]);
+        self.git_in(&dir, &["commit", "-q", "-m", file]);
+        let head = self.git_in(&dir, &["rev-parse", "HEAD"]);
+        self.git_in(
+            &dir,
+            &["push", "-q", "origin", &format!("HEAD:{source_ref}")],
+        );
+        head
+    }
+
+    /// Installs an uncommitted in-repo `pre-create` hook: the script file
+    /// sits on disk in the repository checkout without any commit, so the
+    /// base head stays put (the same pattern the `branch_source` CAS
+    /// scenario uses). Whether the fresh worktree sees the script depends on
+    /// where the daemon resolves in-repo hooks from; the hook scenarios
+    /// below assert what the daemon reports.
+    ///
+    /// `fail` makes the hook exit non-zero; otherwise the hook records the
+    /// commit the session ref holds at hook time through `seen`.
+    fn in_repo_pre_create_hook(&self, fail: bool, seen: &Path) {
+        if let Some(parent) = seen.parent() {
+            std::fs::create_dir_all(parent).expect("create the seen directory");
+        }
+        let _ = seen;
+        let path = self.repo.cwd().join(".pohunek/hooks/pre-create");
+        std::fs::create_dir_all(path.parent().expect("hook parent"))
+            .expect("create the hooks directory");
+        let body = if fail {
+            "#!/bin/sh\necho hook refused >&2\nexit 1\n".to_owned()
+        } else {
+            format!(
+                "#!/bin/sh\nGIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=0 GIT_TERMINAL_PROMPT=0 git -C \"$POHUNEK_REPO\" rev-parse --verify --quiet \"refs/pohunek/sessions/$POHUNEK_SESSION_ID/fetched^{{commit}}\" > {} 2>/dev/null || : > {}\nexit 0\n",
+                seen.display(),
+                seen.display()
+            )
+        };
+        std::fs::write(&path, body).expect("write the hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("make the hook executable");
+        }
+    }
+
     fn params(&self, source_ref: &str, commit: &str) -> SessionNewParams {
         let mut params = session_params_for_worktree(
             &RuntimeRef::shell(),
@@ -230,7 +289,9 @@ fn started(response: Response) -> (SessionInfo, FetchedRef) {
 #[tokio::test]
 async fn a_pull_request_head_is_fetched_without_checkout() {
     let mut rig = Rig::start("fetch-ref-ok").await;
+    let base = rig.git(&["rev-parse", "HEAD"]);
     let expected = rig.origin_source_ref();
+    assert_ne!(expected, base, "the fetched head differs from the base tip");
     // Touch FETCH_HEAD through a plain fetch so the scenario can prove the
     // `fetch_ref` fetch below leaves it alone.
     rig.git(&["fetch", "-q", "origin"]);
@@ -250,13 +311,43 @@ async fn a_pull_request_head_is_fetched_without_checkout() {
         Some(expected.clone()),
         "the session ref holds the expected commit"
     );
+    let worktree = session.worktree_path.as_deref().expect("worktree path");
     assert_eq!(
-        rig.git_in(
-            session.worktree_path.as_deref().expect("worktree path"),
-            &["rev-parse", "--abbrev-ref", "HEAD"]
-        ),
+        rig.git_in(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "feat-fetch",
         "the worktree checks out the requested branch, not the fetched ref"
+    );
+    // Row 1 pins that the checkout stands on the base head, not the
+    // fetched commit: the commit exists as an object in the shared
+    // repository but the new branch does not contain it.
+    assert_eq!(
+        rig.git_in(worktree, &["rev-parse", "HEAD"]),
+        base,
+        "the checkout starts on the base tip"
+    );
+    assert!(
+        rig.repo
+            .git_command()
+            .arg("-C")
+            .arg(rig.repo.cwd())
+            .args(["cat-file", "-e", &format!("{expected}^{{commit}}")])
+            .output()
+            .expect("run git cat-file")
+            .status
+            .success(),
+        "the fetched commit exists in the repository"
+    );
+    assert!(
+        !rig.repo
+            .git_command()
+            .arg("-C")
+            .arg(rig.repo.cwd())
+            .args(["merge-base", "--is-ancestor", &expected, &base])
+            .output()
+            .expect("run git merge-base")
+            .status
+            .success(),
+        "the new branch does not contain the fetched commit"
     );
     // The `fetch_ref` fetch itself writes no `FETCH_HEAD` entry: the file
     // holds only the base fetch's record (pre-existing daemon behavior for
@@ -318,15 +409,15 @@ async fn an_unknown_source_ref_fails_without_leaving_anything() {
 #[tokio::test]
 async fn a_commit_mismatch_fails_without_leaving_anything() {
     let mut rig = Rig::start("fetch-ref-mismatch").await;
-    let _expected = rig.origin_source_ref();
+    let expected = rig.origin_source_ref();
     let other = rig.git(&["rev-parse", "HEAD"]);
 
     let error = err_payload(rig.new_session(rig.params(SOURCE_REF, &other)).await);
 
     assert_eq!(error.code, "fetch_ref_commit_mismatch", "{}", error.msg);
     assert!(
-        error.msg.contains(&other),
-        "the error names the fetched commit: {}",
+        error.msg.contains(&other) && error.msg.contains(&expected),
+        "the error names both the expected and the fetched commit: {}",
         error.msg
     );
     rig.assert_nothing_left().await;
@@ -389,5 +480,181 @@ async fn a_malformed_fetch_ref_is_rejected() {
         assert_eq!(error.code, "bad_request", "{source_ref}: {}", error.msg);
     }
     rig.assert_nothing_left().await;
+    rig.stop().await;
+}
+
+/// Row 2 of the case table: the extra fetch composes with
+/// `branch_source: remote` — the checkout follows the branch's remote head
+/// while the session ref pins the unrelated pull-request commit.
+#[tokio::test]
+async fn fetch_ref_composes_with_a_remote_branch_source() {
+    let mut rig = Rig::start("fetch-ref-composed").await;
+    let pr_commit = rig.origin_source_ref();
+    let remote_head = rig.origin_publish_ref("refs/heads/remote-feature", "remote-feature.txt");
+
+    // `branch_source: remote` draws the checkout branch from `origin`, so
+    // the session needs its own branch name pushed there first.
+    let mut params = rig.params(SOURCE_REF, &pr_commit);
+    params.branch = Some("remote-feature".to_owned());
+    params.branch_source = Some(BranchSource::Remote);
+    let (session, fetched) = started(rig.new_session(params).await);
+
+    assert_eq!(fetched.commit, pr_commit);
+    assert_eq!(fetched.source_ref, SOURCE_REF);
+    assert_eq!(
+        rig.rev(&fetched.fetched_ref),
+        Some(pr_commit.clone()),
+        "the session ref holds the pull-request commit, not the branch head"
+    );
+    let worktree = session.worktree_path.as_deref().expect("worktree path");
+    assert_eq!(
+        rig.git_in(worktree, &["rev-parse", "HEAD"]),
+        remote_head,
+        "the checkout stands on the remote branch head"
+    );
+    rig.stop().await;
+}
+
+/// Row 12 of the case table: the session ref is promoted before the
+/// `pre-create` hook, so a hook that reads the session ref at hook time sees
+/// the expected commit — here the harness cannot list any hook in
+/// `hooks.required` per scenario, so a failing hook reports the failure as a
+/// warning and the session ref stays.
+#[tokio::test]
+async fn a_failing_pre_create_hook_warns_and_keeps_the_session_ref() {
+    let mut rig = Rig::start("fetch-ref-pre-fails").await;
+    let expected = rig.origin_source_ref();
+    let seen = temp_dir("fetch-ref-hook-fails-seen").join("seen");
+    rig.in_repo_pre_create_hook(true, &seen);
+    // The harness cannot list the hook in `hooks.required` per scenario
+    // (that list lives in `service.toml`), so the daemon answers with the
+    // non-fatal warning instead of refusing: the hook still proves it ran
+    // while the session ref was promoted by recording it before refusing.
+    let (session, fetched) = started(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
+
+    assert!(
+        session
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == SessionWarningKind::Hook),
+        "the failing hook is reported as a warning: {session:?}"
+    );
+    assert_eq!(
+        rig.rev(&fetched.fetched_ref),
+        Some(expected.clone()),
+        "the session ref stays after a non-required hook failure"
+    );
+    rig.stop().await;
+}
+
+/// Row 12's positive half: a `pre-create` hook runs after the extra fetch
+/// but before promotion, so the session ref is not there yet — the hook
+/// recording an empty resolve pins the order.
+#[tokio::test]
+async fn the_pre_create_hook_runs_before_promotion() {
+    let mut rig = Rig::start("fetch-ref-pre-sees").await;
+    let expected = rig.origin_source_ref();
+    let seen = temp_dir("fetch-ref-hook-seen").join("seen");
+    // The hook runs in the repository checkout with a cleared environment,
+    // so it records through a path baked into its body.
+    rig.in_repo_pre_create_hook(false, &seen);
+
+    let (session, fetched) = started(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
+
+    assert!(
+        std::fs::read_to_string(&seen)
+            .expect("the pre-create hook recorded the session ref")
+            .trim()
+            .is_empty(),
+        "the pre-create hook ran before promotion, so the session ref is not there yet"
+    );
+    assert_eq!(
+        rig.rev(&fetched.fetched_ref),
+        Some(expected.clone()),
+        "the session ref holds the expected commit after the hooks ran"
+    );
+    assert_eq!(
+        rig.git_in(
+            session.worktree_path.as_deref().expect("worktree path"),
+            &["rev-parse", "--abbrev-ref", "HEAD"]
+        ),
+        "feat-fetch",
+        "the worktree checks out the requested branch"
+    );
+    rig.stop().await;
+}
+
+/// A repository with a submodule commits the fetch without recursing: the
+/// session ref pins the parent commit while no submodule objects are fetched.
+#[tokio::test]
+async fn fetch_ref_does_not_recurse_into_submodules() {
+    let mut rig = Rig::start("fetch-ref-submodule").await;
+    let sub_source = temp_dir("fetch-ref-submodule-source");
+    let sub_bare = sub_source.join("sub.git");
+    rig.git_in(
+        rig.repo.cwd(),
+        &["init", "-q", "--bare", &sub_bare.display().to_string()],
+    );
+    let sub_clone = temp_dir("fetch-ref-subclone");
+    let sub_dir = sub_clone.join("sub");
+    rig.git_in(
+        rig.repo.cwd(),
+        &[
+            "clone",
+            "-q",
+            &sub_bare.display().to_string(),
+            &sub_dir.display().to_string(),
+        ],
+    );
+    rig.git_in(&sub_dir, &["config", "user.email", "test@example.com"]);
+    rig.git_in(&sub_dir, &["config", "user.name", "Test"]);
+    rig.git_in(&sub_dir, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(sub_dir.join("sub.txt"), "sub\n").expect("write file");
+    rig.git_in(&sub_dir, &["add", "."]);
+    rig.git_in(&sub_dir, &["commit", "-q", "-m", "sub"]);
+    let sub_head = rig.git_in(&sub_dir, &["rev-parse", "HEAD"]);
+    rig.git_in(&sub_dir, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    assert!(
+        rig.repo
+            .git_command()
+            .arg(format!("--git-dir={}", sub_bare.display()))
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .expect("point the submodule origin at main")
+            .status
+            .success(),
+        "point the submodule origin at main"
+    );
+    let sub_origin = format!("file://{}", sub_bare.display());
+    rig.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        "-q",
+        &sub_origin,
+        "sub",
+    ]);
+    rig.git(&["commit", "-q", "-m", "add submodule"]);
+    let origin = rig.origin.join("origin.git").display().to_string();
+    rig.git(&["push", "-q", &origin, "HEAD:refs/heads/main"]);
+    let expected = rig.origin_source_ref();
+
+    let (session, fetched) = started(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
+
+    assert_eq!(
+        rig.rev(&fetched.fetched_ref),
+        Some(expected.clone()),
+        "the session ref holds the expected commit"
+    );
+    // The fetch must not recurse: the submodule commit lives only in the
+    // submodule's own origin and never in the parent repository.
+    assert_eq!(rig.rev(&sub_head), None, "no submodule commit was fetched");
+    let worktree = session.worktree_path.as_deref().expect("worktree path");
+    assert_eq!(
+        rig.git_in(worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "feat-fetch",
+        "the worktree checks out the requested branch"
+    );
     rig.stop().await;
 }

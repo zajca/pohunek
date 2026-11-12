@@ -338,14 +338,13 @@ pub enum OnDiverged {
     BackupReset,
 }
 
-/// An extra ref `session.new` fetched into the worktree's repository without
-/// checking it out.
+/// Request to fetch one extra ref into a worktree session without checking
+/// it out. Sent as `SessionNewParams.fetch_ref`; requires `branch`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "FetchRefRequest.ts"))]
 pub struct FetchRefRequest {
-    /// Full ref on `origin` to fetch: must start with `refs/` and name no
-    /// ref the local repository must never move (a leading `-`/`+`), and
+    /// Full ref on `origin` the daemon fetches: must start with `refs/` and
     /// must pass `git check-ref-format`.
     pub source_ref: String,
     /// Full commit id the fetched ref must peel to, lowercase hex, 40 or 64
