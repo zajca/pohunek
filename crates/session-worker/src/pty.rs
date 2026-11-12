@@ -235,10 +235,61 @@ pub enum PtyError {
 /// Cloneable handle to one worker-owned PTY runtime.
 #[derive(Clone)]
 pub struct PtyOwner {
+    inner: Arc<PtyShared>,
+}
+
+/// Everything one worker-owned PTY runtime shares between its handles.
+///
+/// A clone of [`PtyOwner`] is one `Arc` clone. The fields that keep an `Arc` of
+/// their own are the values a thread receives on its own: the reader thread
+/// holds `output_order`, `output_reader` and `output_readiness`, and the
+/// blocking resize and snapshot closures hold those three plus `master`,
+/// `tty_name` and `held_echo`. Each of those clones keeps only the value it
+/// uses alive, so a closure outliving a [`PtyOwner`] never holds `identity`,
+/// `exit_rx`, `output` or `input`.
+///
+/// Lock order, outermost first. A new lock use keeps this order:
+///
+/// 1. `resize`: the async gate of `resize` (`pty.rs:783`), `attach_snapshot`
+///    (`pty.rs:865`) and `dimensions` (`pty.rs:924`). `resize` and `commit_resize_before_resume`
+///    (`pty.rs:1325`) stay held across the blocking boundary closure.
+/// 2. `output_order`: taken inside the boundary closure (`pty.rs:803`,
+///    `pty.rs:880`) before the master reader. The reader thread takes the
+///    same lock for its unlocked batch reads (`pty.rs:606`).
+/// 3. `output_reader`: taken by the boundary drain (`drain_available_output`,
+///    `pty.rs:1951`) and the reader thread's batch reads (`pty.rs:606`),
+///    always while `output_order` is already held on boundary paths.
+/// 4. `master`: taken by the boundary closure after the drain (`pty.rs:815`,
+///    `pty.rs:892`) and by the input writer (`MasterWriter::write_within`,
+///    `pty.rs:1418`), never while another core lock is held.
+/// 5. `output`: the hub's own ring lock (`output.rs:180`), taken by
+///    `push` (`pty.rs:1954`), `resize` (`pty.rs:818`, `pty.rs:895`),
+///    `subscribe` (`pty.rs:1138`), `force_close` (`pty.rs:1155`) and
+///    `completion` (`pty.rs:1124`, `pty.rs:1130`). It is taken while
+///    `output_order` and `output_reader` are held on boundary paths, and
+///    while `cleanup` is held on stop paths.
+/// 6. `held_echo`: its state lock (`pty.rs:1707`), taken by `OutputPause::new`
+///    (before `output_order`, `pty.rs:802`) and by `resume`
+///    (`release_held_echo`, `pty.rs:1605`), never while another core lock is
+///    held.
+/// 7. `cleanup`: the async gate of `stop` (`pty.rs:953`) and `finish_natural`
+///    (`pty.rs:1058`). While held, at most one of the following is taken at a
+///    time, each released before the next (`pty.rs:1275-1300`): `reap_tx`,
+///    then `child_thread`, then `reader_thread`. No path holds `resize` and
+///    `cleanup` together.
+///
+/// `output_readiness` holds no lock: it is a cancellation latch over
+/// descriptors (`OutputReadiness::cancel`, `pty.rs:1793`). `input` locks only
+/// its own coordinator state (`input.rs:140-151`: the plan and execution
+/// async gates plus the writer and dedup std mutexes), and takes the output
+/// `master` only through `MasterWriter::write_within` (`pty.rs:1418`), with
+/// no core lock held. No path here holds a lock of this core while it writes
+/// input.
+struct PtyShared {
     identity: ProcessIdentity,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
-    child_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    reader_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    child_thread: Mutex<Option<thread::JoinHandle<()>>>,
     exit_rx: watch::Receiver<Option<RootObservation>>,
     output: OutputHub,
     output_order: Arc<Mutex<()>>,
@@ -247,9 +298,9 @@ pub struct PtyOwner {
     tty_name: Arc<Path>,
     held_echo: Arc<HeldEchoRelease>,
     input: WriteCoordinator,
-    resize: Arc<AsyncMutex<ResizeState>>,
-    cleanup: Arc<AsyncMutex<CleanupState>>,
-    reap_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    resize: AsyncMutex<ResizeState>,
+    cleanup: AsyncMutex<CleanupState>,
+    reap_tx: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,8 +462,8 @@ impl Drop for SpawnGuard {
 impl Debug for PtyOwner {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PtyOwner")
-            .field("identity", &self.identity)
-            .field("next_output_offset", &self.output.next_offset())
+            .field("identity", &self.inner.identity)
+            .field("next_output_offset", &self.inner.output.next_offset())
             .finish_non_exhaustive()
     }
 }
@@ -656,25 +707,27 @@ impl PtyOwner {
         drop(pair.slave);
 
         Ok(Self {
-            identity,
-            master: Arc::new(Mutex::new(pair.master)),
-            reader_thread: Arc::new(Mutex::new(Some(reader_thread))),
-            child_thread: Arc::new(Mutex::new(Some(child_thread))),
-            exit_rx,
-            output,
-            output_order,
-            output_reader,
-            output_readiness,
-            tty_name,
-            held_echo: Arc::new(HeldEchoRelease::default()),
-            input,
-            resize: Arc::new(AsyncMutex::new(ResizeState {
-                cols: command.cols,
-                rows: command.rows,
-                sequences: HashMap::new(),
-            })),
-            cleanup: Arc::new(AsyncMutex::new(CleanupState::Active)),
-            reap_tx: Arc::new(Mutex::new(Some(reap_tx))),
+            inner: Arc::new(PtyShared {
+                identity,
+                master: Arc::new(Mutex::new(pair.master)),
+                reader_thread: Mutex::new(Some(reader_thread)),
+                child_thread: Mutex::new(Some(child_thread)),
+                exit_rx,
+                output,
+                output_order,
+                output_reader,
+                output_readiness,
+                tty_name,
+                held_echo: Arc::new(HeldEchoRelease::default()),
+                input,
+                resize: AsyncMutex::new(ResizeState {
+                    cols: command.cols,
+                    rows: command.rows,
+                    sequences: HashMap::new(),
+                }),
+                cleanup: AsyncMutex::new(CleanupState::Active),
+                reap_tx: Mutex::new(Some(reap_tx)),
+            }),
         })
     }
 
@@ -684,32 +737,32 @@ impl PtyOwner {
     /// attached terminal's own reply is dropped from its input.
     #[must_use]
     pub fn answers_program_status_probe(&self) -> bool {
-        self.output.answers_probes()
+        self.inner.output.answers_probes()
     }
 
     /// How many probe replies the foreground filter refused so far. A probe
     /// the filter refuses is counted after its decision is final.
     #[must_use]
     pub fn withheld_probe_replies(&self) -> u64 {
-        self.output.withheld_probe_replies()
+        self.inner.output.withheld_probe_replies()
     }
 
     /// Returns the retained root and process-group identity.
     #[must_use]
     pub fn identity(&self) -> &ProcessIdentity {
-        &self.identity
+        &self.inner.identity
     }
 
     /// Returns the ordered input coordinator.
     #[must_use]
     pub fn input(&self) -> &WriteCoordinator {
-        &self.input
+        &self.inner.input
     }
 
     /// Returns the output actor.
     #[must_use]
     pub fn output(&self) -> &OutputHub {
-        &self.output
+        &self.inner.output
     }
 
     /// Atomically subscribes to retained and live output.
@@ -721,14 +774,14 @@ impl PtyOwner {
         &self,
         after_offset: Option<u64>,
     ) -> Result<OutputSubscriber, RingError> {
-        self.output.subscribe(after_offset)
+        self.inner.output.subscribe(after_offset)
     }
 
     /// Forgets the resize ordering recorded for every source.
     ///
     /// The terminal size itself is kept.
     pub async fn clear_resize_sources(&self) {
-        self.resize.lock().await.sequences.clear();
+        self.inner.resize.lock().await.sequences.clear();
     }
 
     /// Applies a monotonic source-specific resize.
@@ -749,7 +802,7 @@ impl PtyOwner {
         if cols == 0 || rows == 0 {
             return Err(PtyError::InvalidDimensions { cols, rows });
         }
-        let mut resize = self.resize.lock().await;
+        let mut resize = self.inner.resize.lock().await;
         if resize
             .sequences
             .get(source_id)
@@ -757,13 +810,13 @@ impl PtyOwner {
         {
             return Ok(false);
         }
-        let master = Arc::clone(&self.master);
-        let output = self.output.clone();
-        let output_order = Arc::clone(&self.output_order);
-        let output_reader = Arc::clone(&self.output_reader);
-        let output_readiness = Arc::clone(&self.output_readiness);
-        let tty_name = Arc::clone(&self.tty_name);
-        let held_echo = Arc::clone(&self.held_echo);
+        let master = Arc::clone(&self.inner.master);
+        let output = self.inner.output.clone();
+        let output_order = Arc::clone(&self.inner.output_order);
+        let output_reader = Arc::clone(&self.inner.output_reader);
+        let output_readiness = Arc::clone(&self.inner.output_readiness);
+        let tty_name = Arc::clone(&self.inner.tty_name);
+        let held_echo = Arc::clone(&self.inner.held_echo);
         let output_pause = tokio::task::spawn_blocking(move || {
             // Stop the producer before contending for the ordering gate. This
             // makes the remaining queue finite even when the reader repeatedly
@@ -833,14 +886,14 @@ impl PtyOwner {
             }
         }
 
-        let mut resize = self.resize.lock().await;
-        let master = Arc::clone(&self.master);
-        let output = self.output.clone();
-        let output_order = Arc::clone(&self.output_order);
-        let output_reader = Arc::clone(&self.output_reader);
-        let output_readiness = Arc::clone(&self.output_readiness);
-        let tty_name = Arc::clone(&self.tty_name);
-        let held_echo = Arc::clone(&self.held_echo);
+        let mut resize = self.inner.resize.lock().await;
+        let master = Arc::clone(&self.inner.master);
+        let output = self.inner.output.clone();
+        let output_order = Arc::clone(&self.inner.output_order);
+        let output_reader = Arc::clone(&self.inner.output_reader);
+        let output_readiness = Arc::clone(&self.inner.output_readiness);
+        let tty_name = Arc::clone(&self.inner.tty_name);
+        let held_echo = Arc::clone(&self.inner.held_echo);
         let (output_pause, subscriber) = tokio::task::spawn_blocking(move || {
             // Stop the producer before contending for the ordering gate. This
             // makes the remaining queue finite even when the reader repeatedly
@@ -891,7 +944,7 @@ impl PtyOwner {
 
     /// Returns the last successfully applied PTY dimensions.
     pub async fn dimensions(&self) -> (u16, u16) {
-        let resize = self.resize.lock().await;
+        let resize = self.inner.resize.lock().await;
         (resize.cols, resize.rows)
     }
 
@@ -920,7 +973,7 @@ impl PtyOwner {
         grace: Duration,
         kill_reap: Duration,
     ) -> Result<Exit, PtyError> {
-        let mut cleanup = self.cleanup.lock().await;
+        let mut cleanup = self.inner.cleanup.lock().await;
         match &*cleanup {
             CleanupState::Finished(exit) => return Ok(exit.clone()),
             CleanupState::ForcedClosed => return self.known_root_exit(),
@@ -1000,8 +1053,8 @@ impl PtyOwner {
                                 return Err(PtyError::RootUnreaped {
                                     deadline: kill_reap,
                                     state: root_state(
-                                        self.identity.pid,
-                                        self.identity.process_group,
+                                        self.inner.identity.pid,
+                                        self.inner.identity.process_group,
                                     ),
                                 });
                             }
@@ -1025,7 +1078,7 @@ impl PtyOwner {
     ///
     /// Returns [`PtyError`] when the retained child threads cannot be joined.
     pub(crate) async fn finish_natural(&self) -> Result<Exit, PtyError> {
-        let mut cleanup = self.cleanup.lock().await;
+        let mut cleanup = self.inner.cleanup.lock().await;
         match &*cleanup {
             CleanupState::Finished(exit) => return Ok(exit.clone()),
             CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
@@ -1066,7 +1119,7 @@ impl PtyOwner {
     ///
     /// Returns [`PtyError::ExitTimeout`] if the exit channel closes.
     pub async fn wait_exit(&self) -> Result<Exit, PtyError> {
-        let mut receiver = self.exit_rx.clone();
+        let mut receiver = self.inner.exit_rx.clone();
         loop {
             if let Some(observation) = receiver.borrow().clone() {
                 return match observation {
@@ -1083,20 +1136,20 @@ impl PtyOwner {
 
     /// Subscribes to the retained root-process outcome.
     pub(crate) fn exit_receiver(&self) -> watch::Receiver<Option<RootObservation>> {
-        self.exit_rx.clone()
+        self.inner.exit_rx.clone()
     }
 
     /// Returns whether the reader was closed by the lifecycle deadline.
     pub(crate) fn output_forced_closed(&self) -> bool {
         matches!(
-            self.output.completion(),
+            self.inner.output.completion(),
             Some(OutputCompletion::ForcedClosed { .. })
         )
     }
 
     /// Returns the immutable PTY output completion once sealed.
     pub(crate) fn output_completion(&self) -> Option<OutputCompletion> {
-        self.output.completion()
+        self.inner.output.completion()
     }
 
     async fn wait_root_and_output(&self) -> Result<Exit, PtyError> {
@@ -1105,7 +1158,7 @@ impl PtyOwner {
     }
 
     async fn wait_output_exit(&self) -> Result<(), PtyError> {
-        let mut subscriber = self.output.subscribe(None)?;
+        let mut subscriber = self.inner.output.subscribe(None)?;
         loop {
             match subscriber.recv().await {
                 Some(OutputEvent::Exit { .. }) => return Ok(()),
@@ -1121,8 +1174,8 @@ impl PtyOwner {
     }
 
     fn force_output_close(&self) -> Result<OutputCompletion, PtyError> {
-        let completion = self.output.force_close();
-        self.output_readiness.cancel()?;
+        let completion = self.inner.output.force_close();
+        self.inner.output_readiness.cancel()?;
         Ok(completion)
     }
 
@@ -1161,7 +1214,7 @@ impl PtyOwner {
     /// exit is normally present. A root whose exit is unknown, or whose
     /// observation failed, is an error: no exit is assumed.
     fn known_root_exit(&self) -> Result<Exit, PtyError> {
-        match &*self.exit_rx.borrow() {
+        match &*self.inner.exit_rx.borrow() {
             Some(RootObservation::Exited(exit)) => Ok(exit.clone()),
             Some(RootObservation::Failed(message)) => Err(PtyError::ChildObservation {
                 message: message.clone(),
@@ -1197,14 +1250,14 @@ impl PtyOwner {
     /// cleanup mean a reaped root. The reader may still be serving a PTY that a
     /// process outside the group holds open, so it is not waited for.
     async fn reap_and_detach_reader(&self) -> Result<(), PtyError> {
-        join_thread(&self.child_thread).await?;
-        drop(lock_result(&self.reader_thread)?.take());
+        join_thread(&self.inner.child_thread).await?;
+        drop(lock_result(&self.inner.reader_thread)?.take());
         Ok(())
     }
 
     fn detach_threads(&self) -> Result<(), PtyError> {
-        drop(lock_result(&self.reader_thread)?.take());
-        drop(lock_result(&self.child_thread)?.take());
+        drop(lock_result(&self.inner.reader_thread)?.take());
+        drop(lock_result(&self.inner.child_thread)?.take());
         Ok(())
     }
 
@@ -1213,7 +1266,7 @@ impl PtyOwner {
         cleanup: &mut CleanupState,
         released: CleanupState,
     ) -> Result<(), PtyError> {
-        let sender = lock_result(&self.reap_tx)?.take();
+        let sender = lock_result(&self.inner.reap_tx)?.take();
         *cleanup = released;
         if let Some(sender) = sender {
             let _ = sender.send(());
@@ -1222,22 +1275,22 @@ impl PtyOwner {
     }
 
     fn signal_group(&self, signal: Signal) -> Result<(), PtyError> {
-        match read_process_start(self.identity.pid) {
-            Ok(start) if start == self.identity.start_identity => {}
+        match read_process_start(self.inner.identity.pid) {
+            Ok(start) if start == self.inner.identity.start_identity => {}
             Ok(_) => {
                 return Err(PtyError::IdentityChanged {
-                    pid: self.identity.pid,
+                    pid: self.inner.identity.pid,
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
                 return Err(PtyError::ProcessIdentity {
-                    pid: self.identity.pid,
+                    pid: self.inner.identity.pid,
                     source,
                 });
             }
         }
-        match killpg(Pid::from_raw(self.identity.process_group), signal) {
+        match killpg(Pid::from_raw(self.inner.identity.process_group), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
             // XNU leaves zombies out when it signals a group and answers EPERM
             // when it signalled no member (`killpg1` in `bsd/kern/kern_sig.c`),
@@ -1248,9 +1301,9 @@ impl PtyOwner {
             // on both kernels; Linux reports that as success too.
             Err(nix::errno::Errno::EPERM)
                 if cfg!(target_os = "macos")
-                    && !root_is_running(self.identity.pid).map_err(|source| {
+                    && !root_is_running(self.inner.identity.pid).map_err(|source| {
                         PtyError::ProcessIdentity {
-                            pid: self.identity.pid,
+                            pid: self.inner.identity.pid,
                             source,
                         }
                     })? =>
@@ -1258,15 +1311,15 @@ impl PtyOwner {
                 Ok(())
             }
             Err(source) => Err(PtyError::Signal {
-                process_group: self.identity.process_group,
+                process_group: self.inner.identity.process_group,
                 source,
             }),
         }
     }
 
     async fn join_threads(&self) -> Result<(), PtyError> {
-        join_thread(&self.child_thread).await?;
-        join_thread(&self.reader_thread).await
+        join_thread(&self.inner.child_thread).await?;
+        join_thread(&self.inner.reader_thread).await
     }
 }
 
@@ -2637,8 +2690,11 @@ mod tests {
         await_output(&pty, b"ready").await;
         let before = pty.output().next_offset();
 
-        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
-            .expect("pause output");
+        let pause = super::OutputPause::new(
+            &pty.inner.tty_name,
+            std::sync::Arc::clone(&pty.inner.held_echo),
+        )
+        .expect("pause output");
         // Read-write opens of a FIFO never wait for a peer on XNU, and holding
         // both ends keeps the release buffered until the fixture reads it.
         let written = tokio::io::unix::AsyncFd::with_interest(
@@ -2669,11 +2725,11 @@ mod tests {
             "held bytes must not be readable on the master"
         );
 
-        let order = pty.output_order.lock().expect("ordering gate");
+        let order = pty.inner.output_order.lock().expect("ordering gate");
         let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
         drain_snapshot_boundary(
-            &pty.output_reader,
-            &*pty.output_readiness,
+            &pty.inner.output_reader,
+            &*pty.inner.output_readiness,
             &pause,
             pty.output(),
             &mut buffer,
@@ -3340,7 +3396,7 @@ mod tests {
             .expect("root exit");
         pty.output().mark_exit();
 
-        let mut cleanup = pty.cleanup.lock().await;
+        let mut cleanup = pty.inner.cleanup.lock().await;
         *cleanup = CleanupState::ForcedClosing;
         let completion = pty
             .seal_and_release_output(&mut cleanup)
@@ -3541,6 +3597,7 @@ mod tests {
         pty.force_output_close().expect("force output close");
 
         let reader = pty
+            .inner
             .reader_thread
             .lock()
             .expect("reader thread lock")
@@ -3677,8 +3734,8 @@ mod tests {
     async fn drain_ends_when_readiness_lapses_before_the_read() {
         let cwd = crate::test_support::child_cwd();
         let pty = spawn(shell("sleep 30", cwd.path()));
-        let reader = std::sync::Arc::clone(&pty.output_reader);
-        let order = std::sync::Arc::clone(&pty.output_order);
+        let reader = std::sync::Arc::clone(&pty.inner.output_reader);
+        let order = std::sync::Arc::clone(&pty.inner.output_order);
         let output = pty.output().clone();
 
         let drain = tokio::task::spawn_blocking(move || {
@@ -3795,8 +3852,11 @@ mod tests {
         let mut output = pty.subscribe_output(None).expect("subscribe");
         await_marker(&mut output, b"ready", "the child's readiness").await;
 
-        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
-            .expect("pause output");
+        let pause = super::OutputPause::new(
+            &pty.inner.tty_name,
+            std::sync::Arc::clone(&pty.inner.held_echo),
+        )
+        .expect("pause output");
         tokio::time::timeout(
             HELD_ECHO_DEADLINE,
             pty.input().execute_stream(vec![InputFragment {
@@ -3840,8 +3900,11 @@ mod tests {
         let mut output = pty.subscribe_output(None).expect("subscribe");
         await_marker(&mut output, b"ready", "the child's readiness").await;
 
-        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
-            .expect("pause output");
+        let pause = super::OutputPause::new(
+            &pty.inner.tty_name,
+            std::sync::Arc::clone(&pty.inner.held_echo),
+        )
+        .expect("pause output");
         std::fs::File::create(&gate).expect("release the child's write");
         // The child's single write blocks on the suspended output while it
         // holds the terminal, so a non-blocking write is refused meanwhile.
@@ -3885,8 +3948,11 @@ mod tests {
         let mut output = pty.subscribe_output(None).expect("subscribe");
         await_marker(&mut output, b"ready", "the child's readiness").await;
 
-        let pause = super::OutputPause::new(&pty.tty_name, std::sync::Arc::clone(&pty.held_echo))
-            .expect("pause output");
+        let pause = super::OutputPause::new(
+            &pty.inner.tty_name,
+            std::sync::Arc::clone(&pty.inner.held_echo),
+        )
+        .expect("pause output");
         tokio::time::timeout(
             HELD_ECHO_DEADLINE,
             pty.input().execute_stream(vec![InputFragment {
