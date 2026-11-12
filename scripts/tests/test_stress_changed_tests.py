@@ -741,17 +741,26 @@ class Arguments(Fixture):
             self.assertIn(token, result.stdout)
 
 
-def unit_slow_list():
-    """Direct `entry_matches` probes: the daemon regex also matches
-    a selected name only when the package guard allows it."""
+def load_script_module(name):
+    """Load `scripts/stress-changed-tests` as a module under `name`."""
     import importlib.machinery
     import importlib.util
     loader = importlib.machinery.SourceFileLoader(
-        "stress_changed_unit",
+        name,
         str(Path(__file__).resolve().parents[1] / "stress-changed-tests"))
-    spec = importlib.util.spec_from_loader("stress_changed_unit", loader)
+    spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
+    return module
+
+
+SCRIPT_MODULE = load_script_module("stress_changed_shared")
+
+
+def unit_slow_list():
+    """Direct `entry_matches` probes: the daemon regex also matches
+    a selected name only when the package guard allows it."""
+    module = SCRIPT_MODULE
     daemon = module.Target("pohunek-daemon", "pohunek-daemon", "lib",
                            Path("crates/daemon/src/lib.rs"))
     regex = {"filter": "package(=pohunek-daemon) and test(/::running_loss::/)",
@@ -762,8 +771,8 @@ def unit_slow_list():
     assert not module.entry_matches(
         demo, "session::reconcile::tests::running_loss::pinned_case", regex)
     return listing({
-        "demo": {"tests::comment_edit": "matches",
-                   "session::reconcile::tests::running_loss::pinned_case": "matches"}})
+        "pohunek-daemon": {
+            "session::reconcile::tests::running_loss::pinned_case": "matches"}})
 
 
 class SlowRunner(Fixture):
@@ -871,8 +880,9 @@ class SlowRunner(Fixture):
             (daemon / "lib.rs").read_text() + "\n// touch running_loss\n")
         self.commit("add running_loss test")
         return listing({
-            "demo": {"tests::comment_edit": "matches",
-                       "session::reconcile::tests::running_loss::pinned_case": "matches"}})
+            "demo": {"tests::comment_edit": "matches"},
+            "pohunek-daemon": {
+                "session::reconcile::tests::running_loss::pinned_case": "matches"}})
 
     def test_the_untraced_matcher_pairs_package_and_pattern(self):
         unit_slow_list()

@@ -937,12 +937,7 @@ def verify_listed(root, profile, expression, selected, allow_missing, packages):
     missing = []
     runnable = []
     for target, name, rel, line in selected:
-        suite = suites.get(target.binary_id) or suites.get(target.package)
-        if suite is None:
-            suite = next(
-                (candidate for candidate in suites.values()
-                 if name in candidate.get("testcases", {})),
-                None)
+        suite = suites.get(target.binary_id)
         case = suite["testcases"].get(name) if suite else None
         if case is None:
             if allow_missing and (target.binary_id, name) in HOST_DEPENDENT:
