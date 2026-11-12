@@ -12846,7 +12846,7 @@ handler = "codex-hook-v1"
         /// Root of the fixtures' private session TMPDIRs, below the fixture root.
         const FIXTURE_TMP_ROOT: &str = "cache/session-tmp";
         use super::hermetic_shell;
-        use pohunek_test_support::wait::HANG_GUARD;
+        use pohunek_test_support::wait::{guard, HANG_GUARD};
 
         struct Fixture {
             root: crate::test_support::ScopedDir,
@@ -16063,7 +16063,19 @@ generation "$1"
             let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-315", "worker-s-315")
                     .await;
-            persist_record(&fixture.root, "s-315", Some(worker_instance_id.as_str()));
+            let mut record =
+                persist_record(&fixture.root, "s-315", Some(worker_instance_id.as_str()));
+            record.transaction = Some(crate::store::SessionTransaction {
+                id: "recover-s-315".to_owned(),
+                kind: crate::store::TransactionKind::Recover,
+                phase: "requested".to_owned(),
+                previous_worker_id: Some("worker-s-314".to_owned()),
+                previous_worker_instance_id: None,
+                daemon_instance_id: None,
+            });
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the recovery intent");
             drop(controller);
             let mut events = fixture.registry.subscribe();
 
@@ -16075,6 +16087,35 @@ generation "$1"
                 runtime_of(&fixture.registry, "s-315").await.state,
                 RuntimeState::Live
             );
+            let mut seen = Vec::new();
+            let event = guard("the session_native_recovered event", async {
+                loop {
+                    let event = events.recv().await.expect("receive recovery event");
+                    if event.event() == protocol::event::SESSION_NATIVE_RECOVERED {
+                        break event;
+                    }
+                    seen.push(event);
+                }
+            })
+            .await;
+            let recovered_event: protocol::SessionNativeRecoveredEvent =
+                serde_json::from_value(event.payload().clone()).expect("recovery event payload");
+            assert_eq!(
+                serde_json::to_value(&recovered_event).expect("re-serialize the recovery event"),
+                *event.payload(),
+                "the streamed payload must carry the protocol type's shape"
+            );
+            assert!(
+                event.payload().get("previous_worker_instance_id").is_none(),
+                "an absent previous id stays absent: {}",
+                event.payload()
+            );
+            assert_eq!(recovered_event.previous_worker_instance_id, None);
+            assert_eq!(
+                recovered_event.worker_instance_id.as_deref(),
+                Some(worker_instance_id.as_str()),
+                "the event names the adopted worker"
+            );
             let inventory = fixture.registry.runtime_inventory().await;
             let entry = inventory
                 .entries
@@ -16084,6 +16125,12 @@ generation "$1"
             assert_eq!(entry.status, RuntimeInventoryStatus::Managed);
             assert_eq!(entry.reason.as_deref(), Some(UNSUPERVISED_WORKER));
             let mut announced = false;
+            for event in seen {
+                if event.event() == protocol::event::SESSION_RUNTIME_DISCOVERED {
+                    announced |=
+                        event.payload()["entry"]["reason"].as_str() == Some(UNSUPERVISED_WORKER);
+                }
+            }
             while let Ok(event) = events.try_recv() {
                 if event.event() == protocol::event::SESSION_RUNTIME_DISCOVERED {
                     announced |=

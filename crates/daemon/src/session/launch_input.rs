@@ -243,9 +243,9 @@ impl SessionRegistry {
                     );
                     false
                 }
-                // The run recorded its answer before the deadline. Its thread
-                // logs that outcome right after recording it, so the log line
-                // may still be pending.
+                // The run recorded its answer by the time the launch stopped waiting for
+                // it; its thread logs that outcome right after recording it, so the log
+                // line may still be pending.
                 AtDeadline::Finished { trusted } => trusted,
             },
         };
