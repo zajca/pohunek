@@ -774,15 +774,34 @@ fn a_status_probe_that_never_answers_is_bounded_and_killed() {
     let output = fixture.run(&["host", "list", "--refresh", "--json"]);
     assert_eq!(error_code(&output), "tailscale_state_unavailable");
     assert_not_running(&helper);
+}
 
-    // A `--host` command probes the provider to learn whether the name is this
-    // machine and again to resolve the peer: two probes, never more.
-    let before = fs::read_to_string(&runs).expect("runs so far").len();
+/// A `--host` command probes the status twice: once to name this machine,
+/// then to resolve the peer. The probe answers at once, so no probe can
+/// expire and the count does not depend on host timing.
+#[test]
+fn a_host_command_probes_the_provider_once_to_name_this_machine_and_once_to_resolve_the_peer() {
+    let fixture = Fixture::new(&tailnet());
+    // The deadline is at its maximum so the outer budget can never fire.
+    fixture.configure("status_timeout_secs = 120");
+    let runs = fixture.env.root().join("tailscale.count-runs");
+    fs::write(&runs, "").expect("create the runs file");
+    pohunek_test_support::fs::write_executable(
+        fixture.fake.bin_dir().join("tailscale"),
+        format!(
+            "#!/bin/sh\nprintf x >> '{runs}'\nexit 1\n",
+            runs = runs.display()
+        ),
+    )
+    .expect("write the failing fake");
     let (output, targets) = fixture.dial("alpha");
     assert_eq!(error_code(&output), "tailscale_state_unavailable");
     assert!(targets.is_empty(), "{targets:?}");
-    let after = fs::read_to_string(&runs).expect("runs so far").len();
-    assert_eq!(after - before, 2, "the status probe ran twice per command");
+    let probes = fs::read_to_string(&runs).expect("runs").len();
+    assert_eq!(
+        probes, 2,
+        "a --host command probes the status twice: to name this machine, then to resolve the peer"
+    );
 }
 
 /// The deadline is a strict, range-checked `overlays.toml` key.
