@@ -643,7 +643,12 @@ fn version_named_images_outside_the_provider_install_root_are_not_selected() {
         ("codex", "/home/dev/.local/share/claude/versions/2.1.309"),
     ];
     for (provider, executable) in impostors {
-        let table = table_with_agent(executable, &[provider]);
+        let mut table = table_with_agent(executable, &[provider]);
+        table
+            .facts
+            .last_mut()
+            .expect("the agent is in the table")
+            .comm = provider.to_owned();
         assert_eq!(selected(&table, provider), None, "{executable}");
         assert!(
             !verify_launch_claim_with(&table, &claim(provider, AGENT_PID, AGENT_START)).unwrap(),
