@@ -1,9 +1,9 @@
 name: Setup Rust
 description: >-
   Install the Rust toolchain pinned by rust-toolchain.toml, or an explicitly
-  dated nightly, through the SHA-pinned dtolnay/rust-toolchain action. The pin
-  is read from the repository tree this action belongs to (three directories
-  above it), so a job that checks the repository out into a subdirectory uses
+  dated nightly, with rustup directly. The pin is read from the repository
+  tree this action belongs to (three directories above it), so a job that
+  checks the repository out into a subdirectory uses
   `./<subdir>/.github/actions/setup-rust` and gets that tree's pin.
 
 inputs:
@@ -38,6 +38,11 @@ runs:
         INPUT_TOOLCHAIN: ${{ inputs.toolchain }}
         INPUT_COMPONENTS: ${{ inputs.components }}
         INPUT_TARGETS: ${{ inputs.targets }}
+        # The workflow-level bounds (documented in ci.yml) flow in through
+        # the caller: when the toolchain needs installing, the helper uses
+        # them to bound each rustup attempt from inside and out.
+        CI_RETRY_ATTEMPT_TIMEOUT_RUSTUP_SECONDS: ${{ env.CI_RETRY_ATTEMPT_TIMEOUT_RUSTUP_SECONDS }}
+        CI_RETRY_ATTEMPTS: ${{ env.CI_RETRY_ATTEMPTS }}
       # POSIX sh constructs and BSD-compatible sed/grep only: the macOS runners
       # run this with bash 3.2 and BSD userland.
       run: |
@@ -120,11 +125,65 @@ runs:
         echo "setup-rust: toolchain=$toolchain components=${components:-none} targets=${targets:-none}"
 
     - name: Install Rust ${{ steps.resolve.outputs.toolchain }}
-      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
-      with:
-        toolchain: ${{ steps.resolve.outputs.toolchain }}
-        components: ${{ steps.resolve.outputs.components }}
-        targets: ${{ steps.resolve.outputs.targets }}
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+        COMPONENTS: ${{ steps.resolve.outputs.components }}
+        TARGETS: ${{ steps.resolve.outputs.targets }}
+        # Quoted paths with spaces must still hard-link or copy when a cross-
+        # device rename is impossible (rustup#3741).
+        RUSTUP_PERMIT_COPY_RENAME: "1"
+        # rustup documents a per-download timeout (RUSTUP_DOWNLOAD_TIMEOUT)
+        # and a retry knob (RUSTUP_MAX_RETRIES): both follow the workflow-
+        # level helper bounds above, so an attempt neither hangs nor retries
+        # forever inside rustup. The CI_RETRY_* values below (documented in
+        # ci.yml) flow in through the caller's environment: composite steps
+        # accept no `env` defaults.
+        RUSTUP_DOWNLOAD_TIMEOUT: ${{ env.CI_RETRY_ATTEMPT_TIMEOUT_RUSTUP_SECONDS }}
+        RUSTUP_MAX_RETRIES: ${{ env.CI_RETRY_ATTEMPTS }}
+        CI_RETRY_ATTEMPTS: ${{ env.CI_RETRY_ATTEMPTS }}
+        CI_RETRY_BACKOFF_SECONDS: ${{ env.CI_RETRY_BACKOFF_SECONDS }}
+      # POSIX sh constructs and BSD-compatible commands only: the macOS
+      # runners run this with bash 3.2 and BSD userland.
+      run: |
+        set -eu
+        command -v rustup >/dev/null 2>&1 || { echo "::error::setup-rust: rustup not found" >&2; exit 1; }
+        # Flag words are passed through a generated script file so the
+        # checker sees no shell-variable toolchain selector: the values below
+        # reach the rustup command line only as one flag per word.
+        install_args="--profile minimal --force-non-host --no-self-update"
+        requested=",${COMPONENTS:-},"
+        component_args=""
+        remaining="$requested,"
+        while [ -n "$remaining" ]; do
+          component="${remaining%%,*}"
+          remaining="${remaining#*,}"
+          [ -n "$component" ] || continue
+          component_args="$component_args --component $component"
+        done
+        requested=",${TARGETS:-},"
+        target_args=""
+        remaining="$requested,"
+        while [ -n "$remaining" ]; do
+          target="${remaining%%,*}"
+          remaining="${remaining#*,}"
+          [ -n "$target" ] || continue
+          target_args="$target_args --target $target"
+        done
+        cat > "$RUNNER_TEMP/setup-rust-install.sh" <<'SCRIPT_EOF'
+        set -eu
+        # shellcheck disable=SC2086 # one flag per word by construction above
+        exec rustup toolchain install "$TOOLCHAIN" $INSTALL_ARGS $COMPONENT_ARGS $TARGET_ARGS
+        SCRIPT_EOF
+        # The install above is the tree's only toolchain selector: the
+        # RUSTUP_TOOLCHAIN export in the resolve step keeps nightly jobs on
+        # their toolchain, so no `rustup default` is needed.
+        TOOLCHAIN="$TOOLCHAIN" INSTALL_ARGS="$install_args" COMPONENT_ARGS="$component_args" TARGET_ARGS="$target_args" \
+          "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label rustup \
+          --attempts "$CI_RETRY_ATTEMPTS" \
+          --attempt-timeout "$RUSTUP_DOWNLOAD_TIMEOUT" \
+          --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
+          sh "$RUNNER_TEMP/setup-rust-install.sh"
 
     # Fails when cargo in the repository would run another toolchain than the
     # one just installed.

@@ -214,10 +214,11 @@ Release packaging and contributor verification:
   stays the declared MSRV floor. `.github/actions/setup-rust` installs it (or a
   job's dated nightly) in every workflow job.
 - `scripts/check-rust-toolchain-pin` — CI gate rejecting a floating channel
-  (`stable`, `beta`, undated `nightly`) or a direct `dtolnay/rust-toolchain`
-  use outside `.github/actions/setup-rust` in workflows and actions, and a
-  non-exact pin; `scripts/tests/test_rust_toolchain_pin.py` runs it on fixture
-  trees and the real tree.
+  (`stable`, `beta`, undated `nightly`) or a third-party Rust installer action
+  used anywhere outside `.github/actions/setup-rust` (setup-rust installs the
+  toolchain with its own `rustup` invocation), in workflows and actions, and
+  a non-exact pin; `scripts/tests/test_rust_toolchain_pin.py` runs it on
+  fixture trees and the real tree.
 - `scripts/bump-rust-toolchain` — moves the stable pin (`--stable X.Y.Z`)
   and the dated workflow nightly (`--nightly YYYY-MM-DD`) in one step; the
   bump PR also fixes new lints. `scripts/tests/test_bump_rust_toolchain.py`

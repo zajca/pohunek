@@ -1493,7 +1493,7 @@ class OfflineDependencySourcesTests(unittest.TestCase):
                 )
                 if test_run is None:
                     continue
-                fetch = re.search(r"(?m)^\s+(?:- )?run: cargo fetch --locked$", block)
+                fetch = re.search(r"(?m)^\s+(?:- )?run: (?:.*\n)*?.*cargo fetch --locked$", block)
                 with self.subTest(job=name):
                     self.assertIsNotNone(fetch, f"{name} runs cargo test without `cargo fetch --locked`")
                     self.assertLess(fetch.start(), test_run.start(), f"{name} fetches after running cargo test")

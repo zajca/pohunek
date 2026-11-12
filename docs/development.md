@@ -195,6 +195,12 @@ steps accept no `timeout-minutes` of their own. Every other `apt-get` step
 in a workflow has a step `timeout-minutes` and apt network timeouts.
 `scripts/tests/test_ci_step_bounds.py` pins both.
 
+**Network retries.** Every network install step (apt-get, npm ci, bun install,
+rustup, uv, cargo fetch, setup-zig downloads) runs through
+`.github/scripts/ci-retry`, with bounded attempts and per-attempt timeouts
+from the workflow `env`. An exhausted retry marks the job with
+`CI_INFRA_FAILURE`.
+
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the
 route is in the [contribution workflow](../.agents/skills/contribute/SKILL.md)),

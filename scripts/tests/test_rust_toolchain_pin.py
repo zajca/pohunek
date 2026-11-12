@@ -172,21 +172,12 @@ class CheckRustToolchainPinTests(unittest.TestCase):
             "installs Rust outside ./.github/actions/setup-rust",
         )
 
-    def test_rejects_composite_action_pinned_by_branch(self):
+    def test_installs_rust_without_a_third_party_action(self):
         write_tree(self.root)
-        action = self.root / ACTION_RELATIVE
-        text = action.read_text()
-        self.assertIn("dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de", text)
-        action.write_text(
-            text.replace("dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de", "dtolnay/rust-toolchain@stable")
-        )
-        result = self.run_check(str(self.root))
-        self.assert_violation(
-            result,
-            ACTION_RELATIVE.as_posix(),
-            line_of(action.read_text(), "dtolnay/rust-toolchain@stable"),
-            "not pinned to a commit SHA",
-        )
+        action = (self.root / ACTION_RELATIVE).read_text()
+        self.assertIn("exec rustup toolchain install", action)
+        for installer in ("dtolnay/rust-toolchain", "actions-rust-lang/setup-rust-toolchain"):
+            self.assertNotIn(installer, action)
 
     def check_workflow_line(self, old, new):
         """Run the check on the clean workflow with one line replaced."""

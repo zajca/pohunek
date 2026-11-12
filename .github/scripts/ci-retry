@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Runs a command with bounded retries for flaky CI network steps (#2198).
+#
+# Every attempt carries its own timeout: the command runs in its own process
+# group so a stuck attempt (a hung DNS lookup, a stalled download) is killed
+# together with its grandchildren, never left behind to leak into the next
+# attempt. The wait between attempts starts at the backoff value and doubles
+# after every failure. A missing flag is a usage error; exhausting the
+# attempts exits with the last attempt's code so the caller's failure reason
+# is preserved.
+#
+# Interface:
+#   ci-retry --label <name> --attempts <n> --attempt-timeout <seconds> \
+#     --backoff <seconds> -- command args...
+# All flags are required. <label> names the retried unit in the log lines and
+# in the `::error` annotation; it must not contain `=` or a newline because a
+# failing run appends `CI_INFRA_FAILURE=<label>` to $GITHUB_ENV (when set) so
+# the run summary can link the retry to the incident follow-ups.
+#
+# Attempt timeouts are per command class, from the p90 of successful main
+# runs plus headroom (cargo fetch 8 s, apt 11 s, npm 7 s, bun 3 s, rustup
+# 13 s, uv 8 s, zig 57 s): 180 s for the installers, 120 s for a single
+# direct download, which already matches the curl --max-time the download
+# actions use. The worst case (three timed-out 180 s attempts plus the
+# 10 s and 20 s backoff waits) stays inside the smallest step timeout that
+# guards these steps today (10 minutes). Per-request knobs stay at each
+# tool: npm --fetch-timeout, CARGO_HTTP_TIMEOUT, RUSTUP_DOWNLOAD_TIMEOUT,
+# UV_HTTP_TIMEOUT, BUN_CONFIG_HTTP_RETRY_COUNT, curl --connect-timeout and
+# --max-time. rustup documents no retry knob, so the helper is its only
+# retry layer.
+#
+# Portable bash 3.2 compatible with the GitHub macOS runners. No bashisms
+# beyond POSIX plus $(( )), $( ), and kill -SIGNAL -pgid.
+
+set -u
+watchdog_sleep=""
+
+# Grace between TERM and KILL of an over-time attempt, in whole seconds.
+KILL_GRACE_SECONDS=5
+
+usage() {
+    echo "usage: ci-retry --label <name> --attempts <n> --attempt-timeout <seconds> --backoff <seconds> -- command args..." >&2
+    exit 2
+}
+
+label=""
+attempts=""
+attempt_timeout=""
+backoff=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --label)
+            [ $# -ge 2 ] || usage
+            label="$2"
+            shift 2
+            ;;
+        --attempts)
+            [ $# -ge 2 ] || usage
+            attempts="$2"
+            shift 2
+            ;;
+        --attempt-timeout)
+            [ $# -ge 2 ] || usage
+            attempt_timeout="$2"
+            shift 2
+            ;;
+        --backoff)
+            [ $# -ge 2 ] || usage
+            backoff="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[ -n "$label" ] && [ -n "$attempts" ] && [ -n "$attempt_timeout" ] && [ -n "$backoff" ] && [ $# -gt 0 ] || usage
+
+case "$label" in
+    *=* | *"
+"*)
+        usage
+        ;;
+esac
+
+case "$attempts" in
+    '' | *[!0-9]* | 0*)
+        usage
+        ;;
+esac
+case "$attempt_timeout" in
+    '' | *[!0-9]* | 0*)
+        usage
+        ;;
+esac
+case "$backoff" in
+    '' | *[!0-9]*)
+        usage
+        ;;
+esac
+
+# Runs "$@" once in its own process group with a watchdog: when the attempt
+# outlives $attempt_timeout the whole group gets TERM, then KILL after
+# $KILL_GRACE_SECONDS. Returns the command's exit status.
+run_one_attempt() {
+    attempt_rc=""
+    set -m
+    "$@" &
+    cmd_pid=$!
+    set +m
+    if [ -z "${cmd_pid:-}" ]; then
+        printf 'ci-retry: %s could not start the command\n' "$label" >&2
+        return 127
+    fi
+    (
+        trap 'kill "$watchdog_sleep" 2>/dev/null; wait "$watchdog_sleep" 2>/dev/null' TERM
+        sleep "$attempt_timeout" &
+        watchdog_sleep=$!
+        if wait "$watchdog_sleep" 2>/dev/null; then
+            kill -TERM "-$cmd_pid" 2>/dev/null
+            sleep "$KILL_GRACE_SECONDS" 2>/dev/null
+            kill -KILL "-$cmd_pid" 2>/dev/null
+        fi
+    ) &
+    watchdog_pid=$!
+    set +m
+    wait "$cmd_pid" 2>/dev/null
+    attempt_rc=$?
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    return "$attempt_rc"
+}
+
+delay="$backoff"
+i=1
+rc=1
+while [ "$i" -le "$attempts" ]; do
+    echo "ci-retry: $label attempt $i/$attempts"
+    rc=0
+    run_one_attempt "$@" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        exit 0
+    fi
+    echo "ci-retry: $label attempt $i/$attempts failed (exit $rc)"
+    if [ "$i" -lt "$attempts" ]; then
+        sleep "$delay"
+        delay=$((delay * 2))
+    fi
+    i=$((i + 1))
+done
+
+echo "::error title=Infrastructure::$label failed after $attempts attempts (exit $rc)" >&2
+if [ -n "${GITHUB_ENV:-}" ]; then
+    printf 'CI_INFRA_FAILURE=%s\n' "$label" >> "$GITHUB_ENV"
+fi
+exit "$rc"

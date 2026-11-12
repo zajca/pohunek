@@ -22,8 +22,9 @@ violation:
   `rustup override set` and `rustup run`.
 * An action whose name contains `rust-toolchain` or `setup-rust` (or
   `actions-rs/toolchain`) is used anywhere but as the local composite
-  `.github/actions/setup-rust`; inside that composite, dtolnay/rust-toolchain
-  must be referenced by commit SHA, since its branch names are channels.
+  `.github/actions/setup-rust`; no third-party installer action is allowed
+  anywhere, so the toolchain is always installed by the composite's own
+  `rustup` invocation.
 
 Expressions (`${{ ... }}`) and shell variables as a toolchain are allowed only
 inside .github/actions/setup-rust/action.yml, which validates and passes on
@@ -59,7 +60,6 @@ MAX_REPORTED_VIOLATIONS = 50
 
 EXACT_RELEASE = re.compile(r"\d+\.\d+\.\d+")
 DATED_NIGHTLY = re.compile(r"nightly-(\d{4}-\d{2}-\d{2})")
-COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 
 # The line forms the setup-rust resolve step accepts (its sed expressions).
 CHANNEL_KEY_LINE = re.compile(r"^\s*channel\s*=")
@@ -80,7 +80,6 @@ RUSTUP_TOOLCHAIN_ASSIGNMENT = re.compile(
 )
 LOCAL_SETUP_RUST = re.compile(r"\./(?:[\w.-]+/)*\.github/actions/setup-rust")
 INSTALLER_NAME = re.compile(r"rust-toolchain|setup-rust|actions-rs/toolchain", re.I)
-DTOLNAY = "dtolnay/rust-toolchain"
 
 # Shell words that end one command and start the next.
 COMMAND_SEPARATOR = re.compile(r"&&|\|\||[;|&()`]|\$\(")
@@ -273,10 +272,6 @@ def check_uses(relative, number, reference, is_setup_rust):
         return None
     if INSTALLER_NAME.search(name) is None:
         return None
-    if is_setup_rust and name == DTOLNAY:
-        if COMMIT_SHA.fullmatch(ref):
-            return None
-        return (relative, number, f"{reference} is not pinned to a commit SHA")
     return (relative, number, f"{name} installs Rust outside ./.github/actions/setup-rust; use that action")
 
 
