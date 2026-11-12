@@ -137,7 +137,6 @@ fn release(installation: &Installation) -> PathBuf {
     installation.stage()
 }
 
-/// Snapshot of a directory tree: each entry's bytes, or `None` for a directory.
 /// Every entry below `root` with the SHA-256 of each file's content. A
 /// snapshot that held the bytes would print the staged release binaries
 /// (hundreds of MiB) in the message of a failed comparison.
@@ -1930,8 +1929,9 @@ async fn a_hook_selection_naming_an_unknown_home_is_refused() {
             "the message lists the homes the host has: {error}"
         );
     }
-    // Resolving the macOS paths creates the empty runtime and state
-    // directories, so only a written file counts.
+    // Resolving the macOS paths creates empty directories (the runtime and
+    // state directories among them), so the check counts only written files:
+    // a directory-only change anywhere below the installation is dropped.
     let after = snapshot(&installation.root);
     let written: Vec<PathBuf> = changed_paths(&before, &after)
         .into_iter()

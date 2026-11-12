@@ -5116,6 +5116,118 @@ async fn a_daemon_start_removes_the_trust_scratch_a_stopped_daemon_left() {
 }
 
 #[tokio::test]
+async fn a_daemon_start_removes_a_trust_scratch_link_and_keeps_its_target() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut state_root = None;
+    let servers = spawn_servers_configured("pkg-trust-sweep-link", Some(""), |config| {
+        config.catalog_trust = CatalogTrust::Absent;
+        config.trusted_repositories = host_trusting(&["acme/widgets"]);
+        let root = config
+            .worker_state_root
+            .clone()
+            .expect("the fixture configures a worker state root");
+        let scratch = root.join("checkout-trust");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&scratch)
+            .expect("create the scratch directory");
+        // A prefixed entry that is a link: the sweep removes the link as the
+        // entry it found and never walks into the directory the link names.
+        let foreign = root.join("foreign/populated");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&foreign)
+            .expect("create the directory the link names");
+        std::fs::write(foreign.join("kept"), "target survives").expect("write a target file");
+        std::os::unix::fs::symlink(&foreign, scratch.join("pohunek-trust-link"))
+            .expect("link a prefixed entry to the directory outside the scratch root");
+        state_root = Some(root);
+    })
+    .await;
+    let state_root = state_root.expect("the configure step ran");
+    assert_eq!(
+        trust_scratch_entries(&state_root),
+        Vec::<String>::new(),
+        "the start removed the linked entry"
+    );
+    assert!(
+        std::fs::symlink_metadata(state_root.join("checkout-trust/pohunek-trust-link")).is_err(),
+        "the link itself is gone"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state_root.join("foreign/populated/kept"))
+            .expect("the directory the link named survives"),
+        "target survives",
+        "the sweep removed the link, not what it named"
+    );
+
+    servers.stop().await;
+}
+
+#[tokio::test]
+async fn a_daemon_start_refuses_a_trust_scratch_root_that_is_a_link() {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let log = DaemonLog::start();
+    let mut state_root = None;
+    let servers = spawn_servers_configured("pkg-trust-sweep-root-link", Some(""), |config| {
+        config.catalog_trust = CatalogTrust::Absent;
+        config.trusted_repositories = host_trusting(&["acme/widgets"]);
+        let root = config
+            .worker_state_root
+            .clone()
+            .expect("the fixture configures a worker state root");
+        // A scratch root that is itself a link: the sweep refuses it, so every
+        // entry below the directory it names survives.
+        let outside = root.join("outside-scratch");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(outside.join("pohunek-trust-foreign/objects"))
+            .expect("create the directory the scratch root names");
+        std::fs::write(
+            outside.join("pohunek-trust-foreign/objects/kept"),
+            "left alone",
+        )
+        .expect("write a file below the directory the scratch root names");
+        std::os::unix::fs::symlink(&outside, root.join("checkout-trust"))
+            .expect("link the scratch root to a sibling directory");
+        state_root = Some(root);
+    })
+    .await;
+    let state_root = state_root.expect("the configure step ran");
+    assert!(
+        state_root
+            .join("outside-scratch/pohunek-trust-foreign/objects")
+            .is_dir(),
+        "the sweep kept the entry the linked root names"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            state_root.join("outside-scratch/pohunek-trust-foreign/objects/kept")
+        )
+        .expect("the file below the directory the scratch root names survives"),
+        "left alone"
+    );
+    let refused = log.event_records("checkout_trust.sweep_failed");
+    assert!(
+        !refused.is_empty(),
+        "a symlinked scratch root is refused with a warn"
+    );
+    assert!(
+        refused
+            .iter()
+            .any(|record| record["fields"]["reason"] == "the scratch directory is not a directory"),
+        "the warn names the refusal: {refused:?}"
+    );
+
+    servers.stop().await;
+}
+
+#[tokio::test]
 async fn an_ancestor_of_a_nested_declared_path_swapped_for_a_link_is_not_trusted() {
     let servers = spawn_servers_trusting_repositories(
         "pkg-trust-ancestor",

@@ -243,8 +243,9 @@ impl SessionRegistry {
                     );
                     false
                 }
-                // The run recorded its answer, and logged it, before the
-                // deadline; only its thread had not returned yet.
+                // The run recorded its answer before the deadline. Its thread
+                // logs that outcome right after recording it, so the log line
+                // may still be pending.
                 AtDeadline::Finished { trusted } => trusted,
             },
         };
@@ -517,8 +518,8 @@ type StalledCheckouts = std::sync::Mutex<std::collections::HashSet<PathBuf>>;
 
 impl EvaluationRun {
     /// Records that the launch stopped waiting for a run of `checkout` that is
-    /// still blocked, or returns the answer of a run that has just ended and
-    /// logged its own outcome.
+    /// still blocked, or returns the answer of a run that has already recorded
+    /// its outcome; that run's thread logs the outcome.
     fn abandon(&self, stalled: &StalledCheckouts, checkout: &Path) -> AtDeadline {
         let (Ok(mut state), Ok(mut stalled)) = (self.state.lock(), stalled.lock()) else {
             return AtDeadline::Abandoned;
