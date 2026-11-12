@@ -669,7 +669,8 @@ pub fn install_in(
 /// # Errors
 ///
 /// The errors of [`install_in`], and `integration_agent_skill_unsupported` for
-/// a named runtime that declares no skill location.
+/// a named runtime that declares no skill location or has no daemon-managed
+/// hook integration.
 pub fn install_in_with(
     homes: &ConfigHomes,
     agent: Option<&RuntimeRef>,
@@ -721,14 +722,38 @@ pub(super) fn skill_unsupported(display_name: &str, profile: Option<&str>) -> Pr
     )
 }
 
-/// The refusal of a `--skill` request whose named runtime has no daemon-run
-/// handler: it declares no skill location either. Any other error is kept.
-pub(super) fn skill_refusal(agent: Option<&RuntimeRef>, error: ProtocolError) -> ProtocolError {
-    match agent {
-        Some(agent) if error.code == "agent_not_installable" => {
-            skill_unsupported(agent.as_wire(), None)
-        }
-        _ => error,
+/// The refusal of a `--skill` request that names a runtime with no daemon-run
+/// hook integration: a runtime without a daemon-run handler, or one the host
+/// does not serve. `subject` is the runtime id, or `profile <name>`.
+pub(super) fn skill_without_hooks(subject: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        super::agent_skill::UNSUPPORTED_CODE,
+        format!(
+            "{subject} has no daemon-managed hook integration, so the daemon cannot install its agent skill"
+        ),
+        Some(
+            "drop --skill: the daemon installs an agent skill only beside hooks it manages"
+                .to_owned(),
+        ),
+    )
+}
+
+/// The refusal of a `--skill` request that names its runtime, by `agent` or by
+/// a host profile, and whose runtime has no daemon-managed hook integration.
+/// Any other error, and a request that names no runtime, is kept.
+pub(super) fn skill_refusal(
+    agent: Option<&RuntimeRef>,
+    selection: &HomeSelection,
+    error: ProtocolError,
+) -> ProtocolError {
+    if error.code != "agent_not_installable" {
+        return error;
+    }
+    match (selection, agent) {
+        (HomeSelection::Profile(name), _) => skill_without_hooks(&format!("profile {name}")),
+        (_, Some(agent)) => skill_without_hooks(agent.as_wire()),
+        (_, None) => error,
     }
 }
 
@@ -741,7 +766,7 @@ fn install_core(
     gate: HomeGate<'_>,
 ) -> Result<IntegrationInstallResult, ProtocolError> {
     let targets = match homes.targets(agent, selection) {
-        Err(error) if skill => return Err(skill_refusal(agent, error)),
+        Err(error) if skill => return Err(skill_refusal(agent, selection, error)),
         result => result?,
     };
     if skill && (agent.is_some() || matches!(selection, HomeSelection::Profile(_))) {

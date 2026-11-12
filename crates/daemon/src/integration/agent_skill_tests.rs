@@ -18,7 +18,10 @@ use protocol::{
 };
 
 use super::{ConfigHomes, HomeSelection};
-use crate::agent::host::fixture::{cline_shaped_host, official_host, official_profile_pin};
+use crate::agent::host::fixture::{
+    cline_shaped_and_official_host, cline_shaped_host, official_host, official_profile_pin,
+    pi_shaped_host, pi_shaped_profile_pin, PI_SHAPED_NO_CHECK,
+};
 use crate::agent::host::RuntimeHost;
 use crate::agent::ProfileRegistry;
 use crate::integration::handler::{install_in_with, status_in, RetainedSchemas};
@@ -636,6 +639,48 @@ fn a_runtime_with_a_handler_and_no_skill_location_refuses_the_skill_before_any_w
     let removal = uninstall_in_with(&rig.homes, &cline, &HomeSelection::Runtime, true)
         .expect_err("skill-only removal is refused");
     assert_eq!(removal.code, "integration_agent_skill_unsupported");
+
+    // A request that names no runtime skips the runtime without a skill
+    // location and still writes the skill of a runtime that declares one.
+    let mixed = Rig::with_host(
+        &[],
+        cline_shaped_and_official_host(Path::new("/bin/sh"), &[]),
+    );
+    fs::create_dir_all(mixed.home().join(".cline")).expect("create the Cline config home");
+    let installed = install_in_with(
+        &mixed.homes,
+        None,
+        &HomeSelection::Runtime,
+        &RetainedSchemas::default(),
+        true,
+    )
+    .expect("an unnamed request installs every served home it finds");
+    let report_of = |agent: &str| {
+        installed
+            .installed
+            .iter()
+            .find(|home| home.agent.as_wire() == agent)
+            .unwrap_or_else(|| panic!("{agent} is installed"))
+    };
+    let cline_home = report_of("cline");
+    assert!(
+        !cline_home.hook_path.is_empty() && Path::new(&cline_home.hook_path).exists(),
+        "the hooks of a runtime without a skill location are installed"
+    );
+    assert!(
+        cline_home.skill.is_none(),
+        "a runtime without a skill location is skipped"
+    );
+    let claude_home = report_of("claude");
+    assert_eq!(
+        claude_home.skill.as_ref().expect("a skill report").state,
+        AgentSkillChange::Created
+    );
+    assert_eq!(
+        fs::read_to_string(claude_skill_dir(&mixed.home().join(".claude")).join("SKILL.md"))
+            .expect("read the skill"),
+        AGENT_SKILL
+    );
 }
 
 #[test]
@@ -647,6 +692,17 @@ fn a_runtime_without_a_daemon_handler_answers_the_skill_with_the_unsupported_cod
         .install(&pi, &HomeSelection::Runtime, true)
         .expect_err("the skill is refused");
     assert_eq!(install.code, "integration_agent_skill_unsupported");
+    assert!(
+        install
+            .msg
+            .contains("pi has no daemon-managed hook integration"),
+        "{}",
+        install.msg
+    );
+    assert_eq!(
+        install.recover.as_deref(),
+        Some("drop --skill: the daemon installs an agent skill only beside hooks it manages")
+    );
 
     let removal = uninstall_in_with(&rig.homes, &pi, &HomeSelection::Runtime, true)
         .expect_err("skill-only removal is refused");
@@ -656,4 +712,52 @@ fn a_runtime_without_a_daemon_handler_answers_the_skill_with_the_unsupported_cod
         .install(&pi, &HomeSelection::Runtime, false)
         .expect_err("the hooks stay unsupported");
     assert_eq!(hooks.code, "agent_not_installable");
+
+    // A profile over the same runtime answers the same refusal, named after
+    // the profile, and so does a request that names the runtime as well.
+    let profiled = Rig::with_host(
+        &[(
+            "pi-work",
+            format!("base = \"pi\"\n{}", pi_shaped_profile_pin()),
+        )],
+        pi_shaped_host(Path::new("/bin/sh"), PI_SHAPED_NO_CHECK),
+    );
+    let profile = HomeSelection::Profile("pi-work".to_owned());
+    let by_profile = install_in_with(
+        &profiled.homes,
+        None,
+        &profile,
+        &RetainedSchemas::default(),
+        true,
+    )
+    .expect_err("the skill is refused");
+    assert_eq!(by_profile.code, "integration_agent_skill_unsupported");
+    assert!(
+        by_profile
+            .msg
+            .contains("profile pi-work has no daemon-managed hook integration"),
+        "{}",
+        by_profile.msg
+    );
+
+    let profile_removal = uninstall_in_with(&profiled.homes, &pi, &profile, true)
+        .expect_err("skill-only removal is refused");
+    assert_eq!(profile_removal.code, "integration_agent_skill_unsupported");
+    assert!(
+        profile_removal
+            .msg
+            .contains("profile pi-work has no daemon-managed hook integration"),
+        "{}",
+        profile_removal.msg
+    );
+
+    let named = install_in_with(
+        &profiled.homes,
+        Some(&pi),
+        &profile,
+        &RetainedSchemas::default(),
+        true,
+    )
+    .expect_err("the skill is refused");
+    assert_eq!(named.code, "integration_agent_skill_unsupported");
 }

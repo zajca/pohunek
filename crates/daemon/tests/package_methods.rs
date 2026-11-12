@@ -569,6 +569,89 @@ async fn the_lifecycle_runs_end_to_end_on_the_local_socket() {
     servers.stop().await;
 }
 
+/// A credential literal a `package.create_profile` request carries reaches no
+/// captured daemon log line, while the refusal still logs its own warning.
+#[tokio::test]
+async fn a_credential_literal_of_a_new_profile_reaches_no_daemon_log_line() {
+    let log = DaemonLog::start();
+    let servers = spawn_servers("pkg-profile-credential").await;
+    let mut local = connect_unix(&servers.socket).await;
+    // The base declares a config home, so a `home` request reaches the
+    // credential check instead of refusing the home as unsupported.
+    install_with_tables(
+        &mut local,
+        &servers.plugins,
+        "profile-credential",
+        CONFIG_HOME_TABLE,
+    )
+    .await
+    .expect("the base package installs");
+
+    let token = "sk-ant-0123456789abcdef0123456789";
+    let cases = [
+        (
+            "the home path of a new profile looks like a credential",
+            json!({
+                "profile": "leaky",
+                "base": RUNTIME,
+                "home": format!("/{}/sk-ant-api03-{}", "srv", "x".repeat(40)),
+                "dry_run": true
+            }),
+        ),
+        (
+            "an argument of a new profile looks like a credential",
+            json!({
+                "profile": "leaky",
+                "base": RUNTIME,
+                "home": "/srv/leaky",
+                "args": [format!("--api-key={token}")],
+                "dry_run": true
+            }),
+        ),
+        (
+            "a secret_env slot of a new profile looks like a credential",
+            json!({
+                "profile": "leaky",
+                "base": RUNTIME,
+                "home": "/srv/leaky",
+                "secret_env": [format!("API_KEY={token}")],
+                "dry_run": true
+            }),
+        ),
+    ];
+    for (warning, params) in cases {
+        assert_eq!(
+            refusal(&mut local, method::PACKAGE_CREATE_PROFILE, params).await,
+            "package_profile_credential_literal",
+            "{warning}"
+        );
+        // The refusal is captured with a warning of its own, so the absence
+        // asserted below is a redaction and not a capture that dropped it.
+        assert_eq!(logged_records(&log.path(), warning).len(), 1, "{warning}");
+    }
+
+    // The captured files are read as raw text: a serialized parameter field
+    // would hide from a structural check.
+    let mut files = 0;
+    for entry in std::fs::read_dir(log.path()).expect("the capture directory") {
+        let text =
+            std::fs::read_to_string(entry.expect("a log file").path()).expect("read a log file");
+        assert!(
+            !text.contains("sk-ant-"),
+            "a credential literal reached the daemon log"
+        );
+        assert!(
+            !text.contains("0123456789abcdef"),
+            "a credential literal reached the daemon log"
+        );
+        files += 1;
+    }
+    assert!(files > 0, "the scenario read the captured log");
+
+    drop(local);
+    servers.stop().await;
+}
+
 /// `[config_home]` table the transcript scenarios declare next to
 /// `[transcripts]`.
 const CONFIG_HOME_TABLE: &str = "\n[config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n";
