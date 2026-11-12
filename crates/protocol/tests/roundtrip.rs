@@ -1495,6 +1495,7 @@ fn integration_doctor_params_and_result_roundtrip() {
             agent: RuntimeRef::codex(),
             ok: false,
             status: Some(IntegrationAgentStatus {
+                skill: None,
                 home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
@@ -3185,6 +3186,10 @@ fn agent_runtime_config_home_id_is_additive_and_roundtrips() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one test asserts the wire shape of every host capability flag"
+)]
 fn host_capabilities_json_shape_roundtrips() {
     let caps = HostCapabilities {
         daemon_version: "0.1.0".to_owned(),
@@ -3246,6 +3251,8 @@ fn host_capabilities_json_shape_roundtrips() {
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
         package_install_index_context_supported: false,
+        package_create_profile_supported: true,
+        integration_agent_skill_supported: true,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");
@@ -3281,7 +3288,9 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_request_id_supported": true,
             "session_new_context_pin_supported": true,
             "package_install_commands_supported": true,
-            "package_bind_profile_expected_supported": true
+            "package_bind_profile_expected_supported": true,
+            "package_create_profile_supported": true,
+            "integration_agent_skill_supported": true
         })
     );
 
@@ -3417,6 +3426,14 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.package_bind_profile_expected_supported,
         "a host that omits the expected-pin flag rejects expected_previous"
+    );
+    assert!(
+        !caps.package_create_profile_supported,
+        "a host that omits the create-profile flag answers package.create_profile with method_not_found"
+    );
+    assert!(
+        !caps.integration_agent_skill_supported,
+        "a host that omits the agent-skill flag rejects skill and skill_only"
     );
 }
 
@@ -5089,6 +5106,7 @@ fn doctor_and_integration_state_enums_are_tolerant_only_on_the_client() {
         known: vec![
             ("removed", IntegrationUninstallState::Removed),
             ("not_installed", IntegrationUninstallState::NotInstalled),
+            ("unchanged", IntegrationUninstallState::Unchanged),
         ],
         unknown: IntegrationUninstallState::Unknown,
         unknown_wire: "unknown",

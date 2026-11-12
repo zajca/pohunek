@@ -3,4 +3,7 @@
 /**
  * Outcome of removing one agent's managed hooks.
  */
-export type IntegrationUninstallState = "removed" | "not_installed";
+export type IntegrationUninstallState =
+  | "removed"
+  | "not_installed"
+  | "unchanged";

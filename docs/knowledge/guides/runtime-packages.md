@@ -120,11 +120,54 @@ The features this core implements:
 | `package-context-v1` | 0.41.0 | `[context]` |
 | `version-probe-open-range-v1` | 0.42.0 | `version_probe` with `min` and no `below` |
 | `detect-composer-absent-v1` | 0.42.0 | detection manifest rule matcher `composer_absent` (no descriptor key; enforced against the manifest the descriptor names) |
+| `agent-skill-v1` | 0.42.0 | `[agent_skill]` |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
 snapshot file that a test compares. Which core version first has a feature is
 not part of the refusal, because an older core cannot know it.
+
+## Agent skill location
+
+A runtime whose agent reads user-level skills declares where, in an optional
+`[agent_skill]` table, behind the runtime feature `agent-skill-v1`:
+
+```toml
+requires = ["agent-skill-v1"]
+
+[agent_skill]
+root = "config_home"   # closed set: "config_home" | "user_home"
+dir  = "skills"        # relative path of plain components
+```
+
+`root = "config_home"` is the runtime's `[config_home]` (the table is required
+with it) and `dir` is a plain relative path whose last component is `skills`.
+`root = "user_home"` is the user's home directory and accepts only
+`dir = ".agents/skills"`, a location every home and profile of the agent
+shares. The descriptor only names the location: core owns the content, the
+file layout (`<root>/<dir>/pohunek/SKILL.md` and the ownership marker
+`.pohunek-managed` beside it), the modes and every write, which
+`pohunek integration install --skill` performs for the homes it selects. The
+Claude package declares `config_home` and `skills`, the Codex package
+`user_home` and `.agents/skills`; a runtime without the table, or without a daemon-run hook handler such as Pi,
+answers `integration_agent_skill_unsupported` to `--skill`. The official packages that
+declare it are Claude 2.1.0 and Codex 1.9.0, which reach a host with the
+release that ships the feature.
+
+The lifecycle is marker-owned. `integration install --skill` creates the skill
+or refreshes a `stale` one (marker and file agree, another Pohunek version
+wrote them); a `modified` skill (edited since,
+`integration_agent_skill_modified`), a `foreign` one (no valid marker,
+`integration_agent_skill_foreign`) and an `unsafe` path (a link or a group- or
+world-writable directory, `integration_agent_skill_unsafe`) are left as found
+and make the command exit non-zero while the hooks are installed. A plain
+`integration uninstall` removes the hooks and a marked skill; `uninstall
+--skill` removes only the skill, and is also how a `modified` skill is reset
+(then install it again). A skill in the shared Codex location survives the
+removal of one profile (`kept_shared`) and goes with the bare runtime or
+`--all-profiles`. `integration status` reports `skill` per home without
+changing the hook state. A removal that fails on an owned skill is an error,
+never reported as foreign.
 
 ## Session placement
 
@@ -1430,6 +1473,19 @@ one state:
 - `unreadable`: the file is a symlink or special file, is not owned by you, is
   group- or world-writable, is not valid TOML, or has an invalid `base`,
   `package`, or `digest`.
+
+`pohunek plugin profile create <name> --base <runtime> [--home <abs-path>]
+[--arg <a>]... [--secret-env <NAME>]... [--replace <sha256:...>] [--dry-run]
+[--json]` creates a profile through the daemon's `package.create_profile`
+method, under the same lifecycle authority, so a concurrent uninstall of the
+target either runs first (`package_profile_target_invalid`) or is refused with
+`package_referenced`. `--home` is written to the `[config_home]` `env` variable
+the package descriptor declares, so a base without that table takes no home
+(`package_profile_home_unsupported`) and one with a `subdir` is refused
+(`package_profile_home_invalid`). The file is written at mode 0600; the other
+refusals are `package_profile_exists`, `package_profile_digest_mismatch`,
+`package_profile_credential_literal` and `package_profile_dir_unsafe`. A daemon
+without the method (`package_create_profile_supported`) is sent nothing.
 
 `pohunek plugin profile migrate <name> [--digest <d>] [--yes] [--json]` pins
 the profile through the daemon's `package.bind_profile` method; the command

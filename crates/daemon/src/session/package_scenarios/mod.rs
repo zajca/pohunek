@@ -11,6 +11,8 @@ mod catalog_tests;
 #[cfg(test)]
 mod commands_tests;
 #[cfg(test)]
+mod create_tests;
+#[cfg(test)]
 mod index_tests;
 #[cfg(test)]
 mod newer_version_tests;

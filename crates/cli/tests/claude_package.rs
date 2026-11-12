@@ -99,7 +99,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "2.0.0";
+const PACKAGE_VERSION: &str = "2.1.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -811,10 +811,16 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     // Claude Code runs in the TUI process and needs nothing to stay out of a daemon.
     let placement = package.remove("placement").expect("a [placement] table");
     assert_eq!(placement["mode"].as_str(), Some("in_process"));
+    // The agent skill location exists only in the package.
+    let agent_skill = package
+        .remove("agent_skill")
+        .expect("an [agent_skill] table");
+    assert_eq!(agent_skill["root"].as_str(), Some("config_home"));
+    assert_eq!(agent_skill["dir"].as_str(), Some("skills"));
     assert_eq!(
         package["requires"].as_array().map(Vec::len),
-        Some(3),
-        "the descriptor requires exactly the naming, placement and program-status gate features"
+        Some(4),
+        "the descriptor requires exactly the naming, placement, program-status gate and agent skill features"
     );
     package.remove("requires");
     // `ready` is the one key the package declares that v0.34.2 does not: the

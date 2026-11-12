@@ -60,6 +60,9 @@ const WORKER_EXECUTABLE: &str = "/opt/pohunek/libexec/pohunek/1.0.0/pohunek-sess
 /// A worker generation token of the valid grammar.
 const GENERATION: &str = "abcd2345";
 
+/// A Claude package version one patch above the official package.
+const OFFICIAL_NEXT_PATCH: &str = "2.1.1";
+
 /// Journal schema the daemon reads.
 const JOURNAL_SCHEMA: u64 = 4;
 
@@ -3869,7 +3872,7 @@ async fn a_stop_intent_record_is_repaired_before_its_merge() {
 #[tokio::test]
 async fn the_preflight_repair_resolves_against_the_planned_profile_text() {
     let damaged = DamagedHost::new().await;
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", OFFICIAL_NEXT_PATCH);
     damaged
         .catalog
         .write_release_archives(&damaged.release, 2, &[("claude", &bytes, &digest)]);

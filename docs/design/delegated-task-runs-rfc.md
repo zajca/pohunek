@@ -83,7 +83,7 @@ not the price of the worker model.**
 
 ### 2.2 Pohunek's current orchestration surface
 
-The embedded agent skill (`crates/cli/src/commands/agent_skill/SKILL.md`,
+The embedded agent skill (`crates/knowledge/src/agent_skill/SKILL.md`,
 "Sending prompts and waiting") prescribes, for one prompt:
 
 1. `session read` to capture runtime identity and terminal revision;

@@ -1,0 +1,3 @@
+## Unreleased (2026-11-11, plugin profile create, #2132)
+
+- `pohunek plugin profile create` and the local-only `package.create_profile` method create a validated, pinned, 0600 host agent profile; `[env]` holds only the base runtime's config home variable and secrets stay `secret_env` names. `plugin profile list` reports `file_digest`, the value `--replace` expects. New error codes: `package_profile_exists`, `package_profile_digest_mismatch`, `package_profile_credential_literal`, `package_profile_home_invalid`, `package_profile_home_unsupported`, `package_profile_dir_unsafe`; capability `package_create_profile_supported`. See [Agent profiles](concepts/agent-profiles.md) and [Runtime packages](guides/runtime-packages.md).

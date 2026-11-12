@@ -738,3 +738,192 @@ fn status_hints_follow_the_selector_the_daemon_verified() {
         server.join().expect("fake daemon");
     }
 }
+
+/// The `host.inspect` reply of a daemon that implements the agent skill
+/// install, or one that predates it.
+fn capability_result(skill: bool) -> Value {
+    let mut value = json!({
+        "daemon_version": "0.42.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_agents": ["claude"],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "terminal_read_supported": false,
+        "output_read_supported": false,
+        "session_wait_supported": false
+    });
+    if skill {
+        value["integration_agent_skill_supported"] = json!(true);
+    }
+    value
+}
+
+#[test]
+fn install_with_skill_asks_for_the_capability_then_sends_the_skill_flag() {
+    let fixture = Fixture::new("install-skill");
+    let server = serve_script(
+        &fixture.socket(),
+        vec![
+            Ok(capability_result(true)),
+            Ok(json!({ "installed": [{
+                "agent": "claude",
+                "hook_path": "/p/hooks/pohunek-agent-state.sh",
+                "config_paths": [],
+                "cleanup_incomplete": [],
+                "skill": {
+                    "state": "created",
+                    "found": "absent",
+                    "path": "/p/skills/pohunek/SKILL.md"
+                }
+            }] })),
+        ],
+    );
+
+    let output = fixture.run(&["integration", "install", "--agent", "claude", "--skill"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(
+        text.contains("agent skill installed: /p/skills/pohunek/SKILL.md"),
+        "{text}"
+    );
+    let seen = server.join().expect("fake daemon");
+    assert_eq!(seen[0].0, "host.inspect");
+    assert_eq!(
+        seen[1],
+        (
+            "integration.install".to_owned(),
+            json!({ "agent": "claude", "skill": true })
+        )
+    );
+}
+
+#[test]
+fn a_refused_skill_exits_non_zero_and_names_the_reason() {
+    let fixture = Fixture::new("install-skill-refused");
+    let server = serve_script(
+        &fixture.socket(),
+        vec![
+            Ok(capability_result(true)),
+            Ok(json!({ "installed": [{
+                "agent": "claude",
+                "hook_path": "/p/hooks/pohunek-agent-state.sh",
+                "config_paths": [],
+                "cleanup_incomplete": [],
+                "skill": {
+                    "state": "refused",
+                    "found": "foreign",
+                    "path": "/p/skills/pohunek/SKILL.md",
+                    "error": {
+                        "class": "configuration",
+                        "code": "integration_agent_skill_foreign",
+                        "msg": "a skill named pohunek exists and pohunek did not install it",
+                        "recover": "move it away"
+                    }
+                }
+            }] })),
+        ],
+    );
+
+    let output = fixture.run(&["integration", "install", "--agent", "claude", "--skill"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(text.contains("agent skill refused"), "{text}");
+    assert!(text.contains("did not install it"), "{text}");
+    drop(server.join());
+}
+
+#[test]
+fn a_daemon_that_predates_the_skill_install_receives_nothing() {
+    for arguments in [
+        vec!["install", "--agent", "claude", "--skill"],
+        vec!["update", "--agent", "claude", "--skill"],
+        vec!["uninstall", "--agent", "claude", "--skill"],
+    ] {
+        let fixture = Fixture::new("skill-old-daemon");
+        let server = serve_script(&fixture.socket(), vec![Ok(capability_result(false))]);
+        let mut command = vec!["integration"];
+        command.extend(arguments.iter().copied());
+        command.push("--json");
+
+        let output = fixture.run(&command);
+
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert_eq!(
+            stdout_json(&output)["err"]["code"],
+            "integration_agent_skill_daemon_unsupported",
+            "{arguments:?}"
+        );
+        let seen = server.join().expect("fake daemon");
+        assert!(
+            seen.iter().all(|(method, _)| method == "host.inspect"),
+            "{arguments:?}: {seen:?}"
+        );
+    }
+}
+
+#[test]
+fn a_request_without_the_skill_flag_is_byte_identical_for_an_older_daemon() {
+    let fixture = Fixture::new("no-skill-flag");
+    let server = serve_script(
+        &fixture.socket(),
+        vec![Ok(json!({ "installed": [], "failed": [] }))],
+    );
+
+    let output = fixture.run(&["integration", "install", "--agent", "claude", "--json"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        vec![(
+            "integration.install".to_owned(),
+            json!({ "agent": "claude" })
+        )]
+    );
+}
+
+#[test]
+fn the_skill_flag_is_refused_for_hermes_and_update_needs_it_for_claude() {
+    let fixture = Fixture::new("skill-hermes");
+    for (arguments, code) in [
+        (
+            vec![
+                "install",
+                "--agent",
+                "hermes",
+                "--hermes-profile",
+                "p",
+                "--skill",
+            ],
+            "integration_agent_skill_unsupported",
+        ),
+        (
+            vec![
+                "uninstall",
+                "--agent",
+                "hermes",
+                "--hermes-profile",
+                "p",
+                "--skill",
+            ],
+            "integration_agent_skill_unsupported",
+        ),
+        (
+            vec!["update", "--agent", "claude"],
+            "integration_action_unsupported",
+        ),
+    ] {
+        let mut command = vec!["integration"];
+        command.extend(arguments.iter().copied());
+        command.push("--json");
+        let output = fixture.run(&command);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert_eq!(stdout_json(&output)["err"]["code"], code, "{arguments:?}");
+    }
+}

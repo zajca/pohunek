@@ -14,12 +14,14 @@ use pohunek_platform::shell_env;
 use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
+mod credential;
 pub mod host;
 mod launch_env;
 mod native_launch;
 mod native_reference;
 mod profile;
 
+pub(crate) use credential::{credential_arg_problem, credential_literal_problem};
 pub use launch_env::LaunchEnv;
 pub use native_launch::{
     NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
@@ -37,8 +39,9 @@ pub use native_reference::{
 #[cfg(test)]
 pub(crate) use profile::MAX_PROFILE_BYTES;
 pub(crate) use profile::{
-    agent_profile_not_found, apply_pin, parse_head, BindError, DoctorManifestError,
-    DoctorProfileError, Pin, ProfileEnv, ProfilePin, ProfileRegistry, ResolvedAgent,
+    agent_profile_not_found, apply_pin, compose_profile, parse_head, BindDir, BindError,
+    DoctorManifestError, DoctorProfileError, Pin, ProfileEnv, ProfileFile, ProfilePin,
+    ProfileRegistry, ProfileSpec, ResolvedAgent,
 };
 
 /// Shell launched when the host reports no usable login shell.

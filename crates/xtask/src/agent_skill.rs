@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::{create_dir_all, XtaskError};
 
 pub(crate) const SOURCE_PATH: &str = "docs/knowledge/guides/agent-skill.md";
-pub(crate) const GENERATED_PATH: &str = "crates/cli/src/commands/agent_skill/SKILL.md";
+pub(crate) const GENERATED_PATH: &str = "crates/knowledge/src/agent_skill/SKILL.md";
 const SKILL_NAME: &str = "pohunek";
 const SKILL_DESCRIPTION: &str = "Operate Pohunek safely from an agent: discover hosts and sessions, target exactly, read JSON state, subscribe to events, and defer destructive actions and approvals to the owner.";
 const GENERATED_NOTICE: &str =

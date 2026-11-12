@@ -844,7 +844,7 @@ fn an_unpinned_profile_is_refused_when_a_retained_older_version_is_damaged() {
     host.write_claude_profile();
     let older = host.step(false).packages[0].digest.clone();
     let pinned_older = host.profile_text();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", OFFICIAL_NEXT_PATCH);
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -894,7 +894,7 @@ fn an_unreadable_store_line_that_may_pin_widens_the_set_the_plan_judges() {
     host.publish_at(&["claude"], 1);
     host.write_claude_profile();
     let older = host.step(false).packages[0].digest.clone();
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", OFFICIAL_NEXT_PATCH);
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -950,7 +950,7 @@ fn digest_only_repair_state(host: &Host) -> (String, PackageDigest, PathBuf) {
     let older = host.step(false).packages[0].digest.clone();
     // Nothing references the older version once the profile is unpinned.
     host.write_profile("official", "base = \"claude\"\n");
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", OFFICIAL_NEXT_PATCH);
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -1068,7 +1068,7 @@ fn selected_root_missing_state(host: &Host) -> (String, PackageDigest) {
     host.write_profile("other", "base = \"claude\"\n");
     let older = host.step(false).packages[0].digest.clone();
     let pinned_older = host.profile_text_of("other");
-    let (bytes, digest) = official_runtimes::variant_archive("claude", "2.0.1");
+    let (bytes, digest) = official_runtimes::variant_archive("claude", OFFICIAL_NEXT_PATCH);
     host.publish_archives(2, &[("claude", &bytes, &digest)]);
     let newer = host.step(false);
     assert_eq!(newer.packages[0].status, PackageStatus::Installed);
@@ -1956,6 +1956,10 @@ fn detect_without_dry_run_is_a_usage_error_and_changes_nothing() {
     assert_eq!(host.profile_text(), profile);
     assert!(!host.plugins_dir().exists());
 }
+
+/// A Claude package version one patch above the official package, for the
+/// scenarios that need a newer retained or pinned version.
+const OFFICIAL_NEXT_PATCH: &str = "2.1.1";
 
 /// The older and the newer version the repin scenarios publish as the release
 /// package of `claude`.

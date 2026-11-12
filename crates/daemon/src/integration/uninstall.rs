@@ -57,11 +57,45 @@ pub fn uninstall_in(
     agent: &RuntimeRef,
     selection: &HomeSelection,
 ) -> Result<IntegrationUninstallResult, ProtocolError> {
+    uninstall_in_with(homes, agent, selection, false)
+}
+
+/// [`uninstall_in`] that also removes the installed agent skill, or with
+/// `skill_only` removes only the skill and leaves the hooks.
+///
+/// Only a skill carrying this installer's marker is removed. A skill in a
+/// location every home of the agent shares is kept when the request removes
+/// one profile's integration, and reported as `kept_shared`.
+///
+/// # Errors
+///
+/// The errors of [`uninstall_in`].
+pub fn uninstall_in_with(
+    homes: &ConfigHomes,
+    agent: &RuntimeRef,
+    selection: &HomeSelection,
+    skill_only: bool,
+) -> Result<IntegrationUninstallResult, ProtocolError> {
     let per_home = matches!(selection, HomeSelection::All);
     let mut uninstalled = Vec::new();
     let mut failed = Vec::new();
-    for target in homes.existing_targets(Some(agent), selection)? {
-        match uninstall_target(&target) {
+    let targets = match homes.existing_targets(Some(agent), selection) {
+        Err(error) if skill_only => return Err(super::handler::skill_refusal(Some(agent), error)),
+        result => result?,
+    };
+    if skill_only {
+        if let Some(target) = targets
+            .iter()
+            .find(|target| target.resolved.agent_skill.is_none())
+        {
+            return Err(super::handler::skill_unsupported(
+                &target.resolved.display_name,
+                target.scope_profile(),
+            ));
+        }
+    }
+    for target in targets {
+        match uninstall_target(&target, selection, skill_only) {
             Ok(report) => uninstalled.push(report),
             Err(error) if per_home => failed.push(IntegrationHomeFailure {
                 agent: target.resolved.runtime.clone(),
@@ -78,13 +112,22 @@ pub fn uninstall_in(
 }
 
 /// Removes the managed hooks from the home of `target`.
-fn uninstall_target(target: &Target) -> Result<IntegrationUninstallReport, ProtocolError> {
+fn uninstall_target(
+    target: &Target,
+    selection: &HomeSelection,
+    skill_only: bool,
+) -> Result<IntegrationUninstallReport, ProtocolError> {
     let dir = target.dir()?;
-    let mut report = target
-        .resolved
-        .handler
-        .uninstall(&target.resolved.runtime, dir)?;
+    let mut report = if skill_only {
+        unchanged_report(target.resolved.runtime.clone())
+    } else {
+        target
+            .resolved
+            .handler
+            .uninstall(&target.resolved.runtime, dir)?
+    };
     report.home.clone_from(&target.label);
+    report.skill = super::agent_skill::remove_for(target, selection)?;
     Ok(report)
 }
 
@@ -114,8 +157,23 @@ pub fn uninstall_codex(codex_dir: &Path) -> Result<IntegrationUninstallReport, P
 
 fn empty_report(agent: RuntimeRef) -> IntegrationUninstallReport {
     IntegrationUninstallReport {
+        skill: None,
         agent,
         state: IntegrationUninstallState::NotInstalled,
+        removed_paths: Vec::new(),
+        updated_paths: Vec::new(),
+        preserved_paths: Vec::new(),
+        cleanup_incomplete: Vec::new(),
+        home: None,
+    }
+}
+
+/// The report of a removal that left the hooks alone (`skill_only`).
+fn unchanged_report(agent: RuntimeRef) -> IntegrationUninstallReport {
+    IntegrationUninstallReport {
+        skill: None,
+        agent,
+        state: IntegrationUninstallState::Unchanged,
         removed_paths: Vec::new(),
         updated_paths: Vec::new(),
         preserved_paths: Vec::new(),

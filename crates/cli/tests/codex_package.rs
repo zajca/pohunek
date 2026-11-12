@@ -108,7 +108,7 @@ const GOLDEN_MANIFEST_NAME: &str = "codex";
 const PACKAGE_ID: &str = "pohunek.runtime.codex";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "1.8.0";
+const PACKAGE_VERSION: &str = "1.9.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -403,6 +403,13 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     assert_eq!(placement["keep_local_handler"].as_bool(), Some(true));
     // The feature the transcript head paths need exists only in the package.
     assert!(package.remove("requires").is_some());
+    // The agent skill location exists only in the package: Codex reads user
+    // skills below the user's home, shared by every Codex home.
+    let agent_skill = package
+        .remove("agent_skill")
+        .expect("an [agent_skill] table");
+    assert_eq!(agent_skill["root"].as_str(), Some("user_home"));
+    assert_eq!(agent_skill["dir"].as_str(), Some(".agents/skills"));
     // `ready` is the one key the package declares that v0.34.2 does not: the
     // built-in descriptor relied on the bracketed-paste enable signal. The
     // package opts into manifest-idle readiness so the startup update popup

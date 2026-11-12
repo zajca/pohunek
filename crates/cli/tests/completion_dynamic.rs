@@ -87,7 +87,10 @@ fn subcommand_completion_lists_each_group_in_declaration_order() {
                 "profile",
             ],
         ),
-        (&["pohunek", "plugin", "profile", ""], &["list", "migrate"]),
+        (
+            &["pohunek", "plugin", "profile", ""],
+            &["list", "migrate", "create"],
+        ),
     ];
     for (words, expected) in scenarios {
         let output = complete_bash(&env, words);
@@ -222,6 +225,7 @@ fn profile_completion_reads_private_agent_profiles_through_the_cli() {
         ["pohunek", "integration", "install", "--profile", "wo"].as_slice(),
         ["pohunek", "integration", "status", "--profile", "wo"].as_slice(),
         ["pohunek", "integration", "doctor", "--profile", "wo"].as_slice(),
+        ["pohunek", "integration", "update", "--profile", "wo"].as_slice(),
         ["pohunek", "integration", "uninstall", "--profile", "wo"].as_slice(),
         ["pohunek", "plugin", "profile", "migrate", "wo"].as_slice(),
     ] {
@@ -230,19 +234,6 @@ fn profile_completion_reads_private_agent_profiles_through_the_cli() {
         assert!(output.stderr.is_empty(), "{words:?}: {output:?}");
         assert_eq!(output.stdout, b"work", "{words:?}");
     }
-
-    // `integration update` selects no config home, so it offers no
-    // `--profile`; `integration install --prof` in
-    // `flag_completion_follows_the_active_cli_tree` shows the same prefix
-    // reaches the flag where it exists.
-    let output = complete_bash(&env, &["pohunek", "integration", "update", "--prof"]);
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stderr.is_empty(), "{output:?}");
-    let candidates = String::from_utf8(output.stdout).expect("UTF-8 candidates");
-    assert!(
-        !candidates.lines().any(|line| line == "--profile"),
-        "{candidates:?}"
-    );
 }
 
 #[test]

@@ -1141,7 +1141,14 @@ only. A home that several runtimes reach through one handler (a package that
 declares the Claude handler and Claude's config home, say) is attributed to
 none of them when a request names no runtime: each reports it as the error
 `integration_home_ambiguous_owner`, so neither provenance nor id order lets one
-runtime act on another's home. The one home a handler keeps itself is that of a
+runtime act on another's home. The bundled agent skill is the one integration
+asset that is opt-in: `integration.install` with `skill` writes it, with an
+ownership marker, to the location the runtime package declares in
+`[agent_skill]` (the config home's `skills` directory for Claude, the shared
+`~/.agents/skills` below the user's home for Codex), and a skill the marker
+does not prove to be the installer's is never replaced or removed. The text is
+the artifact `pohunek agent-skill` prints, embedded once by `pohunek-knowledge`.
+The one home a handler keeps itself is that of a
 built-in runtime this build does not compile in (the Codex handler keeps
 `CODEX_HOME`, else `~/.codex`, and the Claude handler `CLAUDE_CONFIG_DIR`, else
 `~/.claude`, of the 0.34 built-ins): status, doctor and uninstall that name such an

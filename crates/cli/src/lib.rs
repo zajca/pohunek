@@ -670,6 +670,11 @@ enum IntegrationAction {
         home: HomeSelectionCliOptions,
         #[command(flatten)]
         hermes: HermesCliOptions,
+        /// Also install the bundled Pohunek agent skill into the agent's skill
+        /// location, so the agent can drive Pohunek outside Pohunek sessions.
+        /// Opt-in per home; a skill Pohunek did not install is never replaced.
+        #[arg(long)]
+        skill: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -705,11 +710,19 @@ enum IntegrationAction {
     },
     /// Atomically update the managed Hermes plugin and its policy.
     Update {
-        /// Hermes is the only agent with an update lifecycle.
+        /// Hermes has an update lifecycle of its own; for Codex and Claude,
+        /// `--skill` re-installs the home: its hooks and its agent skill.
         #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
+        home: HomeSelectionCliOptions,
+        #[command(flatten)]
         hermes: HermesUpdateCliOptions,
+        /// Install or refresh the hooks and the bundled Pohunek agent skill of a
+        /// Codex or Claude home. A modified or foreign skill is left alone and
+        /// reported.
+        #[arg(long)]
+        skill: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -724,6 +737,10 @@ enum IntegrationAction {
         home: HomeSelectionCliOptions,
         #[command(flatten)]
         hermes: HermesUninstallCliOptions,
+        /// Remove only the marker-owned agent skill and leave the hooks. A
+        /// skill Pohunek did not install is never removed.
+        #[arg(long)]
+        skill: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -2156,12 +2173,16 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     agent,
                     home,
                     hermes,
+                    skill,
                     json,
                 } => {
                     let home = commands::integration::HomeSelectionArgs::from(home);
                     let hermes = commands::integration::HermesOptions::from(hermes);
                     match agent {
                         Some(commands::integration::HookAgentArg::Hermes) => {
+                            if skill {
+                                return Err(commands::integration::skill_unsupported_for_hermes());
+                            }
                             home.refuse_for_hermes()?;
                             commands::integration::run_hermes(
                                 commands::integration::HermesAction::Install,
@@ -2176,9 +2197,10 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             // Codex and Claude hook installation remains a local daemon
                             // operation and retains its existing request and output shape.
                             let paths = Paths::resolve()?;
-                            let installed =
-                                commands::integration::run_install(&paths, agent, &home, json)
-                                    .await?;
+                            let installed = commands::integration::run_install(
+                                &paths, agent, &home, skill, json,
+                            )
+                            .await?;
                             if !installed {
                                 return Ok(ExitCode::FAILURE);
                             }
@@ -2243,25 +2265,51 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 IntegrationAction::Update {
                     agent,
+                    home,
                     hermes,
+                    skill,
                     json,
                 } => {
-                    return run_integration_hermes_action(
-                        commands::integration::HermesAction::Update,
-                        agent,
-                        &hermes.into(),
-                        json,
-                    );
+                    let home = commands::integration::HomeSelectionArgs::from(home);
+                    if agent == commands::integration::HookAgentArg::Hermes {
+                        if skill {
+                            return Err(commands::integration::skill_unsupported_for_hermes());
+                        }
+                        home.refuse_for_hermes()?;
+                        return run_integration_hermes_action(
+                            commands::integration::HermesAction::Update,
+                            agent,
+                            &hermes.into(),
+                            json,
+                        );
+                    }
+                    if !skill {
+                        return Err(commands::integration::unsupported_action(Some(agent)));
+                    }
+                    // Refreshing the skill rewrites this machine's agent homes, so
+                    // it is a local daemon operation regardless of `--host`; a
+                    // re-install is idempotent for the hooks of the same home.
+                    let paths = Paths::resolve()?;
+                    let installed =
+                        commands::integration::run_install(&paths, Some(agent), &home, true, json)
+                            .await?;
+                    if !installed {
+                        return Ok(ExitCode::FAILURE);
+                    }
                 }
                 IntegrationAction::Uninstall {
                     agent,
                     home,
                     hermes,
+                    skill,
                     json,
                 } => {
                     let home = commands::integration::HomeSelectionArgs::from(home);
                     let hermes = commands::integration::HermesOptions::from(hermes);
                     if agent == commands::integration::HookAgentArg::Hermes {
+                        if skill {
+                            return Err(commands::integration::skill_unsupported_for_hermes());
+                        }
                         home.refuse_for_hermes()?;
                         return run_integration_hermes_action(
                             commands::integration::HermesAction::Uninstall,
@@ -2277,7 +2325,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     // is always a local daemon operation regardless of `--host`.
                     let paths = Paths::resolve()?;
                     let removed =
-                        commands::integration::run_uninstall(&paths, agent, &home, json).await?;
+                        commands::integration::run_uninstall(&paths, agent, &home, skill, json)
+                            .await?;
                     if !removed {
                         return Ok(ExitCode::FAILURE);
                     }
@@ -2856,6 +2905,7 @@ mod tests {
                         agent: commands::integration::HookAgentArg::Hermes,
                         hermes,
                         json: false,
+                        ..
                     },
             } => {
                 assert_eq!(hermes.tool_timeout_ms, Some(8_000));

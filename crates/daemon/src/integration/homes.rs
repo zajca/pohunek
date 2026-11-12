@@ -187,6 +187,21 @@ impl ConfigHomes {
     ) -> Target {
         let env = profile.map_or(&[][..], |(_name, env)| env);
         let home = self.home_of(&resolved, env);
+        let skill_dir = resolved.agent_skill.as_ref().map(|skill| {
+            skill
+                .resolve(resolved.config_home.as_ref(), &|name| {
+                    effective_variable(&self.base, env, name)
+                })
+                .map_err(|error| match error {
+                    HomeError::Unset { .. } => ProtocolError::new(
+                        ErrorClass::Configuration,
+                        "missing_env",
+                        error.to_string(),
+                        None,
+                    ),
+                    HomeError::Invalid { variable } => config_dir_invalid(&variable),
+                })
+        });
         let label = labeled.then(|| IntegrationHome {
             profiles: profile
                 .map(|(name, _env)| name.to_owned())
@@ -198,6 +213,7 @@ impl ConfigHomes {
         Target {
             resolved,
             home,
+            skill_dir,
             label,
             scope: profile.map(|(name, _env)| name.to_owned()),
         }
@@ -526,6 +542,9 @@ pub(super) struct Target {
     pub(super) resolved: Resolved,
     /// The resolved directory, or why the launch environment names none.
     pub(super) home: Result<Home, ProtocolError>,
+    /// The skills directory of the agent in this home, or why it does not
+    /// resolve; `None` when the runtime declares no skill location.
+    pub(super) skill_dir: Option<Result<PathBuf, ProtocolError>>,
     /// Which selectors reach the home; present only on a profile-aware
     /// request.
     pub(super) label: Option<IntegrationHome>,

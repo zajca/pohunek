@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use protocol::{
-    method, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
+    method, AgentSkillChange, AgentSkillRemoval, AgentSkillReport, AgentSkillState,
+    AgentSkillStatus, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
     IntegrationFindingSeverity, IntegrationHome, IntegrationHomeFailure, IntegrationInstallParams,
     IntegrationInstallResult, IntegrationInstallState, IntegrationSelector,
     IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
@@ -377,6 +378,43 @@ async fn require_selector_support(
     }
 }
 
+/// The error for `--skill` against a daemon that predates the agent skill
+/// install: nothing is sent, because the daemon would reject the parameter.
+fn skill_daemon_unsupported() -> CliError {
+    CliError::Protocol(ProtocolError::new(
+        ErrorClass::Configuration,
+        "integration_agent_skill_daemon_unsupported",
+        "the local daemon is too old for `--skill`".to_owned(),
+        Some("run `pohunek service upgrade`, then repeat the command".to_owned()),
+    ))
+}
+
+/// The error for `--skill` together with `--agent hermes`: the Hermes plugin
+/// has its own CLI-owned lifecycle and no agent skill location.
+pub(crate) fn skill_unsupported_for_hermes() -> CliError {
+    CliError::Protocol(ProtocolError::new(
+        ErrorClass::Configuration,
+        "integration_agent_skill_unsupported",
+        "Hermes declares no agent skill location, so `--skill` does not apply to it".to_owned(),
+        Some("remove `--skill`, or name `--agent claude` or `--agent codex`".to_owned()),
+    ))
+}
+
+/// Proves that the daemon implements the agent skill install before a request
+/// that carries it is sent.
+async fn require_skill_support(client: &mut Client) -> Result<(), CliError> {
+    let capabilities = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?;
+    if capabilities.integration_agent_skill_supported {
+        Ok(())
+    } else {
+        Err(skill_daemon_unsupported())
+    }
+}
+
 /// How a result names the config home it describes.
 fn home_label(home: &IntegrationHome) -> String {
     let mut parts = Vec::new();
@@ -403,16 +441,23 @@ pub(crate) async fn run_install(
     paths: &Paths,
     agent: Option<HookAgentArg>,
     home: &HomeSelectionArgs,
+    skill: bool,
     json: bool,
 ) -> Result<bool, CliError> {
-    let result = install_hooks(paths, agent, home).await?;
+    let result = install_with_options(paths, agent, home, skill).await?;
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
         print!("{}", render_install_human(&result));
     }
-    Ok(result.failed.is_empty())
+    let skill_refused = result.installed.iter().any(|report| {
+        report
+            .skill
+            .as_ref()
+            .is_some_and(|skill| skill.state == AgentSkillChange::Refused)
+    });
+    Ok(result.failed.is_empty() && !skill_refused)
 }
 
 /// Installs the daemon-backed hook of `agent` through the local daemon and
@@ -427,7 +472,24 @@ pub(crate) async fn install_hooks(
     agent: Option<HookAgentArg>,
     home: &HomeSelectionArgs,
 ) -> Result<IntegrationInstallResult, CliError> {
+    install_with_options(paths, agent, home, false).await
+}
+
+/// [`install_hooks`] that also installs the agent skill when `skill` is set,
+/// after proving that the daemon implements it.
+///
+/// # Errors
+///
+/// As [`install_hooks`], and a typed error for a daemon that predates the skill
+/// install, to which nothing is sent.
+async fn install_with_options(
+    paths: &Paths,
+    agent: Option<HookAgentArg>,
+    home: &HomeSelectionArgs,
+    skill: bool,
+) -> Result<IntegrationInstallResult, CliError> {
     let params = IntegrationInstallParams {
+        skill,
         agent: agent.map(Into::into),
         profile: home.profile.clone(),
         all_profiles: home.all_profiles,
@@ -436,6 +498,9 @@ pub(crate) async fn install_hooks(
     // this machine's agent config dirs. Always use the local transport regardless
     // of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    if skill {
+        require_skill_support(&mut client).await?;
+    }
     require_selector_support(&mut client, params.agent.clone(), home).await?;
     client.call::<method::IntegrationInstall>(params).await
 }
@@ -486,9 +551,11 @@ pub(crate) async fn run_uninstall(
     paths: &Paths,
     agent: HookAgentArg,
     home: &HomeSelectionArgs,
+    skill_only: bool,
     json: bool,
 ) -> Result<bool, CliError> {
     let params = IntegrationUninstallParams {
+        skill_only,
         agent: agent.into(),
         profile: home.profile.clone(),
         all_profiles: home.all_profiles,
@@ -496,6 +563,9 @@ pub(crate) async fn run_uninstall(
     // Removal edits this machine's agent config dirs, so it always uses the
     // local transport regardless of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    if skill_only {
+        require_skill_support(&mut client).await?;
+    }
     require_selector_support(&mut client, Some(params.agent.clone()), home).await?;
     let result: IntegrationUninstallResult =
         client.call::<method::IntegrationUninstall>(params).await?;
@@ -503,7 +573,7 @@ pub(crate) async fn run_uninstall(
     if json {
         print!("{}", crate::commands::render_json(&result)?);
     } else {
-        print!("{}", render_uninstall_human(&result));
+        print!("{}", render_uninstall_human(&result, skill_only));
     }
     Ok(result.failed.is_empty())
 }
@@ -1435,30 +1505,90 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
         for leftover in &report.cleanup_incomplete {
             let _ = writeln!(output, "  cleanup incomplete: {leftover}");
         }
+        if let Some(skill) = &report.skill {
+            render_skill_install(&mut output, skill);
+        }
     }
     render_failures(&mut output, &result.failed);
     output
 }
 
-fn render_uninstall_human(result: &IntegrationUninstallResult) -> String {
+fn render_skill_install(output: &mut String, skill: &AgentSkillReport) {
+    let verb = match skill.state {
+        AgentSkillChange::Created => "installed",
+        AgentSkillChange::Unchanged => "already current",
+        AgentSkillChange::Refreshed => "refreshed",
+        AgentSkillChange::Refused => "refused",
+        AgentSkillChange::Unknown => "unknown outcome for",
+    };
+    let _ = writeln!(output, "  agent skill {verb}: {}", skill.path);
+    if let Some(error) = &skill.error {
+        let _ = writeln!(output, "    {}", error.msg);
+        if let Some(recover) = &error.recover {
+            let _ = writeln!(output, "    fix: {recover}");
+        }
+    }
+}
+
+fn skill_state_label(state: AgentSkillState) -> &'static str {
+    match state {
+        AgentSkillState::Absent => "absent",
+        AgentSkillState::Current => "current",
+        AgentSkillState::Stale => "stale",
+        AgentSkillState::Modified => "modified",
+        AgentSkillState::Foreign => "foreign",
+        AgentSkillState::Unsafe => "unsafe",
+        AgentSkillState::Unsupported => "unsupported",
+        AgentSkillState::Unknown => "unknown",
+    }
+}
+
+fn render_skill_status(output: &mut String, skill: &AgentSkillStatus) {
+    let shared = if skill.shared {
+        " (shared by every home)"
+    } else {
+        ""
+    };
+    match &skill.path {
+        Some(path) => {
+            let _ = writeln!(
+                output,
+                "  skill: {}{shared}: {path}",
+                skill_state_label(skill.state)
+            );
+        }
+        None => {
+            let _ = writeln!(output, "  skill: {}", skill_state_label(skill.state));
+        }
+    }
+}
+
+fn render_uninstall_human(result: &IntegrationUninstallResult, skill_only: bool) -> String {
     let mut output = String::new();
     for report in &result.uninstalled {
         let agent = match &report.home {
             Some(home) => format!("{} ({})", agent_label(&report.agent), home_label(home)),
             None => agent_label(&report.agent).to_owned(),
         };
-        match report.state {
-            IntegrationUninstallState::NotInstalled => {
-                let _ = writeln!(
-                    output,
-                    "{agent}: no managed hooks installed, nothing removed"
-                );
-            }
-            IntegrationUninstallState::Removed => {
-                let _ = writeln!(output, "{agent}: removed managed hooks");
-            }
-            IntegrationUninstallState::Unknown => {
-                let _ = writeln!(output, "{agent}: unknown uninstall state");
+        if skill_only {
+            let _ = writeln!(output, "{agent}:");
+        } else {
+            match report.state {
+                IntegrationUninstallState::NotInstalled => {
+                    let _ = writeln!(
+                        output,
+                        "{agent}: no managed hooks installed, nothing removed"
+                    );
+                }
+                IntegrationUninstallState::Removed => {
+                    let _ = writeln!(output, "{agent}: removed managed hooks");
+                }
+                IntegrationUninstallState::Unchanged => {
+                    let _ = writeln!(output, "{agent}: managed hooks left in place");
+                }
+                IntegrationUninstallState::Unknown => {
+                    let _ = writeln!(output, "{agent}: unknown uninstall state");
+                }
             }
         }
         for path in &report.removed_paths {
@@ -1472,6 +1602,20 @@ fn render_uninstall_human(result: &IntegrationUninstallResult) -> String {
         }
         for leftover in &report.cleanup_incomplete {
             let _ = writeln!(output, "  cleanup incomplete: {leftover}");
+        }
+        if let Some(skill) = report.skill {
+            let line = match skill {
+                AgentSkillRemoval::Removed => "removed the agent skill",
+                AgentSkillRemoval::NotInstalled => "no agent skill installed",
+                AgentSkillRemoval::LeftForeign => {
+                    "left the agent skill alone: pohunek did not install it or its path is unsafe"
+                }
+                AgentSkillRemoval::KeptShared => {
+                    "kept the agent skill: every home of the agent shares it; remove it with --all-profiles or the bare runtime"
+                }
+                AgentSkillRemoval::Unknown => "unknown agent skill outcome",
+            };
+            let _ = writeln!(output, "  {line}");
         }
     }
     render_failures(&mut output, &result.failed);
@@ -1536,6 +1680,9 @@ fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
         for warning in &report.warnings {
             let warning = qualify_status_warning(host, warning);
             let _ = writeln!(output, "  warning: {warning}");
+        }
+        if let Some(skill) = &report.skill {
+            render_skill_status(&mut output, skill);
         }
         match report.recovery {
             protocol::IntegrationRecovery::None => {}
@@ -1800,6 +1947,7 @@ mod status_tests {
             home_selectors: false,
             agents: vec![
                 IntegrationAgentStatus {
+                    skill: None,
                     home: None,
                     agent: RuntimeRef::claude(),
                     available: true,
@@ -1819,6 +1967,7 @@ mod status_tests {
                     warnings: Vec::new(),
                 },
                 IntegrationAgentStatus {
+                    skill: None,
                     home: None,
                     agent: RuntimeRef::codex(),
                     available: true,
@@ -1866,6 +2015,7 @@ mod status_tests {
         let result = IntegrationStatusResult {
             home_selectors: false,
             agents: vec![IntegrationAgentStatus {
+                skill: None,
                 home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
@@ -1892,6 +2042,7 @@ mod status_tests {
     fn remote_status_qualifies_install_commands_with_the_daemon_host() {
         let result = IntegrationStatusResult { home_selectors: false,
             agents: vec![IntegrationAgentStatus { home: None,
+                skill: None,
                 agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: Vec::new(),
@@ -2002,6 +2153,7 @@ mod tests {
             failed: Vec::new(),
             installed: vec![
                 IntegrationInstallReport {
+                    skill: None,
                     home: None,
                     agent: RuntimeRef::claude(),
                     hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
@@ -2009,6 +2161,7 @@ mod tests {
                     cleanup_incomplete: vec![],
                 },
                 IntegrationInstallReport {
+                    skill: None,
                     home: None,
                     agent: RuntimeRef::codex(),
                     hook_path: "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
@@ -2045,6 +2198,7 @@ mod tests {
         };
         let result = IntegrationInstallResult {
             installed: vec![IntegrationInstallReport {
+                skill: None,
                 agent: RuntimeRef::claude(),
                 hook_path: "/p/work/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec![],
@@ -2071,6 +2225,7 @@ mod tests {
         ));
         let removal = IntegrationUninstallResult {
             uninstalled: vec![IntegrationUninstallReport {
+                skill: None,
                 agent: RuntimeRef::claude(),
                 state: IntegrationUninstallState::NotInstalled,
                 removed_paths: vec![],
@@ -2081,7 +2236,7 @@ mod tests {
             }],
             failed: vec![],
         };
-        assert!(render_uninstall_human(&removal)
+        assert!(render_uninstall_human(&removal, false)
             .starts_with("claude (profile work): no managed hooks installed"));
         let only_failures = IntegrationInstallResult {
             installed: vec![],
@@ -2449,6 +2604,7 @@ mod tests {
         };
 
         let status = IntegrationAgentStatus {
+            skill: None,
             home: None,
             agent: RuntimeRef::codex(),
             available: true,

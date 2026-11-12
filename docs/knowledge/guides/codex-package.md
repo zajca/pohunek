@@ -75,6 +75,12 @@ descriptor does not declare. The package tests compare the package with golden
 copies of that descriptor and its detection manifest in
 `compat/codex/builtin-v0.34/` (`runtime.toml`, `detect.toml`).
 
+- Agent skill: `[agent_skill]` places the bundled Pohunek skill (`pohunek
+  integration install --agent codex --skill`) at
+  `~/.agents/skills/pohunek/SKILL.md`, where Codex reads user skills. The
+  location is below the user's home, not the Codex home, so every Codex home
+  and profile shares one skill: `--all-profiles` writes it once, and removing
+  one profile's integration keeps it.
 - Launch: `codex` with the first prompt as a trailing positional argument;
   bracketed paste followed by a separate Enter 150 ms later for later input.
 - Readiness: `ready = "manifest_idle"`. Codex enables bracketed paste long

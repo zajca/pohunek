@@ -169,6 +169,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: COMPOSER_ABSENT_FEATURE,
         since: "0.42.0",
     },
+    RuntimeFeature {
+        id: "agent-skill-v1",
+        since: "0.42.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].
@@ -258,6 +262,10 @@ pub(super) const FEATURE_GATES: &[FeatureGate] = &[
             present: "runtime.version_probe.min",
             absent: "runtime.version_probe.below",
         },
+    },
+    FeatureGate {
+        feature: "agent-skill-v1",
+        rule: GateRule::Key("agent_skill"),
     },
 ];
 

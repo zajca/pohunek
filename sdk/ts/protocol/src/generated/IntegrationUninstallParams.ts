@@ -24,4 +24,10 @@ export type IntegrationUninstallParams = {
    * per home. Local owner connections only; exclusive with `profile`.
    */
   all_profiles?: boolean;
+  /**
+   * Remove only the installed agent skill and leave the hooks. A client
+   * sends it only when `host.inspect` reports
+   * `HostCapabilities::integration_agent_skill_supported`.
+   */
+  skill_only?: boolean;
 };

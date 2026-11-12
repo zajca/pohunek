@@ -7,6 +7,7 @@
 //! `claude` and `hermes`), while a catalog-authorized package is the only
 //! source of an official alias.
 
+mod agent_skill;
 mod builtin;
 mod checkout_trust;
 mod claim;
@@ -30,6 +31,7 @@ pub use ::package::version_probe::{
     LineTemplate, LineTemplateError, ProbeVersion, VersionProbePolicy, VersionRefusal,
     MAX_PROBE_ARGS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
+pub use agent_skill::{AgentSkill, AgentSkillRoot};
 pub use builtin::BuiltinSource;
 pub use checkout_trust::{
     CheckoutTrust, MAX_CHECKOUT_TRUST_ARGS, MAX_CHECKOUT_TRUST_PATHS, MAX_CHECKOUT_TRUST_PATH_BYTES,

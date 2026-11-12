@@ -868,6 +868,25 @@ impl ProfileRegistry {
             .map(|_agent| ())
     }
 
+    /// Validates a candidate over the built-in `shell` base, which no package
+    /// definition serves, through the same resolution a launch applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `invalid_profile` (or runtime) error a launch would return
+    /// for that text.
+    pub(crate) fn validate_builtin_candidate(
+        &self,
+        name: &str,
+        content: &str,
+    ) -> Result<(), ProtocolError> {
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
+        resolve_profile_text(name, content, dir, &self.runtimes, None).map(|_agent| ())
+    }
+
     /// Resolves the profile `name` with file text `content` over `definition`,
     /// the way [`Self::validate_candidate`] does, and returns the agent a launch
     /// of that text would use.
@@ -1783,7 +1802,9 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
 }
 
 mod bind;
-pub(crate) use bind::{apply_pin, parse_head, BindError, Pin};
+mod compose;
+pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
+pub(crate) use compose::{compose_profile, ProfileSpec};
 
 #[cfg(test)]
 mod pin_tests;

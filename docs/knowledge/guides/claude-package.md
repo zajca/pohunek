@@ -83,7 +83,7 @@ On a host without the package nothing serves `claude`:
 
 ## What the package declares
 
-The package is version `2.0.0`. Every descriptor fact below equals the
+The package is version `2.1.0`. Every descriptor fact below equals the
 built-in Claude descriptor release 0.34.2 shipped (package version `1.0.0`),
 except the version probe, the transcript tree (`[transcripts]`), the input
 readiness (`[input] ready`) and the session name arguments (`[naming]`), which
@@ -96,6 +96,10 @@ manifest in `compat/claude/builtin-v0.34/` (`runtime.toml`, `detect.toml`):
 the manifest may differ only by the enumerated #613 changes and the enumerated
 dropped rules.
 
+- Agent skill: `[agent_skill]` places the bundled Pohunek skill (`pohunek
+  integration install --agent claude --skill`) at
+  `$CLAUDE_CONFIG_DIR/skills/pohunek/SKILL.md` (default `~/.claude/...`), one
+  per config home.
 - Launch: `claude` with the first prompt as a trailing positional argument.
   Claude's Ink input takes text without bracketed paste; the submit key is a
   separate Enter written 150 ms later, and a submit delay the daemon is

@@ -81,6 +81,10 @@ fn package_methods(digest: &PackageDigest) -> Vec<(&'static str, Value)> {
             method::PACKAGE_BIND_PROFILE,
             json!({ "profile": "work", "digest": digest, "dry_run": true }),
         ),
+        (
+            method::PACKAGE_CREATE_PROFILE,
+            json!({ "profile": "work", "base": "shell", "dry_run": true }),
+        ),
     ]
 }
 
@@ -895,6 +899,77 @@ async fn a_config_home_subdir_installs_only_with_its_feature_and_as_a_plain_path
     )
     .await;
     result.expect("a plain subdir with its feature installs");
+
+    drop(local);
+    servers.stop().await;
+}
+
+/// `[config_home]` plus an `[agent_skill]` table naming `root` and `dir`.
+fn agent_skill_tables(root: &str, dir: &str) -> String {
+    format!("{CONFIG_HOME_TABLE}\n[agent_skill]\nroot = \"{root}\"\ndir = \"{dir}\"\n")
+}
+
+#[tokio::test]
+async fn an_agent_skill_location_installs_only_with_its_feature_and_as_a_closed_skills_path() {
+    let servers = spawn_servers("pkg-agent-skill").await;
+    let mut local = connect_unix(&servers.socket).await;
+    let feature = "\"agent-skill-v1\"";
+
+    let (_digest, result) = install_descriptor(
+        &mut local,
+        &servers.plugins,
+        "without-requires",
+        &descriptor_requiring("", &agent_skill_tables("config_home", "skills")),
+        false,
+    )
+    .await;
+    assert_eq!(
+        result.expect_err("a gated table without requires").code,
+        "runtime_feature_unsupported"
+    );
+
+    for (name, root, dir) in [
+        ("unknown-root", "system", "skills"),
+        ("config-home-not-skills", "config_home", "plugins"),
+        ("config-home-parent", "config_home", "../skills"),
+        ("config-home-absolute", "config_home", "/skills"),
+        ("user-home-other", "user_home", "skills"),
+        ("user-home-nested", "user_home", ".agents/skills/x"),
+    ] {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(feature, &agent_skill_tables(root, dir)),
+            false,
+        )
+        .await;
+        assert_eq!(
+            result.expect_err(name).code,
+            "package_descriptor_invalid",
+            "{name}"
+        );
+    }
+    let listed: PackageListResult = call(&mut local, method::PACKAGE_LIST, Value::Null).await;
+    assert!(
+        listed.packages.is_empty(),
+        "a refused descriptor records nothing"
+    );
+
+    for (name, root, dir) in [
+        ("valid-config-home", "config_home", "tools/skills"),
+        ("valid-user-home", "user_home", ".agents/skills"),
+    ] {
+        let (_digest, result) = install_descriptor(
+            &mut local,
+            &servers.plugins,
+            name,
+            &descriptor_requiring(feature, &agent_skill_tables(root, dir)),
+            true,
+        )
+        .await;
+        result.unwrap_or_else(|error| panic!("{name} validates: {error:?}"));
+    }
 
     drop(local);
     servers.stop().await;

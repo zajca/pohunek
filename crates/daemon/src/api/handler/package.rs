@@ -1,6 +1,7 @@
 //! `package.list`, `package.inspect`, `package.doctor`, `package.install`,
 //! `package.link`, `package.set_enabled`, `package.select`,
-//! `package.uninstall` and `package.bind_profile`: the runtime package lifecycle.
+//! `package.uninstall`, `package.bind_profile` and `package.create_profile`: the
+//! runtime package lifecycle.
 //!
 //! The methods extend the owner's launch authority on the host, so they are
 //! served on the local control socket only. Each handler refuses a remote
@@ -9,9 +10,9 @@
 // Rust guideline compliant 2026-10-04
 
 use protocol::{
-    PackageBindProfileParams, PackageDoctorParams, PackageErrorKind, PackageInspectParams,
-    PackageInstallParams, PackageLinkParams, PackageSelectParams, PackageSetEnabledParams,
-    PackageUninstallParams, ProtocolError, Request, Response,
+    PackageBindProfileParams, PackageCreateProfileParams, PackageDoctorParams, PackageErrorKind,
+    PackageInspectParams, PackageInstallParams, PackageLinkParams, PackageSelectParams,
+    PackageSetEnabledParams, PackageUninstallParams, ProtocolError, Request, Response,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
@@ -156,6 +157,26 @@ pub(super) async fn handle_package_bind_profile(
         Ok(params) => respond(
             request,
             state.sessions.packages().package_bind_profile(params).await,
+        ),
+        Err(error) => error_value(request, error),
+    }
+}
+
+pub(super) async fn handle_package_create_profile(
+    request: &Request,
+    state: &DaemonState,
+) -> Response {
+    if let Err(response) = require_local(request, state) {
+        return response;
+    }
+    match parse_params::<PackageCreateProfileParams>(request) {
+        Ok(params) => respond(
+            request,
+            state
+                .sessions
+                .packages()
+                .package_create_profile(params)
+                .await,
         ),
         Err(error) => error_value(request, error),
     }

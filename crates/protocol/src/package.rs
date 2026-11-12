@@ -17,8 +17,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProtocolError, RuntimeId,
-    SessionId,
+    CommandName, ErrorClass, PackageDigest, PackageId, PackageIdentity, ProfileDigest,
+    ProtocolError, RuntimeId, SessionId,
 };
 
 /// How an installed package was authorized.
@@ -561,6 +561,111 @@ pub struct PackageBindProfileResult {
     pub reloaded: bool,
 }
 
+/// Parameters for `package.create_profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "PackageCreateProfileParams.ts")
+)]
+pub struct PackageCreateProfileParams {
+    /// Name of the new host agent profile: its file name under the agents
+    /// directory without `.toml`.
+    pub profile: String,
+    /// The base runtime the profile extends: `shell` or a package-served
+    /// runtime. A package-served base is pinned to the selected, enabled
+    /// package that serves it.
+    pub base: RuntimeId,
+    /// Absolute path of the agent's config home. It is written as
+    /// `[env] <config_home.env> = "<home>"`, where the variable is the one the
+    /// base runtime declares. The profile `[env]` holds nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub home: Option<String>,
+    /// Launch arguments appended to the program, written as `args`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>", optional))]
+    pub args: Vec<String>,
+    /// Names of the secret variables a `session.new` fills, written as
+    /// `secret_env`. Names only; the values never reach the profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>", optional))]
+    pub secret_env: Vec<String>,
+    /// The digest of the existing profile file this call replaces. Required
+    /// when the name exists; refused when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub replace: Option<ProfileDigest>,
+    /// Validate and report without writing.
+    pub dry_run: bool,
+}
+
+/// What a profile creation did to the profile file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "PackageCreateProfileStatus.ts")
+)]
+pub enum PackageCreateProfileStatus {
+    /// A dry run: nothing was written.
+    Preview,
+    /// A new profile file was written.
+    Created,
+    /// An existing profile file was replaced.
+    Replaced,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(PackageCreateProfileStatus);
+
+/// Result of `package.create_profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "PackageCreateProfileResult.ts")
+)]
+pub struct PackageCreateProfileResult {
+    /// What the call did.
+    pub status: PackageCreateProfileStatus,
+    /// The profile name.
+    pub profile: String,
+    /// The base runtime the profile extends.
+    pub base: RuntimeId,
+    /// The package the profile pins; absent for the built-in `shell`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub package: Option<PackageInfo>,
+    /// What the pinned package's runtime descriptor declares; absent for the
+    /// built-in `shell`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime: Option<PackageRuntimeInfo>,
+    /// The name of the `[env]` variable that carries `home`; absent when no
+    /// home was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub home_env: Option<String>,
+    /// The exact bytes of the profile file. The only values in it are the home
+    /// path, arguments that passed the credential check and secret names.
+    pub text: String,
+    /// Digest of `text`.
+    pub file_digest: ProfileDigest,
+    /// Digest of the file this call replaced; absent for a new profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub previous: Option<ProfileDigest>,
+}
+
 /// Result of `package.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -772,6 +877,22 @@ pub enum PackageErrorKind {
     /// a version of the same package that is retained by a session or profile
     /// pin, or that is selected; nothing was changed.
     IntegrationIncompatible,
+    /// The profile name exists and the request did not name the file digest it
+    /// replaces; nothing was written.
+    ProfileExists,
+    /// The digest the request named is not the existing profile file's digest;
+    /// nothing was changed.
+    ProfileDigestMismatch,
+    /// An argument looks like a credential literal; nothing was written.
+    ProfileCredentialLiteral,
+    /// The home path is not an absolute plain path, or the base runtime
+    /// declares a config home subdirectory; nothing was written.
+    ProfileHomeInvalid,
+    /// The base runtime declares no config home, so it takes no `home`.
+    ProfileHomeUnsupported,
+    /// The agents directory or one of its ancestors is a symbolic link or is
+    /// not owner-private; nothing was written.
+    ProfileDirUnsafe,
     /// The descriptor requires a runtime feature this core does not implement,
     /// or uses a key or compiled id of a feature it does not require.
     RuntimeFeatureUnsupported,
@@ -821,6 +942,12 @@ impl PackageErrorKind {
             Self::ProfileTargetInvalid => "package_profile_target_invalid",
             Self::ProfileChanged => "package_profile_changed",
             Self::ProfilePinChanged => "package_profile_pin_changed",
+            Self::ProfileExists => "package_profile_exists",
+            Self::ProfileDigestMismatch => "package_profile_digest_mismatch",
+            Self::ProfileCredentialLiteral => "package_profile_credential_literal",
+            Self::ProfileHomeInvalid => "package_profile_home_invalid",
+            Self::ProfileHomeUnsupported => "package_profile_home_unsupported",
+            Self::ProfileDirUnsafe => "package_profile_dir_unsafe",
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
@@ -882,6 +1009,24 @@ impl PackageErrorKind {
             Self::ProfilePinChanged => {
                 "the agent profile pins another package than the request expected to replace, and was left as found"
             }
+            Self::ProfileExists => {
+                "an agent profile of that name exists and the request did not name its digest"
+            }
+            Self::ProfileDigestMismatch => {
+                "the agent profile is not the file version the request named, and was left as found"
+            }
+            Self::ProfileCredentialLiteral => {
+                "an argument or the home path looks like a credential literal, so no profile was written"
+            }
+            Self::ProfileHomeInvalid => {
+                "the home must be an absolute path of plain components, and the base runtime must declare a plain config home"
+            }
+            Self::ProfileHomeUnsupported => {
+                "the base runtime declares no config home, so the profile takes no home"
+            }
+            Self::ProfileDirUnsafe => {
+                "the agents directory or one of its ancestors is a symbolic link or not private to the owner"
+            }
             Self::IntegrationIncompatible => {
                 "the package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected"
             }
@@ -937,6 +1082,22 @@ impl PackageErrorKind {
             }
             Self::ProfileChanged | Self::ProfilePinChanged => {
                 "run the command again to review the profile as it is now"
+            }
+            Self::ProfileExists => {
+                "pass `--replace` with the digest from `pohunek plugin profile list --json`, or choose another name"
+            }
+            Self::ProfileDigestMismatch => {
+                "read the current digest with `pohunek plugin profile list --json` and repeat the command"
+            }
+            Self::ProfileCredentialLiteral => {
+                "remove the literal; pass secrets by name with `--secret-env`"
+            }
+            Self::ProfileHomeInvalid => {
+                "pass an absolute path without `~`, `.` or `..` components"
+            }
+            Self::ProfileHomeUnsupported => "create the profile without `--home`",
+            Self::ProfileDirUnsafe => {
+                "make the agents directory a real directory owned by you and writable by you only"
             }
             Self::IntegrationIncompatible => {
                 "stop or remove the sessions and unpin the profiles that use the other version, or uninstall it, then retry"

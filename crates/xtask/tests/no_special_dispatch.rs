@@ -146,7 +146,7 @@ const ALLOW_LIST: &[Entry] = &[
     ),
     (
         "crates/daemon/src/integration/mod.rs",
-        Approved::Digest(236, "180394e3eed99793df6d01c5ca106933c905f7aa0e5ce10122e45205d32a95ff"),
+        Approved::Digest(236, "f6d5df216c2a5d15f1e964cb9473f5cf34f12a8d77db4f0d2d6f7e11b05b0d04"),
         Owner::Handlers,
         "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
     ),

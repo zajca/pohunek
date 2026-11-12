@@ -317,6 +317,11 @@ const RULES: &[Rule] = &[
         "knowledge bundle read at run time by the assistant and CLI test fixtures and by xtask tests",
     ),
     rule(
+        Pattern::File("crates/knowledge/src/agent_skill/SKILL.md"),
+        Effect::Packages(&["pohunek-knowledge", "pohunek-cli"]),
+        "agent skill artifact that pohunek-cli's agent_skill test compares with the copy the knowledge crate embeds",
+    ),
+    rule(
         Pattern::File("runtime-packages/hermes/runtime.toml"),
         Effect::Packages(&["pohunek-cli"]),
         "Hermes package descriptor whose version pohunek-cli embeds to judge the selected package",

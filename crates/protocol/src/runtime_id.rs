@@ -284,6 +284,18 @@ validated_string!(
 );
 
 validated_string!(
+    /// Digest of the raw bytes of a host agent profile file.
+    ///
+    /// Same `sha256:<64 lowercase hex>` syntax as [`PackageDigest`], but it
+    /// names profile file content, not a package archive. A caller passes it
+    /// back to replace exactly the file version it read.
+    ProfileDigest,
+    "ProfileDigest.ts",
+    BindingFieldError,
+    validate_digest
+);
+
+validated_string!(
     /// Digest of a built-in runtime descriptor's structural launch fields.
     ///
     /// Same `sha256:` syntax as [`PackageDigest`], but it covers only the

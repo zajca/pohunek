@@ -53,13 +53,13 @@ impl PackageService {
 }
 
 /// The installed package a profile is pinned to.
-struct Target {
-    inspected: Inspected,
-    runtime: PackageRuntimeInfo,
+pub(super) struct Target {
+    pub(super) inspected: Inspected,
+    pub(super) runtime: PackageRuntimeInfo,
 }
 
 /// The error kind of a profile that could not be read or rewritten.
-fn bind_kind(profile: &str, error: BindError) -> PackageErrorKind {
+pub(super) fn bind_kind(profile: &str, error: BindError) -> PackageErrorKind {
     match error {
         BindError::NotFound => PackageErrorKind::ProfileNotFound,
         BindError::Unusable(detail) => {
@@ -74,10 +74,12 @@ fn bind_kind(profile: &str, error: BindError) -> PackageErrorKind {
             warn!(%profile, %reason, "an agent profile could not be rewritten");
             PackageErrorKind::RegistryFailed
         }
+        BindError::Exists => PackageErrorKind::ProfileExists,
+        BindError::DirUnsafe => PackageErrorKind::ProfileDirUnsafe,
     }
 }
 
-fn unusable(profile: &str, detail: &str) -> PackageErrorKind {
+pub(super) fn unusable(profile: &str, detail: &str) -> PackageErrorKind {
     warn!(%profile, %detail, "an agent profile cannot be rewritten");
     PackageErrorKind::ProfileUnusable
 }
@@ -87,7 +89,7 @@ fn unusable(profile: &str, detail: &str) -> PackageErrorKind {
 /// With a digest, the installed package of that digest; without one, the one
 /// selected and enabled package serving `base`. The package must load, serve
 /// exactly `base` and pass the runtime-id claim rules.
-fn resolve_target(
+pub(super) fn resolve_target(
     context: &Context,
     base: &RuntimeId,
     digest: Option<&PackageDigest>,

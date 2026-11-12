@@ -858,6 +858,25 @@ fn daemon_serving_pi(method: &str, params: &Value) -> Value {
     }
 }
 
+/// A daemon that serves `package.create_profile` and records what it receives.
+fn daemon_creating_profiles(method: &str, params: &Value) -> Value {
+    match method {
+        "host.inspect" => {
+            let mut value = capabilities(true);
+            value["package_create_profile_supported"] = json!(true);
+            value
+        }
+        "package.create_profile" => json!({
+            "status": "created",
+            "profile": params["profile"],
+            "base": params["base"],
+            "text": "base = \"pi\"\n",
+            "file_digest": format!("sha256:{}", "c".repeat(64)),
+        }),
+        _ => daemon_serving_pi(method, params),
+    }
+}
+
 /// A daemon that predates the previous-pin check of a profile bind.
 fn daemon_without_the_pin_check(method: &str, params: &Value) -> Value {
     match method {
@@ -1111,6 +1130,74 @@ fn profile_migrate_stops_when_the_daemon_finds_another_pin_than_the_preview_show
         json!({"pinned": {"digest": DIGEST_OLD}}),
         "{}",
         bind.1
+    );
+}
+
+/// A daemon that predates `package.create_profile` is told apart before any
+/// request: the CLI fails with its own code and sends nothing.
+#[test]
+fn profile_create_against_a_daemon_without_the_method_sends_nothing() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    let output = fixture.run(&[
+        "plugin", "profile", "create", "work", "--base", "pi", "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "profile_create_unsupported"
+    );
+    let recorded = daemon.finish();
+    assert!(
+        recorded
+            .iter()
+            .all(|(method, _)| method != "package.create_profile"),
+        "{recorded:?}"
+    );
+}
+
+/// The request carries exactly what the command line named, with option
+/// values taken verbatim even when they start with `--`.
+#[test]
+fn profile_create_sends_the_named_inputs_to_a_daemon_that_serves_it() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_creating_profiles);
+
+    let output = fixture.run(&[
+        "plugin",
+        "profile",
+        "create",
+        "work",
+        "--base",
+        "pi",
+        "--home",
+        "/srv/work",
+        "--arg",
+        "--model=fast",
+        "--secret-env",
+        "WORK_KEY",
+        "--dry-run",
+        "--json",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let recorded = daemon.finish();
+    let create = recorded
+        .iter()
+        .find(|(method, _)| method == "package.create_profile")
+        .expect("the create call");
+    assert_eq!(
+        create.1,
+        json!({
+            "profile": "work",
+            "base": "pi",
+            "home": "/srv/work",
+            "args": ["--model=fast"],
+            "secret_env": ["WORK_KEY"],
+            "dry_run": true
+        })
     );
 }
 
