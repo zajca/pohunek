@@ -355,15 +355,32 @@ class CheckRustToolchainPinTests(unittest.TestCase):
         self.assertIn(f"{extra} violation(s)", result.stderr)
 
 
-def resolve_script():
-    """The `run: |` body of the action's `resolve` step, dedented."""
+def step_script(step_id):
+    """The `run: |` body of one action step, dedented (executed, not parsed)."""
     match = re.search(
-        r"^ {6}id: resolve\n(?:.*\n)*? {6}run: \|\n((?: {8}[^\n]*\n|\n)+)",
+        rf"^ {{6}}id: {step_id}\n(?:.*\n)*? {{6}}run: \|\n((?: {{8}}[^\n]*\n|\n)+)",
         ACTION.read_text(),
         re.M,
     )
     if match is None:
-        raise AssertionError(f"resolve step not found in {ACTION}")
+        raise AssertionError(f"{step_id} step not found in {ACTION}")
+    return "".join(line[8:] if line.strip() else line for line in match.group(1).splitlines(True))
+
+
+def resolve_script():
+    """The `run: |` body of the action's `resolve` step, dedented."""
+    return step_script("resolve")
+
+
+def install_script():
+    """The `run: |` body of the action's `Install Rust` step, dedented."""
+    match = re.search(
+        r"^ +- name: Install Rust .*\n(?:.*\n)*? {6}run: \|\n((?: {8}[^\n]*\n|\n)+)",
+        ACTION.read_text(),
+        re.M,
+    )
+    if match is None:
+        raise AssertionError(f"Install Rust step not found in {ACTION}")
     return "".join(line[8:] if line.strip() else line for line in match.group(1).splitlines(True))
 
 
@@ -476,6 +493,94 @@ class SetupRustResolveTests(unittest.TestCase):
         result, _, _ = self.resolve()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
+
+
+class SetupRustInstallTests(unittest.TestCase):
+    """Execute the action's Install Rust block: parsing cannot catch a
+    dropped line continuation (r2 H1), so the block runs with a fake
+    `rustup` on PATH and the real helper, and the fake must observe the
+    `toolchain install` invocation."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.bin = self.home / "bin"
+        self.bin.mkdir()
+        self.calls = self.home / "rustup-calls.log"
+        fake = self.bin / "rustup"
+        fake.write_text(
+            "#!/bin/bash\n"
+            f'echo "called: $*" >> "{self.calls}"\n'
+            "exit 0\n"
+        )
+        fake.chmod(0o755)
+
+    def install(self, toolchain="1.99.0", components="rustfmt, clippy", targets=""):
+        env_file = self.home / "github_env"
+        env_file.write_text("")
+        result = subprocess.run(
+            ["bash", "-c", install_script()],
+            env={
+                "PATH": f"{self.bin}:/usr/bin:/bin",
+                "GITHUB_ACTION_PATH": str(ROOT / ACTION_RELATIVE.parent),
+                "GITHUB_ENV": str(env_file),
+                "TOOLCHAIN": toolchain,
+                "COMPONENTS": components,
+                "TARGETS": targets,
+                "RETRY_ATTEMPTS": "1",
+                "RETRY_BACKOFF_SECONDS": "0",
+                "RETRY_ATTEMPT_TIMEOUT_SECONDS": "30",
+                "RUSTUP_PERMIT_COPY_RENAME": "1",
+                "RUSTUP_DOWNLOAD_TIMEOUT": "30",
+                "RUSTUP_MAX_RETRIES": "1",
+            },
+            cwd=self.home,
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+        )
+        calls = self.calls.read_text() if self.calls.exists() else ""
+        return result, calls
+
+    def test_install_reaches_rustup_through_the_helper(self):
+        result, calls = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("toolchain install 1.99.0 --profile minimal", calls)
+        self.assertIn("--component rustfmt --component clippy", calls)
+
+    def test_install_without_a_command_string_fails_before_rustup(self):
+        # The r2 H1 shape: the helper line ends in `-- sh -c` with no
+        # trailing backslash, so the payload line never runs. Dropping the
+        # continuation must fail with `sh -c` complaining and rustup
+        # never called.
+        script = install_script().replace("-- sh -c \\\n", "-- sh -c\n")
+        self.assertNotEqual(script, install_script())
+        env_file = self.home / "github_env"
+        env_file.write_text("")
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={
+                "PATH": f"{self.bin}:/usr/bin:/bin",
+                "GITHUB_ACTION_PATH": str(ROOT / ACTION_RELATIVE.parent),
+                "GITHUB_ENV": str(env_file),
+                "TOOLCHAIN": "1.99.0",
+                "COMPONENTS": "",
+                "TARGETS": "",
+                "RETRY_ATTEMPTS": "1",
+                "RETRY_BACKOFF_SECONDS": "0",
+                "RETRY_ATTEMPT_TIMEOUT_SECONDS": "30",
+                "RUSTUP_PERMIT_COPY_RENAME": "1",
+                "RUSTUP_DOWNLOAD_TIMEOUT": "30",
+                "RUSTUP_MAX_RETRIES": "1",
+            },
+            cwd=self.home,
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT_SECONDS,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.calls.exists())
 
 
 if __name__ == "__main__":

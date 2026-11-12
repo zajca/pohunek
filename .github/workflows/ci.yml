@@ -131,26 +131,25 @@ env:
   # download that runs out of time counts as failed: every package job runs.
   PACKAGE_BASELINE_FETCH_TIMEOUT: 120s
   # Retry bounds for `.github/scripts/ci-retry`, shared by every network
-  # install (apt-get, npm ci, bun install, rustup, uv, cargo fetch, setup-zig
-  # downloads; issue #2201). Three attempts with a 10 s backoff bound every
+  # install that runs through it (apt-get, npm ci, bun install, rustup, uv,
+  # cargo fetch; issue #2201). Three attempts with a 10 s backoff bound every
   # class: each attempt carries its own connect/total timeout (apt 30/180 s,
   # the rest 180 s), so a hung mirror fails an attempt instead of the step.
-  # The worst case (3 x 180 s + 2 x 10 s, worst backoff 10 s + 20 s) fits the
-  # smallest 10-minute step limit with headroom. Timeouts were calibrated
+  # The worst case (3 x (180 s + KILL_GRACE_SECONDS) + 10 s + 20 s backoff)
+  # fits the smallest 10-minute step limit with headroom.
   # Attempt timeouts come from the one calibrated set of CI_RETRY_* values
-  # in this workflow's top-level env (p99 of successful main runs plus
-  # headroom, per command class) and from the matching action/retry knobs
-  # named in each comment below:
+  # in this workflow's top-level env (p90 of 29 successful main runs plus
+  # headroom, per command class: cargo fetch 7 s, apt/oomd 17 s, bun 3 s,
+  # rustup 13 s, uv 8 s, zig 16 s; `scripts/ci-timings steps --limit 30`)
+  # and from the matching action/retry knobs named in each comment below:
   # - apt: Acquire::http(s)::Timeout=30 already on every call (apt docs:
   #   `man apt.conf`, the `Acquire::http::Timeout` option); the helper
   #   bounds the total.
   # - npm: the tool defaults stay in force (npm docs:
   #   https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout and
-  #   #fetch-retries: --fetch-timeout=300000, --fetch-retries=2). The
-  #   registry answered #2069 with an HTTP 504 and an HTML body (issue
-  #   #2069: release downloads failed with 504 while the connection
-  #   succeeded), which npm's fetch retries treat as a finished response,
-  #   so the helper retries the whole install when it happens again.
+  #   #fetch-retries: --fetch-timeout=300000, --fetch-retries=2). npm's own
+  #   retries run inside one install; the helper bounds the total install
+  #   time and retries the whole install after npm's retries are exhausted.
   # - bun: the tool default stays in force (BUN_CONFIG_HTTP_RETRY_COUNT=5,
   #   bun docs: https://bun.sh/docs/installation#configuring-bun; bun has
   #   no timeout knob). One timed-out request already ends the attempt,
@@ -2764,13 +2763,10 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/pi/npm"
-          # The registry answered #2069 with an HTTP 504 and an HTML body
-          # (issue #2069: release downloads failed with 504 while the
-          # connection succeeded); npm's own fetch retries (--fetch-retries)
-          # treat that as a finished response, so the helper retries the
-          # whole install when it happens again (npm defaults:
+          # npm's own fetch retries run inside one install (npm defaults:
           # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
-          # and #fetch-retries).
+          # and #fetch-retries); the helper bounds the total install time
+          # and retries the whole install after npm's retries are exhausted.
           if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-pi \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
@@ -2915,13 +2911,10 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/codex/npm"
-          # The registry answered #2069 with an HTTP 504 and an HTML body
-          # (issue #2069: release downloads failed with 504 while the
-          # connection succeeded); npm's own fetch retries (--fetch-retries)
-          # treat that as a finished response, so the helper retries the
-          # whole install when it happens again (npm defaults:
+          # npm's own fetch retries run inside one install (npm defaults:
           # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
-          # and #fetch-retries).
+          # and #fetch-retries); the helper bounds the total install time
+          # and retries the whole install after npm's retries are exhausted.
           if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-codex \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
@@ -3075,13 +3068,10 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/claude/npm"
-          # The registry answered #2069 with an HTTP 504 and an HTML body
-          # (issue #2069: release downloads failed with 504 while the
-          # connection succeeded); npm's own fetch retries (--fetch-retries)
-          # treat that as a finished response, so the helper retries the
-          # whole install when it happens again (npm defaults:
+          # npm's own fetch retries run inside one install (npm defaults:
           # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
-          # and #fetch-retries).
+          # and #fetch-retries); the helper bounds the total install time
+          # and retries the whole install after npm's retries are exhausted.
           if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-claude \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \

@@ -49,9 +49,9 @@ runs:
         # (setup-mold parity), so it must not pass through the helper: only
         # the astral-sh/setup-uv step is a plain installer action, and it
         # resolves nothing because the seed placed the exact version in the
-        # tool cache. No uv download follows in this action: the helper
-        # wraps the uv installs in hermes-test-python, the action's only
-        # network caller.
+        # tool cache. This action performs no uv download of its own: the
+        # uv installs its callers need are the ones the helper wraps in
+        # hermes-test-python.
         case "$(uname -s)-$(uname -m)" in
           Linux-x86_64)  arch=x86_64;  target=x86_64-unknown-linux-gnu;  sha="$UV_SHA256_X86_64_LINUX" ;;
           Linux-aarch64) arch=aarch64; target=aarch64-unknown-linux-gnu; sha="$UV_SHA256_AARCH64_LINUX" ;;

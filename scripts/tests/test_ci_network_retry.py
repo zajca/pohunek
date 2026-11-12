@@ -202,10 +202,6 @@ class NetworkRetryTests(unittest.TestCase):
                     continue
                 if pattern == "dtolnay/rust-toolchain":
                     failures.append(f"{path}:{number}: still uses the third-party action")
-                elif pattern == "rustup toolchain install" and line.strip().startswith("'exec "):
-                    # The helper's `sh -c` payload: the helper invocation in
-                    # the same step runs it through ci-retry.
-                    continue
                 elif RETRY in line or number in invocation_lines:
                     continue
                 else:
@@ -246,6 +242,21 @@ class NetworkRetryTests(unittest.TestCase):
                 "        --attempts 3 -- apt-get install -y wrapped"
             )
             self.assertEqual(self.check_lines(path, 40, wrapped), [])
+        with self.subTest("a sh -c payload after a line without backslash fails"):
+            # Regression shape of setup-rust H1 (r2): the helper line ends
+            # in `-- sh -c` with no trailing `\`, so the shell runs the
+            # helper without a command string and the payload line below
+            # never goes through the helper. The payload must fail even
+            # though it reads like a helper argument.
+            broken = (
+                "    - name: Install Rust\n"
+                '      run: "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label rustup \\\n'
+                '        --attempts 3 -- sh -c\n'
+                '          \'exec rustup toolchain install "$0" $1\' "$TOOLCHAIN" "$args"'
+            )
+            failures = self.check_lines(path, 40, broken)
+            self.assertEqual(len(failures), 1)
+            self.assertIn("setup-mold/action.yml:43", failures[0])
 
     def test_setup_rust_needs_no_caller_env(self):
         """The action installs with its own retry input defaults (#2201 H1)."""

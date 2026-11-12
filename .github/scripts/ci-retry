@@ -22,12 +22,14 @@
 # command rejects, a missing binary). #2205 must not treat it as proof of a
 # network failure without checking the step log first.
 #
-# Attempt timeouts are per command class, from the p99 of successful main
-# runs plus headroom (cargo fetch 8 s, apt 11 s, npm 7 s, bun 3 s, rustup
-# 13 s, uv 8 s, zig 57 s): 180 s for the wrapped installers. A single
+# Attempt timeouts are per command class, from the p90 of successful main
+# runs plus headroom (`scripts/ci-timings steps --limit 30`: 29 runs;
+# cargo fetch p90 7 s, apt/systemd-oomd p90 17 s, bun p90 3 s, rustup p90
+# 13 s, uv p90 8 s, zig 16 s): 180 s for the wrapped installers. A single
 # direct download already carries curl's own --max-time (120 s in the
-# download actions), which is not a helper call. The worst case (three
-# timed-out 180 s attempts plus the 10 s and 20 s backoff waits plus the
+# download actions), which is not a helper call. The 180 s values sit far
+# above either percentile on purpose: an attempt must fail only a hung
+# mirror, never a slow-but-healthy one. The worst case (three timed-out 180 s attempts plus the 10 s and 20 s backoff waits plus the
 # KILL_GRACE_SECONDS grace after each TERM) stays inside the smallest step
 # timeout that guards these steps today (10 minutes). Per-request knobs stay
 # at each tool: npm's own --fetch-timeout (default 300 s, longer than one

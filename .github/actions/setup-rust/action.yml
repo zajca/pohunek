@@ -142,11 +142,9 @@ runs:
         echo "setup-rust: toolchain=$toolchain components=${components:-none} targets=${targets:-none}"
 
     - name: Set $CARGO_HOME
-      # The action sets CARGO_HOME into the job environment exactly this
-      # way; every hosted runner image leaves it unset, so the value is
-      # always $HOME/.cargo. Keeping the line restores the same
-      # Swatinem/rust-cache key as the pinned action, because the cache
-      # hashes every non-empty CARGO* variable into its key.
+      # Exported so every runner sees the same CARGO* set: Swatinem/rust-cache
+      # hashes every non-empty CARGO* variable into its key, and the hosted
+      # images leave CARGO_HOME unset, so the value is always $HOME/.cargo.
       run: echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> "$GITHUB_ENV"
       shell: bash
 
@@ -171,8 +169,7 @@ runs:
         # knobs mirror the matching helper bound; the defaulted `retry-*`
         # inputs above carry the ci.yml class values, so a workflow without
         # its own CI_RETRY_* still retries instead of failing with a usage
-        # error. A caller that defines the CI_RETRY_* env passes them
-        # through as input values to keep one source of truth.
+        # error.
         RUSTUP_DOWNLOAD_TIMEOUT: ${{ inputs.retry-attempt-timeout-seconds }}
         RUSTUP_MAX_RETRIES: ${{ inputs.retry-attempts }}
       # POSIX sh constructs and BSD-compatible commands only: the macOS
@@ -195,7 +192,7 @@ runs:
         # shellcheck disable=SC2086 # one flag per word by construction above
         "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label rustup \
           --attempts "$RETRY_ATTEMPTS" --attempt-timeout "$RETRY_ATTEMPT_TIMEOUT_SECONDS" \
-          --backoff "$RETRY_BACKOFF_SECONDS" -- sh -c
+          --backoff "$RETRY_BACKOFF_SECONDS" -- sh -c \
             'exec rustup toolchain install "$0" $1' "$TOOLCHAIN" "$args"
 
     - name: Set the default toolchain
@@ -204,11 +201,9 @@ runs:
         TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
       # The directory override in rust-toolchain.toml outranks the rustup
       # default, and RUSTUP_TOOLCHAIN outranks both, so nightly jobs keep
-      # their toolchain. `rustup default` takes no `--force-non-host` (that
-      # flag belongs to `toolchain install` only); bare `rustup default`
-      # is the dtolnay spelling. `rustup default` accepts `--force-non-host`
-      # (see `rustup default --help`), so keep the flag exactly as the
-      # pinned action had it.
+      # their toolchain. `rustup default --help` lists `--force-non-host`;
+      # the flag is kept, and the toolchain comes from the resolve step so
+      # only the pinned channel can reach this command.
       run: |
         set -eu
         rustup default --force-non-host "$TOOLCHAIN"

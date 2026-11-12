@@ -212,12 +212,7 @@ def toolchain_values(line):
 
 
 def command_selectors(line):
-    """Toolchain names selected by the shell commands on one line.
-
-    A line continued with a trailing backslash passes before this runs
-    through `unquote`, which strips the backslash off a quoted word, so
-    `"$args"\\` reads as the indirect `$args`, never as a selector.
-    """
+    """Toolchain names selected by the shell commands on one line."""
     selectors = []
     for segment in COMMAND_SEPARATOR.split(line):
         words = [unquote(word) for word in segment.split()]
