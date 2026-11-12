@@ -75,7 +75,13 @@ class BudgetsHarness(unittest.TestCase):
             "    if '--json' not in args:\n"
             "        print('fake gh: issue list without --json', file=sys.stderr)\n"
             "        sys.exit(1)\n"
-            "    print(json.dumps(state['issues']))\n"
+            "    listed = [i for i in state['issues'] if not i.get('closed')]\n"
+            "    if '--state' in args:\n"
+            "        i = args.index('--state')\n"
+            "        if args[i + 1] != 'open':\n"
+            "            print('fake gh: issue list state must be open', file=sys.stderr)\n"
+            "            sys.exit(1)\n"
+            "    print(json.dumps(listed))\n"
             "elif args[:2] == ['label', 'list']:\n"
             "    if '--json' not in args:\n"
             "        print('fake gh: label list without --json', file=sys.stderr)\n"
@@ -96,6 +102,13 @@ class BudgetsHarness(unittest.TestCase):
             "elif args[:2] == ['issue', 'comment']:\n"
             "    record('issue-comment')\n"
             "elif args[:2] == ['issue', 'close']:\n"
+            "    if os.environ.get('GH_FAIL_CLOSE'):\n"
+            "        print('fake gh: issue close refused', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
+            "    for i in state['issues']:\n"
+            "        if str(i['number']) == args[2]:\n"
+            "            i['closed'] = True\n"
+            "    Path(STATE).write_text(json.dumps(state))\n"
             "    record('issue-close')\n"
             "elif args[:2] == ['issue', 'edit']:\n"
             "    if os.environ.get('GH_FAIL_EDIT'):\n"
@@ -220,7 +233,7 @@ class BudgetsHarness(unittest.TestCase):
             "startedAt": stamp(start_hour),
             "completedAt": (
                 f"2026-09-20T{start_hour + total // 3600:02d}"
-                f":{total % 3600 // 60:02d}:00Z"
+                f":{(total % 3600) // 60:02d}:{total % 60:02d}Z"
             ),
             "conclusion": "success",
         }
@@ -253,45 +266,60 @@ class BudgetCheckTests(BudgetsHarness):
         path.write_text(json.dumps(documents, indent=1) + "\n")
         return str(path)
 
+    def lane_jobs(self, lane_seconds, hour):
+        """Push-run jobs with per-run lane seconds (scalar or per-run list)."""
+        values = lane_seconds if isinstance(lane_seconds, list) else [lane_seconds]
+        jobs = []
+        for offset, seconds in enumerate(values):
+            jobs.extend(self.green_lane_jobs(seconds, hour + offset))
+        return jobs
+
     def lane_snapshot(self, lane_seconds=960, *, runs=4, name="snapshot.json"):
         """Push runs where the macOS lane step takes `lane_seconds`.
 
-        Non-green push runs sit between the green ones (a cancelled run,
-        a failed run, and a green rerun whose first attempt failed), so
-        the window must skip them and still hold `runs` green first
-        attempts. Pull-request runs carry their own job for the PR wall
-        median.
+        A list names one duration per green run, newest last, so a mixed
+        window can check that the median covers the whole window instead
+        of the newest runs. Non-green push runs sit between the green
+        ones (a cancelled run, a failed run, and a green rerun whose
+        first attempt failed), so the window must skip them and still
+        hold `runs` green first attempts. Pull-request runs carry their
+        own job for the PR wall median.
         """
+        if isinstance(lane_seconds, list):
+            durations = list(lane_seconds)
+        else:
+            durations = [lane_seconds] * runs
         documents = []
         run_id = 0
-        for green in range(runs):
+        for green, seconds in enumerate(durations):
             hour = 10 + green
             run_id += 1
             documents.append(self.document(
-                run_id, jobs=self.green_lane_jobs(lane_seconds, hour),
+                run_id, jobs=self.green_lane_jobs(seconds, hour),
                 hour=hour, created_minute=green,
             ))
             run_id += 1
             documents.append(self.document(
-                run_id, jobs=self.green_lane_jobs(lane_seconds, hour),
+                run_id, jobs=self.green_lane_jobs(seconds, hour),
                 hour=hour, created_minute=green,
                 conclusion="cancelled",
             ))
         # A failed first attempt with a green rerun: the rerun must never
         # count as a second green run. (Older than every green run above,
         # so the window keeps the newest `runs` greens.)
+        stale = lane_seconds[0] if isinstance(lane_seconds, list) else lane_seconds
         run_id += 1
         documents.append(self.document(
-            run_id, jobs=self.green_lane_jobs(lane_seconds, 8),
+            run_id, jobs=self.green_lane_jobs(stale, 8),
             hour=7, day=19, conclusion="failure",
         ))
         documents.append(self.document(
-            run_id, jobs=self.green_lane_jobs(lane_seconds, 8),
+            run_id, jobs=self.green_lane_jobs(stale, 8),
             hour=7, day=19, attempt=2,
         ))
         run_id += 1
         documents.append(self.document(
-            run_id, jobs=self.green_lane_jobs(lane_seconds, 9),
+            run_id, jobs=self.green_lane_jobs(stale, 9),
             hour=7, day=18, conclusion="failure",
         ))
         for index in range(runs):
@@ -369,6 +397,20 @@ class BudgetCheckTests(BudgetsHarness):
         # Without --report-issue nothing writes.
         self.assertEqual(self.write_calls(), [])
 
+    def test_step_median_covers_the_whole_window(self):
+        # M1: the newest two greens run the lane step at 1000 s, the
+        # older two at 500 s, so the true window median is 750 s. A budget
+        # of 900 s must pass; the running-median merge reports 1000 s.
+        snapshot = self.lane_snapshot(
+            lane_seconds=[500, 500, 1000, 1000])
+        budgets = self.write_budgets([
+            self.step_budget("platform contracts (arm64)",
+                             "Run macOS lane tests", 900),
+        ], window_runs=4)
+        result = self.run_cli("--input", snapshot, "--budgets", budgets)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("median 12m30s", result.stdout)
+
     def test_report_issue_creates_then_edits_with_a_comment_once(self):
         snapshot = self.lane_snapshot(lane_seconds=1200)
         budgets = self.write_budgets([
@@ -398,33 +440,70 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertEqual(len(edits), 1)
 
     def test_changed_exceedance_set_comments_once_per_change(self):
-        # Row 8: A, then A+B, then B. Each change rewrites the body and
-        # adds exactly one comment; repeating B adds none.
+        # Row 8: the step alone trips, then the slow lane wall joins it
+        # (the set grows from one key to two), then both recover and the
+        # night closes the issue. Each set change adds exactly one
+        # comment; repeating a set adds none. The third snapshot keeps
+        # the slow lane step while its runs also carry a slow lane job
+        # wall, so the second step grows the set instead of repeating it.
         green = self.lane_snapshot()
         slow = self.lane_snapshot(lane_seconds=1200, name="slow.json")
+        # Same slow lane step, but the newest four greens also run a
+        # slow lane job wall: add two minutes to each lane job so the
+        # 1500 s wall budget trips beside the already-tripped step.
+        slower_documents = []
+        bumped = 0
+        for document in json.loads(Path(slow).read_text()):
+            if (document.get("event") == "push"
+                    and document.get("conclusion") == "success"
+                    and document.get("attempt") == 1
+                    and bumped < 4):
+                jobs = [
+                    (self.job(
+                        job.get("name"), 1620,
+                        steps=job.get("steps"),
+                        start_hour=10)
+                     if job.get("name") == "platform contracts (arm64)"
+                     else job)
+                    for job in document["jobs"]
+                ]
+                slower_documents.append(dict(document, jobs=jobs))
+                bumped += 1
+            else:
+                slower_documents.append(document)
+        both_slow = self.snapshot("both-slow.json", slower_documents)
         budgets = self.write_budgets([
             self.step_budget("platform contracts (arm64)",
                              "Run macOS lane tests", 1000),
-            self.wall_budget(1500),
+            # Wall 1500 s trips only for the lane job's wall (lane
+            # runs cost lane_seconds + 300 s), never for the core job
+            # the plain snapshot lacks; the third snapshot adds a slow
+            # lane wall beside the same slow step.
+            self.wall_budget(1500, job="platform contracts (arm64)"),
         ], window_runs=4)
         one = self.run_cli("--input", slow, "--budgets", budgets,
                            "--report-issue")
         self.assertEqual(one.returncode, 1, one.stderr)
         self.assertEqual(self.comment_count(), 1)
-        # Push job-wall budget trips next: the slow lane step persists, so
-        # the set grows from one key to two.
-        both = self.run_cli("--input", slow, "--budgets", budgets,
+        # Slow step only, no slow lane wall yet: at exactly 1500 s the
+        # wall budget does not trip, so the marker holds one key.
+        state = json.loads(self.state_path.read_text())
+        marker = state["issues"][0]["body"].split(
+            "<!-- ci-budgets:exceeded=")[1].split("-->")[0]
+        self.assertEqual(len([key for key in marker.split(",") if key]), 1)
+        both = self.run_cli("--input", both_slow, "--budgets", budgets,
                             "--report-issue")
         self.assertEqual(both.returncode, 1, both.stderr)
-        self.assertEqual(self.comment_count(), 1)
-        # Recover the lane step: the set shrinks, so one more comment.
+        self.assertEqual(self.comment_count(), 2)
+        # Recover the lane step and its wall: the set empties, so the
+        # night closes the open issue with no new comment.
         recovered = self.run_cli("--input", green, "--budgets", budgets,
                                  "--report-issue")
-        self.assertEqual(recovered.returncode, 1, recovered.stderr)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
         self.assertEqual(self.comment_count(), 2)
         repeats = self.run_cli("--input", green, "--budgets", budgets,
                                "--report-issue")
-        self.assertEqual(repeats.returncode, 1, repeats.stderr)
+        self.assertEqual(repeats.returncode, 0, repeats.stderr)
         self.assertEqual(self.comment_count(), 2)
 
     def test_recovery_rewrites_and_closes_then_regression_comments(self):
@@ -448,13 +527,18 @@ class BudgetCheckTests(BudgetsHarness):
         state = json.loads(self.state_path.read_text())
         self.assertIn("<!-- ci-budgets:exceeded=-->",
                       state["issues"][0]["body"])
+        # The close removes the issue from the open list, so the
+        # regression opens a second issue and comments on it (L5).
         regressed = self.run_cli("--input", slow, "--budgets", budgets,
                                  "--report-issue")
         self.assertEqual(regressed.returncode, 1, regressed.stderr)
         self.assertEqual(self.comment_count(), 2)
+        creations = [c for c in self.write_calls()
+                     if c["args"][:2] == ["issue", "create"]]
+        self.assertEqual(len(creations), 2)
 
     def test_issue_edit_failure_is_a_usage_error(self):
-        # Row 6: a `gh` failure on the write path keeps rc 1 with no
+        # Row 6: a `gh` failure on the write path exits 2 with no
         # comment. The first run opens the issue (create path); the second
         # hits the failing edit.
         snapshot = self.lane_snapshot(lane_seconds=1200)
@@ -468,10 +552,31 @@ class BudgetCheckTests(BudgetsHarness):
         result = self.run_cli("--input", snapshot, "--budgets", budgets,
                               "--report-issue",
                               extra_env={"GH_FAIL_EDIT": "1"})
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("over budget", result.stdout)
         self.assertIn("issue edit refused", result.stderr)
         self.assertEqual(self.comment_count(), 1)
+
+    def test_issue_close_failure_on_recovery_is_a_usage_error(self):
+        # Row 6 on the repair path: the window is green, the issue is
+        # open, and `gh issue close` refuses. The night must exit 2 and
+        # leave the issue open.
+        snapshot = self.lane_snapshot()
+        budgets = self.write_budgets([
+            self.step_budget("platform contracts (arm64)",
+                             "Run macOS lane tests", 1200),
+        ], window_runs=4)
+        self.write_state({"issues": [{"number": 1, "title": "t",
+                                      "body": "stale"}],
+                          "labels": ["ci-budget"]})
+        result = self.run_cli("--input", snapshot, "--budgets", budgets,
+                              "--report-issue",
+                              extra_env={"GH_FAIL_CLOSE": "1"})
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("issue close refused", result.stderr)
+        self.assertNotIn(["issue", "close"], self.write_call_kinds()[-1:])
+        state = json.loads(self.state_path.read_text())
+        self.assertFalse(state["issues"][0].get("closed", False))
 
     def test_push_job_wall_and_pr_wall_exceedances_trip(self):
         # The two push job-wall budgets and the PR run-wall budget go
@@ -515,9 +620,9 @@ class BudgetCheckTests(BudgetsHarness):
         self.write_state({"issues": "not-a-list", "labels": []})
         result = self.run_cli("--input", snapshot, "--budgets", budgets,
                               "--report-issue")
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("over budget", result.stdout)
-        self.assertIn("invalid JSON", result.stderr)
+        self.assertIn("gh issue list", result.stderr)
         self.assertEqual(self.write_calls(), [])
 
     def test_missing_step_fails_with_the_update_message(self):
@@ -568,9 +673,24 @@ class BudgetWorkflowTests(unittest.TestCase):
         self.assertNotRegex(self.WORKFLOW, r"(?m)^\s*push\s*:")
 
     def test_workflow_permissions_are_minimal(self):
-        self.assertIn("permissions: {}", self.WORKFLOW)
-        for permission in ("actions: read", "contents: read", "issues: write"):
-            self.assertIn(permission, self.WORKFLOW)
+        # L4: exact blocks, so an extra `contents: write` or a job-level
+        # `write-all` cannot hide behind a substring match.
+        self.assertRegex(self.WORKFLOW, r"(?m)^permissions: \{\}$")
+        self.assertRegex(
+            self.WORKFLOW,
+            r"(?m)^    permissions:\n"
+            r"      actions: read\n"
+            r"      contents: read\n"
+            r"      issues: write\n",
+        )
+        self.assertNotRegex(self.WORKFLOW, r"write-all")
+        for line in self.WORKFLOW.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("actions:", "contents:",
+                                     "issues:")):
+                self.assertRegex(stripped, r": read$|: write$"
+                                 if stripped.startswith("issues:")
+                                 else r": read$")
 
     def test_workflow_uses_a_pinned_checkout_without_credentials(self):
         self.assertIn(

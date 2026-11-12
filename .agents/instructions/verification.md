@@ -72,12 +72,14 @@ turns on an in-process mutex that a process per test cannot share.
 
 The nightly `ci-budgets` workflow checks per-step and per-job medians
 over the newest 30 green `ci.yml` runs per event against
-`scripts/ci-budgets.json`. With `--report-issue` it keeps the one
-`ci-budget`-labelled issue current: an exceedance writes the table and
-adds a comment, while a recovered night rewrites the body and closes the
-issue, so the next regression comments again. A pull request that makes a
+`scripts/ci-budgets.json`. With `--report-issue` it keeps one
+`ci-budget`-labelled issue per regression episode current: an exceedance
+writes the table and adds a comment, while a recovered night rewrites the
+body and closes the issue, so the next regression opens a new issue and
+comments again. A pull request that makes a
 budgeted step faster lowers its budget in the same pull request; raising
 a budget needs a reason in its entry.
+
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`,
