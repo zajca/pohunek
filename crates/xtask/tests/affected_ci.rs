@@ -75,6 +75,7 @@ const MEMBERS: &[(&str, &str, &[&str], &[&str])] = &[
         &["pohunek-client"],
         &["pohunek-test-support"],
     ),
+    ("crates/session-worker", "pohunek-session-worker", &[], &[]),
     ("crates/cli", "pohunek-cli", &["pohunek-daemon"], &[]),
     ("crates/xtask", "xtask", &["pohunek-knowledge"], &[]),
     ("crates/relay", "pohunek-relay", &[], &["pohunek-netbird"]),
@@ -93,6 +94,7 @@ const OTHER_FILES: &[(&str, &str)] = &[
     ("docs/public-api.md", "| code |\n"),
     (".github/workflows/ci.yml", "name: CI\n"),
     ("scripts/test-partitions", "#!/bin/sh\n"),
+    ("scripts/gate-receipt", "#!/usr/bin/env python3\n"),
     ("compat/codex/subagent-hooks.json", "{}\n"),
     (
         ".cargo/config.toml",
@@ -975,6 +977,29 @@ fn test_job_scripts() -> std::collections::BTreeSet<String> {
         }
     }
     scripts
+}
+
+#[test]
+fn a_gate_receipt_change_selects_only_the_receipt_guard_and_the_script_suite() {
+    let repo = Repo::new();
+    repo.change(&["scripts/gate-receipt"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages", "{selection:#}");
+    let mut expected = whole(&["pohunek-cli"]);
+    // Selecting pohunek-cli also selects the daemon test that runs the CLI
+    // binary (the BINARY_USES edge); the scanners live in `all_packages`.
+    expected.push((
+        "pohunek-daemon".to_owned(),
+        "binary(=supervised_lifecycle)".to_owned(),
+    ));
+    expected.push((
+        "pohunek-session-worker".to_owned(),
+        "test(=server::receipt_guard_tests::receipt_class_one_matches_the_injected_session_environment)"
+            .to_owned(),
+    ));
+    expected.sort();
+    assert_eq!(all_packages(&selection), expected, "{selection:#}");
+    assert_eq!(selection["script_tests"], true, "{selection:#}");
 }
 
 #[test]
