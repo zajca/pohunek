@@ -35,11 +35,16 @@ FAKE_CARGO = r'''#!/usr/bin/env python3
 The second argument of `-E` of a `nextest list` call selects, from the
 canned file (an object of `listing()` shape), only the test cases the
 filterset matches. The matcher understands the filtersets this test
-suite writes: `package(=P)` and `test(=name)` or `test(/re/)` per
-binary, `and`/`not`/`or` between them, and the script's
-`(selection) and (union)` split expression.
+suite writes: `package(=P)`, `binary_id(=B)`, `kind(K)` or `kind(=K)`
+(`binary(=N)` equality, `binary(N)` glob) and `test(=name)` or
+`test(/re/)` per binary, `and`/`not`/`or` between them, and the
+script's `(selection) and (union)` split expression. `kind` (either
+spelling; the script emits the bare one) and `binary` evaluate against
+the canned suite id with the same encoding the script's
+`Target.binary_id` uses (`<pkg>` is a lib, `<pkg>::<name>` an
+integration test, `<pkg>::bin/<name>` a binary).
 """
-import json, os, re, sys
+import fnmatch, json, os, re, sys
 
 argv = sys.argv[1:]
 if argv[:1] == ["metadata"]:
@@ -98,6 +103,13 @@ elif argv[:2] == ["nextest", "list"]:
             patterns = re.findall(r"test\(/([^/]+)/\)", clause)
             package_names = set(re.findall(r"package\(=([^)]+)\)", clause))
             binary_names = set(re.findall(r"binary_id\(=([^)]+)\)", clause))
+            kinds = set(re.findall(r"kind\(=?([^)]+)\)", clause))
+            binaries = []
+            for raw in re.findall(r"binary\(([^)]+)\)", clause):
+                if raw.startswith("="):
+                    binaries.append(("eq", raw[1:]))
+                else:
+                    binaries.append(("glob", raw))
             # Unknown predicates are an error, not a match: the fake
             # must stay behind nextest's own filterset semantics.
             known = {"package", "test", "binary_id", "kind", "binary"}
@@ -109,6 +121,23 @@ elif argv[:2] == ["nextest", "list"]:
                 return False
             if binary_names and binary_id not in binary_names:
                 return False
+            if kinds or binaries:
+                # Same encoding as Target.binary_id in the script:
+                # `<pkg>` is the lib, `<pkg>::<name>` an integration
+                # test, `<pkg>::bin/<name>` a binary target.
+                bid = binary_id or ""
+                rest = bid[len(package) + 2:] if bid.startswith(package + "::") else None
+                target_kind = ("lib" if rest is None
+                               else "bin" if rest.startswith("bin/") else "test")
+                target_name = (package if rest is None
+                               else rest[len("bin/"):] if rest.startswith("bin/") else rest)
+                if kinds and target_kind not in kinds:
+                    return False
+                if binaries and not any(
+                        target_name == value if form == "eq"
+                        else fnmatch.fnmatchcase(target_name, value)
+                        for form, value in binaries):
+                    return False
             if not names and not patterns:
                 return True
             return name in names or any(re.search(p, name) for p in patterns)
@@ -540,9 +569,9 @@ class Listing(Fixture):
         self.assertNotIn('"run"', self.log.read_text(), "no stress run may start")
 
     def test_a_test_falls_back_to_another_suite_by_name(self):
-        # M1: a selected test whose own binary is absent from the list
-        # must fail as "not in the nextest list", even when another
-        # suite has a test of the same name (the old fallback).
+        # A selected test whose own binary is absent from the list must
+        # fail as "not in the nextest list", even when another suite
+        # has a test of the same name.
         # Here the own binary `demo` is absent and `flow` (same package)
         # carries the same-named case as selected.
         result = self.run_script(list_json=listing({
@@ -972,23 +1001,26 @@ class SlowRunner(Fixture):
         untraced_run = next(call for call in runs if "and not" not in " ".join(call))
         self.assertIn("running_loss", " ".join(untraced_run))
         lines = result.stderr.splitlines()
-        self.assertIn("stress-changed-tests: NOT SLOWED session::reconcile::tests::running_loss::pinned_case", lines)
-        self.assertIn("stress-changed-tests: SLOWED tests::comment_edit", lines)
+        self.assertIn("stress-changed-tests: NOT SLOWED pohunek-daemon session::reconcile::tests::running_loss::pinned_case", lines)
+        self.assertIn("stress-changed-tests: SLOWED demo tests::comment_edit", lines)
         union = self.untraced_filter_union()
-        selection = "((package(=demo) and kind(lib) and (test(=tests::comment_edit))) or (package(=pohunek-daemon) and kind(lib) and (test(=session::reconcile::tests::running_loss::pinned_case))))"
+        selection = "(package(=demo) and kind(lib) and (test(=tests::comment_edit))) or (package(=pohunek-daemon) and kind(lib) and (test(=session::reconcile::tests::running_loss::pinned_case)))"
         self.assertEqual(traced_run[traced_run.index("-E") + 1],
-                         f"{selection} and not ({union})")
+                         f"({selection}) and not ({union})")
         self.assertEqual(untraced_run[untraced_run.index("-E") + 1],
-                         f"{selection} and ({union})")
+                         f"({selection}) and ({union})")
 
-    def test_the_print_line_names_the_split(self):
+    def test_the_print_lines_name_the_per_test_split(self):
         listed = self.mixed_root()
         probe = self.run_script("--slow-runner", "--print", list_json=listed)
         self.assertEqual(probe.returncode, 0, probe.stderr)
-        self.assertIn("slow-runner: SLOWED:", probe.stdout)
-        self.assertIn("slow-runner: NOT SLOWED:", probe.stdout)
-        self.assertIn("running_loss", probe.stdout)
-        self.assertIn("tests::comment_edit", probe.stdout)
+        lines = probe.stdout.splitlines()
+        union = self.untraced_filter_union()
+        selection = "(package(=demo) and kind(lib) and (test(=tests::comment_edit))) or (package(=pohunek-daemon) and kind(lib) and (test(=session::reconcile::tests::running_loss::pinned_case)))"
+        self.assertIn(f"slow-runner: SLOWED: ({selection}) and not ({union})", lines)
+        self.assertIn(f"slow-runner: NOT SLOWED: ({selection}) and ({union})", lines)
+        self.assertIn("slow-runner: SLOWED demo tests::comment_edit", lines)
+        self.assertIn("slow-runner: NOT SLOWED pohunek-daemon session::reconcile::tests::running_loss::pinned_case", lines)
 
     def test_the_slow_run_wraps_the_same_nextest_argv_in_strace(self):
         (listed, run), result = self.slow_argv()
@@ -1009,8 +1041,10 @@ class SlowRunner(Fixture):
             argv[argv.index("-E") + 1],
             "((package(=demo) and kind(lib) and (test(=tests::comment_edit)))) "
             f"and not ({let_union})")
-        self.assertIn("SLOWED", result.stderr)
-        self.assertIn("tests::comment_edit", result.stderr)
+        self.assertIn("stress-changed-tests: SLOWED demo tests::comment_edit",
+                      result.stderr.splitlines())
+        self.assertNotIn("stress-changed-tests: NOT SLOWED demo tests::comment_edit",
+                         result.stderr.splitlines())
 
     def mixed_root(self):
         daemon = self.root / "crates/daemon/src"
@@ -1045,7 +1079,7 @@ class SlowRunner(Fixture):
         self.assertIn("--unpinned", result.stderr)
 
     def test_slow_runner_usage_is_checked_before_selection_or_print(self):
-        # L1: usage errors must win over an empty selection and over
+        # Usage errors must win over an empty selection and over
         # --print; no git/cargo work may happen first.
         # Empty selection: amend the feature branch away so the diff
         # vs main is empty.
@@ -1110,8 +1144,8 @@ class SlowRunner(Fixture):
         self.assertIn("ptrace", result.stderr)
 
     def test_a_fully_listed_selection_runs_only_the_untraced_run(self):
-        # M3: a selection fully on the untraced list runs only the
-        # untraced invocation (no strace, no SLOWED line). Build a
+        # A selection fully on the untraced list runs only the untraced
+        # invocation (no strace, no `SLOWED ...` line). Build a
         # daemon-only change far from the setUp demo edit so the
         # selection contains only the pinned running_loss test.
         daemon = self.root / "crates/daemon/src"
@@ -1152,28 +1186,24 @@ class SlowRunner(Fixture):
         runs = self.nextest_runs()
         self.assertEqual(len(runs), 1)
         self.assertNotIn("and not", " ".join(runs[0]))
-        self.assertIn("NOT SLOWED session::reconcile::tests::running_loss::pinned_case", result.stderr)
+        self.assertIn(
+            "stress-changed-tests: NOT SLOWED pohunek-daemon session::reconcile::tests::running_loss::pinned_case",
+            result.stderr.splitlines())
         self.assertNotIn("stress-changed-tests: SLOWED", result.stderr)
 
-    def test_an_entry_in_a_new_filterset_form_is_split_by_nextest(self):
-        # M2 (r2): an entry nextest understands but the old `entry_matches`
-        # regex parser could not (`binary_id(...)`) must still split
-        # correctly, because the split is nextest's own evaluation.
-        # Hermetic: copy the two scripts and a fixture JSON into the
-        # fixture's own tmp scripts/ dir; the checked-in list is not
-        # touched (L1).
-        listed = self.mixed_root()
+    def probe_scripts(self, untraced_entries):
+        # Probe the slow-runner split against a fixture untraced list
+        # without touching the checked-in one: copy both scripts and the
+        # fixture list into the fixture's own tmp scripts/ dir. Returns
+        # the probe argv plus its env.
         scripts_dir = self.tmp / "probe-scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         for name in ("stress-changed-tests", "stress-run"):
             (scripts_dir / name).write_text(
                 (SCRIPT.parents[0] / name).read_text())
             (scripts_dir / name).chmod(0o755)
-        (scripts_dir / "stress-slow-runner-untraced.json").write_text(json.dumps([{
-            "filter": "binary_id(=pohunek-daemon)",
-            "reason": "probe of a form the old matcher rejected",
-            "evidence": "test-only entry",
-        }]))
+        (scripts_dir / "stress-slow-runner-untraced.json").write_text(
+            json.dumps(untraced_entries))
         argv = [sys.executable, str(scripts_dir / "stress-changed-tests"),
                 "--base", "main", "--count", "3", "--deadline", "60s",
                 "--profile", "heavy", "--slow-runner"]
@@ -1181,117 +1211,115 @@ class SlowRunner(Fixture):
                    FAKE_METADATA=str(self.tmp / "metadata.json"),
                    FAKE_LIST=str(self.tmp / "list.json"),
                    FAKE_LOG=str(self.log), FAKE_RUN_RC="0")
+        return argv, env
+
+    def test_an_entry_in_a_new_filterset_form_is_split_by_nextest(self):
+        # An untraced-list entry nextest understands but a naive
+        # substring matcher would miss (`binary_id(...)`) still splits
+        # correctly, because the split is nextest's own evaluation.
+        listed = self.mixed_root()
+        argv, env = self.probe_scripts([{
+            "filter": "binary_id(=pohunek-daemon)",
+            "reason": "probe of an entry form matched only by nextest evaluation",
+            "evidence": "test-only entry",
+        }, {
+            # The script writes `filter_head` clauses with the bare
+            # `kind(test)` spelling (script's Target.filter_head): a
+            # fake that ignores `kind` would match the demo lib too
+            # and run everything untraced, failing the split below.
+            "filter": "package(=demo) and kind(test)",
+            "reason": "probe of the bare kind() spelling the script emits",
+            "evidence": "test-only entry",
+        }])
         (self.tmp / "list.json").write_text(listed)
         self.log.unlink(missing_ok=True)
         result = subprocess.run(argv, cwd=self.root, capture_output=True, text=True,
                                 env=env, timeout=WAIT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stderr.splitlines()
-        self.assertIn("stress-changed-tests: NOT SLOWED session::reconcile::tests::running_loss::pinned_case", lines)
-        self.assertIn("stress-changed-tests: SLOWED tests::comment_edit", lines)
+        self.assertIn("stress-changed-tests: NOT SLOWED pohunek-daemon session::reconcile::tests::running_loss::pinned_case", lines)
+        self.assertIn("stress-changed-tests: SLOWED demo tests::comment_edit", lines)
         runs = self.nextest_runs()
         self.assertEqual(len(runs), 2)
-        union = "(binary_id(=pohunek-daemon))"
-        selection = "((package(=demo) and kind(lib) and (test(=tests::comment_edit))) or (package(=pohunek-daemon) and kind(lib) and (test(=session::reconcile::tests::running_loss::pinned_case))))"
+        union = "(binary_id(=pohunek-daemon)) or (package(=demo) and kind(test))"
+        selection = "(package(=demo) and kind(lib) and (test(=tests::comment_edit))) or (package(=pohunek-daemon) and kind(lib) and (test(=session::reconcile::tests::running_loss::pinned_case)))"
         traced_run = next(call for call in runs if "and not" in " ".join(call))
         untraced_run = next(call for call in runs if "and not" not in " ".join(call))
         self.assertEqual(traced_run[traced_run.index("-E") + 1],
-                         f"{selection} and not ({union})")
+                         f"({selection}) and not ({union})")
         self.assertEqual(untraced_run[untraced_run.index("-E") + 1],
-                         f"{selection} and ({union})")
+                         f"({selection}) and ({union})")
 
     def test_two_same_named_tests_split_by_binary_id(self):
-        # M1 (r2): two selected tests share the bare name but live in
-        # different binaries; the entry names only one, so the split
-        # must key by (binary_id, name).
+        # Two selected tests share the bare name in different binaries
+        # (the daemon lib and the cli `all` binary both carry
+        # `mod_a::parses_config`); the untraced-list entry names only
+        # the daemon one, so the split keys by (binary_id, name): the
+        # daemon copy runs untraced, the cli copy runs traced.
+        # Both `parses_config` cases are added on the branch: the daemon
+        # lib is a new file, and the cli `mod_a.rs` gains a
+        # `parses_config` beside the base `cli_case`/`deep_case`, which
+        # stay byte-identical so the diff selects only the addition.
+        # The setUp demo edit is reverted, so `demo/src/lib.rs` matches
+        # main and contributes nothing to the selection.
         daemon = self.root / "crates/daemon/src"
         daemon.mkdir(parents=True, exist_ok=True)
-        # Both bodies below are edited in place (one comment line each)
-        # so per-test-range placement picks exactly the two
-        # parses_config cases (the setUp demo body edit is committed
-        # away as code, not inside a test range).
         (daemon / "lib.rs").write_text(
             "#[cfg(test)]\nmod mod_a {\n"
             "    #[test]\n    fn parses_config() {\n"
-            "        // original comment\n        assert!(true);\n    }\n}\n")
+            "        assert!(true);\n    }\n}\n")
         self.write_metadata(extra_packages=({
             "name": "pohunek-daemon", "targets": [{
                 "name": "pohunek-daemon", "kind": ["lib"], "test": True,
                 "src_path": str(daemon / "lib.rs")}]},))
-        # CLI parses_config lives in mod_a.rs (binary pohunek-cli::all)
-        # so its full test name is mod_a::parses_config, same as daemon.
-        # parses_config lives in the `all` binary's mod_a module, but
-        # an *edit* of its body selects only it even though the binary
-        # also carries cli_case: select the whole-`mod_a.rs` file once
-        # in setUp's commit, then edit only parses_config above.
-        self.write_metadata([{"name": "parses", "kind": ["test"], "test": True,
-                              "src_path": str(self.root / "crates/cli/tests/mod_a.rs")}],
-                            extra_packages=({
-            "name": "pohunek-daemon", "targets": [{
-                "name": "pohunek-daemon", "kind": ["lib"], "test": True,
-                "src_path": str(daemon / "lib.rs")}]},))
-        # One comment edit inside each parses_config body.
-        (daemon / "lib.rs").write_text(
-            (daemon / "lib.rs").read_text().replace(
-                "// original comment", "// reworded comment"))
-        # cli_case sits outside the changed range; edit only the
-        # parses_config body (the fixture mod_a.rs has no such test
-        # yet, so add it as a body edit from a baseline that lacks it:
-        # write a baseline without parses_config, then append the
-        # import-less edit as a changed test range).
         self.write("crates/cli/tests/mod_a.rs",
-                   '#[test]\nfn cli_case() { assert!(true); }\n\n'
-                   '#[test]\nfn parses_config() {\n    // original comment\n    assert!(true);\n}\n')
-        self.edit("crates/cli/tests/mod_a.rs",
-                  "// original comment", "// reworded comment")
+                   '#[test]\nfn cli_case() {\n    assert!(true);\n}\n\n'
+                   '#[test]\nfn parses_config() {\n    assert!(true);\n}\n\n'
+                   'mod nested {\n'
+                   '    #[tokio::test(flavor = "multi_thread")]\n'
+                   '    async fn deep_case() {\n        assert!(true);\n    }\n}\n')
         self.edit("crates/demo/src/lib.rs", "// edit", "// original comment")
         self.commit("two parses_config")
-        scripts_dir = self.tmp / "probe-scripts"
-        scripts_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("stress-changed-tests", "stress-run"):
-            (scripts_dir / name).write_text(
-                (SCRIPT.parents[0] / name).read_text())
-            (scripts_dir / name).chmod(0o755)
-        (scripts_dir / "stress-slow-runner-untraced.json").write_text(json.dumps([{
+        argv, env = self.probe_scripts([{
             "filter": "package(=pohunek-daemon) and test(=mod_a::parses_config)",
             "reason": "probe naming one binary",
             "evidence": "test-only entry",
-        }]))
+        }])
         listed = listing({
             "pohunek-daemon": {"mod_a::parses_config": "matches"},
-            "pohunek-cli::parses": {"cli_case": "matches", "parses_config": "matches",
-                                    "nested::deep_case": "matches"},
-            "pohunek-cli::all": {"mod_a::cli_case": "matches", "mod_a::nested::deep_case": "matches",
+            "pohunek-cli::all": {"mod_a::cli_case": "matches",
                                  "mod_a::parses_config": "matches"},
-            "demo::parses": {"cli_case": "matches", "parses_config": "matches",
-                             "nested::deep_case": "matches"},
         })
         (self.tmp / "list.json").write_text(listed)
-        argv = [sys.executable, str(scripts_dir / "stress-changed-tests"),
-                "--base", "main", "--count", "3", "--deadline", "60s",
-                "--profile", "heavy", "--slow-runner"]
-        env = dict(os.environ, PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",
-                   FAKE_METADATA=str(self.tmp / "metadata.json"),
-                   FAKE_LIST=str(self.tmp / "list.json"),
-                   FAKE_LOG=str(self.log), FAKE_RUN_RC="0")
         self.log.unlink(missing_ok=True)
         result = subprocess.run(argv, cwd=self.root, capture_output=True, text=True,
                                 env=env, timeout=WAIT_SECONDS)
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The first `nextest list` probes the bare selection; the split
+        # probe (selection intersected with the untraced-list union) is
+        # the second one.
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        probes = [c for c in calls
+                  if c[:2] == ["nextest", "list"]
+                  or c[:3] == ["cargo", "nextest", "list"]]
+        self.assertEqual(len(probes), 2)
+        probed = probes[1][probes[1].index("-E") + 1]
+        selection = "(package(=pohunek-cli) and kind(test) and binary(=all) and (test(=mod_a::parses_config))) or (package(=pohunek-daemon) and kind(lib) and (test(=mod_a::parses_config)))"
+        union = "(package(=pohunek-daemon) and test(=mod_a::parses_config))"
+        self.assertEqual(probed, f"({selection}) and ({union})")
         lines = result.stderr.splitlines()
-        # daemon one is NOT SLOWED, cli one is SLOWED (one line each).
-        self.assertIn("stress-changed-tests: NOT SLOWED mod_a::parses_config", lines)
-        self.assertIn("stress-changed-tests: SLOWED mod_a::parses_config", lines)
+        self.assertIn(
+            "stress-changed-tests: NOT SLOWED pohunek-daemon mod_a::parses_config", lines)
+        self.assertIn(
+            "stress-changed-tests: SLOWED pohunek-cli::all mod_a::parses_config", lines)
         runs = self.nextest_runs()
         self.assertEqual(len(runs), 2)
-        union = "(package(=pohunek-daemon) and test(=mod_a::parses_config))"
-        selection = "((package(=demo) and kind(test) and binary(=parses) and (test(=cli_case) or test(=parses_config))) or (package(=pohunek-cli) and kind(test) and binary(=all) and (test(=mod_a::cli_case) or test(=mod_a::parses_config))) or (package(=pohunek-daemon) and kind(lib) and (test(=mod_a::parses_config))))"
         traced_run = next(call for call in runs if "and not" in " ".join(call))
         untraced_run = next(call for call in runs if "and not" not in " ".join(call))
         self.assertEqual(traced_run[traced_run.index("-E") + 1],
-                         f"{selection} and not ({union})")
+                         f"({selection}) and not ({union})")
         self.assertEqual(untraced_run[untraced_run.index("-E") + 1],
-                         f"{selection} and ({union})")
+                         f"({selection}) and ({union})")
 
     def test_the_untraced_list_entries_carry_evidence(self):
         with load_script() as module:
