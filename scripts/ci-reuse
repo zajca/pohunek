@@ -463,8 +463,18 @@ def main() -> int:
                 job = config["jobs"][job_id]
                 entries = []
                 for name in job["names"]:
+                    attempts = by_name.get(name, [])
+                    if not attempts:
+                        # decide() only skips jobs it found green, so a
+                        # missing name means the listing changed under it:
+                        # fail open instead of crashing on max() of [].
+                        warn(f"source run {source['id']} no longer lists {name}; running everything")
+                        entries = []
+                        skip = []
+                        source = None
+                        break
                     newest = max(
-                        by_name.get(name, []),
+                        attempts,
                         key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
                     )
                     entries.append({
@@ -473,6 +483,9 @@ def main() -> int:
                         "source_job_id": newest.get("id"),
                         "completed_at": newest.get("completed_at"),
                     })
+                if source is None:
+                    record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None}
+                    break
                 record["jobs"][job_id] = {
                     "run_id": source["id"],
                     "names": job["names"],

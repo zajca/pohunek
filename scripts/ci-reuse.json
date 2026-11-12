@@ -182,7 +182,7 @@
     },
     "upgrade-test": {
       "names": [
-        "upgrade from the previous release"
+        "upgrade from the previous release / upgrade from the previous release"
       ],
       "selection_dependent": false,
       "consumers": [],

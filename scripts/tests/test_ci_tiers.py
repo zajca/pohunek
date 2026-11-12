@@ -2476,13 +2476,16 @@ def evaluate_needs_expression(
     python = re.sub(r"\benv\.([A-Z_]+)", r"envs.get('\1', '')", python)
     python = re.sub(r"\bmatrix\.([a-z_]+)", r"matrix.get('\1', '')", python)
     python = re.sub(r"needs\.changes\.outputs\.([a-z_]+)", r"changes.get('\1', '')", python)
+    # The reuse skip list must substitute before the generic outputs
+    # translation consumes `needs.reuse.outputs.skip`.
+    python = python.replace("needs.reuse.outputs.skip || '[]'", "reuse_skip")
+    python = python.replace("fromJSON(reuse_skip)", "reuse_skip")
+    python = python.replace("fromjson(reuse_skip)", "reuse_skip")
     python = re.sub(
         r"needs\.([a-z][a-z0-9-]*)\.outputs\.([a-z_]+)",
         r"outputs.get('\1', {}).get('\2', '')",
         python,
     )
-    python = python.replace("needs.reuse.outputs.skip || '[]'", "reuse_skip")
-    python = python.replace("fromjson(reuse_skip)", "reuse_skip")
     python = re.sub(r"needs\.([a-z][a-z0-9-]*)\.result", r"results.get('\1', '')", python)
     python = python.replace("&&", " and ").replace("||", " or ")
     python = re.sub(r"!(?!=)", " not ", python)
@@ -3084,6 +3087,47 @@ class DeltaReuseWiringTests(unittest.TestCase):
         delta = block(dispatch, "delta", indent=6)
         self.assertIn("type: boolean", delta)
         self.assertIn("default: false", delta)
+
+    def test_the_verdict_excuses_a_reused_skip_on_a_dispatch(self):
+        # On a tier=main delta dispatch the reused jobs are skipped, and
+        # the verdict must stay green: every verdict gate knows the reuse
+        # skip list. Package jobs are not in the verdict's needs, so only
+        # the gated jobs are checked here.
+        job = workflow_jobs()["test-selection-verdict"]
+        gates = {
+            "Fail a test job that failed or was skipped without a narrowed selection or a reuse skip":
+                ("build-tests", "fast-tests", "integration"),
+            "Fail a gate job that failed or was skipped without the docs-only path":
+                ("test", "darwin-check", "doctests", "build-bins", "shear"),
+            "Fail a macOS lane that failed or was skipped without a reuse skip or a reason":
+                ("platform-contracts",),
+            "Fail a Hermes macOS job that did not pass the tests the lane left to it and was not reused":
+                ("hermes-compatibility-macos",),
+        }
+        base = {name: "success" for names in gates.values() for name in names}
+        base.update({
+            "test-selection": "success", "test-selection-check": "success",
+            "audit": "success", "changes": "success", "sdk": "success",
+            "macos-release-build": "success",
+        })
+        for step, names in gates.items():
+            condition = step_condition(job_steps(job)[step])
+            for name in names:
+                with self.subTest(step=step, job=name):
+                    results = dict(base)
+                    results[name] = "skipped"
+                    self.assertFalse(bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results=results,
+                        outputs={"test-selection": NARROWED_PLAN},
+                        reuse_skip=[name],
+                    )))
+                    # Without the reuse skip the same skip still fails.
+                    self.assertTrue(bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results=results,
+                        outputs={"test-selection": NARROWED_PLAN},
+                    )))
 
 
 class DocsOnlyPathTests(unittest.TestCase):
