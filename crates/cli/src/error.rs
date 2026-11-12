@@ -344,8 +344,10 @@ pub(crate) enum CliError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// A typed CLI result could not be represented at the previous protocol's
-    /// identity spelling.
+    /// A compat translation failed while a typed CLI result was rendered.
+    ///
+    /// The CLI renders the current shape, which needs no translation, so no CLI
+    /// path produces it.
     #[error("CLI JSON compatibility rendering failed: {0}")]
     JsonCompatibility(#[from] protocol::compat::CompatError),
 }

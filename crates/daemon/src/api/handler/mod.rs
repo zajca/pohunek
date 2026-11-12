@@ -326,10 +326,12 @@ pub(crate) async fn dispatch_line(
 
 /// Dispatch a parsed request to its method handler.
 ///
-/// Negotiates the protocol version first. A request of the previous protocol
-/// version is translated to the current shape before it reaches a handler and
-/// its response is translated back (see [`protocol::compat`]), so handlers only
-/// ever see and produce the current wire shape.
+/// Negotiates the protocol version first: a request outside the window is
+/// refused with `daemon/version_mismatch` before any method runs, and the
+/// refusal carries the current version. The window holds the current version
+/// alone, so a handler sees the request as sent and its response goes back
+/// untranslated; [`protocol::compat`] would translate a negotiated version
+/// other than the current one, which no peer can select.
 ///
 /// Exposed within the crate (and re-exported) so integration tests can exercise
 /// dispatch without a live socket.

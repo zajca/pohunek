@@ -590,13 +590,11 @@ impl Client {
 
     /// Send one framed control request and return the daemon's `ok` payload.
     ///
-    /// The request carries the current protocol shape. When the daemon
-    /// negotiated the previous version, the request is translated into it
-    /// before sending and the payload is translated back, so the caller only
-    /// ever sees the current shape. A request whose translation depends on the
-    /// version first learns it with a `daemon.health` probe on this
-    /// connection. A method the previous version never defined fails with
-    /// [`ClientError::DaemonProtocolTooOld`] before anything is sent.
+    /// The request carries the current protocol shape, the only shape in the
+    /// window, so it is sent as written. A peer of another protocol version
+    /// fails the call with `daemon/version_mismatch` instead of running the
+    /// method: a daemon refuses the request before dispatch, and a reply that
+    /// carries another version is refused on the client.
     ///
     /// A request that times out, or is answered with another request's reply,
     /// leaves its connection untrustworthy: a late reply could be read as the
@@ -995,9 +993,9 @@ impl Client {
     ///
     /// A request that omits `timeout_ms` is bounded by
     /// [`protocol::MAX_COMMAND_TIMEOUT_MS`], the ceiling the daemon applies.
-    /// A daemon that does not implement the method, whether it speaks the
-    /// previous protocol version or the current one, fails with
-    /// `command_unsupported`.
+    /// A daemon of the current protocol version that does not implement the
+    /// method fails with `command_unsupported`; a daemon of another protocol
+    /// version fails the call with `daemon/version_mismatch` instead.
     ///
     /// # Errors
     ///
@@ -1034,8 +1032,8 @@ impl Client {
     /// When the request leaves the duration to the daemon default, the client
     /// cannot know that default and bounds the connection by
     /// [`protocol::MAX_SESSION_WAIT_TURN_MS`], the ceiling no daemon setting
-    /// may exceed. Against a daemon of the previous protocol version the call
-    /// fails with `daemon_protocol_too_old` before anything is sent.
+    /// may exceed. A daemon of another protocol version fails the call with
+    /// `daemon/version_mismatch` before any method runs.
     ///
     /// # Errors
     ///
@@ -1429,9 +1427,9 @@ fn run_token() -> &'static str {
 impl Subscription {
     /// Return the next raw event JSON line, or `None` when the daemon closes.
     ///
-    /// A connection that selected the previous protocol version yields each
-    /// event translated to the current shape and re-serialized, so a line is
-    /// always a current-shape event.
+    /// A line is always a current-shape event: the connection selects the
+    /// current version, the only one the window holds, so nothing is
+    /// translated.
     pub async fn next_line(&mut self) -> Result<Option<String>, ClientError> {
         match &mut self.inner {
             SubscriptionInner::Local(conn) => conn.next_adapted_line(self.selected_version).await,
@@ -1744,9 +1742,12 @@ fn dedicated_request_timeout(configured: Duration, wire_timeout_ms: u32) -> Dura
 /// The error a daemon that lacks `command.run` produces, as the typed
 /// `command_unsupported`.
 ///
-/// A daemon of the previous protocol version is refused before anything is
-/// sent; a daemon of the current version that predates the method answers
-/// `method_not_found`. Both mean the same to the caller.
+/// A daemon of the current protocol version that predates the method answers
+/// `method_not_found`; the mapping also covers a connection frozen below the
+/// method's own version range, which fails with
+/// [`ClientError::DaemonProtocolTooOld`] before anything is sent. Both mean the
+/// same to the caller. A daemon of another protocol version does not reach this
+/// mapping: the call fails with `daemon/version_mismatch` first.
 fn command_unsupported(error: ClientError) -> ClientError {
     let unsupported = || ProtocolError::from(protocol::CommandErrorKind::Unsupported);
     match error {

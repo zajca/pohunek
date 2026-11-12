@@ -751,8 +751,8 @@ mod tests {
             daemon_protocol_version: daemon.get(),
         };
 
-        // A previous-version requester: a v3-only daemon is reachable, a
-        // v4-only one is not.
+        // A previous-version requester: a daemon of that version is reachable,
+        // a current-version one is not.
         let v3_only = single_version_stub(previous).await;
         let actual = classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
         assert_eq!(actual, reachable);

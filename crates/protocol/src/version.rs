@@ -33,10 +33,11 @@ pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSI
 /// Inclusive public protocol range of this build: the window.
 ///
 /// The one definition of the window. A daemon negotiates it with every client,
-/// and every client advertises it ([`CLIENT_PROTOCOL_VERSIONS`]). Both sides
-/// translate the previous version through the shape-only adapters in
-/// [`crate::compat`]: the daemon converts a previous-version peer's requests and
-/// results, a client converts them for a previous-version daemon.
+/// and every client advertises it ([`CLIENT_PROTOCOL_VERSIONS`]). The window
+/// holds the current version only ([`MIN_PROTOCOL_VERSION`] equals
+/// [`PROTOCOL_VERSION`]), so no adapter is live: [`crate::compat`] answers any
+/// other version with [`crate::compat::CompatError::UnsupportedVersion`], and a
+/// peer that announces one is refused with `daemon/version_mismatch`.
 pub const SUPPORTED_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
     minimum: MIN_PROTOCOL_VERSION,
     maximum: PROTOCOL_VERSION,
@@ -44,30 +45,29 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRan
 
 /// Inclusive public protocol range a client of this build advertises.
 ///
-/// Clients (CLI, Rust client) carry the same adapters as the daemon, so they
-/// offer the whole window. A daemon of the previous release answers in the
-/// previous version and the client translates it to the current shape; a
-/// method the previous version never defined fails on the client with
-/// `daemon/daemon_protocol_too_old` before anything is sent. The TypeScript SDK
-/// carries no adapter and offers [`CURRENT_PROTOCOL_VERSIONS`] only.
+/// The CLI, the Rust client and the TypeScript SDK offer the same window as the
+/// daemon, the current version only. A daemon that answers in another version is
+/// refused with `daemon/version_mismatch` before any method runs, and the CLI
+/// `--json` envelope reports this range in its `protocol` field.
 pub const CLIENT_PROTOCOL_VERSIONS: ProtocolVersionRange = SUPPORTED_PROTOCOL_VERSIONS;
 
 /// The exact current version as a range.
 ///
-/// Describes the shape a client hands to its callers: client adapters
-/// translate every older daemon payload to the current shape. New Hermes
-/// policies name exactly this version; the CLI JSON envelope advertises its
-/// full supported window while retaining the previous identity spelling at
-/// typed session sites for an installed previous-release plugin.
+/// A contract that has to name one version rather than a range uses this one.
+/// The Hermes operator policy is written with it, and the installed plugin
+/// refuses a CLI whose advertised range does not include it as
+/// `pohunek_cli_incompatible`. Its bounds equal [`SUPPORTED_PROTOCOL_VERSIONS`]
+/// because the window holds no adapter.
 pub const CURRENT_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
     minimum: PROTOCOL_VERSION,
     maximum: PROTOCOL_VERSION,
 };
 
-// The window needs a nonzero previous version to adapt.
+// Tests derive a version below the window as `MIN_PROTOCOL_VERSION - 1` or
+// `PROTOCOL_VERSION - 1`, which has to stay a valid nonzero version.
 const _: () = assert!(
     PROTOCOL_VERSION.0 >= 2,
-    "the window needs a previous version"
+    "the version below the window must be nonzero"
 );
 
 /// A protocol version number selected for responses and events.

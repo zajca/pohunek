@@ -201,7 +201,7 @@ impl ProtocolError {
 
     /// The canonical `daemon/version_adapter_failed` error.
     ///
-    /// The daemon could not express a payload in the older protocol version the
+    /// The daemon could not express a payload in the protocol version the
     /// connection negotiated. The message names only the version, never the
     /// payload. Code is stable: `version_adapter_failed`.
     #[must_use]
@@ -219,10 +219,10 @@ impl ProtocolError {
 
     /// The canonical `daemon/daemon_protocol_too_old` error.
     ///
-    /// A client refuses a method before sending it because the daemon it is
-    /// connected to negotiated a protocol version that never defined the
-    /// method. `host` is the route of a remote daemon, `None` for the local
-    /// daemon. Code is stable: `daemon_protocol_too_old`.
+    /// A client refuses a method before sending it because the connection's
+    /// protocol version is below the one the method needs. `host` is the route
+    /// of a remote daemon, `None` for the local daemon. Code is stable:
+    /// `daemon_protocol_too_old`.
     #[must_use]
     pub fn daemon_protocol_too_old(
         host: Option<&str>,
@@ -244,7 +244,7 @@ impl ProtocolError {
     /// The canonical `daemon/version_translation_failed` error.
     ///
     /// A client could not express a request in, or read a response of, the
-    /// older protocol version its daemon negotiated. The message names only the
+    /// protocol version the connection negotiated. The message names only the
     /// target and the version, never the payload. Code is stable:
     /// `version_translation_failed`.
     #[must_use]
