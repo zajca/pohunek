@@ -35,14 +35,16 @@ FAKE_CARGO = r'''#!/usr/bin/env python3
 The second argument of `-E` of a `nextest list` call selects, from the
 canned file (an object of `listing()` shape), only the test cases the
 filterset matches. The matcher understands the filtersets this test
-suite writes: `package(=P)`, `binary_id(=B)`, `kind(=K)`, `binary(=N)`
-and `test(=name)` or `test(/re/)` per binary, `and`/`not`/`or` between
-them, and the script's `(selection) and (union)` split expression.
-`kind`/`binary` evaluate against the canned suite id with the same
-encoding the script's `Target.binary_id` uses (`<pkg>` is a lib,
-`<pkg>::<name>` an integration test, `<pkg>::bin/<name>` a binary).
+suite writes: `package(=P)`, `binary_id(=B)`, `kind(K)` or `kind(=K)`
+(`binary(=N)` equality, `binary(N)` glob) and `test(=name)` or
+`test(/re/)` per binary, `and`/`not`/`or` between them, and the
+script's `(selection) and (union)` split expression. `kind` (either
+spelling; the script emits the bare one) and `binary` evaluate against
+the canned suite id with the same encoding the script's
+`Target.binary_id` uses (`<pkg>` is a lib, `<pkg>::<name>` an
+integration test, `<pkg>::bin/<name>` a binary).
 """
-import json, os, re, sys
+import fnmatch, json, os, re, sys
 
 argv = sys.argv[1:]
 if argv[:1] == ["metadata"]:
@@ -101,8 +103,13 @@ elif argv[:2] == ["nextest", "list"]:
             patterns = re.findall(r"test\(/([^/]+)/\)", clause)
             package_names = set(re.findall(r"package\(=([^)]+)\)", clause))
             binary_names = set(re.findall(r"binary_id\(=([^)]+)\)", clause))
-            kinds = set(re.findall(r"kind\(=([^)]+)\)", clause))
-            binaries = set(re.findall(r"binary\(=([^)]+)\)", clause))
+            kinds = set(re.findall(r"kind\(=?([^)]+)\)", clause))
+            binaries = []
+            for raw in re.findall(r"binary\(([^)]+)\)", clause):
+                if raw.startswith("="):
+                    binaries.append(("eq", raw[1:]))
+                else:
+                    binaries.append(("glob", raw))
             # Unknown predicates are an error, not a match: the fake
             # must stay behind nextest's own filterset semantics.
             known = {"package", "test", "binary_id", "kind", "binary"}
@@ -126,7 +133,10 @@ elif argv[:2] == ["nextest", "list"]:
                                else rest[len("bin/"):] if rest.startswith("bin/") else rest)
                 if kinds and target_kind not in kinds:
                     return False
-                if binaries and target_name not in binaries:
+                if binaries and not any(
+                        target_name == value if form == "eq"
+                        else fnmatch.fnmatchcase(target_name, value)
+                        for form, value in binaries):
                     return False
             if not names and not patterns:
                 return True
@@ -1212,6 +1222,14 @@ class SlowRunner(Fixture):
             "filter": "binary_id(=pohunek-daemon)",
             "reason": "probe of an entry form matched only by nextest evaluation",
             "evidence": "test-only entry",
+        }, {
+            # The script writes `filter_head` clauses with the bare
+            # `kind(test)` spelling (script's Target.filter_head): a
+            # fake that ignores `kind` would match the demo lib too
+            # and run everything untraced, failing the split below.
+            "filter": "package(=demo) and kind(test)",
+            "reason": "probe of the bare kind() spelling the script emits",
+            "evidence": "test-only entry",
         }])
         (self.tmp / "list.json").write_text(listed)
         self.log.unlink(missing_ok=True)
@@ -1223,7 +1241,7 @@ class SlowRunner(Fixture):
         self.assertIn("stress-changed-tests: SLOWED demo tests::comment_edit", lines)
         runs = self.nextest_runs()
         self.assertEqual(len(runs), 2)
-        union = "(binary_id(=pohunek-daemon))"
+        union = "(binary_id(=pohunek-daemon)) or (package(=demo) and kind(test))"
         selection = "(package(=demo) and kind(lib) and (test(=tests::comment_edit))) or (package(=pohunek-daemon) and kind(lib) and (test(=session::reconcile::tests::running_loss::pinned_case)))"
         traced_run = next(call for call in runs if "and not" in " ".join(call))
         untraced_run = next(call for call in runs if "and not" not in " ".join(call))
@@ -1238,32 +1256,28 @@ class SlowRunner(Fixture):
         # `mod_a::parses_config`); the untraced-list entry names only
         # the daemon one, so the split keys by (binary_id, name): the
         # daemon copy runs untraced, the cli copy runs traced.
+        # Both `parses_config` cases are added on the branch: the daemon
+        # lib is a new file, and the cli `mod_a.rs` gains a
+        # `parses_config` beside the base `cli_case`/`deep_case`, which
+        # stay byte-identical so the diff selects only the addition.
+        # The setUp demo edit is reverted, so `demo/src/lib.rs` matches
+        # main and contributes nothing to the selection.
         daemon = self.root / "crates/daemon/src"
         daemon.mkdir(parents=True, exist_ok=True)
         (daemon / "lib.rs").write_text(
             "#[cfg(test)]\nmod mod_a {\n"
             "    #[test]\n    fn parses_config() {\n"
-            "        // original comment\n        assert!(true);\n    }\n}\n")
+            "        assert!(true);\n    }\n}\n")
         self.write_metadata(extra_packages=({
             "name": "pohunek-daemon", "targets": [{
                 "name": "pohunek-daemon", "kind": ["lib"], "test": True,
                 "src_path": str(daemon / "lib.rs")}]},))
-        # Keep the untouched `cli_case` and `deep_case` byte-identical
-        # with the base fixture so the diff selects only parses_config.
         self.write("crates/cli/tests/mod_a.rs",
                    '#[test]\nfn cli_case() {\n    assert!(true);\n}\n\n'
-                   '#[test]\nfn parses_config() {\n    // original comment\n    assert!(true);\n}\n\n'
+                   '#[test]\nfn parses_config() {\n    assert!(true);\n}\n\n'
                    'mod nested {\n'
                    '    #[tokio::test(flavor = "multi_thread")]\n'
                    '    async fn deep_case() {\n        assert!(true);\n    }\n}\n')
-        # One comment edit inside each parses_config body selects
-        # exactly the two same-named cases; the setUp demo edit and the
-        # cli cli_case sit outside every changed range.
-        (daemon / "lib.rs").write_text(
-            (daemon / "lib.rs").read_text().replace(
-                "// original comment", "// reworded comment"))
-        self.edit("crates/cli/tests/mod_a.rs",
-                  "// original comment", "// reworded comment")
         self.edit("crates/demo/src/lib.rs", "// edit", "// original comment")
         self.commit("two parses_config")
         argv, env = self.probe_scripts([{
