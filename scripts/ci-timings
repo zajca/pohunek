@@ -80,14 +80,17 @@ VIEW_FIELDS = (
 # GitHub bills each job's runner time rounded UP to a whole minute, so
 # every job's wall clock contributes one minute-quantized step.
 RUNNER_MINUTE = 60
-# A `gh` call that fails with a server error or a secondary rate limit is
-# retried this many times in total, waiting `GH_RETRY_DELAY_SECONDS` times the
+# A `gh` call that fails with a server error, a secondary rate limit or a
+# dropped HTTP/2 stream is retried this many times in total, waiting `GH_RETRY_DELAY_SECONDS` times the
 # attempt number between tries; `--gh-attempts`/`--gh-retry-delay` override
 # both. A primary rate limit, an auth error or a 4xx fails at once: retrying
 # within seconds cannot fix those.
 GH_ATTEMPTS = 5
 GH_RETRY_DELAY_SECONDS = 5.0
-GH_TRANSIENT = re.compile(r"HTTP 5\d\d\b|secondary rate limit", re.IGNORECASE)
+GH_TRANSIENT = re.compile(
+    r"HTTP 5\d\d\b|secondary rate limit|stream error.*CANCEL",
+    re.IGNORECASE,
+)
 # Conclusions of a run that reached a verdict. A run GitHub reports as
 # `completed` with an empty conclusion also counts; `cancelled`, `skipped`
 # and the remaining conclusions (`neutral`, `stale`, `action_required`) do not.
@@ -1042,24 +1045,61 @@ def list_arguments(args, window=None):
 
 
 def wanted_attempts(latest, attempts):
-    """Which attempt numbers of a run the current selection needs.
+    """Which attempt numbers of a run the medians need.
 
     `gh run list` reports only the latest attempt, so every other attempt has
-    to be requested by number. `first` needs attempt 1 (the representative)
-    plus the latest one, whose metadata is what the listing described; `all`
-    needs the whole range, otherwise intermediate reruns of a run already on
-    attempt 3 would silently be missing from the aggregates.
+    to be requested by number. `first` needs attempt 1 only: the selection
+    keeps the lowest attempt number, so a latest-attempt document could not
+    enter the medians and fetching it would only cost a `gh run view`
+    (and, on a sick run, a fatal fetch error) for a document the medians
+    cannot use. The empty-window diagnosis reads the latest attempt's
+    metadata from the listing entry instead, so it needs no view either.
+    `all` needs the whole range, otherwise intermediate reruns of a run
+    already on attempt 3 would silently be missing from the aggregates.
     """
-    latest = latest or 1
     if attempts == "all":
+        latest = latest or 1
         return list(range(1, latest + 1))
-    return sorted({1, latest})
+    return [1]
 
 
-# What one fetch produced: the documents the current listing named, and
-# whether `gh run list` returned exactly `--limit` entries, which means the
-# server may have had more and the sample is a truncation, not a census.
-Fetch = collections.namedtuple("Fetch", ("documents", "truncated"))
+# What one fetch produced: the documents the current listing named, the
+# listing entries themselves (the latest attempt's metadata, which the
+# empty-window diagnosis reads without fetching that document), and whether
+# `gh run list` returned exactly `--limit` entries, which means the server
+# may have had more and the sample is a truncation, not a census.
+Fetch = collections.namedtuple("Fetch", ("documents", "listings", "truncated"))
+
+
+def selected_conclusion(args):
+    """The listing conclusion that keeps every selectable run.
+
+    `filter_runs` applies the `--conclusion` filter after attempt
+    selection, so a green first attempt with a red rerun must stay on
+    the listing. Only a single-attempt run whose listed conclusion
+    already differs from the requested one can be dropped: its one
+    document could never pass the filter, whatever `--attempts` says.
+    Without `--conclusion` every listing stays fetchable.
+    """
+    return getattr(args, "conclusion", None) or None
+
+
+def unselectable_listing(entry, wanted):
+    """Whether a listing can never feed the current selection.
+
+    The listing describes the run's latest attempt: a single-attempt run
+    whose listed conclusion is not the requested one has no selectable
+    attempt, so fetching its job document would only cost a `gh run
+    view` and, on a sick run, a fatal fetch error. Other listings
+    (including a rerun listed red) stay: attempt 1 may still be green.
+    """
+    if wanted is None:
+        return False
+    attempt = entry.get("attempt", 1) or 1
+    if attempt != 1:
+        return False
+    conclusion = entry.get("conclusion")
+    return bool(conclusion) and conclusion != wanted
 
 
 def list_documents(args, window=None):
@@ -1077,15 +1117,30 @@ def list_documents(args, window=None):
         ["run", "list", *list_arguments(args, window), "--json", LIST_FIELDS]
     )
     selected = {}
+    listed_entries = []
     changed = False
     try:
+        wanted = selected_conclusion(args)
         for entry in listed:
             # An unfinished run has no completed job timestamps to measure.
             if not entry.get("conclusion"):
                 continue
+            listed_entries.append(dict(entry))
+            # A single-attempt run whose conclusion already rules out
+            # selection is never viewable: its document cannot feed the
+            # medians, and a sick run would fail the whole fetch.
+            if unselectable_listing(entry, wanted):
+                continue
             run_id = entry["databaseId"]
             latest = entry.get("attempt", 1) or 1
             view_command = ["run", "view", str(run_id), "--json", VIEW_FIELDS]
+            # `unselectable_listing` above already dropped every listing
+            # whose single attempt could never pass the filter, and under
+            # `--attempts first` only attempt 1 is fetched: the latest
+            # document of a rerun is never selected, so viewing it would
+            # only risk a fatal fetch error for an unread document. The
+            # empty-window diagnosis reads that attempt's conclusion from
+            # `listed_entries` instead, so it needs no view either.
             for attempt in wanted_attempts(latest, args.attempts):
                 document = by_key.get((run_id, attempt))
                 if document is None:
@@ -1102,13 +1157,17 @@ def list_documents(args, window=None):
             write_snapshot(
                 cache_path, sorted(by_key.values(), key=document_key)
             )
-    return Fetch(list(selected.values()), bool(args.limit) and len(listed) >= args.limit)
+    return Fetch(list(selected.values()), listed_entries,
+                 bool(args.limit) and len(listed) >= args.limit)
 
 
-# Run summaries for one window, plus whether `--limit` may have cut the
-# sample short. A truncated window still renders, so the flag is what keeps
-# a partial median from passing for a complete one.
-Loaded = collections.namedtuple("Loaded", ("runs", "truncated"))
+# Run summaries for one window, the listing entries the live fetch saw
+# (the empty-window diagnosis reads the latest attempt's metadata from
+# them; `--input` snapshots carry no listing, so they contribute none),
+# plus whether `--limit` may have cut the sample short. A truncated
+# window still renders, so the flag is what keeps a partial median from
+# passing for a complete one.
+Loaded = collections.namedtuple("Loaded", ("runs", "listings", "truncated"))
 
 
 def load_run_summaries(args, window=None, with_steps=False):
@@ -1122,16 +1181,19 @@ def load_run_summaries(args, window=None, with_steps=False):
     kept, so old caches keep reproducing the report until refetched.
     """
     if args.input:
-        documents, truncated = read_snapshot(args.input), False
+        documents, listings, truncated = read_snapshot(args.input), [], False
     else:
-        documents, truncated = list_documents(args, window)
+        fetched = list_documents(args, window)
+        documents, listings, truncated = (
+            fetched.documents, fetched.listings, fetched.truncated
+        )
     summaries = []
     for document in documents:
         name = document.get("workflowName")
         if name is not None and name != "CI":
             continue
         summaries.append(summarize_run(document, with_steps))
-    return Loaded(summaries, truncated)
+    return Loaded(summaries, listings, truncated)
 
 
 def truncation_warning(label, window, limit):
@@ -1287,6 +1349,31 @@ def runs_in_window(runs, window):
 Diagnosis = collections.namedtuple("Diagnosis", ("branch", "message"))
 
 
+def listed_passes_filters(entry, args):
+    """Whether a `gh run list` entry passes the run metadata filters.
+
+    The listing describes the run's latest attempt (`conclusion`, `event`,
+    `headBranch`), so this judges a rerun by the attempt `--attempts all`
+    would add -- the same judgement the empty-window diagnosis used to
+    read off that attempt's fetched document, now without a `gh run view`
+    for a document the medians never use.
+    """
+    return all(
+        value is None or entry.get(field) == value
+        for field, value in (
+            ("conclusion", args.conclusion),
+            ("event", args.event),
+            ("headBranch", args.branch),
+        )
+    )
+
+
+def listed_in_window(entry, window):
+    """Whether a listing entry's creation time falls inside `window`."""
+    created = parse_timestamp(entry.get("createdAt"))
+    return bool(created) and window.start <= created < window.horizon
+
+
 def empty_window_diagnosis(args, loaded, window):
     """Why `window` selected no run, judged from the loaded runs themselves.
 
@@ -1297,7 +1384,7 @@ def empty_window_diagnosis(args, loaded, window):
     `filter_runs`, never against a sibling attempt that was never in the
     running -- that sibling's mismatch is not what emptied the window.
     """
-    present = runs_in_window(loaded, window)
+    present = runs_in_window(loaded.runs, window)
     if not present:
         if args.input:
             return Diagnosis(
@@ -1310,7 +1397,7 @@ def empty_window_diagnosis(args, loaded, window):
             "no run was fetched for it; `gh run list` returns the newest "
             "matching runs first, so raise --limit, or widen the window",
         )
-    candidates = runs_in_window(select_attempts(loaded, args.attempts), window)
+    candidates = runs_in_window(select_attempts(loaded.runs, args.attempts), window)
     if not candidates:
         hint = (
             "; pass --attempts all to count the attempts that do"
@@ -1350,12 +1437,25 @@ def empty_window_diagnosis(args, loaded, window):
         run for run in present
         if run not in candidates and run_passes_filters(run, args)
     ]
+    # Each listing entry already carries its run's latest attempt
+    # (`conclusion`/`event`/`headBranch`), so a rerun whose latest attempt
+    # passes the filters rescues the window even when only attempt 1 was
+    # fetched: `--attempts all` would add exactly that listed attempt.
+    # Entries share their run's creation time, so the window check uses
+    # the listing's `createdAt`. This listing read answers the probe the
+    # fetch-time view used to: the diagnosis needs no attempt-N document.
+    listed_rescue = (
+        args.attempts == "first" and args.input is None and any(
+            listed_passes_filters(entry, args) and listed_in_window(entry, window)
+            for entry in loaded.listings
+        )
+    )
     note = (
         " (a later attempt of it does pass, so --attempts all would match)"
-        if rescuable else ""
+        if rescuable or listed_rescue else ""
     )
     return Diagnosis(
-        "blocking-with-rescue" if rescuable else "blocking",
+        "blocking-with-rescue" if rescuable or listed_rescue else "blocking",
         f"{len(candidates)} run(s) fall inside it, but none passed "
         f"{', '.join(blocking)}; relax them{note}",
     )
@@ -1385,7 +1485,7 @@ def command_runs(args):
     warnings = []
     if loaded.truncated and window is not None:
         warnings.append(truncation_warning("requested", window, args.limit))
-    coverage = selection_coverage_warning(args, window, runs, selected)
+    coverage = selection_coverage_warning(args, window, loaded, selected)
     if coverage:
         warnings.append(coverage)
     if args.json:
@@ -1590,7 +1690,7 @@ def command_tiers(args):
     warnings = []
     if loaded.truncated and window is not None:
         warnings.append(truncation_warning("requested", window, args.limit))
-    coverage = selection_coverage_warning(args, window, loaded.runs, selected)
+    coverage = selection_coverage_warning(args, window, loaded, selected)
     if coverage:
         warnings.append(coverage)
     tiers = {name: [] for name in TIERS}
@@ -1651,10 +1751,12 @@ def command_compare(args):
     if not baseline_summary["runs"] or not current_summary["runs"]:
         empty = [
             f"{label} {spec}: "
-            f"{empty_window_diagnosis(args, runs, window).message}"
-            for label, spec, window, chosen in (
-                ("baseline", args.baseline, baseline_window, baseline),
-                ("current", args.current, current_window, current),
+            f"{empty_window_diagnosis(args, loaded, window).message}"
+            for label, spec, window, chosen, loaded in (
+                ("baseline", args.baseline, baseline_window, baseline,
+                 baseline_loaded),
+                ("current", args.current, current_window, current,
+                 current_loaded),
             )
             if not chosen
         ]
@@ -1766,7 +1868,7 @@ def command_steps(args):
     warnings = []
     if loaded.truncated and window is not None:
         warnings.append(truncation_warning("requested", window, args.limit))
-    coverage = selection_coverage_warning(args, window, loaded.runs, selected)
+    coverage = selection_coverage_warning(args, window, loaded, selected)
     if coverage:
         warnings.append(coverage)
     summary = step_summary(selected, jobs=args.job)

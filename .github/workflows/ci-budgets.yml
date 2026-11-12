@@ -1,0 +1,51 @@
+# A nightly check that compares CI critical-path step medians with the
+# checked-in budgets in `scripts/ci-budgets.json` and keeps one labelled
+# issue current (issue #2209). A workflow of its own, outside the serial
+# `ci.yml` lane: it reads `gh` run metadata only, so it never competes with
+# the test jobs for runners. It runs once a day after the 05:00 UTC nightly
+# has had time to finish, plus manually.
+name: CI budgets
+
+# Linux jobs are pinned to ubuntu-24.04 (#1731), never ubuntu-latest: no run on ubuntu-26.04 covers them yet.
+on:
+  schedule:
+    # After the 05:00 UTC nightly: the window's newest runs have finished.
+    - cron: "30 8 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-budgets
+  cancel-in-progress: false
+
+env:
+  # A Python script never imports from its own directory or the working
+  # directory, so a file a pull request adds there cannot shadow a module.
+  PYTHONSAFEPATH: "1"
+
+jobs:
+  check:
+    name: check budgets against medians
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    # A dry run on a developer host measured 236 s of wall time
+    # on 2026-11-12: the 40-fetch holds only 25 green single-attempt
+    # push runs, so the fetch grows to the 80 step and stops there at
+    # about 67 `gh run view` calls, attempt 1 only. Leave headroom for
+    # transient retries.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The job fails when a budget is exceeded, so the red run is visible
+      # too; the issue body carries the table either way.
+      - name: Check budgets and update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-budgets --report-issue

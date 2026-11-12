@@ -1,0 +1,41 @@
+{
+ "budgets": [
+  {
+   "event": "push",
+   "job": "build tests (nextest archive)",
+   "median_seconds_max": 293,
+   "reason": "Window 2026-11-11..2026-11-12, 30 green push runs of ci.yml on main: archive wall median 266 s, +10 %.",
+   "step": null
+  },
+  {
+   "event": "push",
+   "job": "platform contracts (arm64)",
+   "median_seconds_max": 1056,
+   "reason": "Window 2026-11-11..2026-11-12, 30 green push runs of ci.yml on main: step median 960 s, +10 %.",
+   "step": "Run macOS lane tests"
+  },
+  {
+   "event": "push",
+   "job": "tests (core, fast)",
+   "median_seconds_max": 524,
+   "reason": "Window 2026-11-11..2026-11-12, 30 green push runs of ci.yml on main: shard wall median 476 s, +10 %.",
+   "step": null
+  },
+  {
+   "event": "push",
+   "job": "tests (heavy, PTY + Hermes)",
+   "median_seconds_max": 585,
+   "reason": "Window 2026-11-11..2026-11-12, 30 green push runs of ci.yml on main: step median 531 s, +10 %.",
+   "step": "Heavy tests (bounded nextest concurrency)"
+  },
+  {
+   "event": "pull_request",
+   "job": null,
+   "median_seconds_max": 1803,
+   "reason": "Window 2026-11-11..2026-11-12, 30 green pull_request runs of ci.yml: run wall median 1639 s, +10 %.",
+   "step": null
+  }
+ ],
+ "issue_label": "ci-budget",
+ "window_runs": 30
+}

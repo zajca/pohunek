@@ -467,9 +467,9 @@ class RunTimingTests(CliHarness):
         self.assertIn("2 run(s) fall inside it", result.stderr)
 
     def test_runs_empty_window_suggests_attempts_all_when_a_rerun_would_pass(self):
-        # `--attempts first` always loads attempt 1 beside the latest, and
-        # reruns share their run's creation time, so both siblings sit in
-        # the window. Only attempt 1 is a candidate here; counting attempt
+        # The snapshot holds both attempts of the rerun, and reruns
+        # share their run's creation time, so both siblings sit in the
+        # window. Only attempt 1 is a candidate here; counting attempt
         # 2's mismatch would misreport what happened, and the narrower fix
         # the user actually wants is named too.
         snapshot = self.write_snapshot(
@@ -1285,13 +1285,14 @@ class FetchTests(unittest.TestCase):
         self.set_listing([{"databaseId": 77, "attempt": 2, "conclusion": "success"}])
         self.set_views({
             "77:1": self.view_document(77, attempt=1),
-            "77:2": self.view_document(77, attempt=2),
         })
         payload = self.run_json(
             "runs", "--window", "2026-09-19..2026-09-21"
         )
         self.assertEqual([run["attempt"] for run in payload["runs"]], [1])
-        self.assertEqual(self.view_attempts(), ["1", "2"])
+        # Under `first` only attempt 1 is fetched: the attempt-2
+        # document the listing described is never selected.
+        self.assertEqual(self.view_attempts(), ["1"])
 
     # -- cache reuse -------------------------------------------------------
 
@@ -1356,6 +1357,30 @@ class FetchTests(unittest.TestCase):
 
     # -- conclusion filter after fetching ----------------------------------
 
+    def test_fetch_skips_single_attempt_runs_outside_the_conclusion(self):
+        # A cancelled single-attempt run can never pass `--conclusion
+        # success` under any `--attempts` mode, so it costs no `gh run
+        # view`; a red rerun still fetches attempt 1, which may be green.
+        # Attempt 2 is never viewed under `first`, so a 502 on that
+        # document must not fail the night: only attempt 1 is requested.
+        self.set_listing([
+            {"databaseId": 41, "attempt": 1, "conclusion": "cancelled"},
+            {"databaseId": 42, "attempt": 2, "conclusion": "failure"},
+        ])
+        self.set_views({
+            "42:1": self.view_document(42, attempt=1, conclusion="success"),
+        })
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21",
+            "--conclusion", "success",
+        )
+        self.assertEqual(
+            [(run["id"], run["attempt"], run["conclusion"])
+             for run in payload["runs"]],
+            [(42, 1, "success")],
+        )
+        self.assertEqual(self.view_attempts(), ["1"])
+
     def test_fetch_then_filter_recovers_a_run_whose_rerun_failed(self):
         """The fetch-before-filter pipeline: listing shows only the rerun.
 
@@ -1381,6 +1406,31 @@ class FetchTests(unittest.TestCase):
              for run in payload["runs"]],
             [(27, 1, "success")],
         )
+
+    def test_fetch_empty_window_reads_the_rescue_hint_off_the_listing(self):
+        # The r6 attempt-1-only fetch dropped the document the rescue
+        # hint used to read: with only a red attempt 1 loaded, the
+        # diagnosis told the operator to relax `--conclusion success`
+        # although a greener fix exists. The listing entry already
+        # carries that fix -- run 60 listed at attempt 2 green -- so the
+        # live diagnosis reads the latest attempt's metadata there and
+        # still names `--attempts all`, without viewing attempt 2.
+        self.set_listing([
+            {"databaseId": 60, "attempt": 2, "conclusion": "success",
+             "createdAt": "2026-09-20T10:00:00Z",
+             "event": "pull_request", "headBranch": "topic"},
+        ])
+        self.set_views({
+            "60:1": self.view_document(60, attempt=1, conclusion="failure"),
+        })
+        result = self.run_cli(
+            "runs", "--window", "2026-09-19..2026-09-21",
+            "--conclusion", "success",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--conclusion success", result.stderr)
+        self.assertIn("so --attempts all would match", result.stderr)
+        self.assertEqual(self.view_attempts(), ["1"])
 
     # -- cache scope -------------------------------------------------------
 
@@ -1479,6 +1529,7 @@ class FetchTests(unittest.TestCase):
         for message in (
             "HTTP 502: Server Error (https://api.github.com/repos/o/r/actions/runs/77)",
             "gh: You have exceeded a secondary rate limit",
+            "stream error: stream ID 5; CANCEL; received from peer",
         ):
             with self.subTest(message=message[:20]):
                 self.calls.write_text("")
