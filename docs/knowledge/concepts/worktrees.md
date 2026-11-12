@@ -54,6 +54,23 @@ into a temporary ref, not a remote-tracking branch, and an upstream set to a
 base with another name would make a plain `git push` target the base branch.
 Set one when the branch is first pushed, with `git push -u origin <branch>`.
 
+## Fetching one extra ref
+
+`session.new` with `branch` accepts an optional `fetch_ref` (`source_ref` plus
+`commit`): the daemon fetches one extra ref from `origin` into the worktree's
+repository without checking it out, after base resolution and before any
+hook runs. A GitHub pull-request head is `refs/pull/<n>/head`; the daemon
+has no forge-specific knowledge. The fetch writes no `FETCH_HEAD` entry
+(needs git 2.29 or newer, else `fetch_ref_failed`) and recurses into no
+submodule,
+and lands in the daemon-chosen
+`refs/pohunek/sessions/<session_id>/fetched` once the checkout stands, which
+lives as long as the worktree binding (a failed or refused request leaves no
+session, binding, worktree, temp ref or session ref behind, and
+`session.remove` deletes it with the binding). The first response reports `fetched_ref`
+(`ref`, `source_ref`, `commit`); a replay and the stored session never carry
+it. Clients check `HostCapabilities.session_new_fetch_ref_supported` first.
+
 Worktree operations on one repository wait for each other. Adding, removing and
 pruning worktrees run one at a time, and a base-branch fetch waits for a running
 add or prune and holds those back while it runs (fetches run side by side).

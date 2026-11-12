@@ -53,6 +53,8 @@ export type { EnrollmentStatus } from "./EnrollmentStatus";
 export type { ErrorClass } from "./ErrorClass";
 export type { ErrorDetails } from "./ErrorDetails";
 export type { ExpectedPin } from "./ExpectedPin";
+export type { FetchRefRequest } from "./FetchRefRequest";
+export type { FetchedRef } from "./FetchedRef";
 export type { HostCapabilities } from "./HostCapabilities";
 export type { HostClass } from "./HostClass";
 export type { HostDiscoverParams } from "./HostDiscoverParams";

@@ -1533,6 +1533,7 @@ where
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     };
     exchange(
         framed,
@@ -2708,6 +2709,7 @@ where
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     };
     let created: protocol::SessionNewResult = call(
         framed,

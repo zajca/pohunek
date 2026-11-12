@@ -31,6 +31,8 @@ mod required_hooks;
 mod root_reporter;
 #[path = "health_socket/session_ended_at.rs"]
 mod session_ended_at;
+#[path = "health_socket/session_fetch_ref.rs"]
+mod session_fetch_ref;
 #[path = "health_socket/session_metadata.rs"]
 mod session_metadata;
 #[path = "health_socket/session_request.rs"]
@@ -916,6 +918,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     }
 }
 
@@ -939,6 +942,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     }
 }
 
@@ -967,6 +971,7 @@ fn session_params_for_worktree(
         metadata: std::collections::BTreeMap::new(),
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     }
 }
 

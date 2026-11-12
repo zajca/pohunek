@@ -45,19 +45,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    BranchSource, ErrorClass, OnDiverged, ProtocolError, SessionRetentionHold, SessionWarning,
-    SessionWarningKind, WorktreeSource,
+    BranchSource, ErrorClass, FetchRefRequest, FetchedRef, OnDiverged, ProtocolError,
+    SessionRetentionHold, SessionWarning, SessionWarningKind, WorktreeSource,
 };
 use tracing::{debug, info, warn};
 
 use crate::store::{Store, StoreMutation, WorktreeBinding, WorktreeStatus};
 use crate::time::now_rfc3339;
 
+mod fetch_ref;
 mod git_output;
 mod remote;
 mod stderr_drain;
 mod stderr_tail;
 
+pub(crate) use fetch_ref::check_session_fetch_request;
+use fetch_ref::delete_session_fetched_ref;
 pub(crate) use remote::note_backup;
 use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
@@ -142,6 +145,10 @@ pub struct WorktreeRequest {
     /// Resolution of a local branch that diverged from `origin/<branch>`; only
     /// meaningful with [`BranchSource::Remote`].
     pub on_diverged: Option<OnDiverged>,
+    /// An extra ref to fetch from `origin` without checking it out, pinned
+    /// under `refs/pohunek/sessions/<session_id>/fetched`. Applied exactly
+    /// once per session: a reused worktree reports it without refetching.
+    pub fetch_ref: Option<FetchRefRequest>,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -163,6 +170,9 @@ pub struct WorktreeBound {
     pub stderr_tails: Vec<HookStderrTail>,
     /// The commit a [`BranchSource::Remote`] worktree was built from.
     pub source: Option<WorktreeSource>,
+    /// The extra ref a `fetch_ref` request fetched and pinned, on a fresh
+    /// bind; a reused worktree reports the ref that is already there.
+    pub fetched: Option<FetchedRef>,
 }
 
 /// The rendered stderr tail of one failing hook.
@@ -212,7 +222,7 @@ struct BaseRef {
 /// but only while it still points at [`Self::ref_oid`], so a ref this request did
 /// not create is never removed.
 #[derive(Debug)]
-struct FetchedBase {
+pub(crate) struct FetchedBase {
     /// Peeled commit the worktree starts from.
     commit: String,
     /// Raw object id the ref holds; differs from `commit` when the fetched ref
@@ -404,6 +414,11 @@ impl WorktreeManager {
         if let Some(base) = req.base_branch.as_deref() {
             validate_git_ref_arg(base, "base branch")?;
         }
+        // The extra ref arrives from the socket and becomes a fetch refspec;
+        // reject a shape that can never fetch at this trust boundary.
+        if let Some(fetch) = req.fetch_ref.as_ref() {
+            check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
+        }
         let repository = canonical_or_original(&req.repo);
         if !is_git_repo(&repository) {
             return Err(error(
@@ -458,6 +473,20 @@ impl WorktreeManager {
                         path = %path.display(),
                         "reusing owned worktree"
                     );
+                    // A reused worktree was bound with its session ref already
+                    // pinned (or no fetch requested): report what is there
+                    // without refetching, requiring the expected commit.
+                    let fetched = req
+                        .fetch_ref
+                        .as_ref()
+                        .map(|fetch| {
+                            fetch_ref::require_session_fetched_ref(
+                                repository,
+                                &req.session_id,
+                                fetch,
+                            )
+                        })
+                        .transpose()?;
                     Ok(Some(WorktreeBound {
                         path: binding.path,
                         repository: repository.to_path_buf(),
@@ -467,6 +496,7 @@ impl WorktreeManager {
                         warnings: Vec::new(),
                         stderr_tails: Vec::new(),
                         source: None,
+                        fetched,
                     }))
                 }
                 Some(_) => {
@@ -546,6 +576,14 @@ impl WorktreeManager {
             resolved_base.fetched,
             &mut warnings,
         )?;
+        // The extra ref fetch runs after base resolution and before any hook:
+        // a refused request leaves no session, binding, worktree, temp ref or
+        // session ref behind. The temp guard below pins the commit until it is
+        // promoted to the session ref once the checkout stands.
+        let session_temp = match req.fetch_ref.as_ref() {
+            Some(fetch) => Some(fetch_ref::fetch_session_temp(&repository, fetch)?),
+            None => None,
+        };
         // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
         // / foreign-conflict branches above all returned before here). The worktree
         // does not exist yet, so it runs IN THE REPOSITORY — `POHUNEK_BASE_BRANCH`
@@ -618,6 +656,23 @@ impl WorktreeManager {
             // compensation removes it.
             verify_start(&path, &req.branch, source)?;
         }
+        // The checkout stands: promote the fetched commit to the session ref
+        // before the post-create hook, so the agent and the hooks see the
+        // commit. The session ref then lives with the session until binding
+        // cleanup; every `Err` return above drops the temp guard and deletes
+        // the temp ref instead.
+        let fetched = session_temp
+            .zip(req.fetch_ref.as_ref())
+            .map(|(temp, fetch)| {
+                fetch_ref::promote_session_fetched_ref(
+                    &repository,
+                    &req.session_id,
+                    &req.branch,
+                    fetch,
+                    temp,
+                )
+            })
+            .transpose()?;
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.
         if let Some(failure) = self.run_worktree_hook(
@@ -638,7 +693,6 @@ impl WorktreeManager {
                 source.as_ref(),
             ));
         }
-
         Ok(WorktreeBound {
             path,
             repository,
@@ -648,6 +702,7 @@ impl WorktreeManager {
             warnings,
             stderr_tails,
             source,
+            fetched,
         })
     }
 
@@ -1033,6 +1088,11 @@ impl WorktreeManager {
                 false
             }
         };
+        // The session ref lives with the binding, not the checkout: drop it
+        // whenever the binding is dropped, even when the checkout survived
+        // (compensation keeps the session record then). A later compensation
+        // retry only removes, never re-binds, so no refetch can observe this.
+        delete_session_fetched_ref(&binding.repository, &binding.session_id);
         // post-remove fires IN the repository (the worktree is gone). If the
         // repository itself is gone, skip with a warning rather than spawn in a
         // non-existent cwd.
@@ -1343,7 +1403,7 @@ impl WorktreeManager {
 /// already holding this branch fails with "already checked out"/"already used
 /// by worktree". That surfaces as a clear typed error rather than a generic add
 /// failure.
-fn worktree_add_error(branch: &str, message: &str) -> ProtocolError {
+pub(crate) fn worktree_add_error(branch: &str, message: &str) -> ProtocolError {
     if is_branch_in_use_error(message) {
         branch_in_use_error(branch)
     } else {
@@ -1526,12 +1586,12 @@ fn branch_exists(repo: &Path, branch: &str) -> Result<bool, String> {
 }
 
 /// Whether the repository has an `origin` remote configured.
-fn has_origin(repo: &Path) -> bool {
+pub(crate) fn has_origin(repo: &Path) -> bool {
     git_capture(repo, &["remote", "get-url", "origin"]).is_ok()
 }
 
 /// Name of the per-request ref a fetch lands in: process id plus a random nonce.
-fn fetch_ref_name() -> Result<String, String> {
+pub(crate) fn fetch_ref_name() -> Result<String, String> {
     let mut nonce = [0_u8; FETCH_REF_NONCE_BYTES];
     getrandom::getrandom(&mut nonce)
         .map_err(|err| format!("could not generate a fetch ref nonce: {err}"))?;
@@ -1548,7 +1608,7 @@ fn fetch_ref_name() -> Result<String, String> {
 
 /// Reject a base ref that git would not accept as a ref name. This keeps refspec
 /// syntax (`:`, `+`, `*`, whitespace, ...) out of the fetch refspec built from it.
-fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), String> {
+pub(crate) fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), String> {
     // `+` is a valid ref character but a leading one would make the refspec a
     // forced update.
     if base_branch.starts_with(['-', '+']) {
@@ -1577,16 +1637,70 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
     fetch_into_ref(repo, base_branch, &fetch_ref_name()?)
 }
 
+/// Which owner-visibility profile a single-ref `git fetch` from `origin` runs with.
+///
+/// The daemon has two fetch profiles. Its own base and remote-branch fetches
+/// run as [`FetchScope::Tracked`]: git defaults, so opportunistic
+/// remote-tracking updates move `refs/remotes/origin/*` like any owner's
+/// fetch (retention's `unpushed_hold` reads those refs). The fetch of an
+/// untrusted `fetch_ref` runs as [`FetchScope::Untrusted`]: it writes no
+/// `FETCH_HEAD` entry, recurses into no submodule and follows no configured
+/// `remote.origin.fetch` refspec, so it moves no ref outside the
+/// session-owned destination it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchScope {
+    /// The daemon's own fetch: `FETCH_HEAD` and submodule recursion as git
+    /// defaults, opportunistic remote-tracking updates enabled.
+    Tracked,
+    /// The fetch of an untrusted ref: `--no-write-fetch-head`,
+    /// `--no-recurse-submodules` and `--refmap=`.
+    Untrusted,
+}
+
+impl FetchScope {
+    /// Extra `git fetch` flags this scope adds after `--no-tags`.
+    fn extra_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Tracked => &[],
+            // `--no-write-fetch-head` needs git 2.29 or newer; older gits
+            // fail the fetch instead of writing. `--refmap=` exists since
+            // 2.1, so it adds no new minimum.
+            Self::Untrusted => &[
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--refmap=",
+            ],
+        }
+    }
+}
+
 /// The `git fetch` of `source` from `origin` into `fetch_ref`.
 ///
 /// Automatic maintenance is disabled: its `git gc` runs `worktree prune`, which
-/// can overlap a locked add and inspect its incomplete admin entry.
-fn fetch_command(repo: &Path, source: &str, fetch_ref: &str) -> Result<Command, String> {
+/// can overlap a locked add and inspect its incomplete admin entry. A
+/// [`FetchScope::Tracked`] fetch (the daemon's own base and branch fetches)
+/// follows git defaults: it records the tip in `FETCH_HEAD`, may recurse
+/// into submodules, and lets opportunistic remote-tracking updates move
+/// `refs/remotes/origin/*`. A [`FetchScope::Untrusted`] fetch (an untrusted
+/// `fetch_ref`) additionally passes `--no-write-fetch-head` (a git that
+/// predates it, 2.29, fails the fetch instead of writing), `--no-recurse-submodules` (untrusted content never triggers a
+/// submodule fetch), and `--refmap=` (the repository's configured
+/// `remote.origin.fetch` refspecs are ignored, so the fetch writes only
+/// `fetch_ref`).
+fn fetch_command(
+    repo: &Path,
+    source: &str,
+    fetch_ref: &str,
+    scope: FetchScope,
+) -> Result<Command, String> {
     let mut cmd = git_command(repo)?;
     cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .arg("fetch")
-        .arg("--no-tags")
-        .arg("origin")
+        .arg("--no-tags");
+    for extra in scope.extra_args() {
+        cmd.arg(extra);
+    }
+    cmd.arg("origin")
         .arg("--end-of-options")
         .arg(format!("{source}:{fetch_ref}"));
     Ok(cmd)
@@ -1594,12 +1708,28 @@ fn fetch_command(repo: &Path, source: &str, fetch_ref: &str) -> Result<Command, 
 
 /// [`fetch_origin`] into the named destination ref.
 ///
-/// The refspec has no `+` and the destination must not exist beforehand, so a
-/// ref this request did not create is never overwritten, and a failed fetch
-/// never deletes anything. `--end-of-options` keeps the refspec positional even
-/// if a caller forgets the leading-dash guard (defense in depth against argv
-/// flag injection).
+/// [`fetch_origin`] with `FETCH_HEAD` and submodule recursion as git defaults.
 fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
+    fetch_into_ref_with(repo, source, fetch_ref, FetchScope::Tracked)
+}
+
+/// [`fetch_origin`] into the named destination ref.
+///
+/// `scope` selects the owner-visibility profile of [`fetch_command`]:
+/// [`FetchScope::Tracked`] for the daemon's own fetches,
+/// [`FetchScope::Untrusted`] for an untrusted `fetch_ref`. The refspec has
+/// no `+` and the destination must not exist beforehand, so a ref this
+/// request did not create is never overwritten. A failed fetch deletes only
+/// the destination it was proven to create (see below); nothing else is
+/// removed.
+/// `--end-of-options` keeps the refspec positional even if a caller forgets
+/// the leading-dash guard (defense in depth against argv flag injection).
+pub(crate) fn fetch_into_ref_with(
+    repo: &Path,
+    source: &str,
+    fetch_ref: &str,
+    scope: FetchScope,
+) -> Result<FetchedBase, String> {
     check_fetch_source(repo, source)?;
     let mut probe = git_command(repo)?;
     probe.args(["rev-parse", "--verify", "--quiet", fetch_ref]);
@@ -1609,7 +1739,7 @@ fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedB
         Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
         _ => return Err(output_failure_message(&probed)),
     }
-    let cmd = fetch_command(repo, source, fetch_ref)?;
+    let cmd = fetch_command(repo, source, fetch_ref, scope)?;
     // The fetch's connectivity check reads every `worktrees/<name>/HEAD`, and
     // `git worktree add` first writes a null-oid placeholder there, which fails
     // the check with `bad object worktrees/<name>/HEAD`. Holding the admin lock
@@ -1625,6 +1755,16 @@ fn fetch_into_ref(repo: &Path, source: &str, fetch_ref: &str) -> Result<FetchedB
         move || drop(guard),
     )?;
     if !output.status.success() {
+        // The probe above proved the destination was absent, so a failed
+        // fetch deletes only the ref the fetch itself created: nothing else
+        // can name a session-owned ref here.
+        if let Err(delete) = git_run(repo, &["update-ref", "-d", fetch_ref]) {
+            warn!(
+                fetch_ref,
+                error = %delete,
+                "could not delete the temporary fetch ref after a failed fetch"
+            );
+        }
         return Err(output_failure_message(&output));
     }
     // The fetch created the ref (it was absent above), so this request owns it

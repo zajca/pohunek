@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use protocol::{
-    BranchSource, OnDiverged, PackageDigest, ProtocolError, SessionId, SessionInfo,
-    SessionNewParams,
+    BranchSource, FetchRefRequest, OnDiverged, PackageDigest, ProtocolError, SessionId,
+    SessionInfo, SessionNewParams,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -71,6 +71,8 @@ struct FingerprintView<'a> {
     metadata: &'a BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_package_digest: Option<&'a PackageDigest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fetch_ref: Option<&'a FetchRefRequest>,
 }
 
 /// The fingerprint of `params`, or `None` for a request without a key: the
@@ -107,6 +109,7 @@ pub(super) fn request_fingerprint(
         metadata,
         client_request_id: _client_request_id,
         context_package_digest,
+        fetch_ref,
     } = params;
     let mut secret_env_names: Vec<&str> = secret_env.names().collect();
     secret_env_names.sort_unstable();
@@ -126,6 +129,7 @@ pub(super) fn request_fingerprint(
         secret_env_names,
         metadata,
         context_package_digest: context_package_digest.as_ref(),
+        fetch_ref: fetch_ref.as_ref(),
     };
     let bytes = serde_json::to_vec(&view).map_err(|_error| {
         ProtocolError::bad_request("session.new: the parameters cannot be fingerprinted")

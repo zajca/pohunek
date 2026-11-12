@@ -236,6 +236,9 @@ pub(super) struct TargetResolution {
     /// The commit a `branch_source: remote` worktree was built from, for the
     /// `session.new` result only.
     pub(super) worktree_source: Option<protocol::WorktreeSource>,
+    /// The extra ref a `fetch_ref` request pinned, for the `session.new`
+    /// result only. Never persisted: binding cleanup deletes the ref.
+    pub(super) fetched_ref: Option<protocol::FetchedRef>,
 }
 
 impl TargetResolution {
@@ -424,6 +427,7 @@ impl SessionRegistry {
                     .branch_source
                     .unwrap_or(protocol::BranchSource::Local),
                 on_diverged: params.on_diverged,
+                fetch_ref: params.fetch_ref.clone(),
             })
             .await?;
         Ok(TargetResolution {
@@ -437,6 +441,7 @@ impl SessionRegistry {
             reference_outside_repository: false,
             hook_stderr_tails: bound.stderr_tails,
             worktree_source: bound.source,
+            fetched_ref: bound.fetched,
         })
     }
 
@@ -479,6 +484,7 @@ impl SessionRegistry {
             reference_outside_repository: false,
             hook_stderr_tails: Vec::new(),
             worktree_source: None,
+            fetched_ref: None,
         }
     }
 

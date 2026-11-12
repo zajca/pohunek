@@ -168,6 +168,14 @@ pub struct HostCapabilities {
     /// files unpinned. `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_context_pin_supported: bool,
+    /// Whether `session.new` honors `fetch_ref` and pins the fetched commit
+    /// under `refs/pohunek/sessions/<session_id>/fetched`.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; it
+    /// would drop `fetch_ref` silently and start the session without the extra
+    /// ref. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_new_fetch_ref_supported: bool,
     /// Whether `package.install` and `package.link` accept `accept_commands`
     /// and install packages that declare commands.
     ///

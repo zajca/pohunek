@@ -188,6 +188,7 @@ fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
         agent: "claude".to_owned(),
         branch_source: protocol::BranchSource::Local,
         on_diverged: None,
+        fetch_ref: None,
     }
 }
 
@@ -1310,9 +1311,57 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
 #[test]
 fn fetch_disables_automatic_maintenance() {
     let repo = init_repo("fetch-maintenance");
-    let cmd = super::fetch_command(&repo, "main", "refs/pohunek/fetch/x").expect("command");
-    let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
-    let fetch = args
+    let tracked = super::fetch_command(
+        &repo,
+        "main",
+        "refs/pohunek/fetch/x",
+        super::FetchScope::Tracked,
+    )
+    .expect("command");
+    assert_fetch_argv(
+        &tracked,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            "--end-of-options",
+            "main:refs/pohunek/fetch/x",
+        ],
+        "the daemon's own fetch stays byte-identical to main",
+    );
+    let untrusted = super::fetch_command(
+        &repo,
+        "refs/pull/42/head",
+        "refs/pohunek/fetch/y",
+        super::FetchScope::Untrusted,
+    )
+    .expect("command");
+    assert_fetch_argv(
+        &untrusted,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            "--refmap=",
+            "origin",
+            "--end-of-options",
+            "refs/pull/42/head:refs/pohunek/fetch/y",
+        ],
+        "the untrusted fetch carries exactly the three extra flags",
+    );
+}
+
+/// Assert `command` runs `git fetch` with exactly `fetch_argv` after the
+/// `git` binary and its `-c` config: a byte-identical command line keeps the
+/// daemon's own fetch from drifting. Only the untrusted profile may add
+/// flags.
+fn assert_fetch_argv(command: &std::process::Command, fetch_argv: &[&str], why: &str) {
+    let args: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect();
+    let verb = args
         .iter()
         .position(|arg| arg == "fetch")
         .expect("fetch verb");
@@ -1321,8 +1370,9 @@ fn fetch_disables_automatic_maintenance() {
             .iter()
             .position(|arg| arg == setting)
             .unwrap_or_else(|| panic!("{setting} missing: {args:?}"));
-        assert!(at < fetch, "{setting} must precede the verb: {args:?}");
+        assert!(at < verb, "{setting} must precede the verb: {args:?}");
     }
+    assert_eq!(&args[verb..], fetch_argv, "{why}: {args:?}");
 }
 
 #[test]

@@ -833,13 +833,15 @@ impl Client {
             .await?;
         // A daemon that predates `secret_env` drops the field and would start the
         // agent without its credential, one that predates `client_request_id`
-        // would create a second session on a retry, and one that predates
-        // `context_package_digest` would leave the context files unpinned, so the
-        // flags are checked on the same connection before any of them leaves the
-        // process.
+        // would create a second session on a retry, one that predates
+        // `context_package_digest` would leave the context files unpinned, and
+        // one that predates `fetch_ref` would silently drop the extra fetch,
+        // so the flags are checked on the same connection before any of them
+        // leaves the process.
         if !params.secret_env.is_empty()
             || params.client_request_id.is_some()
             || params.context_package_digest.is_some()
+            || params.fetch_ref.is_some()
         {
             let capabilities = client
                 .host_inspect_with(protocol::HostInspectParams {
@@ -862,6 +864,11 @@ impl Client {
             {
                 return Err(ClientError::Protocol(
                     ProtocolError::session_new_context_pin_unsupported(self.remote_host()),
+                ));
+            }
+            if params.fetch_ref.is_some() && !capabilities.session_new_fetch_ref_supported {
+                return Err(ClientError::Protocol(
+                    ProtocolError::session_new_fetch_ref_unsupported(self.remote_host()),
                 ));
             }
         }

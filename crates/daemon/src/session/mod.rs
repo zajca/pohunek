@@ -1986,6 +1986,10 @@ pub struct CreateOutcome {
     pub session: SessionInfo,
     /// The commit a `branch_source: remote` worktree was built from.
     pub worktree_source: Option<protocol::WorktreeSource>,
+    /// The extra ref a `fetch_ref` request pinned. Only on the first
+    /// response: a replay reports nothing was created, and the stored session
+    /// never carries it.
+    pub fetched_ref: Option<protocol::FetchedRef>,
     /// Whether the initial input was acknowledged, when asked for.
     pub prompt_delivered: Option<bool>,
     /// Whether the request's key named a session an earlier request created;
@@ -2000,6 +2004,7 @@ impl CreateOutcome {
         Self {
             session,
             worktree_source: None,
+            fetched_ref: None,
             prompt_delivered: None,
             replayed: true,
         }
@@ -3623,18 +3628,19 @@ impl SessionRegistry {
             let extended_input_ready_wait = params.extended_input_ready_wait.unwrap_or(false);
             let branch = params.branch.clone();
             let input_ack_timeout = params.input_ack_timeout_ms;
-            let (info, pending_initial_input, source) = Box::pin(registry.create_transaction(
-                id,
-                params,
-                resolved,
-                profile_revision,
-                validated_program,
-                fallback_cwd,
-                secret_env,
-                spawned_by,
-                create_request,
-            ))
-            .await?;
+            let (info, pending_initial_input, source, fetched_ref) =
+                Box::pin(registry.create_transaction(
+                    id,
+                    params,
+                    resolved,
+                    profile_revision,
+                    validated_program,
+                    fallback_cwd,
+                    secret_env,
+                    spawned_by,
+                    create_request,
+                ))
+                .await?;
             let (session, prompt_delivered) = registry
                 .complete_create(
                     info,
@@ -3647,6 +3653,7 @@ impl SessionRegistry {
             Ok(CreateOutcome {
                 session,
                 worktree_source: source,
+                fetched_ref,
                 prompt_delivered,
                 replayed: false,
             })
@@ -4050,6 +4057,7 @@ impl SessionRegistry {
             SessionInfo,
             Option<String>,
             Option<protocol::WorktreeSource>,
+            Option<protocol::FetchedRef>,
         ),
         ProtocolError,
     > {
@@ -4071,10 +4079,12 @@ impl SessionRegistry {
         self.write_session_record(intent).await?;
         let mut hook_stderr_tails = Vec::new();
         let mut worktree_source = None;
+        let mut fetched_ref = None;
         let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
             Ok(mut target) => {
                 hook_stderr_tails = std::mem::take(&mut target.hook_stderr_tails);
                 worktree_source = target.worktree_source.take();
+                fetched_ref = target.fetched_ref.take();
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
                 if let Err(error) = self
@@ -4134,6 +4144,7 @@ impl SessionRegistry {
             with_hook_stderr_tails(info, hook_stderr_tails),
             pending_initial_input,
             worktree_source,
+            fetched_ref,
         ))
     }
 
@@ -8718,6 +8729,18 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
                 protocol::MAX_CLIENT_REQUEST_ID_BYTES
             )));
         }
+    }
+    // The extra ref is fetched from `origin` without checking it out: it only
+    // makes sense for a worktree session; fail fast before anything is
+    // created. The shape check mirrors the worktree trust boundary so a
+    // malformed request never reaches `git`.
+    if let Some(fetch) = params.fetch_ref.as_ref() {
+        if params.branch.is_none() {
+            return Err(ProtocolError::bad_request(
+                "session.new fetch_ref requires branch (the ref is pinned for a worktree session)",
+            ));
+        }
+        crate::worktree::check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
     }
     validate_session_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;

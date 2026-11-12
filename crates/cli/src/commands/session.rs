@@ -1796,6 +1796,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         metadata: parse_meta_pairs(&args.meta)?,
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
+        fetch_ref: None,
     })
 }
 

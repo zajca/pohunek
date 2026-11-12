@@ -40,6 +40,7 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
                 session: outcome.session,
                 applied_input: requested_input.then_some(true),
                 worktree_source: outcome.worktree_source,
+                fetched_ref: outcome.fetched_ref,
                 prompt_delivered: outcome.prompt_delivered,
                 replayed: outcome.replayed.then_some(true),
             };

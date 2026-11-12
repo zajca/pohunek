@@ -338,6 +338,37 @@ pub enum OnDiverged {
     BackupReset,
 }
 
+/// Request to fetch one extra ref into a worktree session without checking
+/// it out. Sent as `SessionNewParams.fetch_ref`; requires `branch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "FetchRefRequest.ts"))]
+pub struct FetchRefRequest {
+    /// Full ref on `origin` the daemon fetches: must start with `refs/` and
+    /// must pass `git check-ref-format`.
+    pub source_ref: String,
+    /// Full commit id the fetched ref must peel to, lowercase hex, 40 or 64
+    /// digits.
+    pub commit: String,
+}
+
+/// The ref a `session.new` worktree create fetched and pinned in the source
+/// repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "FetchedRef.ts"))]
+pub struct FetchedRef {
+    /// Daemon-chosen ref the commit was fetched to:
+    /// `refs/pohunek/sessions/<session_id>/fetched`.
+    #[serde(rename = "ref")]
+    #[cfg_attr(feature = "ts", ts(rename = "ref"))]
+    pub fetched_ref: String,
+    /// The requested source ref, as sent.
+    pub source_ref: String,
+    /// The requested commit, as sent.
+    pub commit: String,
+}
+
 /// The commit a `session.new` worktree was built from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -500,6 +531,19 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub context_package_digest: Option<PackageDigest>,
+    /// An extra ref to fetch into the worktree's repository without checking
+    /// it out, pinned under
+    /// `refs/pohunek/sessions/<session_id>/fetched`. Requires `branch`. The
+    /// daemon fetches `fetch_ref.source_ref` from `origin` into that ref and
+    /// checks that it peels to `fetch_ref.commit` before the worktree is
+    /// bound; the commit must already exist on `origin` (nothing is uploaded).
+    /// A daemon that does not advertise
+    /// `HostCapabilities::session_new_fetch_ref_supported` would drop the
+    /// field silently, so a client checks the flag before sending it (the
+    /// protocol 3 client adapter refuses it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fetch_ref: Option<FetchRefRequest>,
 }
 
 /// Most bytes a [`SessionNewParams::client_request_id`] may hold.
@@ -3475,6 +3519,13 @@ pub struct SessionNewResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub worktree_source: Option<WorktreeSource>,
+    /// The extra ref the worktree create fetched and pinned. Present on the
+    /// first response of a worktree session started with
+    /// [`SessionNewParams::fetch_ref`], like `worktree_source`; absent on a
+    /// replay and never persisted on [`SessionInfo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fetched_ref: Option<FetchedRef>,
     /// With [`SessionNewParams::input_ack_timeout_ms`]: `true` when the agent
     /// showed `working` activity after the initial input was submitted within
     /// the window. `false` when the window elapsed first, the runtime changed,

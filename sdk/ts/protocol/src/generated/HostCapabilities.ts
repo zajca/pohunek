@@ -112,6 +112,15 @@ export type HostCapabilities = {
    */
   session_new_context_pin_supported?: boolean;
   /**
+   * Whether `session.new` honors `fetch_ref` and pins the fetched commit
+   * under `refs/pohunek/sessions/<session_id>/fetched`.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; it
+   * would drop `fetch_ref` silently and start the session without the extra
+   * ref. `false` is likewise omitted on the wire.
+   */
+  session_new_fetch_ref_supported?: boolean;
+  /**
    * Whether `package.install` and `package.link` accept `accept_commands`
    * and install packages that declare commands.
    *
