@@ -240,8 +240,8 @@ regressions run in the core shard unless a narrowed selection needs none.
 
 A narrowed selection whose every changed file has no Rust tests and no gate
 but `docs check` (`docs_only`, mode `none`; for example `docs/` outside the
-mapped `docs/knowledge/` and `docs/public-api.md`, `changelog.d/` fragments (validated by
-the changelog guard's `scripts/changelog check`), root `*.md`, `.agents/`,
+mapped `docs/knowledge/` and `docs/public-api.md`, `changelog.d/` fragments validated
+by the changelog guard's `scripts/changelog check`, root `*.md`, `.agents/`,
 `.claude/` or `assets/`) takes the docs-only path. It skips `fmt + clippy`,
 `darwin-check`, `doctests`, `build bins`, `SDK workspace`, `cargo-audit` and
 `cargo-shear`; push, schedule and dispatch runs still run them. No such file
@@ -743,7 +743,7 @@ lint/format configs, and any path no rule covers run everything.
 reads through `pohunek_test_support::workspace_root()` or `manifest_dir()`
 selects that test, and `cargo xtask affected ci --base REV --out DIR` writes the
 selection for a pull request's CI jobs. Only a reviewed allowlist in `crates/xtask/src/affected/mod.rs` (other paths:
-`sdk/ts/`, the root Bun workspace files, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
+`sdk/ts/`, the root Bun workspace files, `docs/`, `changelog.d/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
 `LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
 exits 0 without running nextest and names the follow-up checks (`cargo xtask
 docs check`, the `scripts/` unittests, the Bun gates). It narrows only which
