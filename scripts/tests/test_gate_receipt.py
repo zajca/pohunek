@@ -45,21 +45,22 @@ def gate_runtime_names():
 
 
 class SessionRuntimeListTests(unittest.TestCase):
-    """Guards the session runtime list against daemon drift.
+    """Guards the shared list against scripts-side drift.
 
-    The daemon owns which POHUNEK_* names are session runtime (injected into
-    every managed session) versus contributor configuration. When the daemon
-    gains a new session variable, this test fails until the name is added
-    to SESSION_RUNTIME_VARS in scripts/gate-receipt with its reason."""
+    Compares SESSION_RUNTIME_VARS with SESSION_ENVIRONMENT_NAMES (the names
+    command_from_initialize injects, owned by server.rs) plus
+    HOOK_RETRY_ENV_NAMES in env.rs. When the worker injects a new session
+    variable, add its name here (a name the worker no longer injects
+    becomes class 2 and is keyed)."""
 
     WORKER_ENV = ROOT / "crates" / "session-worker" / "src" / "server.rs"
     RETRY_ENV = ROOT / "crates" / "worker-protocol" / "src" / "env.rs"
 
     def worker_injected_names(self):
-        """POHUNEK_* string literals inside command_from_initialize."""
+        """POHUNEK_* literals in the SESSION_ENVIRONMENT_NAMES const."""
         source = self.WORKER_ENV.read_text()
-        start = source.index("fn command_from_initialize")
-        end = source.index("\nfn ", start)
+        start = source.index("SESSION_ENVIRONMENT_NAMES")
+        end = source.index("];", start)
         return set(re.findall(r'"(POHUNEK_[A-Z0-9_]+)"', source[start:end]))
 
     def retry_names(self):

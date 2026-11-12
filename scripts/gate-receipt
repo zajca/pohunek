@@ -114,10 +114,11 @@ ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
 # authoritative `reserved` map plus the conditional daemon-id and
 # reference-kind inserts) together with `HOOK_RETRY_ENV_NAMES` from
 # `crates/worker-protocol/src/env.rs` (the only POHUNEK_* names a profile
-# environment may carry into the child). A test in each direction guards
-# the list: receipt_guard_tests in the worker fails when the injected set
-# changes, and the Python suite fails on scripts-side edits. The entries
-# carry no per-name reason; the grouping comment states each name's source.
+# environment may carry into the child). The Rust guard test
+# (receipt_guard_tests in session-worker, which runs on every worker PR)
+# compares the POHUNEK_* names production injects with this list; the
+# Python suite guards scripts-side edits. The entries carry no per-name
+# reason; the grouping comment states each name's source.
 SESSION_RUNTIME_VARS = frozenset({
     # Injected unconditionally by the worker (the `reserved` map).
     "POHUNEK_ENV",
