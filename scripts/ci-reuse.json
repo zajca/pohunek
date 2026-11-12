@@ -5,9 +5,8 @@
     "pull_request"
   ],
   "not_dispatch_consumers": {
-    "test-selection-check": "pull_request-only: its job-level if: requires github.event_name == 'pull_request'",
-    "test-selection-audit": "nightly-only: its job-level if: requires schedule or (workflow_dispatch with tier == 'nightly')",
-    "sdk": "its producers are not all reusable: hermes-package reads the release baseline digest from pull_request-only package-selection"
+    "test-selection-check": "pull_request-only: its job-level if: requires github.event_name == 'pull_request' (a guard also derives this from the workflow, it is not only a string here)",
+    "test-selection-audit": "nightly-only: its job-level if: requires schedule or (workflow_dispatch with tier == 'nightly') (a guard also derives this from the workflow, it is not only a string here)"
   },
   "jobs": {
     "build-bins": {
@@ -18,7 +17,7 @@
       "consumers": [
         "sdk"
       ],
-      "reason": "compiles the workspace test archive from the lockfile; identical on the same tree"
+      "reason": "default-feature build of the shipped binaries; never reused because sdk always runs and downloads this run's archive (hermes-package, the other downloaders excluded from the allowlist, read the release baseline digest from pull_request-only package-selection)"
     },
     "build-tests": {
       "names": [
@@ -29,7 +28,7 @@
         "fast-tests",
         "integration"
       ],
-      "reason": "default-feature build of the shipped binaries; the closure keeps it when sdk runs"
+      "reason": "compiles the workspace test archive from the lockfile; identical on the same tree"
     },
     "darwin-check": {
       "names": [

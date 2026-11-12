@@ -11,15 +11,16 @@ whose `tested-tree-*` artifact record is exactly that tree.
 For every job of `scripts/ci-reuse.json` it reports `skip` when all of these
 hold: every listed leg's newest attempt concluded `success`, `completed_at` is
 within `max_age_hours` of now, and, when the job is `selection_dependent`, the
-source selection has `narrowed != true`. A source run without a readable
+source selection has `mode != "full"`. A source run without a readable
 `selection.json` counts as narrowed. Then every job with a consumer outside
 `skip` is removed from `skip`, iterated to a fixed point, so a reused job's
 same-run producers are reused with it and no running job downloads an artifact
 its producer did not upload in this run.
 
 Outputs: `skip` is a compact JSON array of job ids (`[]` when nothing
-applies), `source_run` is the run id or empty. The script also uploads the
-`ci-reuse-<tree>` record artifact and writes a job summary table. Any API
+applies), `source_run` is the run id or empty; the workflow step writes the
+`ci-reuse-<tree>` record artifact from those outputs and prints a job
+summary table. Any API
 error, missing record or ambiguity gives `skip=[]`: run everything, and emit
 `::warning` with the reason. The only red outcome is an internal bug.
 
@@ -54,9 +55,7 @@ def warn(message: str) -> None:
 
 
 def output(name: str, value: str) -> None:
-    destination = os.environ.get("GITHUB_OUTPUT")
-    if not destination:
-        raise ReuseError("GITHUB_OUTPUT is not set")
+    destination = os.environ["GITHUB_OUTPUT"]
     with open(destination, "a") as stream:
         stream.write(f"{name}={value}\n")
 
@@ -64,10 +63,13 @@ def output(name: str, value: str) -> None:
 def gh(*arguments: str) -> str:
     try:
         result = subprocess.run(
-            ["gh", *arguments], capture_output=True, text=True, check=False
+            ["gh", *arguments], capture_output=True, text=True, check=False,
+            timeout=60,
         )
     except FileNotFoundError as error:
         raise ReuseError("gh is required to list Actions runs") from error
+    except subprocess.TimeoutExpired as error:
+        raise ReuseError(f"gh timed out: {' '.join(arguments[:4])}") from error
     if result.returncode != 0:
         detail = result.stderr.strip() or f"gh exited with status {result.returncode}"
         raise ReuseError(detail)
@@ -132,6 +134,7 @@ def commit_tree(sha: str) -> str:
         capture_output=True,
         text=True,
         check=False,
+        timeout=60,
     )
     if result.returncode != 0 or not SHA_PATTERN.fullmatch(result.stdout.strip()):
         raise ReuseError(f"cannot compute the tree of {sha}: {result.stderr.strip()}")
@@ -225,21 +228,9 @@ def run_artifacts(repo: str, run_id: int) -> list[str]:
 
 
 def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
-    result = subprocess.run(
-        [
-            "gh", "api", "--method", "GET",
-            f"repos/{repo}/actions/runs/{run_id}/artifacts",
-            "-f", "per_page=100",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return False
     try:
-        pages = json.loads(result.stdout)
-    except json.JSONDecodeError:
+        pages = list_artifact_pages(repo, run_id)
+    except ReuseError:
         return False
     artifact_id = None
     for page in pages if isinstance(pages, list) else []:
@@ -255,6 +246,7 @@ def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
         ],
         capture_output=True,
         check=False,
+        timeout=120,
     )
     if fetch.returncode != 0:
         return False
@@ -266,6 +258,7 @@ def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
         ["unzip", "-o", "-q", str(archive), "-d", str(target)],
         capture_output=True,
         check=False,
+        timeout=120,
     )
     archive.unlink(missing_ok=True)
     return unzip.returncode == 0
@@ -273,7 +266,10 @@ def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
 
 def source_selection_narrowed(repo: str, run_id: int) -> bool | None:
     """Whether the source run's selection narrowed it: True when narrowed or
-    unreadable, False when full, None when the artifact lookup failed."""
+    unreadable, False when the selection is `full`, None when the artifact
+    lookup failed. The output (job-level `needs.test-selection.outputs.mode`)
+    names the mode the planned jobs read: a `full` selection runs every test,
+    so a `selection_dependent` job is reused only from a non-full one."""
     names: list[str] | None = None
     try:
         names = run_artifacts(repo, run_id)
@@ -281,7 +277,7 @@ def source_selection_narrowed(repo: str, run_id: int) -> bool | None:
         return None
     if "test-selection" not in (names or []):
         return True
-    temporary = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"ci-reuse-selection-{run_id}"
+    temporary = Path(os.environ["RUNNER_TEMP"]) / f"ci-reuse-selection-{run_id}"
     if not download_artifact(repo, run_id, "test-selection", str(temporary)):
         return None
     selection_file = temporary / "selection.json"
@@ -291,7 +287,7 @@ def source_selection_narrowed(repo: str, run_id: int) -> bool | None:
         return True
     if not isinstance(selection, dict):
         return True
-    return selection.get("narrowed") is True
+    return selection.get("mode") != "full"
 
 
 def decide(
@@ -301,14 +297,11 @@ def decide(
     now: datetime.datetime,
     sha: str,
     repo: str,
-    jobs_of=None,
-    names_of=None,
-    narrowed_of=None,
 ) -> tuple[list[str], dict | None, str]:
     """The skip list, the source run, and why not (`""` when reused)."""
-    jobs_of = jobs_of or run_jobs
-    names_of = names_of or run_artifacts
-    narrowed_of = narrowed_of or source_selection_narrowed
+    jobs_of = run_jobs
+    names_of = run_artifacts
+    narrowed_of = source_selection_narrowed
     window = datetime.timedelta(hours=config["max_age_hours"])
     candidates = [
         run for run in runs
@@ -392,8 +385,7 @@ def summarize(config: dict, skip: list[str], source: dict | None, tree: str) -> 
         if job_id in skip and source is not None:
             lines.append(f"| {job_id} | reused from {link} |")
         else:
-            reason = config["jobs"][job_id]["reason"]
-            lines.append(f"| {job_id} | runs: {reason} |")
+            lines.append(f"| {job_id} | runs here |")
     return "\n".join(lines)
 
 
@@ -417,7 +409,7 @@ def main() -> int:
     except ReuseError as error:
         print(f"ci-reuse: {error}", file=sys.stderr)
         return 1
-    workflow_file = os.environ.get("WORKFLOW_FILE", "ci.yml")
+    workflow_file = os.environ["WORKFLOW_FILE"]
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
         runs = list_runs(repo, workflow_file, sha)
@@ -507,7 +499,7 @@ def main() -> int:
     else:
         print(summarize(config, skip, source, tree))
     record_name = f"ci-reuse-{tree}"
-    record_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / f"{record_name}.json"
+    record_path = Path(os.environ["RUNNER_TEMP"]) / f"{record_name}.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n")
     print(f"ci-reuse: skip={json.dumps(skip)} source_run={source['id'] if source else ''}")
     return 0

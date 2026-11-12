@@ -420,6 +420,11 @@ def reuse_record(repo: str, run_id: int, tree: str) -> dict[str, Any] | None:
             raise EvidenceError(
                 f"run {run_id} has a ci-reuse-{tree} record without names for {job_id}"
             )
+        if entry.get("run_id") != record["source_run_id"]:
+            raise EvidenceError(
+                f"run {run_id} has a ci-reuse-{tree} record naming {job_id} "
+                f"from run {entry.get('run_id')}, expected {record['source_run_id']}"
+            )
     return record
 
 
@@ -902,7 +907,7 @@ def tree_evidence(
             if recorded == {tree} and failures and run.get("conclusion") == "success":
                 jobs = get_jobs(args.repo, run["id"])
                 reused, reuse_failures, reused_from = verify_reuse(
-                    args.repo, run, config, args.tier, args.sha, cache, jobs
+                    args.repo, run, config, args.tier, run["head_sha"], cache, jobs
                 )
                 if reuse_failures:
                     failures = [*reuse_failures, *failures]

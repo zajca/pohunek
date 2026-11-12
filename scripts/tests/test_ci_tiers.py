@@ -1374,7 +1374,7 @@ class SetupUvActionTests(unittest.TestCase):
 class FailFastTests(unittest.TestCase):
     """A required job that fails cancels the rest of a PR or dispatch run, and nothing else does (#1075)."""
 
-    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run. The reuse decision fails open too (no source means running everything), and every job it gates waits on it, so a failed decision already ends the run without a cancel.
+    # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run. The reuse decision fails open too (no source means running everything), and every job it gates waits on it.
     EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection", "reuse"}
     REUSABLE = {
         "upgrade-test",
@@ -2932,7 +2932,10 @@ REUSE_JOB = "reuse"
 REUSE_AGGREGATORS = {"test-selection-verdict", "test-duplicates"}
 # Consumers that need a reusable job but can never run on a tier=main
 # dispatch: the check runs on pull requests only, the audit on nightly only.
-REUSE_NEVER_ON_DISPATCH = {"test-selection-check", "test-selection-audit"}
+# Derived from `scripts/ci-reuse.json`, never copied: a new PR-only consumer
+# must be added there on purpose, or the guard fails.
+def reuse_never_on_dispatch() -> set[str]:
+    return set(reuse_config()["not_dispatch_consumers"])
 
 
 def reuse_config() -> dict:
@@ -2971,7 +2974,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertEqual(config["source_events"], ["pull_request"])
         self.assertEqual(
             set(config["not_dispatch_consumers"]),
-            REUSE_NEVER_ON_DISPATCH | {"sdk"},
+            {"test-selection-check", "test-selection-audit"},
             "the map documents every consumer that is not reusable on a dispatch",
         )
         for job_id, entry in config["jobs"].items():
@@ -2980,9 +2983,54 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 self.assertIsInstance(entry["selection_dependent"], bool)
                 self.assertIsInstance(entry["consumers"], list)
                 self.assertTrue(entry["reason"], "every reusable job says why it is safe")
-        # The sdk entry explains why it is not reusable: its producers are
-        # not all reusable.
-        self.assertIn("producer", config["not_dispatch_consumers"]["sdk"])
+        # Every entry explains why it cannot run on the dispatch path.
+        for job_id, reason in config["not_dispatch_consumers"].items():
+            with self.subTest(job=job_id):
+                self.assertTrue(reason, "every entry says why it cannot run on a dispatch")
+
+    def test_the_allowlist_holds_no_never_listed_job(self):
+        # The riskiest mistake is adding a job whose inputs live outside
+        # the tree: the advisory DB, the selectors, the aggregators, the
+        # watchers, or the reuse job itself.
+        never = {
+            "audit", "changes", "test-selection", "package-selection",
+            "package-version-bump", "test-selection-verdict", "test-duplicates",
+            "reuse",
+        } | cancel_after_jobs()
+        allowlisted = set(reuse_config()["jobs"])
+        self.assertTrue(cancel_after_jobs(), "the never set covers the cancellations")
+        self.assertEqual(allowlisted & never, set())
+        for job_id in reuse_config()["not_dispatch_consumers"]:
+            self.assertNotIn(job_id, allowlisted)
+
+    def test_every_allowlisted_id_exists_and_its_display_names_match(self):
+        # A renamed job silently stops being reused, and the config keeps a
+        # stale name: every allowlisted id exists and its legs name the
+        # `name:` Actions shows (matrix legs expanded one by one).
+        jobs = workflow_jobs()
+        for job_id, entry in reuse_config()["jobs"].items():
+            with self.subTest(job=job_id):
+                self.assertIn(job_id, jobs)
+                name = re.search(r"(?m)^    name: (.+)$", jobs[job_id]).group(1)
+                matrix = re.search(r"(?m)^        shard: (.+)$", jobs[job_id])
+                if job_id == "fast-tests":
+                    self.assertIsNotNone(matrix)
+                    self.assertEqual(
+                        entry["names"],
+                        [f"tests ({shard}, fast)"
+                         for shard in partitions_module().FAST_SHARDS],
+                    )
+                else:
+                    self.assertIsNone(matrix)
+                    called = re.search(
+                        r"(?m)^    uses: \./(\.github/workflows/\S+)$", jobs[job_id])
+                    if called is None:
+                        self.assertEqual(entry["names"], [name])
+                    else:
+                        # A called workflow shows as `caller / called job`.
+                        inner = (ROOT / called.group(1)).read_text().split("jobs:\n", 1)[1]
+                        inner_name = re.search(r"(?m)^    name: (.+)$", inner).group(1)
+                        self.assertEqual(entry["names"], [f"{name} / {inner_name}"])
 
     def test_the_config_consumers_match_the_workflow_needs(self):
         needed_by = reverse_needs()
@@ -2995,11 +3043,11 @@ class DeltaReuseWiringTests(unittest.TestCase):
             with self.subTest(job=job_id):
                 self.assertEqual(
                     set(entry["consumers"]),
-                    needed_by.get(job_id, set()) - aggregators - REUSE_NEVER_ON_DISPATCH,
+                    needed_by.get(job_id, set()) - aggregators - reuse_never_on_dispatch(),
                 )
 
     def test_the_never_on_dispatch_consumers_cannot_run_on_a_main_dispatch(self):
-        for job_id in REUSE_NEVER_ON_DISPATCH:
+        for job_id in reuse_never_on_dispatch():
             with self.subTest(job=job_id):
                 condition = job_condition(job_id)
                 self.assertNotIn("inputs.tier == 'main'", condition)
@@ -3010,8 +3058,128 @@ class DeltaReuseWiringTests(unittest.TestCase):
                     or "inputs.tier == 'nightly'" in condition,
                     condition,
                 )
+                # The guard evaluates the condition like Actions does: it
+                # must be false for a tier=main dispatch whatever the rest
+                # reads (a bare `|| workflow_dispatch` string match is not
+                # enough).
+                for tier_results in ({}, {"inputs": "main"}):
+                    with self.subTest(tier=tier_results):
+                        self.assertFalse(bool(evaluate_needs_expression(
+                            condition, event="workflow_dispatch", tier="main",
+                        )))
 
-    def test_the_full_fast_legs_come_from_the_same_source_the_workflow_uses(self):
+    def test_no_reused_job_decides_work_on_a_step_level_event_or_input(self):
+        # A step-level `if:` reading `github.event_name` or `inputs.` means
+        # the job can do different work per event: the PR-green result is not
+        # the dispatch result, so the guard must evaluate it for the delta
+        # path instead of string-matching. Exempt: the fail-fast cancel steps
+        # (every job carries one, it only ends the run after a failure) and
+        # the narrowing steps of `selection_dependent` jobs, which the guard
+        # below forces to `selection_dependent: true` precisely so a narrowed
+        # source never reuses them (their condition is `... == 'pull_request'
+        # && narrowed == 'true'`, false on every dispatch).
+        for job_id in reuse_config()["jobs"]:
+            body = workflow_jobs()[job_id]
+            # A called workflow (`uses:`) has no steps of its own; its
+            # job-level `if:` already gates the event.
+            if "steps:" not in body:
+                continue
+            steps = job_steps(body)
+            for name, step in steps.items():
+                with self.subTest(job=job_id, step=name):
+                    if name == "Cancel the run (fail fast)":
+                        continue
+                    match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
+                    if match is None:
+                        continue
+                    condition = match.group(1) or match.group(2)
+                    if "github.event_name" not in condition and "inputs." not in condition:
+                        continue
+                    # A called workflow (`uses:`) has no steps of its own;
+                    # its job-level `if:` already gates the event.
+                    if "steps:" not in body:
+                        continue
+                    entry = reuse_config()["jobs"][job_id]
+                    # A step that *adds* work on non-PR events (the script
+                    # regressions run when the selection does not narrow) is
+                    # safe: on a dispatch it runs the whole tree, exactly as
+                    # the source did when it did not narrow.
+                    if bool(evaluate_needs_expression(
+                        condition, event="pull_request", tier="",
+                        results={},
+                        outputs={},
+                        env={"TEST_SELECTION_SPARSE": "false"},
+                        matrix={"shard": "core"},
+                    )) and not bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results={"test-selection": "success"},
+                        outputs={"test-selection": {
+                            "narrowed": "true", "mode": "packages",
+                            "script_tests": "true", "docs_only": "false",
+                            "fast_shards": '["core"]', "heavy": "true", "lane": "true",
+                        }},
+                        env={"TEST_SELECTION_SPARSE": "true"},
+                        matrix={"shard": "core"},
+                    )):
+                        continue
+                    # A nightly-only step (the macos-package cold rebuild runs
+                    # on neither the PR nor the main/nightly-dispatch path the
+                    # allowlist reuses) never runs on the delta path either.
+                    if not bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results={},
+                        outputs={},
+                        env={},
+                        matrix={},
+                    )) and not bool(evaluate_needs_expression(
+                        condition, event="pull_request", tier="",
+                        results={},
+                        outputs={},
+                        env={},
+                        matrix={},
+                    )):
+                        continue
+                    self.assertTrue(
+                        entry["selection_dependent"],
+                        "an event/input-gated step is allowed only in a "
+                        "selection_dependent job, never reused from a narrowed source",
+                    )
+                    self.assertFalse(bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results={"test-selection": "success"},
+                        outputs={"test-selection": {
+                            "narrowed": "true", "mode": "packages",
+                            "script_tests": "true", "docs_only": "false",
+                            "fast_shards": '["core"]', "heavy": "true", "lane": "true",
+                        }},
+                        env={"TEST_SELECTION_SPARSE": "true"},
+                        matrix={"shard": "core"},
+                    )), "the gated step must not run on a tier=main dispatch")
+
+    def test_every_selection_reading_job_is_selection_dependent(self):
+        # A job that reads `needs.test-selection.outputs`, downloads the
+        # `test-selection` artifact, or passes `--selection` narrows on a
+        # pull request: reuse it only from a non-narrowed (full) source.
+        # The docs-only gates read the outputs only to decide the docs-only
+        # path (`mode == 'none' && docs_only`): on a dispatch the event
+        # clause runs them whole, so they stay `false` with this guard
+        # pinning why.
+        docs_only = {"test", "darwin-check", "doctests", "build-bins", "shear"}
+        for job_id, entry in reuse_config()["jobs"].items():
+            body = workflow_jobs()[job_id]
+            reads = (
+                "needs.test-selection.outputs" in body
+                or "Download test selection" in body
+                or "--selection" in body
+            )
+            with self.subTest(job=job_id):
+                if job_id in docs_only:
+                    self.assertFalse(entry["selection_dependent"])
+                    self.assertIn("docs_only", job_condition(job_id))
+                elif reads:
+                    self.assertTrue(entry["selection_dependent"])
+                else:
+                    self.assertFalse(entry["selection_dependent"])
         names = reuse_config()["jobs"]["fast-tests"]["names"]
         self.assertEqual(
             names,
@@ -3022,6 +3190,9 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_the_reuse_job_runs_only_on_a_delta_dispatch(self):
         job = workflow_jobs()[REUSE_JOB]
         self.assertNotRegex(job, r"(?m)^    needs:")
+        # The `gh` calls must not hang the 21 jobs that wait on them:
+        # the job carries a timeout like every other network step must.
+        self.assertRegex(job, r"(?m)^    timeout-minutes: \d+$")
         self.assertEqual(
             job_condition(REUSE_JOB),
             "github.event_name == 'workflow_dispatch' "
@@ -3029,6 +3200,14 @@ class DeltaReuseWiringTests(unittest.TestCase):
         )
         for output in ("skip", "source_run", "tree"):
             self.assertIn(f"      {output}: ${{{{ steps.decide.outputs.{output} }}}}\n", job)
+        # The evidence side reads the record for the whole tier window:
+        # retention must cover it like `tested-tree` does, and a re-run
+        # of the delta dispatch must not fail on the re-upload.
+        upload = job.split("Upload the reuse record", 1)[1]
+        retention = re.search(r"(?m)^          retention-days: (\d+)$", upload)
+        self.assertIsNotNone(retention)
+        self.assertEqual(int(retention.group(1)), 30)
+        self.assertIn("overwrite: true", upload)
 
     def test_every_reusable_job_needs_reuse_and_names_itself_in_skip(self):
         jobs = workflow_jobs()
@@ -3052,8 +3231,9 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_a_skipped_reuse_job_never_skips_a_reusable_job(self):
         # Every event but a delta dispatch skips the reuse job; its outputs
         # are then empty, so `skip || '[]'` reads as no skip and each
-        # reusable job runs exactly as before. With an empty skip the
-        # clause is true, so replacing it with `true` must change nothing.
+        # reusable job runs exactly as before. Evaluate the real condition
+        # with empty reuse outputs against the condition without the clause:
+        # both must agree on every event.
         clause = re.compile(
             r" && !contains\(fromJSON\(needs\.reuse\.outputs\.skip \|\| '\[\]'\), '[a-z-]+'\)"
         )
@@ -3061,7 +3241,6 @@ class DeltaReuseWiringTests(unittest.TestCase):
             condition = job_condition(job_id)
             self.assertEqual(len(clause.findall(condition)), 1, job_id)
             without_reuse = clause.sub("", condition)
-            as_true = clause.sub(" && always()", condition)
             for event, tier in (
                 ("pull_request", ""),
                 ("push", ""),
@@ -3072,7 +3251,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 with self.subTest(job=job_id, event=event, tier=tier):
                     self.assertEqual(
                         bool(evaluate_needs_expression(
-                            as_true, event=event, tier=tier,
+                            condition, event=event, tier=tier,
                             results={REUSE_JOB: "skipped"}, outputs={REUSE_JOB: {}},
                         )),
                         bool(evaluate_needs_expression(

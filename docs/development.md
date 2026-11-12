@@ -189,9 +189,13 @@ the run keeps its real failure.
 **Delta dispatch.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
 accepts `delta: true`: the `delta reuse` job finds the newest green pull
 request run of the same tree (within 24 hours) and the reusable jobs it names
-skip, reusing those legs instead of running them again. `scripts/ci-reuse`
+skip, reusing those legs instead of running them again. Reused legs must be
+`success` in the source run (a skipped or failed leg is never reused) and
+they are looked up by job name with the same `tested-tree-*` record the
+evidence script uses, so a renamed job cannot be silently skipped and a
+renamed matrix leg falls back to running. `scripts/ci-reuse`
 decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
-`scripts/tests/test_ci_tiers.py` guards); a narrowed selection excludes the
+`scripts/tests/test_ci_tiers.py` guards); a `mode != \"full\"` selection excludes the
 selection-dependent jobs, and an ambiguous source runs everything. A full
 dispatch (`delta: false`) stays the default, and `scripts/release` keeps
 dispatching full runs. `scripts/ci-evidence` accepts the union of the evidence
