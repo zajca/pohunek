@@ -9,6 +9,7 @@
 
 // Rust guideline compliant 2026-11-12
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt as _;
@@ -38,6 +39,15 @@ const FETCHED_REF: &str = "refs/pohunek/sessions/s-fetch-1/fetched";
 
 /// Requests the fixture daemon served: method and params, in arrival order.
 type Served = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// `client_request_id` keys the fixture daemon has seen, as the real daemon
+/// remembers them: the first `session.new` under a key creates the session,
+/// a repeat returns it with `replayed: true` and none of the first
+/// response's outcomes.
+#[derive(Default)]
+struct Keys {
+    seen: Mutex<HashSet<String>>,
+}
 
 /// What the fixture daemon advertises and answers.
 #[derive(Clone, Copy)]
@@ -76,7 +86,10 @@ fn capabilities(daemon: Daemon) -> Value {
         "worktree_supported": true,
         "terminal_read_supported": true,
         "output_read_supported": true,
-        "session_wait_supported": true
+        "session_wait_supported": true,
+        // The replay scenario needs keyed creations; the refusal scenario
+        // below predates only the extra ref, never the key.
+        "session_new_request_id_supported": true
     });
     if daemon.fetch_ref_supported {
         value["session_new_fetch_ref_supported"] = json!(true);
@@ -84,7 +97,7 @@ fn capabilities(daemon: Daemon) -> Value {
     value
 }
 
-fn session_new_result(request: &Request, daemon: Daemon) -> Value {
+fn session_new_result(request: &Request, daemon: Daemon, keys: &Keys) -> Value {
     let mut value = json!({
         "id": SESSION_ID,
         "agent": "shell",
@@ -99,6 +112,15 @@ fn session_new_result(request: &Request, daemon: Daemon) -> Value {
         "created_at": "2026-07-08T00:00:00Z",
         "updated_at": "2026-07-08T00:01:00Z"
     });
+    let replayed = request.params()["client_request_id"]
+        .as_str()
+        .is_some_and(|key| !keys.seen.lock().expect("keys").insert(key.to_owned()));
+    if replayed {
+        // A replay carries neither the first response's `fetched_ref` nor
+        // `replayed: false`: only the marker.
+        value["replayed"] = json!(true);
+        return value;
+    }
     if daemon.fetch_ref_supported
         && daemon.report_outcome
         && request.params().get("fetch_ref").is_some()
@@ -112,7 +134,7 @@ fn session_new_result(request: &Request, daemon: Daemon) -> Value {
     value
 }
 
-fn result_for(request: &Request, daemon: Daemon) -> Value {
+fn result_for(request: &Request, daemon: Daemon, keys: &Keys) -> Value {
     match request.method() {
         protocol::method::DAEMON_HEALTH => json!({
             "status": "ok",
@@ -120,12 +142,12 @@ fn result_for(request: &Request, daemon: Daemon) -> Value {
             "protocol_version": PROTOCOL_VERSION.get()
         }),
         protocol::method::HOST_INSPECT => capabilities(daemon),
-        protocol::method::SESSION_NEW => session_new_result(request, daemon),
+        protocol::method::SESSION_NEW => session_new_result(request, daemon, keys),
         other => panic!("the CLI sent an unexpected request: {other}"),
     }
 }
 
-fn serve_connection<S: Read + Write>(stream: S, served: &Served, daemon: Daemon) {
+fn serve_connection<S: Read + Write>(stream: S, served: &Served, daemon: Daemon, keys: &Keys) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -138,8 +160,12 @@ fn serve_connection<S: Read + Write>(stream: S, served: &Served, daemon: Daemon)
             .lock()
             .expect("served requests")
             .push((request.method().to_owned(), request.params().clone()));
-        let response = Response::ok(PROTOCOL_VERSION, request.id(), result_for(&request, daemon))
-            .expect("valid fixture response");
+        let response = Response::ok(
+            PROTOCOL_VERSION,
+            request.id(),
+            result_for(&request, daemon, keys),
+        )
+        .expect("valid fixture response");
         // The CLI may have gone away already.
         let _ = writeln!(
             reader.get_mut(),
@@ -166,6 +192,10 @@ fn private_environment() -> TestEnv {
 }
 
 fn serve_local(socket: &Path, daemon: Daemon) -> Served {
+    serve_local_with_keys(socket, daemon, Arc::new(Keys::default()))
+}
+
+fn serve_local_with_keys(socket: &Path, daemon: Daemon, keys: Arc<Keys>) -> Served {
     let served = Served::default();
     let listener = UnixListener::bind(socket).expect("bind the fixture daemon");
     let recorded = Arc::clone(&served);
@@ -173,7 +203,8 @@ fn serve_local(socket: &Path, daemon: Daemon) -> Served {
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let served = Arc::clone(&recorded);
-            thread::spawn(move || serve_connection(stream, &served, daemon));
+            let keys = Arc::clone(&keys);
+            thread::spawn(move || serve_connection(stream, &served, daemon, &keys));
         }
     });
     served
@@ -297,7 +328,7 @@ fn fetch_ref_prints_the_destination_for_humans() {
 }
 
 #[test]
-fn fetch_ref_without_its_commit_is_a_usage_error() {
+fn fetch_ref_needs_its_commit_and_a_branch() {
     for args in [
         vec![
             "--repo",
@@ -324,20 +355,9 @@ fn fetch_ref_without_its_commit_is_a_usage_error() {
             FETCH_COMMIT,
         ],
     ] {
-        let env = private_environment();
-        let root = env.root().to_path_buf();
-        let served = serve_local(&root.join("run/pohunek/daemon.sock"), SUPPORTING);
-        let output = env
-            .command(pohunek_test_support::bin_exe("pohunek"))
-            .args(["session", "new", "--agent", "shell"])
-            .args(&args)
-            .output()
-            .expect("run pohunek session new");
-        assert!(!output.status.success(), "{args:?} must be refused");
-        assert!(
-            served.lock().expect("served requests").is_empty(),
-            "{args:?} reached the daemon"
-        );
+        let (output, served) = run_plain(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?} must be refused");
+        assert!(served.is_empty(), "{args:?} reached the daemon");
     }
 }
 
@@ -352,14 +372,75 @@ fn fetch_ref_is_refused_by_a_daemon_that_ignores_it() {
         "{}",
         run.document
     );
+    assert_eq!(run.document["err"]["class"], "daemon", "{}", run.document);
     assert!(
         run.document["err"]["msg"]
             .as_str()
-            .is_some_and(|message| message.contains("session_new_fetch_ref_supported")),
+            .is_some_and(|message| message.contains("fetch_ref")),
+        "{}",
+        run.document
+    );
+    assert!(
+        run.document["err"]["recover"]
+            .as_str()
+            .is_some_and(|recover| recover.contains("upgrade the daemon")),
         "{}",
         run.document
     );
     assert!(run.session_new().is_none(), "no session.new was sent");
+}
+
+#[test]
+fn a_replay_reports_no_fetched_ref_and_stays_green() {
+    let keys = Arc::new(Keys::default());
+    let env = private_environment();
+    let root = env.root().to_path_buf();
+    let served = serve_local_with_keys(
+        &root.join("run/pohunek/daemon.sock"),
+        SUPPORTING,
+        Arc::clone(&keys),
+    );
+    let session_new = |extra: &[&str]| {
+        let mut args = fetch_ref_args();
+        args.extend(["--request-id", "fetch-1", "--json"]);
+        args.extend(extra.iter().copied());
+        env.command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["session", "new", "--agent", "shell"])
+            .args(&args)
+            .output()
+            .expect("run pohunek session new")
+    };
+    let first = session_new(&[]);
+    let second = session_new(&[]);
+
+    assert!(first.status.success(), "{first:?}");
+    assert!(second.status.success(), "{second:?}");
+    let (first, second) = (
+        serde_json::from_slice::<Value>(&first.stdout).expect("one JSON document"),
+        serde_json::from_slice::<Value>(&second.stdout).expect("one JSON document"),
+    );
+    assert!(
+        first["ok"].get("replayed").is_none() && first["ok"].get("fetched_ref").is_some(),
+        "{first}"
+    );
+    assert_eq!(second["ok"]["replayed"], true, "{second}");
+    assert!(
+        second["ok"].get("fetched_ref").is_none() && second.get("err").is_none(),
+        "{second}"
+    );
+    let served = served.lock().expect("served requests").clone();
+    let creates: Vec<&Value> = served
+        .iter()
+        .filter(|(method, _)| method == protocol::method::SESSION_NEW)
+        .map(|(_, params)| params)
+        .collect();
+    assert_eq!(creates.len(), 2, "{creates:?}");
+    assert!(
+        creates
+            .iter()
+            .all(|params| params["client_request_id"] == "fetch-1"),
+        "{creates:?}"
+    );
 }
 
 #[test]
@@ -370,6 +451,11 @@ fn a_missing_fetched_outcome_fails_loudly() {
     assert_eq!(
         run.error_code(),
         "fetch_ref_outcome_missing",
+        "{}",
+        run.document
+    );
+    assert_eq!(
+        run.document["err"]["details"]["session_id"], SESSION_ID,
         "{}",
         run.document
     );

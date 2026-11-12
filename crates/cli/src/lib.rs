@@ -1841,8 +1841,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             base_branch,
                             from_remote,
                             reset_diverged,
-                            fetch_ref,
-                            fetch_commit,
+                            // Clap `requires` enforces the pair, so a missing half
+                            // can only mean neither flag was passed.
+                            fetch_ref: fetch_ref.zip(fetch_commit).map(|(source_ref, commit)| {
+                                protocol::FetchRefRequest { source_ref, commit }
+                            }),
                             input,
                             input_ack_timeout_ms,
                             request_timeout_ms,

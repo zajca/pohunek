@@ -207,25 +207,6 @@ pub(crate) enum CliError {
         daemon_version: String,
     },
 
-    /// The host's daemon predates `session new --fetch-ref` and would drop
-    /// the extra ref silently instead of fetching it.
-    #[error(
-        "host '{host}' runs daemon {daemon_version}, which does not advertise \
-         `session_new_fetch_ref_supported`: --fetch-ref needs a daemon that advertises it \
-         (upgrade the daemon on that host); no session was created"
-    )]
-    SessionNewFetchRefUnsupported {
-        /// The host as the user typed it.
-        host: String,
-        /// Version the host's daemon reported.
-        daemon_version: String,
-    },
-
-    /// `--fetch-ref` and `--fetch-commit` travel together; one without the
-    /// other is a usage error caught before any connection is dialed.
-    #[error("--fetch-ref and --fetch-commit must be given together")]
-    SessionNewFetchRefIncomplete,
-
     /// The daemon advertised `session_new_fetch_ref_supported` but omitted
     /// `fetched_ref` from a first (non-replayed) response: a contract break.
     /// The session was created; only the outcome report is unusable.
@@ -572,23 +553,7 @@ impl CliError {
                         .to_owned(),
                 ),
             ),
-            CliError::SessionNewFetchRefUnsupported { .. } => ProtocolError::new(
-                ErrorClass::Configuration,
-                "session_new_fetch_ref_unsupported",
-                self.to_string(),
-                Some(
-                    "update and restart the pohunek daemon on that host to a release that advertises \
-                     `session_new_fetch_ref_supported`, or start the session without --fetch-ref"
-                        .to_owned(),
-                ),
-            ),
-            CliError::SessionNewFetchRefIncomplete => ProtocolError::new(
-                ErrorClass::Configuration,
-                "fetch_ref_incomplete",
-                self.to_string(),
-                Some("pass both --fetch-ref and --fetch-commit".to_owned()),
-            ),
-            CliError::SessionNewFetchRefMissing { .. } => ProtocolError::new(
+            CliError::SessionNewFetchRefMissing { session_id, .. } => ProtocolError::new(
                 ErrorClass::Daemon,
                 "fetch_ref_outcome_missing",
                 self.to_string(),
@@ -596,7 +561,11 @@ impl CliError {
                     "the session was created; inspect the session and the worktree before relying on the extra ref"
                         .to_owned(),
                 ),
-            ),
+            )
+            .with_details(protocol::ErrorDetails {
+                session_id: Some(protocol::SessionId(session_id.clone())),
+                ..protocol::ErrorDetails::default()
+            }),
             CliError::RemoteAddPathRequired => ProtocolError::new(
                 ErrorClass::Configuration,
                 "remote_add_path_required",

@@ -4550,10 +4550,20 @@ session the first one created: `--json` then carries a top-level `replayed:
 true` and no `prompt_delivered`, and the human output says the session was
 already created. A host whose daemon does not advertise
 `session_new_request_id_supported` is refused with
-`session_new_request_id_unsupported` before the request is sent. `session new`
+`session_new_request_id_unsupported` before the request is sent. `session new
+--fetch-ref <ref>` (requires `--branch` and `--fetch-commit <sha>`) fetches
+one extra ref from `origin` into the worktree's repository without checking
+it out; `--json` then carries a top-level `fetched_ref`, and a replay of the
+same `--request-id` answers `replayed: true` with no `fetched_ref`. A host
+whose daemon does not advertise `session_new_fetch_ref_supported` is refused
+with `session_new_fetch_ref_unsupported` before the request is sent. The one
+CLI error after which a session certainly exists is `fetch_ref_outcome_missing`
+(a first response without the outcome from an advertised daemon): the session
+keeps running and its id is in `details.session_id`. `session new`
 sends one `session.new` request and never resends it by itself. Only its own
 refusals before that request (`cli_usage`, `confirmation_required`,
-`confirmation_declined`, `session_new_request_id_unsupported`) prove that
+`confirmation_declined`, `session_new_request_id_unsupported`,
+`session_new_fetch_ref_unsupported`) prove that
 nothing was created. Any other failure
 leaves the outcome unknown:
 `request_timeout`, whose recovery hint says so; a transport error such as
@@ -4666,7 +4676,8 @@ again only to repeat the same request.
 Only the CLI's own refusals before that request prove that no session was
 created: `cli_usage` (including an invalid stdin request or request id),
 `confirmation_required`, `no_capable_agent`, `materialization_failed`,
-`agent_cannot_read_bundle`, `session_new_request_id_unsupported` and
+`agent_cannot_read_bundle`, `session_new_request_id_unsupported`,
+`session_new_fetch_ref_unsupported` and
 `session_new_context_pin_unsupported`. A refusal proves that the attempt raising
 it sent nothing: in a keyed launch whose first attempt got no answer, the error
 of the retry is returned and the first attempt's outcome stays unknown.

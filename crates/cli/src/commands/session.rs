@@ -426,10 +426,10 @@ pub(crate) struct NewArgs {
     pub from_remote: bool,
     /// Keep a diverged local branch as a backup and reset it (`--reset-diverged`).
     pub reset_diverged: bool,
-    /// Extra ref on `origin` to fetch without checking out (`--fetch-ref`).
-    pub fetch_ref: Option<String>,
-    /// Commit the fetched ref must peel to (`--fetch-commit`).
-    pub fetch_commit: Option<String>,
+    /// Extra ref on `origin` to fetch without checking out: `--fetch-ref`
+    /// with `--fetch-commit`, carried as one value because clap `requires`
+    /// already enforces the pair.
+    pub fetch_ref: Option<protocol::FetchRefRequest>,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
     /// Acknowledgement window for the initial input; the result then reports
@@ -693,11 +693,7 @@ async fn check_new_capabilities(
     cwd_requested: bool,
     args: &NewArgs,
 ) -> Result<(), CliError> {
-    if !(cwd_requested
-        || args.from_remote
-        || args.fetch_ref.is_some()
-        || args.input_ack_timeout_ms.is_some())
-    {
+    if !(cwd_requested || args.from_remote || args.input_ack_timeout_ms.is_some()) {
         return Ok(());
     }
     let capabilities = client
@@ -717,12 +713,6 @@ async fn check_new_capabilities(
             daemon_version: capabilities.daemon_version,
         });
     }
-    if args.fetch_ref.is_some() && !capabilities.session_new_fetch_ref_supported {
-        return Err(CliError::SessionNewFetchRefUnsupported {
-            host: host.to_owned(),
-            daemon_version: capabilities.daemon_version,
-        });
-    }
     if args.input_ack_timeout_ms.is_some() && !capabilities.session_new_input_ack_supported {
         return Err(CliError::SessionNewInputAckUnsupported {
             host: host.to_owned(),
@@ -732,10 +722,10 @@ async fn check_new_capabilities(
     Ok(())
 }
 
-/// The requested `fetched_ref` outcome, or `None` when no extra ref was
-/// requested. A daemon that advertises the capability but omits it from a
-/// first (non-replayed) response breaks the contract: the session exists, but
-/// the outcome report is unusable, so the failure is loud.
+/// Decide on the requested `fetched_ref` outcome, or `None` when no extra
+/// ref was requested. A daemon that advertises the capability but omits it
+/// from a first (non-replayed) response breaks the contract: the session
+/// exists, but the outcome report is unusable, so the failure is loud.
 fn requested_fetched_ref(
     host: &str,
     args: &NewArgs,
@@ -1839,16 +1829,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         metadata: parse_meta_pairs(&args.meta)?,
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
-        fetch_ref: match (&args.fetch_ref, &args.fetch_commit) {
-            (Some(source_ref), Some(commit)) => Some(protocol::FetchRefRequest {
-                source_ref: source_ref.clone(),
-                commit: commit.clone(),
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(CliError::SessionNewFetchRefIncomplete);
-            }
-        },
+        fetch_ref: args.fetch_ref.clone(),
     })
 }
 
@@ -3029,7 +3010,6 @@ mod tests {
             from_remote: false,
             reset_diverged: false,
             fetch_ref: None,
-            fetch_commit: None,
             input: None,
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
@@ -3128,7 +3108,6 @@ mod tests {
             from_remote: false,
             reset_diverged: false,
             fetch_ref: None,
-            fetch_commit: None,
             input: Some("Fix #1234".to_owned()),
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
