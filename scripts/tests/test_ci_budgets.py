@@ -466,8 +466,8 @@ class BudgetCheckTests(BudgetsHarness):
         self.assertIn("median 12m30s", result.stdout)
 
     def test_live_window_skips_non_green_first_attempts(self):
-        # The live fetch lists newest runs first: a failed first
-        # attempt with a green rerun (run 20, listed at attempt 2),
+        # The live fetch lists newest runs first: a stale green rerun
+        # whose latest attempt failed (run 20, listed at attempt 2),
         # a failed run, and a cancelled run sit among the newest
         # listings but must not shrink the four-green window. The
         # window median over the surviving greens is 2500 s; a
