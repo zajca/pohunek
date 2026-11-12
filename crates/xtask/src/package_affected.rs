@@ -67,6 +67,10 @@ const NEUTRAL: &[(Pattern, &str)] = &[
         "root prose; read only by `cargo xtask docs check`",
     ),
     (
+        Pattern::Dir("changelog.d"),
+        "release note fragments; validated by the changelog guard's `scripts/changelog check` and folded only by `scripts/release`, never an input of a package job",
+    ),
+    (
         Pattern::Dir(".github/ISSUE_TEMPLATE"),
         "issue forms; read only by GitHub",
     ),

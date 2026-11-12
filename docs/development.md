@@ -286,7 +286,7 @@ The official runtime package jobs (`pi-package`, `codex-package`,
 collects changed files like `cargo xtask affected` (committed diff against the
 merge base, staged, unstaged, untracked) in the Git repository of the working
 directory. A file below `runtime-packages/<p>/` or `compat/<p>/` selects package
-`<p>`; prose (`docs/` outside `docs/knowledge`, root `*.md`, the GitHub issue
+`<p>`; prose (`docs/` outside `docs/knowledge`, `changelog.d/` fragments, root `*.md`, the GitHub issue
 forms and pull request template) selects nothing; every other file (including
 `compat/<d>/` of a `<d>` without a package directory) and every file a Rust source
 embeds with `include_str!`/`include_bytes!` (for example
@@ -649,7 +649,8 @@ a multi-surface repository. `scripts/changelog check` validates the fragments,
 `fold VERSION [--surface S] [--date YYYY-MM-DD]` writes the version section into
 the committed `CHANGELOG.md` and deletes the released fragments, and
 `notes VERSION [--surface S]` prints the marked release-notes block for a folded
-version. The repository layout is declared in `.github/changelog.json`; the
+version. A fragment alone no longer widens test or package selection: it selects no Rust
+test and no runtime package. The repository layout is declared in `.github/changelog.json`; the
 contract fixtures in `scripts/tests/fixtures/changelog` pin the byte-exact output.
 
 ## Release

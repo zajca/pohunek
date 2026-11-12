@@ -565,6 +565,12 @@ const RULES: &[Rule] = &[
         "prose outside docs/knowledge; only `cargo xtask docs check` reads it",
     ),
     rule(
+        Pattern::Dir("changelog.d"),
+        Effect::NoRustTests,
+        "release note fragments, validated on every pull request by the changelog guard's \
+         `scripts/changelog check` and folded only by `scripts/release`",
+    ),
+    rule(
         Pattern::Dir(".github"),
         Effect::NoRustTests,
         "CI configuration outside the release workflow",
