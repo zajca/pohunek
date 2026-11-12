@@ -73,7 +73,7 @@ GATE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 # compiler binary (which may differ from `rustc -vV` on PATH); the WRAPPER
 # names interpose on every rustc invocation; CARGO_ENCODED_RUSTFLAGS carries
 # extra flags; RUSTC_BOOTSTRAP unlocks unstable features; CARGO_HOME is
-# keyed by location (fail-safe): a different unpack path reruns the gate.
+# keyed by location (fail-safe): a different location reruns the gate.
 # The content of $CARGO_HOME/config.toml is not covered — only the location.
 ENV_EXACT = (
     "RUSTFLAGS",
@@ -114,10 +114,12 @@ ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
 # authoritative `reserved` map plus the conditional daemon-id and
 # reference-kind inserts) together with `HOOK_RETRY_ENV_NAMES` from
 # `crates/worker-protocol/src/env.rs` (the only POHUNEK_* names a profile
-# environment may carry into the child). A test guards the list: when the
-# daemon gains a new session variable, the suite fails until the name is
-# added here with its reason.
+# environment may carry into the child). A test in each direction guards
+# the list: receipt_guard_tests in the worker fails when the injected set
+# changes, and the Python suite fails on scripts-side edits. The entries
+# carry no per-name reason; the grouping comment states each name's source.
 SESSION_RUNTIME_VARS = frozenset({
+    # Injected unconditionally by the worker (the `reserved` map).
     "POHUNEK_ENV",
     "POHUNEK_SESSION_ID",
     "POHUNEK_WORKER_ID",
@@ -130,8 +132,10 @@ SESSION_RUNTIME_VARS = frozenset({
     "POHUNEK_HOOK_TRACE_MAX_BYTES",
     "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
     "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
+    # Injected conditionally (daemon-id and reference-kind inserts).
     "POHUNEK_DAEMON_ID",
     "POHUNEK_NATIVE_REFERENCE_KIND",
+    # From HOOK_RETRY_ENV_NAMES (profile environment may carry them).
     "POHUNEK_HOOK_ADMISSION_RETRY",
     "POHUNEK_HOOK_RETRY_DEADLINE_MS",
     "POHUNEK_HOOK_RETRY_BACKOFF_MS",
@@ -248,10 +252,11 @@ def tracked_environment():
 
 def child_environment():
     """The environment for the wrapped command: everything except the session
-    runtime names. Stripping them keeps the documented invocation to one line
-    and matches deliver-issue (which runs every test with POHUNEK_* unset);
-    every other POHUNEK_* name passes through unchanged, so contributor
-    configuration such as POHUNEK_PYTHON_BIN still reaches the gate."""
+    runtime names. Every other POHUNEK_* name passes through unchanged, so
+    contributor configuration such as POHUNEK_PYTHON_BIN still reaches the
+    gate. This differs from deliver-issue, which unsets every POHUNEK_*
+    (there the operator can re-export a name; here stripping keeps the
+    documented invocation to one line and receipts shared across sessions)."""
     return {name: value for name, value in os.environ.items()
             if name not in SESSION_RUNTIME_VARS}
 

@@ -7441,6 +7441,37 @@ async fn write_handshake_file(
     }
 }
 
+/// `POHUNEK_*` names the worker injects into every managed session child.
+///
+/// This is the exact set `command_from_initialize` writes: the `reserved`
+/// map, plus `POHUNEK_DAEMON_ID` and `POHUNEK_NATIVE_REFERENCE_KIND` when
+/// their `Initialize` fields are set, plus `HOOK_RETRY_ENV_NAMES` (the only
+/// `POHUNEK_*` names a profile environment may carry into the child). The
+/// gate receipt tool strips exactly these names and never keys them
+/// (`scripts/gate-receipt` `SESSION_RUNTIME_VARS`); `receipt_guard_tests`
+/// fails when this set and the tool's list differ, in either direction.
+/// Sorted for the guard test.
+const SESSION_ENVIRONMENT_NAMES: &[&str] = &[
+    "POHUNEK_BACKGROUND_LABEL_MAX_BYTES",
+    "POHUNEK_BACKGROUND_PROGRAM_MAX_BYTES",
+    "POHUNEK_DAEMON_ID",
+    "POHUNEK_ENV",
+    "POHUNEK_HOOK_ADMISSION_RETRY",
+    "POHUNEK_HOOK_RETRY_BACKOFF_MAX_MS",
+    "POHUNEK_HOOK_RETRY_BACKOFF_MS",
+    "POHUNEK_HOOK_RETRY_DEADLINE_MS",
+    "POHUNEK_HOOK_TRACE_MAX_BYTES",
+    "POHUNEK_HOOK_TRACE_PATH",
+    "POHUNEK_NATIVE_REFERENCE_KIND",
+    "POHUNEK_PROTOCOL_VERSION",
+    "POHUNEK_SESSION_ID",
+    "POHUNEK_SOCKET_PATH",
+    "POHUNEK_WORKER_HOOK_PROTOCOL_VERSION",
+    "POHUNEK_WORKER_ID",
+    "POHUNEK_WORKER_INSTANCE_ID",
+    "POHUNEK_WORKER_SOCKET_PATH",
+];
+
 /// Builds the PTY child command from a validated `Initialize`.
 ///
 /// The child environment starts empty and is layered as base environment,
@@ -8431,6 +8462,8 @@ where
 
 #[cfg(test)]
 mod launch_layout_tests;
+#[cfg(test)]
+mod receipt_guard_tests;
 
 #[cfg(test)]
 mod tests {

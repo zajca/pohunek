@@ -176,7 +176,7 @@ A receipt is not accepted — the command runs again — when any of these holds
   other `POHUNEK_*` name is configuration and is keyed, so a changed
   contributor setting reruns the gate.
 - It is older than `--max-age`, or it ends more than 60s in the future
-  (beyond the `CLOCK_SKEW_SECONDS` clock skew).
+  (beyond the `CLOCK_SKEW_SECONDS` clock skew bound).
 - It is not owned by the current uid, or it is readable or writable by
   group or others.
 - The store directory is not owned by the current uid, or is not mode 0700.

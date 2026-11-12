@@ -25,10 +25,6 @@ TOOL = ROOT / "scripts" / "gate-receipt"
 
 RUSTC_TEXT = "rustc 1.96.0 (fake abcdef)\nbinary: rustc\n"
 CARGO_TEXT = "cargo 1.96.0 (fake 123456)\nrelease: 1.96.0\n"
-# CI compiles with `-D warnings` (`.github/workflows/ci.yml`); the suite
-# runs every scenario under the same flag so receipt file-name sort order
-# (which follows the key hashes) matches CI.
-CI_RUSTFLAGS = "-D warnings"
 
 
 def load_gate_receipt():
@@ -78,8 +74,8 @@ class SessionRuntimeListTests(unittest.TestCase):
         self.assertEqual(
             set(gate_receipt.SESSION_RUNTIME_VARS), expected,
             "SESSION_RUNTIME_VARS drifted from what the daemon injects; "
-            "add the new session name with its reason, or stop keying a "
-            "name the daemon no longer injects",
+            "add the new session name, or remove a name the daemon no longer "
+            "injects (an unlisted name becomes class 2 and is keyed)",
         )
 
 
@@ -137,7 +133,7 @@ class GateReceiptCase(unittest.TestCase):
         self.write_tool("rustc", RUSTC_TEXT)
         self.write_tool("cargo", CARGO_TEXT)
         self.write_command("ok", "exit 0")
-        self.env = dict(os.environ, RUSTFLAGS=CI_RUSTFLAGS)
+        self.env = dict(os.environ)
         for name in list(self.env):
             if name.startswith("POHUNEK_"):
                 del self.env[name]
