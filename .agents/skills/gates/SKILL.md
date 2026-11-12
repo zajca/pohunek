@@ -145,9 +145,12 @@ scripts/gate-receipt run --gate nextest --max-age 24h -- /tmp/heavy-run.sh cargo
 scripts/gate-receipt run --gate doctests --max-age 24h -- /tmp/heavy-run.sh cargo test --doc --workspace --all-features
 scripts/gate-receipt run --gate release-build --max-age 24h -- /tmp/heavy-run.sh cargo build --workspace --release
 scripts/gate-receipt run --gate docs --max-age 24h -- /tmp/heavy-run.sh cargo xtask docs check
-scripts/gate-receipt run --gate hermes-package --max-age 24h -- /tmp/heavy-run.sh scripts/build-hermes-package /abs/path/to/hermes.tar.zst
-scripts/gate-receipt run --gate hermes-compat --max-age 24h -- /tmp/heavy-run.sh cargo xtask hermes compatibility --bin-dir /abs/path/to/target/release --package /abs/path/to/hermes.tar.zst
 ```
+
+The `nextest` gate needs the transient `POHUNEK_*` session state kept out of
+the way only when it confuses the gate itself; the receipt key already
+excludes per-session identity, so no unsetting is needed around
+gate-receipt.
 
 The final gate before a push may use a receipt only when that receipt was
 written for the exact tree being pushed; a receipt never carries a gate
@@ -162,17 +165,30 @@ A receipt is not accepted — the command runs again — when any of these holds
 
 - No receipt file exists for the key, or it is not valid JSON of the known schema.
 - The key differs: a changed working tree (tracked, staged, unstaged, or
-  untracked-but-not-ignored files), a different gate name or argv, different
-  `rustc -vV`/`cargo -vV` output, a different command-file hash, or different
-  tracked environment hashes.
-- It is older than `--max-age`.
-- It is not owned by the current uid, or it is group- or world-writable.
+  untracked-but-not-ignored files), a different gate name or argv, a
+  different working directory, different `rustc -vV`/`cargo -vV` output, a
+  different command-file hash, a different `CARGO_HOME` location, extra
+  compiler flags or wrappers (`RUSTC`, `RUSTC_WRAPPER`,
+  `RUSTC_WORKSPACE_WRAPPER`, `CARGO_ENCODED_RUSTFLAGS`, `RUSTC_BOOTSTRAP`),
+  or different tracked environment hashes. The session, daemon and worker
+  ids, the worker socket path, and the hook trace path are excluded, so a
+  second session reuses the receipt; anything else under `POHUNEK_*` stays
+  keyed and reruns the gate.
+- It is older than `--max-age`, or it ends in the future (beyond clock skew).
+- It is not owned by the current uid, or it is readable or writable by
+  group or others.
 - The store directory is not owned by the current uid, or is not mode 0700.
+  A wrong store mode is never repaired silently: both `run` and `check`
+  refuse the receipt, `run` runs the command and writes no receipt.
 - Ignored inputs are out of scope by construction: `target/`, local `.env`
   files, and other ignored paths never enter the tree id, so changing only
   them never invalidates a receipt.
-- A gate that needs the network or external state is never wrapped: the Hermes
-  package gates and `cargo audit` re-run every time.
+- A gate that needs the network or external state is never wrapped: the
+  two Hermes gates (`scripts/build-hermes-package`,
+  `cargo xtask hermes compatibility`) and `cargo audit` re-run every time.
+  Their inputs live outside the key — the package tarball, the `--bin-dir`
+  build outputs, the remote registry — so a receipt could skip a gate whose
+  real inputs have moved.
 
 ## Narrower loops while iterating
 

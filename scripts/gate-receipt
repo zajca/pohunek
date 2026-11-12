@@ -24,11 +24,18 @@ Contract:
   This is the XDG base-directory convention: per-user state that roams with
   neither the repository nor the session. The store is created 0700 and
   receipts are written 0600, atomically (a temporary file in the same
-  directory, then `os.replace`).
+  directory, then `os.replace`). An existing store is never repaired: a
+  store with the wrong mode or owner rejects the receipt in both verbs,
+  the command runs, and no receipt is written.
 * The key is sha256 over a canonical JSON of the working-tree id, the gate
-  name, the exact argv after `--`, the toolchain outputs, a hash of the
-  command file when it lives inside the repository, and the hashes (never the
-  values) of the environment that can change a gate result.
+  name, the exact argv after `--`, the working directory relative to the
+  repository root, the toolchain outputs, a hash of the command file when it
+  lives inside the repository, and the hashes (never the values) of the
+  environment that can change a gate result. Per-session identity (the
+  session, daemon and worker ids, the worker socket path, the hook trace
+  path) is excluded, so a second session reuses a receipt written on the
+  same tree. The HEAD commit is recorded in the receipt but not keyed, so
+  committing identical content keeps the key.
 * Raw environment values are never written anywhere, neither into the receipt
   nor onto stdout.
 
@@ -61,26 +68,60 @@ DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 DURATION_PATTERN = re.compile(r"(\d+)([smhd])")
 # A gate name becomes a file name, so it carries no path separators.
 GATE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
-# Exact environment names that can change a gate result.
-ENV_EXACT = ("RUSTFLAGS", "RUSTDOCFLAGS", "RUSTUP_TOOLCHAIN")
+# Exact environment names that can change a gate result. RUSTC selects the
+# compiler binary (which may differ from `rustc -vV` on PATH); the WRAPPER
+# names interpose on every rustc invocation; CARGO_ENCODED_RUSTFLAGS carries
+# extra flags; RUSTC_BOOTSTRAP unlocks unstable features; CARGO_HOME points
+# at config files that can set rustflags and profiles, so its location is
+# keyed (as a hash, like every other tracked value).
+ENV_EXACT = (
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC_BOOTSTRAP",
+    "CARGO_HOME",
+)
 # Environment prefixes that can change a gate result. Every match is recorded
 # as name to sha256(value), with an absent variable distinct from an empty one
 # (an absent variable simply has no entry).
-ENV_PREFIXES = ("CARGO_BUILD_", "CARGO_PROFILE_", "NEXTEST_", "POHUNEK_")
+ENV_PREFIXES = ("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_", "NEXTEST_", "POHUNEK_")
 # Names deliberately outside the key, with the reason each is excluded:
 # - CARGO_TARGET_DIR: per-worktree build cache location; changes where build
-#   outputs go, not whether the gate passes.
-# - CARGO_HOME: toolchain unpack location; the same compiler from another cache
-#   path gives the same verdict, and the toolchain strings pin the compiler.
+#   outputs go, not whether the gate passes. (It matches the CARGO_TARGET_
+#   prefix, so it is excluded explicitly.)
 # - TMPDIR: scratch location; nothing a gate asserts depends on it.
 # - PATH: differs per session (shims, wrappers); the toolchain strings pin
 #   the compiler, so a PATH-only change cannot silently pass a gate.
-# None of these matches ENV_EXACT or ENV_PREFIXES, so the exclusion is
-# structural; the reasons above explain why that is safe.
-# POHUNEK_SESSION_ID records the authoring session in the receipt but stays out
-# of the key: a session id cannot change a gate result, and keying on it would
-# reject a receipt written by another agent session on the same host, which
-# the owner policy accepts.
+# None of the remaining names matches ENV_EXACT or ENV_PREFIXES, and
+# CARGO_TARGET_DIR is listed here, so the exclusion is structural; the
+# reasons above explain why that is safe.
+ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
+# Per-session identity, excluded from the key with the reason per name:
+# - POHUNEK_SESSION_ID: the authoring session; recorded in the receipt but
+#   cannot change a gate result.
+# - POHUNEK_DAEMON_ID: which daemon started the session; same.
+# - POHUNEK_WORKER_ID, POHUNEK_WORKER_INSTANCE_ID: which worker runs this
+#   session; same.
+# - POHUNEK_WORKER_SOCKET_PATH: the control socket of this session's worker;
+#   an address, not a gate input.
+# - POHUNEK_HOOK_TRACE_PATH: where hook traces are appended; a log path
+#   cannot change a gate result.
+# Excluding them is what lets a second session reuse a receipt written on
+# the same tree. Anything else under POHUNEK_ stays keyed: an unknown
+# variable fails safe by rerunning the gate.
+SESSION_EXCLUDED = frozenset({
+    "POHUNEK_SESSION_ID",
+    "POHUNEK_DAEMON_ID",
+    "POHUNEK_WORKER_ID",
+    "POHUNEK_WORKER_INSTANCE_ID",
+    "POHUNEK_WORKER_SOCKET_PATH",
+    "POHUNEK_HOOK_TRACE_PATH",
+})
+# Records the authoring session in the receipt; never part of the key.
 SESSION_ID_VAR = "POHUNEK_SESSION_ID"
 
 
@@ -176,7 +217,7 @@ def tracked_environment():
     """Name to sha256(value) for the environment that can change a gate result."""
     tracked = {}
     for name, value in os.environ.items():
-        if name == SESSION_ID_VAR:
+        if name in SESSION_EXCLUDED or name in ENV_EXCLUDE:
             continue
         if name in ENV_EXACT or name.startswith(ENV_PREFIXES):
             tracked[name] = hashlib.sha256(value.encode()).hexdigest()
@@ -213,15 +254,21 @@ def compute_key(root, gate, argv):
     key_object = {
         "gate": gate,
         "argv": list(argv),
+        # argv means different things in different directories, so the
+        # working directory relative to the root is part of the key.
+        "cwd": os.path.relpath(os.getcwd(), root),
         "tree": tree,
-        "head": head_commit(root),
         "rustc": toolchain_output(root, "rustc"),
         "cargo": toolchain_output(root, "cargo"),
         "command_file": command_file_hash(root, argv),
         "env": tracked_environment(),
     }
     canonical = json.dumps(key_object, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).hexdigest(), key_object
+    key = hashlib.sha256(canonical.encode()).hexdigest()
+    # Recorded in the receipt for provenance, but not keyed: committing
+    # identical content keeps the key.
+    key_object["head"] = head_commit(root)
+    return key, key_object
 
 
 def receipt_path(store, gate, key):
@@ -270,11 +317,13 @@ def validate(store, gate, key, max_age_seconds):
     age = (datetime.now(timezone.utc) - end).total_seconds()
     if age > max_age_seconds:
         return False, f"receipt at {path} is older than the max age", None
+    if age < -60:
+        return False, f"receipt at {path} ends in the future", None
     info = os.stat(path)
     if info.st_uid != os.getuid():
         return False, f"receipt at {path} is not owned by uid {os.getuid()}", None
     if info.st_mode & 0o077 != 0:
-        return False, f"receipt at {path} is group- or world-writable", None
+        return False, f"receipt at {path} is readable or writable by group or others", None
     ok, reason = check_store(store)
     if not ok:
         return False, reason, None
@@ -331,15 +380,26 @@ def write_receipt(store, gate, key, key_object, started, ended):
 
 
 def ensure_store(store):
-    """Creates the store 0700 when missing; raises UsageError when unusable.
-    The mode is enforced with chmod because the process umask may strip it."""
+    """Creates the store 0700 when missing; raises UsageError when it cannot
+    be created or the path is not a directory. An existing store is never
+    repaired: `validate` judges it as it is, so `run` and `check` agree. The
+    mode is enforced with chmod on creation only, because the process umask
+    may strip it."""
+    if os.path.isdir(store):
+        return
+    if os.path.lexists(store):
+        raise UsageError(f"store {store} is not a directory")
     try:
-        os.makedirs(store, mode=STORE_MODE, exist_ok=True)
+        os.makedirs(store, mode=STORE_MODE, exist_ok=False)
+    except FileExistsError:
+        # Raced with another creator; validate judges what is there.
+        return
+    except OSError as exc:
+        raise UsageError(f"cannot create store {store}: {exc}") from exc
+    try:
         os.chmod(store, STORE_MODE)
     except OSError as exc:
         raise UsageError(f"cannot create store {store}: {exc}") from exc
-    if not os.path.isdir(store):
-        raise UsageError(f"store {store} is not a directory")
 
 
 def cmd_run(gate, max_age_seconds, store, argv):
@@ -351,7 +411,7 @@ def cmd_run(gate, max_age_seconds, store, argv):
     if ok:
         print(f"gate-receipt: {gate}: {describe_receipt(path, receipt)} verified; skipping")
         return 0
-    print(f"gate-receipt: {gate}: {reason}; running the command")
+    print(f"gate-receipt: {gate}: {reason}; running the command", flush=True)
     started = datetime.now(timezone.utc)
     try:
         completed = subprocess.run(argv, check=False)

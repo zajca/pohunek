@@ -22,6 +22,16 @@ TOOL = ROOT / "scripts" / "gate-receipt"
 
 RUSTC_TEXT = "rustc 1.96.0 (fake abcdef)\nbinary: rustc\n"
 CARGO_TEXT = "cargo 1.96.0 (fake 123456)\nrelease: 1.96.0\n"
+# Per-session identity the key excludes; mirroring these names here keeps the
+# scenarios honest about what the suite's own environment carries.
+SESSION_IDENTITY = (
+    "POHUNEK_SESSION_ID",
+    "POHUNEK_DAEMON_ID",
+    "POHUNEK_WORKER_ID",
+    "POHUNEK_WORKER_INSTANCE_ID",
+    "POHUNEK_WORKER_SOCKET_PATH",
+    "POHUNEK_HOOK_TRACE_PATH",
+)
 
 
 class GateReceiptCase(unittest.TestCase):
@@ -79,6 +89,8 @@ class GateReceiptCase(unittest.TestCase):
         self.write_tool("cargo", CARGO_TEXT)
         self.write_command("ok", "exit 0")
         self.env = dict(os.environ)
+        for name in SESSION_IDENTITY:
+            self.env.pop(name, None)
         self.env["PATH"] = f"{self.bin}{os.pathsep}{self.env['PATH']}"
         self.env.pop("POHUNEK_SESSION_ID", None)
 
@@ -97,26 +109,26 @@ class GateReceiptCase(unittest.TestCase):
         )
         path.chmod(0o755)
 
-    def run_tool(self, *args, env=None):
+    def run_tool(self, *args, env=None, cwd=None):
         return subprocess.run(
             [sys.executable, str(TOOL), *args],
-            cwd=self.repo,
+            cwd=self.repo if cwd is None else cwd,
             env=env or self.env,
             capture_output=True,
             text=True,
             check=False,
         )
 
-    def run_gate(self, *args, env=None):
+    def run_gate(self, *args, env=None, cwd=None):
         return self.run_tool(
             "run", "--gate", "test-gate", "--max-age", "24h",
-            "--store", str(self.store), "--", *args, env=env,
+            "--store", str(self.store), "--", *args, env=env, cwd=cwd,
         )
 
-    def check_gate(self, *args, env=None):
+    def check_gate(self, *args, env=None, cwd=None):
         return self.run_tool(
             "check", "--gate", "test-gate", "--max-age", "24h",
-            "--store", str(self.store), "--", *args, env=env,
+            "--store", str(self.store), "--", *args, env=env, cwd=cwd,
         )
 
     def marker_lines(self):
@@ -207,7 +219,65 @@ class GateReceiptCase(unittest.TestCase):
             receipt.chmod(0o600)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.marker_lines(), 2)
-        self.assertIn("group- or world-writable", result.stdout)
+        self.assertIn("readable or writable by group or others", result.stdout)
+
+    def test_store_with_wrong_mode_is_never_repaired(self):
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        self.assertEqual(self.marker_lines(), 1)
+        mode = 0o750
+        self.store.chmod(mode)
+        run_result = self.run_gate("ok")
+        check_result = self.check_gate("ok")
+        mode_after = oct(self.store.stat().st_mode & 0o777)
+        self.store.chmod(0o700)
+        self.assertEqual(run_result.returncode, 0, run_result.stderr)
+        self.assertEqual(self.marker_lines(), 2)
+        self.assertIn("is not mode 0700", run_result.stdout)
+        self.assertEqual(check_result.returncode, 1)
+        self.assertIn("is not mode 0700", check_result.stdout)
+        self.assertEqual(mode_after, oct(mode))
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        self.assertEqual(self.marker_lines(), 2)
+
+    def test_second_session_with_different_identity_reuses_the_receipt(self):
+        first_env = dict(self.env, POHUNEK_SESSION_ID="s-first")
+        self.assertEqual(self.run_gate("ok", env=first_env).returncode, 0)
+        self.assertEqual(self.marker_lines(), 1)
+        self.assertEqual(self.read_receipt().get("session"), "s-first")
+        other = dict(
+            self.env,
+            POHUNEK_SESSION_ID="s-other",
+            POHUNEK_DAEMON_ID="d-other",
+            POHUNEK_WORKER_ID="worker-other",
+            POHUNEK_WORKER_INSTANCE_ID="runtime-other",
+            POHUNEK_WORKER_SOCKET_PATH="/tmp/other-control.sock",
+            POHUNEK_HOOK_TRACE_PATH="/tmp/other-hooks.jsonl",
+        )
+        result = self.run_gate("ok", env=other)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.marker_lines(), 1)
+        self.assertIn("verified; skipping", result.stdout)
+        self.assertEqual(len(self.receipts()), 1)
+        receipt = self.read_receipt()
+        # The skipping run does not rewrite the receipt with its own session.
+        self.assertEqual(receipt.get("session"), "s-first")
+        for name in SESSION_IDENTITY:
+            self.assertNotIn(name, receipt["env"])
+
+    def test_malformed_receipt_is_rejected(self):
+        for payload in ("not json\n", '{"schema": 1}\n'):
+            with self.subTest(payload=payload):
+                self.assertEqual(self.run_gate("ok").returncode, 0)
+                before = self.marker_lines()
+                receipt_path = self.receipts()[0]
+                receipt_path.write_text(payload)
+                try:
+                    result = self.run_gate("ok")
+                finally:
+                    receipt_path.unlink()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.marker_lines(), before + 1)
+                self.assertIn("running the command", result.stdout)
 
     def test_expired_receipt_is_rejected_without_sleep(self):
         self.assertEqual(self.run_gate("ok").returncode, 0)
@@ -250,15 +320,17 @@ class GateReceiptCase(unittest.TestCase):
         clone = self.tmp / "clone"
         self.git_clone(self.repo, clone)
         marker = self.tmp / "clone-marker"
-        env = dict(self.env)
-        (self.bin / "clone-ok").write_text(
+        self.write_command("ok", "exit 0")
+        # The gate command resolves through PATH on the shared bin dir, so the
+        # clone run uses the same argv to match the key; the second session
+        # carries different per-session identity.
+        self.bin.joinpath("ok").write_text(
             "#!/bin/sh\n" f'echo ran >> "{marker}"\n' "exit 0\n"
         )
-        (self.bin / "clone-ok").chmod(0o755)
-        # The gate command resolves through PATH, so the clone run must use the
-        # same argv to match the key.
-        (self.bin / "ok").write_text(
-            "#!/bin/sh\n" f'echo ran >> "{marker}"\n' "exit 0\n"
+        env = dict(
+            self.env,
+            POHUNEK_SESSION_ID="s-clone",
+            POHUNEK_WORKER_ID="worker-clone",
         )
         result = subprocess.run(
             [sys.executable, str(TOOL), "run", "--gate", "test-gate",
