@@ -259,23 +259,50 @@ pub struct PtyOwner {
 /// - `resize` -> `held_echo`: `commit_resize_before_resume` and
 ///   `OutputPause::resume` (also `OutputPause::drop` on the error path) reach
 ///   `HeldEchoRelease::request` while the `resize` guard is still held.
-/// - `cleanup` -> `output`: `stop` and `finish_natural` hold the `cleanup`
-///   async guard while `subscribe`, `force_close`, `completion`,
-///   `subscribe_terminal_snapshot` or `mark_exit` take the hub's ring lock.
-/// - `cleanup` -> `reap_tx` -> `child_thread` -> `reader_thread`: `stop`,
-///   `finish_natural` and the sealed-cleanup helpers release each thread
-///   slot before taking the next one. No path holds two of them at once.
-/// - `output_order` -> `output_reader` -> `master` -> `output`: the
-///   boundary closure holds the ordering gate across the master-reader drain,
-///   takes the master descriptor to apply the resize, then resizes the
-///   terminal model in the hub. The reader thread takes the same two locks
-///   for its batch reads and pushes.
-/// - `output_order` -> `output_reader` -> `output`: the reader thread holds
-///   the ordering gate and the master reader while pushing into the hub.
+/// - `cleanup` -> `output`: `stop` holds the `cleanup` async guard while
+///   `wait_output_exit` (via `wait_root_and_output`) calls `subscribe` and
+///   drives `recv`, which take the hub ring lock. `stop` also calls
+///   `force_output_close` -> `force_close` directly in its
+///   observation-failure arms and via `seal_and_release_output`.
+///   `finish_natural` holds `cleanup` while `reject_forced_close` ->
+///   `output_forced_closed` calls `completion`, and while
+///   `seal_and_release_output` calls `force_close`.
+/// - `cleanup` -> `reap_tx`: `release_authority` takes the `reap_tx` slot while
+///   the `cleanup` guard is held.
+/// - `cleanup` -> `child_thread` and `cleanup` -> `reader_thread`:
+///   `join_threads` takes the child-thread slot and then the reader-thread
+///   slot; `reap_and_detach_reader` joins the child thread and then drops
+///   the reader handle; `detach_threads` drops the reader handle and then
+///   the child handle. Each slot is released before the next is taken
+///   (`join_thread` takes the handle and drops the slot guard before
+///   awaiting the join), so no path holds both at once. `stop` and
+///   `finish_natural` reach these only through `join_threads`,
+///   `finish_sealed_cleanup` and `finish_observation_failure`, never by
+///   locking a slot directly.
+/// - `output_order` -> `output_reader`: the reader thread holds the ordering
+///   gate while `drain_available_output` takes the reader lock; the resize
+///   and attach-snapshot boundary closures hold the gate while
+///   `drain_snapshot_boundary` (via `drain_available_output` and
+///   `consume_held_output`) takes the reader lock.
+/// - `output_reader` -> `output`: the reader holds the master-reader lock
+///   across `output.push` in `drain_available_output` and
+///   `consume_held_output` (the `match` scrutinee guard lives to the end of
+///   the `match`), and across `closed_before_boundary` -> `mark_exit`.
+/// - `output_order` -> `master`: the resize and attach-snapshot boundary
+///   closures drain into the snapshot first, then take the master descriptor
+///   while the ordering gate is still held.
+/// - `master` -> `output`: the same closures call `output.resize` while the
+///   master guard is alive.
+/// - `output_order` -> `output`: the reader thread holds the ordering gate
+///   while its batch pushes take the hub ring lock; the resize and
+///   attach-snapshot closures hold the gate while the boundary drain calls
+///   `push` and `mark_exit` (via `closed_before_boundary`), and while they
+///   call `output.resize` and `subscribe_terminal_snapshot`.
 ///
 /// Guards, leaf by leaf: `resize` is the async gate of `resize`,
-/// `attach_snapshot` and `dimensions`; `cleanup` is the async gate of `stop`
-/// and `finish_natural`. No path holds `resize` and `cleanup` together. The
+/// `attach_snapshot`, `clear_resize_sources` and `dimensions`; `cleanup` is
+/// the async gate of `stop` and `finish_natural`. No path holds `resize` and
+/// `cleanup` together. The
 /// hub ring lock and the std mutexes are never held across an await. `master`
 /// guards the master descriptor a resize writes. `output` is the hub's own
 /// ring lock. `held_echo` is the deferred echo-release state lock. `reap_tx`,

@@ -43,8 +43,8 @@ pub enum RingError {
 pub struct OutputChunk {
     /// Offset of the first payload byte.
     pub offset: u64,
-    /// Raw PTY bytes.
-    pub bytes: Vec<u8>,
+    /// Raw PTY bytes; clones share one allocation.
+    pub bytes: Arc<[u8]>,
 }
 
 impl OutputChunk {
@@ -224,34 +224,41 @@ impl OutputHub {
     /// # Errors
     ///
     /// Returns [`RingError::OffsetOverflow`] instead of wrapping offsets.
-    pub fn push(&self, bytes: &[u8]) -> Result<OutputChunk, RingError> {
-        let mut state = lock(&self.inner);
-        if state.completion.is_some() && !bytes.is_empty() {
+    pub fn push(&self, bytes: &[u8]) -> Result<(), RingError> {
+        let mut guard = lock(&self.inner);
+        if guard.completion.is_some() && !bytes.is_empty() {
             return Err(RingError::Closed);
         }
-        let chunk = state.ring.push(bytes)?;
+        let offset = guard.ring.push(bytes)?;
         if bytes.is_empty() {
-            return Ok(chunk);
+            return Ok(());
         }
-        state.terminal.feed(bytes);
-        state.terminal_snapshot = None;
-        let probes = state.terminal.take_probes();
-        if let Some(responder) = state.probe.as_mut() {
+        guard.terminal.feed(bytes);
+        guard.terminal_snapshot = None;
+        let probes = guard.terminal.take_probes();
+        if let Some(responder) = guard.probe.as_mut() {
             for span in probes {
                 if responder.guard.admit(span) {
                     responder.replies.queue();
                 }
             }
         }
-        let state = &mut *state;
+        let state = &mut *guard;
         let next_offset = state.ring.next_offset;
         let terminal = &state.terminal;
         let subscribers = &mut state.subscribers;
         let mut built: Option<Arc<TerminalSnapshot>> = None;
+        let mut shared: Option<OutputChunk> = None;
         let mut retained = Vec::with_capacity(subscribers.len());
         for weak in subscribers.drain(..) {
             if let Some(queue) = weak.upgrade() {
-                queue.push_output(chunk.clone(), || {
+                let chunk = shared
+                    .get_or_insert_with(|| OutputChunk {
+                        offset,
+                        bytes: Arc::from(bytes),
+                    })
+                    .clone();
+                queue.push_output(chunk, || {
                     Arc::clone(
                         built.get_or_insert_with(|| Arc::new(terminal.snapshot(next_offset))),
                     )
@@ -263,9 +270,9 @@ impl OutputHub {
         if let Some(snapshot) = built {
             state.terminal_snapshot = Some(snapshot);
         }
-        let _ = state;
+        drop(guard);
         self.observation.notify_waiters();
-        Ok(chunk)
+        Ok(())
     }
 
     /// Starts queueing a reply for every answerable OSC 7501 probe.
@@ -557,7 +564,7 @@ impl HubState {
         Ok(OutputSnapshot::Replay {
             chunk: OutputChunk {
                 offset: requested,
-                bytes: self.ring.bytes_from(requested),
+                bytes: self.ring.bytes_shared_from(requested),
             },
             watermark: self.ring.next_offset,
         })
@@ -744,7 +751,7 @@ impl SubscriberState {
                 self.replay = None;
                 return Some(OutputEvent::Replay(OutputChunk {
                     offset,
-                    bytes: Vec::new(),
+                    bytes: Arc::from([]),
                 }));
             }
             if let Some(chunk) = hub.ring.chunk(replay.next, replay.end, event_limit) {
@@ -817,16 +824,13 @@ impl OutputRing {
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Result<OutputChunk, RingError> {
+    fn push(&mut self, bytes: &[u8]) -> Result<u64, RingError> {
         let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let next = self
             .next_offset
             .checked_add(len)
             .ok_or(RingError::OffsetOverflow)?;
-        let chunk = OutputChunk {
-            offset: self.next_offset,
-            bytes: bytes.to_vec(),
-        };
+        let offset = self.next_offset;
         self.bytes.extend(bytes.iter().copied());
         self.next_offset = next;
         while self.bytes.len() > self.limit {
@@ -836,13 +840,7 @@ impl OutputRing {
                 .checked_add(1)
                 .ok_or(RingError::OffsetOverflow)?;
         }
-        Ok(chunk)
-    }
-
-    fn bytes_from(&self, offset: u64) -> Vec<u8> {
-        let relative =
-            usize::try_from(offset.saturating_sub(self.start_offset)).unwrap_or(self.bytes.len());
-        self.bytes.iter().skip(relative).copied().collect()
+        Ok(offset)
     }
 
     fn bytes_from_limited(&self, offset: u64, limit: usize) -> Vec<u8> {
@@ -856,17 +854,27 @@ impl OutputRing {
             .collect()
     }
 
+    /// Builds one `Arc` allocation directly from the ring slice.
+    ///
+    /// `VecDeque::range` plus `copied` is `TrustedLen`, so the `Arc`
+    /// `FromIterator` specialization allocates once instead of collecting a
+    /// `Vec` first.
+    fn bytes_shared_from(&self, offset: u64) -> Arc<[u8]> {
+        let relative =
+            usize::try_from(offset.saturating_sub(self.start_offset)).unwrap_or(self.bytes.len());
+        self.bytes.range(relative..).copied().collect()
+    }
+
     fn chunk(&self, offset: u64, end: u64, limit: usize) -> Option<OutputChunk> {
         if offset < self.start_offset || offset >= end || end > self.next_offset {
             return None;
         }
         let relative = usize::try_from(offset.checked_sub(self.start_offset)?).ok()?;
         let remaining = usize::try_from(end.checked_sub(offset)?).ok()?;
-        let bytes = self
+        let len = remaining.min(limit);
+        let bytes: Arc<[u8]> = self
             .bytes
-            .iter()
-            .skip(relative)
-            .take(remaining.min(limit))
+            .range(relative..relative + len)
             .copied()
             .collect();
         Some(OutputChunk { offset, bytes })
@@ -884,6 +892,31 @@ mod tests {
     use super::{OutputCompletion, OutputEvent, OutputHub, OutputSnapshot, RingError};
     use pohunek_terminal::TerminalSnapshot;
     use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn one_push_shares_a_single_buffer_between_live_subscribers() {
+        let hub = OutputHub::new(64, 64, 2, 10).expect("hub");
+        let mut first = hub.subscribe(None).expect("first subscribe");
+        let mut second = hub.subscribe(None).expect("second subscribe");
+        hub.push(b"shared").expect("push");
+
+        // Each seed replays the empty range first; the push then arrives as
+        // a live `Output` event carrying the single shared chunk.
+        let (Some(OutputEvent::Replay(_)), Some(OutputEvent::Replay(_))) =
+            (first.recv().await, second.recv().await)
+        else {
+            panic!("both live subscribers must replay the empty seed range");
+        };
+        let (Some(OutputEvent::Output(first_chunk)), Some(OutputEvent::Output(second_chunk))) =
+            (first.recv().await, second.recv().await)
+        else {
+            panic!("both live subscribers must receive the single push");
+        };
+        assert_eq!(first_chunk.offset, 0);
+        assert_eq!(&*first_chunk.bytes, b"shared");
+        assert!(Arc::ptr_eq(&first_chunk.bytes, &second_chunk.bytes));
+    }
 
     #[test]
     fn offsets_advance_and_eviction_reports_gap() {
@@ -899,7 +932,7 @@ mod tests {
         assert!(matches!(
             hub.snapshot(Some(2)).expect("snapshot"),
             OutputSnapshot::Replay { chunk, watermark: 6 }
-                if chunk.offset == 2 && chunk.bytes == b"cdef"
+                if chunk.offset == 2 && &*chunk.bytes == b"cdef"
         ));
     }
 
@@ -954,7 +987,7 @@ mod tests {
         assert_eq!(hub.next_offset(), 8);
         assert!(matches!(
             subscriber.recv().await,
-            Some(OutputEvent::Replay(chunk)) if chunk.bytes == b"complete"
+            Some(OutputEvent::Replay(chunk)) if &*chunk.bytes == b"complete"
         ));
         assert_eq!(
             subscriber.recv().await,
@@ -1077,12 +1110,12 @@ mod tests {
 
         assert!(matches!(
             subscriber.recv().await,
-            Some(OutputEvent::Replay(chunk)) if chunk.bytes == b"before"
+            Some(OutputEvent::Replay(chunk)) if &*chunk.bytes == b"before"
         ));
         assert!(matches!(
             subscriber.recv().await,
             Some(OutputEvent::Output(chunk))
-                if chunk.offset == 6 && chunk.bytes == b"after"
+                if chunk.offset == 6 && &*chunk.bytes == b"after"
         ));
     }
 
@@ -1112,7 +1145,7 @@ mod tests {
         assert!(matches!(
             subscriber.recv().await,
             Some(OutputEvent::Output(chunk))
-                if chunk.offset == watermark && chunk.bytes == b"-live"
+                if chunk.offset == watermark && &*chunk.bytes == b"-live"
         ));
     }
 
@@ -1132,7 +1165,7 @@ mod tests {
         assert!(matches!(
             replacement.recv().await,
             Some(OutputEvent::Replay(chunk))
-                if chunk.offset == last_daemon_offset && chunk.bytes == during
+                if chunk.offset == last_daemon_offset && &*chunk.bytes == during
         ));
     }
 
