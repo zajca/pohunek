@@ -233,6 +233,7 @@ fn a_docs_only_change_selects_nothing() {
         &[
             "docs/guide.md",
             "README.md",
+            "changelog.d/7-thing.md",
             ".github/ISSUE_TEMPLATE/work-item.yml",
         ],
         false,

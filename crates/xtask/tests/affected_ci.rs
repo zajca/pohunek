@@ -669,6 +669,34 @@ fn a_docs_only_change_selects_no_rust_test() {
     assert_eq!(all_packages(&selection), Vec::<(String, String)>::new());
 }
 
+#[test]
+fn a_docs_change_with_a_changelog_fragment_selects_no_rust_test() {
+    let repo = Repo::new();
+    repo.change(&["docs/guide.md", "changelog.d/7-thing.md"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "none");
+    assert_eq!(selection["docs_only"], true);
+    assert!(selection["filterset"].is_null());
+    assert_eq!(all_packages(&selection), Vec::<(String, String)>::new());
+}
+
+#[test]
+fn a_changelog_fragment_with_a_code_change_selects_what_the_code_alone_selects() {
+    let repo = Repo::new();
+    repo.change(&["crates/relay-client/src/lib.rs", "changelog.d/7-thing.md"]);
+    let with_fragment = repo.select();
+    let repo = Repo::new();
+    repo.change(&["crates/relay-client/src/lib.rs"]);
+    let code_alone = repo.select();
+    assert_eq!(with_fragment["mode"], code_alone["mode"]);
+    assert_eq!(with_fragment["filterset"], code_alone["filterset"]);
+    assert_eq!(
+        all_packages(&with_fragment),
+        all_packages(&code_alone),
+        "{with_fragment:#} vs {code_alone:#}"
+    );
+}
+
 /// A head whose tree equals its merge base changes nothing a run could test,
 /// so it takes the docs-only path.
 #[test]

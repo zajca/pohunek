@@ -240,7 +240,8 @@ regressions run in the core shard unless a narrowed selection needs none.
 
 A narrowed selection whose every changed file has no Rust tests and no gate
 but `docs check` (`docs_only`, mode `none`; for example `docs/` outside the
-mapped `docs/knowledge/` and `docs/public-api.md`, root `*.md`, `.agents/`,
+mapped `docs/knowledge/` and `docs/public-api.md`, `changelog.d/` fragments (validated by
+the changelog guard's `scripts/changelog check`), root `*.md`, `.agents/`,
 `.claude/` or `assets/`) takes the docs-only path. It skips `fmt + clippy`,
 `darwin-check`, `doctests`, `build bins`, `SDK workspace`, `cargo-audit` and
 `cargo-shear`; push, schedule and dispatch runs still run them. No such file
