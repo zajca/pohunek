@@ -85,6 +85,8 @@ INSTALLER_NAME = re.compile(r"rust-toolchain|setup-rust|actions-rs/toolchain", r
 COMMAND_SEPARATOR = re.compile(r"&&|\|\||[;|&()`]|\$\(")
 TOOLCHAIN_COMMANDS = {"cargo", "rustc", "rustdoc", "rustup", "clippy-driver", "rustfmt"}
 # rustup options whose value is the next word, so it is not an operand.
+# `--component`/`-c` and `--target`/`-t` each take one value; repeating the
+# flag installs another name, so `--component a --component b` is two options.
 RUSTUP_VALUE_OPTIONS = {"--profile", "-c", "--component", "-t", "--target", "--path"}
 # rustup subcommand paths whose operands are toolchain names; for `run` only
 # the first operand is.
@@ -210,7 +212,12 @@ def toolchain_values(line):
 
 
 def command_selectors(line):
-    """Toolchain names selected by the shell commands on one line."""
+    """Toolchain names selected by the shell commands on one line.
+
+    A line continued with a trailing backslash passes before this runs
+    through `unquote`, which strips the backslash off a quoted word, so
+    `"$args"\\` reads as the indirect `$args`, never as a selector.
+    """
     selectors = []
     for segment in COMMAND_SEPARATOR.split(line):
         words = [unquote(word) for word in segment.split()]
@@ -266,13 +273,14 @@ def check_selector(relative, number, value, pinned, is_setup_rust, source):
     )
 
 
-def check_uses(relative, number, reference, is_setup_rust):
+def check_uses(relative, number, reference):
     name, _, ref = reference.partition("@")
     if LOCAL_SETUP_RUST.fullmatch(name) and not ref:
         return None
     if INSTALLER_NAME.search(name) is None:
         return None
-    return (relative, number, f"{name} installs Rust outside ./.github/actions/setup-rust; use that action")
+    location = "in ./.github/actions/setup-rust itself" if relative == SETUP_RUST_ACTION else "outside ./.github/actions/setup-rust"
+    return (relative, number, f"{name} installs Rust {location}; use the local composite action")
 
 
 def check_yaml(relative, text, pinned):
@@ -294,7 +302,7 @@ def check_yaml(relative, text, pinned):
                      f"the stable pin belongs in {PIN_FILE} (omit `toolchain`)")
                 )
         for uses in USES_KEY.finditer(line):
-            found.append(check_uses(relative, number, unquote(uses.group("value")), is_setup_rust))
+            found.append(check_uses(relative, number, unquote(uses.group("value"))))
         for assignment in RUSTUP_TOOLCHAIN_ASSIGNMENT.finditer(line):
             found.append(check_selector(
                 relative, number, unquote(assignment.group("value")), pinned, is_setup_rust, "RUSTUP_TOOLCHAIN"

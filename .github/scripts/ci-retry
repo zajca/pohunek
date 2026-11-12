@@ -15,19 +15,36 @@
 # All flags are required. <label> names the retried unit in the log lines and
 # in the `::error` annotation; it must not contain `=` or a newline because a
 # failing run appends `CI_INFRA_FAILURE=<label>` to $GITHUB_ENV (when set) so
-# the run summary can link the retry to the incident follow-ups.
+# a later lane (#2205) can link the retry to the incident follow-ups.
 #
-# Attempt timeouts are per command class, from the p90 of successful main
+# The marker alone never proves an infrastructure cause: it fires for every
+# exhausted retry, including deterministic product failures (a lockfile the
+# command rejects, a missing binary). #2205 must not treat it as proof of a
+# network failure without checking the step log first.
+#
+# Attempt timeouts are per command class, from the p99 of successful main
 # runs plus headroom (cargo fetch 8 s, apt 11 s, npm 7 s, bun 3 s, rustup
-# 13 s, uv 8 s, zig 57 s): 180 s for the installers, 120 s for a single
-# direct download, which already matches the curl --max-time the download
-# actions use. The worst case (three timed-out 180 s attempts plus the
-# 10 s and 20 s backoff waits) stays inside the smallest step timeout that
-# guards these steps today (10 minutes). Per-request knobs stay at each
-# tool: npm --fetch-timeout, CARGO_HTTP_TIMEOUT, RUSTUP_DOWNLOAD_TIMEOUT,
-# UV_HTTP_TIMEOUT, BUN_CONFIG_HTTP_RETRY_COUNT, curl --connect-timeout and
-# --max-time. rustup documents no retry knob, so the helper is its only
-# retry layer.
+# 13 s, uv 8 s, zig 57 s): 180 s for the wrapped installers. A single
+# direct download already carries curl's own --max-time (120 s in the
+# download actions), which is not a helper call. The worst case (three
+# timed-out 180 s attempts plus the 10 s and 20 s backoff waits plus the
+# KILL_GRACE_SECONDS grace after each TERM) stays inside the smallest step
+# timeout that guards these steps today (10 minutes). Per-request knobs stay
+# at each tool: npm's own --fetch-timeout (default 300 s, longer than one
+# attempt, so it never fires inside the helper) and --fetch-retries (npm
+# docs: https://docs.npmjs.com/cli/v11/using-npm/config#fetch-retries),
+# CARGO_NET_RETRY with CARGO_HTTP_TIMEOUT (cargo docs:
+# https://doc.rust-lang.org/cargo/reference/config.html#netretry),
+# RUSTUP_DOWNLOAD_TIMEOUT (rustup docs:
+# https://rust-lang.github.io/rustup/devel/environment-variables.html)
+# paired with RUSTUP_MAX_RETRIES (a number the action controls, equal to
+# the helper attempts), UV_HTTP_TIMEOUT (uv docs:
+# https://docs.astral.sh/uv/reference/settings/#http-timeout) with
+# UV_HTTP_RETRIES, BUN_CONFIG_HTTP_RETRY_COUNT (bun default 5; no timeout
+# knob, source: `bun --help` has no timeout flag), curl --connect-timeout
+# and --max-time. Note RUSTUP_DOWNLOAD_TIMEOUT equals the attempt timeout
+# (180 = 180), so a single rustup request that runs exactly to its own
+# limit also ends the attempt: the helper is the layer that always fires.
 #
 # Portable bash 3.2 compatible with the GitHub macOS runners. No bashisms
 # beyond POSIX plus $(( )), $( ), and kill -SIGNAL -pgid.

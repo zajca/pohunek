@@ -196,9 +196,12 @@ in a workflow has a step `timeout-minutes` and apt network timeouts.
 `scripts/tests/test_ci_step_bounds.py` pins both.
 
 **Network retries.** Every network install step (apt-get, npm ci, bun install,
-rustup, uv, cargo fetch, setup-zig downloads) runs through
-`.github/scripts/ci-retry`, with bounded attempts and per-attempt timeouts
-from the workflow `env`. An exhausted retry marks the job with
+rustup, uv, cargo fetch) runs through `.github/scripts/ci-retry`, with
+bounded attempts and per-attempt timeouts from the workflow `env` (or from
+the setup-rust action's own defaulted `retry-*` inputs, calibrated to the
+same ci.yml values). The seed curl downloads (setup-zig, setup-mold,
+setup-sccache, setup-uv) carry curl's own retry and transfer limits instead
+of the helper. An exhausted helper retry marks the job with
 `CI_INFRA_FAILURE`.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker

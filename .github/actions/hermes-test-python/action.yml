@@ -65,9 +65,11 @@ runs:
         export UV_PYTHON_INSTALL_DIR="$private_root/install"
         export UV_PYTHON_BIN_DIR="$private_root/bin-links"
         install -d -m 700 "$UV_PYTHON_INSTALL_DIR" "$UV_PYTHON_BIN_DIR"
-        # uv retries transient HTTP failures inside (UV_HTTP_RETRIES) with
-        # per-request UV_HTTP_TIMEOUT/UV_HTTP_CONNECT_TIMEOUT; the helper
-        # retries a hung download whose request never returns.
+        # uv retries transient HTTP failures inside (UV_HTTP_RETRIES,
+        # uv docs: https://docs.astral.sh/uv/reference/settings/#http-retries)
+        # with per-request UV_HTTP_TIMEOUT/UV_HTTP_CONNECT_TIMEOUT
+        # (https://docs.astral.sh/uv/reference/settings/#http-timeout);
+        # the helper retries a hung download whose request never returns.
         "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label uv-python-hermes \
           --attempts "$CI_RETRY_ATTEMPTS" \
           --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_UV_SECONDS" \
@@ -77,8 +79,10 @@ runs:
         python_bin="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$found")"
         [[ "$python_bin" == "$private_root"/install/* ]] \
           || { echo "resolved interpreter escapes the private install: $found -> $python_bin" >&2; exit 1; }
-        # One unit with the install above: a finished interpreter with a
-        # missing PyYAML is discarded and both steps retry together.
+        # A finished interpreter with a missing PyYAML is discarded: the
+        # private root is removed and both helper calls retry from scratch
+        # on the next job attempt. The two retried installs are separate
+        # helper calls, so one can succeed while the other retries.
         "$GITHUB_ACTION_PATH/../../scripts/ci-retry" --label uv-pip-hermes \
           --attempts "$CI_RETRY_ATTEMPTS" \
           --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_UV_SECONDS" \

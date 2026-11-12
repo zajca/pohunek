@@ -300,9 +300,12 @@ ending the run. A fork or Dependabot pull request has a read-only token, so the
 cancel call is refused and the run keeps its real failure.
 
 **Network retries.** Every network install step (apt-get, npm ci, bun install,
-rustup, uv, cargo fetch, setup-zig downloads) runs through
-`.github/scripts/ci-retry`, with bounded attempts and per-attempt timeouts
-from the workflow `env`. An exhausted retry marks the job with
+rustup, uv, cargo fetch) runs through `.github/scripts/ci-retry`, with
+bounded attempts and per-attempt timeouts from the workflow `env` (or from
+the setup-rust action's own defaulted `retry-*` inputs, calibrated to the
+same ci.yml values). The seed curl downloads (setup-zig, setup-mold,
+setup-sccache, setup-uv) carry curl's own retry and transfer limits instead
+of the helper. An exhausted helper retry marks the job with
 `CI_INFRA_FAILURE`.
 
 **Fork heads.** This applies to every dispatch, rerun and `head_ref` rule in

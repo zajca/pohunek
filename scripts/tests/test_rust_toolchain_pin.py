@@ -169,7 +169,30 @@ class CheckRustToolchainPinTests(unittest.TestCase):
             result,
             WORKFLOW_RELATIVE.as_posix(),
             line_of(workflow, "dtolnay/rust-toolchain@"),
-            "installs Rust outside ./.github/actions/setup-rust",
+            "installs Rust outside",
+        )
+
+    def test_rejects_direct_installer_use_inside_setup_rust(self):
+        action = ACTION.read_text()
+        anchor = "        uses: ./.github/actions/setup-rust\n"
+        self.assertIn(anchor, CLEAN_WORKFLOW)
+        polluted = action.replace(
+            '          --backoff "$RETRY_BACKOFF_SECONDS" -- sh -c',
+            '          --backoff "$RETRY_BACKOFF_SECONDS" -- sh -c\n'
+            "      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1",
+            1,
+        )
+        self.assertNotEqual(polluted, action)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(root)
+            (root / ACTION_RELATIVE).write_text(polluted)
+            result = self.run_check(str(root))
+        self.assert_violation(
+            result,
+            ACTION_RELATIVE.as_posix(),
+            line_of(polluted, "dtolnay/rust-toolchain@"),
+            "installs Rust in ./.github/actions/setup-rust itself",
         )
 
     def test_installs_rust_without_a_third_party_action(self):

@@ -137,29 +137,45 @@ env:
   # the rest 180 s), so a hung mirror fails an attempt instead of the step.
   # The worst case (3 x 180 s + 2 x 10 s, worst backoff 10 s + 20 s) fits the
   # smallest 10-minute step limit with headroom. Timeouts were calibrated
-  # on 17 successful main runs (cargo fetch p90 3-8 s, apt p90 11 s,
-  # npm p90 ~7 s, bun p90 3 s, rustup p90 10-13 s, uv p90 4-8 s) plus
-  # per-tool timeout research:
-  # - apt: Acquire::http(s)::Timeout=30 already on every call; the helper
+  # Attempt timeouts come from the one calibrated set of CI_RETRY_* values
+  # in this workflow's top-level env (p99 of successful main runs plus
+  # headroom, per command class) and from the matching action/retry knobs
+  # named in each comment below:
+  # - apt: Acquire::http(s)::Timeout=30 already on every call (apt docs:
+  #   `man apt.conf`, the `Acquire::http::Timeout` option); the helper
   #   bounds the total.
-  # - npm: --fetch-timeout=300000/--fetch-retries=2 pass through, but a
-  #   #2069-style 504 arrives as a body, not a connection error, so npm's
-  #   own retries miss it and the helper retries the whole install.
-  # - bun: BUN_CONFIG_HTTP_RETRY_COUNT=5 retries a failed request but gives
-  #   up after one timeout, so the helper retries the whole install.
+  # - npm: the tool defaults stay in force (npm docs:
+  #   https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout and
+  #   #fetch-retries: --fetch-timeout=300000, --fetch-retries=2). The
+  #   registry answered #2069 with an HTTP 504 and an HTML body (issue
+  #   #2069: release downloads failed with 504 while the connection
+  #   succeeded), which npm's fetch retries treat as a finished response,
+  #   so the helper retries the whole install when it happens again.
+  # - bun: the tool default stays in force (BUN_CONFIG_HTTP_RETRY_COUNT=5,
+  #   bun docs: https://bun.sh/docs/installation#configuring-bun; bun has
+  #   no timeout knob). One timed-out request already ends the attempt,
+  #   so the helper retries the whole install instead.
   # - rustup: RUSTUP_DOWNLOAD_TIMEOUT bounds each download from inside and
-  #   RUSTUP_MAX_RETRIES retries it; the helper still bounds a hung install
-  #   whose request never returns.
-  # - uv: UV_HTTP_TIMEOUT/UV_HTTP_CONNECT_TIMEOUT/UV_HTTP_RETRIES stay at
-  #   the tool; the helper retries a hung download whose request never
+  #   RUSTUP_MAX_RETRIES retries it (rustup docs:
+  #   https://rust-lang.github.io/rustup/devel/environment-variables.html);
+  #   RUSTUP_DOWNLOAD_TIMEOUT equals the helper attempt timeout, so the
+  #   helper always fires first and bounds a hung install whose request
+  #   never returns.
+  # - uv: the tool defaults stay in force (uv docs:
+  #   https://docs.astral.sh/uv/reference/settings/#http-timeout:
+  #   UV_HTTP_TIMEOUT/UV_HTTP_CONNECT_TIMEOUT, UV_HTTP_RETRIES); the
+  #   helper retries a hung download whose request never returns.
+  # - cargo: the tool defaults stay in force (cargo docs:
+  #   https://doc.rust-lang.org/cargo/reference/config.html#netretry:
+  #   CARGO_NET_RETRY, CARGO_HTTP_TIMEOUT). CARGO_NET_RETRY retries
+  #   spurious failures inside cargo and CARGO_HTTP_TIMEOUT bounds each
+  #   request; the helper retries a hung fetch whose request never
   #   returns.
-  # - cargo: CARGO_NET_RETRY retries spurious failures inside cargo and
-  #   CARGO_HTTP_TIMEOUT bounds each request; the helper retries a hung
-  #   fetch whose request never returns.
   # - setup-zig: curl --connect-timeout/--max-time (mold parity, plus a
   #   stall --speed-limit/--speed-time since curl retries only attempts that
-  #   return) bound each download; the helper is not wrapped around curl
-  #   because a curl transfer is already one bounded attempt.
+  #   return, curl docs: https://curl.se/docs/manpage.html) bound each
+  #   download; the helper is not wrapped around curl because a curl
+  #   transfer is already one bounded attempt.
   CI_RETRY_ATTEMPTS: "3"
   CI_RETRY_BACKOFF_SECONDS: "10"
   CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS: "180"
@@ -2748,10 +2764,13 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/pi/npm"
-          # The registry answers #2069-style 504s with a body instead of a
-          # connection error; npm's own fetch retries (--fetch-retries)
-          # miss them, so the helper retries the whole install. The 300 s
-          # npm --fetch-timeout applies inside each attempt.
+          # The registry answered #2069 with an HTTP 504 and an HTML body
+          # (issue #2069: release downloads failed with 504 while the
+          # connection succeeded); npm's own fetch retries (--fetch-retries)
+          # treat that as a finished response, so the helper retries the
+          # whole install when it happens again (npm defaults:
+          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
+          # and #fetch-retries).
           if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-pi \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
@@ -2896,10 +2915,13 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/codex/npm"
-          # The registry answers #2069-style 504s with a body instead of a
-          # connection error; npm's own fetch retries (--fetch-retries)
-          # miss them, so the helper retries the whole install. The 300 s
-          # npm --fetch-timeout applies inside each attempt.
+          # The registry answered #2069 with an HTTP 504 and an HTML body
+          # (issue #2069: release downloads failed with 504 while the
+          # connection succeeded); npm's own fetch retries (--fetch-retries)
+          # treat that as a finished response, so the helper retries the
+          # whole install when it happens again (npm defaults:
+          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
+          # and #fetch-retries).
           if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-codex \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
@@ -3053,10 +3075,13 @@ jobs:
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/claude/npm"
-          # The registry answers #2069-style 504s with a body instead of a
-          # connection error; npm's own fetch retries (--fetch-retries)
-          # miss them, so the helper retries the whole install. The 300 s
-          # npm --fetch-timeout applies inside each attempt.
+          # The registry answered #2069 with an HTTP 504 and an HTML body
+          # (issue #2069: release downloads failed with 504 while the
+          # connection succeeded); npm's own fetch retries (--fetch-retries)
+          # treat that as a finished response, so the helper retries the
+          # whole install when it happens again (npm defaults:
+          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
+          # and #fetch-retries).
           if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-claude \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
@@ -3668,9 +3693,10 @@ jobs:
 
       - name: Install workspace dependencies
         run: |
-          # Bun retries a failed request (BUN_CONFIG_HTTP_RETRY_COUNT) but
-          # gives up after one timeout, which has no knob: the helper retries
-          # the whole install instead.
+          # Bun retries a failed request (tool default
+          # BUN_CONFIG_HTTP_RETRY_COUNT=5, https://bun.sh/docs/installation#configuring-bun;
+          # bun has no timeout knob) but gives up after one timeout: the
+          # helper retries the whole install instead.
           "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label bun-install-sdk \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_BUN_SECONDS" \
@@ -3802,9 +3828,10 @@ jobs:
 
       - name: Install workspace dependencies
         run: |
-          # Bun retries a failed request (BUN_CONFIG_HTTP_RETRY_COUNT) but
-          # gives up after one timeout, which has no knob: the helper retries
-          # the whole install instead.
+          # Bun retries a failed request (tool default
+          # BUN_CONFIG_HTTP_RETRY_COUNT=5, https://bun.sh/docs/installation#configuring-bun;
+          # bun has no timeout knob) but gives up after one timeout: the
+          # helper retries the whole install instead.
           "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label bun-install-sdk-macos \
             --attempts "$CI_RETRY_ATTEMPTS" \
             --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_BUN_SECONDS" \

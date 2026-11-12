@@ -1493,10 +1493,23 @@ class OfflineDependencySourcesTests(unittest.TestCase):
                 )
                 if test_run is None:
                     continue
-                fetch = re.search(r"(?m)^\s+(?:- )?run: (?:.*\n)*?.*cargo fetch --locked$", block)
+                # Anchor on the fetch line itself: starting the lazy match at
+                # the job's first `run:` would make the position comparison
+                # below vacuous.
+                fetch = re.search(r"(?m)^[^\n]*cargo fetch --locked$", block)
                 with self.subTest(job=name):
                     self.assertIsNotNone(fetch, f"{name} runs cargo test without `cargo fetch --locked`")
                     self.assertLess(fetch.start(), test_run.start(), f"{name} fetches after running cargo test")
+
+    def test_fetch_guard_names_the_fetch_line_not_the_first_run(self):
+        block = "      - run: cargo test --workspace\n      - run: cargo fetch --locked\n"
+        fetch = re.search(r"(?m)^[^\n]*cargo fetch --locked$", block)
+        test_run = re.search(r"(?m)^\s+(?:- )?run: cargo test\b", block)
+        self.assertIsNotNone(fetch)
+        self.assertIsNotNone(test_run)
+        # A job that moved `cargo fetch` after `cargo test` still matches,
+        # but the positions now order it after the test run.
+        self.assertGreater(fetch.start(), test_run.start())
 
 
 class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
