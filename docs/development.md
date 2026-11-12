@@ -148,7 +148,15 @@ passed, and a failing, cancelled or still pending check does not.
   or relies on a later run on `main`: the post-merge `main` run is the main
   tier, while the release rehearsal, the release gate and the other
   nightly-only jobs (`test selection audit (G3)`) get their evidence only from the scheduled nightly run or a
-  `tier=nightly` dispatch of `main` or of a maintainer branch. Before a release,
+  `tier=nightly` dispatch of `main` or of a maintainer branch. The nightly
+  `CI budgets` workflow then checks per-step and per-job medians over the
+  newest 30 green `ci.yml` runs per event against `scripts/ci-budgets.json`:
+  with `--report-issue` it keeps the one `ci-budget`-labelled issue current,
+  an exceedance writes the table and adds a comment, while a recovered night
+  rewrites the body and closes the issue, so the next regression comments
+  again. A pull request that makes a budgeted step faster lowers its budget
+  in the same pull request; raising a budget needs a reason in its entry.
+  Before a release,
   `scripts/release` requires that evidence on the release commit and, when it
   pushes the candidate, dispatches the missing tier itself.
 
@@ -245,11 +253,6 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-2
 scripts/stress-run --deadline 45m -- cargo nextest run -p pohunek-daemon --stress-count 100 -E 'test(/profile_freeze_tests/)'  # reproduce a timing failure under pinned CPU load (build first with --no-run)
 scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --profile heavy  # stress the tests this diff adds or changes
 ```
-
-The nightly `ci-budgets` workflow checks per-step and per-job medians
-against `scripts/ci-budgets.json` and keeps the one `ci-budget`-labelled
-issue current. A pull request that makes a budgeted step faster lowers its
-budget in the same pull request; raising a budget needs a reason in its entry.
 
 Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
 for the shard helper. `profile.fast.default-filter` is the cost boundary;

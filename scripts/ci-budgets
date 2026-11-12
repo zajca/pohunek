@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """Check CI critical-path budgets against step medians on `main` (issue #2209).
 
-Compares the per-budget medians from `scripts/ci-timings` with the checked-in
-budgets in `scripts/ci-budgets.json` and keeps one labelled issue current: the
-body always carries the latest table, and a comment is added only when the set
-of exceeded budgets changed since the body was last written.
+Compares the per-budget medians over the newest `window_runs` green `ci.yml`
+runs per event with the checked-in budgets in `scripts/ci-budgets.json`, then
+keeps one labelled issue current: the body always carries the latest table,
+and a comment is added only when the set of exceeded budgets changed since
+the body was last written. A night with every budget within limits rewrites
+the body and closes the issue, so the next regression comments again.
+
+The window really is green runs: the fetch asks for a superset of runs and
+takes the newest `window_runs` green first attempts, so cancelled or failed
+runs inside the window never shrink the sample.
 
 Exit codes: 0 means every measured median is within budget; 1 means a budget
 is exceeded or names a job/step absent from the window; 2 means a usage or
@@ -12,6 +18,7 @@ API error. Nothing writes to an issue without `--report-issue`.
 """
 
 import argparse
+import datetime
 import json
 import statistics
 import subprocess
@@ -21,6 +28,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUDGETS = ROOT / "scripts" / "ci-budgets.json"
 CI_TIMINGS = ROOT / "scripts" / "ci-timings"
+
+# The fetch hands `ci-timings --limit` a superset of `window_runs`: every run
+# whose first attempt is not green (cancelled, failed, rerun green) still
+# costs a listing slot, so the limit must cover the worst realistic gap.
+FETCH_MULTIPLE = 4
 
 # Machine-readable marker in the issue body: the set of exceeded budget keys
 # the body was last written for. A comment goes out only when this set
@@ -133,62 +145,207 @@ def run_ci_timings(arguments):
         ) from error
 
 
-def selection(event, window_runs, *, input_path, branch):
-    """The `ci-timings` run-selection flags for one event's window.
+def selection(event, fetch_limit, *, input_path, branch):
+    """The `ci-timings` run-selection flags for one event's fetch.
 
     Push budgets read green `ci.yml` runs on `branch`; the pull-request
-    window spans every head branch, so it carries no branch filter.
+    window spans every head branch, so it carries no branch filter. The
+    limit is a fetch superset, not the window: the caller keeps the newest
+    `window_runs` green first attempts out of what the fetch returns.
     """
     arguments = [
-        "--limit", str(window_runs),
+        "--limit", str(fetch_limit),
         "--event", event, "--conclusion", "success",
     ]
+    if event == "push":
+        arguments += ["--branch", branch]
     if input_path is not None:
         arguments += ["--input", input_path]
-    elif event == "push":
-        arguments += ["--branch", branch]
     return arguments
 
 
-def fetch_medians(*, window_runs, input_path, branch):
-    """Per-budget medians over the newest green `ci.yml` runs per event.
+def green_first_attempts(documents, window_runs):
+    """The newest green first attempts: the window every median covers.
 
-    Push budgets measure per-step medians (`steps` on `main`) and per-job
-    wall medians (`runs` on `main`); the pull-request budget measures the
-    run wall clock (`runs`, every head branch). With `--input` every call
-    reads the snapshot instead of `gh`, so offline runs stay reproducible.
+    `ci-timings` already applied `--conclusion success` to the attempts it
+    selected, but old snapshots may predate an attempt field, and reruns
+    share an id with the attempt they supersede: attempt 1 decides whether
+    the run counts, newer first by creation time, then by id.
     """
-    push_steps = run_ci_timings(
-        ["steps", *selection("push", window_runs,
+    first = {}
+    for run in documents:
+        attempt = run.get("attempt") or 1
+        if attempt != 1:
+            continue
+        if run.get("conclusion") != "success":
+            continue
+        first[run.get("id")] = run
+    ordered = sorted(
+        first.values(),
+        key=lambda run: (run.get("created_at") or "", run.get("id") or 0),
+        reverse=True,
+    )
+    return ordered[:window_runs]
+
+
+def measured_window(documents, window_runs):
+    """Newest green first attempts plus whether the window filled.
+
+    The issue table prints the sample size beside every median, and a
+    window that never reached `window_runs` green runs must say so instead
+    of comparing a partial sample with a budget calibrated on a full one.
+    """
+    selected = green_first_attempts(documents, window_runs)
+    return selected, len(selected) >= window_runs
+
+
+def fetch_event_runs(event, *, window_runs, input_path, branch):
+    """The window's run summaries for one event, newest first.
+
+    `ci-timings` caps a fetch at `--limit` newest matching runs, then keeps
+    the first attempts its conclusion filter passed. Non-green first
+    attempts cost fetch slots, so the fetch asks for a multiple of the
+    window and the window slices the newest green first attempts out of
+    it. With `--input` the snapshot stands in for `gh`, so offline runs
+    stay reproducible.
+    """
+    fetch_limit = window_runs * FETCH_MULTIPLE
+    payload = run_ci_timings(
+        ["runs", *selection(event, fetch_limit,
                              input_path=input_path, branch=branch)]
     )
-    push_walls = run_ci_timings(
-        ["runs", *selection("push", window_runs,
-                            input_path=input_path, branch=branch)]
-    )
-    pr_runs = run_ci_timings(
-        ["runs", *selection("pull_request", window_runs,
-                            input_path=input_path, branch=branch)]
-    )
-    push_step_runs = push_steps.get("runs")
-    push_wall_list = push_walls.get("runs") or []
-    pr_run_list = pr_runs.get("runs") or []
-    pr_walls = [
-        run["wall_seconds"]
-        for run in pr_run_list
+    documents = payload.get("runs") or []
+    if isinstance(documents, int):
+        raise BudgetError(
+            "scripts/ci-timings runs printed a count, not a run list"
+        )
+    runs, filled = measured_window(documents, window_runs)
+    return runs, filled
+
+
+def fetch_event_steps(event, window_runs, *, input_path, branch):
+    """Per-run step samples for the window, newest run first.
+
+    One `steps` payload aggregates a whole fetch, so a window-sized fetch
+    would hand the merge per-fetch medians instead of per-run samples.
+    `steps --limit N` aggregates exactly the newest N green first
+    attempts, so fetching `--limit 1`, then 2, and so on names one new
+    run per fetch: with per-fetch sample counts beside every step, the
+    delta between consecutive fetches recovers the next older run's
+    samples exactly. A step a run skips never newly appears, so it never
+    counts toward that step's median. `FETCH_MULTIPLE` bounds the scan.
+    With `--input` the snapshot stands in for `gh`, so offline runs stay
+    reproducible.
+    """
+    per_run = []
+    samples = {}
+    for limit in range(1, window_runs * FETCH_MULTIPLE + 1):
+        if len(per_run) >= window_runs:
+            break
+        payload = run_ci_timings(
+            ["steps", *selection(event, limit,
+                                  input_path=input_path, branch=branch)]
+        )
+        runs = payload.get("runs")
+        if not isinstance(runs, int):
+            raise BudgetError(
+                "scripts/ci-timings steps printed a run list, not a count"
+            )
+        if runs <= len(per_run):
+            break
+        summary = payload.get("summary") or {}
+        single = {}
+        for job, steps in summary.items():
+            for name, entry in steps.items():
+                key = (job, name)
+                bucket = samples.setdefault(key, [])
+                for _ in range(entry["runs"] - len(bucket)):
+                    bucket.append(entry["p50"])
+                single.setdefault(job, {})[name] = bucket[-1]
+        per_run.append(single)
+    return per_run
+
+
+def step_window_medians(per_run):
+    """Per-step medians over the window's per-run samples.
+
+    Each entry of `per_run` holds one run's step samples (a step a run
+    skips is absent), so the median per step is exact, with the sample
+    size beside it. A step absent from every fetched run stays absent.
+    """
+    samples = {}
+    for single in per_run:
+        for job, steps in single.items():
+            for name, seconds in steps.items():
+                samples.setdefault(job, {}).setdefault(name, []).append(
+                    seconds)
+    return {
+        job: {
+            name: {"p50": statistics.median(values), "runs": len(values)}
+            for name, values in steps.items()
+        }
+        for job, steps in samples.items()
+    }
+
+
+def measure(*, window_runs, input_path, branch):
+    """Medians over the newest green first attempts per event.
+
+    Push budgets read green `ci.yml` runs on `branch`; the pull-request
+    window spans every head branch. Run walls slice the newest
+    `window_runs` green first attempts out of one fetch; step medians merge
+    the per-fetch `steps` summaries covering the same window. With
+    `--input` every call reads the snapshot instead of `gh`, so offline runs
+    stay reproducible.
+    """
+    push_runs, push_filled = fetch_event_runs(
+        "push", window_runs=window_runs, input_path=input_path, branch=branch)
+    pr_runs, pr_filled = fetch_event_runs(
+        "pull_request", window_runs=window_runs,
+        input_path=input_path, branch=branch)
+    push_per_run = fetch_event_steps(
+        "push", window_runs, input_path=input_path, branch=branch)
+    return {
+        "push_steps": step_window_medians(push_per_run),
+        "push_job_walls": job_wall_medians(push_runs),
+        "push_runs": len(push_runs),
+        "push_filled": push_filled,
+        "pr_wall_median": wall_median(pr_runs),
+        "pr_runs": len(pr_runs),
+        "pr_filled": pr_filled,
+        "slowest_push": sorted(
+            (run for run in push_runs if run.get("id") is not None),
+            key=lambda run: run.get("wall_seconds") or 0,
+            reverse=True,
+        )[:5],
+        "slowest_pr": sorted(
+            (run for run in pr_runs if run.get("id") is not None),
+            key=lambda run: run.get("wall_seconds") or 0,
+            reverse=True,
+        )[:5],
+    }
+
+
+def wall_median(runs):
+    """Median wall clock over run summaries, None when all are missing."""
+    walls = [
+        run.get("wall_seconds") for run in runs
         if run.get("wall_seconds") is not None
     ]
+    return statistics.median(walls) if walls else None
+
+
+def job_wall_medians(runs):
+    """Per-job wall medians over the window, with the sample size each."""
+    per_job = {}
+    for run in runs:
+        for name, seconds in (run.get("jobs") or {}).items():
+            per_job.setdefault(name, []).append(seconds)
     return {
-        "push_steps": push_steps.get("summary") or {},
-        "push_runs": (push_step_runs
-                         if isinstance(push_step_runs, int)
-                         else len(push_step_runs or [])),
-        "push_job_walls": (push_walls.get("summary") or {}).get("jobs") or {},
-        "pr_jobs": (pr_runs.get("summary") or {}).get("jobs") or {},
-        "pr_wall_median": statistics.median(pr_walls) if pr_walls else None,
-        "pr_runs": (pr_run_list if isinstance(pr_run_list, int)
-                      else len(pr_run_list)),
+        name: {"p50": statistics.median(values), "runs": len(values)}
+        for name, values in per_job.items()
     }
+
 
 
 def check_budgets(budgets, medians):
@@ -202,18 +359,22 @@ def check_budgets(budgets, medians):
     for entry in budgets:
         event, job, step = entry["event"], entry["job"], entry["step"]
         limit = entry["median_seconds_max"]
-        median, window = None, 0
+        median, window, filled = None, 0, True
         if event == "pull_request" and job is None and step is None:
             median, window = medians["pr_wall_median"], medians["pr_runs"]
+            filled = medians["pr_filled"]
         elif event == "pull_request":
-            per_job = (medians.get("pr_jobs") or {}).get(job)
-            if per_job is not None:
-                median, window = per_job["p50"], medians["pr_runs"]
+            raise BudgetError(
+                f"budget {budget_key(entry)}: pull_request budgets cover "
+                "the run wall clock only (job and step must be null)"
+            )
         elif step is None:
+            filled = medians["push_filled"]
             per_job = (medians.get("push_job_walls") or {}).get(job)
             if per_job is not None:
                 median, window = per_job["p50"], per_job["runs"]
         else:
+            filled = medians["push_filled"]
             per_step = ((medians.get("push_steps") or {}).get(job) or {}).get(step)
             if per_step is not None:
                 median, window = per_step["p50"], per_step["runs"]
@@ -224,33 +385,26 @@ def check_budgets(budgets, medians):
             "runs": window,
             "exceeded": median is not None and median > limit,
             "missing": median is None,
+            "short": not filled,
         })
     return rows
 
 
-def slowest_runs(*, window_runs, input_path, branch, limit=5):
-    """The slowest runs per event, for links in the issue table."""
-    links = {}
-    for event in ("push", "pull_request"):
-        payload = run_ci_timings(
-            ["runs", *selection(event, limit,
-                                input_path=input_path, branch=branch)]
-        )
-        ordered = sorted(
-            (payload.get("runs") or []),
-            key=lambda run: run.get("wall_seconds") or 0,
-            reverse=True,
-        )
-        links[event] = [
-            {"id": run.get("id"), "wall_seconds": run.get("wall_seconds")}
-            for run in ordered[:limit]
-            if run.get("id") is not None
-        ]
-    return links
+def repo_slug():
+    """`owner/repo` for the checkout, for run links in the issue body."""
+    result = gh("repo", "view", "--json", "nameWithOwner")
+    try:
+        return json.loads(result.stdout)["nameWithOwner"]
+    except (json.JSONDecodeError, KeyError) as error:
+        raise BudgetError(f"gh printed invalid JSON: {error}") from error
 
 
-def render_body(rows, *, window_runs, slowest):
-    """The full issue body: the budget table plus the marker line."""
+def render_body(rows, *, window_runs, medians, slug):
+    """The full issue body: the budget table plus the marker line.
+
+    The slowest runs come from the measured window itself, as links, so a
+    slow run older than the newest few is still one click away.
+    """
     lines = [
         "# CI critical-path budgets",
         "",
@@ -263,7 +417,9 @@ def render_body(rows, *, window_runs, slowest):
     ]
     for row in rows:
         entry = row["budget"]
-        if row["missing"]:
+        if row["short"]:
+            status = "SHORT WINDOW"
+        elif row["missing"]:
             status = "MISSING JOB/STEP"
         elif row["exceeded"]:
             status = "EXCEEDED"
@@ -278,12 +434,17 @@ def render_body(rows, *, window_runs, slowest):
     lines.append("")
     lines.append("Slowest runs in the window:")
     lines.append("")
-    for event, runs in slowest.items():
+    for event, runs in (
+        ("push", medians["slowest_push"]),
+        ("pull_request", medians["slowest_pr"]),
+    ):
         if not runs:
             lines.append(f"- {event}: n/a")
             continue
         items = ", ".join(
-            f"{run['id']} ({format_seconds(run['wall_seconds'])})" for run in runs
+            f"[{run['id']}](https://github.com/{slug}/actions/runs/"
+            f"{run['id']}) ({format_seconds(run['wall_seconds'])})"
+            for run in runs
         )
         lines.append(f"- {event}: {items}")
     lines.append("")
@@ -334,6 +495,10 @@ def find_issue(label):
     )
     try:
         issues = json.loads(result.stdout)
+        if not isinstance(issues, list):
+            raise BudgetError(
+                "gh printed invalid JSON: issue list is not a JSON array"
+            )
     except json.JSONDecodeError as error:
         raise BudgetError(f"gh printed invalid JSON: {error}") from error
     if len(issues) > 1:
@@ -346,11 +511,10 @@ def find_issue(label):
 
 def ensure_label(label):
     """Create the budget label when it does not exist yet."""
+    result = gh("label", "list", "--limit", "1000", "--json", "name")
     try:
-        names = {
-            entry["name"] for entry in json.loads(gh("label", "list").stdout)
-        }
-    except json.JSONDecodeError as error:
+        names = {entry["name"] for entry in json.loads(result.stdout)}
+    except (json.JSONDecodeError, KeyError) as error:
         raise BudgetError(f"gh printed invalid JSON: {error}") from error
     if label not in names:
         gh(
@@ -360,19 +524,33 @@ def ensure_label(label):
         )
 
 
-def report_issue(*, label, body, comment, dry_run):
-    """Create or update the one labelled issue; comment only on set change."""
+def report_issue(*, label, body, comment, dry_run, problems):
+    """Create, update, or close the one labelled issue.
+
+    An exceedance creates the issue (or rewrites it) and comments; a
+    recovered night rewrites the body and closes the issue, so the next
+    regression comments again. A comment goes out only when the exceeded
+    set changed between writes. `problems` is empty on a recovered night:
+    then there is no comment text, and an issue that was never opened
+    stays unopened.
+    """
     if dry_run:
         print("dry run: no issue write")
         print("")
         print(body)
-        if comment is not None:
-            print("would add comment:")
+        if problems:
+            print("would update the issue and add a comment:")
             print(comment)
+        else:
+            print("would rewrite the body and close the issue")
         return "dry-run"
-    ensure_label(label)
     issue = find_issue(label)
+    if issue is None and not problems:
+        return "absent"
+    ensure_label(label)
     if issue is None:
+        if not problems:
+            return "absent"
         created = gh(
             "issue", "create", "--label", label,
             "--title", "CI critical-path budget exceeded",
@@ -384,20 +562,30 @@ def report_issue(*, label, body, comment, dry_run):
         return "created"
     number = str(issue["number"])
     previous = read_marker(issue.get("body") or "")
+    current = read_marker(body)
     gh("issue", "edit", number, "--body", body)
-    if previous != read_marker(body):
+    if not problems:
+        gh("issue", "close", number)
+        return "closed"
+    if previous != current:
         gh("issue", "comment", number, "--body", comment)
         return "updated+commented"
     return "updated"
 
 
-def describe_row(row):
+def describe_row(row, window_runs):
     """One-line human summary of a checked budget row."""
     entry = row["budget"]
     where = (
         f"{entry['event']} {entry['job'] or '(run wall)'} "
         f"{entry['step'] or '(job wall)'}"
     )
+    if row["short"]:
+        return (
+            f"short window ({row['runs']} of {window_runs} green runs): "
+            f"median {format_seconds(row['median'])} vs budget "
+            f"{format_seconds(entry['median_seconds_max'])} ({where})"
+        )
     if row["missing"]:
         return (
             f"budget names a missing job/step: update scripts/ci-budgets.json "
@@ -437,11 +625,19 @@ def build_parser():
 
 
 def main(argv=None):
-    """Compare medians with budgets; optionally keep the issue current."""
+    """Compare medians with budgets; optionally keep the issue current.
+
+    A green night with `--report-issue` still rewrites the body and closes
+    the issue (the marker comparison decides the comment); without
+    `--report-issue` a green night only prints the table and exits 0. A
+    window that never filled fails the check: comparing a partial sample
+    with a budget calibrated on a full one would pass a drift it cannot
+    see.
+    """
     args = build_parser().parse_args(argv)
     try:
         config = load_budgets(args.budgets)
-        medians = fetch_medians(
+        medians = measure(
             window_runs=config["window_runs"],
             input_path=args.input,
             branch=args.branch,
@@ -450,38 +646,48 @@ def main(argv=None):
     except BudgetError as error:
         print(f"ci-budgets: error: {error}", file=sys.stderr)
         return 2
-    problems = [row for row in rows if row["exceeded"] or row["missing"]]
+    problems = [
+        row for row in rows
+        if row["exceeded"] or row["missing"] or row["short"]
+    ]
     for row in rows:
-        print(f"ci-budgets: {describe_row(row)}")
-    if not problems:
-        return 0
-    if not args.report_issue and not args.dry_run:
+        print(f"ci-budgets: {describe_row(row, config['window_runs'])}")
+    dry_run = args.dry_run and not args.report_issue
+    if problems and not args.report_issue and not dry_run:
         return 1
-    try:
-        links = slowest_runs(
-            window_runs=config["window_runs"],
-            input_path=args.input, branch=args.branch,
-        )
-    except BudgetError as error:
-        print(f"ci-budgets: error: {error}", file=sys.stderr)
-        return 2
-    body = render_body(rows, window_runs=config["window_runs"], slowest=links)
+    if not args.report_issue and not dry_run:
+        return 0
+    if dry_run:
+        body = render_body(rows, window_runs=config["window_runs"],
+                           medians=medians, slug="owner/repo")
+    else:
+        try:
+            body = render_body(rows, window_runs=config["window_runs"],
+                               medians=medians, slug=repo_slug())
+        except BudgetError as error:
+            print(f"ci-budgets: error: {error}", file=sys.stderr)
+            return 2
     names = ", ".join(
         f"{row['budget']['event']} {row['budget']['job'] or '(run wall)'} "
         f"{row['budget']['step'] or '(job wall)'}"
         for row in problems
     )
+    comment = (
+        f"CI budget check: exceeded, missing, or short window: {names}."
+        if names else None
+    )
     try:
         action = report_issue(
             label=config["issue_label"], body=body,
-            comment=f"CI budget check: exceeded or missing: {names}.",
+            comment=comment,
             dry_run=args.dry_run,
+            problems=problems,
         )
     except BudgetError as error:
-        print(f"ci-budgets: error: {error}", file=sys.stderr)
-        return 2
+        print(f"ci-budgets: {error}", file=sys.stderr)
+        return 1 if problems else 0
     print(f"ci-budgets: issue {action}")
-    return 1
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

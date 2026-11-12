@@ -69,10 +69,15 @@ trees, so its `test-selection-audit` artifact is excluded from this duplicate
 check. Under that profile the tests of xtask's `hermes::tests`
 run one at a time (test group `hermes-pty`), because its PTY scenarios take
 turns on an in-process mutex that a process per test cannot share.
+
 The nightly `ci-budgets` workflow checks per-step and per-job medians
-against `scripts/ci-budgets.json` and keeps the one `ci-budget`-labelled
-issue current. A pull request that makes a budgeted step faster lowers its
-budget in the same pull request; raising a budget needs a reason in its entry.
+over the newest 30 green `ci.yml` runs per event against
+`scripts/ci-budgets.json`. With `--report-issue` it keeps the one
+`ci-budget`-labelled issue current: an exceedance writes the table and
+adds a comment, while a recovered night rewrites the body and closes the
+issue, so the next regression comments again. A pull request that makes a
+budgeted step faster lowers its budget in the same pull request; raising
+a budget needs a reason in its entry.
 The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`,

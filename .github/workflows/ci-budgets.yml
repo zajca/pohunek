@@ -24,6 +24,13 @@ env:
   # directory, so a file a pull request adds there cannot shadow a module.
   PYTHONSAFEPATH: "1"
 
+  # A hung `gh` call would hold the runner until the 360-minute default,
+  # and the next night's run queues behind it, because the group never
+  # cancels. Keep the timeout well under the job's `timeout-minutes` so a
+  # stuck API call fails the job instead of hanging it: `gh` aborts the
+  # HTTP request this many seconds after it starts.
+  GH_TIMEOUT_SECONDS: "600"
+
 jobs:
   check:
     name: check budgets against medians
@@ -32,6 +39,7 @@ jobs:
       actions: read
       contents: read
       issues: write
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
