@@ -1119,6 +1119,23 @@ enum SessionAction {
         /// `backup/<branch>-<short-sha>` and reset the branch to the remote head.
         #[arg(long, requires = "from_remote")]
         reset_diverged: bool,
+        /// Fetch one extra ref from `origin` into the worktree's repository
+        /// without checking it out, pinned under
+        /// `refs/pohunek/sessions/<session_id>/fetched` until the worktree
+        /// binding is dropped. Requires `--branch` and `--fetch-commit`.
+        /// The GitHub pull-request example is `--fetch-ref refs/pull/<n>/head`.
+        /// Needs a daemon that advertises `session_new_fetch_ref_supported`.
+        #[arg(
+            long,
+            value_name = "REF",
+            requires = "branch",
+            requires = "fetch_commit"
+        )]
+        fetch_ref: Option<String>,
+        /// The full lowercase hex commit id (40 or 64 digits) the fetched ref
+        /// must peel to. Requires `--fetch-ref`.
+        #[arg(long, value_name = "SHA", requires = "fetch_ref")]
+        fetch_commit: Option<String>,
         /// Initial text to inject into the session after the PTY is spawned.
         #[arg(long, group = "initial_input")]
         input: Option<String>,
@@ -1791,6 +1808,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     base_branch,
                     from_remote,
                     reset_diverged,
+                    fetch_ref,
+                    fetch_commit,
                     input,
                     input_stdin,
                     input_ack_timeout_ms,
@@ -1822,6 +1841,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             base_branch,
                             from_remote,
                             reset_diverged,
+                            fetch_ref,
+                            fetch_commit,
                             input,
                             input_ack_timeout_ms,
                             request_timeout_ms,

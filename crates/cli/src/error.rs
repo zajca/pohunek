@@ -207,6 +207,39 @@ pub(crate) enum CliError {
         daemon_version: String,
     },
 
+    /// The host's daemon predates `session new --fetch-ref` and would drop
+    /// the extra ref silently instead of fetching it.
+    #[error(
+        "host '{host}' runs daemon {daemon_version}, which does not advertise \
+         `session_new_fetch_ref_supported`: --fetch-ref needs a daemon that advertises it \
+         (upgrade the daemon on that host); no session was created"
+    )]
+    SessionNewFetchRefUnsupported {
+        /// The host as the user typed it.
+        host: String,
+        /// Version the host's daemon reported.
+        daemon_version: String,
+    },
+
+    /// `--fetch-ref` and `--fetch-commit` travel together; one without the
+    /// other is a usage error caught before any connection is dialed.
+    #[error("--fetch-ref and --fetch-commit must be given together")]
+    SessionNewFetchRefIncomplete,
+
+    /// The daemon advertised `session_new_fetch_ref_supported` but omitted
+    /// `fetched_ref` from a first (non-replayed) response: a contract break.
+    /// The session was created; only the outcome report is unusable.
+    #[error(
+        "host '{host}' advertises `session_new_fetch_ref_supported` but did not report `fetched_ref`; \
+         session {session_id} is running without a usable fetch outcome"
+    )]
+    SessionNewFetchRefMissing {
+        /// The host as the user typed it.
+        host: String,
+        /// Id the daemon reported for the created session.
+        session_id: String,
+    },
+
     /// A remote `project add` named no PATH. A local path is meaningless on
     /// another host, so a remote add must give a path valid on that host; fails
     /// fast before any connection is dialed.
@@ -536,6 +569,31 @@ impl CliError {
                 Some(
                     "update and restart the pohunek daemon on that host to a release that advertises \
                      `session_new_branch_source_supported`, or start the session without --from-remote"
+                        .to_owned(),
+                ),
+            ),
+            CliError::SessionNewFetchRefUnsupported { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "session_new_fetch_ref_unsupported",
+                self.to_string(),
+                Some(
+                    "update and restart the pohunek daemon on that host to a release that advertises \
+                     `session_new_fetch_ref_supported`, or start the session without --fetch-ref"
+                        .to_owned(),
+                ),
+            ),
+            CliError::SessionNewFetchRefIncomplete => ProtocolError::new(
+                ErrorClass::Configuration,
+                "fetch_ref_incomplete",
+                self.to_string(),
+                Some("pass both --fetch-ref and --fetch-commit".to_owned()),
+            ),
+            CliError::SessionNewFetchRefMissing { .. } => ProtocolError::new(
+                ErrorClass::Daemon,
+                "fetch_ref_outcome_missing",
+                self.to_string(),
+                Some(
+                    "the session was created; inspect the session and the worktree before relying on the extra ref"
                         .to_owned(),
                 ),
             ),

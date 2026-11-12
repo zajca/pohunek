@@ -426,6 +426,10 @@ pub(crate) struct NewArgs {
     pub from_remote: bool,
     /// Keep a diverged local branch as a backup and reset it (`--reset-diverged`).
     pub reset_diverged: bool,
+    /// Extra ref on `origin` to fetch without checking out (`--fetch-ref`).
+    pub fetch_ref: Option<String>,
+    /// Commit the fetched ref must peel to (`--fetch-commit`).
+    pub fetch_commit: Option<String>,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
     /// Acknowledgement window for the initial input; the result then reports
@@ -689,7 +693,11 @@ async fn check_new_capabilities(
     cwd_requested: bool,
     args: &NewArgs,
 ) -> Result<(), CliError> {
-    if !(cwd_requested || args.from_remote || args.input_ack_timeout_ms.is_some()) {
+    if !(cwd_requested
+        || args.from_remote
+        || args.fetch_ref.is_some()
+        || args.input_ack_timeout_ms.is_some())
+    {
         return Ok(());
     }
     let capabilities = client
@@ -709,6 +717,12 @@ async fn check_new_capabilities(
             daemon_version: capabilities.daemon_version,
         });
     }
+    if args.fetch_ref.is_some() && !capabilities.session_new_fetch_ref_supported {
+        return Err(CliError::SessionNewFetchRefUnsupported {
+            host: host.to_owned(),
+            daemon_version: capabilities.daemon_version,
+        });
+    }
     if args.input_ack_timeout_ms.is_some() && !capabilities.session_new_input_ack_supported {
         return Err(CliError::SessionNewInputAckUnsupported {
             host: host.to_owned(),
@@ -716,6 +730,29 @@ async fn check_new_capabilities(
         });
     }
     Ok(())
+}
+
+/// The requested `fetched_ref` outcome, or `None` when no extra ref was
+/// requested. A daemon that advertises the capability but omits it from a
+/// first (non-replayed) response breaks the contract: the session exists, but
+/// the outcome report is unusable, so the failure is loud.
+fn requested_fetched_ref(
+    host: &str,
+    args: &NewArgs,
+    result: &protocol::SessionNewResult,
+) -> Result<Option<protocol::FetchedRef>, CliError> {
+    if args.fetch_ref.is_none() {
+        return Ok(None);
+    }
+    // A replay never carries the first response's `fetched_ref`.
+    let replayed = result.replayed == Some(true);
+    if result.fetched_ref.is_none() && !replayed {
+        return Err(CliError::SessionNewFetchRefMissing {
+            host: host.to_owned(),
+            session_id: result.session.id.0.clone(),
+        });
+    }
+    Ok(result.fetched_ref.clone())
 }
 
 /// Run `session new` on `host`.
@@ -807,10 +844,15 @@ pub(crate) async fn run_new(
     } else {
         None
     };
+    // A replay never carries the first response's `fetched_ref`.
+    let fetched_ref = requested_fetched_ref(host, &args, &result)?;
     if json {
         let mut value = serde_json::to_value(info)?;
         if let (Some(source), Some(object)) = (&result.worktree_source, value.as_object_mut()) {
             object.insert("worktree_source".to_owned(), serde_json::to_value(source)?);
+        }
+        if let (Some(fetched), Some(object)) = (fetched_ref.as_ref(), value.as_object_mut()) {
+            object.insert("fetched_ref".to_owned(), serde_json::to_value(fetched)?);
         }
         if let (Some(delivered), Some(object)) = (prompt_delivered, value.as_object_mut()) {
             object.insert(
@@ -828,6 +870,7 @@ pub(crate) async fn run_new(
             render_new_human(
                 info,
                 result.worktree_source.as_ref(),
+                fetched_ref.as_ref(),
                 prompt_delivered,
                 replayed,
             )
@@ -1796,7 +1839,16 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         metadata: parse_meta_pairs(&args.meta)?,
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
-        fetch_ref: None,
+        fetch_ref: match (&args.fetch_ref, &args.fetch_commit) {
+            (Some(source_ref), Some(commit)) => Some(protocol::FetchRefRequest {
+                source_ref: source_ref.clone(),
+                commit: commit.clone(),
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(CliError::SessionNewFetchRefIncomplete);
+            }
+        },
     })
 }
 
@@ -2026,6 +2078,7 @@ fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, 
 fn render_new_human(
     info: &SessionInfo,
     source: Option<&protocol::WorktreeSource>,
+    fetched: Option<&protocol::FetchedRef>,
     prompt_delivered: Option<bool>,
     replayed: bool,
 ) -> String {
@@ -2059,6 +2112,13 @@ fn render_new_human(
         if let Some(backup) = &source.backup_ref {
             let _ = writeln!(output, "  previous local head kept as: {backup}");
         }
+    }
+    if let Some(fetched) = fetched {
+        let _ = writeln!(
+            output,
+            "  fetched: {} -> {} at {}",
+            fetched.source_ref, fetched.fetched_ref, fetched.commit
+        );
     }
     if let Some(delivered) = prompt_delivered {
         let _ = writeln!(
@@ -2968,6 +3028,8 @@ mod tests {
             base_branch: None,
             from_remote: false,
             reset_diverged: false,
+            fetch_ref: None,
+            fetch_commit: None,
             input: None,
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
@@ -3065,6 +3127,8 @@ mod tests {
             base_branch: Some("main".to_owned()),
             from_remote: false,
             reset_diverged: false,
+            fetch_ref: None,
+            fetch_commit: None,
             input: Some("Fix #1234".to_owned()),
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
@@ -3722,7 +3786,7 @@ mod tests {
             },
         ];
 
-        let output = render_new_human(&session, None, None, false);
+        let output = render_new_human(&session, None, None, None, false);
 
         assert!(
             output.starts_with("session s-42 created (state: running)\n"),
