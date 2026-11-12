@@ -84,8 +84,9 @@ default features too: a test that exists only behind a Cargo feature is not in
 the list, because CI's macOS lane never builds it either. Without
 `--allow-missing-on-host` it fails by name; with the flag it is reported NOT
 STRESSED and belongs to the Linux run that builds it with `--all-features`.
-`--print` shows the selection without running anything (with `--slow-runner` it shows
-the SLOWED/NOT SLOWED split). A test
+`--print` shows the selection without running anything. With `--slow-runner` it
+prints the SLOWED/NOT SLOWED split, which it derives by running `cargo nextest list`
+(`-E '(<selection>) and (<union>)'`), so it builds the selected test binaries. A test
 the script cannot map or list fails the step by name; a `macro_rules!` that
 generates tests fails by the macro's name (stress the whole partition then). A
 diff that changes tests for two operating systems cannot pass on one host: run
@@ -112,8 +113,8 @@ reports them as NOT SLOWED; every other selected test runs under strace and is
 reported as SLOWED. NOT SLOWED means "ran pinned but not slowed", never
 "skipped": a NOT SLOWED failure is a FLAKY result like any other. To extend
 the list, add one entry with `filter` (a nextest filterset matching the test),
-a non-empty `reason`, and `evidence` (the fable-ci report section or the issue
-with the hang); keep the filters exact so no other test loses its slowdown.
+a non-empty `reason`, and `evidence` (an issue comment with the hang
+measurement, for example the `strace -f -c` hang count on #2213); keep the filters exact so no other test loses its slowdown.
 `--slow-runner` is Linux-only and conflicts with `--unpinned`. Each
 of the two runs gets the full `--deadline`, so the wall time can reach
 twice the deadline. A deadline
