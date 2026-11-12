@@ -90,15 +90,17 @@ multi-team control plane without replacing either owner path.
   acceptance eligibility policy, and host-enforced human input control
   (`task.input_control`). Amended 2026-11-06 (design-only): the owner answers,
   routed asks as the addressed answer path, and the shared `task` and ask MCP server.
-  This amendment is not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987).
-- [Ask channel RFC](design/ask-channel-rfc.md) — withdrawn 2026-11-12 (#1987), not planned: a durable ask
+  This amendment is not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987); only the ask parts
+  (routed asks, the ask tools) are affected, the task MCP server stays.
+- [Ask channel RFC](design/ask-channel-rfc.md) — withdrawn 2026-11-12 (#1987): the ask channel (Part A) is not planned,
+  and its amendments to the delegated task runs RFC are not planned; the Part B per-session rights
+  (AC-17 to AC-20, #2002-#2005) are held without milestone pending an owner decision. The RFC keeps a durable ask
   primitive between a running agent and its operator (answer kinds, outcomes,
   expiry, refine), emission through the MCP server and a CLI ask command, routing
   of native permission prompts where a hook can answer them, owner surfaces, a
   `secret` answer kind that returns references, and the Pohunek MCP server with
   per-session rights (a guardrail, not a boundary); MCP now, an A2A gateway
-  later. Amends the delegated task runs RFC (owner answers, routed asks as the
-  addressed answer path, the shared MCP server).
+  later.
 - [Relay dark factory RFC](https://github.com/pohunekd/pohunek-relay/blob/main/docs/design/relay-dark-factory-rfc.md) — accepted
   (in the relay repository): relay authorization, budgets, audit, task projections and escalation for
   unattended manager/auditor delegation over the team relay; the factory is a
