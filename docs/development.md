@@ -240,8 +240,7 @@ scripts/stress-changed-tests --base origin/main --count 50 --deadline 45m --prof
 Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
 for the shard helper. `profile.fast.default-filter` is the cost boundary;
 `scripts/test-partitions` subdivides it by package ownership, with an exact
-complement for heavy tests. Whole
-fixture-owning modules stay heavy: real
+complement for heavy tests. Whole fixture-owning modules stay heavy: real
 PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites,
 and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
 and CLI integration tests; `--lib` alone is **not** a cost boundary.

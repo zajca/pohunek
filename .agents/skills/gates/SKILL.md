@@ -140,17 +140,15 @@ scripts/gate-receipt run --gate fmt --max-age 24h -- /tmp/heavy-run.sh cargo fmt
 scripts/gate-receipt run --gate toolchain-pin --max-age 24h -- /tmp/heavy-run.sh scripts/check-rust-toolchain-pin
 scripts/gate-receipt run --gate clippy --max-age 24h -- /tmp/heavy-run.sh cargo clippy --workspace --all-targets --all-features
 scripts/gate-receipt run --gate darwin --max-age 24h -- /tmp/heavy-run.sh scripts/darwin-check
-scripts/gate-receipt run --gate bins --max-age 24h -- /tmp/heavy-run.sh cargo build -p pohunek-session-worker --bin pohunek-sessiond
 scripts/gate-receipt run --gate nextest --max-age 24h -- /tmp/heavy-run.sh cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 scripts/gate-receipt run --gate doctests --max-age 24h -- /tmp/heavy-run.sh cargo test --doc --workspace --all-features
-scripts/gate-receipt run --gate release-build --max-age 24h -- /tmp/heavy-run.sh cargo build --workspace --release
 scripts/gate-receipt run --gate docs --max-age 24h -- /tmp/heavy-run.sh cargo xtask docs check
 ```
 
-The `nextest` gate needs the transient `POHUNEK_*` session state kept out of
-the way only when it confuses the gate itself; the receipt key already
-excludes per-session identity, so no unsetting is needed around
-gate-receipt.
+`gate-receipt` runs the wrapped command with every `POHUNEK_*` variable
+removed from its environment (the `deliver-issue` local-environment rule)
+and keys no `POHUNEK_*` name, so no unsetting is needed around the
+invocation and receipts are shared across sessions.
 
 The final gate before a push may use a receipt only when that receipt was
 written for the exact tree being pushed; a receipt never carries a gate
@@ -170,11 +168,12 @@ A receipt is not accepted — the command runs again — when any of these holds
   different command-file hash, a different `CARGO_HOME` location, extra
   compiler flags or wrappers (`RUSTC`, `RUSTC_WRAPPER`,
   `RUSTC_WORKSPACE_WRAPPER`, `CARGO_ENCODED_RUSTFLAGS`, `RUSTC_BOOTSTRAP`),
-  or different tracked environment hashes. The session, daemon and worker
-  ids, the worker socket path, and the hook trace path are excluded, so a
-  second session reuses the receipt; anything else under `POHUNEK_*` stays
-  keyed and reruns the gate.
-- It is older than `--max-age`, or it ends in the future (beyond clock skew).
+  or different tracked environment hashes. No `POHUNEK_*` name is ever
+  keyed: `gate-receipt` strips every `POHUNEK_*` variable from the wrapped
+  command's environment, so a session variable can neither change a gate
+  result nor change the key.
+- It is older than `--max-age`, or it ends more than 60s in the future
+  (beyond clock skew).
 - It is not owned by the current uid, or it is readable or writable by
   group or others.
 - The store directory is not owned by the current uid, or is not mode 0700.
@@ -189,6 +188,13 @@ A receipt is not accepted — the command runs again — when any of these holds
   Their inputs live outside the key — the package tarball, the `--bin-dir`
   build outputs, the remote registry — so a receipt could skip a gate whose
   real inputs have moved.
+- A gate whose output under an ignored path feeds a later gate is never
+  wrapped: `bins` builds `pohunek-sessiond`, which the nextest daemon tests
+  spawn from beside the test binaries, and `release-build` fills
+  `target/release`, which the Hermes compatibility gate reads through
+  `--bin-dir`. Both outputs live under the ignored `target/`, outside the
+  key, so a skipped producer would leave a missing or stale artifact that a
+  later gate consumes. Build them every time.
 
 ## Narrower loops while iterating
 

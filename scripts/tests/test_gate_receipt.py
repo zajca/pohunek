@@ -22,16 +22,6 @@ TOOL = ROOT / "scripts" / "gate-receipt"
 
 RUSTC_TEXT = "rustc 1.96.0 (fake abcdef)\nbinary: rustc\n"
 CARGO_TEXT = "cargo 1.96.0 (fake 123456)\nrelease: 1.96.0\n"
-# Per-session identity the key excludes; mirroring these names here keeps the
-# scenarios honest about what the suite's own environment carries.
-SESSION_IDENTITY = (
-    "POHUNEK_SESSION_ID",
-    "POHUNEK_DAEMON_ID",
-    "POHUNEK_WORKER_ID",
-    "POHUNEK_WORKER_INSTANCE_ID",
-    "POHUNEK_WORKER_SOCKET_PATH",
-    "POHUNEK_HOOK_TRACE_PATH",
-)
 
 
 class GateReceiptCase(unittest.TestCase):
@@ -89,10 +79,10 @@ class GateReceiptCase(unittest.TestCase):
         self.write_tool("cargo", CARGO_TEXT)
         self.write_command("ok", "exit 0")
         self.env = dict(os.environ)
-        for name in SESSION_IDENTITY:
-            self.env.pop(name, None)
+        for name in list(self.env):
+            if name.startswith("POHUNEK_"):
+                del self.env[name]
         self.env["PATH"] = f"{self.bin}{os.pathsep}{self.env['PATH']}"
-        self.env.pop("POHUNEK_SESSION_ID", None)
 
     def write_tool(self, name, text):
         path = self.bin / name
@@ -233,36 +223,59 @@ class GateReceiptCase(unittest.TestCase):
         self.assertEqual(run_result.returncode, 0, run_result.stderr)
         self.assertEqual(self.marker_lines(), 2)
         self.assertIn("is not mode 0700", run_result.stdout)
+        self.assertIn("no receipt written", run_result.stdout)
         self.assertEqual(check_result.returncode, 1)
         self.assertIn("is not mode 0700", check_result.stdout)
         self.assertEqual(mode_after, oct(mode))
         self.assertEqual(self.run_gate("ok").returncode, 0)
         self.assertEqual(self.marker_lines(), 2)
 
-    def test_second_session_with_different_identity_reuses_the_receipt(self):
-        first_env = dict(self.env, POHUNEK_SESSION_ID="s-first")
-        self.assertEqual(self.run_gate("ok", env=first_env).returncode, 0)
-        self.assertEqual(self.marker_lines(), 1)
+    def test_session_state_neither_reaches_the_gate_nor_changes_the_key(self):
+        # A gate that records whether POHUNEK_SESSION_ID reached it. The
+        # marker has two lines per execution: `ran`, then the id or `unset`.
+        probe = self.bin / "probe"
+        probe.write_text(
+            "#!/bin/sh\n"
+            f'echo ran >> "{self.marker}"\n'
+            f'echo "${{POHUNEK_SESSION_ID-unset}}" >> "{self.marker}"\n'
+        )
+        probe.chmod(0o755)
+        first_env = dict(
+            self.env,
+            POHUNEK_SESSION_ID="s-first",
+            POHUNEK_FOO="non-identity-extra",
+            POHUNEK_WORKER_ID="worker-first",
+        )
+        result = self.run_gate("probe", env=first_env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = self.marker.read_text().splitlines()
+        self.assertEqual(runs[-2:], ["ran", "unset"])
         self.assertEqual(self.read_receipt().get("session"), "s-first")
+        # A second session with different POHUNEK_* state reuses the receipt:
+        # no POHUNEK_* name is keyed, so the key is unchanged.
         other = dict(
             self.env,
-            POHUNEK_SESSION_ID="s-other",
-            POHUNEK_DAEMON_ID="d-other",
-            POHUNEK_WORKER_ID="worker-other",
-            POHUNEK_WORKER_INSTANCE_ID="runtime-other",
-            POHUNEK_WORKER_SOCKET_PATH="/tmp/other-control.sock",
-            POHUNEK_HOOK_TRACE_PATH="/tmp/other-hooks.jsonl",
+            POHUNEK_SESSION_ID="s-second",
+            POHUNEK_WORKER_ID="worker-second",
+            POHUNEK_NEW_VARIABLE="never-seen",
         )
-        result = self.run_gate("ok", env=other)
+        result = self.run_gate("probe", env=other)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified; skipping", result.stdout)
+        self.assertEqual(len(self.receipts()), 1)
+        self.assertEqual(self.marker.read_text().splitlines(), runs)
+        receipt = self.read_receipt()
+        for name in receipt["env"]:
+            self.assertFalse(name.startswith("POHUNEK_"))
+
+    def test_second_session_with_different_identity_reuses_the_receipt(self):
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        self.assertEqual(self.marker_lines(), 1)
+        env = dict(self.env, POHUNEK_SESSION_ID="s-clone")
+        result = self.run_gate("ok", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.marker_lines(), 1)
         self.assertIn("verified; skipping", result.stdout)
-        self.assertEqual(len(self.receipts()), 1)
-        receipt = self.read_receipt()
-        # The skipping run does not rewrite the receipt with its own session.
-        self.assertEqual(receipt.get("session"), "s-first")
-        for name in SESSION_IDENTITY:
-            self.assertNotIn(name, receipt["env"])
 
     def test_malformed_receipt_is_rejected(self):
         for payload in ("not json\n", '{"schema": 1}\n'):
@@ -278,6 +291,61 @@ class GateReceiptCase(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self.marker_lines(), before + 1)
                 self.assertIn("running the command", result.stdout)
+
+    def test_future_end_beyond_skew_is_rejected(self):
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        receipt_path = self.receipts()[0]
+        receipt = json.loads(receipt_path.read_text())
+        receipt["end"] = "2999-01-01T00:00:00+00:00"
+        receipt_path.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+        before = self.marker_lines()
+        result = self.run_gate("ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.marker_lines(), before + 1)
+        self.assertIn("more than 60s in the future", result.stdout)
+
+    def test_working_directory_is_part_of_the_key(self):
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        self.assertEqual(self.marker_lines(), 1)
+        subdir = self.repo / "sub"
+        subdir.mkdir()
+        result = self.run_gate("ok", cwd=subdir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.marker_lines(), 2)
+        self.assertIn("running the command", result.stdout)
+
+    def test_committing_identical_content_keeps_the_key(self):
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        self.assertEqual(self.marker_lines(), 1)
+        head_before = self.read_receipt()["head"]
+        self.git("commit", "-qm", "same content", "--allow-empty")
+        head_after = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(head_before, head_after)
+        result = self.run_gate("ok")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.marker_lines(), 1)
+        self.assertIn("verified; skipping", result.stdout)
+        self.assertEqual(self.read_receipt()["head"], head_before)
+
+    def test_receipt_copied_under_another_key_is_rejected(self):
+        self.assertEqual(self.run_gate("ok").returncode, 0)
+        (self.repo / "untracked.txt").write_text("new\n")
+        before = self.marker_lines()
+        second = self.run_gate("ok")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.marker_lines(), before + 1)
+        first_receipt, second_receipt = self.receipts()
+        forged = second_receipt.read_text().replace(
+            json.loads(second_receipt.read_text())["key"],
+            json.loads(first_receipt.read_text())["key"],
+        )
+        second_receipt.write_text(forged)
+        try:
+            result = self.run_gate("ok")
+        finally:
+            second_receipt.unlink()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("is for a different key", result.stdout)
 
     def test_expired_receipt_is_rejected_without_sleep(self):
         self.assertEqual(self.run_gate("ok").returncode, 0)
@@ -320,10 +388,9 @@ class GateReceiptCase(unittest.TestCase):
         clone = self.tmp / "clone"
         self.git_clone(self.repo, clone)
         marker = self.tmp / "clone-marker"
-        self.write_command("ok", "exit 0")
         # The gate command resolves through PATH on the shared bin dir, so the
         # clone run uses the same argv to match the key; the second session
-        # carries different per-session identity.
+        # carries different POHUNEK_* state.
         self.bin.joinpath("ok").write_text(
             "#!/bin/sh\n" f'echo ran >> "{marker}"\n' "exit 0\n"
         )

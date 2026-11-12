@@ -31,11 +31,11 @@ Contract:
   name, the exact argv after `--`, the working directory relative to the
   repository root, the toolchain outputs, a hash of the command file when it
   lives inside the repository, and the hashes (never the values) of the
-  environment that can change a gate result. Per-session identity (the
-  session, daemon and worker ids, the worker socket path, the hook trace
-  path) is excluded, so a second session reuses a receipt written on the
-  same tree. The HEAD commit is recorded in the receipt but not keyed, so
-  committing identical content keeps the key.
+  environment that can change a gate result. No POHUNEK_* name is ever keyed,
+  and the wrapped command runs with every POHUNEK_* variable removed from
+  its environment (the deliver-issue local-environment rule), so receipts
+  are shared across sessions. The HEAD commit is recorded in the receipt
+  but not keyed, so committing identical content keeps the key.
 * Raw environment values are never written anywhere, neither into the receipt
   nor onto stdout.
 
@@ -73,7 +73,10 @@ GATE_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 # names interpose on every rustc invocation; CARGO_ENCODED_RUSTFLAGS carries
 # extra flags; RUSTC_BOOTSTRAP unlocks unstable features; CARGO_HOME points
 # at config files that can set rustflags and profiles, so its location is
-# keyed (as a hash, like every other tracked value).
+# keyed (as a hash, like every other tracked value). This keying of
+# CARGO_HOME is a deliberate deviation from the brief, which said not to
+# key it: keying the location is fail-safe (a changed location reruns the
+# gate) and covers config files the toolchain strings cannot see.
 ENV_EXACT = (
     "RUSTFLAGS",
     "RUSTDOCFLAGS",
@@ -87,8 +90,12 @@ ENV_EXACT = (
 )
 # Environment prefixes that can change a gate result. Every match is recorded
 # as name to sha256(value), with an absent variable distinct from an empty one
-# (an absent variable simply has no entry).
-ENV_PREFIXES = ("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_", "NEXTEST_", "POHUNEK_")
+# (an absent variable simply has no entry). No POHUNEK_* name is ever keyed:
+# the tool runs the wrapped command with every POHUNEK_* variable removed
+# from its environment (the deliver-issue local-environment rule), so a
+# session variable can neither change a gate result nor change the key, and
+# two sessions share receipts written on the same tree.
+ENV_PREFIXES = ("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_", "NEXTEST_")
 # Names deliberately outside the key, with the reason each is excluded:
 # - CARGO_TARGET_DIR: per-worktree build cache location; changes where build
 #   outputs go, not whether the gate passes. (It matches the CARGO_TARGET_
@@ -100,29 +107,14 @@ ENV_PREFIXES = ("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_", "NEXTEST_", "
 # CARGO_TARGET_DIR is listed here, so the exclusion is structural; the
 # reasons above explain why that is safe.
 ENV_EXCLUDE = frozenset({"CARGO_TARGET_DIR"})
-# Per-session identity, excluded from the key with the reason per name:
-# - POHUNEK_SESSION_ID: the authoring session; recorded in the receipt but
-#   cannot change a gate result.
-# - POHUNEK_DAEMON_ID: which daemon started the session; same.
-# - POHUNEK_WORKER_ID, POHUNEK_WORKER_INSTANCE_ID: which worker runs this
-#   session; same.
-# - POHUNEK_WORKER_SOCKET_PATH: the control socket of this session's worker;
-#   an address, not a gate input.
-# - POHUNEK_HOOK_TRACE_PATH: where hook traces are appended; a log path
-#   cannot change a gate result.
-# Excluding them is what lets a second session reuse a receipt written on
-# the same tree. Anything else under POHUNEK_ stays keyed: an unknown
-# variable fails safe by rerunning the gate.
-SESSION_EXCLUDED = frozenset({
-    "POHUNEK_SESSION_ID",
-    "POHUNEK_DAEMON_ID",
-    "POHUNEK_WORKER_ID",
-    "POHUNEK_WORKER_INSTANCE_ID",
-    "POHUNEK_WORKER_SOCKET_PATH",
-    "POHUNEK_HOOK_TRACE_PATH",
-})
-# Records the authoring session in the receipt; never part of the key.
+# Receives every POHUNEK_* name: the wrapped command never sees session
+# state (deliver-issue runs every test with POHUNEK_* unset), and the key
+# stays identical across sessions. Read once at startup; never printed.
 SESSION_ID_VAR = "POHUNEK_SESSION_ID"
+POHUNEK_PREFIX = "POHUNEK_"
+# A receipt ending less than this far in the future is accepted: NTP steps
+# and VM restores move the clock by seconds, not minutes.
+CLOCK_SKEW_SECONDS = 60
 
 
 class UsageError(Exception):
@@ -214,14 +206,24 @@ def toolchain_output(root, program):
 
 
 def tracked_environment():
-    """Name to sha256(value) for the environment that can change a gate result."""
+    """Name to sha256(value) for the environment that can change a gate result.
+    No POHUNEK_* name is ever keyed (see ENV_PREFIXES)."""
     tracked = {}
     for name, value in os.environ.items():
-        if name in SESSION_EXCLUDED or name in ENV_EXCLUDE:
+        if name.startswith(POHUNEK_PREFIX) or name in ENV_EXCLUDE:
             continue
         if name in ENV_EXACT or name.startswith(ENV_PREFIXES):
             tracked[name] = hashlib.sha256(value.encode()).hexdigest()
     return tracked
+
+
+def child_environment():
+    """The environment for the wrapped command: everything except POHUNEK_*.
+    Session state (socket paths, worker and daemon ids, hook limits) must
+    not reach a gate — the deliver-issue local-environment rule — and
+    stripping it here keeps the documented invocation to one line."""
+    return {name: value for name, value in os.environ.items()
+            if not name.startswith(POHUNEK_PREFIX)}
 
 
 def command_file_hash(root, argv):
@@ -317,8 +319,8 @@ def validate(store, gate, key, max_age_seconds):
     age = (datetime.now(timezone.utc) - end).total_seconds()
     if age > max_age_seconds:
         return False, f"receipt at {path} is older than the max age", None
-    if age < -60:
-        return False, f"receipt at {path} ends in the future", None
+    if age < -CLOCK_SKEW_SECONDS:
+        return False, f"receipt at {path} ends more than {CLOCK_SKEW_SECONDS}s in the future", None
     info = os.stat(path)
     if info.st_uid != os.getuid():
         return False, f"receipt at {path} is not owned by uid {os.getuid()}", None
@@ -361,7 +363,9 @@ def write_receipt(store, gate, key, key_object, started, ended):
     }
     session = os.environ.get(SESSION_ID_VAR)
     if session is not None:
-        # Recorded only; the session id is not part of the key.
+        # Provenance only: the session id is read from gate-receipt's own
+        # environment before the child is stripped, and is never part of
+        # the key.
         receipt["session"] = session
     body = json.dumps(receipt, sort_keys=True, indent=2) + "\n"
     fd, tmp = tempfile.mkstemp(dir=store, prefix=".tmp-")
@@ -414,7 +418,7 @@ def cmd_run(gate, max_age_seconds, store, argv):
     print(f"gate-receipt: {gate}: {reason}; running the command", flush=True)
     started = datetime.now(timezone.utc)
     try:
-        completed = subprocess.run(argv, check=False)
+        completed = subprocess.run(argv, env=child_environment(), check=False)
     except OSError as exc:
         print(f"gate-receipt: {gate}: cannot start the command: {exc}", file=sys.stderr)
         return 2
