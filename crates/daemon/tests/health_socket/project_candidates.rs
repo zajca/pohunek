@@ -646,3 +646,49 @@ async fn reached_bounds_are_reported_and_never_fail_the_call() {
     assert_documented_shape(&result);
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn history_directory_budget_counts_only_directories_the_walk_enters() {
+    // The three project directories fit the directory budget exactly. The
+    // auxiliary directory of session `s1` is listed beside `s1.jsonl` but not
+    // entered, so it uses no share of the budget.
+    let mut rig = Rig::start_with("pcand-dirs", |config| {
+        config.candidates.max_directories = 3;
+    })
+    .await;
+    let home = rig.home_dir();
+    let work = home.join("work");
+
+    let a = make_repo(&rig.home, &work.join("dir-a"), None);
+    let b = make_repo(&rig.home, &work.join("dir-b"), None);
+    let c = make_repo(&rig.home, &work.join("dir-c"), None);
+    let decoy = make_repo(&rig.home, &work.join("dir-decoy"), None);
+
+    let path = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
+    write_claude(&home, "-a", "s1", &[claude_user(&path(&a))]);
+    write_claude(
+        &home,
+        "-a/s1/subagents",
+        "agent-1",
+        &[claude_user(&path(&decoy))],
+    );
+    write_claude(&home, "-b", "s2", &[claude_user(&path(&b))]);
+    write_claude(&home, "-c", "s3", &[claude_user(&path(&c))]);
+
+    let result = rig
+        .candidates(serde_json::json!({ "sources": ["history"] }))
+        .await;
+    let mut expected = vec![a, b, c];
+    expected.sort();
+    assert_eq!(roots(&result), expected, "{result}");
+    assert!(
+        !roots(&result).contains(&decoy),
+        "the auxiliary log of a session is not a session: {result}"
+    );
+    assert_eq!(
+        result.get("limits_reached"),
+        None,
+        "a directory the walk does not enter uses no share of the directory budget: {result}"
+    );
+    rig.finish().await;
+}

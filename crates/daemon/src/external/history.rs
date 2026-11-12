@@ -171,11 +171,6 @@ fn walk(
                 if root.depth_limit().is_some_and(|max| depth >= max) {
                     continue;
                 }
-                if *directories_left == 0 {
-                    limits.insert(CandidateLimit::Entries);
-                    return;
-                }
-                *directories_left -= 1;
                 subdirectories.push(path);
             } else if file_type.is_file() && is_jsonl_path(&path) {
                 let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
@@ -198,6 +193,15 @@ fn walk(
             dir.file_name()
                 .is_none_or(|name| !session_files.contains(name))
         });
+        // The budget counts directories the walk enters, not directories it
+        // lists: a skipped sibling-session directory must not use it up.
+        for _ in &subdirectories {
+            if *directories_left == 0 {
+                limits.insert(CandidateLimit::Entries);
+                return;
+            }
+            *directories_left -= 1;
+        }
         // Reversed so the first (newest-named) directory is popped first.
         stack.extend(
             subdirectories
