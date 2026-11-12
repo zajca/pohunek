@@ -17,13 +17,12 @@ use pohunek_worker_protocol::LaunchProcess;
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundStateEvent,
     BlockedKind, CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
-    RuntimeInventoryEntry, RuntimeRef, RuntimeState, SessionAttachParams, SessionEvent, SessionId,
-    SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter,
-    SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
+    RuntimeInventoryEntry, RuntimeRef, RuntimeState, SessionAttachParams, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionNewParams,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult,
+    SessionState, SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -8209,12 +8208,7 @@ impl SessionRegistry {
     /// unchanged. The notification projector takes it as a baseline and
     /// notifies nothing.
     fn emit_replayed(&self, name: &str, info: &SessionInfo) {
-        let event = crate::events::event(
-            name,
-            event_payload(SessionEvent {
-                session: info.clone(),
-            }),
-        );
+        let event = crate::events::event(name, event_payload(SessionEventRef { session: info }));
         let _ = self.inner.produced_events.send(ProducedEvent {
             event: event.clone(),
             produced: std::time::Instant::now(),
@@ -8227,12 +8221,7 @@ impl SessionRegistry {
         if name == event::SESSION_REMOVED {
             self.inner.turns.forget(&info.id);
         }
-        let event = crate::events::event(
-            name,
-            event_payload(SessionEvent {
-                session: info.clone(),
-            }),
-        );
+        let event = crate::events::event(name, event_payload(SessionEventRef { session: info }));
         self.publish(event);
     }
 
@@ -8247,8 +8236,8 @@ impl SessionRegistry {
             .and_then(|runtime| runtime.worker_instance_id.clone());
         let event = crate::events::event(
             event::SESSION_NATIVE_RECOVERED,
-            event_payload(SessionNativeRecoveredEvent {
-                session: info.clone(),
+            event_payload(SessionNativeRecoveredEventRef {
+                session: info,
                 previous_worker_instance_id,
                 worker_instance_id,
             }),
@@ -8424,6 +8413,24 @@ where
     T: serde::Serialize,
 {
     serde_json::to_value(payload).expect("protocol event payload serialization is infallible")
+}
+
+/// Borrowed form of [`protocol::SessionEvent`]: serializes a session without
+/// cloning it. Its JSON must stay identical to the protocol type's.
+#[derive(serde::Serialize)]
+struct SessionEventRef<'a> {
+    session: &'a SessionInfo,
+}
+
+/// Borrowed form of [`protocol::SessionNativeRecoveredEvent`]. Keep the
+/// `skip_serializing_if` attributes of the protocol type so absent ids stay absent.
+#[derive(serde::Serialize)]
+struct SessionNativeRecoveredEventRef<'a> {
+    session: &'a SessionInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_worker_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_instance_id: Option<String>,
 }
 
 /// Whether cwd evidence observed at `observed_at` moves a live session to `cwd`.
