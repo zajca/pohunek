@@ -1474,7 +1474,7 @@ jobs:
         self.fixture.write_text(json.dumps(fixture))
         result = self.invoke("main")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("neither the commit nor the tree", result.stderr)
+        self.assertIn(f"has head SHA {THIRD_SHA}, expected", result.stderr)
 
     def test_a_dispatch_evidence_accepts_a_same_commit_source(self):
         # The dispatch evidence run is 789 on OTHER_SHA (the dispatch
@@ -1581,7 +1581,31 @@ jobs:
         result = self.invoke("main")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("tree match", result.stderr)
-        self.assertIn("neither the commit nor the tree", result.stderr)
+        self.assertIn("head SHA", result.stderr)
+
+    def test_a_dispatch_union_by_recorded_tree_refuses_a_third_commit(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=THIRD_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match", result.stderr)
+        self.assertIn(f"has head SHA {THIRD_SHA}, expected", result.stderr)
 
     def test_a_reuse_union_on_the_tree_path_is_refused_for_a_red_source(self):
         union_fixture(self)

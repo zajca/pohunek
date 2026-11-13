@@ -148,7 +148,7 @@ def evidence_commit_match(source: dict, sha: str) -> str | None:
     source's commit is the evidence run's commit."""
     if source.get("head_sha") == sha:
         return None
-    return f"has neither the commit nor the tree of {sha[:7]}"
+    return f"has head SHA {source.get('head_sha')}, expected {sha}"
 
 
 def evidence_tree_match(source: dict, sha: str, tree: str, lookup) -> str | None:
