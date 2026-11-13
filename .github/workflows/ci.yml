@@ -47,27 +47,30 @@ on:
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI [tier={0}]{1}{2}', inputs.tier, inputs.dispatch_id != '' && format(' [dispatch={0}]', inputs.dispatch_id) || '', inputs.delta && ' [delta]' || '') || ' ' }}
 
 
-# A verdict-set job that fails deterministically in a pull request or
-# `workflow_dispatch` run cancels the run (#1075, narrowed by #2205): the
-# job's `Cancel the run (fail fast)` step uses .github/actions/cancel-run,
-# and only the jobs in the `test-selection-verdict` `needs:` list (minus the
-# advisory `audit`, the fail-open selectors and the verdict itself) carry it.
-# A failure that an infrastructure tag marks as network-like never cancels
-# (see below); a job outside the verdict set never cancels either, so the
-# called-workflow watchers are gone. The step needs `actions: write`, granted
-# per job and never for the workflow. Push runs, scheduled runs, the advisory
-# audit job and a job that was itself cancelled never trigger it. The failing
-# job and the run end as `cancelled`, so no job shows `failure` on the run page;
-# the `::error` annotation on the failed job's check run (and its job summary)
+# A cancelling-set job that fails deterministically in a pull request or
+# `workflow_dispatch` run cancels the run (#1075): the job's
+# `Cancel the run (fail fast)` step uses .github/actions/cancel-run. The
+# cancelling set is the jobs in the `test-selection-verdict` `needs:` list
+# minus the advisory `audit` and the fail-open `test-selection` and `reuse`
+# decisions, plus the two jobs that also carry the step outside the verdict
+# set (`package-version-bump`, `docs`); every other job never cancels, and
+# a called workflow never cancels either: its failure shows as `failure` on
+# the run page. The step needs `actions: write`, granted per job and never
+# for the workflow. Push runs, scheduled runs, the advisory audit job and a
+# job that was itself cancelled never trigger it. The failing job and the
+# run end as `cancelled`, so no job shows `failure` on the run page; the
+# `::error` annotation on the failed job's check run (and its job summary)
 # names the job's display name, job id, link and failed step.
 # Infrastructure marking (#2205) is deterministic: `env.CI_INFRA_FAILURE` (set
 # by .github/scripts/ci-retry when its retries are exhausted) or a failed
 # network `uses:` step tagged with an `infra-` id (taiki-e/install-action,
 # actions/download-artifact and upload-artifact, actions/setup-node,
-# actions/cache restore, oven-sh/setup-bun, actions/checkout). Such a failure
+# actions/cache restore, oven-sh/setup-bun, actions/checkout). A failure
+# tagged as infrastructure (an exhausted retry or a failed network step)
 # never runs the cancel step; instead the `Note the infrastructure failure
-# (no cancel)` step writes a `::notice` and the run continues, so rerunning
-# the failed job alone is the recovery.
+# (no cancel)` step writes a `::notice` and the run continues. Check the
+# step log: a deterministic failure of a retried command is tagged too,
+# so rerunning the failed job alone recovers only from a flaky download.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
 # drain (#1209): the running main run completes, and GitHub keeps only the
 # newest push pending behind it, replacing an older pending one. Each scheduled
@@ -412,8 +415,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # The macOS packages the PR lane does not test (issue #361): their macOS-only
   # test code runs here on main and nightly, never on a pull request.
@@ -565,8 +568,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Native Apple Silicon packaging (issue #104): the daemon archive is packaged
   # from the binaries of `macos-release-build`, and the nightly tier rebuilds
@@ -765,8 +768,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Lints the macOS-only code on a Linux runner in about two minutes cold
   # (issue #365), so a `cfg(target_os = "macos")` compile or lint error fails a
@@ -825,8 +828,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Selects the pull request's tests with the selector of its merge base
   # (scripts/ci-test-selection); every other event runs every test. A test
@@ -1068,8 +1071,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
@@ -1182,8 +1185,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
@@ -1481,8 +1484,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   integration:
     name: tests (heavy, PTY + Hermes)
@@ -1600,8 +1603,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
   # user manager (transient worker units, the namespaced daemon unit, the
@@ -1749,6 +1752,11 @@ jobs:
     uses: ./.github/workflows/upgrade.yml
     permissions:
       contents: read
+
+  # G3 of #1218: each package's tests run from a tree holding only the files
+  # whose change selects that package, so a test that reads a path outside
+  # its selector's map fails here every night instead of passing a narrowed
+  # pull request with the path absent from its selection.
   test-selection-audit:
     name: test selection audit (G3)
     needs: [build-tests]
@@ -1889,8 +1897,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
@@ -1990,8 +1998,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Full release build: schedule, push to main, manual dispatch, or a pull
   # request that changes a `release` filter input.
@@ -2050,6 +2058,13 @@ jobs:
       contents: read
     with:
       mode: rehearsal
+
+  # The rehearsal's synthetic-archive smoke scenarios (issue #1259, D1/D2).
+  # The scenarios read only this checkout, so the job waits for `changes`
+  # alone: it starts in parallel with the rehearsal build and before the
+  # bundle assembly, instead of after both. Its result is required by the
+  # rehearsal verdict through `scenarios_result` on the evidence call below;
+  # a failure, cancellation or skip fails the run's evidence.
   release-rehearsal-scenarios:
     name: release rehearsal (archive smoke scenarios)
     needs: [changes]
@@ -2057,6 +2072,7 @@ jobs:
     uses: ./.github/workflows/release-smoke-scenarios.yml
     permissions:
       contents: read
+
   release-rehearsal:
     name: release rehearsal (evidence, assembly, archive smoke)
     needs: [changes, release-rehearsal-build, release-rehearsal-scenarios]
@@ -2075,6 +2091,14 @@ jobs:
       # them in a release only). The verdict refuses a rehearsal whose external
       # scenario result is not `success`.
       scenarios_result: ${{ needs.release-rehearsal-scenarios.result }}
+
+  # The release gate's test steps, run between releases (#1727): in the
+  # nightly tier (schedule or a nightly dispatch) and on a pull request that
+  # changes a `release_gate` filter input. It never runs on push to main or a
+  # `main` dispatch, and the main tier does not require it. A break in the
+  # gate shows here, not on the next tag; the tag's nightly evidence requires
+  # this job. The called workflow needs only `contents: read`, so a fork or
+  # Dependabot pull request runs it too.
   release-gate:
     name: release gate (full test set)
     needs: changes
@@ -2082,6 +2106,11 @@ jobs:
     uses: ./.github/workflows/gate-tests.yml
     permissions:
       contents: read
+
+  # TS-binding drift is gated by paths filter (issue #125); it only runs on
+  # schedule, push to main, manual dispatch (always a full run), or when the
+  # protocol/generation inputs change.
+  # It is kept as its own job so `docs check` always runs every PR.
   ts-drift:
     name: TS binding drift (xs check)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
@@ -2609,10 +2638,12 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     permissions:
       contents: read
+      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           # The release commit of the baseline has to be in the history.
           fetch-depth: 0
@@ -2730,6 +2761,16 @@ jobs:
   # credential and no model call. The always-running unit tests in the same
   # test binary keep the descriptor, the supported range and the lock in sync;
   # this job proves the locked release still behaves as they say.
+
+      - name: Cancel the run (fail fast)
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
   pi-package:
     name: Pi runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
@@ -3527,8 +3568,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Each test runs at most once per OS in a run (#1226): this job reads every
   # JUnit report of the run and fails on a test two jobs of the same OS ran,
@@ -3551,7 +3592,7 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
+      actions: read
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -3668,8 +3709,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
   # selection whose every changed file has no Rust tests and no gate but
@@ -3797,8 +3838,8 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure' || steps.infra-6.outcome == 'failure' || steps.infra-7.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # The SDK workspace on Apple Silicon (issue #103): typecheck, lint, unit
   # tests, and the SDK e2e suite against the real macOS pohunekd,
@@ -3921,8 +3962,10 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -3941,6 +3984,16 @@ jobs:
         run: cargo xtask docs check
         env:
           RUSTFLAGS: -D warnings
+
+      - name: Cancel the run (fail fast)
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   feature-matrix:
     name: cargo-hack (feature powerset)
@@ -4078,5 +4131,5 @@ jobs:
         if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
         shell: bash
         run: |
-          set -eu
-          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}; not cancelling, rerun this job alone"
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"

@@ -161,50 +161,40 @@ opens a new issue and comments again. A pull request that makes a budgeted step
 faster lowers its budget in the same pull request; raising a budget needs a reason
 in its entry.
 
-**Fail fast.** When a verdict-set job of a pull request run or a
+**Fail fast.** When a cancelling-set job of a pull request run or a
 `workflow_dispatch` run of `ci.yml` fails for a deterministic cause, its
 `Cancel the run (fail fast)` step (the composite `.github/actions/cancel-run`)
 cancels the run, so the jobs that are still running free their runners for
-other work. Only the jobs in the `test-selection-verdict` `needs:` list carry
-that step (minus the advisory `cargo-audit`, the two fail-open selectors and
-the verdict itself), so a job outside the verdict set never cancels the run:
-the five `cancel-after-<job>` watchers of the called workflows are gone, and
-`systemd-supervision` no longer cancels either. Push runs (`main` drains),
+other work. The cancelling set is the jobs in the `test-selection-verdict`
+`needs:` list minus the advisory `cargo-audit` and the fail-open
+`test-selection` and `reuse` decisions, plus `package-version-bump` and `docs`;
+every other job never cancels, and a called workflow never cancels either:
+its failure shows as `failure` on the run page. Push runs (`main` drains),
 scheduled runs, the advisory `cargo-audit` job and a job that was itself
-cancelled never trigger it. An infrastructure failure on a verdict job never
-cancels either (issue #2205): a network `uses:` step of the brief's list
-(`taiki-e/install-action`, `actions/download-artifact` and `upload-artifact`,
-`actions/setup-node`, `actions/cache` restore, `oven-sh/setup-bun`,
-`actions/checkout`) carries an `infra-` `id:`, and a `ci-retry` run whose
-retries are exhausted sets `env.CI_INFRA_FAILURE`; the fail-fast step's `if:`
-requires all of them to be clear, and the following `Note the infrastructure
-failure (no cancel)` step writes a `::notice` instead, so the run continues
-and rerunning the failed job alone recovers from a flaky download. Read such a
-run accordingly: when a deterministic failure cancels, the job that failed and
-the run end as `cancelled`, while the failed step stays red in the job log and
-the step's `::error` annotation (`Fail fast`) names the job that failed first.
-The annotation and the job summary sit on the failed job's check run (not on
-the run page) and give the job's display name (for example `tests (cli, fast)`),
-its job id, a link by check run id and the step that failed. The name and step
-come from the jobs API on a best-effort basis, bounded to 20 seconds
-(`LOOKUP_TIMEOUT_SECONDS`, enforced by a bash watchdog because the macOS callers
-have no GNU `timeout`); without them the message falls back to the job id and
-the link, and with an empty `job.check_run_id` the lookup and the job link are
-skipped (the run link stays). The cancel happens in every case. The jobs with a
-relocated checkout copy the `cancel-run` action out of the checkout first, so
-every job uses the same script (`.github/actions/cancel-run/cancel-run.sh`).
-So a cancelled job in a pull request run can mean that another job failed first:
-open the cancelled jobs and look for the one whose step list has a red step
-followed by the executed `Cancel the run (fail fast)` step. The
-`test selection verdict` check still runs after the cancel and is red when a
-job it waits for failed or was cancelled; a job that decides the pull request
-outside the verdict no longer ends the run. A job that hits its
-`timeout-minutes` is cancelled by GitHub and does not trigger the step, and the
-two selector jobs (`test selection`, `runtime package selection`) do not carry
-it, because a failed selection runs everything instead of ending the run. A
-fork or Dependabot pull request has a read-only token, so the cancel call is
-refused and
-the run keeps its real failure.
+cancelled never trigger it. An infrastructure failure never cancels either
+(issue #2205): a network `uses:` step of the `is_network_step` list in
+`scripts/tests/test_ci_tiers.py` (`taiki-e/install-action`,
+`actions/download-artifact` and `upload-artifact`, `actions/setup-node`,
+`actions/cache` restore, `oven-sh/setup-bun`, `actions/checkout`) carries an
+`infra-` `id:`, and a `ci-retry` run whose retries are exhausted sets
+`env.CI_INFRA_FAILURE`; the fail-fast step's `if:` requires all of them to
+be clear, and the following `Note the infrastructure failure (no cancel)`
+step writes a `::notice` instead, so the run continues. A failure tagged as
+infrastructure (an exhausted retry or a failed network step) is only the
+infra class: a deterministic failure of a retried command is tagged too, so
+check the step log first — rerunning the failed job alone recovers only
+from a flaky download. Read such a run accordingly: when a deterministic
+failure cancels, the job that failed and the run end as `cancelled`, while
+the failed step stays red in the job log and the step's `::error`
+annotation (`Fail fast`) names the job that failed first. So a cancelled
+job in a pull request run can mean that another job failed first. The
+`test selection verdict` check still runs after the cancel and is red when
+a job it waits for failed or was cancelled. A job that hits its
+`timeout-minutes` is cancelled by GitHub and does not trigger the step, and
+the two selector jobs (`test selection`, `runtime package selection`) do not
+carry it, because a failed selection runs everything instead of ending the
+run. A fork or Dependabot pull request has a read-only token, so the cancel
+call is refused and the run keeps its real failure.
 
 **Delta dispatch.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
 accepts `delta: true`: the `delta reuse` job finds the newest pull

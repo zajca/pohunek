@@ -53,8 +53,9 @@ loop around them.
    worker on a remote host (for example macOS) for platform evidence.
 3. **Watchers** (each as a Monitor or a background loop that exits on the
    event; re-arm on expiry):
-   - a CI fail-fast watcher that cancels a PR or dispatch run with a real
-     failed job (queued and in-progress runs, skip a branch on request);
+   - a CI fail-fast watcher that cancels a PR or dispatch run only for a
+     failed job of the cancelling set whose failure is not tagged as
+     infrastructure (queued and in-progress runs, skip a branch on request);
    - a state watcher for the PRs on the critical path (head, checks, dispatch,
      `main`), emitting only changes;
    - an idle subscription on each worker (one-shot; re-subscribe after each
