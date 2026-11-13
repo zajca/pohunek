@@ -4291,7 +4291,7 @@ Canonical public codes currently emitted include:
 |---|---|
 | `configuration` | `paths_unavailable`, `overlay_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict`, `integration_home_ambiguous_owner`, `session_new_secret_env_relay_refused` |
 | `daemon` | `version_mismatch`, `native_store_check_task_panicked`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down`, `hook_schema_unavailable`, `candidates_home_unavailable`, `session_new_secret_env_unsupported`, `session_new_request_id_unsupported`, `session_new_context_pin_unsupported`, `session_new_fetch_ref_unsupported`, `command_unsupported`, `package_install_commands_unsupported`, `notifications_unavailable` |
-| `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_state_restricted`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `remote_discovery_failed` |
+| `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_state_restricted`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `host_identity_unpinnable`, `host_identity_mismatch`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `session_request_in_progress`, `session_request_conflict`, `agent_profile_not_found`, `invalid_profile`, `secret_env_not_declared`, `secret_env_missing`, `secret_env_invalid`, `agent_not_resumable`, `agent_native_reference_missing`, `agent_native_store_relocated`, `native_identity_missing`, `native_identity_unverified`, `native_identity_uncertain`, `native_identity_evidence_unavailable`, `native_report_unattested`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `integration_no_managed_runtime`, `bundle_unavailable`,`assistant_package_missing`, `assistant_daemon_outdated`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `session_input_stalled`, `session_cwd_missing`, `session_tmpdir_unsafe`, `session_tmpdir_failed`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `base_branch_fetch_failed`, `worktree_branch_in_use`, `worktree_add_failed`, `hook_required_failed`, `branch_fetch_failed`, `remote_branch_not_found`, `branch_diverged`, `backup_ref_exists`, `fetch_ref_not_found`, `fetch_ref_commit_mismatch`, `fetch_ref_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible`, `launch_input_invalid`, `launch_input_unavailable`, `integration_overlay_unavailable`, `integration_launch_arg_conflict`, `integration_hook_path_conflict`, `cline_launch_arg_refused`, `cline_launch_env_refused`, `cline_data_root_invalid`, `cline_config_home_missing`, `command_package_not_installed`, `command_not_selected`, `command_not_declared`, `command_not_exposed`, `command_package_disabled`, `command_busy`, `command_failed`, `command_timed_out`, `command_output_too_large`, `command_output_not_utf8`, `command_unavailable` |
 
 In the `discovery` row `<overlay>` is `netbird` or `tailscale`: `netbird_cli_missing`,
@@ -5003,6 +5003,7 @@ Public exports:
   `diagnose_overlays(registry, budget)` returns the `OverlayDiagnostic` of every
   configured overlay, a provider that has not answered within `budget` reported
   as unavailable.
+- `ClientError::HostIdentityMismatch { host, overlay, address, expected, reported }`: a static peer's daemon reported a host id other than the one pinned in `overlays.toml`. The connection is dropped and no other request was served; the mapping is `host_identity_mismatch` (`discovery` class). `OverlayConfig::registry_without_static_peers()` builds the daemon registry without static peers, so `host.resolve` through the daemon never names a static peer, and `discover_peers`/`discover_snapshot`/`host discover`/`host list` never list one.
 - `ClientError::HostUnreachable { host, overlay, address, port, source }`: a
   connection to a resolved peer failed. `overlay` is `None` when the caller
   dialled an address it resolved itself (`connect_trusted_tcp_addr*`,
@@ -5010,6 +5011,10 @@ Public exports:
   overlay, the address and the port in `msg` and, when the overlay is known,
   hints in `recover` that the remote host's `overlays.toml` must list that
   overlay.
+- `resolve_host_peer_in(overlay, selector, registry, ...)`: for a static peer
+  the returned `address` is safe to dial only behind the host-id check that
+  `Client` runs when it dials the `pinned_route`; a caller that dials
+  `address` itself skips that check.
 - `Client`: framed request/response and subscription client.
 - `ClientOptions`: `request_timeout` and `connect_timeout`, both defaulting to
   5 seconds, and `origin_source`, set with `with_origin_source`. A typed
@@ -5153,8 +5158,9 @@ CLI belongs in the file. Every failure, including an unusable
 `POHUNEK_REMOTE_PORT`, is `overlay_configuration_invalid` (class
 `configuration`; before this code an unusable `POHUNEK_REMOTE_PORT` reported
 `netbird_configuration_invalid`). Its message names the file and at most a line
-number, never a value from the file, and no provider is consulted before it is
-raised. The daemon validates the file before it takes a lock, migrates the store
+number, never a value from the file — a `netbird` table failure names the
+validated key (`netbird.static_peers.<key>` and the failed field), still never
+a value — and no provider is consulted before it is raised. The daemon validates the file before it takes a lock, migrates the store
 or adopts a worker, and exits with the same code in its error text. The daemon
 reads the file at start, so a change applies after a daemon restart. A CLI of
 this release reads `port` from the file while an older daemon still binds the
@@ -5162,7 +5168,7 @@ environment value or 18722, and so does a client of an earlier release (a CLI
 on another host, or a Rust client pinned to an earlier tag such as the
 `pohunek-work` gateway): set `port` only after every daemon and every client that
 dials those hosts runs this release and the daemons are restarted. A pinned
-client adopts the file when it bumps its pin.
+client adopts the file when it bumps its pin. With `providers = ["netbird"]` the file may also carry `[netbird]` (`subnet`, an IPv4 network inside `100.64.0.0/10` from `/10` to `/30`, no host bits) and 1–32 `[netbird.static_peers.<name>]` entries with `address`, `fqdn` and a required `host_id`; the key is a lowercase DNS label other than `local`, the `{key, first fqdn label}` sets of two entries are disjoint, `address`/`fqdn`/`host_id` are pairwise distinct across entries, the `fqdn` is a lowercase DNS name of at least two labels at most 253 bytes with no trailing dot, and `address` must lie inside `subnet` (not the network or broadcast address). Those entries are used only while the NetBird overview is restricted (NetBird 0.83+, daemon status `Connected`); the client verifies the pin with `host.governance.inspect` before any other request on that connection (`host_identity_mismatch` on a mismatch), and before a raw stream (`connect_raw_with_options`, `attach_raw_with_options`) the pin is pre-proved on a separate framed connection on that same path, after which the raw stream itself opens unverified. Static peers never appear in `host discover`/`host list`. When a full status is available it wins and the static table is cross-checked against it (`overlay_configuration_invalid` on a contradiction). The residual gap is a different mesh member that took the pinned address and reports the pinned host id itself; the id is self-reported and not detected. The daemon (`host.resolve`, and so the TypeScript SDK) never resolves static peers; one dialing through `host.resolve` therefore refuses them as `netbird_state_restricted`. Upgrade every binary and pinned client first. An older `pohunekd` refuses to start with the new table (the file is a schema error), and an older release rejects it as an unknown key. Invalid `port`/`netbird` values are `overlay_configuration_invalid` and name only the entry key, never a value.
 
 Diagnostics. `pohunek doctor` checks the overlays that are configured instead
 of NetBird unconditionally: one `<overlay>_cli` check per overlay, in the place
@@ -5246,7 +5252,9 @@ Connection APIs:
   connecting to it looks the peer up by identity and a renamed or reassigned
   short name cannot select another peer; the address may change. `display` is the
   name the caller typed. A peer with neither a peer id nor an FQDN fails with
-  `host_identity_unpinnable`. `pinned_host_id(overlay, peer_id, fqdn)` builds the
+  `host_identity_unpinnable`; a static peer whose daemon reports a different
+  host id than the pinned one fails with `host_identity_mismatch`.
+  `pinned_host_id(overlay, peer_id, fqdn)` builds the
   `<overlay>:<selector>` part that fan-out targets share.
 - `Client::connect_resolved_with_options(&resolved, socket_path, options)`:
   connects to a `ResolvedHost`; lookup failures and connection errors name

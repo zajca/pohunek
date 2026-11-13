@@ -1,0 +1,4 @@
+---
+kind: added
+---
+The owner can list static NetBird peers in `overlays.toml` (`[netbird.static_peers.<name>]` with `address`, `fqdn` and a required `host_id` under `[netbird] subnet`, 1–32 entries; the subnet inside `100.64.0.0/10` up to `/30`), so a non-owner account under NetBird 0.83+ reaches the configured peer. The client verifies the pinned host id with `host.governance.inspect` before any other request; a different id is refused as `host_identity_mismatch`. Static peers never appear in `host discover`/`host list`. Upgrade every binary and pinned client first: an older `pohunekd` refuses to start with the new table, and an older release rejects it as an unknown key. The pin does not detect a different mesh member that took the pinned address and reports the pinned host id itself (the id is self-reported). ([#2310](https://github.com/zajca/pohunek/issues/2310))

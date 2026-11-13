@@ -56,6 +56,8 @@ mod host_pin_session;
 mod integration_hooks;
 #[path = "json_usage_errors.rs"]
 mod json_usage_errors;
+#[path = "netbird_static_peers.rs"]
+mod netbird_static_peers;
 #[path = "newer_daemon.rs"]
 mod newer_daemon;
 #[path = "notification_lifecycle_cut.rs"]

@@ -204,6 +204,7 @@ fn resolved_peer(peer: &Node) -> ResolvedPeer {
         display_name: peer.fqdn().and_then(peers::short_name).map(str::to_owned),
         fqdn: peer.fqdn().map(str::to_owned),
         address,
+        expected_host_id: None,
     }
 }
 

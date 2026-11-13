@@ -178,6 +178,24 @@ pub enum ClientError {
         host: String,
     },
 
+    /// The daemon at a static-peer address reported a host id that does not
+    /// match the one pinned for that entry in `overlays.toml`.
+    #[error(
+        "host '{host}' at {address} reports host id {reported}, but overlays.toml pins {expected}"
+    )]
+    HostIdentityMismatch {
+        /// Host name as the caller typed it.
+        host: String,
+        /// Overlay the address was resolved through, when known.
+        overlay: Option<String>,
+        /// Address whose daemon reported the other host id.
+        address: IpAddr,
+        /// The host id pinned in `overlays.toml`.
+        expected: String,
+        /// The host id the daemon reported.
+        reported: String,
+    },
+
     /// An overlay TCP connection to the host's daemon port could not be opened.
     #[error(
         "could not open an overlay connection to host '{host}' ({}): {source}",
@@ -420,6 +438,21 @@ impl ClientError {
                         .to_owned(),
                 ),
             ),
+            ClientError::HostIdentityMismatch {
+                host,
+                address,
+                reported,
+                expected,
+                ..
+            } => ProtocolError::new(
+                ErrorClass::Discovery,
+                "host_identity_mismatch",
+                format!("host '{host}' at {address} reports host id {reported}, but overlays.toml pins {expected}"),
+                Some(
+                    "the address of this static peer now belongs to another host, or the host's identity was recreated: run pohunek host governance inspect local on the intended host and correct address or host_id of its entry in overlays.toml"
+                        .to_owned(),
+                ),
+            ),
             ClientError::InvalidRemoteRoute { route, detail } => ProtocolError::new(
                 ErrorClass::Configuration,
                 "invalid_remote_route",
@@ -561,14 +594,17 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
             format!("{overlay}_state_restricted"),
             format!("{overlay} detailed status is restricted to the owner of the {overlay} connection: {detail}"),
             Some(format!(
-                "run pohunek as the account that owns the {overlay} connection, or pin {overlay} below the release that restricts status (NetBird 0.83); see docs/knowledge/guides/remote-hosts.md"
+                "run pohunek as the account that owns the {overlay} connection, list the host as a static peer in overlays.toml, or pin {overlay} below the release that restricts status (NetBird 0.83); see docs/knowledge/guides/remote-hosts.md"
             )),
         ),
         overlay::OverlayError::InvalidConfig { detail, .. } => ProtocolError::new(
             ErrorClass::Configuration,
-            format!("{overlay}_configuration_invalid"),
-            format!("{overlay} configuration is invalid: {detail}"),
-            Some("fix the overlay configuration and restart the command".to_owned()),
+            "overlay_configuration_invalid",
+            format!("overlays.toml does not match current {overlay} state: {detail}"),
+            Some(
+                "correct or remove the static peer in overlays.toml; `netbird status` run as the account that owns the NetBird connection shows the current addresses"
+                    .to_string(),
+            ),
         ),
         overlay::OverlayError::ListenerAddressMissing { reason, .. } => ProtocolError::new(
             ErrorClass::Discovery,

@@ -70,12 +70,56 @@ status_timeout_secs = 10  # optional
   port both sides must use in the file.
 - `pohunek doctor` checks the configured overlay and compares the file with the
   running daemon; see [Diagnostics](#diagnostics).
+- With `providers = ["netbird"]` the owner can also list static peers under
+  `[netbird.static_peers.<name>]`, each with `address`, `fqdn` and `host_id`;
+  see [Static peers](#static-peers).
 - A daemon of an older release ignores the file and binds the environment value
   or 18722, and so does a client of an earlier release (a CLI on another host,
   a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
   Upgrade every client and restart every daemon before you set `port`, or those
   clients dial a port nothing listens on; a pinned client adopts the file when
   it bumps its pin.
+
+### Static peers
+
+With `providers = ["netbird"]` the owner can list static peers under
+`[netbird.static_peers.<name>]`, each with `address`, `fqdn` and `host_id`.
+The entries are used only while NetBird withholds its detailed status from
+this account (NetBird 0.83+ restricted overview, daemon status `Connected`);
+when the full status is available it wins and the table is cross-checked
+(a table that contradicts it fails as `overlay_configuration_invalid`).
+Before any other request the client asks `host.governance.inspect` and
+requires the reported host id to equal the pinned one; a mismatch is
+`host_identity_mismatch` and the connection drops. A raw address never
+matches the table, and static peers never appear in `host discover` or
+`host list`. `[netbird]` takes `subnet` (an IPv4 network inside `100.64.0.0/10`,
+from `100.64.0.0/10` itself to `/30`), and `[netbird.static_peers.*]`
+is required with it. The host id is required; at most 32 entries. The key
+must be a lowercase DNS label other than `local`, and the {key, first fqdn
+label} sets of two entries must be disjoint. The distinctness of `address`,
+`fqdn` and `host_id` across entries is likewise required; the `fqdn` is a
+lowercase DNS name of at least two labels, at most 253 bytes, with no
+trailing dot. The `address` must lie inside the subnet and not be the
+network or broadcast address. Error messages name the entry key and never
+a value from the file.
+
+The trust anchor is the owner-chosen `host_id`: it names the exact daemon
+that must answer at the static `address`, verified by
+`host.governance.inspect` before any other request.
+
+- **Accounts that do not own the connection.** Find the subnet and the
+  peer `fqdn` from `netbird status --json` run as the owning account (or
+  from the Dashboards settings); the host id from `pohunek host governance
+  inspect local --json` on the peer. On the peer the selector is `local`.
+  The pin compares the host id the dialled
+  daemon reports with `host.governance.inspect` against the pinned one
+  before any other request; a different id is refused as
+  `host_identity_mismatch`. The pin does not protect against a different
+  mesh member that took the pinned address and reports the pinned host
+  id itself (the id is self-reported and not detected).
+  `host_identity_mismatch` means the dialled daemon does not report the
+  pinned host id: run `pohunek host governance inspect local` on the
+  peer and correct the `address`/`host_id`.
 
 ### Diagnostics
 
@@ -125,6 +169,9 @@ Use these commands for orientation:
   `session <action> <name>` command that looks the session name up first) and
   pinned to the peer identity it selected, so a renamed short name is never followed midway; a
   peer with no peer id and no FQDN fails with `host_identity_unpinnable`.
+  A static peer (owner-configured in `overlays.toml`, see [Static peers](#static-peers))
+  is never
+  listed by these commands; it is resolved on demand by `--host` only.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short
   owner-private cache avoids repeated probing, and `--refresh` bypasses it.
@@ -250,12 +297,18 @@ macOS-specific routing, bridging, or relay mode.
   sent again. After wake, compare `worker_instance_id` before and after: the same id
   is continuity.
 - **Troubleshooting.** Run `netbird status` (or `tailscale status`) in the same
-  shell. Since NetBird 0.83, `netbird status` shows peers only to the account that owns the NetBird connection (and root); pohunek run as another account fails with `netbird_state_restricted`. Run pohunek as the owning account, or pin NetBird to 0.82.x; resolution for other accounts is tracked in #2308. Without an `overlays.toml` the NetBird default is not retried: if the
+  shell. Without an `overlays.toml` the NetBird default is not retried: if the
   daemon logged `overlay CLI missing; listener disabled`, fix the CLI lookup
   above and restart the daemon. For an overlay listed in `overlays.toml` the
   daemon logs `overlay CLI missing; serving local-only and retrying` and binds as
   soon as the CLI is found. For a VPN that was not ready, wait one retry
   interval and look for `serving control protocol over overlay`.
+  - **NetBird 0.83 non-owner account.** `netbird status` shows peers only to
+    the account that owns the NetBird connection (and root); pohunek run as
+    another account fails with `netbird_state_restricted` unless the owner
+    lists the peer as a static peer in `overlays.toml` with its pinned host
+    id. Run pohunek as the owning account, pin NetBird to 0.82.x, or
+    configure the static peer (see [Static peers](#static-peers)).
 
 The future public team relay does not replace this direct overlay model and does
 not require NetBird. After host enrollment and transport work land, an enrolled

@@ -462,8 +462,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("crates/netbird/tests/fixtures"),
-        Effect::Packages(&["pohunek-netbird", "pohunek-cli"]),
-        "NetBird status recordings embedded by NetBird tests and CLI discovery scenarios",
+        Effect::Packages(&["pohunek-netbird", "pohunek-cli", "pohunek-client"]),
+        "NetBird status recordings embedded by NetBird tests, CLI discovery scenarios, and the client static-peer tests",
     ),
     rule(
         Pattern::Dir("runtime-packages"),

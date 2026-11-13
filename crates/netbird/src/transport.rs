@@ -4,11 +4,12 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use overlay::{
-    BindAddrError, DiscoveredPeer, ExternalIdentity, LocalIdentity, OverlayError, OverlayFuture,
-    OverlayId, OverlaySnapshot, OverlayTransport, ResolvedPeer, ResolvedSelector,
+    BindAddrError, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind, LocalIdentity,
+    OverlayError, OverlayFuture, OverlayId, OverlaySnapshot, OverlayTransport, ResolvedPeer,
+    ResolvedSelector,
 };
 
-use crate::{NetbirdError, NetbirdStatus, Peer};
+use crate::{NetbirdError, NetbirdStatus, Peer, StaticPeers};
 
 /// Stable identifier used by every `NetBird` route and wire record.
 pub const NETBIRD_OVERLAY_ID: &str = "netbird";
@@ -18,6 +19,7 @@ pub const NETBIRD_OVERLAY_ID: &str = "netbird";
 pub struct NetbirdTransport {
     id: OverlayId,
     status_deadline: Duration,
+    static_peers: Option<StaticPeers>,
 }
 
 impl NetbirdTransport {
@@ -35,6 +37,19 @@ impl NetbirdTransport {
             id: OverlayId::new(NETBIRD_OVERLAY_ID)
                 .expect("the static NetBird overlay identifier is valid"),
             status_deadline,
+            static_peers: None,
+        }
+    }
+
+    /// Create the adapter with `status_deadline` and owner-configured static
+    /// peers. The peers are used only while `NetBird` withholds its status.
+    #[must_use]
+    pub fn with_static_peers(status_deadline: Duration, static_peers: Option<StaticPeers>) -> Self {
+        Self {
+            id: OverlayId::new(NETBIRD_OVERLAY_ID)
+                .expect("the static NetBird overlay identifier is valid"),
+            status_deadline,
+            static_peers,
         }
     }
 
@@ -43,6 +58,21 @@ impl NetbirdTransport {
             .await
             .map_err(|error| map_error(error, &self.id))
     }
+
+    async fn load_view(&self) -> Result<View, OverlayError> {
+        match crate::run_status_async(self.status_deadline).await {
+            Ok(status) => Ok(View::Full(status)),
+            Err(NetbirdError::DetailRestricted { daemon_status }) => {
+                Ok(View::Restricted { daemon_status })
+            }
+            Err(error) => Err(map_error(error, &self.id)),
+        }
+    }
+}
+
+enum View {
+    Full(NetbirdStatus),
+    Restricted { daemon_status: String },
 }
 
 impl Default for NetbirdTransport {
@@ -77,8 +107,13 @@ impl OverlayTransport for NetbirdTransport {
 
     fn resolve_peer<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedPeer> {
         Box::pin(async move {
-            let status = self.load_status().await?;
-            resolve_from_status(&status, host, self.id())
+            match self.load_view().await? {
+                View::Full(status) => {
+                    self.cross_check(&status)?;
+                    resolve_from_status(&status, host, self.id())
+                }
+                View::Restricted { daemon_status } => self.static_peer(host, &daemon_status),
+            }
         })
     }
 
@@ -87,8 +122,27 @@ impl OverlayTransport for NetbirdTransport {
         identity: &'a ExternalIdentity,
     ) -> OverlayFuture<'a, ResolvedPeer> {
         Box::pin(async move {
-            let status = self.load_status().await?;
-            resolve_identity_from_status(&status, identity, self.id())
+            match self.load_view().await? {
+                View::Full(status) => {
+                    self.cross_check(&status)?;
+                    resolve_identity_from_status(&status, identity, self.id())
+                }
+                View::Restricted { daemon_status } => {
+                    let restricted = restricted_error(&daemon_status, self.id());
+                    if !connected_restricted(&daemon_status) || self.static_peers.is_none() {
+                        return Err(restricted);
+                    }
+                    match identity.kind() {
+                        ExternalIdentityKind::Fqdn => self
+                            .static_peers
+                            .as_ref()
+                            .and_then(|peers| peers.match_fqdn(identity.value()))
+                            .map(static_peer)
+                            .ok_or(restricted),
+                        ExternalIdentityKind::PeerId => Err(restricted),
+                    }
+                }
+            }
         })
     }
 
@@ -111,8 +165,15 @@ impl OverlayTransport for NetbirdTransport {
 
     fn resolve_selector<'a>(&'a self, host: &'a str) -> OverlayFuture<'a, ResolvedSelector> {
         Box::pin(async move {
-            let status = self.load_status().await?;
-            selector_from_status(&status, host, self.id())
+            match self.load_view().await? {
+                View::Full(status) => {
+                    self.cross_check(&status)?;
+                    selector_from_status(&status, host, self.id())
+                }
+                View::Restricted { daemon_status } => Ok(ResolvedSelector::Peer(
+                    self.static_peer(host, &daemon_status)?,
+                )),
+            }
         })
     }
 
@@ -121,6 +182,89 @@ impl OverlayTransport for NetbirdTransport {
             let status = self.load_status().await?;
             Ok(local_identity_from_status(&status, self.id()))
         })
+    }
+}
+
+impl NetbirdTransport {
+    fn static_peer(&self, host: &str, daemon_status: &str) -> Result<ResolvedPeer, OverlayError> {
+        if !connected_restricted(daemon_status) || self.static_peers.is_none() {
+            return Err(restricted_error(daemon_status, self.id()));
+        }
+        self.static_peers
+            .as_ref()
+            .and_then(|peers| peers.match_selector(host))
+            .map(static_peer)
+            .ok_or_else(|| restricted_error(daemon_status, self.id()))
+    }
+
+    fn cross_check(&self, status: &NetbirdStatus) -> Result<(), OverlayError> {
+        let Some(peers) = &self.static_peers else {
+            return Ok(());
+        };
+        let invalid = |detail: String| OverlayError::InvalidConfig {
+            overlay: self.id.clone(),
+            detail,
+        };
+        if let Some(own) = status.self_netbird_ip() {
+            if !peers.contains(own) {
+                return Err(invalid(
+                    "this host's NetBird address is outside netbird.subnet".to_owned(),
+                ));
+            }
+        }
+        for entry in peers.peers() {
+            let entry_ip = IpAddr::V4(entry.address);
+            if status.self_netbird_ip() == Some(entry_ip) {
+                return Err(invalid(format!(
+                    "netbird.static_peers.{} lists this host's own NetBird address",
+                    entry.name
+                )));
+            }
+            for peer in status.peers() {
+                let peer_ip = peer.ip();
+                let peer_fqdn = peer.fqdn.as_deref();
+                if peer_fqdn.is_some_and(|fqdn| fqdn.eq_ignore_ascii_case(&entry.fqdn))
+                    && peer_ip.is_some_and(|ip| ip != entry_ip)
+                {
+                    return Err(invalid(format!(
+                        "netbird.static_peers.{}: NetBird status lists its fqdn at another address",
+                        entry.name
+                    )));
+                }
+                if peer_ip == Some(entry_ip)
+                    && peer_fqdn.is_some_and(|fqdn| !fqdn.eq_ignore_ascii_case(&entry.fqdn))
+                {
+                    return Err(invalid(format!(
+                        "netbird.static_peers.{}: NetBird status gives its address to another peer",
+                        entry.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn connected_restricted(daemon_status: &str) -> bool {
+    daemon_status.trim().eq_ignore_ascii_case("Connected")
+}
+
+fn restricted_error(daemon_status: &str, id: &OverlayId) -> OverlayError {
+    map_error(
+        NetbirdError::DetailRestricted {
+            daemon_status: daemon_status.to_owned(),
+        },
+        id,
+    )
+}
+
+fn static_peer(entry: &crate::StaticPeer) -> ResolvedPeer {
+    ResolvedPeer {
+        peer_id: None,
+        display_name: Some(entry.name.clone()),
+        fqdn: Some(entry.fqdn.clone()),
+        address: IpAddr::V4(entry.address),
+        expected_host_id: Some(entry.host_id.clone()),
     }
 }
 
@@ -205,6 +349,7 @@ fn resolved_peer(peer: &Peer) -> ResolvedPeer {
         display_name: short_name(peer),
         fqdn: peer.fqdn.clone(),
         address,
+        expected_host_id: None,
     }
 }
 
