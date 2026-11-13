@@ -7477,7 +7477,6 @@ pub(super) const SESSION_ENVIRONMENT_NAMES: &[&str] = &[
     "POHUNEK_WORKER_SOCKET_PATH",
 ];
 
-/// Builds the PTY child command from a validated `Initialize`.
 /// Values the worker injects for the unconditionally present session names.
 ///
 /// `command_from_initialize` looks each of these values up by the name in
