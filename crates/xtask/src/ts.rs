@@ -231,11 +231,15 @@ fn emit_methods(dir: &Path) -> Result<(), XtaskError> {
     write_generated_file(&dir.join("methods.ts"), &body)
 }
 
-/// Emits the tables a client without the Rust adapter needs for the previous version.
+/// Emits the tables a client without the Rust adapter needs for the admitted older version.
+///
+/// The window holds one version, so the introduced and renamed tables are
+/// empty; the range-forwarding table lists the method that keeps the whole
+/// window on its envelope.
 fn emit_previous_version_tables(body: &mut String) {
     writeln!(
         body,
-        "/** Methods the previous protocol version never defined; a client refuses them before sending to a daemon of that version. */"
+        "/** Methods the admitted older protocol version never defined; empty in this window. */"
     )
     .expect("writing to a String cannot fail");
     body.push_str("export const PREVIOUS_VERSION_INTRODUCED_METHODS = [\n");
@@ -245,9 +249,15 @@ fn emit_previous_version_tables(body: &mut String) {
     body.push_str("] as const;\n");
     writeln!(
         body,
-        "/** Keys the previous protocol version spelled differently, as [previous, current]. */"
+        "/** Keys the admitted older protocol version spelled differently, as [older, current]; empty in this window. */"
     )
     .expect("writing to a String cannot fail");
+    body.push_str("export const PREVIOUS_VERSION_RENAMED_KEYS = [\n");
+    for (previous, current) in renamed_keys(MIN_PROTOCOL_VERSION) {
+        writeln!(body, "  [\"{previous}\", \"{current}\"],")
+            .expect("writing to a String cannot fail");
+    }
+    body.push_str("] as const;\n");
     writeln!(
         body,
         "/** Methods whose handler forwards the asking client's range to other hosts; a client keeps advertising its whole window on them. */"
@@ -256,12 +266,6 @@ fn emit_previous_version_tables(body: &mut String) {
     body.push_str("export const RANGE_FORWARDING_METHODS = [\n");
     for name in RANGE_FORWARDING_METHODS {
         writeln!(body, "  \"{name}\",").expect("writing to a String cannot fail");
-    }
-    body.push_str("] as const;\n");
-    body.push_str("export const PREVIOUS_VERSION_RENAMED_KEYS = [\n");
-    for (previous, current) in renamed_keys(MIN_PROTOCOL_VERSION) {
-        writeln!(body, "  [\"{previous}\", \"{current}\"],")
-            .expect("writing to a String cannot fail");
     }
     body.push_str("] as const;\n");
 }

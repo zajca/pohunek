@@ -55,8 +55,8 @@ export type HostCapabilities = {
    * Whether the daemon serves `session.wait_turn` turn-event waits.
    *
    * A daemon that predates the method omits the field, which decodes as
-   * `false`; `false` is likewise omitted on the wire, so a protocol 3
-   * snapshot round-trips unchanged.
+   * `false`; `false` is likewise omitted on the wire, so a snapshot from
+   * such a daemon round-trips unchanged.
    */
   session_wait_turn_supported?: boolean;
   /**

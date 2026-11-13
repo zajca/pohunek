@@ -516,11 +516,17 @@ class SetupRustInstallTests(unittest.TestCase):
         )
         fake.chmod(0o755)
 
-    def install(self, toolchain="1.99.0", components="rustfmt, clippy", targets=""):
+    def install(
+        self,
+        toolchain="1.99.0",
+        components="rustfmt, clippy",
+        targets="",
+        script=None,
+    ):
         env_file = self.home / "github_env"
         env_file.write_text("")
         result = subprocess.run(
-            ["bash", "-c", install_script()],
+            ["bash", "-c", script if script is not None else install_script()],
             env={
                 "PATH": f"{self.bin}:/usr/bin:/bin",
                 "GITHUB_ACTION_PATH": str(ROOT / ACTION_RELATIVE.parent),
@@ -546,6 +552,7 @@ class SetupRustInstallTests(unittest.TestCase):
     def test_install_reaches_rustup_through_the_helper(self):
         result, calls = self.install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("ci-retry: rustup attempt 1/1", result.stdout)
         self.assertIn("toolchain install 1.99.0 --profile minimal", calls)
         self.assertIn("--component rustfmt --component clippy", calls)
 
@@ -556,31 +563,10 @@ class SetupRustInstallTests(unittest.TestCase):
         # never called.
         script = install_script().replace("-- sh -c \\\n", "-- sh -c\n")
         self.assertNotEqual(script, install_script())
-        env_file = self.home / "github_env"
-        env_file.write_text("")
-        result = subprocess.run(
-            ["bash", "-c", script],
-            env={
-                "PATH": f"{self.bin}:/usr/bin:/bin",
-                "GITHUB_ACTION_PATH": str(ROOT / ACTION_RELATIVE.parent),
-                "GITHUB_ENV": str(env_file),
-                "TOOLCHAIN": "1.99.0",
-                "COMPONENTS": "",
-                "TARGETS": "",
-                "RETRY_ATTEMPTS": "1",
-                "RETRY_BACKOFF_SECONDS": "0",
-                "RETRY_ATTEMPT_TIMEOUT_SECONDS": "30",
-                "RUSTUP_PERMIT_COPY_RENAME": "1",
-                "RUSTUP_DOWNLOAD_TIMEOUT": "30",
-                "RUSTUP_MAX_RETRIES": "1",
-            },
-            cwd=self.home,
-            capture_output=True,
-            text=True,
-            timeout=RUN_TIMEOUT_SECONDS,
-        )
+        result, calls = self.install(components="", script=script)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.calls.exists())
+        self.assertEqual(calls, "")
 
 
 if __name__ == "__main__":

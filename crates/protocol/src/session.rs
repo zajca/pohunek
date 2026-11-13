@@ -493,8 +493,7 @@ pub struct SessionNewParams {
     /// fill and every declared name is required; values are never listed,
     /// persisted or logged. A daemon that does not advertise
     /// `HostCapabilities::session_new_secret_env_supported` would drop the field
-    /// silently, so a client checks the flag before sending it (the protocol 3
-    /// client adapter refuses it).
+    /// silently, so a client checks the flag before sending it.
     #[serde(default, skip_serializing_if = "SessionSecretEnv::is_unset")]
     #[cfg_attr(feature = "ts", ts(optional, type = "Record<string, string>"))]
     pub secret_env: SessionSecretEnv,
@@ -512,8 +511,7 @@ pub struct SessionNewParams {
     /// `session_request_in_progress`. A removed session frees its key, and so
     /// does a create that was rolled back. A daemon that does not advertise
     /// `HostCapabilities::session_new_request_id_supported` would drop the field
-    /// silently, so a client checks the flag before sending it (the protocol 3
-    /// client adapter refuses it).
+    /// silently, so a client checks the flag before sending it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub client_request_id: Option<String>,
@@ -539,8 +537,7 @@ pub struct SessionNewParams {
     /// bound; the commit must already exist on `origin` (nothing is uploaded).
     /// A daemon that does not advertise
     /// `HostCapabilities::session_new_fetch_ref_supported` would drop the
-    /// field silently, so a client checks the flag before sending it (the
-    /// protocol 3 client adapter refuses it).
+    /// field silently, so a client checks the flag before sending it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub fetch_ref: Option<FetchRefRequest>,
@@ -3267,8 +3264,7 @@ pub struct SessionInfo {
     /// open past the stop deadline or past the drain after the root's own
     /// exit. The session still ended with its root's exit; output the holder
     /// wrote after the close is not retained. Set only on a terminal session
-    /// whose exit was observed, and omitted from the wire form when false. The
-    /// protocol 3 adapter drops it.
+    /// whose exit was observed, and omitted from the wire form when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "ts", ts(optional, as = "Option<bool>"))]
     pub output_force_closed: bool,

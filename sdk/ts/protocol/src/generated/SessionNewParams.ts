@@ -112,8 +112,7 @@ export type SessionNewParams = {
    * fill and every declared name is required; values are never listed,
    * persisted or logged. A daemon that does not advertise
    * `HostCapabilities::session_new_secret_env_supported` would drop the field
-   * silently, so a client checks the flag before sending it (the protocol 3
-   * client adapter refuses it).
+   * silently, so a client checks the flag before sending it.
    */
   secret_env?: Record<string, string>;
   /**
@@ -132,8 +131,7 @@ export type SessionNewParams = {
    * `session_request_in_progress`. A removed session frees its key, and so
    * does a create that was rolled back. A daemon that does not advertise
    * `HostCapabilities::session_new_request_id_supported` would drop the field
-   * silently, so a client checks the flag before sending it (the protocol 3
-   * client adapter refuses it).
+   * silently, so a client checks the flag before sending it.
    */
   client_request_id?: string;
   /**
@@ -159,8 +157,7 @@ export type SessionNewParams = {
    * bound; the commit must already exist on `origin` (nothing is uploaded).
    * A daemon that does not advertise
    * `HostCapabilities::session_new_fetch_ref_supported` would drop the
-   * field silently, so a client checks the flag before sending it (the
-   * protocol 3 client adapter refuses it).
+   * field silently, so a client checks the flag before sending it.
    */
   fetch_ref?: FetchRefRequest;
 };

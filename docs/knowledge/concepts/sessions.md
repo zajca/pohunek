@@ -309,9 +309,7 @@ The `session.list` protocol request can filter this metadata with exact-value
 the complete value; presence also matches an empty value. Metadata filters
 combine with each other and existing session filters using AND semantics. Keys
 and values remain opaque strings and use the same validation as
-`session.set_metadata`. When a current Rust or TypeScript client targets a
-protocol-3 daemon, a metadata filter fails with
-`daemon/daemon_protocol_too_old` before the request is sent.
+`session.set_metadata`. Every client of the protocol window can send these predicates.
 
 The CLI exposes these predicates as repeatable `pohunek session list
 --meta-eq key=value` and `--meta-has key` options. Equality splits on the first

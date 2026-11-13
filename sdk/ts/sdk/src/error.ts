@@ -76,7 +76,7 @@ export type ClientErrorKind =
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
 
-/** Facts of a method that a daemon's older protocol version never defined. */
+/** Facts of a method that a negotiated protocol version predates. */
 export interface DaemonProtocolTooOldDetail {
   /** Route of the remote host, or `undefined` for the local daemon. */
   readonly host: string | undefined;
@@ -275,7 +275,7 @@ export class ClientError extends Error {
     );
   }
 
-  /** A method the daemon's negotiated older protocol version never defined. */
+  /** A method that the connection's negotiated version predates. */
   public static daemonProtocolTooOld(detail: DaemonProtocolTooOldDetail): ClientError {
     const target = daemonTarget(detail.host);
     const msg = `${target} runs protocol ${detail.daemonVersion}, but \`${detail.method}\` needs protocol ${detail.requiredVersion}`;
@@ -293,7 +293,7 @@ export class ClientError extends Error {
     );
   }
 
-  /** A payload that could not be translated for the daemon's older version. */
+  /** A payload that could not be translated for the negotiated version. */
   public static versionTranslation(
     host: string | undefined,
     daemonVersion: ProtocolVersion,

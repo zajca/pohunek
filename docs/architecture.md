@@ -760,7 +760,7 @@ list generated from the Rust adapter, so `cargo xtask ts check` catches drift
 ([#527](https://github.com/zajca/pohunek/issues/527)).
 
 Core types describe only the current wire shape. `crates/protocol/src/compat/`
-holds one adapter module per older version in the window (`v3`). An adapter
+holds one adapter module per older version in the window (none in the current window). An adapter
 translates by shape only: renames and moved fields at typed locations (free-form
 values such as session metadata are never walked), plus withholding what the
 older version cannot decode (events it never defined, enum values such as

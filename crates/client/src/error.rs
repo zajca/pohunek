@@ -30,12 +30,12 @@ pub enum ClientError {
         /// Invalid version returned by the peer.
         received: ProtocolVersion,
     },
-    /// The connection's protocol version is below the one the method needs.
+    /// The connection's protocol version is below the version the request needs.
     ///
-    /// Raised before anything is sent: the method exists only from
-    /// `required_version` on, so the peer's host has to be upgraded first. The
-    /// window holds the current version alone, so a peer of another version
-    /// fails earlier with `daemon/version_mismatch`.
+    /// Raised before the request is sent. The window holds the current version
+    /// alone, so a connection always selects it: the error comes only from a
+    /// request whose own version range starts above it, and a peer of another
+    /// version fails earlier with `daemon/version_mismatch`.
     #[error(
         "{}",
         ProtocolError::daemon_protocol_too_old(
