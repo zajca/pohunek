@@ -23,6 +23,9 @@
 //!   exit 2.
 //! - H: the expected table names an unknown scenario (`permision_prompt`):
 //!   compare refuses it as exit 2, naming the missing and unknown names.
+//! - I: the capture carries a base64 message in `attention` (or an unknown
+//!   extra key in a row): compare refuses it as exit 2, naming `attention`
+//!   (or the unknown field).
 
 // Rust guideline compliant 2026-11-13
 
@@ -351,5 +354,39 @@ fn expected_table_with_a_renamed_row_is_refused() {
     assert!(
         diagnostic.contains("permision_prompt"),
         "the diagnostic names the unknown scenario: {diagnostic}"
+    );
+}
+
+#[test]
+fn capture_with_a_base64_attention_entry_is_refused() {
+    let canary = Canary::new();
+    let output = canary.compare("expected.json", "capture-attention-base64.json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a capture whose `attention` carries a base64 message is a usage error: stderr {}",
+        stderr_of(&output)
+    );
+    let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        diagnostic.contains("`attention`"),
+        "the refusal names the `attention` field: {diagnostic}"
+    );
+}
+
+#[test]
+fn capture_with_an_unknown_extra_key_is_refused() {
+    let canary = Canary::new();
+    let output = canary.compare("expected.json", "capture-extra-key.json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a capture with an unknown extra key is a usage error: stderr {}",
+        stderr_of(&output)
+    );
+    let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        diagnostic.contains("unknown field `note`"),
+        "the refusal names the unknown field: {diagnostic}"
     );
 }

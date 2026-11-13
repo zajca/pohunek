@@ -182,17 +182,14 @@ fn compare(expected_path: &Path, capture_path: &Path) -> Result<CompareReport, X
             unknown.join(", ")
         )));
     }
-    // `claude_version` is a required field of the capture schema: without it
-    // the table pasted as evidence carries no version, so compare refuses
-    // the capture instead of printing a placeholder.
-    let claude_version = match capture.get("claude_version") {
-        Some(Value::String(version)) => version.clone(),
-        _ => {
-            return Err(XtaskError::Usage(
-                "the capture must carry a string `claude_version`".to_owned(),
-            ));
-        }
-    };
+    // `claude_version` is a required field of the capture schema and is
+    // already validated by `policy_scan`; read it as everyone requires it
+    // to be there.
+    let claude_version = capture
+        .get("claude_version")
+        .and_then(Value::as_str)
+        .expect("the capture carries a string `claude_version`")
+        .to_owned();
     let mut rows = Vec::new();
     let mut diff_lines = Vec::new();
     let mut mismatched = 0_u32;
@@ -377,6 +374,35 @@ const STATES: [&str; 6] = ["working", "blocked", "done", "idle", "error", "clear
 /// `kind` values of a blocked record.
 const KINDS: [&str; 3] = ["permission", "question", "auth"];
 
+/// `attention` entries: the `NotificationKind` wire strings
+/// (`crates/protocol/src/notification.rs`), the only kinds the notification
+/// list can carry.
+const ATTENTION_KINDS: [&str; 6] = [
+    "agent_blocked",
+    "approval_required",
+    "turn_completed",
+    "session_finished",
+    "error",
+    "system",
+];
+
+/// `activity` values: the `AgentActivity` wire strings
+/// (`crates/protocol/src/session.rs`), the only values a session carries.
+const ACTIVITIES: [&str; 3] = ["working", "blocked", "idle"];
+
+/// The keys the capture document may carry, at each level: the top level and
+/// one scenario row.
+const TOP_LEVEL_KEYS: [&str; 5] = [
+    "schema",
+    "runtime",
+    "claude_version",
+    "pohunek_version",
+    "scenarios",
+];
+
+/// The keys one scenario row may carry.
+const ROW_KEYS: [&str; 4] = ["records", "final_record", "activity", "attention"];
+
 /// Renders the compared fields of one scenario row, for example
 /// `state=done []`. A missing or non-JSON value renders as `null`.
 fn render_pair(row: &Value) -> String {
@@ -402,79 +428,136 @@ fn render_pair(row: &Value) -> String {
     format!("{final_record} {attention}")
 }
 
-/// Refuses a capture that stores a message (`msg`/`title`/`progress` or a raw
-/// base64 message tail). The schema has no message field, and a stored
-/// message is a policy breach. Every `records[]` and `final_record` value
-/// must match the canonical record grammar
-/// `[app=<app>:]state=<state>[:kind=<kind>]`; a `msg=` segment or any other
-/// unknown segment fails the validation. A `records` that is not an array of
-/// strings, a `final_record` that is neither a string nor `null` and an
-/// `attention` that is not an array of strings are refused as well, so no
-/// other shape can slip a message past the scan.
+/// Checks a capture document against the closed allowlists of its schema.
+///
+/// Every string leaf in the document must sit in a slot the schema defines:
+/// `claude_version` is the version line, a scenario name from [`SCENARIOS`],
+/// a record checked by [`check_record`], an `attention` entry from
+/// [`ATTENTION_KINDS`], or an `activity` from [`ACTIVITIES`]. The first
+/// offending leaf fails the whole capture as a policy breach (exit 2), so no
+/// base64 message tail can be smuggled through any field, however it is
+/// nested. `pohunek_version` carries no string leaf semantics of its own;
+/// it must be a `pohunek` version line.
 fn policy_scan(capture: &Value) -> Result<(), String> {
-    /// Keys a capture document must never carry.
-    const FORBIDDEN_KEYS: [&str; 3] = ["msg", "title", "progress"];
-    let mut stack = vec![capture];
-    while let Some(value) = stack.pop() {
-        match value {
-            Value::Object(map) => {
-                for (key, child) in map {
-                    if FORBIDDEN_KEYS.contains(&key.as_str()) {
-                        return Err(format!(
-                            "the capture stores a `{key}` field: the capture schema has no message; a stored message is a policy breach"
-                        ));
-                    }
-                    stack.push(child);
-                }
-            }
-            Value::Array(items) => stack.extend(items),
-            _ => {}
+    let Some(top) = capture.as_object() else {
+        return Err("the capture is not a JSON object".to_owned());
+    };
+    check_no_unknown_keys(top, &TOP_LEVEL_KEYS, "the capture")?;
+    // `claude_version` is required and must be a string; `compare` reads it
+    // after this scan, so a missing or non-string value is refused here.
+    match top.get("claude_version") {
+        Some(Value::String(_)) => {}
+        Some(_) => return Err("the capture `claude_version` is not a string".to_owned()),
+        None => return Err("the capture has no `claude_version`".to_owned()),
+    }
+    if let Some(pv) = top.get("pohunek_version") {
+        let Some(line) = pv.as_str() else {
+            return Err("the capture `pohunek_version` is not a string".to_owned());
+        };
+        if !is_pohunek_version(line) {
+            return Err(format!(
+                "the capture `pohunek_version` is not a pohunek version line: `{line}`"
+            ));
         }
     }
-    if let Some(scenarios) = capture.get("scenarios").and_then(Value::as_object) {
-        for (name, row) in scenarios {
-            if let Some(records_value) = row.get("records") {
-                let Some(records) = records_value.as_array() else {
-                    return Err(format!(
-                        "the capture scenario `{name}` carries a `records` that is not an array of records"
-                    ));
-                };
-                for record in records {
-                    if let Some(text) = record.as_str() {
-                        check_record(text, name)?;
-                    } else {
-                        return Err(format!(
-                            "the capture scenario `{name}` carries a non-string record"
-                        ));
-                    }
-                }
+    let Some(scenarios) = top.get("scenarios").and_then(Value::as_object) else {
+        return Err("the capture has no `scenarios` object".to_owned());
+    };
+    for (name, row) in scenarios {
+        if !SCENARIOS.contains(&name.as_str()) {
+            return Err(format!("the capture names the unknown scenario `{name}`"));
+        }
+        scan_row(name, row)?;
+    }
+    Ok(())
+}
+
+/// Checks one scenario row: only the known keys, the known shapes, and
+/// every string leaf in its closed set.
+fn scan_row(name: &str, row: &Value) -> Result<(), String> {
+    let Some(map) = row.as_object() else {
+        return Err(format!(
+            "the capture scenario `{name}` is not a JSON object"
+        ));
+    };
+    check_no_unknown_keys(map, &ROW_KEYS, &format!("the capture scenario `{name}`"))?;
+    if let Some(records_value) = map.get("records") {
+        let Some(records) = records_value.as_array() else {
+            return Err(format!(
+                "the capture scenario `{name}` carries a `records` that is not an array of records"
+            ));
+        };
+        for record in records {
+            let Some(text) = record.as_str() else {
+                return Err(format!(
+                    "the capture scenario `{name}` carries a non-string record"
+                ));
+            };
+            check_record(text, name)?;
+        }
+    }
+    if let Some(final_value) = map.get("final_record") {
+        match final_value {
+            Value::String(text) => check_record(text, name)?,
+            Value::Null => {}
+            _ => {
+                return Err(format!(
+                    "the capture scenario `{name}` carries a `final_record` that is neither a string nor null"
+                ));
             }
-            if let Some(final_value) = row.get("final_record") {
-                match final_value {
-                    Value::String(text) => check_record(text, name)?,
-                    Value::Null => {}
-                    _ => {
-                        return Err(format!(
-                            "the capture scenario `{name}` carries a `final_record` that is neither a string nor null"
-                        ));
-                    }
-                }
-            }
-            if let Some(attention_value) = row.get("attention") {
-                let Some(attention) = attention_value.as_array() else {
-                    return Err(format!(
-                        "the capture scenario `{name}` carries an `attention` that is not an array of strings"
-                    ));
-                };
-                if attention.iter().any(|item| !item.is_string()) {
-                    return Err(format!(
-                        "the capture scenario `{name}` carries a non-string attention entry"
-                    ));
-                }
+        }
+    }
+    if let Some(activity_value) = map.get("activity") {
+        let Some(activity) = activity_value.as_str() else {
+            return Err(format!(
+                "the capture scenario `{name}` carries an `activity` that is not a string"
+            ));
+        };
+        if !ACTIVITIES.contains(&activity) {
+            return Err(format!(
+                "the capture scenario `{name}` carries an unknown `activity`: `{activity}`"
+            ));
+        }
+    }
+    if let Some(attention_value) = map.get("attention") {
+        let Some(attention) = attention_value.as_array() else {
+            return Err(format!(
+                "the capture scenario `{name}` carries an `attention` that is not an array of strings"
+            ));
+        };
+        for entry in attention {
+            let Some(kind) = entry.as_str() else {
+                return Err(format!(
+                    "the capture scenario `{name}` carries a non-string `attention` entry"
+                ));
+            };
+            if !ATTENTION_KINDS.contains(&kind) {
+                return Err(format!(
+                    "the capture scenario `{name}` carries an unknown `attention` entry: `{kind}`"
+                ));
             }
         }
     }
     Ok(())
+}
+
+/// Refuses any key outside `allowed` in one object.
+fn check_no_unknown_keys(
+    map: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    what: &str,
+) -> Result<(), String> {
+    for key in map.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("{what} carries the unknown field `{key}`"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `line` is a `pohunek` version line, for example `pohunek 0.42.0`.
+fn is_pohunek_version(line: &str) -> bool {
+    line.starts_with("pohunek ") && line.len() > "pohunek ".len()
 }
 
 /// Checks one record string against the canonical grammar
