@@ -145,7 +145,10 @@ fn serve(reported: String) -> (u16, Arc<Mutex<Vec<String>>>) {
 
 /// A daemon whose reported host id can change between connections: `(port,
 /// served methods, current reported host id)`.
-#[allow(clippy::type_complexity, reason = "(port, served methods, reported id) triple used by the fixture daemon")]
+#[allow(
+    clippy::type_complexity,
+    reason = "(port, served methods, reported id) triple used by the fixture daemon"
+)]
 fn serve_switchable() -> (u16, Arc<Mutex<Vec<String>>>, Arc<Mutex<String>>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
     let port = listener.local_addr().expect("fixture address").port();
