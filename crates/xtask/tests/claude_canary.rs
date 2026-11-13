@@ -17,6 +17,12 @@
 //!   compare refuses it with exit 2.
 //! - E: the capture row lacks `attention`: the row reports MISMATCH with a
 //!   `-`-only leaf line and the code is 1.
+//! - F: the capture carries `records` as a string (not an array) or a
+//!   non-string `final_record`: compare refuses it as exit 2.
+//! - G: the capture carries no `claude_version`: compare refuses it as
+//!   exit 2.
+//! - H: the expected table names an unknown scenario (`permision_prompt`):
+//!   compare refuses it as exit 2, naming the missing and unknown names.
 
 // Rust guideline compliant 2026-11-13
 
@@ -273,5 +279,77 @@ fn checked_in_table_is_exercised() {
         Some(3),
         "the checked-in table matches the fixture with the login row UNVERIFIED: stderr {}",
         stderr_of(&output)
+    );
+}
+
+#[test]
+fn capture_with_a_string_records_is_refused() {
+    let canary = Canary::new();
+    let output = canary.compare("expected.json", "capture-records-string.json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a capture whose `records` is a string is a usage error: stderr {}",
+        stderr_of(&output)
+    );
+    let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        diagnostic.contains("`records`"),
+        "the refusal names the `records` field: {diagnostic}"
+    );
+}
+
+#[test]
+fn capture_with_an_array_final_record_is_refused() {
+    let canary = Canary::new();
+    let output = canary.compare("expected.json", "capture-final-record-array.json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a capture whose `final_record` is an array is a usage error: stderr {}",
+        stderr_of(&output)
+    );
+    let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        diagnostic.contains("`final_record`"),
+        "the refusal names the `final_record` field: {diagnostic}"
+    );
+}
+
+#[test]
+fn capture_without_a_version_is_refused() {
+    let canary = Canary::new();
+    let output = canary.compare("expected.json", "capture-no-version.json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a capture without `claude_version` is a usage error: stderr {}",
+        stderr_of(&output)
+    );
+    let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        diagnostic.contains("claude_version"),
+        "the refusal names the missing version: {diagnostic}"
+    );
+}
+
+#[test]
+fn expected_table_with_a_renamed_row_is_refused() {
+    let canary = Canary::new();
+    let output = canary.compare("expected-renamed.json", "capture-match.json");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an expected table with a renamed row is a usage error: stderr {}",
+        stderr_of(&output)
+    );
+    let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+    assert!(
+        diagnostic.contains("permission_prompt"),
+        "the diagnostic names the missing scenario: {diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("permision_prompt"),
+        "the diagnostic names the unknown scenario: {diagnostic}"
     );
 }

@@ -182,11 +182,17 @@ fn compare(expected_path: &Path, capture_path: &Path) -> Result<CompareReport, X
             unknown.join(", ")
         )));
     }
-    let claude_version = capture
-        .get("claude_version")
-        .and_then(Value::as_str)
-        .unwrap_or("(no version recorded)")
-        .to_owned();
+    // `claude_version` is a required field of the capture schema: without it
+    // the table pasted as evidence carries no version, so compare refuses
+    // the capture instead of printing a placeholder.
+    let claude_version = match capture.get("claude_version") {
+        Some(Value::String(version)) => version.clone(),
+        _ => {
+            return Err(XtaskError::Usage(
+                "the capture must carry a string `claude_version`".to_owned(),
+            ));
+        }
+    };
     let mut rows = Vec::new();
     let mut diff_lines = Vec::new();
     let mut mismatched = 0_u32;
@@ -401,7 +407,10 @@ fn render_pair(row: &Value) -> String {
 /// message is a policy breach. Every `records[]` and `final_record` value
 /// must match the canonical record grammar
 /// `[app=<app>:]state=<state>[:kind=<kind>]`; a `msg=` segment or any other
-/// unknown segment fails the validation.
+/// unknown segment fails the validation. A `records` that is not an array of
+/// strings, a `final_record` that is neither a string nor `null` and an
+/// `attention` that is not an array of strings are refused as well, so no
+/// other shape can slip a message past the scan.
 fn policy_scan(capture: &Value) -> Result<(), String> {
     /// Keys a capture document must never carry.
     const FORBIDDEN_KEYS: [&str; 3] = ["msg", "title", "progress"];
@@ -424,7 +433,12 @@ fn policy_scan(capture: &Value) -> Result<(), String> {
     }
     if let Some(scenarios) = capture.get("scenarios").and_then(Value::as_object) {
         for (name, row) in scenarios {
-            if let Some(records) = row.get("records").and_then(Value::as_array) {
+            if let Some(records_value) = row.get("records") {
+                let Some(records) = records_value.as_array() else {
+                    return Err(format!(
+                        "the capture scenario `{name}` carries a `records` that is not an array of records"
+                    ));
+                };
                 for record in records {
                     if let Some(text) = record.as_str() {
                         check_record(text, name)?;
@@ -435,8 +449,28 @@ fn policy_scan(capture: &Value) -> Result<(), String> {
                     }
                 }
             }
-            if let Some(final_record) = row.get("final_record").and_then(Value::as_str) {
-                check_record(final_record, name)?;
+            if let Some(final_value) = row.get("final_record") {
+                match final_value {
+                    Value::String(text) => check_record(text, name)?,
+                    Value::Null => {}
+                    _ => {
+                        return Err(format!(
+                            "the capture scenario `{name}` carries a `final_record` that is neither a string nor null"
+                        ));
+                    }
+                }
+            }
+            if let Some(attention_value) = row.get("attention") {
+                let Some(attention) = attention_value.as_array() else {
+                    return Err(format!(
+                        "the capture scenario `{name}` carries an `attention` that is not an array of strings"
+                    ));
+                };
+                if attention.iter().any(|item| !item.is_string()) {
+                    return Err(format!(
+                        "the capture scenario `{name}` carries a non-string attention entry"
+                    ));
+                }
             }
         }
     }

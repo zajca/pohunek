@@ -24,7 +24,8 @@ changes an expectation.
 
 The capture command is tracked in issue #2137.
 
-The capture schema, written by the capture command and read by `compare`:
+The capture schema, the schema the planned capture command (#2137) will
+write and `compare` reads:
 
 ```json
 {
