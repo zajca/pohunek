@@ -29363,8 +29363,8 @@ async fn an_older_snapshot_keeps_the_activity_waiting_for_a_deferred_commit() {
             .await
             .recorded
     );
-    // The watcher polls every 100 ms and would apply the newer snapshot as
-    // soon as imports are unblocked, so it is parked until the older
+    // The worker exit watcher applies the worker's newest snapshot at its next
+    // poll once imports are unblocked, so it is parked until the older
     // snapshot's effect is checked.
     let poll = registry.hold_next_input(&created.id, "worker_snapshot");
     guard(

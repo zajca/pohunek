@@ -1441,8 +1441,8 @@ def empty_window_diagnosis(args, loaded, window):
     # passes the filters rescues the window even when only attempt 1 was
     # fetched: `--attempts all` would add exactly that listed attempt.
     # Entries share their run's creation time, so the window check uses
-    # the listing's `createdAt`. The diagnosis reads that probe from the
-    # listing, so it needs no attempt-N document.
+    # the listing's `createdAt`. The rescue check reads only the listing,
+    # so the diagnosis needs no attempt-N document.
     listed_rescue = (
         args.attempts == "first" and args.input is None and any(
             listed_passes_filters(entry, args) and listed_in_window(entry, window)
