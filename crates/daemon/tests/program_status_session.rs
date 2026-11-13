@@ -1526,6 +1526,10 @@ fn unmapped_journal_lines(log: &str) -> Vec<&str> {
 /// the record as blocked without a kind, and a rejected payload is only
 /// journaled.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the journal scenario pins both unmapped shapes and the paused assert"
+)]
 async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
@@ -1566,6 +1570,23 @@ async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
     .await;
 
     let lines = unmapped_journal_lines(&logged);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("reason=\"unknown_kind\""))
+            .count(),
+        1,
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("reason=\"rejected\""))
+            .count(),
+        1,
+        "{lines:?}"
+    );
     let unknown_kind = lines
         .iter()
         .find(|line| line.contains("reason=\"unknown_kind\""))
@@ -1618,6 +1639,14 @@ async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
         Some("blocked")
     );
     assert_eq!(attention.records(&created.id).len(), 1, "one record");
+
+    let logged = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
+    let lines = unmapped_journal_lines(&logged);
+    assert_eq!(
+        lines.len(),
+        2,
+        "a journal line written late is counted too: {lines:?}"
+    );
 
     fixture
         .registry

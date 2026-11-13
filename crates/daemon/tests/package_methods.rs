@@ -5029,7 +5029,7 @@ async fn an_evaluation_that_answers_as_its_deadline_passes_keeps_its_answer() {
     assert!(hook.lock().expect("read hook").is_none(), "the hold ran");
     assert!(
         carries_trust_arg(&argv),
-        "an answer recorded before the deadline is the launch's answer: {argv:?}"
+        "an answer recorded before the launch stopped waiting is the launch's answer: {argv:?}"
     );
     let failures: Vec<Value> = log
         .event_records("checkout_trust.failed")
@@ -5214,15 +5214,16 @@ async fn a_daemon_start_refuses_a_trust_scratch_root_that_is_a_link() {
         .expect("the file below the directory the scratch root names survives"),
         "left alone"
     );
-    let refused = log.event_records("checkout_trust.sweep_failed");
-    assert!(
-        !refused.is_empty(),
-        "a symlinked scratch root is refused with a warn"
-    );
-    assert!(
-        refused
-            .iter()
-            .any(|record| record["fields"]["reason"] == "the scratch directory is not a directory"),
+    let refused: Vec<Value> = log
+        .event_records("checkout_trust.sweep_failed")
+        .into_iter()
+        .filter(|record| {
+            record["fields"]["path"] == state_root.join("checkout-trust").to_string_lossy().as_ref()
+        })
+        .collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(
+        refused[0]["fields"]["reason"], "the scratch directory is not a directory",
         "the warn names the refusal: {refused:?}"
     );
 
