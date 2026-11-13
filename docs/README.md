@@ -126,6 +126,8 @@ multi-team control plane without replacing either owner path.
   ordinary M3 rollout, canary verification, incident recovery, and safe removal.
 - [Hermes plugin migration and rollback](migrations/hermes-operator-plugin.md) —
   one-time M1 context, upgrade-forward limits, and rollback boundaries.
+- [Claude OSC 7501 canary](runbooks/claude-canary.md) — the Claude status-record
+  table, the `claude canary compare` command, and how a difference is handled.
 - [Projects: automatic git-repo awareness](design/projects.md) — detect the repo
   / worktree a session runs in and record lightweight projects; auto on session
   start or manual via CLI, no filesystem scan.

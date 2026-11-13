@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "runtime": "claude",
+  "claude_version": "Claude Code 2.1.323",
+  "pohunek_version": "pohunek 0.43.0-rc.1",
+  "scenarios": {
+    "idle_after_turn": {
+      "records": ["state=done"],
+      "final_record": "state=done",
+      "activity": "idle",
+      "attention": []
+    },
+    "permission_prompt": {
+      "records": ["state=done", "state=blocked:kind=permission"],
+      "final_record": "state=blocked:kind=permission",
+      "activity": "blocked",
+      "attention": ["approval_required"]
+    },
+    "mcp_elicitation": {
+      "records": ["state=working", "state=blocked:kind=question"],
+      "final_record": "state=blocked:kind=question",
+      "activity": "blocked",
+      "attention": ["agent_blocked"]
+    },
+    "login_screen": {
+      "records": ["state=working"],
+      "final_record": "state=working",
+      "activity": "working",
+      "attention": []
+    },
+    "running_turn": {
+      "records": ["state=working"],
+      "final_record": "state=working",
+      "activity": "working",
+      "attention": []
+    }
+  }
+}
