@@ -64,10 +64,8 @@ const MAX_TRACKED_RELEASES: usize = 8;
 const CSI_PARAM_START: u8 = 0x20;
 /// CSI parameter bytes end at the ECMA-48 maximum (`0x3f`).
 const CSI_PARAM_END: u8 = 0x3f;
-/// SS3 final bytes occupy the inclusive ECMA-48 `0x40..=0x7e` range.
-const SS3_FINAL_START: u8 = 0x40;
-/// SS3 final bytes end at the ECMA-48 maximum (`0x7e`).
-const SS3_FINAL_END: u8 = 0x7e;
+/// SS3 final bytes share the CSI final-byte range, so no separate
+/// SS3 range constants are needed.
 /// SS3 reports are `ESC O <final>`.
 const SS3_REPORT_LEN: usize = 3;
 /// Bytes of the `ESC [` prefix of a CSI report.
@@ -298,12 +296,12 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecod
     // the parameter range before any final byte (CR, ESC, DEL, ...) aborts
     // the sequence: the Escape is passed and the rest is re-parsed, so a
     // stray byte can no longer swallow following keys.
-    if let Some(abort) = input[2..]
+    if let Some(abort) = input[CSI_PREFIX_LEN..]
         .iter()
         .position(|byte| !(CSI_PARAM_START..=CSI_PARAM_END).contains(byte))
     {
         let candidate = abort + CSI_PREFIX_LEN;
-        if input[candidate] >= CSI_FINAL_START && input[candidate] <= CSI_FINAL_END {
+        if (CSI_FINAL_START..=CSI_FINAL_END).contains(&input[candidate]) {
             return parse_csi_body(input, candidate, menu_mode, decoder);
         }
         return Parse::Pass;
@@ -319,14 +317,14 @@ fn parse_csi_body(
 ) -> Parse {
     let consumed = final_index + 1;
     let final_byte = input[final_index];
-    let params = &input[2..final_index];
+    let params = &input[CSI_PREFIX_LEN..final_index];
 
     // Bracketed-paste control sequences belong to the menu decoder, which
     // skips pasted text wholesale; a mouse report is consumed there too. A
     // bare `ESC [ M` is a legacy mouse head, not an arrow or paste report.
     if is_paste_control(params, final_byte)
         || params.first() == Some(&SGR_MOUSE_MARKER)
-        || (final_byte == MOUSE_FINAL && final_index == 2)
+        || (final_byte == MOUSE_FINAL && final_index == CSI_PREFIX_LEN)
     {
         return Parse::Pass;
     }
@@ -431,7 +429,7 @@ fn parse_ss3(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     if input.len() < SS3_REPORT_LEN {
         return Parse::Pending;
     }
-    if !(SS3_FINAL_START..=SS3_FINAL_END).contains(&input[2]) {
+    if !(CSI_FINAL_START..=CSI_FINAL_END).contains(&input[CSI_PREFIX_LEN]) {
         // Not an SS3 final byte: the Escape is a lone Escape and the rest is
         // re-parsed, so a flush after the timeout cannot swallow Escape or
         // the detach byte.
@@ -559,7 +557,7 @@ impl CsiUKey {
     }
 }
 
-pub(super) fn parse_decimal(bytes: &[u8]) -> Option<u32> {
+fn parse_decimal(bytes: &[u8]) -> Option<u32> {
     if bytes.is_empty() {
         return None;
     }

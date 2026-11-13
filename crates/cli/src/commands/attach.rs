@@ -122,20 +122,14 @@ const MENU_SS3_REPORT_LEN: usize = 3;
 const MENU_CSI_FINAL_START: u8 = 0x40;
 /// Upper bound of the ECMA-48 CSI final-byte range.
 const MENU_CSI_FINAL_END: u8 = 0x7e;
-/// SS3 final bytes occupy the inclusive ECMA-48 `0x40..=0x7e` range.
-const MENU_SS3_FINAL_END: u8 = 0x7e;
+/// SS3 final bytes share the CSI final-byte range, so no separate
+/// SS3 range constants are needed.
 /// Kitty event type `3` is a key release.
 const MENU_EVENT_RELEASE: u32 = 3;
 /// Parameter bytes of a CSI stop at the first byte below the parameter range.
 const MENU_CSI_PARAM_START: u8 = 0x20;
 /// Parameter bytes of a CSI stop at the first byte above the parameter range.
 const MENU_CSI_PARAM_END: u8 = 0x3f;
-/// Bracketed-paste parameters that open and close pasted text.
-const MENU_PASTE_OPEN_PARAMS: &[u8] = b"200";
-/// Bracketed-paste close parameters.
-const MENU_PASTE_CLOSE_PARAMS: &[u8] = b"201";
-/// CSI `~` final shared by bracketed-paste markers.
-const MENU_PASTE_FINAL: u8 = b'~';
 /// Largest incomplete menu CSI retained between reads.
 ///
 /// A CSI longer than this cannot be a key report, so it is abandoned the
@@ -1424,7 +1418,7 @@ fn parse_ss3_menu_key(input: &[u8]) -> ParsedMenuKey {
             key: None,
         };
     }
-    if !(MENU_CSI_FINAL_START..=MENU_SS3_FINAL_END).contains(&input[2]) {
+    if !(MENU_CSI_FINAL_START..=MENU_CSI_FINAL_END).contains(&input[MENU_CSI_PREFIX_LEN]) {
         // Not an SS3 final byte: the Escape is a lone Escape and the rest is
         // re-parsed, so a following Escape or detach byte is not swallowed.
         return ParsedMenuKey {
@@ -1500,13 +1494,6 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
                 }
             } else {
                 parse_sgr_menu_mouse(input)
-            }
-        }
-        MENU_PASTE_FINAL if body == MENU_PASTE_OPEN_PARAMS || body == MENU_PASTE_CLOSE_PARAMS => {
-            ParsedMenuKey {
-                consumed,
-                pending: false,
-                key: None,
             }
         }
         _ => ParsedMenuKey {
