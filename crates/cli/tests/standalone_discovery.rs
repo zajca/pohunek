@@ -416,7 +416,8 @@ fn discovery_tolerates_missing_peer_address_and_empty_status() {
 
     assert!(discover_with_status(include_str!(
         "../../netbird/tests/fixtures/status_owner_idle_v0_83.json"
-    )).is_empty());
+    ))
+    .is_empty());
 
     let offline = discover_with_status(include_str!(
         "../../netbird/tests/fixtures/status_offline.json"
