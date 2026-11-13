@@ -614,7 +614,7 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
             warn(message + "; running everything")
             reason = message
             skip, sources, source = [], {}, None
-            record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None, "source_runs": []}
+            record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None, "source_runs": [], "jobs": {}}
     output("skip", json.dumps(skip, separators=(",", ":")))
     output("source_run", str(source["id"]) if source else "")
     output("source_runs", json.dumps(ordered_run_ids if sources else []))

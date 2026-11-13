@@ -868,13 +868,6 @@ def verify_steps(
         if not matching:
             failures.append(f"missing job for required step {name}: {required['step']}")
             continue
-        def _step_conclusion(step: dict) -> str:
-            conclusion = step.get("conclusion") or "missing"
-            if conclusion == "failure":
-                return "failure"
-            if conclusion == "success":
-                return "success"
-            return conclusion
         for job in matching:
             steps = job.get("steps") or []
             found = [step for step in steps if step.get("name") == required["step"]]
@@ -882,7 +875,7 @@ def verify_steps(
                 failures.append(f"missing required step {required['step']} in {name}")
                 continue
             for step in found:
-                conclusion = _step_conclusion(step)
+                conclusion = step.get("conclusion") or "missing"
                 if conclusion != "success":
                     failures.append(
                         f"required step {required['step']} in {name}: conclusion={conclusion}"
