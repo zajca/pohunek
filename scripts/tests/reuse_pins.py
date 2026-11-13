@@ -58,115 +58,115 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "540d92da36d78f82584861903b8087fd4d314b259bbadc63bba0c11ac90f31e8"
+PINNED_PREAMBLE = "062690e1a0df78904db933882d7cb937b53848ebf166e78adeb2822bd6b901e6"
 
 
 def pinned_preamble():
     return PINNED_PREAMBLE
 
 # Each entry: a token-reading line of a pinned body, with its expected
-# result on both reused paths. Bodies' job-level `if:` is positional
+# result on all three reused paths (pull request, dispatch, push). Bodies' job-level `if:` is positional
 # (the first `if:` of its own job) and exempt; `save-if:` and the
 # `shard:` line are exempt by exact text. `failure()` reads false
 # (a reused leg was green). Legs: `legs` are the matrix values the
-# entry is computed with; each leg records both paths.
+# entry is computed with; each leg records all three paths.
 EVALUATION_TABLE = [
     {
         "text": "NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "SKIP_OWNED_BY: ${{ (github.event_name != 'pull_request' || needs.changes.outputs.hermes_macos == 'true') && 'hermes-macos' || '' }}",
         "legs": {
-            "": {"pull_request": "hermes-macos", "workflow_dispatch": "hermes-macos"},
+            "": {"pull_request": "hermes-macos", "workflow_dispatch": "hermes-macos", "push": "hermes-macos"},
         },
     },
     {
         "text": "if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}",
         "legs": {
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}",
         "legs": {
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: env.TEST_SELECTION_SPARSE == 'true' && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && steps.infra-5.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'",
         "legs": {
-            "core": {"pull_request": "false", "workflow_dispatch": "false"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "": {"pull_request": "false", "workflow_dispatch": "false"},
+            "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: matrix.shard == 'core' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false')",
         "legs": {
-            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
-            "core": {"pull_request": "true", "workflow_dispatch": "true"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "core": {"pull_request": "true", "workflow_dispatch": "true", "push": "true"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
 ]

@@ -50,8 +50,9 @@ import sys
 from pathlib import Path
 
 fixture_path = Path(os.environ["GH_FIXTURE"])
-fixture = json.loads(fixture_path.read_text())
 args = sys.argv[1:]
+with Path(os.environ["GH_CALLS"]).open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
 
 if args[:2] == ["api", "--method"]:
     endpoint = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
@@ -59,10 +60,20 @@ if args[:2] == ["api", "--method"]:
     # alone concatenates them. The fixtures carry real artifacts on later
     # pages, so a script that reads only the first page misses them.
     slurped = "--paginate" in args and "--slurp" in args
-    def listing(key):
+    fixture = json.loads(fixture_path.read_text())
+    def listing(key, run_id=None):
         pages = fixture.get("pages", {}).get(key)
         if pages is None:
             pages = fixture.get(f"{key}_pages")
+        if pages is None and run_id is not None:
+            per_run = (fixture.get("pages", {}).get(f"{key}_by_run", {}) or {}).get(str(run_id))
+            if per_run is not None:
+                fixture.setdefault("run_call_counts", {}).setdefault(str(run_id), {})
+                fixture["run_call_counts"][str(run_id)].setdefault(key, 0)
+                seen = fixture["run_call_counts"][str(run_id)][key]
+                fixture["run_call_counts"][str(run_id)][key] += 1
+                fixture_path.write_text(json.dumps(fixture))
+                pages = per_run[min(seen, len(per_run) - 1)]
         if pages is None:
             return None
         if slurped:
@@ -104,7 +115,7 @@ if args[:2] == ["api", "--method"]:
         sys.stdout.buffer.write(base64.b64decode(zips[artifact_id]))
     elif "/actions/runs/" in endpoint and "/jobs" in endpoint:
         run_id = str(endpoint.split("/")[-2])
-        if listing("jobs") is None:
+        if listing("jobs", run_id) is None:
             print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get(run_id, [])}]))
     else:
         raise SystemExit("unexpected Actions API endpoint: " + repr(endpoint))
@@ -113,14 +124,24 @@ else:
 '''
 
 
-def run_doc(run_id=777, event="pull_request", head_repo=REPO):
+def run_doc(run_id=777, event="pull_request", head_repo=REPO, branch="zajca/feature", head_sha=None,
+            status="completed", conclusion="success", path=".github/workflows/ci.yml@refs/heads/main"):
+    # Push sources default to main branch (run_tier main); PR sources stay
+    # on the feature branch, which run_tier maps to None (not main/nightly).
+    if event == "push" and branch == "zajca/feature":
+        branch = "main"
+    title = "CI [tier=main]" if event == "workflow_dispatch" else "CI"
     return {
         "id": run_id,
         "run_number": run_id,
         "run_attempt": 1,
-        "head_sha": SHA,
-        "head_branch": "zajca/feature",
+        "head_sha": head_sha or SHA,
+        "head_branch": branch,
+        "path": path,
         "event": event,
+        "status": status,
+        "conclusion": conclusion,
+        "display_title": title,
         "repository": {"full_name": REPO},
         "head_repository": {"full_name": head_repo},
         "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
@@ -190,19 +211,23 @@ class CiReuseProcessTests(unittest.TestCase):
         gh.chmod(0o755)
         self.bin_dir = bin_dir
         self.fixture = self.directory / "fixture.json"
+        self.calls = self.directory / "calls.jsonl"
+        self.calls.write_text("")
         self.output = self.directory / "output"
         self.output.write_text("")
         self.saved = {
             key: os.environ.get(key)
             for key in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_OUTPUT",
-                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE")
+                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE", "GH_CALLS", "GITHUB_EVENT_NAME")
         }
         self.addCleanup(self.restore_env)
         os.environ["GITHUB_REPOSITORY"] = REPO
         os.environ["GITHUB_SHA"] = SHA
+        os.environ["GITHUB_EVENT_NAME"] = "push"
         os.environ["GITHUB_OUTPUT"] = str(self.output)
         os.environ["RUNNER_TEMP"] = str(self.directory)
         os.environ["WORKFLOW_FILE"] = "ci.yml"
+        os.environ["GH_CALLS"] = str(self.calls)
         os.environ["PATH"] = f"{bin_dir}{os.pathsep}{self.saved['PATH']}"
         self.git_tree = None
 
@@ -625,6 +650,400 @@ else:
         skip = json.loads(self.outputs()["skip"])
         self.assertIn("platform-contracts", skip)
         self.assertIn("hermes-compatibility-macos", skip)
+
+
+
+
+    def test_a_push_reuses_a_pull_request_source_by_tree(self):
+        # Push (issue #2204, rows 1-2): the merge commit differs from the PR
+        # head that tested the same tree. The source is on another commit
+        # (OTHER_SHA) but its recorded tested-tree equals the push tree.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="pull_request", head_sha="b" * 40)],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertIn("test", skip)
+        self.assertEqual(self.outputs()["source_run"], "777")
+        self.assertEqual(self.outputs()["source_runs"], "[777]")
+
+    def test_a_push_takes_the_newest_green_leg_in_each_job(self):
+        # Two same-tree sources (push 888 newer, pull_request 777 older).
+        # The newer push run supplies `test`; the older supplies the rest.
+        # `test` appears red in the older run but green in the newer one.
+        newer_jobs = [job("fmt + clippy")]  # push 888 supplies only `test`
+        older_jobs = green_jobs()
+        self.write_fixture(
+            runs=[
+                run_doc(run_id=888, event="push"),
+                run_doc(run_id=777, event="pull_request"),
+            ],
+            jobs_by_run={"888": newer_jobs, "777": older_jobs + [job("fmt + clippy", conclusion="failure")]},
+            artifacts={
+                "888": [{"name": f"tested-tree-{TREE}", "id": 1}, {"name": "test-selection", "id": 2}],
+                "777": [{"name": f"tested-tree-{TREE}", "id": 3}, {"name": "test-selection", "id": 4}],
+            },
+            artifact_zips={"2": selection_zip("full"), "4": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertIn("test", skip)
+        record = self.record(TREE)
+        self.assertEqual(record["jobs"]["test"]["run_id"], 888)
+        self.assertEqual(record["source_runs"], [777, 888])
+        self.assertEqual(record["jobs"]["darwin-check"]["run_id"], 777)
+        self.assertIn(record["jobs"]["test"]["run_id"], record["source_runs"])
+
+    def test_a_delta_dispatch_never_reuses_a_same_tree_source_on_another_commit(self):
+        # Row 15: a delta dispatch reuses the same commit; a same-tree
+        # source on another commit is not a dispatch source.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="workflow_dispatch", head_sha="b" * 40)],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_delta_dispatch_reuses_a_same_commit_source(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="workflow_dispatch")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 0)
+        self.assertIn("test", json.loads(self.outputs()["skip"]))
+
+    def test_a_delta_dispatch_source_never_reuses_a_skipped_leg(self):
+        # A workflow_dispatch source whose `test` leg was skipped (reused
+        # there) cannot supply `test` here; the job runs here.
+        jobs = []
+        for entry in green_jobs():
+            if entry["name"] == "fmt + clippy":
+                jobs.append(job("fmt + clippy", conclusion="skipped"))
+            else:
+                jobs.append(entry)
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="workflow_dispatch")],
+            jobs_by_run={"777": jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertNotIn("test", skip)
+
+    def test_a_push_never_reuses_a_source_older_than_a_day(self):
+        stale_jobs = [job(entry["name"], completed_at=STALE) for entry in green_jobs()]
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push")],
+            jobs_by_run={"777": stale_jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_source_on_a_disallowed_event_supplies_nothing(self):
+        # A run whose event is not in the candidate's allowlist (for example
+        # a schedule run) never supplies reuse, even when everything else
+        # is green and fresh.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="schedule")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_run_from_another_repository_supplies_nothing(self):
+        # The listing only names this repository's runs; a same-tree run
+        # recorded under another owner never supplies reuse, even when the
+        # head repository matches.
+        self.write_fixture(
+            runs=[{**run_doc(run_id=777, event="push"),
+                    "repository": {"full_name": "someone/pohunek"}}],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_push_never_uses_a_fork_source(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push", head_repo="someone/pohunek")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_dispatch_source_of_another_tier_supplies_nothing(self):
+        # A dispatch source whose title names another tier (here nightly)
+        # never supplies main reuse, even when the tree matches.
+        self.write_fixture(
+            runs=[{**run_doc(run_id=777, event="workflow_dispatch",
+                           head_sha=SHA, branch="main"),
+                    "display_title": "CI [tier=nightly]"}],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_push_to_a_feature_branch_never_supplies_reuse(self):
+        # A push source must be a main-branch push (run_tier main).
+        self.write_fixture(
+            runs=[{**run_doc(run_id=777, event="push"), "head_branch": "zajca/feature"}],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_consumer_on_an_unknown_event_refuses_reuse(self):
+        # `ci-reuse` answers only push and delta-dispatch consumers: a
+        # schedule consumer refuses before any listing, so the refusal
+        # text names the event instead of reusing anything.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "schedule"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
+
+    def test_a_run_created_before_the_window_supplies_nothing(self):
+        # A run created more than 24h ago never supplies reuse, even when
+        # every leg is green and fresh: the run-level age guard drops it
+        # before any job is considered.
+        old = {**run_doc(run_id=777, event="push"),
+               "created_at": "2026-11-10T11:00:00Z"}
+        self.write_fixture(
+            runs=[old],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_source_for_another_tree_never_supplies_a_job(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": "tested-tree-" + "d" * 40, "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_source_with_conclusion_not_success_supplies_nothing(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push", conclusion="cancelled")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_source_with_head_sha_mismatch_for_a_dispatch_supplies_nothing(self):
+        # A delta dispatch must not reuse a same-tree PR source on
+        # another commit (row 15 via consumer event).
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="pull_request", head_sha="b" * 40)],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_leg_lost_between_listings_runs_everything(self):
+        # A leg that was green in the decide listing but is gone when the
+        # record entries are read resets the whole decision: the record
+        # must not name a job the source no longer lists.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        # The record entries are read off a second jobs listing, after
+        # decide: drop every leg there so the source no longer lists the
+        # reused legs and the whole decision resets.
+        fixture = json.loads(self.fixture.read_text())
+        fixture["pages"] = {"jobs_by_run": {"777": [[{"jobs": green_jobs()}], [{"jobs": []}]]}}
+        self.fixture.write_text(json.dumps(fixture))
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+        record = self.record(TREE)
+        self.assertEqual(record["jobs"], {})
+        self.assertEqual(record["source_runs"], [])
+
+    def test_a_listing_query_filters_by_the_reuse_window(self):
+        # The listing query carries the reuse window to the API: the `created`
+        # filter starts at now-24h, so the listing never grows unbounded.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [{"name": f"tested-tree-{TREE}", "id": 1}]},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        listings = [
+            json.loads(line) for line in self.calls.read_text().splitlines()
+            if "actions/workflows/ci.yml/runs" in " ".join(json.loads(line))
+        ]
+        self.assertEqual(len(listings), 1)
+        query = " ".join(listings[0])
+        self.assertIn("per_page=100", query)
+        since = (NOW - datetime.timedelta(hours=24)).date().isoformat()
+        self.assertIn(f"created=>={since}", query.replace(" ", ""))
+
+    def test_a_full_first_run_stops_before_the_second_listing(self):
+        # The candidate loop stops when every allowlisted job has its
+        # newest leg: with one full same-tree run first, the older run's
+        # artifacts are never listed.
+        self.write_fixture(
+            runs=[run_doc(run_id=888, event="push"), run_doc(run_id=777)],
+            jobs_by_run={"888": green_jobs(), "777": green_jobs()},
+            artifacts={"888": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ], "777": [
+                {"name": f"tested-tree-{TREE}", "id": 3},
+                {"name": "test-selection", "id": 4},
+            ]},
+            artifact_zips={"2": selection_zip("full"), "4": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertIn("test", json.loads(self.outputs()["skip"]))
+        artifact_lists = [
+            " ".join(json.loads(line)) for line in self.calls.read_text().splitlines()
+            if "/artifacts" in " ".join(json.loads(line))
+        ]
+        self.assertTrue(any("runs/888/artifacts" in call for call in artifact_lists))
+        self.assertFalse(any("runs/777/artifacts" in call for call in artifact_lists))
+
+    def test_dry_run_reports_the_decision_without_writing_outputs(self):
+        # `--dry-run` prints the decision but writes neither the record nor
+        # the step outputs: a planning probe must not publish reuse.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [{"name": f"tested-tree-{TREE}", "id": 1}]},
+        )
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("ci_reuse_under_test", str(SCRIPT))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.commit_tree = lambda sha: TREE
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = module.main(now=NOW, argv=["--dry-run"])
+        out = buffer.getvalue()
+        self.assertEqual(rc, 0)
+        lines = [line for line in out.strip().splitlines() if line.startswith("{")]
+        decision = json.loads(lines[-1])
+        self.assertIn("test", decision["skip"])
+        self.assertEqual(self.output.read_text(), "")
+        self.assertFalse((self.directory / f"ci-reuse-{TREE}.json").exists())
 
 
 if __name__ == "__main__":
