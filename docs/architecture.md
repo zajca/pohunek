@@ -1934,6 +1934,9 @@ is available it wins and the static table is cross-checked against it
 pin with `host.governance.inspect` before any other request on a static peer
 and refuses a mismatch as `host_identity_mismatch`, with the typed error and
 advice to run `pohunek host governance inspect local` and correct the file.
+The trust anchor is the owner-chosen pinned host id alone, and the daemon's
+registry (`host.resolve`, and so the TypeScript SDK) builds its registry without
+static peers, so it never resolves them.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.

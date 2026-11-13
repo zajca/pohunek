@@ -5154,8 +5154,9 @@ CLI belongs in the file. Every failure, including an unusable
 `POHUNEK_REMOTE_PORT`, is `overlay_configuration_invalid` (class
 `configuration`; before this code an unusable `POHUNEK_REMOTE_PORT` reported
 `netbird_configuration_invalid`). Its message names the file and at most a line
-number, never a value from the file, and no provider is consulted before it is
-raised. The daemon validates the file before it takes a lock, migrates the store
+number, never a value from the file — a `netbird` table failure names the
+validated key (`netbird.static_peers.<key>` and the failed field), still never
+a value — and no provider is consulted before it is raised. The daemon validates the file before it takes a lock, migrates the store
 or adopts a worker, and exits with the same code in its error text. The daemon
 reads the file at start, so a change applies after a daemon restart. A CLI of
 this release reads `port` from the file while an older daemon still binds the
@@ -5163,7 +5164,7 @@ environment value or 18722, and so does a client of an earlier release (a CLI
 on another host, or a Rust client pinned to an earlier tag such as the
 `pohunek-work` gateway): set `port` only after every daemon and every client that
 dials those hosts runs this release and the daemons are restarted. A pinned
-client adopts the file when it bumps its pin. With `providers = ["netbird"]` the file may also carry `[netbird]` (`subnet`, an IPv4 network inside `100.64.0.0/10` from `/10` to `/30`, no host bits) and 1–32 `[netbird.static_peers.<name>]` entries with `address`, `fqdn` and a required `host_id`; the key is a DNS label other than `local`, must not equal another entry address, fqdn, host id or short name, and `address` must lie inside `subnet` (not the network or broadcast address). Those entries are used only while the NetBird overview is restricted (NetBird 0.83+, daemon status `Connected`), the client verifies the pin with `host.governance.inspect` before any other request (`host_identity_mismatch` on a mismatch), and static peers never appear in `host discover`/`host list`. Upgrade every binary and pinned client first. An older `pohunekd` refuses to start with the new table (the file is a schema error), and an older release rejects it as an unknown key. Invalid `port`/`netbird` values are `overlay_configuration_invalid` and name only the entry key, never a value.
+client adopts the file when it bumps its pin. With `providers = ["netbird"]` the file may also carry `[netbird]` (`subnet`, an IPv4 network inside `100.64.0.0/10` from `/10` to `/30`, no host bits) and 1–32 `[netbird.static_peers.<name>]` entries with `address`, `fqdn` and a required `host_id`; the key is a lowercase DNS label other than `local`, the `{key, first fqdn label}` sets of two entries are disjoint, `address`/`fqdn`/`host_id` are pairwise distinct across entries, the `fqdn` is a lowercase DNS name of at least two labels at most 253 bytes with no trailing dot, and `address` must lie inside `subnet` (not the network or broadcast address). Those entries are used only while the NetBird overview is restricted (NetBird 0.83+, daemon status `Connected`); the client verifies the pin with `host.governance.inspect` before any other request on a separate framed connection (`host_identity_mismatch` on a mismatch), and before a raw stream (`connect_raw_with_options`, `attach_raw_with_options`) the pin is pre-proved on such a framed connection and the raw stream itself is not verified. Static peers never appear in `host discover`/`host list`. When a full status is available it wins and the static table is cross-checked against it (`overlay_configuration_invalid` on a contradiction). The residual gap is a different mesh member that took the pinned address and reports the pinned host id itself; the id is self-reported and not detected. The daemon (`host.resolve`, and so the TypeScript SDK) never resolves static peers; one dialing through `host.resolve` therefore refuses them as `netbird_state_restricted`. Upgrade every binary and pinned client first. An older `pohunekd` refuses to start with the new table (the file is a schema error), and an older release rejects it as an unknown key. Invalid `port`/`netbird` values are `overlay_configuration_invalid` and name only the entry key, never a value.
 
 Diagnostics. `pohunek doctor` checks the overlays that are configured instead
 of NetBird unconditionally: one `<overlay>_cli` check per overlay, in the place
@@ -5551,8 +5552,7 @@ Host resolution:
   this machine's own overlay name) are the CLI's and the Rust client's; the SDK
   holds no copy of them. The daemon's typed errors keep their `code`, message
   and recovery hint (`host_unknown`, `overlay_host_ambiguous`,
-  `overlay_host_unavailable`, `host_identity_unpinnable`,
-  `host_identity_mismatch`), and a daemon of the
+  `overlay_host_unavailable`, `host_identity_unpinnable`), and a daemon of the
   previous protocol version fails with `daemon_protocol_too_old`. `display` is
   the route as the caller typed it.
 - `pinnedRoute` names the peer by its stable identity. Resolving it again

@@ -113,7 +113,10 @@ fn serve_first_then_later(listener: TcpListener, served: Served, first: String, 
 }
 
 /// A daemon recording every method served, grouped per connection, with a
-/// switchable reported host id and a session list that names `s-1`.
+/// switchable reported host id and a session list that names `s-1`. The
+/// connection slot is allocated at accept time and each request is pushed
+/// into its slot as it is read, so the test may assert on the recording
+/// without waiting for the fixture threads to observe EOF.
 fn serve_session_and_track(
     listener: TcpListener,
     connections: Arc<Mutex<Vec<Vec<String>>>>,
@@ -123,20 +126,21 @@ fn serve_session_and_track(
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let connections = Arc::clone(&connections);
+            let slot = connections.lock().expect("connections").len();
+            connections.lock().expect("connections").push(Vec::new());
             let reported = Arc::clone(&reported);
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
-                let mut methods: Vec<String> = Vec::new();
                 loop {
                     line.clear();
                     if reader.read_line(&mut line).expect("read a fixture line") == 0 {
-                        connections.lock().expect("connections").push(methods);
                         return;
                     }
                     let request: Request =
                         serde_json::from_str(line.trim_end()).expect("parse a request");
-                    methods.push(request.method().to_owned());
+                    connections.lock().expect("connections")[slot]
+                        .push(request.method().to_owned());
                     let reported = reported.lock().expect("reported").clone();
                     let result = match request.method() {
                         protocol::method::SESSION_INPUT => {
@@ -393,7 +397,9 @@ fn a_mismatching_host_id_refuses_and_dials_nothing_after_the_check() {
     );
 }
 
-/// S2: a raw address is never matched against the static table.
+/// S2: a raw address is never matched against the static table. The
+/// `netbird_state_restricted` code is asserted, so the test fails if the raw
+/// literal started to resolve (or if the code changed).
 #[test]
 fn a_raw_address_is_never_matched_against_the_static_table() {
     let pinned = host_id(b'A');
@@ -402,7 +408,12 @@ fn a_raw_address_is_never_matched_against_the_static_table() {
         &pinned,
         &pinned,
     );
-    assert!(!run.output.status.success(), "{}", diagnostics(&run.output));
+    let text = diagnostics(&run.output);
+    assert!(!run.output.status.success(), "{text}");
+    assert!(
+        text.contains("netbird_state_restricted"),
+        "the restricted code: {text}"
+    );
     assert!(
         run.dialed.is_empty(),
         "no dial for a raw address: {:?}",
@@ -415,11 +426,12 @@ fn a_raw_address_is_never_matched_against_the_static_table() {
     );
 }
 
-/// S6: without the static table the restricted overview keeps failing
-/// closed. (Empty table => `overlays.toml` without `[netbird]`.)
+/// S5: a name absent from the table fails with the restricted error rather
+/// than `host_unknown`. The `netbird_state_restricted` code is asserted, so
+/// the test fails if the code changed. (Empty table => `overlays.toml`
+/// without `[netbird]`.)
 #[test]
 fn a_restricted_overview_without_the_table_keeps_failing_closed() {
-    let _pinned = host_id(b'A');
     let env = TestEnv::new().expect("create the hermetic test environment");
     let root = env.root().to_path_buf();
     for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -454,21 +466,20 @@ fn a_restricted_overview_without_the_table_keeps_failing_closed() {
         .output()
         .expect("run pohunek");
     assert!(!output.status.success(), "{}", diagnostics(&output));
+    let text = diagnostics(&output);
+    assert!(
+        text.contains("netbird_state_restricted"),
+        "the restricted code: {text}"
+    );
     assert!(
         fs::read_to_string(&capture).unwrap_or_default().is_empty(),
         "no dial without the table"
     );
 }
 
-/// S7 (CLI half, see S10/S11): a full status wins over the table. The fixture
-/// peer table contradicts the static entry, so a resolution through the table
-/// would have failed; the command reaches the status peer instead.
-///
-/// This scenario lives beside the full-status tests of the `netbird` crate; it
-/// only proves the CLI dials the status address, not the table address.
-/// The `Connecting` stub (S3 setup): reach through `run_pinned` with a
-/// connecting fake. The restricted fixture's `Connected` is replaced once at
-/// write time, so the check is not a tautology.
+/// S4: a `Connecting` overview never resolves the static peer. The restricted
+/// fixture's `Connected` is replaced once at write time, so the check is not
+/// a tautology. The `netbird_state_restricted` code is asserted.
 #[test]
 fn a_connecting_overview_never_resolves_the_static_peer() {
     let pinned = host_id(b'A');
@@ -522,19 +533,6 @@ fn a_connecting_overview_never_resolves_the_static_peer() {
     );
 }
 
-/// S9: locked `0600` config written by the helper is accepted, so every
-/// scenario above is the locked-file case; this test only names the mode.
-#[test]
-fn the_locked_config_mode_is_accepted() {
-    let pinned = host_id(b'A');
-    let local = run_static_session(&pinned, &pinned);
-    assert!(
-        local.output.status.success(),
-        "{}",
-        diagnostics(&local.output)
-    );
-}
-
 /// S6: a restricted overview never names a static peer in discovery or
 /// listing. `host discover --json` and `host list --json` both fail with the
 /// restricted code and no peer record carries the static name or FQDN.
@@ -565,8 +563,6 @@ fn host_discover_does_not_name_a_static_peer() {
     );
 }
 
-/// S11a: a duplicate pin (same address twice) is refused at load. This is the
-/// `1..=MAX` duplicate rejection proof at the CLI boundary.
 /// S11: the daemon builds its registry **without** static peers. A real
 /// `pohunekd` with the static-peer `overlays.toml` and a fake restricted
 /// `netbird` answers `host.resolve` over its local Unix socket with
@@ -655,12 +651,6 @@ fn the_daemon_never_resolves_a_static_peer() {
     );
 }
 
-/// S3 (dedicated): `session.input` with `--until` goes through
-/// `call_dedicated`, which dials a fresh connection and re-proves the pin.
-/// The fixture daemon lists `s-1` so the name lookup succeeds first;
-/// the dedicated connection must then carry `host.governance.inspect`
-/// before `session.input`, and the pin must be the first non-`daemon.health`
-/// request on that connection too.
 /// S5: an unmatched name fails closed with the restricted error, never with
 /// `host_unknown`, and dials nothing.
 #[test]
@@ -960,7 +950,7 @@ fn a_shared_short_name_is_refused_at_load() {
         format!(
             "providers = [\"netbird\"]\n\n[netbird]\nsubnet = \"100.64.0.0/10\"\n\n\
              [netbird.static_peers.{PEER_NAME}]\naddress = \"{PEER_IP}\"\nfqdn = \"vps2.remote-box.netbird.test\"\nhost_id = \"{pinned}\"\n\n\
-             [netbird.static_peers.twin]\naddress = \"100.64.0.22\"\nfqdn = \"vps2.other.netbird.test\"\nhost_id = \"{pinned}\"\n"
+             [netbird.static_peers.twin]\naddress = \"100.64.0.22\"\nfqdn = \"vps2.other.netbird.test\"\nhost_id = \"host_CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
         ),
     )
     .expect("write overlays.toml");
@@ -991,6 +981,10 @@ fn a_shared_short_name_is_refused_at_load() {
     assert!(
         out.contains("overlay_configuration_invalid"),
         "config code: {out}"
+    );
+    assert!(
+        out.contains("share a selector name"),
+        "the selector-name-arm message: {out}"
     );
     assert!(!marker.exists(), "no provider call");
     assert!(
@@ -1128,7 +1122,7 @@ fn a_consistent_full_status_dials_without_the_pin_check() {
     );
 }
 
-/// N1 CLI S3: `pohunek --host vps2 session input s-1 hello --until working`
+/// S3 (CLI side): `pohunek --host vps2 session input s-1 hello --until working`
 /// resolves the session through a pinned connection, then dials a dedicated
 /// connection for `session.input`; each connection must carry
 /// `host.governance.inspect` before any other method, and the dedicated
@@ -1214,10 +1208,13 @@ fn a_dedicated_cli_connection_reproves_the_pin() {
     );
 }
 
-/// N1b CLI: the by-host raw attach path proves the pin on a framed connection
-/// before any raw byte is delivered; a daemon that matched the pin on the
-/// first connection but reports a different id on the attach connection is
-/// refused, and the raw stream never receives a header.
+/// S10: `pohunek --host vps2 attach s-1` goes through `Client::attach_raw` on
+/// a pinned client: a framed control connection resolves `vps2` (proving the
+/// pin), then `attach_raw` opens a fresh framed connection and proves the pin
+/// again before any raw byte. The fixture reports the pinned id on the first
+/// connection and a different id from the second; the attach then fails with
+/// `host_identity_mismatch` before any raw attach prelude is served, and
+/// `session.attach` is never served.
 #[test]
 fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
     let pinned = host_id(b'A');
@@ -1249,7 +1246,7 @@ fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
     let port = listener.local_addr().expect("fixture address").port();
     let served = Served::default();
-    serve_first_then_later(listener, Arc::clone(&served), pinned.clone(), host_id(b'B'));
+    serve_first_then_later(listener, Arc::clone(&served), pinned, host_id(b'B'));
     let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
     command.env("PATH", &bin);
     command.env("LD_PRELOAD", &library);
@@ -1278,9 +1275,12 @@ fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
     );
 }
 
-/// N4: a pinned-route action under a contradicting full status is refused
-/// with `overlay_configuration_invalid` and dials nothing. This exercises
-/// `resolve_peer` (host-name route) and `resolve_peer_identity` paths.
+/// S8 (pinned-route side): a pinned-route action under a contradicting full
+/// status is refused with `overlay_configuration_invalid` and dials nothing.
+/// `session list` on `--host vps2` resolves through `resolve_peer` (host-name
+/// route), so this re-proves the same cross-check from the CLI side.
+/// The identity path (`resolve_peer_identity`, `netbird:fqdn~` route) is
+/// proven in the client crate, where it is reachable without stdio.
 #[test]
 fn a_pinned_route_under_a_contradicting_full_status_is_refused() {
     let pinned = host_id(b'A');
@@ -1332,12 +1332,26 @@ fn a_pinned_route_under_a_contradicting_full_status_is_refused() {
     assert!(captured.is_empty(), "nothing is dialed: {captured}");
 }
 
-/// N2: the three uniqueness rules each fail alone: a shared address, a shared
-/// fqdn, and a shared short name; no arm is masked by another.
-#[test]
-fn each_uniqueness_rule_fails_alone() {
-    // Shared address arm.
-    let pinned = host_id(b'A');
+/// S7: the four uniqueness rules each fail alone: a shared address, a shared
+/// fqdn, a shared host id, and a shared short name (`{key, first fqdn label}`
+/// sets). Each block asserts its exact `check_uniqueness` message, so a
+/// decision-1.5 message change or an arm removal is caught. A shared fqdn
+/// only reaches its arm before the selector-name arm, and its message names
+/// `share an fqdn` where the selector arm would say `share a selector name`.
+/// Shared hermetic scaffold for one uniqueness arm: the owner-private
+/// directories, `overlays.toml` with `table`, and a fake `netbird` on `PATH`
+/// that touches `marker` when consulted. Returns the command environment,
+/// the marker, and the dial capture.
+struct UniquenessSetup {
+    env: TestEnv,
+    marker: std::path::PathBuf,
+    capture: std::path::PathBuf,
+    library: std::path::PathBuf,
+    bin: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+fn uniqueness_setup(table: &str) -> UniquenessSetup {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let root = env.root().to_path_buf();
     for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -1351,11 +1365,8 @@ fn each_uniqueness_rule_fails_alone() {
     fs::create_dir_all(&config_dir).expect("create the config directory");
     fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
         .expect("make the config directory private");
-    let text = format!(
-        "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"{PEER_FQDN}\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"{PEER_IP}\"\nfqdn = \"vps3.remote-box.netbird.test\"\nhost_id = \"host_BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
-    );
     let file = config_dir.join("overlays.toml");
-    fs::write(&file, &text).expect("write overlays.toml");
+    fs::write(&file, table).expect("write overlays.toml");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
         .expect("make overlays.toml private");
     let bin = root.join("bin");
@@ -1370,58 +1381,88 @@ fn each_uniqueness_rule_fails_alone() {
     )
     .expect("write fake netbird");
     let (library, capture) = connect_redirect::build(&root);
-    let mut cmd = env.command(pohunek_test_support::bin_exe("pohunek"));
-    cmd.env("PATH", &bin);
-    cmd.env("LD_PRELOAD", &library);
-    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    UniquenessSetup {
+        env,
+        marker,
+        capture,
+        library,
+        bin,
+        file,
+    }
+}
+
+/// Run `pohunek --host vps2 session list --json` in a uniqueness setup and
+/// assert the refusal carries `code` and `message` with no provider call
+/// and no dial.
+fn uniqueness_arm_refuses(setup: &UniquenessSetup, label: &str, code: &str, message: &str) {
+    let mut cmd = setup.env.command(pohunek_test_support::bin_exe("pohunek"));
+    cmd.env("PATH", &setup.bin);
+    cmd.env("LD_PRELOAD", &setup.library);
+    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &setup.capture);
     cmd.args(["--host", PEER_NAME, "session", "list", "--json"]);
     let out = cmd.output().expect("run pohunek");
     let text = diagnostics(&out);
-    assert!(!out.status.success(), "shared address refuses: {text}");
-    assert!(
-        text.contains("overlay_configuration_invalid"),
-        "config code: {text}"
-    );
-    assert!(!marker.exists(), "no provider call after rejection");
-    let captured = fs::read_to_string(&capture).unwrap_or_default();
+    assert!(!out.status.success(), "{label} refuses: {text}");
+    assert!(text.contains(code), "the config code: {text}");
+    assert!(text.contains(message), "the {label} message: {text}");
+    assert!(!setup.marker.exists(), "no provider call after rejection");
+    let captured = fs::read_to_string(&setup.capture).unwrap_or_default();
     assert!(captured.is_empty(), "nothing dialed: {captured}");
+}
 
-    // Shared fqdn arm: the full-fqdn check is subsumed by the short-name
-    // check (equal fqdn implies equal first label), so it is kept for a
-    // specific error message but cannot fail in isolation.
-    let text = format!(
+#[test]
+fn each_uniqueness_rule_fails_alone() {
+    // Shared address arm.
+    let pinned = host_id(b'A');
+    let table = format!(
+        "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"{PEER_FQDN}\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"{PEER_IP}\"\nfqdn = \"vps3.remote-box.netbird.test\"\nhost_id = \"host_BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
+    );
+    let setup = uniqueness_setup(&table);
+    uniqueness_arm_refuses(
+        &setup,
+        "shared address",
+        "overlay_configuration_invalid",
+        "netbird.static_peers.vps2 and netbird.static_peers.vps3 share an address",
+    );
+
+    // Shared fqdn arm: equal fqdns imply equal first labels, so the
+    // selector-name arm would also reject this file; the fqdn arm fires
+    // first and its message (`share an fqdn`) distinguishes it from the
+    // selector-name arm (`share a selector name`).
+    let table = format!(
         "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"aaa.test\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"100.64.0.22\"\nfqdn = \"aaa.test\"\nhost_id = \"host_BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
     );
-    fs::write(&file, &text).expect("write overlays.toml");
-    let mut cmd = env.command(pohunek_test_support::bin_exe("pohunek"));
-    cmd.env("PATH", &bin);
-    cmd.env("LD_PRELOAD", &library);
-    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
-    cmd.args(["--host", PEER_NAME, "session", "list", "--json"]);
-    let out = cmd.output().expect("run pohunek");
-    let text = diagnostics(&out);
-    assert!(!out.status.success(), "shared fqdn refuses: {text}");
-    assert!(
-        text.contains("overlay_configuration_invalid"),
-        "config code: {text}"
+    fs::write(&setup.file, &table).expect("write overlays.toml");
+    uniqueness_arm_refuses(
+        &setup,
+        "shared fqdn",
+        "overlay_configuration_invalid",
+        "netbird.static_peers.vps2 and netbird.static_peers.vps3 share an fqdn",
+    );
+
+    // Shared host-id arm: distinct addresses, fqdns and short names; the
+    // host-id arm fires alone.
+    let table = format!(
+        "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"{PEER_FQDN}\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"100.64.0.22\"\nfqdn = \"vps3.remote-box.netbird.test\"\nhost_id = \"{pinned}\"\n"
+    );
+    fs::write(&setup.file, &table).expect("write overlays.toml");
+    uniqueness_arm_refuses(
+        &setup,
+        "shared host id",
+        "overlay_configuration_invalid",
+        "netbird.static_peers.vps2 and netbird.static_peers.vps3 share a host id",
     );
 
     // Shared short-name arm.
     let other_pinned = host_id(b'C');
-    let text = format!(
+    let table = format!(
         "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"vps2.remote-box.netbird.test\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"100.64.0.22\"\nfqdn = \"vps2.remote-box2.netbird.test\"\nhost_id = \"{other_pinned}\"\n"
     );
-    fs::write(&file, &text).expect("write overlays.toml");
-    let mut cmd = env.command(pohunek_test_support::bin_exe("pohunek"));
-    cmd.env("PATH", &bin);
-    cmd.env("LD_PRELOAD", &library);
-    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
-    cmd.args(["--host", PEER_NAME, "session", "list", "--json"]);
-    let out = cmd.output().expect("run pohunek");
-    let text = diagnostics(&out);
-    assert!(!out.status.success(), "shared short name refuses: {text}");
-    assert!(
-        text.contains("overlay_configuration_invalid"),
-        "config code: {text}"
+    fs::write(&setup.file, &table).expect("write overlays.toml");
+    uniqueness_arm_refuses(
+        &setup,
+        "shared short name",
+        "overlay_configuration_invalid",
+        "netbird.static_peers.vps2 and netbird.static_peers.vps3 share a selector name",
     );
 }

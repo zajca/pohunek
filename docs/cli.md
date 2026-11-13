@@ -80,7 +80,10 @@ cannot be pinned: the operation fails before its first connection with
 owner-configured static table only while the NetBird overview is restricted
 (NetBird 0.83+, daemon status `Connected`) and verifies the pinned `host_id`
 with `host.governance.inspect` before any other request; a mismatch fails
-with `host_identity_mismatch`. `host discover` and `host list` never name
+with `host_identity_mismatch`. The trust anchor is the owner-chosen pinned
+host id alone. When a full status is available it wins and the static table
+is cross-checked (`overlay_configuration_invalid` on a contradiction).
+`host discover` and `host list` never name
 static peers. Errors and output keep the name you typed.
 
 | Command | What it does |
