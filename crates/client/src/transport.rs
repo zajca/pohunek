@@ -1329,10 +1329,9 @@ impl Client {
                         expected_host_id: expected_host_id.clone(),
                     },
                     options,
-                    selected_version: None,
+                    selected_version: self.inherited_version(),
                     origin: self.origin.clone(),
                 };
-                client.selected_version = self.inherited_version();
                 if let Some(expected) = expected_host_id {
                     client.verify_host_identity(expected).await?;
                 }

@@ -82,7 +82,20 @@ status_timeout_secs = 10  # optional
   matches the table, and static peers never appear in `host discover` or
   `host list`. `[netbird]` takes `subnet` (an IPv4 network inside `100.64.0.0/10`,
   from `100.64.0.0/10` itself to `/30`), and `[netbird.static_peers.*]`
-  is required with it.
+  is required with it. The host id is required; at most 32 entries. The key
+  must be a DNS label other than `local`; it must not equal another entry
+  address, fqdn, host id or short name. The `address` must lie inside the
+  subnet and not be the network or broadcast address. Error messages name
+  the entry key and never a value from the file.
+  - **Accounts that do not own the connection.** Find the subnet from
+    `netbird status --json` of the owning account, or from the Dashboards
+    settings; the peer `fqdn` and host id from `pohunek host governance
+    inspect <host>` on the peer. The pin does not protect against a daemon
+    that reports another host id; a mesh member that took the address and
+    reports the pinned id is not detected (the id is self-reported).
+    `host_identity_mismatch` means the dialled daemon is not the pinned
+    host: run `pohunek host governance inspect local` on the peer and
+    correct the `address`/`host_id`.
 - A daemon of an older release ignores the file and binds the environment value
   or 18722, and so does a client of an earlier release (a CLI on another host,
   a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
@@ -138,6 +151,8 @@ Use these commands for orientation:
   `session <action> <name>` command that looks the session name up first) and
   pinned to the peer identity it selected, so a renamed short name is never followed midway; a
   peer with no peer id and no FQDN fails with `host_identity_unpinnable`.
+  A static peer (owner-configured in `overlays.toml`, see below) is never
+  listed by these commands; it is resolved on demand by `--host` only.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short
   owner-private cache avoids repeated probing, and `--refresh` bypasses it.

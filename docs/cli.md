@@ -75,7 +75,13 @@ Every connection of the operation then looks the peer up by its stable identity
 so a short name that starts selecting another peer midway is never followed; the
 address may still change. A peer that reports neither a peer id nor an FQDN
 cannot be pinned: the operation fails before its first connection with
-`host_identity_unpinnable`. Errors and output keep the name you typed.
+`host_identity_unpinnable`. For a NetBird static peer (`overlays.toml`
+`[netbird.static_peers.<name>]`), the client resolves the name through the
+owner-configured static table only while the NetBird overview is restricted
+(NetBird 0.83+, daemon status `Connected`) and verifies the pinned `host_id`
+with `host.governance.inspect` before any other request; a mismatch fails
+with `host_identity_mismatch`. `host discover` and `host list` never name
+static peers. Errors and output keep the name you typed.
 
 | Command | What it does |
 |---|---|

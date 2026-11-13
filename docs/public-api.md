@@ -5163,7 +5163,7 @@ environment value or 18722, and so does a client of an earlier release (a CLI
 on another host, or a Rust client pinned to an earlier tag such as the
 `pohunek-work` gateway): set `port` only after every daemon and every client that
 dials those hosts runs this release and the daemons are restarted. A pinned
-client adopts the file when it bumps its pin. With `providers = ["netbird"]` the file may also carry `[netbird]` (`subnet`) and `[netbird.static_peers.<name>]` (`address`, `fqdn`, `host_id`) entries; those are used only while the NetBird overview is restricted (NetBird 0.83+), the address must lie inside `subnet` (inside `100.64.0.0/10`), the `host_id` is required and the client verifies it with `host.governance.inspect` before any other request (`host_identity_mismatch` on a mismatch). An older release rejects the new table as an unknown key.
+client adopts the file when it bumps its pin. With `providers = ["netbird"]` the file may also carry `[netbird]` (`subnet`, an IPv4 network inside `100.64.0.0/10` from `/10` to `/30`, no host bits) and 1–32 `[netbird.static_peers.<name>]` entries with `address`, `fqdn` and a required `host_id`; the key is a DNS label other than `local`, must not equal another entry address, fqdn, host id or short name, and `address` must lie inside `subnet` (not the network or broadcast address). Those entries are used only while the NetBird overview is restricted (NetBird 0.83+, daemon status `Connected`), the client verifies the pin with `host.governance.inspect` before any other request (`host_identity_mismatch` on a mismatch), and static peers never appear in `host discover`/`host list`. Upgrade every binary and pinned client first. An older `pohunekd` refuses to start with the new table (the file is a schema error), and an older release rejects it as an unknown key. Invalid `port`/`netbird` values are `overlay_configuration_invalid` and name only the entry key, never a value.
 
 Diagnostics. `pohunek doctor` checks the overlays that are configured instead
 of NetBird unconditionally: one `<overlay>_cli` check per overlay, in the place
@@ -5247,7 +5247,9 @@ Connection APIs:
   connecting to it looks the peer up by identity and a renamed or reassigned
   short name cannot select another peer; the address may change. `display` is the
   name the caller typed. A peer with neither a peer id nor an FQDN fails with
-  `host_identity_unpinnable`. `pinned_host_id(overlay, peer_id, fqdn)` builds the
+  `host_identity_unpinnable`; a static peer whose daemon reports a different
+  host id than the pinned one fails with `host_identity_mismatch`.
+  `pinned_host_id(overlay, peer_id, fqdn)` builds the
   `<overlay>:<selector>` part that fan-out targets share.
 - `Client::connect_resolved_with_options(&resolved, socket_path, options)`:
   connects to a `ResolvedHost`; lookup failures and connection errors name
@@ -5549,7 +5551,8 @@ Host resolution:
   this machine's own overlay name) are the CLI's and the Rust client's; the SDK
   holds no copy of them. The daemon's typed errors keep their `code`, message
   and recovery hint (`host_unknown`, `overlay_host_ambiguous`,
-  `overlay_host_unavailable`, `host_identity_unpinnable`), and a daemon of the
+  `overlay_host_unavailable`, `host_identity_unpinnable`,
+  `host_identity_mismatch`), and a daemon of the
   previous protocol version fails with `daemon_protocol_too_old`. `display` is
   the route as the caller typed it.
 - `pinnedRoute` names the peer by its stable identity. Resolving it again

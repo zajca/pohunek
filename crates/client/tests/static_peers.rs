@@ -11,6 +11,8 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
+
 use overlay::{
     BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
     OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
@@ -204,7 +206,6 @@ fn registry(port: u16, pinned: &str) -> OverlayRegistry {
         id: OverlayId::new("stub").expect("overlay id"),
         pinned: pinned.to_owned(),
     };
-    let _ = port;
     OverlayRegistry::new(vec![
         ConfiguredTransport::new(Arc::new(transport), port).expect("configured transport")
     ])
@@ -214,12 +215,13 @@ fn registry(port: u16, pinned: &str) -> OverlayRegistry {
 /// The restricted `0.83` status from slice A: no peer detail, daemon connected.
 const RESTRICTED: &str = include_str!("../../netbird/tests/fixtures/status_restricted_v0_83.json");
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn the_daemon_registry_without_static_peers_never_names_one() {
     // Hermetic: the transport resolves `netbird` through `PATH`, so the fake
-    // script must shadow the real installation for this test process. Tests in
-    // this binary never run concurrently with other PATH readers (the pin
-    // scenarios above use a stub overlay), and the value is restored after.
+    // script must shadow the real installation for this test process.
+    if !in_own_process() {
+        return;
+    }
     let pinned = host_id(b'A');
     let env = pohunek_test_support::env::TestEnv::new().expect("create the test environment");
     let root = env.root().to_path_buf();
@@ -249,14 +251,8 @@ async fn the_daemon_registry_without_static_peers_never_names_one() {
         format!("#!/bin/sh\nprintf '%s\\n' '{RESTRICTED}'\n"),
     )
     .expect("write fake netbird");
-    let original_path = std::env::var_os("PATH");
-    let path = match &original_path {
-        Some(path) => {
-            std::ffi::OsString::from(format!("{}:{}", bin.display(), path.to_string_lossy()))
-        }
-        None => bin.as_os_str().to_owned(),
-    };
-    std::env::set_var("PATH", &path);
+    let mut process_env = ProcessEnv::lock();
+    process_env.set("PATH", bin.as_os_str());
     async {
         let config =
             pohunek_client::OverlayConfig::load_from(&config_dir).expect("the config loads");
@@ -279,10 +275,6 @@ async fn the_daemon_registry_without_static_peers_never_names_one() {
         );
     }
     .await;
-    match original_path {
-        Some(value) => std::env::set_var("PATH", value),
-        None => std::env::remove_var("PATH"),
-    }
 }
 
 #[tokio::test]
@@ -376,5 +368,42 @@ async fn a_mismatching_pin_refuses_the_attach_connection() {
             .iter()
             .any(|method| method == protocol::method::SESSION_LIST),
         "no other request reaches the daemon: {methods:?}"
+    );
+}
+
+/// M1: `session.input` with a wait goes through `call_dedicated`, which dials
+/// a fresh connection and must re-prove the pin before `session.input` on it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_dedicated_static_connection_reproves_the_pin() {
+    let pinned = host_id(b'A');
+    let (port, served) = serve(pinned.clone());
+    let mut client = Client::connect_with_registry_and_options(
+        PEER_NAME,
+        std::path::Path::new("/nonexistent/daemon.sock"),
+        registry(port, &pinned),
+        options(),
+    )
+    .await
+    .expect("the matching connection");
+    let params = protocol::SessionInputParams {
+        session_id: protocol::SessionId("s-1".to_owned()),
+        text: "hello".to_owned(),
+        wait: Some(protocol::SessionInputWait {
+            until: Some(vec![protocol::AgentActivity::Working]),
+            timeout_ms: Some(100),
+            allow_prompt_accepted: None,
+        }),
+    };
+    let _ = client.session_input(params).await;
+    let inspect_count = served
+        .lock()
+        .expect("served lock")
+        .iter()
+        .filter(|m| m.as_str() == protocol::method::HOST_GOVERNANCE_INSPECT)
+        .count();
+    assert!(
+        inspect_count >= 1,
+        "inspect served {inspect_count}: {:?}",
+        *served.lock().expect("served")
     );
 }

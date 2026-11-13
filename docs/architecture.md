@@ -1851,8 +1851,9 @@ The daemon, SDK, CLI, and external browser gateways consume one configured overl
 registry. Each entry has a stable overlay ID, a transport implementation, and
 its own non-zero daemon port. The registry is built by one loader in
 `pohunek-client` from the owner-private `<config>/pohunek/overlays.toml`
-(`providers`, `port`; absent means NetBird on port 18722) with the
-`POHUNEK_REMOTE_PORT` development override. The file and its directory are read
+(`providers`, `port`, and for NetBird optionally `subnet` plus
+`[netbird.static_peers.<name>]` entries; absent means NetBird on port 18722)
+with the `POHUNEK_REMOTE_PORT` development override. The file and its directory are read
 through the trusted-directory checks (owner, no foreign write access, mode
 `0600`, at most 64 KiB), and any problem is `overlay_configuration_invalid`
 before a provider is consulted. A host runs exactly one provider: the loader
@@ -1923,7 +1924,16 @@ identity; peers without one preserve `peer_id = null` and clients fall back to
 the peer FQDN rather than treating its mutable IP as identity. The owner-restricted
 overview of NetBird 0.83+ is detected structurally (present-but-empty `management.url`,
 `netbirdIp`, `publicKey`, no peers) and reported as `netbird_state_restricted`;
-`"details": null` alone is a valid empty peer list.
+`"details": null` alone is a valid empty peer list. When that overview is
+restricted and the daemon status is `Connected`, the client may fall back to
+owner-configured static peers (`overlays.toml` `[netbird.static_peers.<name>]`:
+`address`, `fqdn`, a required `host_id`): explicit selectors only, never
+`host discover`/`host list`, never this host's own listener. When a full status
+is available it wins and the static table is cross-checked against it
+(`overlay_configuration_invalid` on a contradiction). The client verifies the
+pin with `host.governance.inspect` before any other request on a static peer
+and refuses a mismatch as `host_identity_mismatch`, with the typed error and
+advice to run `pohunek host governance inspect local` and correct the file.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.
