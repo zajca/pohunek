@@ -47,16 +47,30 @@ on:
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('CI [tier={0}]{1}{2}', inputs.tier, inputs.dispatch_id != '' && format(' [dispatch={0}]', inputs.dispatch_id) || '', inputs.delta && ' [delta]' || '') || ' ' }}
 
 
-# A required job that fails in a pull request or `workflow_dispatch` run cancels
-# the run (#1075): the job's last step uses .github/actions/cancel-run, and a
-# `cancel-after-<job>` job does the same when a called workflow ends red. The
-# step needs `actions: write`, granted per job and never for the workflow.
-# Push runs, scheduled runs and the advisory audit job never cancel. The failing
-# job and the run end as `cancelled`, so no job shows `failure` on the run page;
-# the `::error` annotation on the failed job's check run (and its job summary)
-# names the job's display name, job id, link and failed step. The
-# advisory audit, the two fail-open selectors and the verdict do not carry the
-# step.
+# A cancelling-set job that fails deterministically in a pull request or
+# `workflow_dispatch` run cancels the run (#1075): the job's
+# `Cancel the run (fail fast)` step uses .github/actions/cancel-run. The
+# cancelling set is the jobs in the `test-selection-verdict` `needs:` list
+# minus the advisory `audit` and the fail-open `test-selection` and `reuse`
+# decisions, plus the two jobs that also carry the step outside the verdict
+# set (`package-version-bump`, `docs`); every other job never cancels, and
+# a called workflow never cancels either: its failure shows as `failure` on
+# the run page. The step needs `actions: write`, granted per job and never
+# for the workflow. Push runs, scheduled runs, the advisory audit job and a
+# job that was itself cancelled never trigger it. The failing job and the
+# run end as `cancelled`, so no job shows `failure` on the run page; the
+# `::error` annotation on the failed job's check run (and its job summary)
+# names the job's display name, job id, link and failed step.
+# Infrastructure marking (#2205) is deterministic: `env.CI_INFRA_FAILURE` (set
+# by .github/scripts/ci-retry when its retries are exhausted) or a failed
+# network `uses:` step tagged with an `infra-` id (taiki-e/install-action,
+# actions/download-artifact and upload-artifact, actions/setup-node,
+# actions/cache restore, oven-sh/setup-bun, actions/checkout). A failure
+# tagged as infrastructure (an exhausted retry or a failed network step)
+# never runs the cancel step; instead the `Note the infrastructure failure
+# (no cancel)` step writes a `::notice` and the run continues. Check the
+# step log: a deterministic failure of a retried command is tagged too,
+# so rerunning the failed job alone recovers only from a flaky download.
 # A new PR push cancels the PR's run in progress (latest wins). Pushes to main
 # drain (#1209): the running main run completes, and GitHub keeps only the
 # newest push pending behind it, replacing an older pending one. Each scheduled
@@ -218,6 +232,7 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -260,6 +275,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
+        id: infra-2
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -300,6 +316,7 @@ jobs:
       # Independent of the check: the tests still run when the partition check fails.
       - name: Download test selection
         if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
+        id: infra-3
         uses: actions/download-artifact@v4
         with:
           name: test-selection
@@ -385,14 +402,21 @@ jobs:
 
       - name: Upload macOS lane test report
         if: always()
+        id: infra-4
         uses: actions/upload-artifact@v4
         with:
           name: macos-lane-junit
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # The macOS packages the PR lane does not test (issue #361): their macOS-only
   # test code runs here on main and nightly, never on a pull request.
@@ -404,7 +428,6 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: read
-      actions: write
     timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -478,9 +501,6 @@ jobs:
           name: macos-tier-junit
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # The version-A release daemon for aarch64-apple-darwin, built once per run
   # (issue #1210). `macos-package` and `hermes-compatibility-macos` download
@@ -500,6 +520,7 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -533,6 +554,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the daemon binaries
+        id: infra-2
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-release-daemon
@@ -540,8 +562,14 @@ jobs:
           retention-days: 1
           if-no-files-found: error
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Native Apple Silicon packaging (issue #104): the daemon archive is packaged
   # from the binaries of `macos-release-build`, and the nightly tier rebuilds
@@ -561,7 +589,6 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: read
-      actions: write
     timeout-minutes: 90
     env:
       # mold is Linux-only: keep the default linker on macOS runners.
@@ -685,9 +712,6 @@ jobs:
           PKG_ACCEPT_ARCHIVE: ${{ steps.package-a.outputs.archive }}
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
         run: scripts/acceptance/macos-package-install
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
   # selection whose every changed file has no Rust tests and no gate but
@@ -704,6 +728,7 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -726,6 +751,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
+        id: infra-2
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -736,8 +762,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Lints the macOS-only code on a Linux runner in about two minutes cold
   # (issue #365), so a `cfg(target_os = "macos")` compile or lint error fails a
@@ -765,6 +797,7 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -789,8 +822,14 @@ jobs:
       - name: Clippy for aarch64-apple-darwin
         run: scripts/darwin-check
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Selects the pull request's tests with the selector of its merge base
   # (scripts/ci-test-selection); every other event runs every test. A test
@@ -980,6 +1019,7 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -999,6 +1039,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        id: infra-2
         with:
           tool: cargo-nextest
 
@@ -1015,6 +1056,7 @@ jobs:
 
       # The archive is already zstd-compressed: store it as is (level 0).
       - name: Upload test archive
+        id: infra-3
         uses: actions/upload-artifact@v4
         with:
           name: nextest-archive
@@ -1023,8 +1065,14 @@ jobs:
           compression-level: 0
           if-no-files-found: error
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
@@ -1044,6 +1092,7 @@ jobs:
         working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           path: relocated
           persist-credentials: false
@@ -1055,10 +1104,12 @@ jobs:
         run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        id: infra-2
         with:
           tool: cargo-nextest
 
       - name: Download test archive
+        id: infra-3
         uses: actions/download-artifact@v4
         with:
           name: nextest-archive
@@ -1066,6 +1117,7 @@ jobs:
 
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
+        id: infra-4
         uses: actions/download-artifact@v4
         with:
           name: test-selection
@@ -1120,14 +1172,21 @@ jobs:
 
       - name: Upload shard timing report
         if: always()
+        id: infra-5
         uses: actions/upload-artifact@v4
         with:
           name: nextest-junit-${{ matrix.shard }}
           path: relocated/target/nextest/ci/junit.xml
           if-no-files-found: warn
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && steps.infra-5.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./cancel-run-action
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
@@ -1158,6 +1217,7 @@ jobs:
       # Push events (after merge to main) resolve the filter with git commands
       # against the previous commit, which needs more than a depth-1 checkout.
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           fetch-depth: 2
           persist-credentials: false
@@ -1176,6 +1236,7 @@ jobs:
           echo "tree=$tree" >> "$GITHUB_OUTPUT"
           echo "Tested tree \`$tree\` of commit \`$(git rev-parse HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the tested-tree record
+        id: infra-2
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: tested-tree-${{ steps.tree.outputs.tree }}
@@ -1417,8 +1478,14 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   integration:
     name: tests (heavy, PTY + Hermes)
@@ -1433,6 +1500,7 @@ jobs:
         working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           path: relocated
           persist-credentials: false
@@ -1444,6 +1512,7 @@ jobs:
         run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
       - name: Install cargo-nextest
+        id: infra-2
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -1466,6 +1535,7 @@ jobs:
             cargo fetch --locked
 
       - name: Download test archive
+        id: infra-3
         uses: actions/download-artifact@v4
         with:
           name: nextest-archive
@@ -1479,6 +1549,7 @@ jobs:
 
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
+        id: infra-4
         uses: actions/download-artifact@v4
         with:
           name: test-selection
@@ -1519,14 +1590,21 @@ jobs:
       # attributes). Nextest writes the report under its own storage directory.
       - name: Upload integration test report
         if: always()
+        id: infra-5
         uses: actions/upload-artifact@v4
         with:
           name: nextest-junit-heavy
           path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && steps.infra-5.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./cancel-run-action
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
   # user manager (transient worker units, the namespaced daemon unit, the
@@ -1540,7 +1618,6 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
-      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
       POHUNEK_SYSTEMD_E2E: "1"
@@ -1662,9 +1739,6 @@ jobs:
         env:
           POHUNEK_PRIVILEGED_E2E: "1"
         run: cargo test --locked -p pohunek-daemon --test systemd_durable_worker -- --ignored --test-threads 1 privileged_ --nocapture
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Issue #525: a session started on the previous release survives
   # `pohunek service upgrade` to this build. The job is the reusable
@@ -1679,26 +1753,6 @@ jobs:
     permissions:
       contents: read
 
-  cancel-after-upgrade-test:
-    name: cancel the run after upgrade-test fails
-    needs: upgrade-test
-    if: ${{ !cancelled() && needs.upgrade-test.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel the run (fail fast)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: upgrade-test
-        run: |
-          set -eu
-          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
-
   # G3 of #1218: each package's tests run from a tree holding only the files
   # whose change selects that package, so a test that reads a path outside
   # its selector's map fails here every night instead of passing a narrowed
@@ -1710,7 +1764,6 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
-      actions: write
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
@@ -1788,9 +1841,6 @@ jobs:
           name: test-selection-audit
           path: ${{ runner.temp }}/test-selection-audit/
           if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Skipping the shards a narrowed plan does not start can drop no selected
   # test: every selected test must lie in a planned shard. It runs on every
@@ -1808,6 +1858,7 @@ jobs:
         working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           path: relocated
           persist-credentials: false
@@ -1819,16 +1870,19 @@ jobs:
         run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        id: infra-2
         with:
           tool: cargo-nextest
 
       - name: Download test archive
+        id: infra-3
         uses: actions/download-artifact@v4
         with:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
 
       - name: Download test selection
+        id: infra-4
         uses: actions/download-artifact@v4
         with:
           name: test-selection
@@ -1837,8 +1891,14 @@ jobs:
       - name: Verify the planned shards hold every selected test
         run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --selection "$RUNNER_TEMP/test-selection/selection.json"
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./cancel-run-action
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
@@ -1907,6 +1967,7 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -1931,8 +1992,14 @@ jobs:
       - name: Documentation tests
         run: cargo test --doc --workspace --all-features
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Full release build: schedule, push to main, manual dispatch, or a pull
   # request that changes a `release` filter input.
@@ -1941,7 +2008,6 @@ jobs:
     runs-on: ubuntu-24.04 # glibc floor of the shipped binaries (#1731)
     permissions:
       contents: read
-      actions: write
     needs: [changes, reuse]
     if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release == 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'release-build') }}
     env:
@@ -1968,9 +2034,6 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Release rehearsal (issue #150): the PR-time proof of the release assembly.
   # It runs the same reusable workflows as a tag with mode `rehearsal`: the
@@ -1996,26 +2059,6 @@ jobs:
     with:
       mode: rehearsal
 
-  cancel-after-release-rehearsal-build:
-    name: cancel the run after release-rehearsal-build fails
-    needs: release-rehearsal-build
-    if: ${{ !cancelled() && needs.release-rehearsal-build.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel the run (fail fast)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: release-rehearsal-build
-        run: |
-          set -eu
-          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
-
   # The rehearsal's synthetic-archive smoke scenarios (issue #1259, D1/D2).
   # The scenarios read only this checkout, so the job waits for `changes`
   # alone: it starts in parallel with the rehearsal build and before the
@@ -2029,26 +2072,6 @@ jobs:
     uses: ./.github/workflows/release-smoke-scenarios.yml
     permissions:
       contents: read
-
-  cancel-after-release-rehearsal-scenarios:
-    name: cancel the run after release-rehearsal-scenarios fails
-    needs: release-rehearsal-scenarios
-    if: ${{ !cancelled() && needs.release-rehearsal-scenarios.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel the run (fail fast)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: release-rehearsal-scenarios
-        run: |
-          set -eu
-          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
 
   release-rehearsal:
     name: release rehearsal (evidence, assembly, archive smoke)
@@ -2069,26 +2092,6 @@ jobs:
       # scenario result is not `success`.
       scenarios_result: ${{ needs.release-rehearsal-scenarios.result }}
 
-  cancel-after-release-rehearsal:
-    name: cancel the run after release-rehearsal fails
-    needs: release-rehearsal
-    if: ${{ !cancelled() && needs.release-rehearsal.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel the run (fail fast)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: release-rehearsal
-        run: |
-          set -eu
-          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
-
   # The release gate's test steps, run between releases (#1727): in the
   # nightly tier (schedule or a nightly dispatch) and on a pull request that
   # changes a `release_gate` filter input. It never runs on push to main or a
@@ -2104,26 +2107,6 @@ jobs:
     permissions:
       contents: read
 
-  cancel-after-release-gate:
-    name: cancel the run after release-gate fails
-    needs: release-gate
-    if: ${{ !cancelled() && needs.release-gate.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: write
-    steps:
-      - name: Cancel the run (fail fast)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ github.run_id }}
-          REPOSITORY: ${{ github.repository }}
-          FAILED_JOB: release-gate
-        run: |
-          set -eu
-          echo "::error title=Fail fast::${FAILED_JOB} (a called workflow) failed first; cancelling run ${RUN_ID}, so the jobs it cancels are not failures of their own"
-          gh run cancel "$RUN_ID" --repo "$REPOSITORY"
-
   # TS-binding drift is gated by paths filter (issue #125); it only runs on
   # schedule, push to main, manual dispatch (always a full run), or when the
   # protocol/generation inputs change.
@@ -2133,7 +2116,6 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     needs: [changes, reuse]
     if: ${{ !cancelled() && needs.changes.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docs_ts == 'true') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'ts-drift') }}
     env:
@@ -2165,9 +2147,6 @@ jobs:
         run: cargo xtask ts check
         env:
           RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Official Hermes runtime package against the pinned, locked Hermes
   # release. `compat stage-upstream` stages the runtime with the provisioner
@@ -2182,7 +2161,6 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.hermes != 'false') }}
     env:
@@ -2493,9 +2471,6 @@ jobs:
           name: package-junit-hermes
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Runtime package selection for pull requests (issue #149). `cargo xtask
   # package affected` classifies every file the pull request changes against
@@ -2668,6 +2643,7 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           # The release commit of the baseline has to be in the history.
           fetch-depth: 0
@@ -2776,9 +2752,6 @@ jobs:
           if [ "$(jq -r '.verdict' "$RUNNER_TEMP/package-bump.json")" = undecided ]; then
             echo "::warning::the catalog of release v$VERSION is absent; the version bump gate is undecided"
           fi
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Official Pi runtime package against the real, locked Pi release. The job
   # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,
@@ -2788,12 +2761,21 @@ jobs:
   # credential and no model call. The always-running unit tests in the same
   # test binary keep the descriptor, the supported range and the lock in sync;
   # this job proves the locked release still behaves as they say.
+
+      - name: Cancel the run (fail fast)
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
   pi-package:
     name: Pi runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.pi != 'false') }}
     env:
@@ -2929,9 +2911,6 @@ jobs:
           name: package-junit-pi
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Official Codex runtime package against the real, locked Codex release. The
   # job installs the npm tree pinned by `compat/codex/npm/package-lock.json`,
@@ -2949,7 +2928,6 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.codex != 'false') }}
     env:
@@ -3077,9 +3055,6 @@ jobs:
           name: package-junit-codex
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Official Claude Code runtime package against the real, locked Claude Code
   # release. The job installs the npm tree pinned by
@@ -3101,7 +3076,6 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     needs: package-selection
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.package-selection.result != 'success' || needs.package-selection.outputs.claude != 'false') }}
     env:
@@ -3238,9 +3212,6 @@ jobs:
           name: package-junit-claude
           path: target/nextest/package/junit.xml
           if-no-files-found: warn
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Native Apple Silicon counterpart of `hermes-package`. It provisions
   # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD
@@ -3268,6 +3239,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -3305,6 +3277,7 @@ jobs:
       # Same inputs as the Linux runtime cache plus the CPU architecture; a
       # runtime provisioned on Linux is never restored here.
       - name: Cache Hermes runtime
+        id: infra-2
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/hermes-compat-cache
@@ -3326,6 +3299,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-nextest
+        id: infra-3
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-nextest
@@ -3398,6 +3372,7 @@ jobs:
       # The version-A binaries come from `macos-release-build`; this job does
       # not compile them.
       - name: Download the daemon binaries
+        id: infra-4
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: macos-release-daemon
@@ -3566,6 +3541,7 @@ jobs:
 
       - name: Upload Hermes macOS test reports
         if: always()
+        id: infra-5
         uses: actions/upload-artifact@v4
         with:
           name: hermes-macos-junit
@@ -3586,8 +3562,14 @@ jobs:
             ${{ hashFiles('crates/xtask/src/upstream_stage.rs') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && steps.infra-5.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Each test runs at most once per OS in a run (#1226): this job reads every
   # JUnit report of the run and fails on a test two jobs of the same OS ran,
@@ -3610,14 +3592,13 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
+      actions: read
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: |
             scripts
-            .github/actions/cancel-run
           persist-credentials: false
 
       # Only this workflow's test jobs: the release rehearsal's reusable
@@ -3643,9 +3624,6 @@ jobs:
 
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Build the three runnable binaries exactly once. The SDK e2e job reuses
   # this artifact instead of rebuilding Rust (issue #122).
@@ -3664,6 +3642,7 @@ jobs:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -3691,6 +3670,7 @@ jobs:
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 
       - name: Upload built binaries
+        id: infra-2
         uses: actions/upload-artifact@v4
         with:
           name: pohunek-bins
@@ -3716,14 +3696,21 @@ jobs:
             --output-dir target/hermes-e2e/catalog
 
       - name: Upload the Hermes package and its throwaway catalog
+        id: infra-3
         uses: actions/upload-artifact@v4
         with:
           name: hermes-e2e-package
           path: target/hermes-e2e
           if-no-files-found: error
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
   # selection whose every changed file has no Rust tests and no gate but
@@ -3738,10 +3725,12 @@ jobs:
     if: ${{ !cancelled() && needs.build-bins.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.mode != 'none' || needs.test-selection.outputs.docs_only != 'true') }}
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
       - name: Install Bun
+        id: infra-2
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.11
@@ -3751,6 +3740,7 @@ jobs:
       # setup-bun bun-version pin above, so repeat runs install from disk
       # instead of the network.
       - name: Cache Bun packages
+        id: infra-3
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
@@ -3788,6 +3778,7 @@ jobs:
       # named by POHUNEK_TEST_NODE_BIN (skipped when unset), so each step below
       # runs the whole contract once per Node major.
       - name: Install Node 20 for the SDK Node contract
+        id: infra-4
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -3796,6 +3787,7 @@ jobs:
         run: POHUNEK_TEST_NODE_BIN="$(command -v node)" bun test sdk/ts/scripts
 
       - name: Install Node 22 for the SDK Node contract
+        id: infra-5
         uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -3808,6 +3800,7 @@ jobs:
       # They come from the build-bins artifact (issue #122): no Rust toolchain
       # or cargo cache is needed in this job.
       - name: Download built binaries
+        id: infra-6
         uses: actions/download-artifact@v4
         with:
           name: pohunek-bins
@@ -3817,6 +3810,7 @@ jobs:
         run: chmod +x target/debug/pohunekd target/debug/pohunek-sessiond target/debug/pohunek
 
       - name: Download the Hermes package and its throwaway catalog
+        id: infra-7
         uses: actions/download-artifact@v4
         with:
           name: hermes-e2e-package
@@ -3838,8 +3832,14 @@ jobs:
           POHUNEK_HERMES_PACKAGE: ${{ github.workspace }}/target/hermes-e2e/hermes.tar.zst
           POHUNEK_HERMES_CATALOG_DIR: ${{ github.workspace }}/target/hermes-e2e/catalog
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && steps.infra-5.outcome != 'failure' && steps.infra-6.outcome != 'failure' && steps.infra-7.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure' || steps.infra-3.outcome == 'failure' || steps.infra-4.outcome == 'failure' || steps.infra-5.outcome == 'failure' || steps.infra-6.outcome == 'failure' || steps.infra-7.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # The SDK workspace on Apple Silicon (issue #103): typecheck, lint, unit
   # tests, and the SDK e2e suite against the real macOS pohunekd,
@@ -3851,7 +3851,6 @@ jobs:
     runs-on: macos-15
     permissions:
       contents: read
-      actions: write
     timeout-minutes: 60
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -3919,9 +3918,6 @@ jobs:
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Dependency hygiene (M-STATIC-VERIFICATION): security advisories, the Cargo
   # feature matrix, and unused dependencies. Kept off the critical `test` job so
@@ -3969,6 +3965,7 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -3987,16 +3984,22 @@ jobs:
         run: cargo xtask docs check
         env:
           RUSTFLAGS: -D warnings
+
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   feature-matrix:
     name: cargo-hack (feature powerset)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     # Expensive (issue #125): run only on schedule, push to main, manual
     # dispatch (always a full run), or when the dependency graph / feature
     # set / CI workflow changes.
@@ -4037,9 +4040,6 @@ jobs:
       # exercises the everything-on case.
       - name: Check feature powerset
         run: cargo hack --feature-powerset --workspace clippy --all-targets
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Pull requests get the stable source-level `shear` job below. cargo-udeps
   # needs the nightly toolchain and a full workspace build, so it runs only on
@@ -4052,7 +4052,6 @@ jobs:
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     permissions:
       contents: read
-      actions: write
     if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'udeps') }}
     env:
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
@@ -4089,9 +4088,6 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo udeps --workspace --all-targets --all-features
-      - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
 
   # Unused-dependency check for every event, including pull requests. It reads
   # manifests and sources without compiling, so it needs only stable cargo for
@@ -4113,6 +4109,7 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           persist-credentials: false
 
@@ -4120,6 +4117,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install cargo-shear
+        id: infra-2
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-shear@1.14.0
@@ -4127,5 +4125,11 @@ jobs:
       - name: Check for unused dependencies
         run: cargo shear --locked --deny-warnings --format=github
       - name: Cancel the run (fail fast)
-        if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure' || steps.infra-2.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
