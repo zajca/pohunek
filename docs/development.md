@@ -275,7 +275,9 @@ bounded attempts and per-attempt timeouts from the workflow `env` (or from
 the setup-rust action's own defaulted `retry-*` inputs, calibrated to the
 same ci.yml values). The seed curl downloads (setup-zig, setup-mold,
 setup-sccache, setup-uv) carry curl's own retry and transfer limits instead
-of the helper. An exhausted helper retry marks the job with
+of the helper. `scripts/provision-hermes-compat` runs its `uv sync` without
+the helper, under uv's own retry and read-timeout defaults; in CI the job
+timeout bounds it. An exhausted helper retry marks the job with
 `CI_INFRA_FAILURE`.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
