@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "runtime": "claude",
+  "scenarios": {
+    "idle_after_turn": {
+      "final_record": "state=done",
+      "attention": [],
+      "source": "hand-written fixture from the evidence only"
+    },
+    "permision_prompt": {
+      "final_record": "state=blocked:kind=permission",
+      "attention": ["approval_required"],
+      "source": "hand-written fixture from the evidence only"
+    },
+    "mcp_elicitation": {
+      "final_record": "state=blocked:kind=question",
+      "attention": ["agent_blocked"],
+      "source": "hand-written fixture from the evidence only"
+    },
+    "login_screen": {
+      "final_record": null,
+      "attention": null,
+      "source": "hand-written fixture from the evidence only"
+    },
+    "running_turn": {
+      "final_record": "state=working",
+      "attention": [],
+      "source": "hand-written fixture from the evidence only"
+    }
+  }
+}

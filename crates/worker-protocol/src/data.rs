@@ -449,32 +449,52 @@ pub async fn write_frame<W>(writer: &mut W, frame: &DataFrame) -> Result<(), Fra
 where
     W: AsyncWrite + Unpin + Send,
 {
-    validate_payload(&frame.header.kind, &frame.payload)?;
-    let mut header = serde_json::to_vec(&frame.header)?;
-    if header.len() > MAX_DATA_HEADER_BYTES {
+    write_frame_parts(writer, &frame.header, &frame.payload).await
+}
+
+/// Writes one complete data frame from borrowed metadata and payload.
+///
+/// The payload is written as given and is never copied or modified.
+///
+/// # Errors
+///
+/// Returns [`FrameError`] when the payload contradicts the frame kind, a
+/// length exceeds protocol bounds, or I/O fails. Partial writes are retried
+/// until the complete frame is sent.
+pub async fn write_frame_parts<W>(
+    writer: &mut W,
+    header: &FrameHeader,
+    payload: &[u8],
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    validate_payload(&header.kind, payload)?;
+    let mut header_bytes = serde_json::to_vec(header)?;
+    if header_bytes.len() > MAX_DATA_HEADER_BYTES {
         let error = FrameError::HeaderTooLarge {
-            actual: header.len(),
+            actual: header_bytes.len(),
             maximum: MAX_DATA_HEADER_BYTES,
         };
-        header.fill(0);
+        header_bytes.fill(0);
         return Err(error);
     }
-    if frame.payload.len() > MAX_DATA_PAYLOAD_BYTES {
+    if payload.len() > MAX_DATA_PAYLOAD_BYTES {
         return Err(FrameError::PayloadTooLarge {
-            actual: frame.payload.len(),
+            actual: payload.len(),
             maximum: MAX_DATA_PAYLOAD_BYTES,
         });
     }
 
     let write_result = async {
-        write_length(writer, header.len()).await?;
-        writer.write_all(&header).await?;
-        write_length(writer, frame.payload.len()).await?;
-        writer.write_all(&frame.payload).await?;
+        write_length(writer, header_bytes.len()).await?;
+        writer.write_all(&header_bytes).await?;
+        write_length(writer, payload.len()).await?;
+        writer.write_all(payload).await?;
         Ok::<(), FrameError>(())
     }
     .await;
-    header.fill(0);
+    header_bytes.fill(0);
     write_result?;
     Ok(())
 }

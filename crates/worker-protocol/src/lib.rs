@@ -72,8 +72,8 @@ pub use control::{
 };
 #[doc(inline)]
 pub use data::{
-    read_frame, write_frame, CloseReason, Cursor, DataFrame, FrameError, FrameHeader, FrameKind,
-    TerminalSnapshot, MAX_DATA_HEADER_BYTES, MAX_DATA_PAYLOAD_BYTES,
+    read_frame, write_frame, write_frame_parts, CloseReason, Cursor, DataFrame, FrameError,
+    FrameHeader, FrameKind, TerminalSnapshot, MAX_DATA_HEADER_BYTES, MAX_DATA_PAYLOAD_BYTES,
 };
 #[doc(inline)]
 pub use env::{

@@ -411,11 +411,13 @@ impl<'a> JournalTokens<'a> {
     /// Collects the tokens of `payload`.
     ///
     /// Pairs split as the parser splits them: on `:` first, then on the first
-    /// `=`; a pair without `=` and a pair with an empty key carry no token.
-    /// A repeated key keeps its last raw value, while the parser stops at
-    /// its first rejection (an unknown `state`, an oversized key, or an
-    /// invalid `msg` or `title`) and drops an invalid `app` or an unknown
-    /// `kind`, so a journaled token can be one the parser never read.
+    /// `=`; a pair without `=` and a pair with an empty key carry no token. A
+    /// repeated key keeps its last value. The journal can still carry a token
+    /// the parsed report never saw or kept: the parser rejects the payload at
+    /// its first invalid input (non-UTF-8 bytes, an overlong key, invalid
+    /// `msg` or `title`, or a missing or unknown `state`) and drops an invalid
+    /// `app` or an unknown `kind` it read, so a journaled token can be one the
+    /// parser never read or one it discarded.
     fn of(payload: &'a [u8]) -> Self {
         let mut tokens = Self::default();
         for pair in payload.split(|&byte| byte == b':') {

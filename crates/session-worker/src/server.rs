@@ -3174,7 +3174,7 @@ async fn serve_data(
             &header.stream_id,
             &header.worker_instance_id,
             FrameKind::AttachReady { dimensions },
-            Vec::new(),
+            &[],
         )
         .await?;
         subscriber
@@ -3331,7 +3331,7 @@ where
                         stream_id,
                         worker_instance_id,
                         FrameKind::InputAck { write_id, bytes_written },
-                        Vec::new(),
+                        &[],
                     ).await?;
                 }
                 None => acks_open = false,
@@ -3355,7 +3355,7 @@ where
                         stream_id,
                         worker_instance_id,
                         FrameKind::Close { reason },
-                        Vec::new(),
+                        &[],
                     ).await;
                 }
                 Some(StreamItem::Error(error)) => {
@@ -3683,7 +3683,7 @@ where
                 FrameKind::Close {
                     reason: CloseReason::LeaseReleased,
                 },
-                Vec::new(),
+                &[],
             )
             .await;
         }
@@ -3717,7 +3717,7 @@ where
             FrameKind::Close {
                 reason: CloseReason::LeaseReleased,
             },
-            Vec::new(),
+            &[],
         )
         .await;
     }
@@ -3854,7 +3854,7 @@ where
             has_more: page.has_more,
             timed_out,
         },
-        Vec::new(),
+        &[],
     )
     .await?;
     write_output_chunks(
@@ -3876,7 +3876,7 @@ where
         FrameKind::Close {
             reason: CloseReason::ObservationComplete,
         },
-        Vec::new(),
+        &[],
     )
     .await
 }
@@ -3897,12 +3897,15 @@ where
         stream_id,
         worker_instance_id,
         FrameKind::Error { error },
-        Vec::new(),
+        &[],
     )
     .await
 }
 
-async fn write_output_event<W>(
+/// Frames one subscriber output event onto a worker data stream.
+///
+/// Public only as the measurement seam of the output-path benchmark binary.
+pub async fn write_output_event<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
@@ -3952,7 +3955,7 @@ where
                     missing_end: missing.end,
                     watermark,
                 },
-                Vec::new(),
+                &[],
             )
             .await
         }
@@ -3964,7 +3967,7 @@ where
                 stream_id,
                 worker_instance_id,
                 payload_limit,
-                &snapshot,
+                snapshot,
                 &chunk.bytes,
             )
             .await
@@ -3978,7 +3981,7 @@ where
                 FrameKind::Close {
                     reason: CloseReason::RuntimeExited,
                 },
-                Vec::new(),
+                &[],
             )
             .await
         }
@@ -4025,7 +4028,7 @@ where
 /// Frames one output or replay payload; the framing caller keeps stream identity explicit.
 #[expect(
     clippy::too_many_arguments,
-    reason = "stream framing keeps authenticated stream identity and lease explicit"
+    reason = "stream framing keeps authenticated stream identity explicit"
 )]
 async fn write_output_chunks<W>(
     writer: &mut W,
@@ -4051,15 +4054,7 @@ where
                 offset: chunk_offset,
             }
         };
-        write_data_frame(
-            writer,
-            version,
-            stream_id,
-            worker_instance_id,
-            kind,
-            frame.to_vec(),
-        )
-        .await?;
+        write_data_frame(writer, version, stream_id, worker_instance_id, kind, frame).await?;
         chunk_offset = chunk_offset
             .checked_add(u64::try_from(frame.len()).unwrap_or(u64::MAX))
             .ok_or_else(|| WorkerError::Protocol("output frame offset overflowed".to_owned()))?;
@@ -4067,30 +4062,29 @@ where
     Ok(())
 }
 
+/// Frames one terminal repaint; every fragment carries the same snapshot header.
 async fn write_terminal_chunks<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
     worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
-    snapshot: &WireTerminalSnapshot,
+    snapshot: WireTerminalSnapshot,
     ansi: &[u8],
 ) -> Result<(), WorkerError>
 where
     W: AsyncWrite + Unpin + Send,
 {
+    let header = FrameHeader {
+        version,
+        stream_id: stream_id.clone(),
+        worker_instance_id: worker_instance_id.clone(),
+        kind: FrameKind::TerminalSnapshot { snapshot },
+    };
     for bytes in ansi.chunks(payload_limit) {
-        write_data_frame(
-            writer,
-            version,
-            stream_id,
-            worker_instance_id,
-            FrameKind::TerminalSnapshot {
-                snapshot: snapshot.clone(),
-            },
-            bytes.to_vec(),
-        )
-        .await?;
+        protocol::write_frame_parts(writer, &header, bytes)
+            .await
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
     }
     Ok(())
 }
@@ -4101,22 +4095,18 @@ async fn write_data_frame<W>(
     stream_id: &StreamId,
     worker_instance_id: &WorkerInstanceId,
     kind: FrameKind,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> Result<(), WorkerError>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let frame = DataFrame::new(
-        FrameHeader {
-            version,
-            stream_id: stream_id.clone(),
-            worker_instance_id: worker_instance_id.clone(),
-            kind,
-        },
-        payload,
-    )
-    .map_err(|error| WorkerError::Protocol(error.to_string()))?;
-    protocol::write_frame(writer, &frame)
+    let header = FrameHeader {
+        version,
+        stream_id: stream_id.clone(),
+        worker_instance_id: worker_instance_id.clone(),
+        kind,
+    };
+    protocol::write_frame_parts(writer, &header, payload)
         .await
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
@@ -11624,7 +11614,7 @@ mod tests {
             &stream_id,
             &worker_instance_id,
             MAX_DATA_PAYLOAD_BYTES,
-            &snapshot,
+            snapshot.clone(),
             &ansi,
         )
         .await
