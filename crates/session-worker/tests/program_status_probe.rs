@@ -315,10 +315,10 @@ async fn a_probe_reply_stuck_behind_a_full_pty_never_blocks_output() {
     assert_eq!(dump(&output, 1), REPLY_HEX);
 }
 
-/// Shell fragment that waits until the last background job runs its own image,
-/// so a probe printed after it sees the job as the listed program and not as
-/// the forked shell it starts as.
-const AWAIT_JOB_EXEC: &str = "until ps -o comm= -p $! | grep -q sleep; do :; done; ";
+/// Shell fragment that waits until the last background job's argv reads as
+/// the listed program, so a probe printed after it sees the job as the
+/// listed program and not as the forked shell it starts as.
+const AWAIT_JOB_EXEC: &str = "until ps -o args= -p $! | grep -q '^sleep 1234'; do :; done; ";
 
 /// The foreground program of these scenarios is the `/bin/sh -c <script>` root.
 fn listed(cmdline: &str) -> Vec<ProcessPatterns> {
