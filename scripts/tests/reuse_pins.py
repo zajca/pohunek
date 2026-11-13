@@ -21,27 +21,27 @@ def pinned_callee():
 
 # Populated by the pin-update procedure; see docs/development.md (Delta dispatch).
 PINNED_BODY_HASHES = {
-  "build-bins": "ad27b9dd000e779bdcab273e02b60cd3f82b511e9e6579728b65648f5899098a",
-  "build-tests": "55351e1992f8d274a6a1c762887e7cd8c0f0d30790c125c5a494bccccd61804c",
-  "darwin-check": "20741efc376fff1eef708b2a50d8baaa9d53adcc4b3ca74e1f569ba7eae7548e",
-  "docs": "241044f79dd6a64f5b448aa16d6f40ab6668f9bc6c89ee4c721d4c80077d09b4",
-  "doctests": "96a870799a342185aca050adb7443cbe2ec46efcbb05ca0e6ecbbb9fda2c8e83",
-  "fast-tests": "f7b4763514540644e59fafd1e298860fb9052a0bdd2b185cf13af1aabc2fac17",
-  "feature-matrix": "da43714f8fc9e99af344bfb16b6c3dc710f4374fadc2c88e23a07a139525b652",
-  "hermes-compatibility-macos": "5bd4a58bc0e1b49186ccea7f28b5b44d29e91a1e93dd1dabe6d7011bc0f58100",
-  "integration": "43111fbc1647f22f734185f4eb2cb77f75ed87064d6224d89ced42042b2bbd78",
-  "macos-package": "32541e19c608d76e1b9f6d07901a61ee352567ae296d4e0b4c64eedcd6ec89e0",
-  "macos-release-build": "ecfe1d026d1f4cf48ef5e3fd17d2220edab28a9a48e88eb504039a0b46e78221",
-  "macos-tier": "4a268d85bf953110a494159a1dd89f97d03fbf1b41646751403826311b2b54d6",
-  "platform-contracts": "7f8fa364afa7fee54e1a58085e98ffc3b8d540c7ad74e60e0909f9d91643a0c2",
-  "release-build": "0a2c0cf6986c5d3a0233f30b7ec19827968e5759509eed92474954cc34f82b3a",
-  "sdk-macos": "57458579f490959989d2a5e4b48f64f5df6fd66a29e07edd7af44035e65ad525",
-  "shear": "5f429ea7bd81206e947bdaa678f1f6fec6d7d74d3a8ce295c08d107cd8b56d9f",
-  "systemd-supervision": "97609496b32ee900d45b9544234ce18f11edcd4ade065299addbc9e508b46e59",
-  "test": "bc900a088f77e2c3ee962e8e8b03fafe4865ad8d032798e9103d8761ab870aed",
-  "ts-drift": "944e34491562ff54e149558e8d97d9fbde7c75915bfebba9ff94ec62bf032aa0",
-  "udeps": "84433f4e2617314f4d89c01166870cc76e57d8c2a65cdfde3c4720f1596b36a0",
-  "upgrade-test": "e6effae0c42865fc724c2c1b72d09aeaa84e07e88b15f5c18a587f5761dedd2e"
+  "build-bins": "4b6f420e7a91884a3dedb9ac06b712c83c7fbd22fe00ff7312ee00f8ea7599c6",
+  "build-tests": "fa460f03f432768c30793481c44c75b7a3e3ca4f527a20c5a53f168d270664e1",
+  "darwin-check": "52b00915c39dcf66a5de42cae4388c0a1dd019ac2f303d98548ba5030f37a11c",
+  "docs": "cae90e7b5d5faf47b6587832f8c267c265baadebbe6109cb6e102b51811c391c",
+  "doctests": "ac58d854d5cbe8c5e6f2d4f1a51bc808dd94eddb30d08c0290656573f5d66c0f",
+  "fast-tests": "860299f21260b143537f3e511daf7fc17e4c09f35e614cfe4f37103e3c449679",
+  "feature-matrix": "aa5ee100347f8e163a3d12d241c1782636ac5d5ecc52a929c0ff1a855bde7c5a",
+  "hermes-compatibility-macos": "a953afa63430c78ec4a455fb0b22e095744a963ced8b4bbc83acb7081abb4e32",
+  "integration": "c87a52fe9c58fee123b50667e1ac0c058b376e8a1b49cdf993c8ce6f4c55af06",
+  "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
+  "macos-release-build": "4da092a45553db6610409afc5b7caeee8aca58e38c99a0166c51e509e691dba9",
+  "macos-tier": "b6d5867fa5aeccaf431276e6f6cd1a3e697c5f8cbc7a60f0595a986224c7cc83",
+  "platform-contracts": "55ae47b7a26873956a80608656a74475f7648933b20cb458b7ddce8aa8e82554",
+  "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
+  "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
+  "shear": "91fd4a3eba97ea08007c9203aeb3607395904db4fdd4799b799fdb30c98f2b76",
+  "systemd-supervision": "a04fe11b2d6067b7e86548f20a07d951c5485b11e5629c86e5ab9281424b4f86",
+  "test": "57d245e3425664af417be6791a9dc8eead22f2c0eb2a2d09f21a5d5bb445600b",
+  "ts-drift": "d18b132a9b0a47f66735ed031448f0503a5af9840521fb481c69db78d6dc4cc1",
+  "udeps": "71da2c358e8873c1d9075d2410840afa7d476d50e01a8909716a25f51dbef38f",
+  "upgrade-test": "5085c4d9086eb08446a2834e80a94fb0538d52e03fab110d3206f9ff17145053",
 }
 
 PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7110a00b775b94a957cf0909001b183b128d"}
@@ -90,7 +90,43 @@ EVALUATION_TABLE = [
         },
     },
     {
-        "text": "if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
+        "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
+        "legs": {
+            "core": {"pull_request": "false", "workflow_dispatch": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false"},
+        },
+    },
+    {
+        "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
+        "legs": {
+            "core": {"pull_request": "false", "workflow_dispatch": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false"},
+        },
+    },
+    {
+        "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
+        "legs": {
+            "core": {"pull_request": "false", "workflow_dispatch": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false"},
+        },
+    },
+    {
+        "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
+        "legs": {
+            "core": {"pull_request": "false", "workflow_dispatch": "false"},
+            "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
+            "cli": {"pull_request": "false", "workflow_dispatch": "false"},
+            "": {"pull_request": "false", "workflow_dispatch": "false"},
+        },
+    },
+    {
+        "text": "if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && steps.infra-5.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')",
         "legs": {
             "core": {"pull_request": "false", "workflow_dispatch": "false"},
             "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
@@ -122,4 +158,4 @@ def pinned_preamble():
     # from ci.yml at pin time.
     return PINNED_PREAMBLE
 
-PINNED_PREAMBLE = "11150566b689134605836bf908672791311c550d5bb36a773eae52c44679079a"
+PINNED_PREAMBLE = "540d92da36d78f82584861903b8087fd4d314b259bbadc63bba0c11ac90f31e8"
