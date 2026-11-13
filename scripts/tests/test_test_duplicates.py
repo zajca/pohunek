@@ -249,11 +249,11 @@ class RepositoryRuntimePackageTests(DuplicateScenario):
         # fast shard is a partition bug, not the runtime package overlap.
         name = f"hermes_package::{self.MODULE_CASES['hermes_package']}"
         self.artifact("nextest-junit-cli", [(self.BINARY, name, 1.0)])
-        self.artifact("nextest-junit-heavy", [(self.BINARY, name, 2.0)])
+        self.artifact("nextest-junit-heavy-1", [(self.BINARY, name, 2.0)])
         result = self.run_check()
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(
-            "1 test(s) of pohunek-cli::all ran on linux in nextest-junit-cli and nextest-junit-heavy",
+            "1 test(s) of pohunek-cli::all ran on linux in nextest-junit-cli and nextest-junit-heavy-1",
             result.stderr,
         )
 

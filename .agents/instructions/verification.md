@@ -500,8 +500,8 @@ the measurement path behind
 The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI compiles the workspace test binaries
 once in `build-tests` (`cargo nextest archive --workspace --all-features`) and
-runs three fast matrix shards and the heavy job from that
-archive, independently of lint/release jobs. The cost boundary is
+runs three fast matrix shards, three heavy matrix parts and the
+script-regressions job from that archive, independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
 all discovered tests, including ignored ones, are assigned exactly once.
@@ -775,8 +775,9 @@ cargo t -p pohunek-daemon                     # fast tests in one crate (alias t
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/cli/heavy
+python3 scripts/test-partitions run heavy --part 1/3  # one heavy part: the only K/N form CI runs
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
-python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
+python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy --part 1/3  # CI mode: no compile, one leg
 python3 scripts/test-partitions --archive-file A check-macos   # 14-package macOS set: exact lane/tier/bucket partition
 python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
 python3 scripts/test-partitions --archive-file A run-macos     # PR macOS lane: 9 packages, profile macos

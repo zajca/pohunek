@@ -592,6 +592,10 @@ class CiEvidenceCliTests(unittest.TestCase):
             name = name_match.group(1)
             if name == "tests (${{ matrix.shard }}, fast)":
                 workflow_names.update(f"tests ({shard}, fast)" for shard in ("core", "daemon", "cli"))
+            elif name == "tests (heavy ${{ matrix.part }}/3, PTY + Hermes)":
+                # The heavy matrix legs 1..3 share the job's display name
+                # template; the config lists each leg like the fast shards.
+                workflow_names.update(f"tests (heavy {part}/3, PTY + Hermes)" for part in (1, 2, 3))
             else:
                 workflow_names.add(name)
         for tier in ("main", "nightly"):

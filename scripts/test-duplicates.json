@@ -6,7 +6,9 @@
     "nextest-junit-core": "linux",
     "nextest-junit-daemon": "linux",
     "nextest-junit-cli": "linux",
-    "nextest-junit-heavy": "linux",
+    "nextest-junit-heavy-1": "linux",
+    "nextest-junit-heavy-2": "linux",
+    "nextest-junit-heavy-3": "linux",
     "package-junit-pi": "linux",
     "package-junit-claude": "linux",
     "package-junit-codex": "linux",
@@ -14,23 +16,43 @@
   },
   "allowed": [
     {
-      "binaries": ["pohunek-cli::all"],
-      "sources": ["nextest-junit-cli", "package-junit-pi"],
+      "binaries": [
+        "pohunek-cli::all"
+      ],
+      "sources": [
+        "nextest-junit-cli",
+        "package-junit-pi"
+      ],
       "reason": "the package job exports POHUNEK_PI_PACKAGE_ARCHIVE, which switches the pi_package module of all from the in-process archive to the supplied one; the cli shard keeps the in-process path until the per-test audit of #1226 settles it"
     },
     {
-      "binaries": ["pohunek-cli::all"],
-      "sources": ["nextest-junit-cli", "package-junit-claude"],
+      "binaries": [
+        "pohunek-cli::all"
+      ],
+      "sources": [
+        "nextest-junit-cli",
+        "package-junit-claude"
+      ],
       "reason": "the package job runs the claude_package module of all under its real-runtime environment; the cli shard's run of the module's non-ignored tests stays until the per-test audit of #1226 settles it"
     },
     {
-      "binaries": ["pohunek-cli::all"],
-      "sources": ["nextest-junit-cli", "package-junit-codex"],
+      "binaries": [
+        "pohunek-cli::all"
+      ],
+      "sources": [
+        "nextest-junit-cli",
+        "package-junit-codex"
+      ],
       "reason": "the package job runs the codex_package and codex_subagent_sequences modules of all under its real-runtime environment; the cli shard's run of the modules' non-ignored tests stays until the per-test audit of #1226 settles it"
     },
     {
-      "binaries": ["pohunek-cli::all"],
-      "sources": ["nextest-junit-heavy", "package-junit-hermes"],
+      "binaries": [
+        "pohunek-cli::all"
+      ],
+      "sources": [
+        "nextest-junit-heavy-1",
+        "package-junit-hermes"
+      ],
       "reason": "the package job runs the hermes_package module of all under its real-runtime environment; the heavy shard's run of the module's non-ignored tests stays until the per-test audit of #1226 settles it"
     }
   ]

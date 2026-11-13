@@ -121,7 +121,8 @@ that path too.
   job, the macOS lane or the Hermes macOS job that the selection requires did
   not pass. Its `needs` are `required jobs (paths filter)`, `test selection`,
   `test selection check`, `build tests (nextest archive)`, the fast shards (`tests (<shard>, fast)`),
-  `tests (heavy, PTY + Hermes)`,
+  the heavy parts (`tests (heavy 1/3, PTY + Hermes)`, `tests (heavy 2/3, PTY + Hermes)`,
+  `tests (heavy 3/3, PTY + Hermes)`), `script regressions`,
   `fmt + clippy`, `macOS lint from Linux (aarch64-apple-darwin clippy)`,
   `doctests`, `build bins (pohunekd + pohunek-sessiond + pohunek)`,
   `SDK workspace`, `cargo-audit (RustSec advisories)`,
@@ -318,6 +319,7 @@ cargo tw                       # unfiltered full suite, four test processes
 bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
 bacon                          # watcher: profile-fast nextest loop (bacon.toml)
 python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/cli/heavy)
+python3 scripts/test-partitions run heavy --part 1/3  # one heavy part: the only K/N form CI runs
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
 # macOS only, from a nextest archive: `check-macos` (`--scope lane` for the PR lane archive) and `run-macos` (PR lane), `run-macos-tier` (main/nightly); see verification.md, Fast loops
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
@@ -392,8 +394,11 @@ tool cache; `astral-sh/setup-uv` then finds that exact version there, so no job
 fetches the uv version manifest. Raising the pin means changing `UV_VERSION`
 and the four checksums of `uv-<target>.tar.gz.sha256` together.
 
-CI runs three fast matrix shards and a separate heavy job without waiting for
-Clippy or release builds. Heavy uses four test processes and the real worker
+CI runs three fast matrix shards, three heavy matrix parts and a separate
+script-regressions job without waiting for
+Clippy or release builds. Each heavy part extracts the archive once and runs
+its `hash:K/N` partition after part 1 proves the union of the parts covers
+the whole shard; heavy parts use four test processes and the real worker
 binary. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
@@ -795,8 +800,8 @@ assembles and publishes the release in one fixed flow.
 The `gate` job calls the reusable workflow `.github/workflows/gate-tests.yml`
 and tests the way CI does: it builds the `cargo nextest archive
 --profile ci --workspace --all-features` archive, proves the shards of
-`scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy`
-under its bounded profile), and runs the doctests with `cargo test --doc --workspace
+`scripts/test-partitions` exhaustive and disjoint, runs every shard (each
+heavy part under its bounded profile), and runs the doctests with `cargo test --doc --workspace
 --all-features`, because nextest runs none. Every shard runs before the step
 fails, so one red shard does not hide another. The same workflow runs in CI as
 the job `release gate (full test set)`: in the nightly tier (schedule or a

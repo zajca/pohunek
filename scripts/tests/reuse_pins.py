@@ -35,15 +35,16 @@ PINNED_BODY_HASHES = {
   "darwin-check": "4a82af03b6684e8d7c970cd338a799007bbca51e5dfd7681c1e4ccdbfb62612b",
   "docs": "06499e3f4e9ade20bfd77c7c4f55b0d1c8cdead3de485bcbb2be2b69528544b2",
   "doctests": "7978d844ac8b29ecbbf12db1808456dbb830fb70431c85d7afa3eb8a1ba24326",
-  "fast-tests": "84c81271684fe68f2490cb3bea2f84e70cdf86eed3e9b15c69210a63e46e0eab",
+  "fast-tests": "52fd5b00e1b4c08ea1269507b57da3bc8ddb5b7367762660452f5d189c560685",
   "feature-matrix": "aa5ee100347f8e163a3d12d241c1782636ac5d5ecc52a929c0ff1a855bde7c5a",
   "hermes-compatibility-macos": "31230f71891dba9c8ddd9d7ef8e758da1d2559f6419d47662ed35063db1ee325",
-  "integration": "908bcf7a96414e511ea375ef32e1b9e17b15ab64b67ca1e8eda9d147ba96edb5",
+  "integration": "132e97ee40e1840da274b6872586fc0635264cd64553d3c37ed32b8367221caf",
   "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
   "macos-release-build": "3606ddebf6821c5b43a453417aa4f5077c8843fb5de0a35e0560094fc3746a38",
   "macos-tier": "b6d5867fa5aeccaf431276e6f6cd1a3e697c5f8cbc7a60f0595a986224c7cc83",
   "platform-contracts": "e8c96045f47a59e50ec5e6c95c1fac53d744a4888248add118ac939761cb8473",
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
+  "script-tests": "6bf890865bcac4488c6f72d4b4f6ee15010be064f17b2b2221398be1f62b1996",
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "8e9684845342c677bb4155e024c73fd205e8d1be7582a73a81b75bdff4046c62",
   "systemd-supervision": "4d67597b01aba3f4abe135be42474c79ae44ee9fbc2e097415c16d1dee46c887",
@@ -58,7 +59,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "f417a86f42f619a6b1eda97ccee35b45b8b582fc61a35c785327dccd21ee4640"
+PINNED_PREAMBLE = "eb1736bd450b8dc17bbf8c0f7045d767195e556965aa76cbdc6f62a185e0ed27"
 
 
 def pinned_preamble():
@@ -78,6 +79,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -90,12 +94,18 @@ EVALUATION_TABLE = [
         "text": "if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}",
         "legs": {
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
         "text": "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly') }}",
         "legs": {
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -105,6 +115,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -114,6 +127,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -123,6 +139,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -132,6 +151,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -141,6 +163,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -150,6 +175,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
     {
@@ -159,14 +187,9 @@ EVALUATION_TABLE = [
             "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             "": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
-        },
-    },
-    {
-        "text": "if: matrix.shard == 'core' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false')",
-        "legs": {
-            "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
-            "core": {"pull_request": "true", "workflow_dispatch": "true", "push": "true"},
-            "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "1": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "2": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            "3": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
         },
     },
 ]

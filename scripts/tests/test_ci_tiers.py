@@ -1555,13 +1555,18 @@ class SameOsDuplicateTests(unittest.TestCase):
         for name, job in self.jobs.items():
             for artifact in re.findall(r"(?m)^          name: (.*junit.*)$", job):
                 uploads.setdefault(name, []).append(artifact)
-        # The fast-tests matrix names one artifact per shard; a full run starts all.
+        # The fast-tests matrix names one artifact per shard, the integration
+        # matrix one per heavy part; a full run starts all.
         shards = json.loads(re.search(r"\|\| '(\[[^']+\])'\)", self.jobs["fast-tests"]).group(1))
+        part_list = re.search(r"(?m)^        part: \[(.+)\]$", self.jobs["integration"]).group(1)
+        parts = [part.strip() for part in part_list.split(",")]
         artifacts = set()
         for names in uploads.values():
             for artifact in names:
                 if "${{ matrix.shard }}" in artifact:
                     artifacts.update(artifact.replace("${{ matrix.shard }}", shard) for shard in shards)
+                elif "${{ matrix.part }}" in artifact:
+                    artifacts.update(artifact.replace("${{ matrix.part }}", part) for part in parts)
                 else:
                     artifacts.add(artifact)
         config = json.loads((ROOT / "scripts" / "test-duplicates.json").read_text())
@@ -1769,7 +1774,7 @@ class FailFastTests(unittest.TestCase):
     def test_every_cancelling_job_ends_with_the_step_the_notice_and_exact_conditions(self):
         jobs = workflow_jobs()
         cancelling = self.cancelling_set()
-        self.assertEqual(len(cancelling - self.OUTSIDE), 14)
+        self.assertEqual(len(cancelling - self.OUTSIDE), 15)
         self.assertEqual(cancelling - self.OUTSIDE - set(job_needs(jobs["test-selection-verdict"])), set())
         for name in sorted(cancelling):
             with self.subTest(job=name):
@@ -1835,7 +1840,7 @@ class FailFastTests(unittest.TestCase):
         jobs = workflow_jobs()
         cancelling = self.cancelling_set()
         relocated = {name for name in cancelling if re.search(r"(?m)^ +path: relocated$", jobs[name])}
-        self.assertEqual(relocated, {"fast-tests", "integration", "test-selection-check"})
+        self.assertEqual(relocated, {"fast-tests", "integration", "script-tests", "test-selection-check"})
         for name in sorted(cancelling):
             steps = job_steps(jobs[name])
             cancel = steps[FAIL_FAST_STEP]
@@ -3005,6 +3010,26 @@ def ci_rules_paths() -> list[str]:
 
 
 class TestSelectionWiringTests(unittest.TestCase):
+    def test_the_heavy_parts_are_the_numbered_legs_of_the_heavy_env_count(self):
+        # Issue #774: the integration matrix runs one leg per heavy part,
+        # numbered 1..N where N is the job's HEAVY_PARTS env value, and the
+        # display name shows the leg over that count.
+        job = workflow_jobs()["integration"]
+        parts = re.search(r"(?m)^        part: \[(.+)\]$", job)
+        self.assertIsNotNone(parts, job)
+        assert parts is not None
+        legs = [piece.strip() for piece in parts.group(1).split(",")]
+        count = re.search(r"(?m)^      HEAVY_PARTS: \"([0-9]+)\"$", job)
+        self.assertIsNotNone(count, job)
+        assert count is not None
+        self.assertEqual(legs, [str(part) for part in range(1, int(count.group(1)) + 1)])
+        name = re.search(r"(?m)^    name: (.+)$", job).group(1)
+        self.assertIn("${{ matrix.part }}", name)
+        self.assertIn(f"/{count.group(1)}", name)
+        run = job_steps(job)["Heavy tests (bounded nextest concurrency)"]
+        self.assertIn('"$PART/$HEAVY_PARTS"', step_script(run))
+        self.assertEqual(step_env_expression(run, "PART"), "matrix.part")
+
     """The Linux test jobs narrow only on a narrowed selection of a pull request."""
 
     def runs(self, job, *, event="pull_request", cancelled=False, build="success",
@@ -3259,6 +3284,7 @@ class TestSelectionWiringTests(unittest.TestCase):
 
         def fails(results, plan=None, selection="success", event="pull_request", narrowed=True):
             every = {"build-tests": "success", "fast-tests": "success", "integration": "success",
+                     "script-tests": "success",
                      TEST_SELECTOR: selection,
                      TEST_CHECK: "success" if narrowed else "skipped"}
             outputs = {**(NARROWED_PLAN if narrowed else {}), **(plan or {})}
@@ -3272,6 +3298,7 @@ class TestSelectionWiringTests(unittest.TestCase):
         self.assertFalse(fails({}, event="push", narrowed=False))
         self.assertFalse(fails({"fast-tests": "skipped"}, {"fast_shards": "[]"}))
         self.assertFalse(fails({"integration": "skipped"}, {"heavy": "false"}))
+        self.assertFalse(fails({"script-tests": "skipped"}, {"script_tests": "false"}))
         self.assertFalse(fails({"fast-tests": "skipped", "integration": "skipped"},
                                {"fast_shards": "[]", "heavy": "false"}))
         for results, plan, selection, event, narrowed in (
@@ -3295,6 +3322,13 @@ class TestSelectionWiringTests(unittest.TestCase):
             ({"integration": "skipped"}, {}, "success", "pull_request", True),
             ({"integration": "skipped"}, {"heavy": "false"}, "skipped", "pull_request", True),
             ({"integration": "failure"}, {"heavy": "false"}, "success", "pull_request", True),
+            ({"script-tests": "skipped"}, {"script_tests": "true"}, "success", "pull_request", True),
+            ({"script-tests": "skipped"}, {"script_tests": "false", "mode": "full"}, "success",
+             "pull_request", True),
+            ({"script-tests": "skipped"}, {"script_tests": "false"}, "success", "schedule", True),
+            ({"script-tests": "skipped"}, {"script_tests": "false"}, "success", "pull_request", False),
+            ({"script-tests": "skipped"}, {}, "success", "pull_request", True),
+            ({"script-tests": "failure"}, {"script_tests": "false"}, "success", "pull_request", True),
             # The selection check must pass on every narrowed selection.
             ({TEST_CHECK: "skipped"}, {}, "success", "pull_request", True),
             ({TEST_CHECK: "failure"}, {}, "success", "pull_request", True),
@@ -3352,23 +3386,28 @@ class TestSelectionWiringTests(unittest.TestCase):
                     )
         heavy = job_steps(workflow_jobs()["integration"])
         order = list(heavy)
-        self.assertLess(order.index("Verify exhaustive disjoint test partitions"),
-                        order.index("Keep only the selection's files in the tree"))
-        script_tests = step_condition(job_steps(workflow_jobs()["fast-tests"])["Check script regressions"])
-        for shard, event, plan, runs in (
-            ("core", "pull_request", {"script_tests": "false", **NARROWED_PLAN}, False),
-            ("core", "pull_request", {"script_tests": "true", **NARROWED_PLAN}, True),
+        self.assertLess(order.index("Download test selection"),
+                        order.index("Heavy tests (bounded nextest concurrency)"))
+        run = heavy["Heavy tests (bounded nextest concurrency)"]
+        # Only part 1 proves the partition: its run step checks, the later
+        # parts run their tests alone.
+        self.assertIn('if [ "$PART" = 1 ]; then', step_script(run))
+        self.assertIn('check=(--check)', step_script(run))
+        self.assertIn('"$PART/$HEAVY_PARTS"', step_script(run))
+        script_tests = job_condition("script-tests")
+        for event, plan, runs in (
+            ("pull_request", {"script_tests": "false", **NARROWED_PLAN}, False),
+            ("pull_request", {"script_tests": "true", **NARROWED_PLAN}, True),
             # Only a narrowed selection skips them: the scripts the test jobs
             # run are tested whenever the pipeline changed.
-            ("core", "pull_request", {"script_tests": "false"}, True),
-            ("core", "pull_request", {"script_tests": "false", "narrowed": "false"}, True),
-            ("core", "push", {"script_tests": "false", **NARROWED_PLAN}, True),
-            ("cli", "pull_request", {"script_tests": "true", **NARROWED_PLAN}, False),
+            ("pull_request", {"script_tests": "false"}, True),
+            ("pull_request", {"script_tests": "false", "narrowed": "false"}, True),
+            ("push", {"script_tests": "false", **NARROWED_PLAN}, True),
         ):
-            with self.subTest(shard=shard, event=event, plan=plan):
+            with self.subTest(event=event, plan=plan):
                 self.assertEqual(bool(evaluate_needs_expression(
-                    script_tests, event=event, results={TEST_SELECTOR: "success"},
-                    outputs={TEST_SELECTOR: plan}, matrix={"shard": shard},
+                    job_condition("script-tests"), event=event, results={TEST_SELECTOR: "success"},
+                    outputs={TEST_SELECTOR: plan},
                 )), runs)
 
 
@@ -3490,6 +3529,14 @@ class DeltaReuseWiringTests(unittest.TestCase):
                         entry["names"],
                         [f"tests ({shard}, fast)"
                          for shard in partitions_module().FAST_SHARDS],
+                    )
+                elif job_id == "integration":
+                    part = re.search(r"(?m)^        part: \[(.+)\]$", jobs[job_id])
+                    self.assertIsNotNone(part)
+                    self.assertEqual(
+                        entry["names"],
+                        [f"tests (heavy {leg}/3, PTY + Hermes)"
+                         for leg in (piece.strip() for piece in part.group(1).split(","))],
                     )
                 else:
                     self.assertIsNone(matrix)
@@ -3684,7 +3731,12 @@ class DeltaReuseWiringTests(unittest.TestCase):
             if expression.startswith("${{") and expression.endswith("}}"):
                 expression = expression[3:-3].strip()
             for shard in legs:
-                matrix = {"shard": shard} if shard else {}
+                # Matrix legs read `matrix.shard` (fast-tests) or
+                # `matrix.part` (integration); a non-matrix job reads none.
+                if job_id == "integration":
+                    matrix = {"part": shard} if shard else {}
+                else:
+                    matrix = {"shard": shard} if shard else {}
                 for (event, tier), changes in evaluator.items():
                     value = evaluate_needs_expression(
                         expression, event=event, tier=tier,
@@ -3748,7 +3800,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertNotEqual(edited_other, ci_text)
         for other_id in config["jobs"]:
             other_body = jobs_from(edited_other)[other_id]
-            has_matrix = re.search(r"(?m)^        shard: ", other_body) is not None
+            has_matrix = re.search(r"(?m)^        (?:shard|part): ", other_body) is not None
             legs = partitions_module().FAST_SHARDS if has_matrix else [""]
             self.check_reused_paths_identical(
                 config, job_id=other_id, body=other_body, legs=list(legs),
@@ -3837,10 +3889,17 @@ class DeltaReuseWiringTests(unittest.TestCase):
             body = jobs[job_id]
             # The fast-tests matrix line is read wherever it sits (the
             # block carries `fail-fast:` and a comment); a matrix job's
-            # `shard:` line must name every FAST_SHARDS leg.
-            has_matrix = re.search(r"(?m)^        shard: ", body) is not None
-            legs = list(partitions_module().FAST_SHARDS) if has_matrix else [""]
-            if has_matrix:
+            # `shard:` line must name every FAST_SHARDS leg. The
+            # integration `part:` line must name every heavy part, which
+            # the HEAVY_PARTS consistency test derives from the workflow.
+            has_shard_matrix = re.search(r"(?m)^        shard: ", body) is not None
+            has_part_matrix = re.search(r"(?m)^        part: ", body) is not None
+            if has_part_matrix:
+                part = re.search(r"(?m)^        part: \[(.+)\]$", body).group(1)
+                legs = [piece.strip() for piece in part.split(",")]
+            else:
+                legs = list(partitions_module().FAST_SHARDS) if has_shard_matrix else [""]
+            if has_shard_matrix:
                 shard = re.search(r"(?m)^        shard: (.+)$", body).group(1)
                 for leg in partitions_module().FAST_SHARDS:
                     self.assertIn(f'"{leg}"', shard)
@@ -4356,7 +4415,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         job = workflow_jobs()["test-selection-verdict"]
         gates = {
             "Fail a test job that failed or was skipped without a narrowed selection or a reuse skip":
-                ("build-tests", "fast-tests", "integration"),
+                ("build-tests", "fast-tests", "integration", "script-tests"),
             "Fail a gate job that failed or was skipped without the docs-only path":
                 ("test", "darwin-check", "doctests", "build-bins", "shear"),
             "Fail a macOS lane that failed or was skipped without a reuse skip or a reason":
@@ -4594,8 +4653,10 @@ class DocsOnlyPathTests(unittest.TestCase):
             job_steps(job)["Fail a test job that failed or was skipped without a narrowed selection or a reuse skip"]
         )
         skipped = {"build-tests": "skipped", TEST_CHECK: "skipped",
-                   "fast-tests": "skipped", "integration": "skipped"}
-        plan = {**DOCS_ONLY_PLAN, "fast_shards": "[]", "heavy": "false"}
+                   "fast-tests": "skipped", "integration": "skipped",
+                   "script-tests": "skipped"}
+        plan = {**DOCS_ONLY_PLAN, "fast_shards": "[]", "heavy": "false",
+                "script_tests": "false"}
 
         def fails(results=None, selection_plan=None, selection="success", changes="success",
                   docs_only="true", event="pull_request"):

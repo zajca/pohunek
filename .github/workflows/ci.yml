@@ -1593,7 +1593,9 @@ jobs:
   # Issue #2208: the script regressions have their own job since leaving the
   # `core` fast shard. The job runs the same `unittest discover` the core
   # shard used to carry, on every run except a narrowed selection whose
-  # `script_tests` output is false.
+  # `script_tests` output is false. Cancels the run on a deterministic
+  # failure like every other verdict-needs job; its checkout is the only
+  # network step, so its infra id is `infra-1`.
   script-tests:
     name: script regressions
     needs: [test-selection, reuse]
@@ -1601,17 +1603,36 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
+      actions: write
     defaults:
       run:
         working-directory: relocated
     steps:
       - uses: actions/checkout@v4
+        id: infra-1
         with:
           path: relocated
           persist-credentials: false
 
       - name: Run script regressions
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Keep the fail-fast action
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
+      - name: Cancel the run (fail fast)
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./cancel-run-action
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Issue #774: the heavy shard runs as three parts (matrix `part`), so no
   # single job waits for the whole heavy list. Part 1 proves the partition
