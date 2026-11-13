@@ -1920,7 +1920,10 @@ addresses of the CGNAT range are never node addresses.
 The production NetBird adapter remains tokenless and local. There is no signed
 manifest exchange. NetBird `publicKey` or legacy `pubKey` is the stable peer
 identity; peers without one preserve `peer_id = null` and clients fall back to
-the peer FQDN rather than treating its mutable IP as identity.
+the peer FQDN rather than treating its mutable IP as identity. The owner-restricted
+overview of NetBird 0.83+ is detected structurally (present-but-empty `management.url`,
+`netbirdIp`, `publicKey`, no peers) and reported as `netbird_state_restricted`;
+`"details": null` alone is a valid empty peer list.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no
    management-API token) to enumerate peers, NetBird addresses, and names.

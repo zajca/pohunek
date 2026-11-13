@@ -136,6 +136,12 @@ fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
                 detail,
             }
         }
+        NetbirdError::DetailRestricted { daemon_status } => OverlayError::StateRestricted {
+            overlay: id.clone(),
+            detail: format!(
+                "this account does not own the active NetBird profile (daemon status: {daemon_status})"
+            ),
+        },
         NetbirdError::HostUnknown(host) => OverlayError::HostUnknown {
             host,
             overlay: id.clone(),

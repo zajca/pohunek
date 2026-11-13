@@ -76,6 +76,36 @@ fn inspect_output(status: &str, host: &str) -> std::process::Output {
 }
 
 #[test]
+fn inspect_reports_the_owner_restricted_netbird_overview_as_its_own_error() {
+    let output = inspect_output(
+        include_str!("../../netbird/tests/fixtures/status_restricted_v0_83.json"),
+        "zajca-maine-pc",
+    );
+    assert!(!output.status.success());
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+    assert_eq!(document["err"]["code"], "netbird_state_restricted");
+    let message = document["err"]["msg"].as_str().expect("error message");
+    assert!(message.contains("owner"), "{message}");
+    assert!(message.contains("daemon status: Connected"), "{message}");
+    assert!(!message.contains("PeersRepr"), "{message}");
+    let recover = document["err"]["recover"].as_str().expect("recover hint");
+    assert!(recover.contains("owns"), "{recover}");
+    assert!(recover.contains("0.83"), "{recover}");
+}
+
+#[test]
+fn discovery_reports_the_owner_restricted_netbird_overview_as_its_own_error() {
+    let output = discover_output(include_str!(
+        "../../netbird/tests/fixtures/status_restricted_v0_83.json"
+    ));
+    assert!(!output.status.success());
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+    assert_eq!(document["err"]["code"], "netbird_state_restricted");
+}
+
+#[test]
 fn inspect_rejects_unknown_and_ambiguous_netbird_hosts() {
     let unknown = inspect_output(r#"{"peers":[]}"#, "missing");
     assert!(!unknown.status.success());
@@ -378,6 +408,11 @@ fn discovery_tolerates_missing_peer_address_and_empty_status() {
     assert!(empty.is_empty());
 
     assert!(discover_with_status(r#"{"netbirdIp":"100.64.0.1","peers":null}"#).is_empty());
+
+    let owner_no_peers = discover_with_status(include_str!(
+        "../../netbird/tests/fixtures/status_owner_no_peers.json"
+    ));
+    assert!(owner_no_peers.is_empty());
 
     let offline = discover_with_status(include_str!(
         "../../netbird/tests/fixtures/status_offline.json"

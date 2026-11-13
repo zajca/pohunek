@@ -56,6 +56,14 @@ pub enum NetbirdError {
     /// not logged in, or a non-zero exit). Carries a short, bounded detail.
     #[error("NetBird local state is unavailable: {0}")]
     StateUnavailable(String),
+    /// `NetBird` answered with its owner-restricted overview: this account does
+    /// not own the active `NetBird` profile, so no peers and no own address are
+    /// reported (`NetBird` 0.83 and later).
+    #[error("NetBird detailed status is restricted to the owner of the NetBird connection (daemon status: {daemon_status})")]
+    DetailRestricted {
+        /// The daemon status the overview reports.
+        daemon_status: String,
+    },
     /// The `netbird status --json` output could not be parsed.
     #[error("failed to parse `netbird status --json`: {0}")]
     Parse(String),
@@ -70,6 +78,15 @@ pub enum NetbirdError {
         /// The hosts it matched.
         candidates: Vec<overlay::CandidateIdentity>,
     },
+}
+
+/// Management state (root `management` of shape A); only the URL is parsed.
+/// Unknown keys are ignored, as everywhere in this file.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct ManagementState {
+    /// The configured management URL, when reported.
+    url: Option<String>,
 }
 
 /// This host's local peer state (shape B: `localPeerState`).
@@ -152,10 +169,12 @@ enum PeersRepr {
     /// Shape B: `peers` is a bare array of peer objects.
     List(Vec<Peer>),
     /// Shape A: `peers` is an object whose `details` holds the array. Other
-    /// sibling keys (`connected`, `total`, ...) are ignored.
+    /// sibling keys (`connected`, `total`, ...) are ignored. `details` may be
+    /// `null` when there are no peers: `NetBird` marshals a nil slice as
+    /// `null`, so a connected owner with zero peers prints `"details":null`.
     Object {
         #[serde(default)]
-        details: Vec<Peer>,
+        details: Option<Vec<Peer>>,
     },
 }
 
@@ -170,7 +189,7 @@ impl<'de> Deserialize<'de> for PeersField {
         Ok(match repr {
             None => PeersField(Vec::new()),
             Some(PeersRepr::List(peers)) => PeersField(peers),
-            Some(PeersRepr::Object { details }) => PeersField(details),
+            Some(PeersRepr::Object { details }) => PeersField(details.unwrap_or_default()),
         })
     }
 }
@@ -184,6 +203,10 @@ impl<'de> Deserialize<'de> for PeersField {
 pub struct NetbirdStatus {
     /// Shape A self IP: root-level `netbirdIp` (no CIDR mask).
     netbird_ip: Option<String>,
+    /// This host's `NetBird` public key (root `publicKey` of shape A).
+    public_key: Option<String>,
+    /// Management state (root `management` of shape A).
+    management: Option<ManagementState>,
     /// Shape B self IP source: `localPeerState` (the `IP` may carry a mask).
     local_peer_state: Option<LocalPeerState>,
     /// `NetBird` daemon version string, when reported.
@@ -237,6 +260,40 @@ impl NetbirdStatus {
     pub fn status_text(&self) -> Option<&str> {
         self.daemon_status.as_deref()
     }
+
+    /// True when the snapshot is the owner-restricted overview `NetBird` 0.83
+    /// and later prints for a caller that does not own the active profile
+    /// (root, the profile owner, or everyone with
+    /// `NB_DISABLE_PROFILE_OWNERSHIP` get the full status instead): the
+    /// overview reports a daemon status but no peers, no shape B local state,
+    /// and a present-but-empty `management.url`, `netbirdIp`, `publicKey`,
+    /// with no `fqdn`. A lone `"details": null` is not a restriction signal:
+    /// a connected owner with zero peers prints one too.
+    #[must_use]
+    pub fn is_detail_restricted(&self) -> bool {
+        let has_daemon_status = self
+            .daemon_status
+            .as_deref()
+            .is_some_and(|status| !status.trim().is_empty());
+        let empty = |value: &Option<String>| {
+            value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+        };
+        has_daemon_status
+            && self.local_peer_state.is_none()
+            && self.peers().is_empty()
+            && empty(&self.netbird_ip)
+            && empty(&self.public_key)
+            && self
+                .management
+                .as_ref()
+                .is_some_and(|management| empty(&management.url))
+            && self
+                .fqdn
+                .as_deref()
+                .is_none_or(|fqdn| fqdn.trim().is_empty())
+    }
 }
 
 /// Parse the JSON text of `netbird status --json` into a [`NetbirdStatus`].
@@ -261,6 +318,8 @@ pub fn parse_status(json: &str) -> Result<NetbirdStatus, NetbirdError> {
 /// - [`NetbirdError::CliMissing`] when no trusted `netbird` is found.
 /// - [`NetbirdError::StateUnavailable`] on a non-zero exit (daemon down / not
 ///   logged in), carrying a short trimmed detail from stderr/stdout.
+/// - [`NetbirdError::DetailRestricted`] when `NetBird` 0.83+ answers with its
+///   owner-restricted overview instead of the full status.
 /// - [`NetbirdError::Parse`] when the output is not valid status JSON.
 pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
     run_status_at(&resolve_host_program()?)
@@ -424,7 +483,15 @@ fn status_from_output(output: &std::process::Output) -> Result<NetbirdStatus, Ne
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_status(&stdout)
+    let status = parse_status(&stdout)?;
+    if status.is_detail_restricted() {
+        let daemon_status = clamp(
+            status.status_text().unwrap_or_default().trim(),
+            MAX_ERROR_DETAIL_BYTES,
+        );
+        return Err(NetbirdError::DetailRestricted { daemon_status });
+    }
+    Ok(status)
 }
 
 /// Build a bounded, human-readable detail for a non-zero `netbird` exit.
