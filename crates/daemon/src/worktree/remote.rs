@@ -17,11 +17,11 @@ use protocol::{
     ErrorClass, OnDiverged, ProtocolError, SessionWarning, SessionWarningKind, WorktreeSource,
 };
 
+use super::fetch::{fetch_into_ref, fetch_ref_name, FetchedBase};
 use super::{
-    admin_lock, branch_exists, branch_in_use_error, error, fetch_into_ref, fetch_ref_name,
-    git_capture, git_command, git_output, has_origin, lock_within, output_failure_message,
-    run_output_bounded, worktree_add_error, worktree_add_existing, worktree_add_new, FetchedBase,
-    GIT_COMMAND_TIMEOUT,
+    admin_lock, branch_exists, branch_in_use_error, error, git_capture, git_command, git_output,
+    has_origin, lock_within, output_failure_message, run_output_bounded, worktree_add_error,
+    worktree_add_existing, worktree_add_new, GIT_COMMAND_TIMEOUT,
 };
 
 /// Name of the only remote a remote-mode branch is taken from.

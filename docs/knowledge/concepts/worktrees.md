@@ -61,9 +61,9 @@ Set one when the branch is first pushed, with `git push -u origin <branch>`.
 repository without checking it out, after base resolution and before any
 hook runs. A GitHub pull-request head is `refs/pull/<n>/head`; the daemon
 has no forge-specific knowledge. The fetch writes no `FETCH_HEAD` entry
-(needs git 2.29 or newer, else `fetch_ref_failed`) and recurses into no
-submodule,
-and lands in the daemon-chosen
+(needs git 2.29 or newer, else `fetch_ref_failed`), recurses into no
+submodule, and moves no remote-tracking ref, even one a configured
+`remote.origin.fetch` refspec maps. It lands in the daemon-chosen
 `refs/pohunek/sessions/<session_id>/fetched` once the checkout stands, which
 lives as long as the worktree binding (a failed or refused request leaves no
 session, binding, worktree, temp ref or session ref behind, and
