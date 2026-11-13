@@ -207,9 +207,14 @@ carry it, because a failed selection runs everything instead of ending the
 run. A fork or Dependabot pull request has a read-only token, so the cancel
 call is refused and the run keeps its real failure.
 
-**Delta dispatch.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
-accepts `delta: true`: the `delta reuse` job finds the newest pull
-request run of the same tree (within 24 hours) and reuses its green legs;
+**Delta dispatch and push reuse.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
+accepts `delta: true`, and a `main` push reuses green jobs while the workflow-level
+`CI_REUSE_PUSH` kill switch is `"true"` (issue #2204; set it to `"false"` to turn
+push reuse off — a tier=main delta dispatch is unaffected): the `delta reuse` job
+finds the newest green legs of the previous runs of the same tree from this
+repository — pull request runs, prior main pushes, and tier=main delta dispatches,
+each within 24 hours, fork runs never — and reuses those green legs (per job, the
+newest green leg; a skipped or failed leg is never reused);
 the reusable jobs those legs name skip instead of running again. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the
@@ -226,8 +231,10 @@ such jobs are listed in `not_dispatch_consumers` with the reason; each such job'
 `pairs` names a job pair that is reused only together, in either direction:
 platform-contracts and hermes-compatibility-macos (see
 `scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
-run and the recorded source run as evidence for the commit, and names both
-runs in its report. For the dynamic-matrix `fast-tests` job the allowlist names
+run and the recorded source runs (one per reused job) as evidence for the commit,
+and names all of them in its report. A nightly or schedule run never reuses;
+`cargo-audit` is never allowlisted, because the advisory database changes
+independently of the tree. For the dynamic-matrix `fast-tests` job the allowlist names
 every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
 the workflow plans); such a job is `selection_dependent`, so a narrowed
 source never reuses any of them.

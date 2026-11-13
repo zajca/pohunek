@@ -552,10 +552,10 @@ def reuse_record(repo: str, run_id: int, tree: str) -> dict[str, Any] | None:
             raise EvidenceError(
                 f"run {run_id} has a ci-reuse-{tree} record without names for {job_id}"
             )
-        if entry.get("run_id") != record["source_run_id"]:
+        if not isinstance(entry.get("run_id"), int):
             raise EvidenceError(
                 f"run {run_id} has a ci-reuse-{tree} record naming {job_id} "
-                f"from run {entry.get('run_id')}, expected {record['source_run_id']}"
+                f"from run {entry.get('run_id')!r}, which is no run id"
             )
     return record
 
@@ -584,14 +584,15 @@ def verify_reuse(
     cache: dict[str, str],
     evidence_jobs: list[dict[str, Any]],
 ) -> tuple[set[str], list[str], dict[str, Any] | None, dict[str, str]]:
-    """The union of the evidence run with its delta-reuse source run.
+    """The union of the evidence run with its reuse source run(s).
 
     The required jobs that are `skipped` in the evidence run and named in its
-    `ci-reuse-<tree>` record are verified against the source run's API data:
-    the source run exists in this repository, ran on an allowed event with
-    `head_sha` of the evidence run's commit, recorded the tree, and has every
-    named leg green and fresh, with every required step of a reused job
-    passed. Returns the reused display names, the union failures, and the
+    `ci-reuse-<tree>` record are verified against their own source run's API
+    data: the source run exists in this repository, ran on an allowed event
+    and (for a delta dispatch) on the evidence run's commit or (for a push)
+    on a commit with the same tree, recorded the tree, and has every named
+    leg green and fresh, with every required step of a reused job passed.
+    Returns the reused display names, the union failures, and the
     `reused_from` record. Without a reuse artifact there is no union: empty
     names, no failures, no record, and the caller verifies the run exactly
     as before."""
@@ -610,38 +611,65 @@ def verify_reuse(
     if record is None:
         return set(), [], None, {}
     evidence_url = run.get("html_url") or f"run {run.get('id', 'unknown')}"
-    source_id = record["source_run_id"]
-    try:
-        source = read_source_run(repo, source_id)
-    except EvidenceError as error:
-        return set(), [f"cannot read source run {source_id} reused by {evidence_url}: {error}"], None, {}
-    source_url = source.get("html_url") or f"run {source_id}"
-    failures = []
-    if (source.get("repository") or {}).get("full_name") != repo or (
-        source.get("head_repository") or {}
-    ).get("full_name") != repo:
-        failures.append(f"source {source_url} is not a run of this repository (evidence {evidence_url})")
-    if source.get("event") not in reuse["source_events"]:
-        failures.append(
-            f"source {source_url} ran on event {source.get('event')!r}, "
-            f"which the candidate does not allow for reuse (evidence {evidence_url})"
-        )
-    if source.get("head_sha") != sha:
-        failures.append(
-            f"source {source_url} has head SHA {source.get('head_sha')}, "
-            f"expected {sha} (evidence {evidence_url})"
-        )
-    try:
-        recorded = recorded_trees(repo, source_id)
-    except EvidenceError as error:
-        failures.append(f"source {source_url} artifacts could not be read: {error}")
-        recorded = set()
-    if recorded != {tree}:
-        names = ", ".join(sorted(recorded)) or "none"
-        failures.append(
-            f"source {source_url} recorded tested tree {names}, "
-            f"expected {tree} (evidence {evidence_url})"
-        )
+    failures: list[str] = []
+    source_ids = sorted({entry["run_id"] for entry in record["jobs"].values()})
+    created = parse_moment(run.get("created_at"))
+    if created is None:
+        failures.append(f"evidence {evidence_url} has no readable created_at")
+    runs_by_id: dict[int, tuple[dict[str, Any], str, dict[str, list[dict[str, Any]]]]] = {}
+    for source_id in source_ids:
+        try:
+            source = read_source_run(repo, source_id)
+        except EvidenceError as error:
+            failures.append(f"cannot read source run {source_id} reused by {evidence_url}: {error}")
+            continue
+        source_url = source.get("html_url") or f"run {source_id}"
+        if (source.get("repository") or {}).get("full_name") != repo or (
+            source.get("head_repository") or {}
+        ).get("full_name") != repo:
+            failures.append(f"source {source_url} is not a run of this repository (evidence {evidence_url})")
+        if source.get("event") not in reuse["source_events"]:
+            failures.append(
+                f"source {source_url} ran on event {source.get('event')!r}, "
+                f"which the candidate does not allow for reuse (evidence {evidence_url})"
+            )
+        # A delta dispatch reuses the same commit; a push reuses the same
+        # tree (the PR head and the merge commit differ, the tree is equal).
+        same_commit_or_tree = False
+        if source.get("head_sha") == sha:
+            same_commit_or_tree = True
+        elif run.get("event") == "push":
+            try:
+                source_tree = commit_tree(repo, source.get("head_sha") or "", cache) if source.get("head_sha") else ""
+            except Exception:
+                source_tree = ""
+            if source_tree == tree:
+                same_commit_or_tree = True
+        if not same_commit_or_tree:
+            failures.append(
+                f"source {source_url} has neither the commit nor the tree of "
+                f"{evidence_url} (evidence {evidence_url})"
+            )
+        try:
+            recorded = recorded_trees(repo, source_id)
+        except EvidenceError as error:
+            failures.append(f"source {source_url} artifacts could not be read: {error}")
+            recorded = set()
+        if recorded != {tree}:
+            names = ", ".join(sorted(recorded)) or "none"
+            failures.append(
+                f"source {source_url} recorded tested tree {names}, "
+                f"expected {tree} (evidence {evidence_url})"
+            )
+        try:
+            source_jobs = get_jobs(repo, source_id)
+        except EvidenceError as error:
+            failures.append(f"jobs of source {source_url} could not be read: {error}")
+            source_jobs = []
+        source_by_name: dict[str, list[dict[str, Any]]] = {}
+        for job in source_jobs:
+            source_by_name.setdefault(job.get("name", ""), []).append(job)
+        runs_by_id[source_id] = (source, source_url, source_by_name)
     evidence_by_name: dict[str, list[str]] = {}
     for job in evidence_jobs:
         evidence_by_name.setdefault(job.get("name", ""), []).append(
@@ -662,19 +690,12 @@ def verify_reuse(
                 f"reuse record names {name}, but it ran in {evidence_url} "
                 f"(conclusion={', '.join(conclusions)})"
             )
-    try:
-        source_jobs = get_jobs(repo, source_id)
-    except EvidenceError as error:
-        failures.append(f"jobs of source {source_url} could not be read: {error}")
-        source_jobs = []
-    source_by_name: dict[str, list[dict[str, Any]]] = {}
-    for job in source_jobs:
-        source_by_name.setdefault(job.get("name", ""), []).append(job)
-    created = parse_moment(run.get("created_at"))
-    if created is None:
-        failures.append(f"evidence {evidence_url} has no readable created_at")
     window = datetime.timedelta(hours=reuse["max_age_hours"])
     for job_id in sorted(record["jobs"]):
+        source_id = record["jobs"][job_id]["run_id"]
+        if source_id not in runs_by_id:
+            continue
+        _source, source_url, source_by_name = runs_by_id[source_id]
         for name in record["jobs"][job_id]["names"]:
             attempts = source_by_name.get(name, [])
             if not attempts:
@@ -696,6 +717,11 @@ def verify_reuse(
     for required in config["required_steps"][tier]:
         if required["job"] not in reused_names:
             continue
+        job_entry = record["jobs"].get(required["job"])
+        source_id = job_entry.get("run_id") if isinstance(job_entry, dict) else None
+        if source_id not in runs_by_id:
+            continue
+        _source, source_url, source_by_name = runs_by_id[source_id]
         for job in source_by_name.get(required["job"], []):
             steps = job.get("steps") or []
             found = [step for step in steps if step.get("name") == required["step"]]
@@ -723,7 +749,10 @@ def verify_reuse(
             for conclusion in evidence_by_name.get(name) or evidence_by_name.get(alias.get(name, ""), [])
         )
     }
-    return reused, [], {"run_id": source_id, "url": source_url, "jobs": sorted(record["jobs"])}, alias
+    primary = runs_by_id.get(record["source_run_id"])
+    primary_url = primary[1] if primary else "unknown"
+    return reused, [], {"run_id": record["source_run_id"], "run_ids": source_ids, "url": primary_url, "jobs": sorted(record["jobs"])}, alias
+
 
 
 def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str, Any]]:
@@ -1134,9 +1163,14 @@ def main() -> int:
             detail = ""
             if result["match"] == "tree":
                 detail = f" by tree {result['tree']} (dispatch run on {result['run_sha']})"
+            source_urls = []
+            for run_id in reused_from.get("run_ids") or [reused_from.get("run_id")]:
+                if isinstance(run_id, int):
+                    source_urls.append(f"https://github.com/{args.repo}/actions/runs/{run_id}")
+            source_line = ", ".join(source_urls) or reused_from["url"]
             print(
                 f"ci-evidence: {args.tier} tier passed for {args.sha}{detail} "
-                f"by union of {result['url']} and {reused_from['url']}"
+                f"by union of {result['url']} and {source_line}"
             )
         elif result["match"] == "tree":
             print(

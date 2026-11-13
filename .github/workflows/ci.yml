@@ -93,6 +93,11 @@ env:
   # holding only the files whose change selects them. Off until three
   # consecutive nightly G3 runs on main pass, plus the local preflight.
   TEST_SELECTION_SPARSE: "false"
+  # Push reuse (issue #2204): a main push reuses the green jobs of a green
+  # same-tree run (PR, prior main push, or tier=main delta dispatch) from
+  # the last 24 hours. Setting this to "false" turns push reuse off; a
+  # tier=main delta dispatch is unaffected.
+  CI_REUSE_PUSH: "true"
   # A Python script never imports from its own directory or the working
   # directory, so a file a pull request adds there cannot shadow a module.
   PYTHONSAFEPATH: "1"
@@ -959,22 +964,24 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # Finds the newest same-tree pull request run and decides which jobs
-  # a delta dispatch reuses from it (issue #2203). Runs only on a tier=main
-  # dispatch with delta=true; every other event skips it, and each reusable
-  # job reads its `skip` output (a failed `reuse` run fails the verdict, so
-  # no job is wrongly skipped).
+  # Finds the green legs of the previous same-tree runs and decides which
+  # jobs this run reuses (issues #2203, #2204). Runs on a tier=main dispatch
+  # with delta=true, and on a main push while the CI_REUSE_PUSH kill switch
+  # is on; never on schedule or tier=nightly. Every other event skips it,
+  # and each reusable job reads its `skip` output (a failed `reuse` run fails
+  # the verdict, so no job is wrongly skipped).
   reuse:
     name: delta reuse
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || (github.event_name == 'push' && env.CI_REUSE_PUSH == 'true') }}
     permissions:
       contents: read
       actions: read
     outputs:
       skip: ${{ steps.decide.outputs.skip }}
       source_run: ${{ steps.decide.outputs.source_run }}
+      source_runs: ${{ steps.decide.outputs.source_runs }}
       tree: ${{ steps.decide.outputs.tree }}
     steps:
       - uses: actions/checkout@v4
@@ -3634,11 +3641,15 @@ jobs:
 
       # Only this workflow's test jobs: the release rehearsal's reusable
       # workflow uploads its own JUnit reports, which this job does not wait for.
-      # On a delta dispatch the reused jobs ran in the source run, so their
-      # JUnit reports live there: download them first, then this run's own
-      # reports over them, so each job contributes the report it ran here
-      # (a rerun job uploads to this run, never to the source).
-      - name: Download the reused jobs' JUnit reports from the source run
+      # On a delta dispatch or a push, the reused jobs ran in their source
+      # runs (possibly more than one, issue #2204), so their JUnit reports
+      # live there: download them first, then this run's own reports over
+      # them, so each job contributes the report it ran here (a rerun job
+      # uploads to this run, never to the source).
+      # The reused jobs may come from more than one source run (issue #2204):
+      # download each source run's reports in age order, so the newest
+      # report of a same name wins the overwrite, then this run's own.
+      - name: Download the reused jobs' JUnit reports from the source runs
         if: ${{ needs.reuse.outputs.source_run != '' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -3646,6 +3657,48 @@ jobs:
           path: ${{ runner.temp }}/junit
           run-id: ${{ needs.reuse.outputs.source_run }}
           github-token: ${{ github.token }}
+      - name: Download the reused jobs' JUnit reports from any other source run
+        if: ${{ needs.reuse.outputs.source_run != '' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import io, json, os, subprocess, zipfile
+          from pathlib import Path
+          runs = json.loads(os.environ["SOURCE_RUNS"])
+          target = Path(os.environ["RUNNER_TEMP"]) / "junit"
+          target.mkdir(parents=True, exist_ok=True)
+          repo = os.environ["GITHUB_REPOSITORY"]
+          for run_id in runs:
+              if str(run_id) == os.environ["SOURCE_RUN"]:
+                  continue
+              pages = json.loads(subprocess.run(
+                  ["gh", "api", "--method", "GET", "--paginate", "--slurp",
+                   f"repos/{repo}/actions/runs/{run_id}/artifacts", "-f", "per_page=100"],
+                  capture_output=True, text=True, check=True, timeout=60,
+              ).stdout)
+              for page in pages if isinstance(pages, list) else [pages]:
+                  for artifact in (page.get("artifacts") or []) if isinstance(page, dict) else []:
+                      name = artifact.get("name") or ""
+                      if not any(name.startswith(prefix) for prefix in (
+                          "nextest-junit-", "package-junit-", "macos-lane-junit",
+                          "macos-tier-junit", "hermes-macos-junit")):
+                          continue
+                      if artifact.get("expired"):
+                          continue
+                      raw = subprocess.run(
+                          ["gh", "api", "--method", "GET",
+                           f"repos/{repo}/actions/artifacts/{artifact['id']}/zip"],
+                          capture_output=True, check=True, timeout=120,
+                      ).stdout
+                      dest = target / name
+                      dest.mkdir(parents=True, exist_ok=True)
+                      with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                          archive.extractall(dest)
+          PYEOF
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ needs.reuse.outputs.source_run }}
+          SOURCE_RUNS: ${{ needs.reuse.outputs.source_runs }}
 
       - name: Download the run's JUnit reports
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

@@ -434,6 +434,8 @@ def evaluate_condition(
     python = python.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
+    python = re.sub(r"\binputs\.([a-z_]+)", r"inputs.get('\1', False)", python)
+    # Inputs read as booleans: `inputs.delta` is True on a delta dispatch.
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
     python = re.sub(
         rf"needs\.{re.escape(PACKAGE_SELECTOR)}\.outputs\.([a-z_]+)",
@@ -2601,6 +2603,7 @@ def evaluate_needs_expression(
     results: dict[str, str] | None = None,
     outputs: dict[str, dict[str, str]] | None = None,
     env: dict[str, str] | None = None,
+    inputs: dict[str, bool | str] | None = None,
     matrix: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
 ):
@@ -2630,6 +2633,8 @@ def evaluate_needs_expression(
     python = python.replace("fromJSON(", "fromjson(")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
+    python = re.sub(r"\binputs\.([a-z_]+)", r"inputs.get('\1', False)", python)
+    # Inputs read as booleans: `inputs.delta` is True on a delta dispatch.
     python = re.sub(r"\benv\.([A-Z_]+)", r"envs.get('\1', '')", python)
     python = re.sub(r"\bmatrix\.([a-z_]+)", r"matrix.get('\1', '')", python)
     python = re.sub(r"needs\.changes\.outputs\.([a-z_]+)", r"changes.get('\1', '')", python)
@@ -2649,7 +2654,7 @@ def evaluate_needs_expression(
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
         r"'[^']*'|\b(?:not|and|or|True|False|event|tier|cancelled|fromjson|contains|changes\.get|"
-        r"results\.get|outputs\.get|envs\.get|matrix\.get|reuse_skip|get|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
+        r"results\.get|outputs\.get|envs\.get|matrix\.get|inputs\.get|reuse_skip|get|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
         "",
         python,
     )
@@ -2665,6 +2670,7 @@ def evaluate_needs_expression(
         # Literals are lowered with the rest of the expression, keys included.
         "envs": {name.lower(): value.lower() for name, value in (env or {}).items()},
         "matrix": {name.lower(): value.lower() for name, value in (matrix or {}).items()},
+        "inputs": (inputs or {"delta": event == "workflow_dispatch" and tier.lower() == "main"}),
         "changes": {name: value.lower() for name, value in (changes or {}).items()},
         "results": {name: value.lower() for name, value in (results or {}).items()},
         "outputs": {
@@ -3138,7 +3144,10 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_the_reuse_config_has_the_expected_shape(self):
         config = reuse_config()
         self.assertEqual(config["max_age_hours"], 24)
-        self.assertEqual(config["source_events"], ["pull_request"])
+        self.assertEqual(
+            config["source_events"],
+            ["pull_request", "push", "workflow_dispatch"],
+        )
         self.assertEqual(
             set(config["not_dispatch_consumers"]),
             {"test-selection-check", "test-selection-audit"},
@@ -3747,6 +3756,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertIn("download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", body)
         self.assertIn("run-id: ${{ needs.reuse.outputs.source_run }}", body)
         self.assertIn('python3 scripts/test-duplicates "$RUNNER_TEMP/junit"', body)
+        self.assertIn("Download the reused jobs' JUnit reports from any other source run", body)
+        self.assertIn("SOURCE_RUNS: ${{ needs.reuse.outputs.source_runs }}", body)
         source_download = body.index("Download the reused jobs' JUnit reports")
         own_download = body.index("Download the run's JUnit reports")
         self.assertLess(
@@ -3764,10 +3775,11 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertRegex(job, r"(?m)^    timeout-minutes: \d+$")
         self.assertEqual(
             job_condition(REUSE_JOB),
-            "github.event_name == 'workflow_dispatch' "
-            "&& inputs.tier == 'main' && inputs.delta",
+            "(github.event_name == 'workflow_dispatch' "
+            "&& inputs.tier == 'main' && inputs.delta) "
+            "|| (github.event_name == 'push' && env.CI_REUSE_PUSH == 'true')",
         )
-        for output in ("skip", "source_run", "tree"):
+        for output in ("skip", "source_run", "source_runs", "tree"):
             self.assertIn(f"      {output}: ${{{{ steps.decide.outputs.{output} }}}}\n", job)
         # The evidence side reads the record for the whole tier window:
         # retention must cover it like `tested-tree` does, and a re-run
@@ -3777,6 +3789,44 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertIsNotNone(retention)
         self.assertEqual(int(retention.group(1)), 30)
         self.assertIn("overwrite: true", upload)
+
+    def test_the_reuse_job_runs_on_a_push_while_the_kill_switch_is_on(self):
+        condition = job_condition(REUSE_JOB)
+        on = bool(evaluate_needs_expression(
+            condition, event="push", env={"CI_REUSE_PUSH": "true"},
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("push")),
+        ))
+        self.assertTrue(on, "a push with CI_REUSE_PUSH=true runs the reuse job")
+        off = bool(evaluate_needs_expression(
+            condition, event="push", env={"CI_REUSE_PUSH": "false"},
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("push")),
+        ))
+        self.assertFalse(off, "CI_REUSE_PUSH=false turns push reuse off")
+        nightly = bool(evaluate_needs_expression(
+            condition, event="workflow_dispatch", tier="nightly",
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("workflow_dispatch")),
+        ))
+        self.assertFalse(nightly, "a nightly dispatch never runs reuse")
+        schedule = bool(evaluate_needs_expression(
+            condition, event="schedule",
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("schedule")),
+        ))
+        self.assertFalse(schedule, "a schedule never runs reuse")
+        pr = bool(evaluate_needs_expression(
+            condition, event="pull_request",
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("pull_request")),
+        ))
+        self.assertFalse(pr, "a pull request never runs reuse")
+
+    def test_the_kill_switch_is_documented_and_defaults_on(self):
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn('CI_REUSE_PUSH: "true"', text)
+        self.assertIn("issue #2204", text)
 
     def test_every_reusable_job_needs_reuse_and_names_itself_in_skip(self):
         jobs = workflow_jobs()

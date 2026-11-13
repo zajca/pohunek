@@ -627,5 +627,124 @@ else:
         self.assertIn("hermes-compatibility-macos", skip)
 
 
+
+
+    def test_a_push_reuses_a_pull_request_source_by_tree(self):
+        # Push (issue #2204): the merge commit differs from the PR head, the
+        # tested tree is equal. The run doc's head_sha is SHA, the tree is
+        # the fixture's; a push candidate list that includes the PR run by
+        # tree must reuse it.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="pull_request")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertIn("test", skip)
+        self.assertEqual(self.outputs()["source_run"], "777")
+        self.assertEqual(self.outputs()["source_runs"], "[777]")
+
+    def test_a_push_takes_the_newest_green_leg_in_each_job(self):
+        # Two same-tree sources (push 888 newer, pull_request 777 older).
+        # The newer push run supplies `test`; the older supplies the rest.
+        # `test` appears red in the older run but green in the newer one.
+        newer_jobs = [job("fmt + clippy")]  # push 888 supplies only `test`
+        older_jobs = green_jobs()
+        self.write_fixture(
+            runs=[
+                run_doc(run_id=888, event="push"),
+                run_doc(run_id=777, event="pull_request"),
+            ],
+            jobs_by_run={"888": newer_jobs, "777": older_jobs + [job("fmt + clippy", conclusion="failure")]},
+            artifacts={
+                "888": [{"name": f"tested-tree-{TREE}", "id": 1}, {"name": "test-selection", "id": 2}],
+                "777": [{"name": f"tested-tree-{TREE}", "id": 3}, {"name": "test-selection", "id": 4}],
+            },
+            artifact_zips={"2": selection_zip("full"), "4": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertIn("test", skip)
+        record = self.record(TREE)
+        self.assertEqual(record["jobs"]["test"]["run_id"], 888)
+        self.assertEqual(record["source_runs"], [777, 888])
+        self.assertEqual(record["jobs"]["darwin-check"]["run_id"], 777)
+        self.assertIn(record["jobs"]["test"]["run_id"], record["source_runs"])
+
+    def test_a_dispatch_source_never_reuses_a_skipped_leg(self):
+        # A workflow_dispatch source whose `test` leg was skipped (reused
+        # there) cannot supply `test` here; the job runs here.
+        jobs = []
+        for entry in green_jobs():
+            if entry["name"] == "fmt + clippy":
+                jobs.append(job("fmt + clippy", conclusion="skipped"))
+            else:
+                jobs.append(entry)
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="workflow_dispatch")],
+            jobs_by_run={"777": jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertNotIn("test", skip)
+
+    def test_a_push_never_reuses_a_source_older_than_a_day(self):
+        stale_jobs = [job(entry["name"], completed_at=STALE) for entry in green_jobs()]
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push")],
+            jobs_by_run={"777": stale_jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_push_never_uses_a_fork_source(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push", head_repo="someone/pohunek")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_source_for_another_tree_never_supplies_a_job(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": "tested-tree-" + "d" * 40, "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -105,7 +105,9 @@
   "reuse": {
     "max_age_hours": 24,
     "source_events": [
-      "pull_request"
+      "pull_request",
+      "push",
+      "workflow_dispatch"
     ]
   }
 }
