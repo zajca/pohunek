@@ -2609,8 +2609,10 @@ def evaluate_needs_expression(
     the reuse job's skip list: the `fromJSON` of the `|| '[]'` default reads
     it as a list, defaulting to no reuse as on a full run.
     """
+    # The reuse guards evaluate the pull request and the dispatch paths,
+    # where a reused leg was green, so `failure()` reads false on both.
     python = expression.replace("!cancelled()", "(not cancelled)")
-    python = python.replace("failure()", "(False)")  # a reused leg was green
+    python = python.replace("failure()", "(False)")
     # A step of a reused leg that ran successfully reads success; a
     # conditional step that never ran reads skipped, which never matters for
     # a fail-fast clause (`failure()` already reads false on a green leg).
@@ -3333,8 +3335,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
             held.add(stripped)
         entries = {entry["text"]: entry for entry in reuse_pins.EVALUATION_TABLE}
         for stripped in sorted(held):
-            self.assertIn(
-                stripped, entries,
+            self.assertTrue(
+                stripped in entries,
                 f"job {job_id!r} line {stripped!r} is not in the evaluation "
                 "table; it must leave the allowlist or the table must be "
                 "extended in the same commit",
