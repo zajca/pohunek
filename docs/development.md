@@ -195,6 +195,43 @@ because a failed selection runs everything instead of ending the run. A fork or
 Dependabot pull request has a read-only token, so the cancel call is refused and
 the run keeps its real failure.
 
+**Delta dispatch.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
+accepts `delta: true`: the `delta reuse` job finds the newest pull
+request run of the same tree (within 24 hours) and reuses its green legs;
+the reusable jobs those legs name skip instead of running again. Reused legs must be
+`success` in the source run (a skipped or failed leg is never reused) and
+they are looked up by job name with the same `tested-tree-*` record the
+evidence script uses, so a renamed job cannot be silently skipped and a
+renamed matrix leg falls back to running. `scripts/ci-reuse`
+decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
+`scripts/tests/test_ci_tiers.py` guards); the source selection must be `mode == "full"`,
+and an ambiguous source runs everything. A full
+dispatch (`delta: false`) stays the default, and `scripts/release` keeps
+dispatching full runs. A job that `needs:` a reusable
+job but that can never run on a tier=main dispatch is not a reuse consumer:
+such jobs are listed in `not_dispatch_consumers` with the reason; each such job's own
+`if:` restricts it to events that cannot run the dispatch.
+`pairs` names a job pair that is reused only together, in either direction:
+platform-contracts and hermes-compatibility-macos (see
+`scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
+run and the recorded source run as evidence for the commit, and names both
+runs in its report. For the dynamic-matrix `fast-tests` job the allowlist names
+every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
+the workflow plans); such a job is `selection_dependent`, so a narrowed
+source never reuses any of them.
+
+If an allowlisted job body or the called `upgrade.yml` changes, the reuse guard
+fails with `job <id> changed: re-check its reuse eligibility, then update its
+pin`. In the same commit, re-check that every event/input line of the job still
+reads the same on both paths (full-selection pull request and tier=main
+dispatch), update the body's sha256 in `scripts/tests/reuse_pins.py`
+(`PINNED_BODY_HASHES`), and extend `EVALUATION_TABLE` for every new
+token-reading line; `failure()` reads false there: a reused leg was green.
+The pins and the table are checked-in data, never regenerated from the
+workflow under test. A token-reading line whose values on the two paths
+differ, or an entry no pinned body holds, fails the guard: the job
+leaves `scripts/ci-reuse.json`.
+
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the
 `.github/actions/setup-mold` composite (never an inline `apt-get`): curl has

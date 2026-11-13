@@ -282,7 +282,9 @@ the test.
 
 Before the final head of a pull request from this repository merges, dispatch
 `ci.yml` once with `tier=main` on the branch (`gh workflow run ci.yml --ref
-<branch> -f tier=main`; fork heads: see Fork heads below)
+<branch> -f tier=main`; after a green pull request run of the same tree pass
+`-f delta=true` to reuse its green jobs instead of running them again;
+`scripts/release` always dispatches full runs; fork heads: see Fork heads below)
 only when the diff touches a release workflow or release xtask code, the runtime
 packages or packaging, the TypeScript SDK, Cargo dependencies, the protocol
 version window, or what the main and nightly tiers run (their jobs in `ci.yml`,
@@ -354,7 +356,9 @@ unpushed `--no-push` candidate), otherwise from the git commits API. Once any
 run or run attempt of the tier on the commit itself has completed, the runs on
 the commit decide, so a tree match never hides a failure there; pull-request, push, and
 schedule runs never match by tree. The report names the run and whether it
-matched by `sha` or by `tree`. The required jobs and steps come from
+matched by `sha` or by `tree`; a delta dispatch (`delta: true`) additionally
+names the recorded source pull request run whose green jobs it reuses, and the
+union of both runs decides. The required jobs and steps come from
 `scripts/ci-evidence.json` in the candidate commit's own tree, read from the
 local checkout when it holds the commit and otherwise from the contents API,
 never from the checkout that runs the script (#1243); a commit whose config

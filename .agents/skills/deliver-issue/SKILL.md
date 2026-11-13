@@ -245,7 +245,8 @@ that touches release workflows or xtask release code, runtime packages or
 packaging, the TypeScript SDK, Cargo dependencies, or the protocol version
 window also needs one green `tier=main` dispatch at the final head, started
 after PR CI and the marker are green (`gh workflow run ci.yml --ref <branch>
--f tier=main`). A fork head is never dispatched in this repository: the
+-f tier=main`; pass `-f delta=true` after a green pull request run of the same
+tree to reuse its green jobs instead of running them again). A fork head is never dispatched in this repository: the
 maintainer re-creates the change on its own branch and dispatches that, or
 relies on a later run on `main` (the post-merge run for the main tier; the
 scheduled nightly run or a `tier=nightly` dispatch for the release rehearsal

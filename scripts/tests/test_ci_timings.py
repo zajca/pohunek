@@ -2012,7 +2012,11 @@ class TierTimingTests(CliHarness):
         self.assertIsNotNone(run_name)
         assert run_name is not None
         self.assertIn("github.event_name == 'workflow_dispatch'", run_name.group(1))
-        self.assertIn("format('CI [tier={0}]', inputs.tier)", run_name.group(1))
+        self.assertIn("format('CI [tier={0}]", run_name.group(1))
+        self.assertIn("inputs.tier", run_name.group(1))
+        # A delta dispatch keeps the tier marker first, so the timing tiers
+        # still classify it; the marker only gains opt-in suffixes.
+        self.assertIn("' [delta]'", run_name.group(1))
 
         documents = []
         for run_id, tier in (

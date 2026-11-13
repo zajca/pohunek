@@ -442,7 +442,11 @@ Release packaging and contributor verification:
 - `scripts/changelog` — validates the `changelog.d/` fragments and folds them
   into the committed `CHANGELOG.md`; `notes` prints the release-body block.
 - `scripts/ci-evidence` — verifies successful Actions jobs and steps for an
-  exact commit, with optional dispatch and bounded polling.
+  exact commit, with optional dispatch and bounded polling; accepts a delta
+  dispatch's union with its recorded source run.
+- `scripts/ci-reuse` — decides which jobs a `tier=main` delta dispatch reuses
+  from the newest pull request run of the same tree; allowlist in
+  `scripts/ci-reuse.json`.
 - `scripts/provision-hermes-compat`
 - `scripts/tests/provision-hermes-compat.sh`
 - `scripts/smoke-hermes-plugin-release`

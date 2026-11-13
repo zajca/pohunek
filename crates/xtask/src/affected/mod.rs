@@ -630,6 +630,14 @@ pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
         Pattern::File("scripts/ci-retry"),
         "bounded-retry helper every CI test job install runs through",
     ),
+    (
+        Pattern::File("scripts/ci-reuse"),
+        "decides the delta-dispatch reuse of the CI test jobs",
+    ),
+    (
+        Pattern::File("scripts/ci-reuse.json"),
+        "allowlist of the delta-dispatch reuse of the CI test jobs",
+    ),
 ];
 
 /// Platform-neutral data that the macOS lane selection of a pull request
