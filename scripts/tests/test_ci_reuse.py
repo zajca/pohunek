@@ -205,11 +205,12 @@ class CiReuseProcessTests(unittest.TestCase):
         self.saved = {
             key: os.environ.get(key)
             for key in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_OUTPUT",
-                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE")
+                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE", "GITHUB_EVENT_NAME")
         }
         self.addCleanup(self.restore_env)
         os.environ["GITHUB_REPOSITORY"] = REPO
         os.environ["GITHUB_SHA"] = SHA
+        os.environ["GITHUB_EVENT_NAME"] = "push"
         os.environ["GITHUB_OUTPUT"] = str(self.output)
         os.environ["RUNNER_TEMP"] = str(self.directory)
         os.environ["WORKFLOW_FILE"] = "ci.yml"
@@ -688,7 +689,7 @@ else:
         self.assertIn(record["jobs"]["test"]["run_id"], record["source_runs"])
 
     def test_a_delta_dispatch_never_reuses_a_same_tree_source_on_another_commit(self):
-        # M2/row 15: a delta dispatch reuses the same commit; a same-tree
+        # Row 15: a delta dispatch reuses the same commit; a same-tree
         # source on another commit is not a dispatch source.
         self.write_fixture(
             runs=[run_doc(run_id=777, event="workflow_dispatch", head_sha="b" * 40)],
@@ -699,11 +700,33 @@ else:
             ]},
             artifact_zips={"2": selection_zip("full")},
         )
-        rc = self.run_script_with_tree(TREE)
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
-    def test_a_dispatch_source_never_reuses_a_skipped_leg(self):
+    def test_a_delta_dispatch_reuses_a_same_commit_source(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="workflow_dispatch")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 0)
+        self.assertIn("test", json.loads(self.outputs()["skip"]))
+
+    def test_a_delta_dispatch_source_never_reuses_a_skipped_leg(self):
         # A workflow_dispatch source whose `test` leg was skipped (reused
         # there) cannot supply `test` here; the job runs here.
         jobs = []
@@ -756,7 +779,7 @@ else:
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
     def test_a_push_to_a_feature_branch_never_supplies_reuse(self):
-        # M7: a push source must be a main-branch push (run_tier main).
+        # A push source must be a main-branch push (run_tier main).
         self.write_fixture(
             runs=[{**run_doc(run_id=777, event="push"), "head_branch": "zajca/feature"}],
             jobs_by_run={"777": green_jobs()},
@@ -784,7 +807,77 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    def test_a_source_with_conclusion_not_success_supplies_nothing(self):
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="push", conclusion="cancelled")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_source_with_head_sha_mismatch_for_a_dispatch_supplies_nothing(self):
+        # A delta dispatch must not reuse a same-tree PR source on
+        # another commit (row 15 via consumer event).
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="pull_request", head_sha="b" * 40)],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_query_is_bounded_by_date_not_by_count(self):
+        # L6 guard: the API filter is `created>=now-24h` in the query and
+        # there is no page/candidate cap; a listing with 150 candidates
+        # makes 150 candidate lookups, not a silent cap at 100.
+        runs = [run_doc(run_id=1000 + i, event="pull_request", head_sha="b" * 40) for i in range(150)]
+        jobs_by_run = {str(1000 + i): green_jobs() for i in range(150)}
+        artifacts = {str(1000 + i): [{"name": "tested-tree-" + "d" * 40, "id": 1}] for i in range(150)}
+        self.write_fixture(runs=runs, jobs_by_run=jobs_by_run, artifacts=artifacts)
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+        fixture = json.loads(self.fixture.read_text())
+        self.assertEqual(fixture.get("queried_runs", 1), 1)  # one listing, no cap claim; kill by inspecting query args in dry-run
+
+    def test_dry_run_prints_the_query_args(self):
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [{"name": f"tested-tree-{TREE}", "id": 1}]},
+        )
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("ci_reuse_under_test", str(SCRIPT))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.commit_tree = lambda sha: TREE
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = module.main(now=NOW, argv=["--dry-run"])
+        out = buffer.getvalue()
+        self.assertEqual(rc, 0)
+        lines = [line for line in out.strip().splitlines() if line.startswith("{")]
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["query"]["per_page"], 100)
+        self.assertIn("created_since", payload["query"])
+        self.assertIn("skip", json.loads(lines[-1]))
+
 
 if __name__ == "__main__":
     unittest.main()
-

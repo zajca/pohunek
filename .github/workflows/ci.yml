@@ -968,15 +968,22 @@ jobs:
   # jobs this run reuses (issues #2203, #2204). Runs on a tier=main dispatch
   # with delta=true, and on pushes (same tree, per-job newest green leg).
   # On a push with CI_REUSE_PUSH != 'true', the kill-switch step emits
-  # skip=[] (every job runs); the decide step is skipped. Never on schedule
-  # or tier=nightly. Every other event skips it,
-  # and each reusable job reads its `skip` output (a failed `reuse` run fails
-  # the verdict, so no job is wrongly skipped).
+  # skip=[] (every job runs); the decide and upload steps are skipped and
+  # no reuse record is uploaded. The job therefore always succeeds when
+  # the switch is off, and downstream jobs that need `reuse.outputs.skip`
+  # still evaluate (they use `!cancelled()`). Never on schedule or
+  # tier=nightly. Every other event skips it, and each reusable job reads
+  # its `skip` output (a failed `reuse` run fails the verdict, so no job
+  # is wrongly skipped).
   reuse:
     name: delta reuse
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || github.event_name == 'push' }}
+    # `CI_REUSE_PUSH` cannot be read here (job `if:` has no `env`), so the
+    # kill switch is the `nopus` step below. On a push with the switch
+    # off, `decide` and the upload are skipped, every job runs, and the
+    # job still succeeds. Every other event leaves the job skipped.
     permissions:
       contents: read
       actions: read
@@ -1006,7 +1013,6 @@ jobs:
         if: github.event_name != 'push' || env.CI_REUSE_PUSH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_REUSE_PUSH: ${{ env.CI_REUSE_PUSH }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           # The workflow file the source runs ran (the decide step lists
           # them by name under `.github/workflows/`).
@@ -1017,6 +1023,7 @@ jobs:
           echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
 
       - name: Upload the reuse record
+        if: github.event_name != 'push' || env.CI_REUSE_PUSH == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ci-reuse-${{ steps.decide.outputs.tree }}
@@ -3665,28 +3672,34 @@ jobs:
       # The reused jobs may come from more than one source run (issue #2204):
       # download each source run's reports in age order, so the newest
       # report of a same name wins the overwrite, then this run's own.
-      - name: Download the reused jobs' JUnit reports from the source runs
-        if: ${{ needs.reuse.outputs.source_run != '' }}
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
-          path: ${{ runner.temp }}/junit
-          run-id: ${{ needs.reuse.outputs.source_run }}
-          github-token: ${{ github.token }}
-      - name: Download the reused jobs' JUnit reports from any other source run
-        if: ${{ needs.reuse.outputs.source_run != '' }}
+      # The whole download is one inline step so age order is exact:
+      # `actions/download-artifact` over each source run sequentially,
+      # with expired artifacts skipped and missing ones tolerated.
+      - name: Download the reused and own JUnit reports in age order
         timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ needs.reuse.outputs.source_run }}
+          SOURCE_RUNS: ${{ needs.reuse.outputs.source_runs }}
         run: |
           set -euo pipefail
           python3 - <<'PYEOF'
-          import io, json, os, subprocess, zipfile
+          import io, json, os, subprocess, sys, zipfile
           from pathlib import Path
-          runs = json.loads(os.environ["SOURCE_RUNS"])
           target = Path(os.environ["RUNNER_TEMP"]) / "junit"
           target.mkdir(parents=True, exist_ok=True)
           repo = os.environ["GITHUB_REPOSITORY"]
-          for run_id in sorted(runs):
-              if str(run_id) == os.environ["SOURCE_RUN"]:
+          patterns = ("nextest-junit-", "package-junit-", "macos-lane-junit", "macos-tier-junit", "hermes-macos-junit")
+          source_runs_env = os.environ.get("SOURCE_RUNS", "[]")
+          try:
+              runs = json.loads(source_runs_env) if source_runs_env else []
+          except json.JSONDecodeError:
+              runs = []
+          if not isinstance(runs, list):
+              runs = []
+          source_run = (os.environ.get("SOURCE_RUN") or "").strip()
+          for run_id in sorted(v for v in runs if isinstance(v, int)):
+              if str(run_id) == source_run:
                   continue
               pages = json.loads(subprocess.run(
                   ["gh", "api", "--method", "GET", "--paginate", "--slurp",
@@ -3694,11 +3707,11 @@ jobs:
                   capture_output=True, text=True, check=True, timeout=60,
               ).stdout)
               for page in pages if isinstance(pages, list) else [pages]:
-                  for artifact in (page.get("artifacts") or []) if isinstance(page, dict) else []:
+                  if not isinstance(page, dict):
+                      continue
+                  for artifact in page.get("artifacts") or []:
                       name = artifact.get("name") or ""
-                      if not any(name.startswith(prefix) for prefix in (
-                          "nextest-junit-", "package-junit-", "macos-lane-junit",
-                          "macos-tier-junit", "hermes-macos-junit")):
+                      if not any(name.startswith(prefix) for prefix in patterns):
                           continue
                       if artifact.get("expired"):
                           continue
@@ -3711,17 +3724,39 @@ jobs:
                       dest.mkdir(parents=True, exist_ok=True)
                       with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                           archive.extractall(dest)
+          # The primary source run and this run's own reports, via the
+          # download action equivalent (gh api artifact list + zip).
+          def download_run(run_id: str) -> None:
+              pages = json.loads(subprocess.run(
+                  ["gh", "api", "--method", "GET", "--paginate", "--slurp",
+                   f"repos/{repo}/actions/runs/{run_id}/artifacts", "-f", "per_page=100"],
+                  capture_output=True, text=True, check=True, timeout=60,
+              ).stdout)
+              for page in pages if isinstance(pages, list) else [pages]:
+                  if not isinstance(page, dict):
+                      continue
+                  for artifact in page.get("artifacts") or []:
+                      name = artifact.get("name") or ""
+                      if not any(name.startswith(prefix) for prefix in patterns):
+                          continue
+                      if artifact.get("expired"):
+                          continue
+                      raw = subprocess.run(
+                          ["gh", "api", "--method", "GET",
+                           f"repos/{repo}/actions/artifacts/{artifact['id']}/zip"],
+                          capture_output=True, check=True, timeout=120,
+                      ).stdout
+                      dest = target / name
+                      dest.mkdir(parents=True, exist_ok=True)
+                      with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                          archive.extractall(dest)
+          if source_run:
+              download_run(source_run)
+          # This run's own reports, last, so they win name collisions.
+          current = os.environ.get("GITHUB_RUN_ID", "")
+          if current:
+              download_run(current)
           PYEOF
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN: ${{ needs.reuse.outputs.source_run }}
-          SOURCE_RUNS: ${{ needs.reuse.outputs.source_runs }}
-
-      - name: Download the run's JUnit reports
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
-          path: ${{ runner.temp }}/junit
 
       - name: Check for same-OS duplicates
         run: python3 scripts/test-duplicates "$RUNNER_TEMP/junit"

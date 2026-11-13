@@ -214,14 +214,15 @@ push reuse off — a tier=main delta dispatch is unaffected): the `delta reuse` 
 finds the newest green legs of the previous runs of the same tree from this
 repository — pull request runs, prior main pushes, and tier=main delta dispatches,
 each within 24 hours, fork runs never — and reuses those green legs (per job, the
-newest green leg; a skipped or failed leg is never reused);
-the reusable jobs those legs name skip instead of running again. Reused legs must be
+newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push may match by recorded tested tree. A failed `reuse` run fails
+the verdict, so no job is wrongly skipped, and a failed reused leg can never be named again: the record is written only on success. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the
 evidence script uses, so a renamed job cannot be silently skipped and a
 renamed matrix leg falls back to running. The list query is bounded in time
-(`created>=now-24h` in the API filter) and in count, and a `--dry-run` mode
-prints the decision without writing outputs for manual proof. `scripts/ci-reuse`
+(`created>=now-24h` in the API filter, `per_page=100`); `--dry-run` prints the
+query arguments and the decision without writing outputs or a record, for
+manual proof. `scripts/ci-reuse`
 decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
 `scripts/tests/test_ci_tiers.py` guards); the source selection must be `mode == "full"`,
 and an ambiguous source runs everything. A full
@@ -234,7 +235,9 @@ such jobs are listed in `not_dispatch_consumers` with the reason; each such job'
 platform-contracts and hermes-compatibility-macos (see
 `scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
 run and the recorded source runs (one per reused job) as evidence for the commit,
-and names all of them in its report. A nightly or schedule run never reuses;
+and names all of them in its report. `scripts/ci-evidence` re-verifies age against
+the evidence run (per source leg) and requires each reused job to be `success`
+in its own source run. A nightly or schedule run never reuses;
 `cargo-audit` is never allowlisted, because the advisory database changes
 independently of the tree. For the dynamic-matrix `fast-tests` job the allowlist names
 every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
@@ -245,8 +248,9 @@ If an allowlisted job body, the called `upgrade.yml` or the workflow text
 before `jobs:` changes, the reuse guard fails (`job <id> changed: re-check
 its reuse eligibility, then update its pin`, or `workflow preamble ...
 changed` for the text before `jobs:`). In the same commit, re-check that
-every event/input line of the job still reads the same on both paths
-(full-selection pull request and tier=main dispatch), update the body's
+every event/input line of the job still reads the same on all reuse paths
+(full-selection pull request, tier=main dispatch and main push — three paths),
+update the body's
 sha256 in `scripts/tests/reuse_pins.py` (`PINNED_BODY_HASHES`, `PINNED_CALLEE`
 for `upgrade.yml`, `PINNED_PREAMBLE` for the text before `jobs:`), and extend
 `EVALUATION_TABLE` for every new token-reading line of a job body;

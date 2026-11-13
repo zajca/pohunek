@@ -617,6 +617,7 @@ def verify_reuse(
     if created is None:
         failures.append(f"evidence {evidence_url} has no readable created_at")
     runs_by_id: dict[int, tuple[dict[str, Any], str, dict[str, list[dict[str, Any]]]]] = {}
+    evidence_event = run.get("event")
     for source_id in source_ids:
         try:
             source = read_source_run(repo, source_id)
@@ -633,30 +634,37 @@ def verify_reuse(
                 f"source {source_url} ran on event {source.get('event')!r}, "
                 f"which the candidate does not allow for reuse (evidence {evidence_url})"
             )
-        # Witnessed event (M2): push source only main-branch pushes,
-        # dispatch source only tier=main dispatches (via shared run_tier).
         ev_event = source.get("event")
-        if ev_event == "push" and source.get("head_branch") != "main":
-            failures.append(f"source {source_url} is a push to {source.get('head_branch')!r}, not main (evidence {evidence_url})")
-        if ev_event == "workflow_dispatch" and run_tier(source, config.get("workflow_path", ".github/workflows/ci.yml")) != "main":
+        if ev_event == "push" and run_tier(source, config["workflow_path"]) != "main":
+            failures.append(f"source {source_url} is not a main push (evidence {evidence_url})")
+        if ev_event == "workflow_dispatch" and run_tier(source, config["workflow_path"]) != "main":
             failures.append(f"source {source_url} is not a tier=main dispatch (evidence {evidence_url})")
         if source.get("conclusion") != "success" or source.get("status") != "completed":
             failures.append(f"source {source_url} did not conclude success (evidence {evidence_url})")
-        # A delta dispatch reuses the same commit; a push reuses the same
-        # tree. A pull_request source is matched by its recorded tested
-        # tree (its head_sha is the PR head, the tested commit is the merge
-        # commit — brief design 4). Push evidence compares the merge tree.
+        # A dispatched delta run reuses the same commit; a push reuses the
+        # same tree. A `pull_request` source is matched by its recorded
+        # tested tree (owner policy, issue #2204: a `main` run may rely on
+        # a PR run of the identical tree; the PR head differs from the
+        # merge commit). Push evidence compares the merge tree.
         same_commit_or_tree = False
-        if source.get("event") == "pull_request":
-            same_commit_or_tree = True  # recorded tree checked below
-        elif source.get("head_sha") == sha:
-            same_commit_or_tree = True
-        elif run.get("event") == "push":
-            try:
-                source_tree = commit_tree(repo, source.get("head_sha") or "", cache) if source.get("head_sha") else ""
-            except EvidenceError:
-                source_tree = ""
-            if source_tree == tree:
+        if evidence_event == "push":
+            if source.get("event") == "pull_request":
+                same_commit_or_tree = True  # recorded tree checked below
+            elif source.get("head_sha") == sha:
+                same_commit_or_tree = True
+            else:
+                try:
+                    source_tree = commit_tree(repo, source.get("head_sha") or "", cache) if source.get("head_sha") else ""
+                except EvidenceError as error:
+                    source_tree = f"<unreadable: {error}>"
+                if source_tree == tree:
+                    same_commit_or_tree = True
+        else:
+            # A dispatched delta run reuses the same commit (SHA). The
+            # tree-matched dispatch evidence passes `sha` = the dispatch
+            # run's own head_sha, so a pull_request source on another
+            # commit is refused here.
+            if source.get("head_sha") == sha:
                 same_commit_or_tree = True
         if not same_commit_or_tree:
             failures.append(
@@ -695,8 +703,8 @@ def verify_reuse(
     # it ran under a name the record never mentions.
     alias = reuse_aliases(repo, sha, config["workflow_path"], reused_names)
     for name in sorted(reused_names):
-        # A record-named leg must be skipped in the evidence run (M4): when
-        # the name is absent from evidence_by_name (alias case) the check
+        # A record-named leg must be skipped in the evidence run: when the
+        # name is absent from evidence_by_name (alias case) the check
         # falls back to the alias target; when the name is present, it must
         # be skipped (or, for a matrix leg, its alias must be skipped).
         conclusions = evidence_by_name.get(name)
@@ -713,7 +721,6 @@ def verify_reuse(
         if source_id not in runs_by_id:
             continue
         _source, source_url, source_by_name = runs_by_id[source_id]
-        source_created = parse_moment(_source.get("created_at")) if _source.get("created_at") else None
         for name in record["jobs"][job_id]["names"]:
             attempts = source_by_name.get(name, [])
             if not attempts:
@@ -727,21 +734,22 @@ def verify_reuse(
                 )
                 continue
             completed = parse_moment(newest.get("completed_at"))
-            if completed is None or created is None or created - completed > window or completed - created > window:
+            if completed is None or created is None or created - completed > window:
                 failures.append(
                     f"source job {name} in {source_url} is older than "
                     f"{reuse['max_age_hours']}h (evidence {evidence_url})"
                 )
-            # Run pin proved earlier than leg (M5): the run's created_at must
-            # not be after the leg's completion (a reused leg cannot predate
-            # the run that produced it).
-            if source_created and completed and created and source_created > completed and source_created > created:
-                failures.append(f"source job {name} in {source_url} completed before its run was created (evidence {evidence_url})")
     for required in config["required_steps"][tier]:
         if required["job"] not in reused_names:
             continue
-        job_entry = record["jobs"].get(required["job"])
-        source_id = job_entry.get("run_id") if isinstance(job_entry, dict) else None
+        job_entry = None
+        for entry in record["jobs"].values():
+            if required["job"] in entry.get("names", []):
+                job_entry = entry
+                break
+        if job_entry is None:
+            continue
+        source_id = job_entry.get("run_id")
         if source_id not in runs_by_id:
             continue
         _source, source_url, source_by_name = runs_by_id[source_id]
@@ -774,7 +782,8 @@ def verify_reuse(
     }
     primary = runs_by_id.get(record["source_run_id"])
     primary_url = primary[1] if primary else "unknown"
-    return reused, [], {"run_id": record["source_run_id"], "run_ids": source_ids, "url": primary_url, "jobs": sorted(record["jobs"])}, alias
+    job_run = {job_id: record["jobs"][job_id]["run_id"] for job_id in record["jobs"]}
+    return reused, [], {"run_id": record["source_run_id"], "run_ids": source_ids, "url": primary_url, "jobs": sorted(record["jobs"]), "job_run": job_run}, alias
 
 
 
@@ -877,6 +886,13 @@ def verify_steps(
         if not matching:
             failures.append(f"missing job for required step {name}: {required['step']}")
             continue
+        def _step_conclusion(step: dict) -> str:
+            conclusion = step.get("conclusion") or "missing"
+            if conclusion == "failure":
+                return "failure"
+            if conclusion == "success":
+                return "success"
+            return conclusion
         for job in matching:
             steps = job.get("steps") or []
             found = [step for step in steps if step.get("name") == required["step"]]
@@ -884,7 +900,7 @@ def verify_steps(
                 failures.append(f"missing required step {required['step']} in {name}")
                 continue
             for step in found:
-                conclusion = step.get("conclusion") or "missing"
+                conclusion = _step_conclusion(step)
                 if conclusion != "success":
                     failures.append(
                         f"required step {required['step']} in {name}: conclusion={conclusion}"

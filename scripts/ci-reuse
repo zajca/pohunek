@@ -3,10 +3,12 @@
 
 A `tier=main` dispatch with `delta=true` and a main-branch push run this
 script in the `reuse` job. It computes the tree of `GITHUB_SHA` and lists
-recent `ci.yml` runs of this repository (no `head_sha` filter: a push merge
-commit differs from the PR head that tested the same tree) whose event is in
-`source_events` of `scripts/ci-reuse.json`, never a fork, never >24h old.
-Candidates are filtered and ordered by the shared eligibility helper
+recent `ci.yml` runs of this repository whose event is in `source_events` of
+`scripts/ci-reuse.json`, never a fork, never >24h old. The consumer event
+(`GITHUB_EVENT_NAME`) is read from the environment: on `workflow_dispatch`
+every candidate must have `head_sha == GITHUB_SHA`; on `push` candidates may
+come from another commit and are matched by their recorded tree. Candidates
+are filtered and ordered by the shared eligibility helper
 `source_is_eligible` (identical rule in `scripts/ci-evidence`; a push source
 must be a main-branch push, a dispatch source must be a `tier=main` dispatch,
 per `run_tier`). Only runs whose run-level `conclusion` is `success` supply
@@ -183,18 +185,13 @@ def run_tier(run: dict, workflow_path: str = ".github/workflows/ci.yml") -> str 
 
 def source_is_eligible(run: dict, repo: str, workflow_path: str,
                        now: datetime.datetime, max_age: datetime.timedelta) -> bool:
-    """One shared eligibility rule (M2/M3): same repo, no fork, tier main,
-    run-level success, fresh. Identical in ci-evidence."""
+    """Eligibility rule shared with `scripts/ci-evidence`: same repo, no fork,
+    tier main, run-level success, fresh."""
     if (run.get("repository") or {}).get("full_name") != repo:
         return False
     if (run.get("head_repository") or {}).get("full_name") != repo:
         return False
-    if run_tier(run, workflow_path) not in ("main", None):
-        # run_tier None means pull_request/schedule etc. - handled by event below
-        pass
     event = run.get("event")
-    # Push sources only main-branch pushes (tier=main dispatch's push tier),
-    # dispatch sources only tier=main dispatches.
     if event == "push" and run.get("head_branch") != "main":
         return False
     if event == "workflow_dispatch" and run_tier(run, workflow_path) != "main":
@@ -207,25 +204,37 @@ def source_is_eligible(run: dict, repo: str, workflow_path: str,
     return True
 
 
+def _run_age(run: dict) -> str:
+    """Age of a source leg for the summary, or empty when unknown."""
+    created = parse_moment(run.get("created_at"))
+    if created is None:
+        return ""
+    age = datetime.datetime.now(datetime.timezone.utc) - created
+    hours = int(age.total_seconds() // 3600)
+    return f" ({hours}h old)" if hours else ""
+
+
 def parse_moment(value: str | None) -> datetime.datetime | None:
-    if not value:
+    if not value or not isinstance(value, str):
         return None
     try:
-        from datetime import timezone
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except Exception:
+        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
         return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment
 
 
-def list_runs(repo: str, workflow_file: str, sha: str,
+def list_runs(repo: str, workflow_file: str,
                 now: datetime.datetime | None = None) -> list[dict]:
     """Recent runs of ci.yml of this repository, any head, in API order.
 
-    Bounded query (M1): `created>=now-24h` in the API filter, cap 100
-    candidates, newest first — no unbounded listing. A push run's merge
-    commit differs from the PR head that tested the same tree, so the
-    candidate set is the recent runs of the workflow and tree identity
-    (not `head_sha`) filters them (issue #2204)."""
+    Bounded query: `created>=now-24h` in the API filter, newest first — no
+    unbounded listing. A push run's merge commit differs from the PR head
+    that tested the same tree, so the candidate set is the recent runs of
+    the workflow and tree identity (not `head_sha`) filters them (issue
+    #2204); the caller filters by consumer event and tree."""
     since = (now or datetime.datetime.now(datetime.timezone.utc)) - datetime.timedelta(hours=24)
     pages = read_json([
         "api", "--method", "GET", "--paginate", "--slurp",
@@ -368,6 +377,7 @@ def decide(
     now: datetime.datetime,
     sha: str,
     repo: str,
+    consumer_event: str,
 ) -> tuple[list[str], dict | None, str, dict[str, str]]:
     """The skip list, the newest source run, a global reason, per-job reasons.
 
@@ -375,17 +385,20 @@ def decide(
     among the candidate runs whose `tested-tree-*` record is exactly `tree`.
     A dispatch-source leg that was itself skipped is never a source."""
     max_age = datetime.timedelta(hours=config["max_age_hours"])
+    def _same_commit(run: dict) -> bool:
+        # A delta dispatch reuses the same commit; a push consumer may
+        # reuse another commit with the same tree.
+        if consumer_event == "push":
+            return True
+        if consumer_event == "workflow_dispatch":
+            return run.get("head_sha") == sha
+        return False
     candidates = [
         run for run in runs
         if run.get("event") in config["source_events"]
         and isinstance(run.get("id"), int)
         and source_is_eligible(run, repo, ".github/workflows/ci.yml", now, max_age)
-        # M2: a delta dispatch reuses the same commit; only push runs
-        # (and PR runs supplying them) may come from another commit.
-        and not (
-            run.get("event") == "workflow_dispatch"
-            and run.get("head_sha") != sha
-        )
+        and _same_commit(run)
     ]
     # Newest first.
     candidates.sort(
@@ -396,7 +409,6 @@ def decide(
     per_run_reasons: dict[str, str] = {}
     selected: dict[str, dict] = {}
     narrowed_by_run: dict[int, bool | None] = {}
-    selected_run: dict | None = None
     for run in candidates:
         try:
             names = artifact_names(repo, run["id"])
@@ -453,12 +465,10 @@ def decide(
                     per_run_reasons.setdefault(job_id, "the source selection was narrowed")
                     continue
             selected[job_id] = run
-            if selected_run is None:
-                selected_run = run
     if not selected:
         if per_run_reasons:
             return [], {}, "no same-tree green run within 24 hours", per_run_reasons
-        return [], {}, "no same-tree pull request run", {}
+        return [], {}, "no same-tree run", {}
     skip_set = set(selected)
     closure_reasons: dict[str, str] = {}
     changed = True
@@ -496,7 +506,7 @@ def summarize(
     for job_id in config["jobs"]:
         run = (sources or {}).get(job_id) or fallback if job_id in skip else None
         if job_id in skip and run is not None:
-            link = f"[run {run['id']}]({run.get('html_url')})"
+            link = f"[run {run['id']}]({run.get('html_url')}){_run_age(run)}"
             lines.append(f"| {job_id} | reused from {link} |")
         elif job_reasons and job_id in job_reasons:
             lines.append(f"| {job_id} | runs: {job_reasons[job_id]} |")
@@ -529,16 +539,22 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     except ReuseError as error:
         print(f"ci-reuse: {error}", file=sys.stderr)
         return 1
+    consumer_event = os.environ.get("GITHUB_EVENT_NAME", "")
+    if consumer_event not in ("push", "workflow_dispatch"):
+        print(f"ci-reuse: GITHUB_EVENT_NAME {consumer_event!r} is not a reuse consumer", file=sys.stderr)
+        return 1
     workflow_file = os.environ["WORKFLOW_FILE"]
     moment = now or datetime.datetime.now(datetime.timezone.utc)
     reason = ""
     listed = True
     try:
-        runs = list_runs(repo, workflow_file, sha, moment)
+        runs = list_runs(repo, workflow_file, moment)
     except ReuseError as error:
         warn(f"cannot list candidate runs: {error}; running everything")
         runs = []
         listed = False
+    if dry_run:
+        print(json.dumps({"query": {"workflow_file": workflow_file, "created_since": (moment - datetime.timedelta(hours=24)).date().isoformat(), "per_page": 100}, "consumer_event": consumer_event}))
     job_reasons: dict[str, str] = {}
     sources: dict[str, dict] = {}
     skip: list[str] = []
@@ -546,7 +562,7 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     if runs:
         try:
             skip, sources, reason, job_reasons = decide(
-                config, tree, runs, moment, sha, repo,
+                config, tree, runs, moment, sha, repo, consumer_event,
             )
             if dry_run:
                 print(json.dumps({"skip": skip, "source_runs": sorted({r['id'] for r in sources.values()}),
@@ -562,7 +578,10 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
             warn(f"{reason}; running everything")
     else:
         if listed:
-            warn("no same-tree pull request run; running everything")
+            warn("no same-tree run; running everything")
+    if dry_run and not runs:
+        print(json.dumps({"skip": [], "source_runs": [], "reason": reason}))
+        return 0
     ordered_run_ids = sorted({run["id"] for run in sources.values()})
     # The primary source run is the one supplying the most reused jobs
     # (ties: the oldest such run id); the summary names it, and
@@ -590,6 +609,7 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     if sources:
         try:
             job_cache: dict[int, dict[str, list[dict]]] = {}
+            failed = False
             for job_id in skip:
                 job = config["jobs"][job_id]
                 run = sources[job_id]
@@ -605,10 +625,7 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
                     attempts = by_name.get(name, [])
                     if not attempts:
                         warn(f"source run {run['id']} no longer lists {name}; running everything")
-                        entries = []
-                        skip = []
-                        sources = {}
-                        source = None
+                        failed = True
                         break
                     newest = max(
                         attempts,
@@ -620,8 +637,9 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
                         "source_job_id": newest.get("id"),
                         "completed_at": newest.get("completed_at"),
                     })
-                if not entries and job_id in sources:
-                    record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None, "source_runs": []}
+                if failed:
+                    record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None, "source_runs": [], "jobs": {}}
+                    skip, sources, source = [], {}, None
                     break
                 record["jobs"][job_id] = {
                     "run_id": run["id"],
@@ -641,7 +659,7 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as stream:
-            stream.write(f"### Delta reuse (tree `{tree}`)\n\n")
+            stream.write(f"### Reuse (tree `{tree}`)\n\n")
             stream.write(summarize(config, skip, sources, source, reason, job_reasons,))
             stream.write("\n")
     else:

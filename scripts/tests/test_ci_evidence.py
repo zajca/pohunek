@@ -1415,7 +1415,7 @@ jobs:
         self.assertIn(f"/actions/runs/{OTHER_SOURCE}", text.stdout)
 
     def test_a_push_reuse_union_by_tree_accepts_a_source_on_another_commit(self):
-        # M3/M7(b): a pull_request source whose head_sha differs from the push
+        # A pull_request source whose head_sha differs from the push
         # commit is accepted by its recorded tested tree.
         OTHER = "b" * 40
         union_fixture(self)
@@ -1432,7 +1432,7 @@ jobs:
         self.assertEqual(report["reused_from"]["run_ids"], [REUSE_SOURCE_ID])
 
     def test_a_push_reuse_union_is_refused_for_an_audit_record_entry(self):
-        # M7(d)/row 11: cargo-audit is never excused — a record naming it is refused.
+        # Cargo-audit is never excused — a record naming it is refused.
         union_fixture(self)
         fixture = json.loads(self.fixture.read_text())
         fixture["artifact_zips"]["11"] = reuse_zip(
@@ -1442,6 +1442,112 @@ jobs:
         self.fixture.write_text(json.dumps(fixture))
         result = self.invoke("main", "--json")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_a_dispatch_evidence_refuses_a_same_tree_source_on_another_commit(self):
+        # Row 15 regression: evidence on the tree path (dispatch
+        # consumer) must not accept a same-tree PR source on another commit.
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=THIRD_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("neither the commit nor the tree", result.stderr)
+
+    def test_a_dispatch_evidence_accepts_a_same_commit_source(self):
+        # The dispatch evidence run is 789 on OTHER_SHA (the dispatch
+        # commit); a source on that same commit is accepted.
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=OTHER_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_required_step_is_checked_by_display_name(self):
+        self.config_data["required_steps"]["main"] = [{"job": REUSE_JOB, "step": "Check formatting"}]
+        self.write_config()
+        union_fixture(self, jobs_by_run={
+            "456": jobs_page(overrides={REUSE_JOB: "skipped"}),
+            str(REUSE_SOURCE_ID): {"jobs": [{"name": REUSE_JOB, "conclusion": "success", "completed_at": "2026-11-12T11:00:00Z", "steps": [{"name": "Check formatting", "conclusion": "failure"}]}]},
+        })
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required step Check formatting", result.stderr)
+
+    def test_per_job_run_id_from_the_record_is_honoured(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        import base64, io, zipfile as _zip
+        import json as _json
+        raw = _zip.ZipFile(io.BytesIO(base64.b64decode(fixture["artifact_zips"]["11"])))
+        record = _json.loads(raw.read(f"ci-reuse-{TREE}.json"))
+        record["jobs"]["matrix"]["run_id"] = 999
+        buffer = io.BytesIO()
+        with _zip.ZipFile(buffer, "w", _zip.ZIP_DEFLATED) as archive:
+            archive.writestr(f"ci-reuse-{TREE}.json", _json.dumps(record))
+        fixture["artifact_zips"]["11"] = base64.b64encode(buffer.getvalue()).decode()
+        fixture["runs_by_id"]["999"] = run_doc(sha=SHA, event="pull_request", branch="zajca/feature", run_id=999, repo=REPO, head_repo=REPO)
+        fixture["artifacts"]["999"] = [f"tested-tree-{TREE}"]
+        fixture["jobs_by_run"]["999"] = jobs_page(overrides={REUSE_JOB: "failure"})
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_two_source_runs_with_a_required_job_in_each(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        import base64, io, zipfile as _zip
+        import json as _json
+        raw = _zip.ZipFile(io.BytesIO(base64.b64decode(fixture["artifact_zips"]["11"])))
+        record = _json.loads(raw.read(f"ci-reuse-{TREE}.json"))
+        record["jobs"]["extra"] = {"run_id": 888, "names": ["extra check (linux)"], "source_job_ids": [], "completed_at": []}
+        buffer = io.BytesIO()
+        with _zip.ZipFile(buffer, "w", _zip.ZIP_DEFLATED) as archive:
+            archive.writestr(f"ci-reuse-{TREE}.json", _json.dumps(record))
+        fixture["artifact_zips"]["11"] = base64.b64encode(buffer.getvalue()).decode()
+        fixture["runs_by_id"]["888"] = run_doc(sha=SHA, event="pull_request", branch="zajca/feature", run_id=888, repo=REPO, head_repo=REPO)
+        fixture["artifacts"]["888"] = [f"tested-tree-{TREE}"]
+        fixture["jobs_by_run"]["888"] = {"jobs": [{"name": "extra check (linux)", "conclusion": "success", "completed_at": "2026-11-12T11:00:00Z"}]}
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_source_leg_age_is_one_sided(self):
+        union_fixture(self, jobs_by_run={
+            "456": jobs_page(overrides={REUSE_JOB: "skipped"}),
+            str(REUSE_SOURCE_ID): jobs_page(completed_at="2026-11-12T18:00:00Z"),
+        })
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_reuse_union_on_the_tree_path_is_refused_for_a_third_commit(self):
         # A source run on neither the candidate nor the dispatch commit is

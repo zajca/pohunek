@@ -1293,9 +1293,11 @@ class SameOsDuplicateTests(unittest.TestCase):
         # producer: the check still reads every artifact its jobs upload.
         self.assertEqual(needs - {"reuse"}, set(uploads))
         self.assertIn("reuse", needs, "the duplicate check waits for the reuse decision")
-        pattern = re.search(r"(?m)^          pattern: '\{([^}']+)\}'$", check)
-        self.assertIsNotNone(pattern, check)
-        globs = pattern.group(1).split(",")
+        # The inline age-ordered downloader names the JUnit prefixes,
+        # not the `pattern:` of the action.
+        for prefix in ("nextest-junit-", "package-junit-", "macos-lane-junit", "macos-tier-junit", "hermes-macos-junit"):
+            self.assertIn(prefix, check, prefix)
+        globs = [p + "*" if not p.endswith("junit") else p for p in ("nextest-junit-", "package-junit-", "macos-lane-junit", "macos-tier-junit", "hermes-macos-junit")]
         for artifact in artifacts:
             with self.subTest(artifact=artifact):
                 self.assertTrue(any(fnmatch.fnmatchcase(artifact, glob) for glob in globs))
@@ -3106,7 +3108,7 @@ def reuse_config() -> dict:
 
 
 def changes_of(event: str) -> dict[str, str]:
-    """Placeholder change outputs for the two reused path shapes."""
+    """Placeholder change outputs for the three reused path shapes."""
     base = {name: "false" for name in (
         "feature_matrix", "macos", "macos_package", "sdk_macos", "hermes_macos",
         "docs_ts", "release", "release_rehearsal", "release_gate", "upgrade")}
@@ -3246,7 +3248,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         Each token-reading line of the pinned body outside the
         positional job `if:` and the exact `save-if:`/`shard:` texts
         must appear in the checked-in evaluation table with the
-        expected value on both paths; a line with no entry fails.
+        expected value on all three paths; a line with no entry fails.
         `failure()` evaluates as false (a reused leg was green). The
         job-level `if:` is the first `if:` line of its own job body,
         never matched by text.
@@ -3325,7 +3327,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 )
         # 3. Evaluation table: each pinned token line (except the
         # positional job `if:` and the two exact exempt texts) has an
-        # entry with its expected value on both paths, evaluated here.
+        # entry with its expected value on all three paths, evaluated here.
         job_if_index = None
         for index, raw in enumerate(body.splitlines()):
             if re.match(r"^    if:", raw):
@@ -3342,6 +3344,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         evaluator = {
             ("pull_request", ""): pr_changes,
             ("workflow_dispatch", "main"): dispatch_changes,
+            ("push", ""): dict(changes_of("push")),
         }
         for index, raw in enumerate(body.splitlines()):
             stripped = raw.strip()
@@ -3366,8 +3369,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 f"job {job_id!r} line {stripped!r} does not table the legs "
                 f"{legs} of the job",
             )
-            # A line reused on the dispatch path must read the same as on
-            # the pull request: a reused leg ran the pinned body, so a
+            # A line reused on the dispatch or push path must read the same
+            # as on the pull request: a reused leg ran the pinned body, so a
             # line that differs between the paths decides work.
             for leg in legs:
                 pair = entry["legs"][leg]
@@ -3375,6 +3378,12 @@ class DeltaReuseWiringTests(unittest.TestCase):
                     pair["pull_request"], pair["workflow_dispatch"],
                     f"line {stripped!r} of job {job_id!r} differs between "
                     "the pull request and the dispatch; the job must leave "
+                    "the allowlist",
+                )
+                self.assertEqual(
+                    pair["pull_request"], pair["push"],
+                    f"line {stripped!r} of job {job_id!r} differs between "
+                    "the pull request and the push; the job must leave "
                     "the allowlist",
                 )
             expression = stripped.split(":", 1)[1].strip()
@@ -3580,9 +3589,47 @@ class DeltaReuseWiringTests(unittest.TestCase):
         entry = {
             "text": "if: matrix.shard == 'core' && github.event_name != 'pull_request'",
             "legs": {
-                "core": {"pull_request": "false", "workflow_dispatch": "true"},
-                "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
-                "cli": {"pull_request": "false", "workflow_dispatch": "false"},
+                "core": {"pull_request": "false", "workflow_dispatch": "true", "push": "true"},
+                "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+                "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+            },
+        }
+        try:
+            reuse_pins.PINNED_BODY_HASHES["fast-tests"] = reuse_pins.pinned_hash(edited_body)
+            reuse_pins.EVALUATION_TABLE.append(entry)
+            with self.assertRaisesRegex(AssertionError, "differs between"):
+                self.check_reused_paths_identical(
+                    config, job_id="fast-tests", body=edited_body,
+                    legs=list(partitions_module().FAST_SHARDS),
+                )
+        finally:
+            if original_hash is None:
+                reuse_pins.PINNED_BODY_HASHES.pop("fast-tests", None)
+            else:
+                reuse_pins.PINNED_BODY_HASHES["fast-tests"] = original_hash
+            reuse_pins.EVALUATION_TABLE[:] = original_table
+
+    def test_the_paths_guard_catches_a_push_only_difference(self):
+        # A line identical on pull request and dispatch but different on
+        # push must fail too: the push path reads the same pinned body.
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
+        config = reuse_config()
+        edited = ci_text.replace(
+            "      - name: Download test archive\n",
+            "      - name: Download test archive\n"
+            "        if: matrix.shard == 'core' && github.event_name == 'push'\n",
+            1,
+        )
+        self.assertNotEqual(edited, ci_text)
+        edited_body = workflow_jobs(edited)["fast-tests"]
+        original_hash = reuse_pins.PINNED_BODY_HASHES.get("fast-tests")
+        original_table = list(reuse_pins.EVALUATION_TABLE)
+        entry = {
+            "text": "if: matrix.shard == 'core' && github.event_name == 'push'",
+            "legs": {
+                "core": {"pull_request": "false", "workflow_dispatch": "false", "push": "true"},
+                "daemon": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
+                "cli": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"},
             },
         }
         try:
@@ -3608,7 +3655,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         try:
             reuse_pins.EVALUATION_TABLE.append({
                 "text": "if: ${{ github.event_name == 'never' }}",
-                "legs": {"": {"pull_request": "false", "workflow_dispatch": "false"}},
+                "legs": {"": {"pull_request": "false", "workflow_dispatch": "false", "push": "false"}},
             })
             with self.assertRaisesRegex(AssertionError, "held by no pinned body"):
                 self.assert_no_stale_table_entries(config, jobs)
@@ -3746,26 +3793,16 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertTrue(value, "a failed reuse job must fail the verdict")
 
     def test_the_duplicates_step_counts_both_runs_reports(self):
-        # The mixed directory counts each report once because the
-        # source-run download runs first (into the same directory WITHOUT
-        # merge-multiple, so same-name reports overwrite) and this run's
-        # download runs after it. The source download must be gated on the
-        # recorded source run.
+        # The inline step downloads every source run in sorted age order
+        # then this run's own, so same-name reports overwrite with the
+        # newest. The primary source download must precede the own one.
         body = workflow_jobs()["test-duplicates"]
-        self.assertIn('${{ needs.reuse.outputs.source_run != \'\' }}', body)
-        self.assertIn("download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", body)
-        self.assertIn("run-id: ${{ needs.reuse.outputs.source_run }}", body)
+        self.assertIn("needs.reuse.outputs.source_runs", body)
         self.assertIn('python3 scripts/test-duplicates "$RUNNER_TEMP/junit"', body)
-        self.assertIn("Download the reused jobs' JUnit reports from any other source run", body)
-        self.assertIn("SOURCE_RUNS: ${{ needs.reuse.outputs.source_runs }}", body)
-        source_download = body.index("Download the reused jobs' JUnit reports")
-        own_download = body.index("Download the run's JUnit reports")
-        self.assertLess(
-            source_download, own_download,
-            "the source-run download must precede this run's download",
-        )
-        self.assertNotIn("merge-multiple", body,
-                          "neither download merges: overwrite dedups by name")
+        self.assertIn("Download the reused and own JUnit reports in age order", body)
+        self.assertIn("sorted", body, "source runs are downloaded in sorted age order")
+        self.assertIn("SOURCE_RUNS:", body)
+        self.assertNotIn("merge-multiple", body)
 
     def test_the_reuse_job_runs_only_on_a_delta_dispatch(self):
         job = workflow_jobs()[REUSE_JOB]
@@ -3833,6 +3870,24 @@ class DeltaReuseWiringTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn('CI_REUSE_PUSH: "true"', text)
         self.assertIn("issue #2204", text)
+
+    def test_k1_kill_switch_step_never_fails_the_reuse_job(self):
+        # H2 guard: `steps.nopus.outputs.skip` must be non-empty even
+        # when the switch is off, so the dead `skip || ... || '[]'`
+        # expression never collapses to empty for downstream jobs.
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("steps.nopus.outputs.skip", text)
+        self.assertRegex(text, r"steps\.nopus\.outputs\.skip[^\n]*\|\| '\\[\\]'|steps\.decide\.outputs\.skip")
+
+    def test_k3_upload_step_shares_the_decide_gate(self):
+        # H2 guard: the upload step must not read `steps.decide.outputs.tree`
+        # unconditionally; it must be gated exactly like the decide step so
+        # a kill-switch run uploads nothing and does not fail.
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        decide_gate = "github.event_name != 'push' || env.CI_REUSE_PUSH == 'true'"
+        self.assertIn(decide_gate, text)
+        upload_block = text.split("Upload the reuse record", 1)[1].split("- name:", 1)[0]
+        self.assertIn(decide_gate, upload_block, "upload must share the decide gate")
 
     def test_every_reusable_job_needs_reuse_and_names_itself_in_skip(self):
         jobs = workflow_jobs()
@@ -4405,10 +4460,8 @@ class SelectionAuditTests(unittest.TestCase):
         self.assertIn("          name: test-selection-audit\n", job)
         check = workflow_jobs()["test-duplicates"]
         self.assertNotIn(AUDIT_JOB, job_needs(check))
-        pattern = re.search(r"(?m)^          pattern: '\{([^}']+)\}'$", check)
-        self.assertIsNotNone(pattern)
-        self.assertFalse(any(fnmatch.fnmatchcase("test-selection-audit", glob)
-                             for glob in pattern.group(1).split(",")))
+        self.assertNotIn("test-selection-audit", check)
+        self.assertFalse(any(fnmatch.fnmatchcase("test-selection-audit", glob) for glob in ("nextest-junit-*", "package-junit-*")))
 
     def runs(self, *, event, tier="", cancelled=False, build="success"):
         return bool(evaluate_needs_expression(
