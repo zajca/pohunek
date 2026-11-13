@@ -3087,8 +3087,8 @@ class TestSelectionWiringTests(unittest.TestCase):
                 )), runs)
 
 
-# The delta reuse wiring (issue #2203): a tier=main dispatch with delta=true
-# reuses the green jobs of the newest same-tree pull request run. The guards
+# The reuse wiring: a tier=main dispatch with delta=true or a push reuses
+# the green jobs of the newest same-tree runs. The guards
 # below keep the allowlist, its consumers, and the skip clauses in lockstep.
 REUSE_JOB = "reuse"
 # Aggregators combine other jobs' results and never run as reused legs: the
@@ -3889,17 +3889,17 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertIn('CI_REUSE_PUSH: "true"', text)
         self.assertIn("issue #2204", text)
 
-    def test_k1_kill_switch_step_never_fails_the_reuse_job(self):
-        # H2 guard: `steps.nopus.outputs.skip` must be non-empty even
-        # when the switch is off, so the dead `skip || ... || '[]'`
-        # expression never collapses to empty for downstream jobs.
+    def test_the_kill_switch_step_always_emits_a_skip_list(self):
+        # `steps.nopus.outputs.skip` must be non-empty even
+        # when the switch is off, so downstream jobs reading the fallback chain
+        # always see a list.
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("steps.nopus.outputs.skip", text)
         self.assertRegex(text, r"steps\.nopus\.outputs\.skip[^\n]*\|\| '\\[\\]'|steps\.decide\.outputs\.skip")
 
-    def test_k3_upload_step_shares_the_decide_gate(self):
-        # H2 guard: the upload step must not read `steps.decide.outputs.tree`
-        # unconditionally; it must be gated exactly like the decide step so
+    def test_the_upload_step_shares_the_decide_gate(self):
+        # The upload step must not read `steps.decide.outputs.tree`
+        # unconditionally; it is gated exactly like the decide step so
         # a kill-switch run uploads nothing and does not fail.
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         decide_gate = "github.event_name != 'push' || env.CI_REUSE_PUSH == 'true'"
@@ -3908,7 +3908,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertIn(decide_gate, upload_block, "upload must share the decide gate")
 
     def test_the_kill_switch_off_runs_nothing_and_skips_nothing(self):
-        # M9: with the switch off a push runs only the kill-switch step,
+        # With the switch off a push runs only the kill-switch step,
         # so `decide.outputs.skip` never wins and every job runs.
         job = workflow_jobs()[REUSE_JOB]
         steps = job_steps(job)
