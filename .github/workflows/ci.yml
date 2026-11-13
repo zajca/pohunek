@@ -416,7 +416,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # The macOS packages the PR lane does not test (issue #361): their macOS-only
   # test code runs here on main and nightly, never on a pull request.
@@ -569,7 +569,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Native Apple Silicon packaging (issue #104): the daemon archive is packaged
   # from the binaries of `macos-release-build`, and the nightly tier rebuilds
@@ -769,7 +769,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Lints the macOS-only code on a Linux runner in about two minutes cold
   # (issue #365), so a `cfg(target_os = "macos")` compile or lint error fails a
@@ -829,7 +829,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Selects the pull request's tests with the selector of its merge base
   # (scripts/ci-test-selection); every other event runs every test. A test
@@ -1072,7 +1072,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   fast-tests:
     name: tests (${{ matrix.shard }}, fast)
@@ -1186,7 +1186,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
     # Determine which CI jobs the changed files require. Heavy non-default jobs
   # (feature-powerset, macOS contracts, Hermes compatibility, and TS-binding
@@ -1485,7 +1485,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   integration:
     name: tests (heavy, PTY + Hermes)
@@ -1604,7 +1604,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Issue #100: the ignored real-systemd suites drive the runner's own systemd
   # user manager (transient worker units, the namespaced daemon unit, the
@@ -1913,7 +1913,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # A skipped test job counts as passed, so this job fails a run where a test
   # job failed, was cancelled, or was skipped without a narrowed selection of
@@ -2014,7 +2014,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Full release build: schedule, push to main, manual dispatch, or a pull
   # request that changes a `release` filter input.
@@ -2767,6 +2767,15 @@ jobs:
           if [ "$(jq -r '.verdict' "$RUNNER_TEMP/package-bump.json")" = undecided ]; then
             echo "::warning::the catalog of release v$VERSION is absent; the version bump gate is undecided"
           fi
+      - name: Cancel the run (fail fast)
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./.github/actions/cancel-run
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Official Pi runtime package against the real, locked Pi release. The job
   # installs the npm tree pinned by `compat/pi/npm/package-lock.json`,
@@ -2777,15 +2786,6 @@ jobs:
   # test binary keep the descriptor, the supported range and the lock in sync;
   # this job proves the locked release still behaves as they say.
 
-      - name: Cancel the run (fail fast)
-        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
-        uses: ./.github/actions/cancel-run
-      - name: Note the infrastructure failure (no cancel)
-        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
   pi-package:
     name: Pi runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
@@ -3584,7 +3584,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Each test runs at most once per OS in a run (#1226): this job reads every
   # JUnit report of the run and fails on a test two jobs of the same OS ran,
@@ -3725,7 +3725,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Skipped on the docs-only path of a pull request (#1218): a narrowed
   # selection whose every changed file has no Rust tests and no gate but
@@ -3854,7 +3854,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # The SDK workspace on Apple Silicon (issue #103): typecheck, lint, unit
   # tests, and the SDK e2e suite against the real macOS pohunekd,
@@ -4008,7 +4008,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   feature-matrix:
     name: cargo-hack (feature powerset)
@@ -4147,4 +4147,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "::notice title=Infrastructure failure::tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
