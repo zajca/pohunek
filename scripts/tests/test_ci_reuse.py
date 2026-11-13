@@ -994,6 +994,32 @@ else:
         since = (NOW - datetime.timedelta(hours=24)).date().isoformat()
         self.assertIn(f"created=>={since}", query.replace(" ", ""))
 
+    def test_a_full_first_run_stops_before_the_second_listing(self):
+        # The candidate loop stops when every allowlisted job has its
+        # newest leg: with one full same-tree run first, the older run's
+        # artifacts are never listed.
+        self.write_fixture(
+            runs=[run_doc(run_id=888, event="push"), run_doc(run_id=777)],
+            jobs_by_run={"888": green_jobs(), "777": green_jobs()},
+            artifacts={"888": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ], "777": [
+                {"name": f"tested-tree-{TREE}", "id": 3},
+                {"name": "test-selection", "id": 4},
+            ]},
+            artifact_zips={"2": selection_zip("full"), "4": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertIn("test", json.loads(self.outputs()["skip"]))
+        artifact_lists = [
+            " ".join(json.loads(line)) for line in self.calls.read_text().splitlines()
+            if "/artifacts" in " ".join(json.loads(line))
+        ]
+        self.assertTrue(any("runs/888/artifacts" in call for call in artifact_lists))
+        self.assertFalse(any("runs/777/artifacts" in call for call in artifact_lists))
+
     def test_dry_run_reports_the_decision_without_writing_outputs(self):
         # `--dry-run` prints the decision but writes neither the record nor
         # the step outputs: a planning probe must not publish reuse.

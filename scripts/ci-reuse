@@ -181,15 +181,17 @@ def _run_age(run: dict, completed_at, now: datetime.datetime) -> str:
 
 
 def list_runs(repo: str, workflow_file: str,
-                now: datetime.datetime | None = None) -> list[dict]:
+                now: datetime.datetime | None = None,
+                max_age: datetime.timedelta = datetime.timedelta(hours=24)) -> list[dict]:
     """Recent runs of ci.yml of this repository, any head, in API order.
 
-    Bounded query: `created>=now-24h` in the API filter, newest first — no
-    unbounded listing. A push run's merge commit differs from the PR head
-    that tested the same tree, so the candidate set is the recent runs of
-    the workflow and tree identity (not `head_sha`) filters them (issue
-    #2204); the caller filters by consumer event and tree."""
-    since = (now or datetime.datetime.now(datetime.timezone.utc)) - datetime.timedelta(hours=24)
+    Bounded query: the `created>=` filter starts at `now - max_age`,
+    newest first — no unbounded listing. A push run's merge commit differs
+    from the PR head that tested the same tree, so the candidate set is
+    the recent runs of the workflow and tree identity (not `head_sha`)
+    filters them (issue #2204); the caller filters by consumer event and
+    tree."""
+    since = (now or datetime.datetime.now(datetime.timezone.utc)) - max_age
     pages = read_json([
         "api", "--method", "GET", "--paginate", "--slurp",
         f"repos/{repo}/actions/workflows/{workflow_file}/runs",
@@ -359,6 +361,8 @@ def decide(
     selected: dict[str, dict] = {}
     narrowed_by_run: dict[int, bool | None] = {}
     for run in candidates:
+        if len(selected) == len(config["jobs"]):
+            break  # every allowlisted job already has its newest leg
         try:
             names = artifact_names(repo, run["id"])
         except ReuseError as error:
@@ -507,10 +511,11 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
         return 1
     workflow_file = os.environ["WORKFLOW_FILE"]
     moment = now or datetime.datetime.now(datetime.timezone.utc)
+    max_age = datetime.timedelta(hours=config["max_age_hours"])
     reason = ""
     listed = True
     try:
-        runs = list_runs(repo, workflow_file, moment)
+        runs = list_runs(repo, workflow_file, moment, max_age)
     except ReuseError as error:
         warn(f"cannot list candidate runs: {error}; running everything")
         runs = []
