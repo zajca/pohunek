@@ -200,10 +200,9 @@ and an ambiguous source runs everything. A full
 dispatch (`delta: false`) stays the default, and `scripts/release` keeps
 dispatching full runs. A job that `needs:` a reusable
 job but that can never run on a tier=main dispatch is not a reuse consumer:
-such jobs are listed in the config's `not_dispatch_consumers` with the reason,
-such a job's own `if:` restricts it to events that cannot run the
-dispatch.
-`pairs` names a job pair that is reused only together, in either direction (see
+such jobs are listed in `not_dispatch_consumers` with the reason; each such job's own `if:` restricts it to events that cannot run the dispatch.
+`pairs` names a job pair that is reused only together, in either direction:
+platform-contracts and hermes-compatibility-macos (see
 `scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
 run and the recorded source run as evidence for the commit, and names both
 runs in its report. For the dynamic-matrix `fast-tests` job the allowlist names

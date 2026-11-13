@@ -463,11 +463,17 @@ elif "/artifacts" in endpoint:
 else:
     raise SystemExit("unexpected " + repr(endpoint))
 ''')
+        gh.chmod(0o755)
         self.write_fixture(runs=[run_doc()], jobs_by_run={"777": green_jobs()}, artifacts={})
-        rc = self.run_script_with_tree(TREE)
+        import contextlib, io
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = self.run_script_with_tree(TREE)
+        out = buffer.getvalue()
         self.assertEqual(rc, 0)
         self.assertEqual(self.outputs()["skip"], "[]")
         self.assertEqual(self.outputs()["source_run"], "")
+        self.assertIn("cannot list artifacts of run 777", out)
 
     def test_a_job_list_error_gives_an_empty_skip_with_exit_zero(self):
         # Row 11: a job-list error after good runs and artifacts gives
@@ -488,42 +494,67 @@ elif "/jobs" in endpoint:
 else:
     raise SystemExit("unexpected " + repr(endpoint))
 ''')
-        fixture = {"runs": [run_doc()], "jobs_by_run": {}, "artifacts": {},
-                   "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False}]}}
+        gh.chmod(0o755)
+        # The artifact list is good, so decide() reaches the job list and
+        # the error there is the branch under test (not an early stop).
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+        )
+        fixture = json.loads(self.fixture.read_text())
+        fixture["artifacts_by_run"] = fixture["artifacts"]
         self.fixture.write_text(json.dumps(fixture))
-        rc = self.run_script_with_tree(TREE)
+        import contextlib, io
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = self.run_script_with_tree(TREE)
+        out = buffer.getvalue()
         self.assertEqual(rc, 0)
         self.assertEqual(self.outputs()["skip"], "[]")
         self.assertEqual(self.outputs()["source_run"], "")
+        self.assertIn("cannot list jobs of run 777", out)
 
     def test_a_selection_download_timeout_gives_an_empty_skip_with_exit_zero(self):
         # Row 11: the `test-selection` zip download hangs (TimeoutExpired):
         # `download_artifact` must catch it and fail open, not crash the
         # reuse job with a traceback.
-        gh = self.bin_dir / "gh"
-        gh.write_text(r'''#!/usr/bin/env python3
-import json, os, sys
-fixture = json.loads(open(os.environ["GH_FIXTURE"]).read())
-args = sys.argv[1:]
-endpoint = next((a for a in args[1:] if a.startswith("repos/")), "")
-if "/actions/workflows/" in endpoint and "/runs" in endpoint:
-    print(json.dumps([{"workflow_runs": fixture.get("runs", [])}]))
-elif endpoint.endswith("/artifacts"):
-    print(json.dumps([{"artifacts": fixture.get("artifacts_by_run", {}).get("777", [])}]))
-elif "/jobs" in endpoint:
-    print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get("777", [])}]))
-elif "/zip" in endpoint:
-    raise SystemExit(1)
-else:
-    raise SystemExit("unexpected " + repr(endpoint))
-''')
-        fixture = {"runs": [run_doc()], "jobs_by_run": {"777": green_jobs()}, "artifacts": {},
-                   "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False},
-                                              {"name": "test-selection", "id": 2, "expired": False}]}}
-        self.fixture.write_text(json.dumps(fixture))
-        rc = self.run_script_with_tree(TREE)
+        import subprocess as subprocess_module
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        original_run = subprocess_module.run
+
+        def fake_run(*args, **kwargs):
+            command = args[0] if args else kwargs.get("args", [])
+            command_text = " ".join(str(part) for part in (command or []))
+            if "/zip" in command_text:
+                raise subprocess_module.TimeoutExpired(command, timeout=120)
+            return original_run(*args, **kwargs)
+
+        subprocess_module.run = fake_run
+        import contextlib, io
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                rc = self.run_script_with_tree(TREE)
+        finally:
+            subprocess_module.run = original_run
+        out = buffer.getvalue()
         self.assertEqual(rc, 0)
         self.assertEqual(self.outputs()["skip"], "[]")
+        # The download was reached (the artifact list is good), the
+        # failure is the selection-read branch and not an early stop.
+        self.assertIn("cannot read the selection of run 777", out)
 
     def test_a_real_download_timeout_gives_an_empty_skip_with_exit_zero(self):
         # Row 11: the artifact list is good but the `test-selection` zip
@@ -535,7 +566,6 @@ else:
                    "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False},
                                               {"name": "test-selection", "id": 2, "expired": False}]}}
         self.fixture.write_text(json.dumps(fixture))
-        fixture_text = self.fixture.read_text()
 
         original_run = subprocess_module.run
 
@@ -564,7 +594,7 @@ else:
 
 
     def test_a_paired_lane_is_dropped_without_its_hermes_partner(self):
-        # M3: the macOS lane preempts the Hermes tests unless the Hermes job
+        # the macOS lane preempts the Hermes tests unless the Hermes job
         # ran in the source. When the source did not run hermes-compatibility-macos
         # (hermes_macos false on the PR), reusing the lane on the dispatch
         # would run the Hermes tests in the lane while test-duplicates sees
@@ -591,7 +621,7 @@ else:
         # Reverse pairs direction: a narrowed source never reuses the
         # lane, so a green Hermes job in that source leaves `skip`
         # too (its consumer `macos-release-build` then runs).
-        jobs = [current for current in green_jobs() if current["name"] != "Platform contracts"]
+        jobs = [current for current in green_jobs() if current["name"] != "platform contracts (arm64)"]
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": jobs},

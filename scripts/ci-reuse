@@ -353,12 +353,11 @@ def decide(
             for name in job["names"]:
                 attempts = by_name.get(name, [])
                 if not attempts:
-                    legs = []
                     missing = True
                     break
                 newest = max(attempts, key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)))
                 legs.append(newest)
-            if missing or len(legs) != len(job["names"]):
+            if missing:
                 reasons[job_id] = "no green leg in the source run"
                 continue
             if any(leg.get("conclusion") != "success" for leg in legs):
@@ -372,7 +371,9 @@ def decide(
                 if narrowed is None:
                     narrowed = source_selection_narrowed(repo, run["id"])
                     if narrowed is None:
-                        return [], None, f"cannot read the selection of run {run['id']}", {}
+                        return [], None, f"cannot read the selection of run {run['id']}", {
+                            job_id: "cannot read the source selection",
+                        } | reasons
                 if narrowed:
                     reasons[job_id] = "the source selection was narrowed"
                     continue
@@ -401,11 +402,11 @@ def decide(
                 if any(consumer not in skip_set for consumer in consumers):
                     skip_set.discard(job_id)
                     outside = [consumer for consumer in consumers if consumer not in skip_set]
-                    closure_reasons.setdefault(job_id, f"consumer {outside[0] if outside else 'unknown'} is not reused")
+                    closure_reasons.setdefault(job_id, f"consumer {outside[0]} is not reused")
                     changed = True
         ordered = [job_id for job_id in config["jobs"] if job_id in skip_set]
         if not ordered:
-            return [], None, "no same-tree green pull request run", reasons
+            return [], None, "no same-tree green pull request run", reasons | closure_reasons
         return (ordered, run, "", reasons | closure_reasons)
     return [], None, "no same-tree pull request run", {}
 
@@ -492,7 +493,9 @@ def main(now: datetime.datetime | None = None) -> int:
         try:
             jobs = run_jobs(repo, source["id"])
         except ReuseError as error:
-            warn(f"cannot list jobs of run {source['id']}: {error}; running everything")
+            message = f"cannot list jobs of run {source['id']}: {error}"
+            warn(message + "; running everything")
+            reason = message
             skip, source = [], None
             record = {**record, "source_run_id": None, "source_url": None, "source_event": None, "source_head_sha": None}
         else:

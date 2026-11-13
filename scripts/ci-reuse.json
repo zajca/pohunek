@@ -5,8 +5,8 @@
     "pull_request"
   ],
   "not_dispatch_consumers": {
-    "test-selection-check": "pull_request-only: its job-level if: requires github.event_name == 'pull_request' (the workflow itself restricts it; the string here is not only a note)",
-    "test-selection-audit": "nightly-only: its job-level if: requires schedule or (workflow_dispatch with tier == 'nightly') (the workflow itself restricts it; the string here is not only a note)"
+    "test-selection-check": "pull_request-only: its job-level if: requires github.event_name == 'pull_request' (the workflow itself restricts it; the guard derives the restriction from the workflow)",
+    "test-selection-audit": "nightly-only: its job-level if: requires schedule or (workflow_dispatch with tier == 'nightly') (the workflow itself restricts it; the guard derives the restriction from the workflow)"
   },
   "pairs": {
     "platform-contracts": "hermes-compatibility-macos"
