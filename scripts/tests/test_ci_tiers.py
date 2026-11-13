@@ -3010,6 +3010,8 @@ def ci_rules_paths() -> list[str]:
 
 
 class TestSelectionWiringTests(unittest.TestCase):
+    """The selection plan and the jobs the selection starts."""
+
     def test_the_heavy_parts_are_the_numbered_legs_of_the_heavy_env_count(self):
         # Issue #774: the integration matrix runs one leg per heavy part,
         # numbered 1..N where N is the job's HEAVY_PARTS env value, and the
@@ -3800,8 +3802,12 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertNotEqual(edited_other, ci_text)
         for other_id in config["jobs"]:
             other_body = jobs_from(edited_other)[other_id]
-            has_matrix = re.search(r"(?m)^        (?:shard|part): ", other_body) is not None
-            legs = partitions_module().FAST_SHARDS if has_matrix else [""]
+            shard_matrix = re.search(r"(?m)^        shard: ", other_body) is not None
+            part_matrix = re.search(r"(?m)^        part: \[(.+)\]$", other_body)
+            if part_matrix is not None:
+                legs = [piece.strip() for piece in part_matrix.group(1).split(",")]
+            else:
+                legs = list(partitions_module().FAST_SHARDS) if shard_matrix else [""]
             self.check_reused_paths_identical(
                 config, job_id=other_id, body=other_body, legs=list(legs),
             )

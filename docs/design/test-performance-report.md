@@ -53,7 +53,7 @@ Jobs only in the current matrix (fast shards + release build; 13/13 runs each):
 | Job | p50 |
 | --- | --- |
 | doctests + release build | 5m27s |
-| tests (heavy 1/3, PTY + Hermes) | 5m29s |
+| tests (heavy, PTY + Hermes) | 5m29s |
 | tests (relay DB, PostgreSQL) | 5m22s |
 | tests (daemon, fast) | 4m19s |
 | tests (relay, fast) | 4m26s |
@@ -103,10 +103,6 @@ scripts/ci-timings junit --label "tests (unit, fast)" --run 35534741514 \
 | tests (relay, fast) | 126 | 0 | 46s | 4m24s | 4m58s |
 | tests (relay DB, PostgreSQL) | 133 | 0 | 4m05s | 5m33s | 6m28s |
 | tests (heavy, PTY + Hermes) | 685 | 0 | 4m02s | 1m14s | 5m56s |
-
-The row predates the heavy split (#774): each of the three parts now runs
-about a third of those 685 cases under its own JUnit artifact
-(`nextest-junit-heavy-1/-2/-3`).
 
 **Σ test time is not a share of the job wall.** nextest runs test cases in
 parallel, so the sum of testcase times is neither a wall-clock quantity nor

@@ -800,8 +800,8 @@ assembles and publishes the release in one fixed flow.
 The `gate` job calls the reusable workflow `.github/workflows/gate-tests.yml`
 and tests the way CI does: it builds the `cargo nextest archive
 --profile ci --workspace --all-features` archive, proves the shards of
-`scripts/test-partitions` exhaustive and disjoint, runs every shard (each
-heavy part under its bounded profile), and runs the doctests with `cargo test --doc --workspace
+`scripts/test-partitions` exhaustive and disjoint, runs every shard (`heavy`
+under its bounded profile), and runs the doctests with `cargo test --doc --workspace
 --all-features`, because nextest runs none. Every shard runs before the step
 fails, so one red shard does not hide another. The same workflow runs in CI as
 the job `release gate (full test set)`: in the nightly tier (schedule or a

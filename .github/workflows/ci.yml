@@ -1167,8 +1167,7 @@ jobs:
       - name: Install Rust toolchain
         uses: ./relocated/.github/actions/setup-rust
 
-      # The script regressions left the `core` shard for their own job
-      # (`script-tests`, #2208): the shard runs Rust tests only now.
+      # `script-tests` runs `scripts/tests`; the `core` shard holds Rust tests only.
 
       # Every workflow installs Rust from rust-toolchain.toml or a dated nightly.
       - name: Check the Rust toolchain pin
@@ -1590,10 +1589,10 @@ jobs:
           set -euo pipefail
           echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
-  # Issue #2208: the script regressions have their own job since leaving the
-  # `core` fast shard. The job runs the same `unittest discover` the core
-  # shard used to carry, on every run except a narrowed selection whose
-  # `script_tests` output is false. Cancels the run on a deterministic
+  # Issue #2208: the script regressions have their own job. The job runs
+  # the same `unittest discover` the `core` fast shard used to carry, on
+  # every run except a narrowed selection whose `script_tests` output is
+  # false. Cancels the run on a deterministic
   # failure like every other verdict-needs job; its checkout is the only
   # network step, so its infra id is `infra-1`.
   script-tests:
@@ -1704,11 +1703,9 @@ jobs:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
 
-      # The daemon socket tests spawn the real durable worker by path
-      # (`target/debug/pohunek-sessiond`); it comes out of the archive, which
-      # cannot be built without it. Part 1 proves the partition in its own
-      # run step (`--check`); parts 2 and 3 run their tests alone, so no
-      # step checks here.
+      # The heavy parts run the extracted archive's test binaries; the
+      # part-1 run step also proves the partition (`--check`) before it
+      # runs. Parts 2 and 3 run their tests alone.
 
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'

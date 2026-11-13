@@ -218,11 +218,18 @@ class RepositoryRuntimePackageTests(DuplicateScenario):
     def test_the_repository_config_admits_every_runtime_package_overlap(self):
         pairs = self.module_pairs()
         self.assertEqual(sorted(pair[3] for pair in pairs),
-                         ["claude_package", "codex_package", "hermes_package", "pi_package"])
+                         ["claude_package", "codex_package",
+                          "hermes_package", "hermes_package", "hermes_package",
+                          "pi_package"])
         shard_cases, package_cases = {}, {}
         for entry, shard, package, module in pairs:
             # The shard skipped the ignored real-runtime test; the package job ran it.
+            # The heavy module's overlap lands in exactly one part: the
+            # hash partition spreads its tests, so each part gets a
+            # distinct case and no test is shared across parts.
             overlap = f"{module}::{self.MODULE_CASES[module]}"
+            if shard.startswith("nextest-junit-heavy-"):
+                overlap = f"{overlap}_{shard.rsplit('-', 1)[1]}"
             ignored = f"{module}::{self.IGNORED_CASES[module]}"
             shard_cases.setdefault(shard, []).append((self.BINARY, overlap, 1.0))
             shard_cases[shard].append((self.BINARY, ignored, 0.0, True))
@@ -243,6 +250,21 @@ class RepositoryRuntimePackageTests(DuplicateScenario):
                 self.assertTrue(row["allowed"])
                 self.assertEqual(row["reason"], reasons[frozenset(row["sources"])])
         self.assertEqual(payload["unused_allowed"], [])
+
+    def test_a_hermes_overlap_in_part_two_stays_allowed(self):
+        # The hash partition spreads `hermes_package::` tests over all
+        # three heavy parts, so the package overlap must be allowed for
+        # each part, not just part 1.
+        name = f"hermes_package::{self.MODULE_CASES['hermes_package']}"
+        self.artifact("nextest-junit-heavy-2", [(self.BINARY, name, 2.0)])
+        self.artifact("package-junit-hermes", [(self.BINARY, name, 4.0)])
+        result = self.run_check("--config", str(CONFIG), "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(len(payload["duplicates"]), 1)
+        self.assertTrue(payload["duplicates"][0]["allowed"])
+        self.assertEqual(payload["duplicates"][0]["sources"],
+                         ["nextest-junit-heavy-2", "package-junit-hermes"])
 
     def test_a_test_of_the_consolidated_binary_in_two_shards_stays_rejected(self):
         # No entry allows two shard sources: a heavy test leaked into the

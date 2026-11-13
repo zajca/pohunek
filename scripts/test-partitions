@@ -211,8 +211,8 @@ def shard_plan(selection):
     """The CI test jobs a selection runs: the fast shards and heavy.
 
     A fast shard runs when it owns a selected package. The script
-    regressions left the `core` shard for their own job (`script-tests`),
-    so `script_tests` no longer pulls `core` in: the new job follows
+    regressions run in their own job (`script-tests`), so `shard_plan`
+    ignores `script_tests`: the new job follows
     `selection["script_tests"]` itself. The heavy job runs whenever a
     package it holds tests of may be selected; which of its tests run is the
     selection's filterset.
@@ -860,16 +860,18 @@ def main():
         partition = part_partition(index, total)
         if args.check:
             # Part 1 checks first in this same process: the full partition
-            # exactly as `check` would, plus the proof that the N parts'
-            # listed heavy tests, unioned, equal the heavy list. The
-            # extracted archive is then reused for the part's own run, so
-            # the job extracts exactly once and a failed check fails before
-            # any test runs.
-            _, selections = verify_coverage(expressions, archive, selection, plan)
-            heavy_tests = selections["heavy"]
+            # on the whole discovered list (as `check` does without
+            # `--selection`), plus the proof that the N parts' listed
+            # heavy tests, unioned, equal the heavy list. The full check
+            # runs before the tree is narrowed, so a narrowed PR still
+            # proves every discovered test is assigned exactly once; the
+            # narrowed check afterwards is what part 1 actually runs.
+            # The extracted archive is then reused for the part's own run,
+            # so the job extracts exactly once and a failed check fails
+            # before any test runs.
+            _, full_selections = verify_coverage(expressions, archive, None, None)
+            heavy_tests = full_selections["heavy"]
             heavy_expression = expressions["heavy"]
-            if selection is not None:
-                heavy_expression = selected_expression(heavy_expression, selection)
             part_lists = [
                 inventory(heavy_expression, archive, partition=part_partition(n, total))
                 for n in range(1, total + 1)
@@ -880,6 +882,8 @@ def main():
                 print(f"error: {error}", file=sys.stderr)
                 sys.exit(1)
             print(f"heavy parts OK: {total} parts hold {len(heavy_tests)} tests exactly once")
+            if selection is not None:
+                verify_coverage(expressions, archive, selection, plan)
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
     # A shard may hold none of a narrowed selection's tests.

@@ -251,7 +251,7 @@ design; it changes the pipeline, so it runs every test, and the review of
 workflow changes protects it. A test job narrows or skips only on a narrowed
 selection, and the `test selection verdict` job fails a run whose test job or
 selection check failed, was cancelled, or was skipped without one. The script
-regressions run in the core shard unless a narrowed selection needs none.
+regressions run in the `script-tests` job unless a narrowed selection needs none.
 
 A narrowed selection whose every changed file has no Rust tests and no gate
 but `docs check` (`docs_only`, mode `none`; for example `docs/` outside the
@@ -501,7 +501,8 @@ The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI compiles the workspace test binaries
 once in `build-tests` (`cargo nextest archive --workspace --all-features`) and
 runs three fast matrix shards, three heavy matrix parts and the
-script-regressions job from that archive, independently of lint/release jobs. The cost boundary is
+script-regressions job from that archive (the script job needs no archive
+itself), independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
 all discovered tests, including ignored ones, are assigned exactly once.

@@ -905,6 +905,12 @@ class SelectionActionTests(ScriptScenario):
     """`run` and `check` with `--selection` narrow the shards to a selection."""
 
     FILTERSET = "package(=pohunek-daemon) | (package(=pohunek-knowledge) and (binary(=bundle)))"
+    PACKAGES = ("pohunek-daemon", "pohunek-knowledge")
+
+    def setUp(self):
+        super().setUp()
+        self.archive = self.root / "built-elsewhere.tar.zst"
+        self.archive.write_bytes(b"cargo nextest archive built at another path")
 
     def write_selection(self, mode, names=(), filterset=FILTERSET):
         path = self.root / "selection.json"
@@ -925,6 +931,33 @@ class SelectionActionTests(ScriptScenario):
             for name, test in entry["tests"].items():
                 test["selected"] = (entry["id"], name) in selected
         return binaries
+
+    def test_part_one_with_a_selection_still_checks_the_full_tree_first(self):
+        # The narrowed PR path: `--check --selection` proves the full
+        # partition first (as plain `check` does), then the narrowed check
+        # for what part 1 actually runs.
+        selection = self.write_selection("packages", self.PACKAGES)
+        self.set_inventory(self.selected_inventory({
+            ("pohunek-daemon-111111", "store::migrate"),
+            ("pohunek-daemon-111111", "reconcile::worker_leak"),
+            ("pohunek-knowledge-444444", "bundle::materialize"),
+        }))
+        result = self.run_script(
+            "run", "heavy", "--archive-file", str(self.archive),
+            "--part", "1/3", "--check", "--selection", selection,
+            extra_env={"PARTITIONS_FILTERSET": self.FILTERSET},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Both checks ran: the full-tree proof and the narrowed one.
+        self.assertEqual(result.stdout.count("Coverage OK:"), 2)
+        self.assertIn("heavy parts OK:", result.stdout)
+        calls = self.nextest_calls()
+        lists = [call for call in calls if call["argv"][1] == "list"]
+        runs = [call for call in calls if call["argv"][1] == "run"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["argv"][runs[0]["argv"].index("--partition") + 1], "hash:1/3")
+        extracts = [call for call in calls if "--extract-to" in call["argv"]]
+        self.assertEqual(len(extracts), 1, "the part-1 job extracts the archive exactly once")
 
     def test_a_shard_runs_only_the_selected_tests_and_passes_when_it_has_none(self):
         selection = self.write_selection("packages", ["pohunek-daemon", "pohunek-knowledge"])
