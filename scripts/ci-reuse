@@ -380,6 +380,12 @@ def decide(
         if run.get("event") in config["source_events"]
         and isinstance(run.get("id"), int)
         and source_is_eligible(run, repo, ".github/workflows/ci.yml", now, max_age)
+        # M2: a delta dispatch reuses the same commit; only push runs
+        # (and PR runs supplying them) may come from another commit.
+        and not (
+            run.get("event") == "workflow_dispatch"
+            and run.get("head_sha") != sha
+        )
     ]
     # Newest first.
     candidates.sort(

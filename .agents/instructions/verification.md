@@ -372,7 +372,13 @@ the commit decide, so a tree match never hides a failure there; pull-request, pu
 schedule runs never match by tree. The report names the run and whether it
 matched by `sha` or by `tree`; a delta dispatch (`delta: true`) additionally
 names the recorded source pull request run whose green jobs it reuses, and the
-union of both runs decides. The required jobs and steps come from
+union of both runs decides. A `main` push (`push` event) likewise reuses
+the newest green legs of the previous same-tree runs (PR, push, tier=main
+dispatch) within 24h while the workflow-level `CI_REUSE_PUSH` kill switch is
+`true`; `scripts/ci-reuse` decides per job and `scripts/ci-evidence` verifies
+the union by the recorded tested tree (`pull_request` sources match by their
+recorded tree, push sources by the merge tree); the kill switch is read only
+in a step, never in a `jobs.<id>.if` (`env` is not available there). The required jobs and steps come from
 `scripts/ci-evidence.json` in the candidate commit's own tree, read from the
 local checkout when it holds the commit and otherwise from the contents API,
 never from the checkout that runs the script (#1243); a commit whose config

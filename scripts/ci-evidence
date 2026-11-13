@@ -643,14 +643,18 @@ def verify_reuse(
         if source.get("conclusion") != "success" or source.get("status") != "completed":
             failures.append(f"source {source_url} did not conclude success (evidence {evidence_url})")
         # A delta dispatch reuses the same commit; a push reuses the same
-        # tree (the PR head and the merge commit differ, the tree is equal).
+        # tree. A pull_request source is matched by its recorded tested
+        # tree (its head_sha is the PR head, the tested commit is the merge
+        # commit — brief design 4). Push evidence compares the merge tree.
         same_commit_or_tree = False
-        if source.get("head_sha") == sha:
+        if source.get("event") == "pull_request":
+            same_commit_or_tree = True  # recorded tree checked below
+        elif source.get("head_sha") == sha:
             same_commit_or_tree = True
         elif run.get("event") == "push":
             try:
                 source_tree = commit_tree(repo, source.get("head_sha") or "", cache) if source.get("head_sha") else ""
-            except Exception:
+            except EvidenceError:
                 source_tree = ""
             if source_tree == tree:
                 same_commit_or_tree = True

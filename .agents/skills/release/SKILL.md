@@ -70,7 +70,9 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    nightly CI evidence for that commit before creating an annotated tag
    `vX.Y.Z`. Evidence is a run on the commit itself or a `workflow_dispatch`
    run that tested the same git tree; `scripts/ci-evidence` prints which run
-   matched and whether by `sha` or by `tree`. By default it pushes the release
+   matched and whether by `sha` or by `tree`. A `main` push reuses the newest
+   green same-tree legs while `CI_REUSE_PUSH` is `true` (`scripts/ci-reuse`);
+   the evidence union names every per-job source run (`run_ids`). By default it pushes the release
    branch before waiting for evidence and pushes the tag after verification.
    With `--no-push`, it checks only already-existing evidence and leaves the
    commit and tag local;

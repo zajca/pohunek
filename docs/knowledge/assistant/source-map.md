@@ -444,9 +444,11 @@ Release packaging and contributor verification:
 - `scripts/ci-evidence` — verifies successful Actions jobs and steps for an
   exact commit, with optional dispatch and bounded polling; accepts a delta
   dispatch's union with its recorded source run.
-- `scripts/ci-reuse` — decides which jobs a `tier=main` delta dispatch reuses
-  from the newest pull request run of the same tree; allowlist in
-  `scripts/ci-reuse.json`.
+- `scripts/ci-reuse` — decides which jobs a `tier=main` delta dispatch or a
+  `main` push reuses from the newest green legs of same-tree runs of this
+  repo (PR, push, tier=main dispatch, within 24h, fork never, recorded
+  `tested-tree-*`); allowlist in `scripts/ci-reuse.json`; push reuse is
+  gated by the `CI_REUSE_PUSH` kill switch (step-level, never `jobs.<id>.if`).
 - `scripts/provision-hermes-compat`
 - `scripts/tests/provision-hermes-compat.sh`
 - `scripts/smoke-hermes-plugin-release`

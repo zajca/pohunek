@@ -1414,6 +1414,35 @@ jobs:
         self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", text.stdout)
         self.assertIn(f"/actions/runs/{OTHER_SOURCE}", text.stdout)
 
+    def test_a_push_reuse_union_by_tree_accepts_a_source_on_another_commit(self):
+        # M3/M7(b): a pull_request source whose head_sha differs from the push
+        # commit is accepted by its recorded tested tree.
+        OTHER = "b" * 40
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=OTHER, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["trees"][OTHER] = "d" * 40  # tree(head) != tree(push)
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["reused_from"]["run_ids"], [REUSE_SOURCE_ID])
+
+    def test_a_push_reuse_union_is_refused_for_an_audit_record_entry(self):
+        # M7(d)/row 11: cargo-audit is never excused — a record naming it is refused.
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["artifact_zips"]["11"] = reuse_zip(
+            TREE, {"matrix": [REUSE_JOB], "cargo-audit": ["cargo-audit (RustSec advisories)"]},
+            source_run_id=REUSE_SOURCE_ID,
+        )
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_a_reuse_union_on_the_tree_path_is_refused_for_a_third_commit(self):
         # A source run on neither the candidate nor the dispatch commit is
         # refused even when its recorded tree matches.
@@ -1429,7 +1458,7 @@ jobs:
         del fixture["artifact_zips"]["11"]
         fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
         fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
-            sha=THIRD_SHA, event="pull_request", branch="zajca/feature",
+            sha=THIRD_SHA, event="workflow_dispatch", branch="main",
             run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
         )
         fixture["artifacts"]["456"] = []

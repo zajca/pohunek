@@ -113,7 +113,7 @@ else:
 '''
 
 
-def run_doc(run_id=777, event="pull_request", head_repo=REPO, branch="zajca/feature",
+def run_doc(run_id=777, event="pull_request", head_repo=REPO, branch="zajca/feature", head_sha=None,
             status="completed", conclusion="success", path=".github/workflows/ci.yml@refs/heads/main"):
     # Push sources default to main branch (run_tier main); PR sources stay
     # on the feature branch, which run_tier maps to None (not main/nightly).
@@ -124,7 +124,7 @@ def run_doc(run_id=777, event="pull_request", head_repo=REPO, branch="zajca/feat
         "id": run_id,
         "run_number": run_id,
         "run_attempt": 1,
-        "head_sha": SHA,
+        "head_sha": head_sha or SHA,
         "head_branch": branch,
         "path": path,
         "event": event,
@@ -640,12 +640,11 @@ else:
 
 
     def test_a_push_reuses_a_pull_request_source_by_tree(self):
-        # Push (issue #2204): the merge commit differs from the PR head, the
-        # tested tree is equal. The run doc's head_sha is SHA, the tree is
-        # the fixture's; a push candidate list that includes the PR run by
-        # tree must reuse it.
+        # Push (issue #2204, rows 1-2): the merge commit differs from the PR
+        # head that tested the same tree. The source is on another commit
+        # (OTHER_SHA) but its recorded tested-tree equals the push tree.
         self.write_fixture(
-            runs=[run_doc(run_id=777, event="pull_request")],
+            runs=[run_doc(run_id=777, event="pull_request", head_sha="b" * 40)],
             jobs_by_run={"777": green_jobs()},
             artifacts={"777": [
                 {"name": f"tested-tree-{TREE}", "id": 1},
@@ -687,6 +686,22 @@ else:
         self.assertEqual(record["source_runs"], [777, 888])
         self.assertEqual(record["jobs"]["darwin-check"]["run_id"], 777)
         self.assertIn(record["jobs"]["test"]["run_id"], record["source_runs"])
+
+    def test_a_delta_dispatch_never_reuses_a_same_tree_source_on_another_commit(self):
+        # M2/row 15: a delta dispatch reuses the same commit; a same-tree
+        # source on another commit is not a dispatch source.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="workflow_dispatch", head_sha="b" * 40)],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
     def test_a_dispatch_source_never_reuses_a_skipped_leg(self):
         # A workflow_dispatch source whose `test` leg was skipped (reused
