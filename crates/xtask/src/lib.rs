@@ -6,6 +6,7 @@ mod attestation;
 mod catalog;
 mod catalog_key;
 mod checks;
+mod claude_canary;
 mod doc_drift;
 mod eval;
 mod generators;
@@ -135,6 +136,9 @@ pub enum XtaskError {
         command: String,
         status: ExitStatus,
     },
+    /// The command completed with a typed process exit code (0 is success and
+    /// never reaches this variant).
+    ExitCode(i32),
 }
 
 /// Process exit code for xtask failures that are not a delegated command's own exit.
@@ -163,6 +167,7 @@ impl XtaskError {
                 use std::os::unix::process::ExitStatusExt as _;
                 SIGNAL_EXIT_BASE + status.signal().unwrap_or(0)
             }),
+            Self::ExitCode(code) => *code,
             Self::Index(_) | Self::Admission(_) => INDEX_REFUSED_EXIT_CODE,
             Self::Prove(_) => PROVE_FAILED_EXIT_CODE,
             _ => FAILURE_EXIT_CODE,
@@ -209,6 +214,7 @@ impl fmt::Display for XtaskError {
                 path.display()
             ),
             Self::ChildExit { command, status } => write!(f, "`{command}` failed with {status}"),
+            Self::ExitCode(code) => write!(f, "command exited with {code}"),
         }
     }
 }
@@ -236,7 +242,8 @@ impl Error for XtaskError {
             | Self::InvalidPath(_)
             | Self::OutputInsideInput(_)
             | Self::OutputIsSymlink(_)
-            | Self::ChildExit { .. } => None,
+            | Self::ChildExit { .. }
+            | Self::ExitCode(_) => None,
         }
     }
 }
@@ -386,6 +393,12 @@ pub fn check_doc_drift(repo: impl AsRef<Path>) -> Result<Vec<&'static str>, Xtas
     doc_drift::check(repo.as_ref())
 }
 
+fn run_claude(
+    action: claude_canary::ClaudeAction,
+) -> Result<claude_canary::CompareOutcome, XtaskError> {
+    claude_canary::run(action)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one flat dispatch over the top-level commands is clearer than splitting it"
@@ -485,6 +498,16 @@ where
             }
         },
         TopCommand::Hermes { action } => run_hermes(action, &root),
+        TopCommand::Claude { action } => match run_claude(action) {
+            Ok(outcome) => {
+                if outcome.exit_code() == 0 {
+                    Ok(())
+                } else {
+                    Err(XtaskError::ExitCode(outcome.exit_code()))
+                }
+            }
+            Err(error) => Err(error),
+        },
         TopCommand::Affected(options) => affected::run(&root, &options),
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
@@ -587,6 +610,17 @@ enum TopCommand {
     Hermes {
         #[command(subcommand)]
         action: HermesAction,
+    },
+    /// The Claude OSC 7501 canary.
+    ///
+    /// `capture` records the canonical 7501 status records of the real
+    /// installed Claude on the owner's account into `capture.json`;
+    /// `compare` diffs a capture against the expected table. A row whose
+    /// expected value is `null` is UNVERIFIED by definition and never a
+    /// pass; expectations change only by a reviewed hand edit.
+    Claude {
+        #[command(subcommand)]
+        action: claude_canary::ClaudeAction,
     },
     AgentSkill {
         #[command(subcommand)]

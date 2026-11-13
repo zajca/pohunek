@@ -880,6 +880,11 @@ and `runtime/`) with a random signing key that is never stored, so its catalog
 is not a release. `scripts/upgrade-test` runs it for the head binaries. Never
 publish its output or feed it to `release assemble`.
 
+`cargo xtask claude canary compare` diffs a canary capture against the
+expected table in `compat/claude/canary/expected.json`; the runbook
+`docs/runbooks/claude-canary.md` documents the command, the exit codes and
+how a difference is handled.
+
 ### Release rehearsal
 
 `ci.yml` calls the build and evidence workflows with `mode: rehearsal`

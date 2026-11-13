@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "runtime": "claude",
+  "scenarios": {
+    "idle_after_turn": {
+      "final_record": "state=done",
+      "attention": [],
+      "source": "#2084 real run, Claude 2.1.322"
+    },
+    "permission_prompt": {
+      "final_record": "state=blocked:kind=question",
+      "attention": ["approval_required"],
+      "source": "#2084 real run, case 1"
+    },
+    "mcp_elicitation": {
+      "final_record": "state=blocked:kind=question",
+      "attention": ["agent_blocked"],
+      "source": "#2084 Q1 comment, Claude 2.1.322"
+    },
+    "login_screen": {
+      "final_record": null,
+      "attention": null,
+      "source": "UNVERIFIED: first real run (#2101)"
+    },
+    "running_turn": {
+      "final_record": "state=working",
+      "attention": [],
+      "source": "#2084 Q1 comment, MCP run table, step 'prompt ... working'"
+    }
+  }
+}
