@@ -16,9 +16,10 @@ const UNMAPPED_PROGRAM_STATUS_TARGET: &str = "session.program_status.unmapped";
 
 /// Longest payload token the journal echoes.
 ///
-/// The journal echoes untrusted tokens, which the grammar does not bound: an
-/// unknown `state` or `kind`, or the `app` of a rejected payload. The bound
-/// keeps such a token from turning into a long log line.
+/// The journal echoes raw tokens the grammar does not bound to this
+/// length: an unknown `state` or `kind`, an `app` the grammar drops
+/// (invalid), or a valid `app` (up to `MAX_APP_BYTES`). The bound keeps
+/// such a token from turning into a long log line.
 const MAX_JOURNAL_TOKEN_CHARS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,7 +416,7 @@ impl<'a> JournalTokens<'a> {
     /// the parsed report never saw or kept: the parser rejects the payload at
     /// its first invalid input (non-UTF-8 bytes, an overlong key, invalid
     /// `msg` or `title`, or a missing or unknown `state`) and drops an invalid
-    /// `app` or an unknown `kind` it read, so a journaled token is one the
+    /// `app` or an unknown `kind` it read, so a journaled token can be one the
     /// parser never read or one it discarded.
     fn of(payload: &'a [u8]) -> Self {
         let mut tokens = Self::default();

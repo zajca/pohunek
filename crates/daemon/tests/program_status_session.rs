@@ -1528,7 +1528,7 @@ fn unmapped_journal_lines(log: &str) -> Vec<&str> {
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "the journal scenario pins both unmapped shapes and the paused assert"
+    reason = "the journal scenario pins both unmapped shapes, their count, and the late-line recount"
 )]
 async fn an_unmapped_program_status_record_is_journaled_without_its_text() {
     if !pohunek_test_support::process_env::in_own_process() {

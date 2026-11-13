@@ -16056,8 +16056,80 @@ generation "$1"
             canonical_task.abort();
         }
 
+        /// A live worker whose supervisor job is absent is adopted, flagged,
+        /// and announced with a reconnect event carrying that worker.
         #[tokio::test]
         async fn live_worker_with_an_absent_job_is_adopted_and_flagged() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, worker_instance_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-315", "worker-s-315")
+                    .await;
+            persist_record(&fixture.root, "s-315", Some(worker_instance_id.as_str()));
+            drop(controller);
+            let mut events = fixture.registry.subscribe();
+            // Keep the announcement scan below exact: the same reconcile pass
+            // publishes the flag and the reconnect event in that order.
+            let mut seen = Vec::new();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            assert_eq!(
+                runtime_of(&fixture.registry, "s-315").await.state,
+                RuntimeState::Live
+            );
+            let event = guard("the runtime reconnected event", async {
+                loop {
+                    let event = events.recv().await.expect("receive recovery event");
+                    if event.event() == protocol::event::SESSION_RUNTIME_RECONNECTED {
+                        break event;
+                    }
+                    seen.push(event);
+                }
+            })
+            .await;
+            let announced_session: protocol::SessionInfo =
+                serde_json::from_value(event.payload()["session"].clone())
+                    .expect("reconnect event session");
+            assert_eq!(
+                announced_session
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.worker_instance_id.as_deref()),
+                Some(worker_instance_id.as_str()),
+                "the event names the adopted worker"
+            );
+            let inventory = fixture.registry.runtime_inventory().await;
+            let entry = inventory
+                .entries
+                .iter()
+                .find(|entry| entry.runtime_slot == "s-315")
+                .expect("adopted worker is inventoried");
+            assert_eq!(entry.status, RuntimeInventoryStatus::Managed);
+            assert_eq!(entry.reason.as_deref(), Some(UNSUPERVISED_WORKER));
+            let mut announced = false;
+            for event in seen {
+                if event.event() == protocol::event::SESSION_RUNTIME_DISCOVERED {
+                    announced |=
+                        event.payload()["entry"]["reason"].as_str() == Some(UNSUPERVISED_WORKER);
+                }
+            }
+            assert!(announced, "the anomaly is announced to subscribers");
+            fixture
+                .registry
+                .stop(&SessionId("s-315".to_owned()))
+                .await
+                .expect("stop adopted worker");
+            server_task.abort();
+        }
+
+        /// A Recover transaction on the adopted record emits a native-recovery
+        /// event whose absent previous instance id stays absent from the
+        /// streamed payload.
+        #[tokio::test]
+        async fn an_absent_job_adoption_with_a_recover_transaction_reports_an_absent_previous_id() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
             let (controller, worker_instance_id, _child_pid, server_task) =
