@@ -3143,6 +3143,15 @@ def reverse_needs() -> dict[str, set[str]]:
 
 
 class DeltaReuseWiringTests(unittest.TestCase):
+    @staticmethod
+    def gate_of(step: str, name: str) -> str:
+        # The K1 murder: a decide step without a gate reads as running
+        # everywhere, so assert the gate exists instead of crashing in
+        # the condition parser.
+        match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
+        assert match is not None, f"the {name} step lost its gate"
+        return match.group(1) or match.group(2)  # type: ignore[union-attr]
+
     def test_the_reuse_config_has_the_expected_shape(self):
         config = reuse_config()
         self.assertEqual(config["max_age_hours"], 24)
@@ -3888,6 +3897,73 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertIn(decide_gate, text)
         upload_block = text.split("Upload the reuse record", 1)[1].split("- name:", 1)[0]
         self.assertIn(decide_gate, upload_block, "upload must share the decide gate")
+
+    def test_the_kill_switch_off_runs_nothing_and_skips_nothing(self):
+        # M9: with the switch off a push runs only the kill-switch step,
+        # so `decide.outputs.skip` never wins and every job runs.
+        job = workflow_jobs()[REUSE_JOB]
+        steps = job_steps(job)
+        nopus_block = steps["Check the push-reuse kill switch"]
+        decide_block = steps["Decide the reused jobs"]
+        upload_block = steps["Upload the reuse record"]
+        self.assertIn("id: nopus", nopus_block)
+        self.assertIn('echo "skip=[]" >> "$GITHUB_OUTPUT"', nopus_block)
+        nopus = self.gate_of(nopus_block, "kill-switch")
+        decide = self.gate_of(decide_block, "decide")
+        upload = self.gate_of(upload_block, "upload")
+        self.assertIn(
+            "github.event_name != 'push' || env.CI_REUSE_PUSH == 'true'",
+            decide,
+            "the decide step shares the kill-switch gate",
+        )
+        for env_value in ("false", ""):
+            with self.subTest(switch=repr(env_value)):
+                env = {"CI_REUSE_PUSH": env_value}
+                self.assertTrue(
+                    evaluate_needs_expression(nopus, event="push", env=env),
+                    "the kill-switch step runs on a push with the switch off",
+                )
+                self.assertFalse(
+                    evaluate_needs_expression(decide, event="push", env=env),
+                    "the decide step is skipped with the switch off",
+                )
+                self.assertFalse(
+                    evaluate_needs_expression(upload, event="push", env=env),
+                    "the upload step is skipped with the switch off",
+                )
+
+    def test_the_kill_switch_on_decides_and_the_outputs_fall_back(self):
+        # M9: with the switch on a push decides (the step runs) while the
+        # kill-switch step is skipped, and a delta dispatch decides too;
+        # the `skip` job output reads the decide output first and only
+        # falls back to the kill-switch step.
+        job = workflow_jobs()[REUSE_JOB]
+        steps = job_steps(job)
+        nopus = self.gate_of(steps["Check the push-reuse kill switch"], "kill-switch")
+        decide = self.gate_of(steps["Decide the reused jobs"], "decide")
+        self.assertFalse(
+            evaluate_needs_expression(nopus, event="push", env={"CI_REUSE_PUSH": "true"}),
+            "the kill-switch step is skipped with the switch on",
+        )
+        self.assertTrue(
+            evaluate_needs_expression(decide, event="push", env={"CI_REUSE_PUSH": "true"}),
+            "the decide step runs on a push with the switch on",
+        )
+        self.assertTrue(
+            evaluate_needs_expression(
+                decide, event="workflow_dispatch", tier="main",
+                inputs={"delta": True}, env={"CI_REUSE_PUSH": "true"},
+            ),
+            "the decide step runs on a delta dispatch",
+        )
+        outputs = workflow_jobs()[REUSE_JOB]
+        skip_line = next(
+            (line for line in outputs.splitlines() if line.strip().startswith("skip:")),
+        )
+        decide_pos = skip_line.find("steps.decide.outputs.skip")
+        nopus_pos = skip_line.find("steps.nopus.outputs.skip")
+        self.assertGreaterEqual(decide_pos, 0)
+        self.assertGreater(nopus_pos, decide_pos, "decide wins over the kill-switch step")
 
     def test_every_reusable_job_needs_reuse_and_names_itself_in_skip(self):
         jobs = workflow_jobs()
