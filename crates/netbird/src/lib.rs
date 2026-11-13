@@ -25,11 +25,13 @@
 
 mod bind;
 mod host;
+mod static_peers;
 mod status;
 mod transport;
 
 pub use bind::{validate_netbird_bind_addr, BindAddrError};
 pub use host::resolve_host;
+pub use static_peers::{StaticPeer, StaticPeers};
 pub use status::{
     parse_status, run_status, run_status_async, run_status_with_program, NetbirdError,
     NetbirdStatus, Peer,

@@ -585,7 +585,7 @@ async fn run() -> Result<(), DaemonError> {
     let overlay_config = pohunek_client::OverlayConfig::load_from(&paths.config_dir)
         .map_err(DaemonError::OverlayConfiguration)?;
     let registry = overlay_config
-        .registry()
+        .registry_without_static_peers()
         .map_err(DaemonError::OverlayConfiguration)?;
     let overlay_source = OverlaySource::of(&overlay_config);
 

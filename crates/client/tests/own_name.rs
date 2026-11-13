@@ -48,6 +48,7 @@ impl StubOverlay {
             display_name: Some(PEER_NAME.to_owned()),
             fqdn: identified.then(|| format!("{PEER_NAME}.overlay.test")),
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            expected_host_id: None,
         }
     }
 
@@ -263,6 +264,7 @@ async fn one_fqdn_on_two_overlays_keeps_both_overlay_qualified_selectors() {
             display_name: Some(PEER_NAME.to_owned()),
             fqdn: Some(format!("{PEER_NAME}.overlay.test")),
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            expected_host_id: None,
         };
         let transport = StubOverlay {
             id: OverlayId::new(id).expect("overlay id"),

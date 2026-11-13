@@ -254,6 +254,7 @@ mod tests {
                     display_name: Some(format!("{} host", self.id)),
                     fqdn: None,
                     address: self.address,
+                    expected_host_id: None,
                 })
             } else {
                 Err(OverlayError::HostUnknown {
@@ -276,6 +277,7 @@ mod tests {
                     display_name: Some(format!("{} host", self.id)),
                     fqdn: None,
                     address: self.address,
+                    expected_host_id: None,
                 })
             } else {
                 Err(OverlayError::HostUnknown {

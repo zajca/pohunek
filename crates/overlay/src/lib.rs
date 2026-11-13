@@ -523,6 +523,8 @@ pub struct ResolvedPeer {
     pub fqdn: Option<String>,
     /// Exact policy-approved address.
     pub address: IpAddr,
+    /// Host id the daemon at `address` must report through `host.governance.inspect` before any other request; set only for an owner-configured static peer.
+    pub expected_host_id: Option<String>,
 }
 
 /// What a host selector names on one overlay.
@@ -606,6 +608,8 @@ pub struct OverlayRoute {
     pub fqdn: Option<String>,
     /// Exact socket address including the overlay-specific port.
     pub addr: SocketAddr,
+    /// Host id the daemon at `addr` must report through `host.governance.inspect` before any other request; set only for an owner-configured static peer.
+    pub expected_host_id: Option<String>,
 }
 
 /// Current diagnostic state for one configured overlay.
@@ -885,6 +889,7 @@ impl OverlayRegistry {
                     display_name: peer.display_name,
                     fqdn: peer.fqdn,
                     addr: SocketAddr::new(peer.address, port),
+                    expected_host_id: peer.expected_host_id,
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
@@ -945,6 +950,7 @@ impl OverlayRegistry {
                 display_name: peer.display_name,
                 fqdn: peer.fqdn,
                 addr: SocketAddr::new(peer.address, entry.port()),
+                expected_host_id: peer.expected_host_id,
             }),
             Err(OverlayError::HostUnknown { .. }) => {
                 Err(RegistryError::HostUnknown(host.to_owned()))
@@ -1005,6 +1011,7 @@ impl OverlayRegistry {
                     display_name: peer.display_name,
                     fqdn: peer.fqdn,
                     addr: SocketAddr::new(peer.address, port),
+                    expected_host_id: peer.expected_host_id,
                 }),
                 Err(OverlayError::HostUnknown { .. }) => {}
                 Err(error @ OverlayError::PeerCollision { .. }) => {
@@ -1075,6 +1082,7 @@ impl OverlayRegistry {
                 display_name: peer.display_name,
                 fqdn: peer.fqdn,
                 addr: SocketAddr::new(peer.address, entry.port()),
+                expected_host_id: peer.expected_host_id,
             })),
             Err(OverlayError::HostUnknown { .. }) => {
                 Err(RegistryError::HostUnknown(host.to_owned()))

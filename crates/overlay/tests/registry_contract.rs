@@ -84,6 +84,7 @@ impl MemoryTransport {
                 display_name: Some(host.to_owned()),
                 fqdn: Some(fqdn.to_owned()),
                 address,
+                expected_host_id: None,
             };
             self.resolutions
                 .insert(host.to_owned(), Ok(resolved.clone()));

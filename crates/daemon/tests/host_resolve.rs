@@ -53,6 +53,7 @@ impl StubOverlay {
             display_name: Some(PEER_NAME.to_owned()),
             fqdn: Some(PEER_FQDN.to_owned()),
             address: PEER_ADDRESS,
+            expected_host_id: None,
         }
     }
 
@@ -62,6 +63,7 @@ impl StubOverlay {
             display_name: Some(BARE_NAME.to_owned()),
             fqdn: None,
             address: PEER_ADDRESS,
+            expected_host_id: None,
         }
     }
 

@@ -70,6 +70,19 @@ status_timeout_secs = 10  # optional
   port both sides must use in the file.
 - `pohunek doctor` checks the configured overlay and compares the file with the
   running daemon; see [Diagnostics](#diagnostics).
+- With `providers = ["netbird"]` the owner can also list static peers under
+  `[netbird.static_peers.<name>]`, each with `address`, `fqdn` and `host_id`.
+  The entries are used only while NetBird withholds its detailed status from
+  this account (NetBird 0.83+ restricted overview, daemon status `Connected`);
+  when the full status is available it wins and the table is cross-checked
+  (a table that contradicts it fails as `overlay_configuration_invalid`).
+  Before any other request the client asks `host.governance.inspect` and
+  requires the reported host id to equal the pinned one; a mismatch is
+  `host_identity_mismatch` and the connection drops. A raw address never
+  matches the table, and static peers never appear in `host discover` or
+  `host list`. `[netbird]` takes `subnet` (an IPv4 network inside `100.64.0.0/10`,
+  from `100.64.0.0/10` itself to `/30`), and `[netbird.static_peers.*]`
+  is required with it.
 - A daemon of an older release ignores the file and binds the environment value
   or 18722, and so does a client of an earlier release (a CLI on another host,
   a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
@@ -250,7 +263,7 @@ macOS-specific routing, bridging, or relay mode.
   sent again. After wake, compare `worker_instance_id` before and after: the same id
   is continuity.
 - **Troubleshooting.** Run `netbird status` (or `tailscale status`) in the same
-  shell. Since NetBird 0.83, `netbird status` shows peers only to the account that owns the NetBird connection (and root); pohunek run as another account fails with `netbird_state_restricted`. Run pohunek as the owning account, or pin NetBird to 0.82.x; resolution for other accounts is tracked in #2308. Without an `overlays.toml` the NetBird default is not retried: if the
+  shell. Since NetBird 0.83, `netbird status` shows peers only to the account that owns the NetBird connection (and root); pohunek run as another account fails with `netbird_state_restricted` unless the owner lists the peer as a static peer in `overlays.toml` with its pinned host id (see above). Run pohunek as the owning account, pin NetBird to 0.82.x, or configure the static peer. Without an `overlays.toml` the NetBird default is not retried: if the
   daemon logged `overlay CLI missing; listener disabled`, fix the CLI lookup
   above and restart the daemon. For an overlay listed in `overlays.toml` the
   daemon logs `overlay CLI missing; serving local-only and retrying` and binds as

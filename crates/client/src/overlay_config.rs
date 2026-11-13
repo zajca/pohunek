@@ -29,13 +29,16 @@
 
 // Rust guideline compliant 2026-10-23
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use netbird::{NetbirdTransport, NETBIRD_OVERLAY_ID};
+use netbird::{NetbirdTransport, StaticPeer, StaticPeers, NETBIRD_OVERLAY_ID};
 use overlay::{
     ConfiguredTransport, OverlayDiagnostic, OverlayError, OverlayRegistry, OverlayTransport,
     DEFAULT_STATUS_DEADLINE, MAX_STATUS_DEADLINE_SECS, MIN_STATUS_DEADLINE_SECS,
@@ -77,6 +80,12 @@ const FORBIDDEN_DIRECTORY_BITS: u32 = 0o022;
 /// Overlay ids the loader can build a provider for.
 const KNOWN_PROVIDER_IDS: [&str; 2] = [NETBIRD_OVERLAY_ID, TAILSCALE_OVERLAY_ID];
 
+/// Largest number of static peers one `overlays.toml` may list.
+const MAX_STATIC_PEERS: usize = 32;
+
+/// The CGNAT range NetBird assigns addresses from, as an IPv4 network and prefix.
+const NETBIRD_CGNAT: (Ipv4Addr, u8) = (Ipv4Addr::new(100, 64, 0, 0), 10);
+
 /// A provider the loader knows how to construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provider {
@@ -100,9 +109,16 @@ impl Provider {
         }
     }
 
-    fn transport(self, status_deadline: Duration) -> Arc<dyn OverlayTransport> {
+    fn transport(
+        self,
+        status_deadline: Duration,
+        static_peers: Option<StaticPeers>,
+    ) -> Arc<dyn OverlayTransport> {
         match self {
-            Self::Netbird => Arc::new(NetbirdTransport::with_status_deadline(status_deadline)),
+            Self::Netbird => Arc::new(NetbirdTransport::with_static_peers(
+                status_deadline,
+                static_peers,
+            )),
             Self::Tailscale => Arc::new(TailscaleTransport::with_status_deadline(status_deadline)),
         }
     }
@@ -130,6 +146,24 @@ struct RawConfig {
     port: Option<i64>,
     /// Wide on purpose, like `port`.
     status_timeout_secs: Option<i64>,
+    netbird: Option<RawNetbird>,
+}
+
+/// Raw shape of the `[netbird]` table.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNetbird {
+    subnet: String,
+    static_peers: BTreeMap<String, RawStaticPeer>,
+}
+
+/// Raw shape of one `[netbird.static_peers.<name>]` entry.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStaticPeer {
+    address: String,
+    fqdn: String,
+    host_id: String,
 }
 
 /// The overlay providers a host works over and the shared remote port.
@@ -138,6 +172,7 @@ pub struct OverlayConfig {
     providers: Vec<Provider>,
     port: u16,
     status_deadline: Duration,
+    static_peers: Option<StaticPeers>,
     /// `true` when the providers came from `overlays.toml`, `false` for the
     /// `NetBird` default of an absent file.
     from_file: bool,
@@ -208,6 +243,7 @@ impl OverlayConfig {
                 providers: vec![Provider::Netbird],
                 port: DEFAULT_REMOTE_PORT,
                 status_deadline: DEFAULT_STATUS_DEADLINE,
+                static_peers: None,
                 from_file: false,
             },
         };
@@ -226,11 +262,30 @@ impl OverlayConfig {
     /// Returns [`ClientError::OverlayRegistry`] when the registry rejects an
     /// entry, which a validated configuration never does.
     pub fn registry(&self) -> Result<OverlayRegistry, ClientError> {
+        self.build_registry(true)
+    }
+
+    /// Build the registry without owner-configured static peers.
+    ///
+    /// This serves `host.resolve` to clients that cannot verify a host-id
+    /// pin, so it leaves static peers out.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::registry`].
+    pub fn registry_without_static_peers(&self) -> Result<OverlayRegistry, ClientError> {
+        self.build_registry(false)
+    }
+
+    fn build_registry(&self, with_static_peers: bool) -> Result<OverlayRegistry, ClientError> {
         let entries = self
             .providers
             .iter()
             .map(|provider| {
-                ConfiguredTransport::new(provider.transport(self.status_deadline), self.port)
+                let peers = with_static_peers
+                    .then(|| self.static_peers.clone())
+                    .flatten();
+                ConfiguredTransport::new(provider.transport(self.status_deadline, peers), self.port)
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(OverlayRegistry::new(entries)?.with_status_budget(self.status_deadline))
@@ -384,12 +439,174 @@ fn parse(text: &str) -> Result<OverlayConfig, String> {
                 )
             })?,
     };
+    let static_peers = match raw.netbird {
+        None => None,
+        Some(netbird) => Some(parse_static_peers(&providers, netbird)?),
+    };
     Ok(OverlayConfig {
         providers,
         port,
         status_deadline,
+        static_peers,
         from_file: true,
     })
+}
+
+/// Validate the `[netbird]` table and build its static peers.
+///
+/// The first failure wins, in the order: provider, subnet, entry count,
+/// per-entry fields, then uniqueness across entries. Messages name the
+/// validated entry key but never a value from the file.
+fn parse_static_peers(providers: &[Provider], netbird: RawNetbird) -> Result<StaticPeers, String> {
+    if providers != [Provider::Netbird] {
+        return Err("the netbird table requires providers = [\"netbird\"]".to_owned());
+    }
+    let (network, prefix) = parse_subnet(&netbird.subnet)?;
+    if netbird.static_peers.is_empty() || netbird.static_peers.len() > MAX_STATIC_PEERS {
+        return Err(format!(
+            "netbird.static_peers must hold 1..={MAX_STATIC_PEERS} entries"
+        ));
+    }
+    let mut peers = Vec::with_capacity(netbird.static_peers.len());
+    for (key, raw) in &netbird.static_peers {
+        peers.push(parse_static_peer(key, raw, network, prefix)?);
+    }
+    check_uniqueness(&peers)?;
+    Ok(StaticPeers::new(network, prefix, peers))
+}
+
+fn parse_static_peer(
+    key: &str,
+    raw: &RawStaticPeer,
+    network: Ipv4Addr,
+    prefix: u8,
+) -> Result<StaticPeer, String> {
+    if !is_dns_label(key) || key == crate::LOCAL_HOST {
+        return Err("a netbird.static_peers entry name must be a lowercase DNS label (a-z, 0-9, '-', 1..=63 characters, no leading or trailing '-') other than 'local'".to_owned());
+    }
+    let address = raw.address.parse::<Ipv4Addr>().ok().filter(|address| {
+        in_subnet(network, prefix, *address)
+            && *address != network
+            && *address != broadcast(network, prefix)
+    });
+    let Some(address) = address else {
+        return Err(format!(
+            "netbird.static_peers.{key}.address must be an IPv4 address inside netbird.subnet other than its network and broadcast address"
+        ));
+    };
+    if !is_dns_name(&raw.fqdn) {
+        return Err(format!(
+            "netbird.static_peers.{key}.fqdn must be a lowercase DNS name with at least two labels and no trailing dot"
+        ));
+    }
+    if protocol::HostId::parse(&raw.host_id).is_err() {
+        return Err(format!(
+            "netbird.static_peers.{key}.host_id must be a host id as pohunek host governance inspect prints it"
+        ));
+    }
+    Ok(StaticPeer {
+        name: key.to_owned(),
+        fqdn: raw.fqdn.clone(),
+        address,
+        host_id: raw.host_id.clone(),
+    })
+}
+
+fn check_uniqueness(peers: &[StaticPeer]) -> Result<(), String> {
+    for (index, left) in peers.iter().enumerate() {
+        for right in peers.iter().skip(index + 1) {
+            let pair = |what: &str| {
+                format!(
+                    "netbird.static_peers.{} and netbird.static_peers.{} share {what}",
+                    left.name, right.name
+                )
+            };
+            if left.address == right.address {
+                return Err(pair("an address"));
+            }
+            if left.fqdn == right.fqdn {
+                return Err(pair("an fqdn"));
+            }
+            if left.host_id == right.host_id {
+                return Err(pair("a host id"));
+            }
+            let left_names = selector_names(left);
+            let right_names = selector_names(right);
+            if left_names.iter().any(|name| right_names.contains(name)) {
+                return Err(pair("a selector name"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn selector_names(peer: &StaticPeer) -> Vec<String> {
+    let mut names = vec![peer.name.clone()];
+    if let Some(short) = peer.fqdn.split('.').next() {
+        if !short.is_empty() && short != peer.name {
+            names.push(short.to_owned());
+        }
+    }
+    names
+}
+
+/// Parse `a.b.c.d/p` and check it is an IPv4 network inside `100.64.0.0/10`.
+fn parse_subnet(value: &str) -> Result<(Ipv4Addr, u8), String> {
+    let invalid = || {
+        "netbird.subnet must be an IPv4 network in CIDR form inside 100.64.0.0/10, prefix length 10..=30, with no host bits set".to_owned()
+    };
+    if value.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let (address, prefix) = value.split_once('/').ok_or_else(invalid)?;
+    let network = Ipv4Addr::from_str(address).map_err(|_invalid| invalid())?;
+    let prefix = prefix.parse::<u8>().map_err(|_invalid| invalid())?;
+    if !(10..=30).contains(&prefix) {
+        return Err(invalid());
+    }
+    if !in_subnet(NETBIRD_CGNAT.0, NETBIRD_CGNAT.1, network) || network != network & mask(prefix) {
+        return Err(invalid());
+    }
+    Ok((network, prefix))
+}
+
+fn mask(prefix: u8) -> Ipv4Addr {
+    let bits = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    Ipv4Addr::from(bits)
+}
+
+fn in_subnet(network: Ipv4Addr, prefix: u8, address: Ipv4Addr) -> bool {
+    let mask = u32::from(mask(prefix));
+    u32::from(network) & mask == u32::from(address) & mask
+}
+
+fn broadcast(network: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(network) | !u32::from(mask(prefix)))
+}
+
+fn is_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
+fn is_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && !value.ends_with('.')
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
+        })
+        && value.split('.').count() >= 2
+        && value.split('.').all(is_dns_label)
 }
 
 /// Resolve [`REMOTE_PORT_ENV`]; `None` when it is unset.

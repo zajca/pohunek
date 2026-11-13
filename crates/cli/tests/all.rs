@@ -142,3 +142,5 @@ mod setup_host;
 mod setup_host_native;
 #[path = "standalone_discovery.rs"]
 mod standalone_discovery;
+#[path = "static_peers.rs"]
+mod static_peers;

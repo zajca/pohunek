@@ -337,6 +337,8 @@ enum Endpoint {
         /// Overlay the address was resolved through, when known.
         overlay: Option<String>,
         addr: SocketAddr,
+        /// Host id the daemon at `addr` must report, for a static peer.
+        expected_host_id: Option<String>,
     },
 }
 
@@ -484,6 +486,7 @@ impl Client {
                     host.to_owned(),
                     Some(route.overlay.to_string()),
                     addr,
+                    route.expected_host_id,
                     options,
                 )
                 .await
@@ -512,11 +515,18 @@ impl Client {
                 display,
             } => {
                 let registry = crate::default_overlay_registry()?;
-                let (overlay, addr) =
+                let (overlay, addr, expected_host_id) =
                     resolve_remote_addr(pinned_route.clone(), options.connect_timeout, registry)
                         .await
                         .map_err(|error| name_typed_host(error, pinned_route, display))?;
-                Self::connect_overlay_addr(display.clone(), Some(overlay), addr, options).await
+                Self::connect_overlay_addr(
+                    display.clone(),
+                    Some(overlay),
+                    addr,
+                    expected_host_id,
+                    options,
+                )
+                .await
             }
         }
     }
@@ -562,7 +572,7 @@ impl Client {
         addr: SocketAddr,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
-        Self::connect_overlay_addr(host.into(), None, addr, options).await
+        Self::connect_overlay_addr(host.into(), None, addr, None, options).await
     }
 
     /// Connect to a daemon on `addr`, which `overlay` resolved when it is known.
@@ -570,22 +580,29 @@ impl Client {
         host: String,
         overlay: Option<String>,
         addr: SocketAddr,
+        expected_host_id: Option<String>,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
         let origin = options.origin_source.resolve()?;
         let stream = connect_tcp(&host, overlay.as_deref(), addr, options.connect_timeout).await?;
 
-        Ok(Self {
+        let mut client = Self {
             inner: ClientInner::Remote(Conn::new(stream, Some(host.clone()), options)),
             endpoint: Endpoint::Remote {
                 host,
                 overlay,
                 addr,
+                expected_host_id,
             },
             options,
             selected_version: None,
             origin,
-        })
+        };
+        let expected = client.expected_host_id().map(str::to_owned);
+        if let Some(expected) = expected {
+            client.verify_host_identity(&expected).await?;
+        }
+        Ok(client)
     }
 
     /// Send one framed control request and return the daemon's `ok` payload.
@@ -648,6 +665,56 @@ impl Client {
         match &self.endpoint {
             Endpoint::Local(_) => None,
             Endpoint::Remote { host, .. } => Some(host),
+        }
+    }
+
+    /// The host-id pin of the endpoint, `None` for the local daemon.
+    fn expected_host_id(&self) -> Option<&str> {
+        match &self.endpoint {
+            Endpoint::Local(_) => None,
+            Endpoint::Remote {
+                expected_host_id, ..
+            } => expected_host_id.as_deref(),
+        }
+    }
+
+    /// Prove the pinned host id of this connection before any other request.
+    ///
+    /// The only exchange allowed before the check is the `daemon.health`
+    /// version probe of the negotiation. Any failure returns that error
+    /// unchanged and the connection is dropped: fail closed.
+    async fn verify_host_identity(&mut self, expected: &str) -> Result<(), ClientError> {
+        let request = Request::new(
+            next_request_id(protocol::method::HOST_GOVERNANCE_INSPECT),
+            protocol::method::HOST_GOVERNANCE_INSPECT,
+            Value::Null,
+        )?;
+        let request = match &self.origin {
+            Some(origin) => origin.apply(request)?,
+            None => request,
+        };
+        let request = self.negotiated_request(request).await?;
+        let value = self.send(&request).await?;
+        let status: HostGovernanceStatus = protocol::tolerant::from_value(value)?;
+        if status.host_id().as_str() == expected {
+            Ok(())
+        } else {
+            let (host, overlay, address) = match &self.endpoint {
+                Endpoint::Remote {
+                    host,
+                    overlay,
+                    addr,
+                    ..
+                } => (host.clone(), overlay.clone(), addr.ip()),
+                Endpoint::Local(_) => unreachable!("the pin check runs only on a remote endpoint"),
+            };
+            Err(ClientError::HostIdentityMismatch {
+                host,
+                overlay,
+                address,
+                expected: expected.to_owned(),
+                reported: status.host_id().as_str().to_owned(),
+            })
         }
     }
 
@@ -1249,20 +1316,27 @@ impl Client {
                 host,
                 overlay,
                 addr,
+                expected_host_id,
             } => {
                 let stream =
                     connect_tcp(host, overlay.as_deref(), *addr, options.connect_timeout).await?;
-                Ok(Self {
+                let mut client = Self {
                     inner: ClientInner::Remote(Conn::new(stream, Some(host.clone()), options)),
                     endpoint: Endpoint::Remote {
                         host: host.clone(),
                         overlay: overlay.clone(),
                         addr: *addr,
+                        expected_host_id: expected_host_id.clone(),
                     },
                     options,
-                    selected_version: self.inherited_version(),
+                    selected_version: None,
                     origin: self.origin.clone(),
-                })
+                };
+                client.selected_version = self.inherited_version();
+                if let Some(expected) = expected_host_id {
+                    client.verify_host_identity(expected).await?;
+                }
+                Ok(client)
             }
         }
     }
@@ -1303,7 +1377,10 @@ impl Client {
     /// Open an attach stream on this client's exact selected endpoint.
     ///
     /// Remote clients reuse the already-resolved socket route rather than
-    /// resolving the host again, preventing control/raw route drift.
+    /// resolving the host again, preventing control/raw route drift. For a
+    /// static peer the raw stream itself is not verified: a separate framed
+    /// connection first proves the pin at the same address, and that check is
+    /// the same class of residual gap as the pin itself.
     ///
     /// # Errors
     ///
@@ -1317,7 +1394,20 @@ impl Client {
                 host,
                 overlay,
                 addr,
-            } => connect_raw_overlay_addr(host, overlay.as_deref(), *addr, self.options).await?,
+                expected_host_id,
+            } => {
+                if let Some(expected) = expected_host_id {
+                    Self::connect_overlay_addr(
+                        host.clone(),
+                        overlay.clone(),
+                        *addr,
+                        Some(expected.clone()),
+                        self.options,
+                    )
+                    .await?;
+                }
+                connect_raw_overlay_addr(host, overlay.as_deref(), *addr, self.options).await?
+            }
         };
         stream.write_attach_header(stream_id).await?;
         Ok(stream)
@@ -1824,6 +1914,10 @@ pub async fn connect_raw(
 }
 
 /// Open a raw, unframed control connection with explicit transport settings.
+///
+/// For a static peer the raw stream itself is not verified: a separate framed
+/// connection first proves the pin at the same address, and that check is the
+/// same class of residual gap as the pin itself.
 pub async fn connect_raw_with_options(
     host: &str,
     socket_path: impl AsRef<Path>,
@@ -1834,8 +1928,20 @@ pub async fn connect_raw_with_options(
         connect_raw_local_with_options(socket_path, options).await
     } else {
         let registry = crate::default_overlay_registry()?;
-        let (overlay, addr) =
+        let (overlay, addr, expected_host_id) =
             resolve_remote_addr(host.to_owned(), options.connect_timeout, registry).await?;
+        if let Some(expected) = expected_host_id {
+            // A raw stream cannot carry a framed request: prove the pin on one
+            // framed connection first. The raw stream itself is not verified.
+            Client::connect_overlay_addr(
+                host.to_owned(),
+                Some(overlay.clone()),
+                addr,
+                Some(expected),
+                options,
+            )
+            .await?;
+        }
         connect_raw_overlay_addr(host, Some(&overlay), addr, options).await
     }
 }
@@ -2237,7 +2343,10 @@ pub struct ResolvedPeer {
 ///
 /// The selection rules are those of [`resolve_host_target`]: `local`, the empty
 /// name and this machine's own overlay name select the local daemon, and a
-/// remote name is pinned to the identity it selects now.
+/// remote name is pinned to the identity it selects now. For a static peer,
+/// `address` is safe only behind the host-id check that [`Client`] runs when
+/// it dials `pinned_route`; a caller that dials `address` itself skips that
+/// check.
 ///
 /// # Errors
 ///
@@ -2320,7 +2429,7 @@ async fn resolve_remote_addr(
     host: String,
     connect_timeout: Duration,
     registry: OverlayRegistry,
-) -> Result<(String, SocketAddr), ClientError> {
+) -> Result<(String, SocketAddr, Option<String>), ClientError> {
     let target = RemoteTarget::parse(&host)?;
     let budget = registry.outer_budget(connect_timeout);
     match tokio::time::timeout(budget, registry.resolve_host(target.selector)).await {
@@ -2332,6 +2441,7 @@ async fn resolve_remote_addr(
                         route.addr.ip(),
                         target.port.map_or(route.addr.port(), NonZeroU16::get),
                     ),
+                    route.expected_host_id,
                 )
             })
             .map_err(ClientError::from),
@@ -2472,6 +2582,7 @@ mod tests {
                     display_name: Some("member".to_owned()),
                     fqdn: Some("member.test".to_owned()),
                     address: self.member,
+                    expected_host_id: None,
                 })
             } else {
                 Err(OverlayError::HostUnknown {
@@ -2496,6 +2607,7 @@ mod tests {
                     display_name: Some("member".to_owned()),
                     fqdn: Some("member.test".to_owned()),
                     address: self.member,
+                    expected_host_id: None,
                 })
             } else {
                 Err(OverlayError::HostUnknown {
@@ -2543,6 +2655,7 @@ mod tests {
                     display_name: Some("member".to_owned()),
                     fqdn: Some("member.test".to_owned()),
                     address: *self.member.read().expect("member read lock"),
+                    expected_host_id: None,
                 })
             } else {
                 Err(OverlayError::HostUnknown {
@@ -2565,6 +2678,7 @@ mod tests {
                     display_name: Some("member".to_owned()),
                     fqdn: Some("member.test".to_owned()),
                     address: *self.member.read().expect("member read lock"),
+                    expected_host_id: None,
                 })
             } else {
                 Err(OverlayError::HostUnknown {
@@ -2877,6 +2991,7 @@ mod tests {
                 host: "fixture-remote".to_owned(),
                 overlay: None,
                 addr: address,
+                expected_host_id: None,
             },
             options,
             selected_version: None,
