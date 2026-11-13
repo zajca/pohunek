@@ -56,32 +56,26 @@ EARLIEST_MOMENT = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
 
 def _load_eligibility() -> Any:
-    # The release harness and the ci-evidence checkout fixture copy this
-    # script into a throwaway repo without the module; the real repo always
-    # carries scripts/ci_eligibility.py beside it, so fall back to the
-    # checkout this file belongs to. Intent: no consumer that copies or runs
-    # ci-evidence may silently lose the shared rule.
-    candidates = [
-        Path(__file__).resolve().parent / "ci_eligibility.py",
-        Path(__file__).resolve().parents[1] / "scripts" / "ci_eligibility.py",
-    ]
-    for path in candidates:
-        if path.is_file():
-            loader = importlib.util.spec_from_file_location("ci_eligibility", path)
-            module = importlib.util.module_from_spec(loader)
-            loader.loader.exec_module(module)
-            return module
-    raise EvidenceError(
-        "scripts/ci_eligibility.py is missing next to ci-evidence: "
-        "copy it with the script (release runs must not lose the rule)"
-    )
-
-
-eligibility = _load_eligibility()
+    # Only the module beside this script: a checkout always carries
+    # scripts/ci_eligibility.py next to scripts/ci-evidence, and a copy
+    # without it fails here instead of running a foreign rule.
+    path = Path(__file__).resolve().parent / "ci_eligibility.py"
+    if not path.is_file():
+        raise EvidenceError(
+            "scripts/ci_eligibility.py is missing next to ci-evidence: "
+            "copy it with the script (release runs must not lose the rule)"
+        )
+    loader = importlib.util.spec_from_file_location("ci_eligibility", path)
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    return module
 
 
 class EvidenceError(Exception):
     """A refusal to accept incomplete or mismatched Actions evidence."""
+
+
+eligibility = _load_eligibility()
 
 
 def gh(*arguments: str) -> str:

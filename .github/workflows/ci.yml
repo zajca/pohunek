@@ -1006,7 +1006,6 @@ jobs:
           echo "source_run=" >> "$GITHUB_OUTPUT"
           echo "source_runs=[]" >> "$GITHUB_OUTPUT"
           echo "Push reuse is off (CI_REUSE_PUSH=${CI_REUSE_PUSH:-unset}): every job runs." >> "$GITHUB_STEP_SUMMARY"
-          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
 
       - name: Decide the reused jobs
         id: decide

@@ -44,20 +44,19 @@ from pathlib import Path
 CHECKOUT = Path(__file__).resolve().parents[1]
 CONFIG_IN_TREE = "scripts/ci-reuse.json"
 def _load_eligibility():
-    candidates = [
-        Path(__file__).resolve().parent / "ci_eligibility.py",
-        Path(__file__).resolve().parents[1] / "scripts" / "ci_eligibility.py",
-    ]
-    for path in candidates:
-        if path.is_file():
-            loader = importlib.util.spec_from_file_location("ci_eligibility", path)
-            module = importlib.util.module_from_spec(loader)
-            loader.loader.exec_module(module)
-            return module
-    raise RuntimeError(
-        "scripts/ci_eligibility.py is missing next to ci-reuse: "
-        "copy it with the script"
-    )
+    # Only the module beside this script: a checkout always carries
+    # scripts/ci_eligibility.py next to scripts/ci-reuse, and a copy
+    # without it fails here instead of running a foreign rule.
+    path = Path(__file__).resolve().parent / "ci_eligibility.py"
+    if not path.is_file():
+        raise RuntimeError(
+            "scripts/ci_eligibility.py is missing next to ci-reuse: "
+            "copy it with the script"
+        )
+    loader = importlib.util.spec_from_file_location("ci_eligibility", path)
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    return module
 
 
 eligibility = _load_eligibility()

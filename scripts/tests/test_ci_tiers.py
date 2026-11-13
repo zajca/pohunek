@@ -3913,9 +3913,39 @@ class DeltaReuseWiringTests(unittest.TestCase):
         upload_block = text.split("Upload the reuse record", 1)[1].split("- name:", 1)[0]
         self.assertIn(decide_gate, upload_block, "upload must share the decide gate")
 
+    def test_the_record_download_runs_only_when_the_reuse_job_emits_a_tree(self):
+        # With the switch off the kill-switch step emits no tree, so the
+        # record download must stay skipped (a missing ci-reuse-<tree>
+        # artifact would fail the test-duplicates job); with the switch
+        # on and on a delta dispatch the decide step emits the tree and
+        # the download runs.
+        steps = job_steps(workflow_jobs()["test-duplicates"])
+        download = steps["Download the reuse record"]
+        condition = self.gate_of(download, "record download")
+        self.assertEqual(condition, "needs.reuse.outputs.tree != ''")
+        nopus_outputs: dict[str, dict[str, str]] = {
+            REUSE_JOB: {"skip": "[]", "tree": ""},
+        }
+        self.assertFalse(bool(evaluate_needs_expression(
+            condition, event="push", outputs=nopus_outputs,
+        )), "no record exists with the switch off, the download stays skipped")
+        decide_outputs: dict[str, dict[str, str]] = {
+            REUSE_JOB: {"skip": "[]", "tree": "c" * 40},
+        }
+        self.assertTrue(bool(evaluate_needs_expression(
+            condition, event="push", outputs=decide_outputs,
+        )), "with the switch on the decide tree names the record")
+        self.assertTrue(bool(evaluate_needs_expression(
+            condition, event="workflow_dispatch", tier="main",
+            outputs=decide_outputs,
+        )), "a delta dispatch downloads the record its decide step names")
+
     def test_the_kill_switch_off_runs_nothing_and_skips_nothing(self):
         # With the switch off a push runs only the kill-switch step,
-        # so `decide.outputs.skip` never wins and every job runs.
+        # so `decide.outputs.skip` never wins and every job runs. The
+        # kill-switch step emits no tree, so the record download in
+        # test-duplicates stays skipped (no ci-reuse-<tree> artifact
+        # exists on that path).
         job = workflow_jobs()[REUSE_JOB]
         steps = job_steps(job)
         nopus_block = steps["Check the push-reuse kill switch"]
@@ -3923,6 +3953,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         upload_block = steps["Upload the reuse record"]
         self.assertIn("id: nopus", nopus_block)
         self.assertIn('echo "skip=[]" >> "$GITHUB_OUTPUT"', nopus_block)
+        self.assertNotIn('echo "tree=', nopus_block)
         nopus = self.gate_of(nopus_block, "kill-switch")
         decide = self.gate_of(decide_block, "decide")
         upload = self.gate_of(upload_block, "upload")
