@@ -9,6 +9,11 @@
 //! recorded identity, retires the worker's job and commits the session
 //! `stopped`; a removal returns a typed runtime error, keeps the session listed
 //! and succeeds on a retry after `SIGCONT`.
+//!
+//! The registry reads the host through [`readable_host::ReadableHost`], so a
+//! stop's marker sweep stays hermetic: an unrelated process of the loaded
+//! test host whose environment the kernel hides cannot keep the sweep
+//! unconfirmed.
 
 // Rust guideline compliant 2026-10-20
 
@@ -20,7 +25,6 @@ use std::time::Duration;
 
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use pohunek_daemon::procwatch::HostInspector;
 use pohunek_daemon::runtime::{
     EnvironmentSource, ExchangeDeadlines, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
@@ -33,6 +37,9 @@ use pohunek_test_support::worker_binary;
 use protocol::{
     SessionId, SessionInputParams, SessionNewParams, SessionState, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
+
+#[path = "../src/procwatch/readable_host.rs"]
+mod readable_host;
 
 /// Seconds the session's root sleeps if the stop never ends it.
 const ROOT_SLEEP_SECONDS: u32 = 30;
@@ -164,7 +171,7 @@ impl Frozen {
         let registry = SessionRegistry::new_with_launcher_and_inspector(
             config,
             Arc::<SubprocessWorkerLauncher>::clone(&launcher),
-            Arc::new(HostInspector::new()),
+            Arc::new(readable_host::ReadableHost::new()),
         );
         let created = {
             // A test run inside a pohunek session must not stamp the worker
