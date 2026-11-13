@@ -1408,9 +1408,8 @@ class FetchTests(unittest.TestCase):
         )
 
     def test_fetch_empty_window_reads_the_rescue_hint_off_the_listing(self):
-        # The r6 attempt-1-only fetch dropped the document the rescue
-        # hint used to read: with only a red attempt 1 loaded, the
-        # diagnosis told the operator to relax `--conclusion success`
+        # With only a red attempt 1 loaded, a filter-only diagnosis
+        # would tell the operator to relax `--conclusion success`
         # although a greener fix exists. The listing entry already
         # carries that fix -- run 60 listed at attempt 2 green -- so the
         # live diagnosis reads the latest attempt's metadata there and

@@ -1354,9 +1354,8 @@ def listed_passes_filters(entry, args):
 
     The listing describes the run's latest attempt (`conclusion`, `event`,
     `headBranch`), so this judges a rerun by the attempt `--attempts all`
-    would add -- the same judgement the empty-window diagnosis used to
-    read off that attempt's fetched document, now without a `gh run view`
-    for a document the medians never use.
+    would add, from the listing alone: the medians never read that
+    attempt's fetched document, so no `gh run view` is needed for it.
     """
     return all(
         value is None or entry.get(field) == value
@@ -1442,8 +1441,8 @@ def empty_window_diagnosis(args, loaded, window):
     # passes the filters rescues the window even when only attempt 1 was
     # fetched: `--attempts all` would add exactly that listed attempt.
     # Entries share their run's creation time, so the window check uses
-    # the listing's `createdAt`. This listing read answers the probe the
-    # fetch-time view used to: the diagnosis needs no attempt-N document.
+    # the listing's `createdAt`. The diagnosis reads that probe from the
+    # listing, so it needs no attempt-N document.
     listed_rescue = (
         args.attempts == "first" and args.input is None and any(
             listed_passes_filters(entry, args) and listed_in_window(entry, window)
@@ -1743,7 +1742,6 @@ def command_compare(args):
     # the newer days exhaust the limit and silently halve the baseline.
     baseline_loaded = load_run_summaries(args, baseline_window)
     current_loaded = load_run_summaries(args, current_window)
-    runs = baseline_loaded.runs + current_loaded.runs
     baseline = select_runs(baseline_loaded.runs, args, baseline_window)
     current = select_runs(current_loaded.runs, args, current_window)
     baseline_summary = window_summary(baseline)
