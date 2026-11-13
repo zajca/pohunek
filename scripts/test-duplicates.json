@@ -1,6 +1,7 @@
 {
   "artifacts": {
     "macos-lane-junit": "macos",
+    "macos-lane-junit-memory": "macos",
     "macos-tier-junit": "macos",
     "hermes-macos-junit": "macos",
     "nextest-junit-core": "linux",

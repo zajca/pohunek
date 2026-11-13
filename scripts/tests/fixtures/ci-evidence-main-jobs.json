@@ -121,7 +121,12 @@
       "conclusion": "success"
     },
     {
-      "name": "platform contracts (arm64)",
+      "name": "platform contracts (arm64) (disk)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "platform contracts (arm64) (memory)",
       "status": "completed",
       "conclusion": "success"
     },

@@ -1280,6 +1280,8 @@ class SameOsDuplicateTests(unittest.TestCase):
             for artifact in names:
                 if "${{ matrix.shard }}" in artifact:
                     artifacts.update(artifact.replace("${{ matrix.shard }}", shard) for shard in shards)
+                elif "matrix.fixture" in artifact:  # PROBE-ONLY (#2199)
+                    artifacts.update({"macos-lane-junit", "macos-lane-junit-memory"})  # PROBE-ONLY (#2199)
                 else:
                     artifacts.add(artifact)
         config = json.loads((ROOT / "scripts" / "test-duplicates.json").read_text())
@@ -3174,6 +3176,10 @@ class DeltaReuseWiringTests(unittest.TestCase):
                         [f"tests ({shard}, fast)"
                          for shard in partitions_module().FAST_SHARDS],
                     )
+                elif job_id == "platform-contracts":  # PROBE-ONLY (#2199)
+                    fixture_matrix = re.search(r"(?m)^        fixture: \[disk, memory\]$", jobs[job_id])  # PROBE-ONLY (#2199)
+                    self.assertIsNotNone(fixture_matrix)  # PROBE-ONLY (#2199)
+                    self.assertEqual(entry["names"], [f"{name} (disk)", f"{name} (memory)"])  # PROBE-ONLY (#2199)
                 else:
                     self.assertIsNone(matrix)
                     called = re.search(

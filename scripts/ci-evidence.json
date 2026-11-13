@@ -6,7 +6,8 @@
   "tree_match_max_age_days": 14,
   "required_jobs": {
     "main": [
-      "platform contracts (arm64)",
+      "platform contracts (arm64) (disk)",
+      "platform contracts (arm64) (memory)",
       "macOS tier packages (arm64)",
       "macOS release daemon build (macos-15)",
       "macOS package install and upgrade (macos-15)",
@@ -40,7 +41,8 @@
       "cargo-shear (unused dependencies)"
     ],
     "nightly": [
-      "platform contracts (arm64)",
+      "platform contracts (arm64) (disk)",
+      "platform contracts (arm64) (memory)",
       "macOS tier packages (arm64)",
       "macOS release daemon build (macos-15)",
       "macOS package install and upgrade (macos-15)",

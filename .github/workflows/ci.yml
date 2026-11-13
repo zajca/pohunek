@@ -212,6 +212,12 @@ env:
 jobs:
   platform-contracts:
     name: platform contracts (arm64)
+    # PROBE-ONLY (#2199): temporary two fixtures for the memory-backed probe,
+    # removed by the design push. Do not merge this matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [disk, memory]
     # macOS runners are costly (issue #125): run in the main/nightly tiers or
     # on a PR when platform inputs change via the paths filter. A narrowed
     # selection whose lane part selects no lane package skips it (#1225).
@@ -230,11 +236,30 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
       # mold is Linux-only: keep the default linker on macOS runners.
       RUSTFLAGS: -D warnings
+      # PROBE-ONLY (#2199): RAM disk size for the memory leg. Sized from the
+      # lane's peak fixture usage (see issue #2199); macOS runner has 7 GB RAM.
+      POHUNEK_FIXTURE_RAMDISK_MB: "2048"
     steps:
       - uses: actions/checkout@v4
         id: infra-1
         with:
           persist-credentials: false
+
+      # PROBE-ONLY (#2199): attach a RAM disk and point fixtures at it for the
+      # memory leg; the disk leg runs on /private/tmp as today.
+      - name: Attach RAM disk for probe
+        if: ${{ matrix.fixture == 'memory' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          size_blocks=$((POHUNEK_FIXTURE_RAMDISK_MB * 2048))
+          dev=$(hdiutil attach -nomount ram://"$size_blocks")
+          diskutil erasevolume APFS r "$dev"
+          mount_point=$(df /Volumes/r | awk 'NR==2 {print $NF}')
+          test "$mount_point" = "/Volumes/r" || { echo "unexpected mount point: $mount_point" >&2; exit 1; }
+          df -k /Volumes/r | { read header; read line; used=$(echo "$line" | awk '{print $3}'); echo "RAM disk used KiB: $used"; }
+          echo "POHUNEK_TEST_TEMP_ROOT=/Volumes/r" >> "$GITHUB_ENV"
+          echo "probe: fixtures will use /Volumes/r"
 
       - name: Verify native runner architecture
         shell: bash
@@ -405,7 +430,9 @@ jobs:
         id: infra-4
         uses: actions/upload-artifact@v4
         with:
-          name: macos-lane-junit
+          # PROBE-ONLY (#2199): disk leg keeps macos-lane-junit, memory leg
+          # uses macos-lane-junit-memory.
+          name: ${{ matrix.fixture == 'memory' && 'macos-lane-junit-memory' || 'macos-lane-junit' }}
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
       - name: Cancel the run (fail fast)
@@ -3611,7 +3638,7 @@ jobs:
         if: ${{ needs.reuse.outputs.source_run != '' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
+          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-lane-junit-memory,macos-tier-junit,hermes-macos-junit}'
           path: ${{ runner.temp }}/junit
           run-id: ${{ needs.reuse.outputs.source_run }}
           github-token: ${{ github.token }}
@@ -3619,7 +3646,7 @@ jobs:
       - name: Download the run's JUnit reports
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-tier-junit,hermes-macos-junit}'
+          pattern: '{nextest-junit-*,package-junit-*,macos-lane-junit,macos-lane-junit-memory,macos-tier-junit,hermes-macos-junit}'
           path: ${{ runner.temp }}/junit
 
       - name: Check for same-OS duplicates

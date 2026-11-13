@@ -589,6 +589,8 @@ class CiEvidenceCliTests(unittest.TestCase):
             name = name_match.group(1)
             if name == "tests (${{ matrix.shard }}, fast)":
                 workflow_names.update(f"tests ({shard}, fast)" for shard in ("core", "daemon", "cli"))
+            elif name == "platform contracts (arm64)" and "fixture: [disk, memory]" in block:  # PROBE-ONLY (#2199)
+                workflow_names.update([f"{name} (disk)", f"{name} (memory)"])  # PROBE-ONLY (#2199)
             else:
                 workflow_names.add(name)
         for tier in ("main", "nightly"):

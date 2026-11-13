@@ -33,7 +33,7 @@ PINNED_BODY_HASHES = {
   "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
   "macos-release-build": "4da092a45553db6610409afc5b7caeee8aca58e38c99a0166c51e509e691dba9",
   "macos-tier": "b6d5867fa5aeccaf431276e6f6cd1a3e697c5f8cbc7a60f0595a986224c7cc83",
-  "platform-contracts": "55ae47b7a26873956a80608656a74475f7648933b20cb458b7ddce8aa8e82554",
+  "platform-contracts": "ef71ed9e024edfce0cf6f58c575c94c9fad3f5260530421c032ba6b8d9bf2f29",  # PROBE-ONLY (#2199)
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "91fd4a3eba97ea08007c9203aeb3607395904db4fdd4799b799fdb30c98f2b76",

@@ -120,7 +120,8 @@
     },
     "platform-contracts": {
       "names": [
-        "platform contracts (arm64)"
+        "platform contracts (arm64) (disk)",
+        "platform contracts (arm64) (memory)"
       ],
       "selection_dependent": true,
       "consumers": [],
