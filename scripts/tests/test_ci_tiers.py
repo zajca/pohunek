@@ -5,7 +5,6 @@ import collections
 import fnmatch
 import hashlib
 import importlib.machinery
-import contextlib
 import importlib.util
 import json
 import os
@@ -2945,7 +2944,7 @@ def reuse_config() -> dict:
 
 
 def changes_of(event: str) -> dict[str, str]:
-    """Placeholder change outputs for the two shapes Ruling 4 tests."""
+    """Placeholder change outputs for the two reused path shapes."""
     base = {name: "false" for name in (
         "feature_matrix", "macos", "macos_package", "sdk_macos", "hermes_macos",
         "docs_ts", "release", "release_rehearsal", "release_gate", "upgrade")}
@@ -3083,23 +3082,28 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 )))
 
     def check_reused_paths_identical(self, jobs, config, *, job_id, body, legs, use_subtest=True):
-        """Assert one allowlisted job's steps and env behave identically.
+        """Assert one allowlisted job behaves identically on the two reused paths.
 
-        Per Ruling 4 the guard evaluates, for each allowlisted job and each
-        matrix leg with its real value, every step's `if:` (translated,
-        never skipped) and every `env:` value that reads `github.event_name`,
-        `github.event.*`, `inputs.*` or `github.ref*` on the two reused paths:
-        (1) a full-selection `pull_request` run, and (2) a `tier=main`
-        `workflow_dispatch` of the same tree. A step that evaluates to the
-        same truth value on both paths does identical work on the reused
-        evidence; any difference means the PR result is not the dispatch
-        result, and the job must leave the allowlist (or carry a `pairs`
-        entry that proves equality under its condition, Ruling 5(1)).
-        Steps without `if:` still have their `env:` compared; a called
-        workflow is compared via its `with:` inputs."""
+        Every line of the job body (and of its called workflow, if any)
+        that reads `github.event_name`, `github.event.*`, `inputs.*` or
+        `github.ref*` must be accounted for by this guard. A line is
+        accounted for only when the guard evaluated it on both reused
+        paths: (1) a full-selection `pull_request` run, and (2) a
+        `tier=main` `workflow_dispatch` of the same tree, and required
+        the same result. The job-level `if:` is evaluated by the
+        reuse-skip guard; a `save-if:` line (a cache setting, never
+        job work) is an explicit named exemption; a `with:` entry of a
+        called workflow is compared as a value, not a boolean. Any
+        other token-reading line - a step `if:` or `env:` value in
+        any YAML shape, an unnamed step, a quoted or embedded
+        `${{ }}` - fails this guard: the job leaves the allowlist
+        instead of carrying work the guard cannot read. For a paired
+        job the `pull_request` path is evaluated under the pair
+        condition (partner green => `hermes_macos == 'true'`)."""
+        _nullcontext = __import__("contextlib").nullcontext
+
         pairs = config.get("pairs", {})
-        # The reused paths share these needs results and selection outputs:
-        # dependencies succeeded and the selection restricted nothing.
+        tokens = ("github.event_name", "github.event.", "inputs.", "github.ref")
         source_results = {name: "success" for name in reverse_needs()}
         source_results["test-selection"] = "success"
         full_outputs = {"test-selection": {
@@ -3107,154 +3111,265 @@ class DeltaReuseWiringTests(unittest.TestCase):
             "docs_only": "false", "fast_shards": '["core","daemon","cli"]',
             "heavy": "true", "lane": "true",
         }}
-        def parse_env(text, indent):
-            # `indent` is the `env:` key indent; entries sit at indent + 2.
-            block = re.search(
-                rf"(?ms)^{' ' * indent}env:\n((?:{' ' * (indent + 2)}[A-Z_]+: [^\n]*\n)+)", text)
-            if block is None:
-                return {}
-            return dict(re.findall(
-                rf"(?m)^{' ' * (indent + 2)}([A-Z_]+): (.+)$", block.group(1)))
-        workflow_env = parse_env(CI, 0)
-        job_env = parse_env(body, 4)
         pr_changes = dict(changes_of("pull_request"))
         dispatch_changes = dict(changes_of("workflow_dispatch"))
-        # Ruling 5(1): for a paired job the PR path is evaluated under the
-        # pair condition (partner green => hermes_macos == 'true').
         if job_id in pairs:
             pr_changes["hermes_macos"] = "true"
             dispatch_changes["hermes_macos"] = "true"
-        # A called workflow is compared via its `with:` inputs; a job with
-        # `uses:` and no `with:` passes no inputs, so there is nothing to
-        # compare beyond the job's steps.
-        uses = re.search(r"(?m)^    uses: (.+)$", body)
-        with_block = re.search(r"(?ms)^    with:\n((?:      .+\n)+)", body)
-        with_inputs = {}
-        if with_block is not None:
-            for line in with_block.group(1).splitlines():
-                item = re.match(r"      ([a-z_]+): (.+)$", line)
+
+        def lines_with_tokens(text):
+            return [
+                (number, line) for number, line in enumerate(text.splitlines(), 1)
+                if any(token in line for token in tokens)
+            ]
+
+        def unwrap(value):
+            value = value.strip()
+            if value.startswith("${{") and value.endswith("}}"):
+                return value[3:-3].strip()
+            return value
+
+        def entries_under(key, indent, text):
+            """`KEY: value` entries of the block started by `key:` at `indent`."""
+            pattern = re.compile(
+                rf"(?ms)^{' ' * indent}{re.escape(key)}:[ \t]*\n"
+                rf"((?:{' ' * (indent + 2)}[^\n]*\n)+)")
+            found = pattern.search(text)
+            if found is None:
+                return {}
+            entries = {}
+            for entry_line in found.group(1).splitlines():
+                item = re.match(rf"{' ' * (indent + 2)}([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$", entry_line)
                 if item:
-                    with_inputs[item.group(1)] = item.group(2).strip()
-        steps = job_steps(body) if "steps:" in body else {}
-        for step_name, step in list(steps.items()) + [("__job__", None)]:
-            condition = None
-            if step is not None:
-                match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step.strip())
-                if match is not None:
-                    condition = match.group(1) or match.group(2)
-                step_env_map = step_env(step)
-            else:
-                step_env_map = {}
-            # The `failure()`/cancel steps end the run only after a
-            # failure: on the two success paths both evaluate to the same
-            # (no-op) state, so they are compared on the rest of their
-            # condition instead of skipped wholesale.
-            if condition is not None and "failure()" in condition:
-                condition = re.sub(
-                    r"failure\(\)\s*&&\s*", "", condition)
-                condition = re.sub(
-                    r"\s*&&\s*failure\(\)", "", condition)
+                    entries[item.group(1)] = item.group(2).strip()
+            return entries
+
+        workflow_env_entries = entries_under("env", 0, CI)
+        job_env_entries = entries_under("env", 4, body)
+        # A step-level `if:` is any line whose key is `if:` below the
+        # job level; the job-level `if:` (4-space indent) belongs to
+        # the reuse-skip guard. Every other `if:` must be evaluated
+        # here, whatever step shape it sits in (named or not).
+        step_conditions = []
+        for number, line in enumerate(body.splitlines(), 1):
+            match = re.match(r"^( +)if:[ \t]*(.*)$", line)
+            if match is None:
+                continue
+            indent = len(match.group(1))
+            if indent == 4:
+                continue  # job-level `if:`; owned by the reuse-skip guard
+            condition = unwrap(match.group(2))
+            if "failure()" in condition:
+                condition = re.sub(r"failure\(\)\s*&&\s*", "", condition)
+                condition = re.sub(r"\s*&&\s*failure\(\)", "", condition)
                 condition = condition.replace("failure()", "")
-            for shard in legs:
-                with (self.subTest(job=job_id, step=step_name, shard=shard)
-                      if use_subtest else contextlib.nullcontext()):
-                    matrix = {"shard": shard} if shard else {}
-                    # Resolve env values along each path in declaration order.
-                    def resolve(event, tier, changes, base_env):
-                        resolved = {}
-                        for name, expr in base_env.items():
-                            # Only values that read the event, inputs or ref
-                            # need evaluation (Ruling 4); every other ${{ }}
-                            # value (steps.*, needs.*) is identical on the
-                            # two paths by construction and is kept opaque.
-                            if expr.startswith("${{") and expr.endswith("}}") and any(
-                                token in expr for token in (
-                                    "github.event_name", "github.event.", "inputs.",
-                                    "github.ref", "github.ref_name",
-                                )
-                            ):
-                                value = evaluate_needs_expression(
-                                    expr[3:-3].strip(), event=event, tier=tier,
-                                    results=dict(source_results),
-                                    outputs={k: dict(v) for k, v in full_outputs.items()},
-                                    changes=dict(changes), env=dict(resolved),
-                                    matrix=dict(matrix),
-                                )
-                                resolved[name] = (
-                                    value if isinstance(value, str)
-                                    else ("true" if value else "false")
-                                )
-                            else:
-                                resolved[name] = expr.strip().strip('"') if not expr.startswith("${{") else expr
-                        return resolved
-                    merged = dict(workflow_env)
-                    merged.update(job_env)
-                    merged.update(step_env_map)
-                    resolved_pr = resolve("pull_request", "", pr_changes, merged)
-                    resolved_dispatch = resolve("workflow_dispatch", "main", dispatch_changes, merged)
-                    # Compare every env value that reads the event, inputs
-                    # or ref (Ruling 4): a value that differs between the
-                    # paths means the steps do different work.
-                    for name, expr in merged.items():
-                        if any(token in expr for token in (
-                            "github.event_name", "github.event.", "inputs.",
-                            "github.ref", "github.ref_name",
-                        )):
-                            self.assertEqual(
-                                resolved_pr[name], resolved_dispatch[name],
-                                f"env {name!r} of step {step_name!r} of job "
-                                f"{job_id!r} differs between a full-selection "
-                                "pull request and a tier=main dispatch",
+            step_conditions.append((number, condition))
+
+        uses_match = re.search(r"(?m)^    uses:[ \t]*(.+)$", body)
+        called_with = entries_under("with", 4, body) if uses_match is not None else {}
+
+        # Line accounting: every token-reading line must be one the
+        # guard evaluated. Walk every line of the body; classify it.
+        accounted = []  # (line number, label)
+        unaccounted = []
+        body_lines = body.splitlines()
+        for number, line in enumerate(body_lines, 1):
+            if not any(token in line for token in tokens):
+                continue
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip(" "))
+            key = stripped.split(":", 1)[0] if ":" in stripped else ""
+            if key == "if" and indent == 4:
+                accounted.append((number, "job-level if:"))
+                continue
+            if key == "if" and indent > 4:
+                accounted.append((number, "step if:"))
+                continue
+            if key == "env" or key == "with" or key in job_env_entries or key in workflow_env_entries:
+                accounted.append((number, f"{key}: entry"))
+                continue
+            if key == "save-if":
+                accounted.append((number, "save-if: (cache)"))
+                continue
+            if key == "shard" and indent == 8 and stripped.startswith("shard: ${{ fromJSON("):
+                accounted.append((number, "matrix shard: (legs guard)"))
+                continue
+            if key.isupper():
+                # Any other uppercase key is an `env:` entry at an
+                # indentation the cascade did not lift; account for it
+                # only when its value is a whole `${{ }}` expression
+                # (which the step-env comparison evaluates) and the
+                # token is inside that expression.
+                value = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+                if value.startswith("${{") and value.endswith("}}"):
+                    accounted.append((number, f"env entry {key}"))
+                    continue
+            # Everything else is work the guard cannot read. A line
+            # that has a token but no YAML shape this guard evaluated
+            # must remove the job from the allowlist.
+            unaccounted.append((number, stripped[:80]))
+
+        # Called workflow: every token-reading line of the called file
+        # must be accounted for too. `inputs.*` of the called workflow
+        # counts only when the caller passes no `with:` for it, so both
+        # paths run the called default; otherwise the caller input
+        # must have been compared as a value above.
+        if uses_match is not None and uses_match.group(1).strip().startswith("./"):
+            callee_path = uses_match.group(1).strip()
+            if callee_path.startswith("./"):
+                callee_path = callee_path[2:]
+            callee_text = (ROOT / callee_path).read_text()
+            callee_inputs = {}
+            inputs_block = re.search(r"(?ms)^  workflow_call:\n((?:    .+\n)+)", callee_text)
+            if inputs_block is not None:
+                for input_line in inputs_block.group(1).splitlines():
+                    item = re.match(r"      ([a-z_]+):$", input_line)
+                    if item:
+                        callee_inputs[item.group(1)] = None
+            for number, line in lines_with_tokens(callee_text):
+                stripped = line.strip()
+                key = stripped.split(":", 1)[0] if ":" in stripped else ""
+                if key == "save-if":
+                    continue
+                if "inputs." in stripped:
+                    match = re.search(r"inputs\.([a-z_]+)", stripped)
+                    if match is not None and match.group(1) in callee_inputs and match.group(1) not in called_with:
+                        continue
+                if key == "if" or key == "env" or key in ("env", "with"):
+                    unaccounted.append((f"{callee_path}:{number}", stripped[:80]))
+                    continue
+                # Any other token-reading line of a called workflow.
+                unaccounted.append((f"{callee_path}:{number}", stripped[:80]))
+
+        self.assertEqual(
+            unaccounted, [],
+            f"job {job_id!r} reads the event or inputs in a line the guard "
+            f"cannot evaluate; it must leave the allowlist: {unaccounted!r}",
+        )
+
+        for shard in legs:
+            with (self.subTest(job=job_id, shard=shard) if use_subtest else _nullcontext()):
+                matrix = {"shard": shard} if shard else {}
+                merged_env = dict(workflow_env_entries)
+                merged_env.update(job_env_entries)
+                # Step-level env entries belong to the step that sets
+                # them; evaluate each step's env block on its own so an
+                # entry in one step cannot leak into another.
+                for (condition_line, condition) in step_conditions:
+                    pass  # conditions already extracted in order
+                # Workflow + job env cascade, resolved per path.
+                def resolve_path(event, tier, changes, initial):
+                    resolved = dict(initial)
+                    for name, expr in merged_env.items():
+                        if any(token in expr for token in tokens):
+                            value = evaluate_needs_expression(
+                                unwrap(expr), event=event, tier=tier,
+                                results=dict(source_results),
+                                outputs={k: dict(v) for k, v in full_outputs.items()},
+                                changes=dict(changes), env=dict(resolved),
+                                matrix=dict(matrix),
                             )
-                    if condition is not None:
-                        pr_value = bool(evaluate_needs_expression(
-                            condition, event="pull_request", tier="",
-                            results=dict(source_results),
-                            outputs={k: dict(v) for k, v in full_outputs.items()},
-                            changes=dict(pr_changes), env=dict(resolved_pr),
-                            matrix=dict(matrix),
-                        ))
-                        dispatch_value = bool(evaluate_needs_expression(
-                            condition, event="workflow_dispatch", tier="main",
-                            results=dict(source_results),
-                            outputs={k: dict(v) for k, v in full_outputs.items()},
-                            changes=dict(dispatch_changes), env=dict(resolved_dispatch),
-                            matrix=dict(matrix),
-                        ))
+                            resolved[name] = value if isinstance(value, str) else ("true" if value else "false")
+                    return resolved
+                workflow_pr = resolve_path("pull_request", "", pr_changes, {})
+                workflow_dispatch = resolve_path("workflow_dispatch", "main", dispatch_changes, workflow_pr)
+                for name, expr in {**workflow_env_entries, **job_env_entries}.items():
+                    if any(token in expr for token in tokens):
                         self.assertEqual(
-                            pr_value, dispatch_value,
-                            f"step {step_name!r} of job {job_id!r} differs between a "
+                            workflow_pr[name], workflow_dispatch[name],
+                            f"env {name!r} of job {job_id!r} differs between a "
                             "full-selection pull request and a tier=main dispatch",
                         )
-                    # A called workflow carries its `with:` inputs: compare
-                    # each input that reads the event, inputs or ref.
-                    if step is None and uses is not None:
-                        for name, expr in with_inputs.items():
-                            if any(token in expr for token in (
-                                "github.event_name", "github.event.", "inputs.",
-                                "github.ref",
-                            )):
-                                pr_input = str(bool(evaluate_needs_expression(
-                                    expr[3:-3].strip() if expr.startswith("${{") else "",
-                                    event="pull_request", tier="",
-                                    results=dict(source_results),
-                                    outputs={k: dict(v) for k, v in full_outputs.items()},
-                                    changes=dict(pr_changes), env=dict(resolved_pr),
-                                    matrix=dict(matrix),
-                                ))) if expr.startswith("${{") else expr
-                                dispatch_input = str(bool(evaluate_needs_expression(
-                                    expr[3:-3].strip() if expr.startswith("${{") else "",
-                                    event="workflow_dispatch", tier="main",
-                                    results=dict(source_results),
-                                    outputs={k: dict(v) for k, v in full_outputs.items()},
-                                    changes=dict(dispatch_changes), env=dict(resolved_dispatch),
-                                    matrix=dict(matrix),
-                                ))) if expr.startswith("${{") else expr
-                                self.assertEqual(
-                                    pr_input, dispatch_input,
-                                    f"workflow input {name!r} of job {job_id!r} differs "
-                                    "between a pull request and a dispatch",
-                                )
+                # Step env blocks: every `env:` block in the body with
+                # 8-space entries.
+                step_env_blocks = []
+                for block_match in re.finditer(r"(?ms)^( +)env:[ \t]*\n((?: +[^\n]*\n)+)", body):
+                    block_indent = len(block_match.group(1))
+                    entries = {}
+                    for entry_line in block_match.group(2).splitlines():
+                        item = re.match(r"^( +)([A-Za-z_][A-Za-z0-9_]*):[ \t]*(.*)$", entry_line)
+                        if item and len(item.group(1)) == block_indent + 2:
+                            entries[item.group(2)] = item.group(3).strip()
+                    if entries:
+                        step_env_blocks.append(entries)
+                for block_env in step_env_blocks:
+                    block_pr = resolve_path("pull_request", "", pr_changes, dict(workflow_pr))
+                    # Re-resolve step entries against the path env.
+                    for name, expr in block_env.items():
+                        if any(token in expr for token in tokens):
+                            value = evaluate_needs_expression(
+                                unwrap(expr), event="pull_request", tier="",
+                                results=dict(source_results),
+                                outputs={k: dict(v) for k, v in full_outputs.items()},
+                                changes=dict(pr_changes),
+                                env=dict(block_pr), matrix=dict(matrix),
+                            )
+                            block_pr[name] = value if isinstance(value, str) else ("true" if value else "false")
+                        else:
+                            block_pr[name] = expr.strip().strip('\"')
+                    block_dispatch = resolve_path("workflow_dispatch", "main", dispatch_changes, dict(block_pr))
+                    for name, expr in block_env.items():
+                        if any(token in expr for token in tokens):
+                            value = evaluate_needs_expression(
+                                unwrap(expr), event="workflow_dispatch", tier="main",
+                                results=dict(source_results),
+                                outputs={k: dict(v) for k, v in full_outputs.items()},
+                                changes=dict(dispatch_changes),
+                                env=dict(block_dispatch), matrix=dict(matrix),
+                            )
+                            block_dispatch[name] = value if isinstance(value, str) else ("true" if value else "false")
+                        else:
+                            block_dispatch[name] = expr.strip().strip('\"')
+                    for name, expr in block_env.items():
+                        if any(token in expr for token in tokens):
+                            self.assertEqual(
+                                block_pr[name], block_dispatch[name],
+                                f"env {name!r} of job {job_id!r} differs between a "
+                                "full-selection pull request and a tier=main dispatch",
+                            )
+                for condition_line, condition in step_conditions:
+                    pr_value = bool(evaluate_needs_expression(
+                        condition, event="pull_request", tier="",
+                        results=dict(source_results),
+                        outputs={k: dict(v) for k, v in full_outputs.items()},
+                        changes=dict(pr_changes), env=dict(workflow_pr),
+                        matrix=dict(matrix),
+                    ))
+                    dispatch_value = bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results=dict(source_results),
+                        outputs={k: dict(v) for k, v in full_outputs.items()},
+                        changes=dict(dispatch_changes), env=dict(workflow_dispatch),
+                        matrix=dict(matrix),
+                    ))
+                    self.assertEqual(
+                        pr_value, dispatch_value,
+                        f"step condition of job {job_id!r} (line {condition_line}) differs "
+                        "between a full-selection pull request and a tier=main dispatch",
+                    )
+                # Called workflow inputs: compared as values.
+                if called_with:
+                    for name, expr in called_with.items():
+                        if any(token in expr for token in tokens):
+                            pr_value = evaluate_needs_expression(
+                                unwrap(expr), event="pull_request", tier="",
+                                results=dict(source_results),
+                                outputs={k: dict(v) for k, v in full_outputs.items()},
+                                changes=dict(pr_changes), env=dict(workflow_pr),
+                                matrix=dict(matrix),
+                            ) if expr.startswith("${{") else expr
+                            dispatch_value = evaluate_needs_expression(
+                                unwrap(expr), event="workflow_dispatch", tier="main",
+                                results=dict(source_results),
+                                outputs={k: dict(v) for k, v in full_outputs.items()},
+                                changes=dict(dispatch_changes), env=dict(workflow_dispatch),
+                                matrix=dict(matrix),
+                            ) if expr.startswith("${{") else expr
+                            self.assertEqual(
+                                pr_value, dispatch_value,
+                                f"workflow input {name!r} of job {job_id!r} differs "
+                                "between a pull request and a dispatch",
+                            )
 
     def test_no_reused_job_decides_work_on_a_step_level_event_or_input(self):
         jobs = workflow_jobs()
@@ -3269,16 +3384,16 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 jobs, config, job_id=job_id, body=body, legs=list(legs),
             )
 
-    def test_the_ruling4_guard_catches_a_matrix_gated_step(self):
-        # Planted-failure scenario 1 (Ruling 4): a step gated by a matrix
-        # leg and the event differs on one shard; the guard must fail.
+    def test_the_paths_guard_catches_a_matrix_gated_step(self):
+        # Planted-failure scenario 1: a step gated by a matrix leg and
+        # the event differs on one shard; the guard must fail.
         workflow = """name: ci
 jobs:
   example:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        shard: ${{ fromJSON('"core","daemon"') }}
+        shard: ${{ fromJSON('["core","daemon"]') }}
     steps:
       - name: Build
         if: matrix.shard == 'core' && github.event_name != 'pull_request'
@@ -3290,15 +3405,15 @@ jobs:
                                      "consumers": [], "reason": "planted"}}
         config["pairs"] = {}
         body = jobs["example"]
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "differs between"):
             self.check_reused_paths_identical(
                 jobs, config, job_id="example", body=body, legs=["core", "daemon"],
                 use_subtest=False,
             )
 
-    def test_the_ruling4_guard_catches_a_step_env_difference(self):
-        # Planted-failure scenario 2 (Ruling 4): a step env value that reads
-        # the event differs between the two paths; the guard must fail.
+    def test_the_paths_guard_catches_a_step_env_difference(self):
+        # Planted-failure scenario 2: a step env value that reads the
+        # event differs between the two paths; the guard must fail.
         workflow = """name: ci
 jobs:
   example:
@@ -3315,11 +3430,76 @@ jobs:
                                      "consumers": [], "reason": "planted"}}
         config["pairs"] = {}
         body = jobs["example"]
+        with self.assertRaisesRegex(AssertionError, "differs between"):
+            self.check_reused_paths_identical(
+                jobs, config, job_id="example", body=body, legs=[""],
+                use_subtest=False,
+            )
+
+    def test_the_paths_guard_catches_a_quoted_env_value_after_padding(self):
+        # A quoted `${{ }}` env value after descriptor lines: the guard
+        # must fail even though the text is formed like an expression.
+        workflow = """name: ci
+jobs:
+  example:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Build
+        env:
+          # descriptor padding
+          ONLY_PR: "${{ github.event_name == 'pull_request' }}"
+        run: echo hi
+"""
+        jobs = workflow_jobs(workflow)
+        config = reuse_config()
+        config["jobs"] = {"example": {"names": ["example"], "selection_dependent": False,
+                                     "consumers": [], "reason": "planted"}}
+        config["pairs"] = {}
+        body = jobs["example"]
         with self.assertRaises(AssertionError):
             self.check_reused_paths_identical(
                 jobs, config, job_id="example", body=body, legs=[""],
                 use_subtest=False,
             )
+
+    def test_the_paths_guard_catches_an_unnamed_step(self):
+        # An unnamed `uses:` step with an event `if:`: the guard must
+        # fail; it may not skip steps that have no name.
+        workflow = """name: ci
+jobs:
+  example:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name != 'pull_request'
+        run: echo hi
+"""
+        jobs = workflow_jobs(workflow)
+        config = reuse_config()
+        config["jobs"] = {"example": {"names": ["example"], "selection_dependent": False,
+                                     "consumers": [], "reason": "planted"}}
+        config["pairs"] = {}
+        body = jobs["example"]
+        with self.assertRaisesRegex(AssertionError, "differs between"):
+            self.check_reused_paths_identical(
+                jobs, config, job_id="example", body=body, legs=[""],
+                use_subtest=False,
+            )
+
+    def test_the_paths_guard_catches_the_skip_owned_by_case_without_pairs(self):
+        # `platform-contracts` without `pairs` sets `SKIP_OWNED_BY` to
+        # `''` on a pull request and `'hermes-macos'` on a dispatch;
+        # the guard must fail with the env-difference cause.
+        jobs = workflow_jobs()
+        config = reuse_config()
+        config["pairs"] = {}
+        body = jobs["platform-contracts"]
+        with self.assertRaisesRegex(AssertionError, "differs between"):
+            self.check_reused_paths_identical(
+                jobs, config, job_id="platform-contracts", body=body, legs=[""],
+                use_subtest=False,
+            )
+
     def test_every_selection_reading_job_is_selection_dependent(self):
         # A job that reads `needs.test-selection.outputs`, downloads the
         # `test-selection` artifact, or passes `--selection` narrows on a
@@ -3372,8 +3552,9 @@ jobs:
         # Contract row 13: a `failure` or `cancelled` result of a reused
         # leg fails the verdict, even when the reuse clause would excuse
         # a `skipped` result. Evaluate each verdict step that checks a
-        # reusable job: with the leg's result set to `failure`/`cancelled`
-        # and the leg in the reuse skip list, the step must trigger.
+        # reusable job on the dispatch path (event `workflow_dispatch`,
+        # tier `main`, the leg in the reuse skip list): with the leg's
+        # result set to `failure` or `cancelled` the step must trigger.
         jobs = workflow_jobs()
         verdict_body = jobs["test-selection-verdict"]
         steps = job_steps(verdict_body)
@@ -3387,50 +3568,41 @@ jobs:
             reusable = sorted(checked & set(reuse_config()["jobs"]))
             if not reusable:
                 continue
-            # A `failure` result is never excused for any reusable job.
-            # `cancelled` is additionally pinned where the verdict step
-            # spells it out (e.g. `test-selection-check`); other steps
-            # excuse a cancelled leg exactly like a skipped one, which the
-            # ci-evidence side refuses anyway (L6: the run is not success).
             for job_id in reusable:
-                for result in ("failure",):
+                for result in ("failure", "cancelled"):
                     with self.subTest(step=step_name, job=job_id, result=result):
                         results = {name: "success" for name in reverse_needs()}
                         results[job_id] = result
-                        outputs = {"reuse": {"skip": skip_list}}
-                        # The Hermes verdict step only applies when the lane
-                        # skipped the Hermes module, which requires
-                        # hermes_macos == 'true' on this path.
-                        changes = dict(changes_of("pull_request"))
+                        changes = dict(changes_of("workflow_dispatch"))
                         if job_id == "hermes-compatibility-macos":
                             changes["hermes_macos"] = "true"
                         value = bool(evaluate_needs_expression(
-                            condition, event="pull_request", tier="",
+                            condition, event="workflow_dispatch", tier="main",
                             results=dict(results),
-                            outputs={k: dict(v) for k, v in outputs.items()},
+                            outputs={"reuse": {"skip": skip_list}},
                             changes=changes,
+                            reuse_skip=[job_id],
                         ))
                         self.assertTrue(
                             value,
                             f"verdict step {step_name!r} must fail the run when "
                             f"reused job {job_id!r} is {result}",
                         )
-                if f"needs.test-selection-check.result == 'cancelled'" in condition:
-                    for result in ("cancelled",):
-                        with self.subTest(step=step_name, result=result):
-                            results = {name: "success" for name in reverse_needs()}
-                            results["test-selection-check"] = result
-                            value = bool(evaluate_needs_expression(
-                                condition, event="pull_request", tier="",
-                                results=dict(results),
-                                outputs={"reuse": {"skip": skip_list}},
-                                changes=dict(changes_of("pull_request")),
-                            ))
-                            self.assertTrue(
-                                value,
-                                f"verdict step {step_name!r} must fail the run when "
-                                f"test-selection-check is {result}",
-                            )
+            if "needs.test-selection-check.result == 'cancelled'" in condition:
+                with self.subTest(step=step_name, result="cancelled"):
+                    results = {name: "success" for name in reverse_needs()}
+                    results["test-selection-check"] = "cancelled"
+                    value = bool(evaluate_needs_expression(
+                        condition, event="workflow_dispatch", tier="main",
+                        results=dict(results),
+                        outputs={"reuse": {"skip": skip_list}},
+                        changes=dict(changes_of("workflow_dispatch")),
+                    ))
+                    self.assertTrue(
+                        value,
+                        f"verdict step {step_name!r} must fail the run when "
+                        f"test-selection-check is cancelled",
+                    )
         # The reuse job itself failing must also fail the verdict: evaluate
         # the `needs.reuse.result == 'failure'` step, not just substring.
         reuse_step = steps["Fail the verdict when the reuse job failed"]
@@ -3438,15 +3610,15 @@ jobs:
         self.assertIsNotNone(match)
         condition = match.group(1)
         value = bool(evaluate_needs_expression(
-            condition, event="pull_request", tier="",
+            condition, event="workflow_dispatch", tier="main",
             results={"reuse": "failure"},
             outputs={"reuse": {"skip": "[]"}},
-            changes=dict(changes_of("pull_request")),
+            changes=dict(changes_of("workflow_dispatch")),
         ))
         self.assertTrue(value, "a failed reuse job must fail the verdict")
 
     def test_the_duplicates_step_counts_both_runs_reports(self):
-        # r1 M2: the mixed directory counts each report once because the
+        # The mixed directory counts each report once because the
         # source-run download runs first (into the same directory WITHOUT
         # merge-multiple, so same-name reports overwrite) and this run's
         # download runs after it. The source download must be gated on the

@@ -513,11 +513,6 @@ elif endpoint.endswith("/artifacts"):
 elif "/jobs" in endpoint:
     print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get("777", [])}]))
 elif "/zip" in endpoint:
-    # Behave like a 120 s hang: exit after simulating latency would be too
-    # slow; instead the fake `gh` prints the not-found marker and the real
-    # TimeoutExpired path is covered by the `subprocess.run(..., timeout=120)`
-    # catch in download_artifact. Here we exercise the missing-unzip /
-    # fetch-failure arm: non-zero exit gives skip=[] via narrowed is None.
     raise SystemExit(1)
 else:
     raise SystemExit("unexpected " + repr(endpoint))
@@ -527,6 +522,35 @@ else:
                                               {"name": "test-selection", "id": 2, "expired": False}]}}
         self.fixture.write_text(json.dumps(fixture))
         rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outputs()["skip"], "[]")
+
+    def test_a_real_download_timeout_gives_an_empty_skip_with_exit_zero(self):
+        # Row 11: the artifact list is good but the `test-selection` zip
+        # download raises TimeoutExpired. Patch `subprocess.run` in
+        # process for the zip call so the scenario raises without a
+        # real wait; `download_artifact` must catch it and reuse nothing.
+        import subprocess as subprocess_module
+        fixture = {"runs": [run_doc()], "jobs_by_run": {"777": green_jobs()}, "artifacts": {},
+                   "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False},
+                                              {"name": "test-selection", "id": 2, "expired": False}]}}
+        self.fixture.write_text(json.dumps(fixture))
+        fixture_text = self.fixture.read_text()
+
+        original_run = subprocess_module.run
+
+        def fake_run(*args, **kwargs):
+            command = args[0] if args else kwargs.get("args", [])
+            command_text = " ".join(str(part) for part in (command or []))
+            if "/zip" in command_text:
+                raise subprocess_module.TimeoutExpired(command, timeout=120)
+            return original_run(*args, **kwargs)
+
+        subprocess_module.run = fake_run
+        try:
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            subprocess_module.run = original_run
         self.assertEqual(rc, 0)
         self.assertEqual(self.outputs()["skip"], "[]")
 
@@ -562,6 +586,26 @@ else:
         self.assertNotIn("platform-contracts", skip)
         self.assertNotIn("hermes-compatibility-macos", skip)
         self.assertIn("test", skip)
+
+    def test_a_paired_partner_is_dropped_without_its_lane(self):
+        # Reverse pairs direction: a narrowed source never reuses the
+        # lane, so a green Hermes job in that source leaves `skip`
+        # too (its consumer `macos-release-build` then runs).
+        jobs = [current for current in green_jobs() if current["name"] != "Platform contracts"]
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("narrowed")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertNotIn("hermes-compatibility-macos", skip)
+        self.assertNotIn("macos-release-build", skip)
 
     def test_a_paired_lane_is_kept_with_its_hermes_partner(self):
         # When both the lane and the Hermes job are green in a full source,

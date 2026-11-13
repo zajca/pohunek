@@ -223,7 +223,7 @@ elif endpoint.endswith("/artifacts"):
             })
         else:
             artifacts.append({"name": entry})
-    # The real `gh` honours the pagination flags (r2 M4, r3 L8): `--paginate
+    # The real `gh` honours the pagination flags: `--paginate
     # --slurp` prints a JSON array of page objects, bare `--paginate`
     # concatenates them, and neither prints the whole list at once. A
     # script that drops the flags gets a single page object and must fail
@@ -231,8 +231,6 @@ elif endpoint.endswith("/artifacts"):
     page = {"artifacts": artifacts}
     if "--paginate" in args and "--slurp" in args:
         print(json.dumps([page]))
-    elif "--paginate" in args:
-        print(json.dumps(page))
     else:
         print(json.dumps(page))
 elif "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
@@ -1347,7 +1345,7 @@ jobs:
 
     def test_a_reuse_union_on_the_tree_path_is_accepted_and_refused(self):
         # The tree-matching dispatch run carries the reuse record; its union
-        # decides like the exact-commit path (r1 M8 scenario). The source
+        # decides like the exact-commit path. The source
         # run and the dispatch run share one commit (OTHER_SHA — the
         # branch head); the candidate SHA only names its tree.
         union_fixture(self)

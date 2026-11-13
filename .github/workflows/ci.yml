@@ -918,7 +918,7 @@ jobs:
           # A delta dispatch reuses the newest same-tree pull request run
           # within 24 hours, and reads its selection record; keep it alive.
           retention-days: 2
-          if-no-files-found: error
+          if-no-files-found: warn
 
   # Finds the newest same-tree pull request run and decides which jobs
   # a delta dispatch reuses from it (issue #2203). Runs only on a tier=main

@@ -309,8 +309,8 @@ def decide(
     now: datetime.datetime,
     sha: str,
     repo: str,
-) -> tuple[list[str], dict | None, str]:
-    """The skip list, the source run, and why not (`""` when reused)."""
+) -> tuple[list[str], dict | None, str, dict[str, str]]:
+    """The skip list, the source run, a global reason, per-job reasons."""
     window = datetime.timedelta(hours=config["max_age_hours"])
     candidates = [
         run for run in runs
@@ -329,7 +329,7 @@ def decide(
         try:
             names = artifact_names(repo, run["id"])
         except ReuseError as error:
-            return [], None, f"cannot list artifacts of run {run['id']}: {error}"
+            return [], None, f"cannot list artifacts of run {run['id']}: {error}", {}
         trees = {
             match.group(1)
             for name in names
@@ -340,76 +340,94 @@ def decide(
         try:
             jobs = run_jobs(repo, run["id"])
         except ReuseError as error:
-            return [], None, f"cannot list jobs of run {run['id']}: {error}"
+            return [], None, f"cannot list jobs of run {run['id']}: {error}", {}
         by_name: dict[str, list[dict]] = {}
         for job in jobs:
             by_name.setdefault(job.get("name", ""), []).append(job)
         narrowed: bool | None = None
         skip: list[str] = []
+        reasons: dict[str, str] = {}
         for job_id, job in config["jobs"].items():
             legs = []
+            missing = False
             for name in job["names"]:
                 attempts = by_name.get(name, [])
                 if not attempts:
                     legs = []
+                    missing = True
                     break
                 newest = max(attempts, key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)))
                 legs.append(newest)
-            if len(legs) != len(job["names"]):
+            if missing or len(legs) != len(job["names"]):
+                reasons[job_id] = "no green leg in the source run"
                 continue
             if any(leg.get("conclusion") != "success" for leg in legs):
+                reasons[job_id] = "a leg did not succeed in the source run"
                 continue
             completed = [parse_time(leg.get("completed_at")) for leg in legs]
             if any(moment is None or now - moment > window for moment in completed):
+                reasons[job_id] = "a leg is older than the reuse window"
                 continue
             if job["selection_dependent"]:
                 if narrowed is None:
                     narrowed = source_selection_narrowed(repo, run["id"])
                     if narrowed is None:
-                        return [], None, f"cannot read the selection of run {run['id']}"
+                        return [], None, f"cannot read the selection of run {run['id']}", {}
                 if narrowed:
+                    reasons[job_id] = "the source selection was narrowed"
                     continue
             skip.append(job_id)
         skip_set = set(skip)
+        closure_reasons: dict[str, str] = {}
         # Closure to a fixed point, pairs included: a pair member is reused
-        # only together with its partner, so the member whose partner is
-        # out leaves; a producer whose consumer is out leaves too. Both
-        # rules only remove jobs, and the pair rules drop both members when
-        # either is out (see the `pairs` guard below).
+        # only when its partner is reused too, and the partner only when
+        # the member is, so either member out drops both; a producer whose
+        # consumer is out leaves too (the consumer runs). Both rules only
+        # remove jobs.
         changed = True
         while changed:
             changed = False
             for job_id, partner in config["pairs"].items():
                 if job_id in skip_set and partner not in skip_set:
                     skip_set.discard(job_id)
+                    closure_reasons.setdefault(job_id, f"its pair partner {partner} is not reused")
                     changed = True
                 if partner in skip_set and job_id not in skip_set:
                     skip_set.discard(partner)
+                    closure_reasons.setdefault(partner, f"its pair partner {job_id} is not reused")
                     changed = True
             for job_id in list(skip_set):
                 consumers = config["jobs"][job_id]["consumers"]
                 if any(consumer not in skip_set for consumer in consumers):
                     skip_set.discard(job_id)
+                    outside = [consumer for consumer in consumers if consumer not in skip_set]
+                    closure_reasons.setdefault(job_id, f"consumer {outside[0] if outside else 'unknown'} is not reused")
                     changed = True
         ordered = [job_id for job_id in config["jobs"] if job_id in skip_set]
         if not ordered:
-            return [], None, "no same-tree green pull request run"
-        return ordered, run, ""
-    return [], None, "no same-tree pull request run"
+            return [], None, "no same-tree green pull request run", reasons
+        return (ordered, run, "", reasons | closure_reasons)
+    return [], None, "no same-tree pull request run", {}
 
 
-def summarize(config: dict, skip: list[str], source: dict | None, reason: str) -> str:
+def summarize(
+    config: dict,
+    skip: list[str],
+    source: dict | None,
+    reason: str,
+    job_reasons: dict[str, str] | None = None,
+) -> str:
     lines = ["| job | decision |", "| --- | --- |"]
     link = f"[run {source['id']}]({source.get('html_url')})" if source else "none"
     for job_id in config["jobs"]:
         if job_id in skip and source is not None:
             lines.append(f"| {job_id} | reused from {link} |")
+        elif job_reasons and job_id in job_reasons:
+            lines.append(f"| {job_id} | runs: {job_reasons[job_id]} |")
+        elif reason:
+            lines.append(f"| {job_id} | runs ({reason}) |")
         else:
-            lines.append(
-                f"| {job_id} | runs ({reason}) |"
-                if reason
-                else f"| {job_id} | runs here |"
-            )
+            lines.append(f"| {job_id} | runs here |")
     return "\n".join(lines)
 
 
@@ -443,9 +461,12 @@ def main(now: datetime.datetime | None = None) -> int:
         warn(f"cannot list candidate runs: {error}; running everything")
         runs = []
         listed = False
+    job_reasons: dict[str, str] = {}
     if runs:
         try:
-            skip, source, reason = decide(config, tree, runs, moment, sha, repo)
+            skip, source, reason, job_reasons = decide(
+                config, tree, runs, moment, sha, repo,
+            )
         except ReuseError as error:
             warn(str(error))
             skip, source, reason = [], None, str(error)
@@ -517,10 +538,10 @@ def main(now: datetime.datetime | None = None) -> int:
     if summary:
         with open(summary, "a") as stream:
             stream.write(f"### Delta reuse (tree `{tree}`)\n\n")
-            stream.write(summarize(config, skip, source, reason))
+            stream.write(summarize(config, skip, source, reason, job_reasons))
             stream.write("\n")
     else:
-        print(summarize(config, skip, source, reason))
+        print(summarize(config, skip, source, reason, job_reasons))
     record_name = f"ci-reuse-{tree}"
     record_path = Path(os.environ["RUNNER_TEMP"]) / f"{record_name}.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n")

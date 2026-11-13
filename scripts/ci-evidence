@@ -589,7 +589,7 @@ def verify_reuse(
     The required jobs that are `skipped` in the evidence run and named in its
     `ci-reuse-<tree>` record are verified against the source run's API data:
     the source run exists in this repository, ran on an allowed event with
-    `head_sha` of the candidate, recorded the candidate's tree, and has every
+    `head_sha` of the evidence run's commit, recorded the tree, and has every
     named leg green and fresh, with every required step of a reused job
     passed. Returns the reused display names, the union failures, and the
     `reused_from` record. Without a reuse artifact there is no union: empty
@@ -1056,9 +1056,8 @@ def tree_evidence(
             reused_from = None
             if recorded == {tree} and failures and run.get("conclusion") == "success":
                 jobs = get_jobs(args.repo, run["id"])
-                # The source run and the dispatch run share one commit (the
-                # owner policy: ci-reuse requires head_sha == GITHUB_SHA);
-                # the candidate SHA is only for the tree.
+                # ci-reuse skips only jobs the newest same-commit pull request
+                # run has green, so the source run shares this run's commit.
                 reused, reuse_failures, reused_from, alias = verify_reuse(
                     args.repo, run, config, args.tier, run["head_sha"], cache, jobs
                 )

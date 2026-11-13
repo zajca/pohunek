@@ -201,13 +201,15 @@ dispatch (`delta: false`) stays the default, and `scripts/release` keeps
 dispatching full runs. A job that `needs:` a reusable
 job but that can never run on a tier=main dispatch is not a reuse consumer:
 such jobs are listed in the config's `not_dispatch_consumers` with the reason,
-and the guards derive the restriction from the workflow rather than this text.
-`pairs` names a job that is reused only together with its partner (see
+such a job's own `if:` restricts it to events that cannot run the
+dispatch.
+`pairs` names a job pair that is reused only together, in either direction (see
 `scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
 run and the recorded source run as evidence for the commit, and names both
 runs in its report. For the dynamic-matrix `fast-tests` job the allowlist names
 every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
-the workflow plans), so a narrowed source never reuses any of them.
+the workflow plans); such a job is `selection_dependent`, so a narrowed
+source never reuses any of them.
 
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the
