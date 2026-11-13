@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import importlib.machinery
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -1598,9 +1599,11 @@ class FailFastTests(unittest.TestCase):
                 self.assertNotIn("cancelled()", step, f"{name} {step_name}")
 
     def test_the_condition_pair_over_the_case_table(self):
-        # The two `if:` texts over the four cases: a code failure, a failed
-        # infra step, an exhausted ci-retry marker, and a push event. On a
-        # pull request the two never hold at once; on a push neither holds.
+        # The two `if:` texts over the five-row case table (a code failure,
+        # a failed first infra step, every infra step failed, an exhausted
+        # ci-retry marker, a push event), and the pull-request property:
+        # on a pull request exactly one of the two holds for every subset
+        # of failed infra ids with the marker unset or set.
         def evaluate(expression, *, event, marker, failed_infra, ids):
             # failure() holds (a step failed); the infra clause model:
             # the marker is set, and each infra id reads failure only
@@ -1640,10 +1643,15 @@ class FailFastTests(unittest.TestCase):
                     note = evaluate(notice, event=event, marker=marker, failed_infra=failed_infra, ids=ids)
                     self.assertEqual((cancel, note), (expect_cancel, expect_notice),
                                      f"{name} marker={marker!r} infra={sorted(failed_infra)} event={event}")
-                    if event == "pull_request":
-                        # On a pull request exactly one of the two holds:
-                        # the run cancels or it records the infra tag.
-                        self.assertTrue(cancel != note, f"{name}: cancel={cancel} notice={note} on pull_request")
+                for marker in ("", "cargo-fetch"):
+                    for size in range(len(ids) + 1):
+                        for failed in itertools.combinations(ids, size):
+                            failed_infra = set(failed)
+                            cancel = evaluate(ff, event="pull_request", marker=marker, failed_infra=failed_infra, ids=ids)
+                            note = evaluate(notice, event="pull_request", marker=marker, failed_infra=failed_infra, ids=ids)
+                            self.assertNotEqual(cancel, note,
+                                                f"{name} marker={marker!r} infra={sorted(failed_infra)}: "
+                                                "exactly one of cancel/notice must hold on pull_request")
 
     def test_the_composite_cancels_the_run_and_fails_soft(self):
         action = (ROOT / ".github" / "actions" / "cancel-run" / "action.yml").read_text()
@@ -3396,7 +3404,9 @@ class DeltaReuseWiringTests(unittest.TestCase):
         # the same line in a non-allowlisted job passes; a line in
         # upgrade.yml fails; a pin updated without the evaluation table
         # (here: body pin refreshed by hashing the edited body) fails
-        # on the new token line.
+        # on the new token line; a line in the preamble fails the
+        # preamble pin, and after a re-hash a header comment that
+        # contains `jobs:` does not move the cut above `env:`.
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
         config = reuse_config()
 
@@ -3487,18 +3497,26 @@ class DeltaReuseWiringTests(unittest.TestCase):
             self.check_preamble_matches(edited_pre)
         finally:
             reuse_pins.PINNED_PREAMBLE = original_preamble
-
-    def test_split_preamble_cuts_at_the_jobs_line(self):
-        # A `jobs:` substring above the section (for example in a header
-        # comment) stays in the preamble; the section line itself does not.
-        text = ("# the test jobs: fast, heavy\n"
-                "on: pull_request\n"
-                "jobs:\n"
-                "  test:\n")
-        self.assertEqual(
-            reuse_pins.split_preamble(text),
-            "# the test jobs: fast, heavy\non: pull_request\n",
-        )
+        # A header comment holding `jobs:` does not move the cut: the
+        # checked-in pin fails on the comment, the re-hashed pin accepts
+        # it, and the re-hashed pin still fails on the env line below it.
+        headed = "# the test jobs: fast, heavy\n" + ci_text
+        with self.assertRaisesRegex(AssertionError, "preamble.*changed"):
+            self.check_preamble_matches(headed)
+        rehashed = reuse_pins.pinned_hash(reuse_pins.split_preamble(headed))
+        try:
+            reuse_pins.PINNED_PREAMBLE = rehashed
+            self.check_preamble_matches(headed)
+            planted_headed = headed.replace(
+                '  TEST_SELECTION_SPARSE: "false"\n',
+                '  TEST_SELECTION_SPARSE: "false"\n  PLANTED: "never"\n',
+                1,
+            )
+            self.assertNotEqual(planted_headed, headed)
+            with self.assertRaisesRegex(AssertionError, "preamble.*changed"):
+                self.check_preamble_matches(planted_headed)
+        finally:
+            reuse_pins.PINNED_PREAMBLE = original_preamble
 
     def held_lines_of_allowlisted_jobs(self, config, jobs):
         """Run the pin and table check of every allowlisted job; return its held lines."""
