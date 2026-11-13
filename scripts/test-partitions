@@ -210,8 +210,10 @@ def owned_packages(owner):
 def shard_plan(selection):
     """The CI test jobs a selection runs: the fast shards and heavy.
 
-    A fast shard runs when it owns a selected package, and core also runs for
-    the script regressions its job carries. The heavy job runs whenever a
+    A fast shard runs when it owns a selected package. The script
+    regressions left the `core` shard for their own job (`script-tests`),
+    so `script_tests` no longer pulls `core` in: the new job follows
+    `selection["script_tests"]` itself. The heavy job runs whenever a
     package it holds tests of may be selected; which of its tests run is the
     selection's filterset.
     """
@@ -234,8 +236,6 @@ def shard_plan(selection):
         next((shard for shard, owned in owners.items() if name in owned), "core")
         for name in names
     }
-    if selection.get("script_tests") is True:
-        shards.add("core")
     return {
         "fast_shards": [shard for shard in FAST_SHARDS if shard in shards],
         "heavy": bool(names),
@@ -350,6 +350,42 @@ def validate_coverage(universe, selections, planned=None):
         )
 
 
+def parse_part(text):
+    """The `(index, total)` of a `--part K/N` argument; raises ValueError."""
+    try:
+        index_text, total_text = text.split("/")
+        index, total = int(index_text), int(total_text)
+    except ValueError:
+        raise ValueError(f"--part is not K/N: {text!r}") from None
+    if not 1 <= index <= total or total < 1:
+        raise ValueError(f"--part is not K/N with 1 <= K <= N: {text!r}")
+    return index, total
+
+
+def part_partition(index, total):
+    """The nextest `--partition` value splitting the heavy list into N parts."""
+    return f"hash:{index}/{total}"
+
+
+def validate_part_union(heavy_tests, part_lists):
+    """Require the heavy part lists to partition `heavy_tests` exactly.
+
+    The parts' listed tests, unioned, must equal the heavy list, with none
+    in two parts: a part that silently dropped or duplicated a test would
+    otherwise pass its own run.
+    """
+    counts = collections.Counter(test for tests in part_lists for test in tests)
+    union = set(counts)
+    missing = heavy_tests - union
+    extra = union - heavy_tests
+    overlap = {test for test, count in counts.items() if count != 1}
+    if missing or extra or overlap:
+        raise ValueError(
+            f"heavy partition failed: missing={sorted(missing)}, "
+            f"extra={sorted(extra)}, overlap={sorted(overlap)}"
+        )
+
+
 # nextest's default `[store] dir`, relative to the workspace root. It does not
 # follow CARGO_TARGET_DIR.
 DEFAULT_STORE_DIR = "target/nextest"
@@ -458,18 +494,20 @@ def nextest_command(subcommand, profile, archive):
     ]
 
 
-def list_document(expression=None, archive=None, run_ignored="all", profile="ci"):
-    """nextest's JSON test list of `expression`."""
+def list_document(expression=None, archive=None, run_ignored="all", profile="ci", partition=None):
+    """nextest's JSON test list of `expression`, optionally of one `--partition` part."""
     command = nextest_command("list", profile, archive)
     command.extend(["--run-ignored", run_ignored, "--message-format", "json"])
+    if partition is not None:
+        command.extend(["--partition", partition])
     if expression is not None:
         command.extend(["-E", expression])
     result = subprocess.run(command, cwd=ROOT, check=True, stdout=subprocess.PIPE)
     return json.loads(result.stdout)
 
 
-def inventory(expression=None, archive=None, run_ignored="all", profile="ci"):
-    return selected_tests(list_document(expression, archive, run_ignored, profile))
+def inventory(expression=None, archive=None, run_ignored="all", profile="ci", partition=None):
+    return selected_tests(list_document(expression, archive, run_ignored, profile, partition))
 
 
 class Process:
@@ -711,6 +749,18 @@ def main():
         "--report-dir", type=Path,
         help="audit-sparse only: receives summary.md and each run's JUnit report",
     )
+    parser.add_argument(
+        "--part", default=None,
+        help="run heavy only: run one heavy part as K/N (for example 1/3), "
+        "passed to nextest as `--partition hash:K/N`; the number of parts "
+        "comes from the argument itself, never from a literal in this script",
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="run heavy --part 1/N only: verify the whole partition and the "
+        "part union first, then run part 1; the part-1 job extracts the "
+        "archive exactly once and a failed check fails before any test",
+    )
     args = parser.parse_args()
     if args.skip_owned_by is not None and args.action not in MACOS_RUN_SETS:
         parser.error("--skip-owned-by applies to run-macos and run-macos-tier only")
@@ -727,6 +777,18 @@ def main():
         print(f"heavy={str(plan['heavy']).lower()}")
         print(f"lane={str(plan['lane']).lower()}")
         return
+    part = None
+    if args.part is not None or args.check:
+        if args.action != "run" or args.shard != "heavy":
+            parser.error("--part and --check apply to run heavy only")
+        if args.part is None:
+            parser.error("--check needs --part 1/N: only part 1 checks before it runs")
+        try:
+            part = parse_part(args.part)
+        except ValueError as error:
+            parser.error(str(error))
+        if args.check and part[0] != 1:
+            parser.error("--check runs on part 1 only: later parts run their tests alone")
     selection = plan = None
     if args.selection is not None:
         if args.action not in ("run", "check", "run-macos"):
@@ -778,23 +840,7 @@ def main():
     if args.action == "check":
         if args.shard is not None:
             parser.error("check verifies all shards; do not specify one")
-        if selection is None or selection["mode"] == "full":
-            universe = inventory(archive=archive)
-            selections = {name: inventory(expressions[name], archive) for name in SHARDS}
-            validate_coverage(universe, selections)
-        elif selection["mode"] == "none":
-            print("Coverage OK: the selection runs no Rust test")
-            return
-        else:
-            universe = inventory(selection["filterset"], archive)
-            selections = {
-                name: inventory(selected_expression(expressions[name], selection), archive)
-                for name in SHARDS
-            }
-            validate_coverage(universe, selections, planned_shards(plan))
-        for name, tests in selections.items():
-            print(f"{name}: {len(tests)} tests")
-        print(f"Coverage OK: {len(universe)} tests selected exactly once (including ignored tests)")
+        verify_coverage(expressions, archive, selection, plan)
         return
     if args.shard is None:
         parser.error("run and filter require a shard")
@@ -808,11 +854,69 @@ def main():
         if expression is None:
             print(f"test-partitions run: the selection runs no Rust test of {args.shard}")
             return
+    partition = None
+    if part is not None:
+        index, total = part
+        partition = part_partition(index, total)
+        if args.check:
+            # Part 1 checks first in this same process: the full partition
+            # exactly as `check` would, plus the proof that the N parts'
+            # listed heavy tests, unioned, equal the heavy list. The
+            # extracted archive is then reused for the part's own run, so
+            # the job extracts exactly once and a failed check fails before
+            # any test runs.
+            _, selections = verify_coverage(expressions, archive, selection, plan)
+            heavy_tests = selections["heavy"]
+            heavy_expression = expressions["heavy"]
+            if selection is not None:
+                heavy_expression = selected_expression(heavy_expression, selection)
+            part_lists = [
+                inventory(heavy_expression, archive, partition=part_partition(n, total))
+                for n in range(1, total + 1)
+            ]
+            try:
+                validate_part_union(heavy_tests, part_lists)
+            except ValueError as error:
+                print(f"error: {error}", file=sys.stderr)
+                sys.exit(1)
+            print(f"heavy parts OK: {total} parts hold {len(heavy_tests)} tests exactly once")
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
     # A shard may hold none of a narrowed selection's tests.
     run_nextest(profile, expression, archive,
-                no_tests_pass=selection is not None and selection["mode"] == "packages")
+                no_tests_pass=selection is not None and selection["mode"] == "packages",
+                partition=partition)
+
+
+def verify_coverage(expressions, archive, selection, plan):
+    """Verify the whole partition exactly as the `check` action does.
+
+    Lists the universe and every shard from the archive (extracting it on the
+    first list) and requires each test exactly once. Shared by `check` and by
+    `run heavy --part 1/N --check`, so the part-1 job proves the partition
+    in the same process that then runs its part.
+
+    Returns the universe and the per-shard selections, so a caller proving
+    the heavy part union reuses the heavy list instead of listing twice.
+    """
+    if selection is None or selection["mode"] == "full":
+        universe = inventory(archive=archive)
+        selections = {name: inventory(expressions[name], archive) for name in SHARDS}
+        validate_coverage(universe, selections)
+    elif selection["mode"] == "none":
+        print("Coverage OK: the selection runs no Rust test")
+        return set(), {}
+    else:
+        universe = inventory(selection["filterset"], archive)
+        selections = {
+            name: inventory(selected_expression(expressions[name], selection), archive)
+            for name in SHARDS
+        }
+        validate_coverage(universe, selections, planned_shards(plan))
+    for name, tests in selections.items():
+        print(f"{name}: {len(tests)} tests")
+    print(f"Coverage OK: {len(universe)} tests selected exactly once (including ignored tests)")
+    return universe, selections
 
 
 def check_macos(archive, scope):
@@ -964,10 +1068,13 @@ def audit_sparse(archive, selector, report_dir):
         sys.exit(1)
 
 
-def run_nextest(profile, expression, archive, no_tests_pass=False):
+def run_nextest(profile, expression, archive, no_tests_pass=False, partition=None):
     """Run `expression` under `profile` and exit with nextest's status.
 
-    `no_tests_pass` lets a run that matches no test succeed.
+    `no_tests_pass` lets a run that matches no test succeed. `partition`
+    restricts the run to one heavy part (`--partition hash:K/N`); the part's
+    tests are a strict subset of the shard's, so the report path stays the
+    shard's.
 
     The profile's previous JUnit report is removed first: nextest writes the
     report only when a run completes, so a report left by an earlier run would
@@ -980,6 +1087,8 @@ def run_nextest(profile, expression, archive, no_tests_pass=False):
     command = nextest_command("run", profile, archive)
     if no_tests_pass:
         command.extend(["--no-tests", "pass"])
+    if partition is not None:
+        command.extend(["--partition", partition])
     command.extend(["-E", expression])
     sys.exit(run_checked(command))
 

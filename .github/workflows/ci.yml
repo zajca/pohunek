@@ -107,9 +107,10 @@ env:
   PYTHONSAFEPATH: "1"
   # Test binaries (issue #170): job `build-tests` compiles the workspace test
   # binaries once (`cargo nextest archive --workspace --all-features`) and
-  # uploads the archive. The test jobs (fast shards, heavy) download
+  # uploads the archive. The test jobs (fast shards, heavy parts, the script
+  # regressions job needs no archive) download
   # it and run from it via scripts/test-partitions --archive-file; they install
-  # only cargo-nextest, no rust-cache (the heavy job also needs the fetched
+  # only cargo-nextest, no rust-cache (each heavy part also needs the fetched
   # crate sources for xtask::dependency_policy). Tests
   # resolve binaries and sources at run time (`CARGO_BIN_EXE_*`,
   # `CARGO_MANIFEST_DIR`, the worker beside the test binaries), so the archive
@@ -1037,8 +1038,8 @@ jobs:
           overwrite: true
           if-no-files-found: error
 
-  # Compiles every workspace test binary exactly once for the fast shards, the
-  # and heavy job (issue #170). Designated `test-debug`
+  # Compiles every workspace test binary exactly once for the fast shards
+  # and the heavy parts (issue #170). Designated `test-debug`
   # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
@@ -1166,9 +1167,8 @@ jobs:
       - name: Install Rust toolchain
         uses: ./relocated/.github/actions/setup-rust
 
-      - name: Check script regressions
-        if: matrix.shard == 'core' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false')
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+      # The script regressions left the `core` shard for their own job
+      # (`script-tests`, #2208): the shard runs Rust tests only now.
 
       # Every workflow installs Rust from rust-toolchain.toml or a dated nightly.
       - name: Check the Rust toolchain pin
@@ -1590,14 +1590,53 @@ jobs:
           set -euo pipefail
           echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
+  # Issue #2208: the script regressions have their own job since leaving the
+  # `core` fast shard. The job runs the same `unittest discover` the core
+  # shard used to carry, on every run except a narrowed selection whose
+  # `script_tests` output is false.
+  script-tests:
+    name: script regressions
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'script-tests') }}
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: relocated
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: relocated
+          persist-credentials: false
+
+      - name: Run script regressions
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+  # Issue #774: the heavy shard runs as three parts (matrix `part`), so no
+  # single job waits for the whole heavy list. Part 1 proves the partition
+  # (`run heavy --part 1/N --check` checks, proves the parts' union, then
+  # runs); parts 2 and 3 run their tests alone. Each part extracts the
+  # archive exactly once, in its own process.
   integration:
-    name: tests (heavy, PTY + Hermes)
+    name: tests (heavy ${{ matrix.part }}/3, PTY + Hermes)
     needs: [build-tests, test-selection, reuse]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
       actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # The heavy parts; part 1 also runs the inventory check. The count
+        # stays in `HEAVY_PARTS` below: the run step builds `--part K/N`
+        # from the leg and that value.
+        part: [1, 2, 3]
+    env:
+      # The number of heavy parts (issue #774). `scripts/test-partitions`
+      # reads N from the `--part K/N` argument, never from a literal.
+      HEAVY_PARTS: "3"
     defaults:
       run:
         working-directory: relocated
@@ -1646,9 +1685,9 @@ jobs:
 
       # The daemon socket tests spawn the real durable worker by path
       # (`target/debug/pohunek-sessiond`); it comes out of the archive, which
-      # cannot be built without it.
-      - name: Verify exhaustive disjoint test partitions
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check
+      # cannot be built without it. Part 1 proves the partition in its own
+      # run step (`--check`); parts 2 and 3 run their tests alone, so no
+      # step checks here.
 
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
@@ -1676,6 +1715,7 @@ jobs:
         shell: bash
         env:
           SHARD: heavy
+          PART: ${{ matrix.part }}
           NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
         run: |
           set -euo pipefail
@@ -1683,11 +1723,15 @@ jobs:
           if [ "$NARROWED" = true ]; then
             selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
           fi
-          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
+          check=()
+          if [ "$PART" = 1 ]; then
+            check=(--check)
+          fi
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" --part "$PART/$HEAVY_PARTS" "${check[@]}" "${selection[@]}"
 
       - name: Summarize flaky tests
         if: always()
-        run: python3 scripts/junit-flaky-summary --label heavy target/nextest/heavy/junit.xml
+        run: python3 scripts/junit-flaky-summary --label "heavy ${{ matrix.part }}/3" target/nextest/heavy/junit.xml
 
       # Per-test timing evidence for the test-performance work (JUnit `time`
       # attributes). Nextest writes the report under its own storage directory.
@@ -1696,7 +1740,7 @@ jobs:
         id: infra-5
         uses: actions/upload-artifact@v4
         with:
-          name: nextest-junit-heavy
+          name: nextest-junit-heavy-${{ matrix.part }}
           path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
       - name: Cancel the run (fail fast)
@@ -2049,7 +2093,7 @@ jobs:
   # skip the selection does not confirm always fails this job.
   test-selection-verdict:
     name: test selection verdict
-    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos, reuse]
+    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, script-tests, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos, reuse]
     if: ${{ always() }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
@@ -2060,10 +2104,10 @@ jobs:
           echo "::error::the reuse job failed, so no skip is trusted"
           exit 1
       - name: Fail a test job that failed or was skipped without a narrowed selection or a reuse skip
-        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') || (github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true'))) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')))) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')))) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success' && !(needs.test-selection-check.result == 'skipped' && github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
+        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') || (github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true'))) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')))) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')))) || (needs.script-tests.result != 'success' && !(needs.script-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'script-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.script_tests == 'false')))) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success' && !(needs.test-selection-check.result == 'skipped' && github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
         shell: bash
         env:
-          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} changes=${{ needs.changes.result }} changes_docs_only=${{ needs.changes.outputs.docs_only }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }}"
+          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} changes=${{ needs.changes.result }} changes_docs_only=${{ needs.changes.outputs.docs_only }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }} script=${{ needs.script-tests.result }}"
         run: |
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1

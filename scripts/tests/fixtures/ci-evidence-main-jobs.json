@@ -206,7 +206,17 @@
       "conclusion": "success"
     },
     {
-      "name": "tests (heavy, PTY + Hermes)",
+      "name": "tests (heavy 1/3, PTY + Hermes)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (heavy 2/3, PTY + Hermes)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "tests (heavy 3/3, PTY + Hermes)",
       "status": "completed",
       "conclusion": "success"
     },
@@ -222,6 +232,11 @@
     },
     {
       "name": "tests (cli, fast)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "script regressions",
       "status": "completed",
       "conclusion": "success"
     },

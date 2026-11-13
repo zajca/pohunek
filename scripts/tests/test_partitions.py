@@ -90,10 +90,30 @@ file is absent, and a test with `binary_dir` is not run at all when that
 directory is absent, as nextest skips the binary of a package it cannot find.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
+
+
+def part_member(binary_id, name, partition):
+    """Whether a fixture test belongs to the `--partition hash:K/N` part.
+
+    The deterministic slice stands in for nextest's own hash partition:
+    every test lands in exactly one of the N parts, so the union of the
+    parts is the whole list. `$PARTITIONS_DROP_PART_TEST` names a test the
+    part lists omit, for the union-proof failure case.
+    """
+    kind, fraction = partition.split(":", 1)
+    if kind != "hash":
+        raise SystemExit("fake nextest: unexpected partition " + repr(partition))
+    index_text, total_text = fraction.split("/")
+    index, total = int(index_text), int(total_text)
+    if os.environ.get("PARTITIONS_DROP_PART_TEST") == name:
+        return False
+    digest = hashlib.sha256(f"{binary_id}::{name}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % total == index - 1
 
 
 def shard_of(expression, fast):
@@ -271,6 +291,8 @@ def main():
         return
 
     fixture = json.loads(Path(os.environ["PARTITIONS_FIXTURE"]).read_text())
+    if os.environ.get("PARTITIONS_FAIL_EXTRACT") and "--archive-file" in argv:
+        raise SystemExit("fake nextest: the archive failed to extract")
     expression = argv[argv.index("-E") + 1] if "-E" in argv else None
     macos_expressions = fixture.get("macos_expressions", {})
     if expression in macos_expressions:
@@ -292,6 +314,7 @@ def main():
         return
     fast = os.environ["PARTITIONS_FAST"]
     run_ignored = argv[argv.index("--run-ignored") + 1] if "--run-ignored" in argv else "default"
+    partition = argv[argv.index("--partition") + 1] if "--partition" in argv else None
     filterset = os.environ.get("PARTITIONS_FILTERSET")
     narrowed = False
     if expression is not None and filterset:
@@ -316,6 +339,8 @@ def main():
                 status = "matches"
             else:
                 status = "mismatch"
+            if status == "matches" and partition is not None:
+                status = "matches" if part_member(entry["id"], name, partition) else "mismatch"
             cases[name] = {
                 "ignored": bool(test.get("ignored", False)),
                 "filter-match": {"status": status},
@@ -411,6 +436,8 @@ class ScriptScenario(unittest.TestCase):
             "PARTITIONS_HOLD_RUN",
             "PARTITIONS_LOCKED_TREE",
             "PARTITIONS_FILTERSET",
+            "PARTITIONS_DROP_PART_TEST",
+            "PARTITIONS_FAIL_EXTRACT",
         ):
             environment.pop(name, None)
         environment.update(extra_env or {})
@@ -624,6 +651,104 @@ class ArchiveActionTests(ScriptScenario):
         self.assertEqual(self.nextest_calls(), [])
 
 
+class PartActionTests(ScriptScenario):
+    """`run heavy --part K/N` runs one part; `--check` proves the union first.
+
+    Part 1 verifies the whole partition and the N parts' union in the same
+    process that then runs its part, so its job extracts the archive exactly
+    once; later parts run their tests alone.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.archive = self.root / "built-elsewhere.tar.zst"
+        self.archive.write_bytes(b"cargo nextest archive built at another path")
+        self.set_inventory(nextest_inventory())
+
+    def run_part(self, *arguments, extra_env=None):
+        return self.run_script(
+            "run", "heavy", "--archive-file", str(self.archive),
+            *arguments, extra_env=extra_env)
+
+    def test_a_later_part_runs_only_its_partition_without_listing(self):
+        result = self.run_part("--part", "2/3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.nextest_calls()
+        # The part's single run is the only nextest call: it extracts the
+        # archive on its first (and only) use, like every archive run.
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[1], "run")
+        self.assertEqual(argv[argv.index("--partition") + 1], "hash:2/3")
+        self.assertIn("--extract-to", argv)
+
+    def test_part_one_checks_then_runs_from_a_single_extraction(self):
+        result = self.run_part("--part", "1/3", "--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Coverage OK: 6 tests selected exactly once (including ignored tests)",
+            result.stdout)
+        self.assertIn("heavy parts OK: 3 parts hold 3 tests exactly once", result.stdout)
+        calls = self.nextest_calls()
+        lists = [call for call in calls if call["argv"][1] == "list"]
+        runs = [call for call in calls if call["argv"][1] == "run"]
+        # The full partition (universe plus one list per shard) plus one
+        # list per heavy part, then the part's own run: 8 lists, 1 run.
+        self.assertEqual(len(lists), 8)
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]["argv"][runs[0]["argv"].index("--partition") + 1], "hash:1/3")
+        extracts = [call for call in calls if "--extract-to" in call["argv"]]
+        self.assertEqual(len(extracts), 1, "the part-1 job extracts the archive exactly once")
+        self.assertIs(extracts[0], calls[0], "extraction happens on the first list")
+
+    def test_a_part_union_that_loses_a_test_fails_before_any_run(self):
+        result = self.run_part("--part", "1/3", "--check",
+                                extra_env={"PARTITIONS_DROP_PART_TEST": "source_map::drift"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("heavy partition failed", result.stderr)
+        self.assertIn("source_map::drift", result.stderr)
+        self.assertIn("missing=", result.stderr)
+        calls = self.nextest_calls()
+        self.assertTrue(calls, "the check lists before it fails")
+        self.assertEqual(
+            [call for call in calls if call["argv"][1] == "run"], [],
+            "no test runs after a failed union proof")
+
+    def test_a_corrupt_archive_fails_part_one_before_any_run(self):
+        result = self.run_part("--part", "1/3", "--check",
+                                extra_env={"PARTITIONS_FAIL_EXTRACT": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        calls = self.nextest_calls()
+        self.assertEqual(len(calls), 1, "the first list already fails the extraction")
+        self.assertEqual(
+            [call for call in calls if call["argv"][1] == "run"], [],
+            "no test runs from a corrupt archive")
+
+    def test_part_and_check_reject_anything_but_run_heavy_part_one(self):
+        archive = ["--archive-file", str(self.archive)]
+        for arguments in (
+            ("run", "core", "--part", "1/3", *archive),
+            ("run", "heavy", *archive, "--part", "2/3", "--check"),
+            ("run", "heavy", *archive, "--check"),
+            ("run", "heavy", *archive, "--part", "bogus"),
+            ("run", "heavy", *archive, "--part", "0/3"),
+            ("run", "heavy", *archive, "--part", "4/3"),
+            ("check", "--part", "1/3", *archive),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_script(*arguments)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(self.nextest_calls(), [])
+
+    def test_run_heavy_without_a_part_still_runs_whole(self):
+        result = self.run_script("run", "heavy", "--archive-file", str(self.archive))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.nextest_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["argv"][1], "run")
+        self.assertNotIn("--partition", calls[0]["argv"])
+
+
 class EntrypointTests(ScriptScenario):
     """The script run as a program, as CI runs it."""
 
@@ -701,11 +826,14 @@ class PlanActionTests(ScriptScenario):
                          ["daemon", "cli"], True)
         self.assert_plan(self.packages("pohunek-protocol"), ["core"], True)
 
-    def test_the_script_regressions_start_core_without_a_rust_test(self):
+    def test_the_script_regressions_start_no_fast_shard(self):
+        # `script_tests` is the script-tests job's own flag: the fast-shard
+        # plan stays about Rust tests, so a selection with no Rust test
+        # starts no shard however `script_tests` reads.
         self.assert_plan({"mode": "none", "script_tests": True, "packages": []},
-                         ["core"], False)
+                         [], False)
         self.assert_plan(self.packages("pohunek-cli", script_tests=True),
-                         ["core", "cli"], True)
+                         ["cli"], True)
 
     def test_a_selection_of_nothing_starts_no_test_job(self):
         self.assert_plan({"mode": "none", "script_tests": False, "packages": []},
