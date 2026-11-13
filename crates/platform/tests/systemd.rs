@@ -29,6 +29,7 @@ use pohunek_platform::supervisor::{
     DaemonSupervisor, Error, ExitEvidence, JobDefinition, JobExit, JobSpec, Namespace,
     RestartPolicy, ServiceId, ServiceObservation, ServiceState, Supervisor, WorkerKey,
 };
+use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 use tempfile::TempDir;
 
 mod support;
@@ -43,9 +44,13 @@ const STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Lifetime of fixture processes; far longer than any test.
 const FIXTURE_LIFETIME: Duration = Duration::from_secs(300);
-/// Fixture file whose appearance tells the `allocate` fixture to start
-/// allocating; named next to the state root of the installation.
+/// Fixture file whose appearance tells the `allocate` and `pressure`
+/// fixtures to start touching their buffers; named next to the state
+/// root of the installation.
 const ALLOCATE_TRIGGER: &str = "allocate-now";
+/// File the `pressure` fixture creates after its first complete pass
+/// over its buffer; named next to the state root of the installation.
+const PRESSURE_PASSED: &str = "pressure-passed";
 /// Memory limit injected into the unit of the out-of-memory scenario.
 const OOM_MEMORY_MAX: &str = "64M";
 /// [`OOM_MEMORY_MAX`] in bytes.
@@ -56,21 +61,21 @@ const OOMD_MEMORY_HIGH: &str = "64M";
 /// Memory pressure (share of time stalled) above which `systemd-oomd` kills
 /// the units of the test slice; low so the throttled unit crosses it at once.
 const OOMD_PRESSURE_LIMIT: &str = "1%";
-/// How long the pressure must hold before `systemd-oomd` acts; short so the
-/// scenario ends well inside [`OOMD_TIMEOUT`].
+/// How long the pressure must hold before `systemd-oomd` acts.
 const OOMD_PRESSURE_DURATION: &str = "2s";
-/// Bound on waiting for `systemd-oomd`, which samples pressure once a second
-/// and then waits out [`OOMD_PRESSURE_DURATION`].
-const OOMD_TIMEOUT: Duration = Duration::from_secs(120);
-/// Bytes the `allocate` fixture touches after its trigger; well above
-/// [`OOM_MEMORY_MAX`].
+/// Bytes the `allocate` and `pressure` fixtures touch after their
+/// trigger; well above [`OOM_MEMORY_MAX`].
 const ALLOCATE_BYTES: usize = 512 * 1024 * 1024;
 /// Start timeout of the worker whose activation never completes.
 const SHORT_START_TIMEOUT: Duration = Duration::from_secs(2);
 /// Session ID shared by the tests; namespaces keep them apart.
 const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
-/// Command-line prefix naming the file whose appearance starts `allocate`.
+/// Command-line prefix naming the file whose appearance starts the
+/// `allocate` and `pressure` fixtures.
 const ALLOCATE_TRIGGER_ARGUMENT: &str = "pohunek-systemd-allocate-trigger=";
+/// Command-line prefix naming the file the `pressure` fixture creates after
+/// its first complete pass over its buffer.
+const PRESSURE_PASSED_ARGUMENT: &str = "pohunek-systemd-pressure-passed=";
 fn require_e2e() {
     assert_eq!(
         std::env::var(E2E_VARIABLE).as_deref(),
@@ -85,7 +90,9 @@ fn require_e2e() {
 /// `ready-then-fail` notifies and exits with status 3; `stubborn-descendants`
 /// starts a child and a grandchild that ignore `SIGHUP` and `SIGTERM`, then
 /// notifies and sleeps; `exec-other` replaces itself with another program
-/// before ever notifying.
+/// before ever notifying; `pressure` notifies, then keeps touching one byte
+/// per 4 KiB page of its buffer after its trigger until the fixture lifetime
+/// ends, creating its pass marker after the first complete pass.
 #[test]
 #[ignore = "fixture entry point; does work only inside a unit started by these tests"]
 fn fixture_entry() {
@@ -131,6 +138,28 @@ fn fixture_entry() {
         "ready-then-fail" => {
             notify_ready();
             std::process::exit(3);
+        }
+        "pressure" => {
+            notify_ready();
+            let trigger = PathBuf::from(argument(ALLOCATE_TRIGGER_ARGUMENT));
+            while !trigger.exists() {
+                // timing-allowed: #326 the fixture waits for the scenario to inject the memory limit; the scenario waits on the unit's state, not on this poll
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            let mut memory = vec![0_u8; ALLOCATE_BYTES];
+            let passed = PathBuf::from(argument(PRESSURE_PASSED_ARGUMENT));
+            let deadline = Instant::now() + FIXTURE_LIFETIME;
+            let mut first_pass = true;
+            while Instant::now() < deadline {
+                for page in memory.chunks_mut(4_096) {
+                    page[0] = 1;
+                }
+                std::hint::black_box(&memory);
+                if first_pass {
+                    std::fs::write(&passed, b"passed").expect("write the pressure pass marker");
+                    first_pass = false;
+                }
+            }
         }
         "stubborn-descendants" => {
             let mut descendants = Command::new("/bin/sh")
@@ -927,8 +956,111 @@ fn require_oomd() {
     );
 }
 
+/// Fails with a stated precondition unless the host has swap and the unit's
+/// cgroup may swap out, which is where the reclaim activity `systemd-oomd`
+/// samples comes from.
+fn require_swap(unit: &str) {
+    let entries = std::fs::read_to_string("/proc/swaps")
+        .unwrap_or_else(|_| panic!("precondition: /proc/swaps cannot be read"));
+    assert!(
+        entries.lines().skip(1).any(|line| !line.trim().is_empty()),
+        "precondition: the host has no swap (/proc/swaps has no entry), so no swap-out reclaim feeds systemd-oomd"
+    );
+    let properties = show(unit, &["ControlGroup"]);
+    let group = properties
+        .get("ControlGroup")
+        .filter(|group| !group.is_empty())
+        .unwrap_or_else(|| panic!("precondition: {unit} has no control group"));
+    let maximum = match std::fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(group.trim_start_matches('/'))
+            .join("memory.swap.max"),
+    ) {
+        Ok(text) => text,
+        Err(error) => panic!("precondition: {unit} cgroup has no memory.swap.max: {error}"),
+    };
+    assert!(
+        maximum.trim() != "0" && maximum.trim() != "",
+        "precondition: the unit's cgroup denies swap (memory.swap.max is 0 or missing), so reclaim scans no anonymous pages"
+    );
+}
+
+/// Prints `oomctl` and cgroup state for the `systemd-oomd` scenario; each
+/// read failure prints its error and never panics.
+fn dump_oom_state(unit: &str, slice: &str) {
+    eprintln!("systemd-oomd scenario state for unit {unit} and slice {slice}");
+    match Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "--property",
+            "ActiveState,SubState,Result,ManagedOOMKills,OOMKills,MemoryCurrent",
+        ])
+        .output()
+    {
+        Ok(output) => eprintln!(
+            "systemctl show {unit}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("systemctl show {unit} failed: {error}"),
+    }
+    for name in [unit, slice] {
+        match Command::new("systemctl")
+            .args(["--user", "show", name, "--property", "ControlGroup"])
+            .output()
+        {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout).into_owned();
+                let group = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("ControlGroup="))
+                    .unwrap_or_default();
+                dump_cgroup_state(name, group);
+            }
+            Err(error) => eprintln!("systemctl show ControlGroup for {name} failed: {error}"),
+        }
+    }
+    match Command::new("oomctl").output() {
+        Ok(output) => eprintln!(
+            "oomctl: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("oomctl failed: {error}"),
+    }
+}
+
+fn dump_cgroup_state(name: &str, group: &str) {
+    if group.is_empty() {
+        eprintln!("{name} has no control group");
+        return;
+    }
+    let base = Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+    for file in ["memory.pressure", "memory.events", "memory.swap.current"] {
+        match std::fs::read_to_string(base.join(file)) {
+            Ok(text) => eprintln!("{name} {file}: {text}"),
+            Err(error) => eprintln!("{name} {file} read failed: {error}"),
+        }
+    }
+    match std::fs::read_to_string(base.join("memory.stat")) {
+        Ok(text) => {
+            for line in text.lines() {
+                if ["pgscan", "pgsteal", "pswpin", "pswpout"]
+                    .iter()
+                    .any(|token| line.starts_with(token))
+                {
+                    eprintln!("{name} memory.stat: {line}");
+                }
+            }
+        }
+        Err(error) => eprintln!("{name} memory.stat read failed: {error}"),
+    }
+}
+
 #[tokio::test]
-#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager with the memory controller, and a running systemd-oomd"]
+#[ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager with the memory controller and available swap, and a running systemd-oomd"]
 async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
     require_e2e();
     require_oomd();
@@ -936,9 +1068,12 @@ async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
     let supervisor = installation.supervisor().await;
     let id = worker_id("verdict6");
     let trigger = installation.root.path().join(ALLOCATE_TRIGGER);
-    let mut spec = fixture_spec(installation.root.path(), "allocate");
+    let passed = installation.root.path().join(PRESSURE_PASSED);
+    let mut spec = fixture_spec(installation.root.path(), "pressure");
     spec.arguments
         .push(format!("{ALLOCATE_TRIGGER_ARGUMENT}{}", trigger.display()));
+    spec.arguments
+        .push(format!("{PRESSURE_PASSED_ARGUMENT}{}", passed.display()));
 
     supervisor
         .start(&id, &JobDefinition::new(spec).expect("valid definition"))
@@ -949,16 +1084,10 @@ async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
     })
     .await;
     let unit = installation.unit(&id);
-    // The slice is the monitored cgroup, the unit its candidate; MemoryHigh
-    // throttles the allocation so the kernel never reaches an OOM kill.
-    systemctl_checked(&[
-        "set-property",
-        "--runtime",
-        &installation.namespace.sessions_slice(),
-        "ManagedOOMMemoryPressure=kill",
-        &format!("ManagedOOMMemoryPressureLimit={OOMD_PRESSURE_LIMIT}"),
-        &format!("ManagedOOMMemoryPressureDurationSec={OOMD_PRESSURE_DURATION}"),
-    ]);
+    let slice = installation.namespace.sessions_slice();
+    // MemoryHigh throttles the fixture so the kernel never reaches an OOM
+    // kill; the fixture keeps touching its buffer so pressure and reclaim
+    // keep coming after the kill logic is armed.
     systemctl_checked(&[
         "set-property",
         "--runtime",
@@ -966,9 +1095,47 @@ async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
         &format!("MemoryHigh={OOMD_MEMORY_HIGH}"),
     ]);
     require_memory_controller(&unit, "memory.high");
+    require_swap(&unit);
     std::fs::write(&trigger, b"go").expect("trigger the allocation");
 
-    let evidence = failed_evidence_within(&supervisor, &id, OOMD_TIMEOUT).await;
+    // Arm systemd-oomd only once the fixture has finished one full pass
+    // over its buffer, then keep the pressure and reclaim running until
+    // the kill, so the verdict does not depend on when oomd registers the
+    // slice. The scenario does not depend on the oomd D-Bus API. Where
+    // oomd registered the slice is read from the oomd debug journal (the
+    // varlink registration line and its per-tick pressure lines) and from
+    // the cgroup files in the failure dump; `oomctl` prints the monitored
+    // set only on a host where oomd owns its bus name, so there it is
+    // best-effort output, never a pass/fail gate.
+    wait_until(
+        "the pressure fixture to finish its first buffer pass",
+        || async { passed.exists().then_some(()) },
+    )
+    .await;
+    // The slice is the monitored cgroup, the unit its candidate.
+    systemctl_checked(&[
+        "set-property",
+        "--runtime",
+        &slice,
+        "ManagedOOMMemoryPressure=kill",
+        &format!("ManagedOOMMemoryPressureLimit={OOMD_PRESSURE_LIMIT}"),
+        &format!("ManagedOOMMemoryPressureDurationSec={OOMD_PRESSURE_DURATION}"),
+    ]);
+    let verdict_supervisor = supervisor.clone();
+    let verdict_id = id.clone();
+    let verdict = tokio::spawn(async move {
+        failed_evidence_within(&verdict_supervisor, &verdict_id, HANG_GUARD).await
+    })
+    .await;
+    let evidence = match verdict {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            dump_oom_state(&unit, &slice);
+            panic!(
+                "the systemd-oomd killed worker never reported a verdict within the hang guard: {error}"
+            );
+        }
+    };
 
     assert_eq!(evidence.result(), "oom-kill", "{evidence:?}");
     assert!(
