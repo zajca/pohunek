@@ -315,6 +315,11 @@ async fn a_probe_reply_stuck_behind_a_full_pty_never_blocks_output() {
     assert_eq!(dump(&output, 1), REPLY_HEX);
 }
 
+/// Shell fragment that waits until the last background job runs its own image,
+/// so a probe printed after it sees the job as the listed program and not as
+/// the forked shell it starts as.
+const AWAIT_JOB_EXEC: &str = "until ps -o comm= -p $! | grep -q sleep; do :; done; ";
+
 /// The foreground program of these scenarios is the `/bin/sh -c <script>` root.
 fn listed(cmdline: &str) -> Vec<ProcessPatterns> {
     vec![ProcessPatterns {
@@ -376,12 +381,13 @@ async fn an_unlisted_foreground_program_is_never_answered() {
 }
 
 /// Without job control a background job shares the foreground group of its
-/// shell, so its listed program is answered.
+/// shell, so its listed program is answered. The probe is printed once the
+/// job runs `sleep`.
 #[tokio::test]
 async fn a_listed_job_sharing_the_foreground_group_of_a_shell_without_job_control_is_answered() {
     let cwd = tempdir().expect("temp dir");
     let script = format!(
-        "sleep 1234 & stty raw -echo; printf '{PROBE_ST}'; {} kill $! 2>/dev/null",
+        "sleep 1234 & {AWAIT_JOB_EXEC}stty raw -echo; printf '{PROBE_ST}'; {} kill $! 2>/dev/null",
         read_dump(1, REPLY_BYTES)
     );
     let pty = spawn_listing(&script, cwd.path(), false, &listed(r"^sleep 1234"));
@@ -394,7 +400,7 @@ async fn a_listed_job_sharing_the_foreground_group_of_a_shell_without_job_contro
 #[tokio::test]
 async fn a_listed_job_in_the_background_of_a_job_control_shell_is_not_answered() {
     first_byte_after_a_refused_probe(
-        "set -m; sleep 1234 & trap 'kill %1' EXIT; ",
+        &format!("set -m; sleep 1234 & trap 'kill %1' EXIT; {AWAIT_JOB_EXEC}"),
         &listed(r"^sleep 1234"),
     )
     .await;
