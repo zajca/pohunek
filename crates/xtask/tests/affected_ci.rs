@@ -995,14 +995,15 @@ fn test_job_scripts() -> std::collections::BTreeSet<String> {
 }
 
 #[test]
-fn a_gate_receipt_change_selects_only_the_receipt_guard_and_the_script_suite() {
+fn a_gate_receipt_change_selects_the_receipt_guard_the_cli_package_and_the_script_suite() {
     let repo = Repo::new();
     repo.change(&["scripts/gate-receipt"]);
     let selection = repo.select();
     assert_eq!(selection["mode"], "packages", "{selection:#}");
     let mut expected = whole(&["pohunek-cli"]);
     // Selecting pohunek-cli also selects the daemon test that runs the CLI
-    // binary (the BINARY_USES edge); the scanners live in `all_packages`.
+    // binary (the BINARY_USES edge); the scanners live in `all_packages`,
+    // which the assertion below compares against the full package selection.
     expected.push((
         "pohunek-daemon".to_owned(),
         "binary(=supervised_lifecycle)".to_owned(),

@@ -1043,7 +1043,7 @@ class CiEvidenceCliTests(unittest.TestCase):
         # Initial listing plus two polls; virtual time used is 2400 s < 3600 s.
         self.assertEqual(len(commit_listings), 3, commit_listings)
 
-    def test_a_wait_whose_deadline_never_arrives_times_out_on_the_virtual_clock(self):
+    def test_a_wait_for_a_run_that_never_completes_times_out_on_the_virtual_clock(self):
         # The polls advance the clock to the 3600 s deadline while the run
         # stays in progress; a wall-clock deadline would spin instantly
         # through the polls until the 60 s guard instead.

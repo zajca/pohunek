@@ -90,9 +90,9 @@ multi-team control plane without replacing either owner path.
   acceptance eligibility policy, and host-enforced human input control
   (`task.input_control`). Amended 2026-11-06 (design-only): the owner answers,
   routed asks as the addressed answer path, and the shared `task` and ask MCP server.
-  This amendment is not planned: the ask channel RFC was withdrawn on 2026-11-12 (#1987); only the ask parts
-  (routed asks, the ask tools) are affected, the task MCP server stays; per-session rights continue
-  rescoped as #2002 and #2005 in milestone 0.44.
+  Its routed asks, ask tools, MCP session tools, and worker-attested path are not planned:
+  the ask channel RFC was withdrawn on 2026-11-12 (#1987); the task MCP server stays;
+  per-session rights continue rescoped as #2002 and #2005 in milestone 0.44.
 - [Ask channel RFC](design/ask-channel-rfc.md) — withdrawn 2026-11-12 (#1987): the ask channel (Part A) is not planned,
   and its routed-ask and ask-tool amendments to the delegated task runs RFC are not planned. Part B per-session
   rights continue rescoped as #2002 and #2005 in milestone 0.44 (#2003 and #2004 closed as not planned;

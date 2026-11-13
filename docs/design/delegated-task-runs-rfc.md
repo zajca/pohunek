@@ -19,9 +19,10 @@
   Design-only: nothing here claims a shipped surface, and none of it changes
   existing section numbering.
 
-  Only the routed asks and the ask tools of this amendment are not planned: the ask channel RFC
+  The routed asks, the ask tools, the MCP session tools, and the worker-attested path
+  of this amendment are not planned: the ask channel RFC
   was withdrawn on 2026-11-12 (#1987). Per-session rights continue rescoped as #2002 and #2005
-  in milestone 0.44; the MCP session tools and the worker-attested path are dropped.
+  in milestone 0.44.
 - **Date:** 2026-09-24
 - **Scope:** A task layer over ordinary sessions that lets an orchestrating agent
   delegate bounded coding work to another agent on any owned host and receive a

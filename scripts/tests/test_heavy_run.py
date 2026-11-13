@@ -227,8 +227,8 @@ class Fixture(unittest.TestCase):
 
     def test_the_guarded_reap_skips_the_collect_once_reaped(self):
         # The reap must keep the command status even when the shell has
-        # already reaped the child: the model probe below runs the old
-        # guarded sequence verbatim under `bash` and asserts it exits 0
+        # already reaped the child: the model probe below models the
+        # `while kill -0` loop alone under `bash` and asserts it exits 0
         # for the failed command, then runs the single `wait` the script
         # uses and asserts it reports 41. The behavioural rc check stays
         # `test_a_failing_command_propagates_its_status_and_stops_the_scope`.
