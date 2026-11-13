@@ -605,9 +605,9 @@ const RULES: &[Rule] = &[
 ///
 /// A pull request's CI run must prove a change to the jobs that select and run
 /// its tests on the full set; locally these paths keep their [`RULES`]
-/// effects. `ci_scripts_of_the_test_jobs_escalate` in [`guard`]'s scenarios
-/// requires every script the test jobs of `.github/workflows/ci.yml` run to be
-/// listed here.
+/// effects. `every_script_the_ci_test_jobs_run_selects_everything` in
+/// `crates/xtask/tests/affected_ci.rs` requires every script the test jobs
+/// of `.github/workflows/ci.yml` run to be listed here.
 pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
     (Pattern::Dir(".github"), "CI configuration"),
     (
@@ -625,10 +625,6 @@ pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
     (
         Pattern::File("scripts/ci-test-selection"),
         "builds and runs the merge base's selector for the CI test jobs",
-    ),
-    (
-        Pattern::File("scripts/ci-retry"),
-        "bounded-retry helper every CI test job install runs through",
     ),
     (
         Pattern::File("scripts/ci-reuse"),

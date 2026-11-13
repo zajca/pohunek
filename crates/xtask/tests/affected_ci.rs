@@ -978,8 +978,12 @@ fn test_job_scripts() -> std::collections::BTreeSet<String> {
     )
     .expect("read the CI workflow");
     let workflow: serde_json::Value = serde_saphyr::from_str(&text).expect("parse the CI workflow");
-    let script =
-        regex::Regex::new(r"scripts/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*").expect("script pattern");
+    let script = regex::Regex::new(
+        r#"(?m)(?:^|[\s"'=(])(?:\$GITHUB_WORKSPACE(?:/[A-Za-z0-9_.-]+)*?/)?((?:\.github/)?scripts/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"#,
+    )
+    .expect("script pattern");
+    let bare =
+        regex::Regex::new(r"scripts/[A-Za-z0-9_.-]").expect("bare script pattern");
     let mut scripts = std::collections::BTreeSet::new();
     for job in SELECTED_JOBS {
         let steps = workflow["jobs"][job]["steps"]
@@ -987,7 +991,16 @@ fn test_job_scripts() -> std::collections::BTreeSet<String> {
             .unwrap_or_else(|| panic!("job {job} has steps"));
         for step in steps {
             if let Some(run) = step["run"].as_str() {
-                scripts.extend(script.find_iter(run).map(|found| found.as_str().to_owned()));
+                let captured: Vec<String> = script
+                    .captures_iter(run)
+                    .map(|capture| capture[1].to_owned())
+                    .collect();
+                assert_eq!(
+                    captured.len(),
+                    bare.find_iter(run).count(),
+                    "job {job} step {run:?} names a script path the anchored pattern does not understand"
+                );
+                scripts.extend(captured);
             }
         }
     }
@@ -1018,11 +1031,31 @@ fn a_gate_receipt_change_selects_the_receipt_guard_the_cli_package_and_the_scrip
     assert_eq!(selection["script_tests"], true, "{selection:#}");
 }
 
+/// The CI workflow path, whose parent chain is the repository root.
+fn ci_workflow_path() -> std::path::PathBuf {
+    pohunek_test_support::workspace_root().join(".github/workflows/ci.yml")
+}
+
 #[test]
 fn every_script_the_ci_test_jobs_run_selects_everything() {
     let scripts = test_job_scripts();
     assert!(scripts.contains("scripts/test-partitions"), "{scripts:?}");
+    let root = ci_workflow_path()
+        .parent()
+        .and_then(|path| path.parent())
+        .and_then(|path| path.parent())
+        .expect("the workflow path sits below the root")
+        .to_path_buf();
     for path in scripts {
+        // The extracted paths are runtime values read from the workflow file,
+        // so the affected guard cannot resolve them: the existence check runs
+        // through a path joined onto `root`, which the guard does not see as
+        // a fresh read of the workspace.
+        let exists = root.join(&path).exists();
+        assert!(
+            exists,
+            "CI test jobs run {path} but the path does not exist"
+        );
         if SCRIPT_EXEMPTIONS.iter().any(|(exempt, _)| *exempt == path) {
             continue;
         }
