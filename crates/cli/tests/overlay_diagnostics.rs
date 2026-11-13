@@ -55,15 +55,23 @@ struct Fixture {
 
 impl Fixture {
     fn new(with_netbird: bool) -> Self {
-        let env = TestEnv::new().expect("create the hermetic test environment");
-        let bin = env.root().join("bin");
-        fs::create_dir_all(&bin).expect("create bin");
-        if with_netbird {
-            let status = format!(
+        let status = with_netbird.then(|| {
+            format!(
                 "{{\"netbirdIp\":\"{SELF_ADDRESS}\",\"peers\":{{\"details\":[{{\
                  \"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{PEER_ADDRESS}\",\
                  \"status\":\"Connected\"}}]}}}}"
-            );
+            )
+        });
+        Self::with_status(status.as_deref().unwrap_or_default())
+    }
+
+    /// A hermetic home whose fake `netbird` prints `status` (empty means no
+    /// fake at all).
+    fn with_status(status: &str) -> Self {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let bin = env.root().join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        if !status.is_empty() {
             pohunek_test_support::fs::write_executable(
                 bin.join("netbird"),
                 format!("#!/bin/sh\nprintf '%s\\n' '{status}'\n"),
@@ -234,6 +242,25 @@ fn a_working_overlay_cli_reports_this_hosts_address() {
     let netbird = check(&checks, "netbird_cli");
     assert_eq!(netbird["status"], "ok", "{netbird}");
     assert!(detail(netbird).contains(SELF_ADDRESS), "{netbird}");
+}
+
+/// An owner-restricted `NetBird` overview is reported as restricted, not as an
+/// unreadable state.
+#[test]
+fn a_restricted_netbird_overview_warns_about_the_connection_owner() {
+    let fixture = Fixture::with_status(include_str!(
+        "../../netbird/tests/fixtures/status_restricted_v0_83.json"
+    ));
+    fixture.write_config("providers = [\"netbird\"]\n", 0o600);
+
+    let checks = fixture.doctor();
+
+    let netbird = check(&checks, "netbird_cli");
+    assert_eq!(netbird["status"], "warn", "{netbird}");
+    assert!(
+        detail(netbird).contains("restricted to the owner"),
+        "{netbird}"
+    );
 }
 
 /// A file the loader refuses is reported by the doctor rather than aborting it,

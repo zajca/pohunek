@@ -88,6 +88,15 @@ pub enum OverlayError {
         /// Bounded, non-secret provider detail.
         detail: String,
     },
+    /// The provider answers, but withholds its peers and this host's address
+    /// from this account.
+    #[error("overlay {overlay} state is restricted for this account: {detail}")]
+    StateRestricted {
+        /// Stable overlay identifier.
+        overlay: OverlayId,
+        /// Bounded, non-secret provider detail.
+        detail: String,
+    },
     /// Provider configuration is invalid.
     #[error("overlay {overlay} configuration is invalid: {detail}")]
     InvalidConfig {
@@ -118,6 +127,7 @@ impl OverlayError {
             Self::HostUnknown { overlay, .. }
             | Self::PeerCollision { overlay, .. }
             | Self::StateUnavailable { overlay, .. }
+            | Self::StateRestricted { overlay, .. }
             | Self::InvalidConfig { overlay, .. }
             | Self::CliMissing { overlay, .. }
             | Self::ListenerAddressMissing { overlay, .. } => overlay,

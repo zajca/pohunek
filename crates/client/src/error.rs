@@ -556,6 +556,14 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
                 "ensure the {overlay} daemon is running and this host is logged in; run `pohunek doctor` to verify"
             )),
         ),
+        overlay::OverlayError::StateRestricted { detail, .. } => ProtocolError::new(
+            ErrorClass::Discovery,
+            format!("{overlay}_state_restricted"),
+            format!("{overlay} detailed status is restricted to the owner of the {overlay} connection: {detail}"),
+            Some(format!(
+                "run pohunek as the account that owns the {overlay} connection, or pin {overlay} below the release that restricts status (NetBird 0.83); see docs/knowledge/guides/remote-hosts.md"
+            )),
+        ),
         overlay::OverlayError::InvalidConfig { detail, .. } => ProtocolError::new(
             ErrorClass::Configuration,
             format!("{overlay}_configuration_invalid"),
