@@ -113,14 +113,24 @@ else:
 '''
 
 
-def run_doc(run_id=777, event="pull_request", head_repo=REPO):
+def run_doc(run_id=777, event="pull_request", head_repo=REPO, branch="zajca/feature",
+            status="completed", conclusion="success", path=".github/workflows/ci.yml@refs/heads/main"):
+    # Push sources default to main branch (run_tier main); PR sources stay
+    # on the feature branch, which run_tier maps to None (not main/nightly).
+    if event == "push" and branch == "zajca/feature":
+        branch = "main"
+    title = "CI [tier=main]" if event == "workflow_dispatch" else "CI"
     return {
         "id": run_id,
         "run_number": run_id,
         "run_attempt": 1,
         "head_sha": SHA,
-        "head_branch": "zajca/feature",
+        "head_branch": branch,
+        "path": path,
         "event": event,
+        "status": status,
+        "conclusion": conclusion,
+        "display_title": title,
         "repository": {"full_name": REPO},
         "head_repository": {"full_name": head_repo},
         "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
@@ -719,6 +729,21 @@ else:
     def test_a_push_never_uses_a_fork_source(self):
         self.write_fixture(
             runs=[run_doc(run_id=777, event="push", head_repo="someone/pohunek")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_push_to_a_feature_branch_never_supplies_reuse(self):
+        # M7: a push source must be a main-branch push (run_tier main).
+        self.write_fixture(
+            runs=[{**run_doc(run_id=777, event="push"), "head_branch": "zajca/feature"}],
             jobs_by_run={"777": green_jobs()},
             artifacts={"777": [
                 {"name": f"tested-tree-{TREE}", "id": 1},

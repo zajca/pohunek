@@ -219,7 +219,9 @@ the reusable jobs those legs name skip instead of running again. Reused legs mus
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the
 evidence script uses, so a renamed job cannot be silently skipped and a
-renamed matrix leg falls back to running. `scripts/ci-reuse`
+renamed matrix leg falls back to running. The list query is bounded in time
+(`created>=now-24h` in the API filter) and in count, and a `--dry-run` mode
+prints the decision without writing outputs for manual proof. `scripts/ci-reuse`
 decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
 `scripts/tests/test_ci_tiers.py` guards); the source selection must be `mode == "full"`,
 and an ambiguous source runs everything. A full

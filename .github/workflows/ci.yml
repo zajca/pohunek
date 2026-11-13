@@ -966,32 +966,48 @@ jobs:
 
   # Finds the green legs of the previous same-tree runs and decides which
   # jobs this run reuses (issues #2203, #2204). Runs on a tier=main dispatch
-  # with delta=true, and on a main push while the CI_REUSE_PUSH kill switch
-  # is on; never on schedule or tier=nightly. Every other event skips it,
+  # with delta=true, and on pushes (same tree, per-job newest green leg).
+  # On a push with CI_REUSE_PUSH != 'true', the kill-switch step emits
+  # skip=[] (every job runs); the decide step is skipped. Never on schedule
+  # or tier=nightly. Every other event skips it,
   # and each reusable job reads its `skip` output (a failed `reuse` run fails
   # the verdict, so no job is wrongly skipped).
   reuse:
     name: delta reuse
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || (github.event_name == 'push' && env.CI_REUSE_PUSH == 'true') }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || github.event_name == 'push' }}
     permissions:
       contents: read
       actions: read
     outputs:
-      skip: ${{ steps.decide.outputs.skip }}
-      source_run: ${{ steps.decide.outputs.source_run }}
-      source_runs: ${{ steps.decide.outputs.source_runs }}
-      tree: ${{ steps.decide.outputs.tree }}
+      skip: ${{ steps.decide.outputs.skip || steps.nopus.outputs.skip || '[]' }}
+      source_run: ${{ steps.decide.outputs.source_run || steps.nopus.outputs.source_run || '' }}
+      source_runs: ${{ steps.decide.outputs.source_runs || steps.nopus.outputs.source_runs || '[]' }}
+      tree: ${{ steps.decide.outputs.tree || steps.nopus.outputs.tree || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
+      - name: Check the push-reuse kill switch
+        id: nopus
+        if: github.event_name == 'push' && env.CI_REUSE_PUSH != 'true'
+        run: |
+          set -euo pipefail
+          echo "skip=[]" >> "$GITHUB_OUTPUT"
+          echo "source_run=" >> "$GITHUB_OUTPUT"
+          echo "source_runs=[]" >> "$GITHUB_OUTPUT"
+          echo "Push reuse is off (CI_REUSE_PUSH=${CI_REUSE_PUSH:-unset}): every job runs." >> "$GITHUB_STEP_SUMMARY"
+          echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+
       - name: Decide the reused jobs
         id: decide
+        if: github.event_name != 'push' || env.CI_REUSE_PUSH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_REUSE_PUSH: ${{ env.CI_REUSE_PUSH }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
           # The workflow file the source runs ran (the decide step lists
           # them by name under `.github/workflows/`).
           WORKFLOW_FILE: ci.yml
@@ -3659,6 +3675,7 @@ jobs:
           github-token: ${{ github.token }}
       - name: Download the reused jobs' JUnit reports from any other source run
         if: ${{ needs.reuse.outputs.source_run != '' }}
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           python3 - <<'PYEOF'
@@ -3668,7 +3685,7 @@ jobs:
           target = Path(os.environ["RUNNER_TEMP"]) / "junit"
           target.mkdir(parents=True, exist_ok=True)
           repo = os.environ["GITHUB_REPOSITORY"]
-          for run_id in runs:
+          for run_id in sorted(runs):
               if str(run_id) == os.environ["SOURCE_RUN"]:
                   continue
               pages = json.loads(subprocess.run(

@@ -3777,10 +3777,11 @@ class DeltaReuseWiringTests(unittest.TestCase):
             job_condition(REUSE_JOB),
             "(github.event_name == 'workflow_dispatch' "
             "&& inputs.tier == 'main' && inputs.delta) "
-            "|| (github.event_name == 'push' && env.CI_REUSE_PUSH == 'true')",
+            "|| github.event_name == 'push'",
         )
+        self.assertNotIn("env.", job_condition(REUSE_JOB))
         for output in ("skip", "source_run", "source_runs", "tree"):
-            self.assertIn(f"      {output}: ${{{{ steps.decide.outputs.{output} }}}}\n", job)
+            self.assertIn(f"steps.decide.outputs.{output}", job)
         # The evidence side reads the record for the whole tier window:
         # retention must cover it like `tested-tree` does, and a re-run
         # of the delta dispatch must not fail on the re-upload.
@@ -3793,23 +3794,28 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_the_reuse_job_runs_on_a_push_while_the_kill_switch_is_on(self):
         condition = job_condition(REUSE_JOB)
         on = bool(evaluate_needs_expression(
-            condition, event="push", env={"CI_REUSE_PUSH": "true"},
+            condition, event="push",
             outputs={REUSE_JOB: {"skip": "[]"}},
             changes=dict(changes_of("push")),
         ))
-        self.assertTrue(on, "a push with CI_REUSE_PUSH=true runs the reuse job")
-        off = bool(evaluate_needs_expression(
-            condition, event="push", env={"CI_REUSE_PUSH": "false"},
-            outputs={REUSE_JOB: {"skip": "[]"}},
-            changes=dict(changes_of("push")),
-        ))
-        self.assertFalse(off, "CI_REUSE_PUSH=false turns push reuse off")
+        self.assertTrue(on, "a push runs the reuse job (kill-switch is a step)")
+        _text = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("id: nopus", _text)
+        self.assertIn("github.event_name == 'push' && env.CI_REUSE_PUSH != 'true'", _text)
+        self.assertIn("steps.nopus.outputs.skip", _text)
         nightly = bool(evaluate_needs_expression(
             condition, event="workflow_dispatch", tier="nightly",
             outputs={REUSE_JOB: {"skip": "[]"}},
             changes=dict(changes_of("workflow_dispatch")),
         ))
         self.assertFalse(nightly, "a nightly dispatch never runs reuse")
+        full = bool(evaluate_needs_expression(
+            condition, event="workflow_dispatch", tier="main",
+            inputs={"delta": False},
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("workflow_dispatch")),
+        ))
+        self.assertFalse(full, "a full dispatch never runs reuse")
         schedule = bool(evaluate_needs_expression(
             condition, event="schedule",
             outputs={REUSE_JOB: {"skip": "[]"}},

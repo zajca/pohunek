@@ -633,6 +633,15 @@ def verify_reuse(
                 f"source {source_url} ran on event {source.get('event')!r}, "
                 f"which the candidate does not allow for reuse (evidence {evidence_url})"
             )
+        # Witnessed event (M2): push source only main-branch pushes,
+        # dispatch source only tier=main dispatches (via shared run_tier).
+        ev_event = source.get("event")
+        if ev_event == "push" and source.get("head_branch") != "main":
+            failures.append(f"source {source_url} is a push to {source.get('head_branch')!r}, not main (evidence {evidence_url})")
+        if ev_event == "workflow_dispatch" and run_tier(source, config.get("workflow_path", ".github/workflows/ci.yml")) != "main":
+            failures.append(f"source {source_url} is not a tier=main dispatch (evidence {evidence_url})")
+        if source.get("conclusion") != "success" or source.get("status") != "completed":
+            failures.append(f"source {source_url} did not conclude success (evidence {evidence_url})")
         # A delta dispatch reuses the same commit; a push reuses the same
         # tree (the PR head and the merge commit differ, the tree is equal).
         same_commit_or_tree = False
@@ -682,9 +691,13 @@ def verify_reuse(
     # it ran under a name the record never mentions.
     alias = reuse_aliases(repo, sha, config["workflow_path"], reused_names)
     for name in sorted(reused_names):
+        # A record-named leg must be skipped in the evidence run (M4): when
+        # the name is absent from evidence_by_name (alias case) the check
+        # falls back to the alias target; when the name is present, it must
+        # be skipped (or, for a matrix leg, its alias must be skipped).
         conclusions = evidence_by_name.get(name)
-        if conclusions is None and name in alias:
-            conclusions = evidence_by_name.get(alias[name])
+        if conclusions is None:
+            conclusions = evidence_by_name.get(alias.get(name, ""))
         if conclusions is not None and any(conclusion != "skipped" for conclusion in conclusions):
             failures.append(
                 f"reuse record names {name}, but it ran in {evidence_url} "
@@ -696,6 +709,7 @@ def verify_reuse(
         if source_id not in runs_by_id:
             continue
         _source, source_url, source_by_name = runs_by_id[source_id]
+        source_created = parse_moment(_source.get("created_at")) if _source.get("created_at") else None
         for name in record["jobs"][job_id]["names"]:
             attempts = source_by_name.get(name, [])
             if not attempts:
@@ -709,11 +723,16 @@ def verify_reuse(
                 )
                 continue
             completed = parse_moment(newest.get("completed_at"))
-            if completed is None or created is None or created - completed > window:
+            if completed is None or created is None or created - completed > window or completed - created > window:
                 failures.append(
                     f"source job {name} in {source_url} is older than "
                     f"{reuse['max_age_hours']}h (evidence {evidence_url})"
                 )
+            # Run pin proved earlier than leg (M5): the run's created_at must
+            # not be after the leg's completion (a reused leg cannot predate
+            # the run that produced it).
+            if source_created and completed and created and source_created > completed and source_created > created:
+                failures.append(f"source job {name} in {source_url} completed before its run was created (evidence {evidence_url})")
     for required in config["required_steps"][tier]:
         if required["job"] not in reused_names:
             continue
