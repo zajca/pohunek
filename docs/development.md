@@ -186,8 +186,19 @@ check the step log first — rerunning the failed job alone recovers only
 from a flaky download. Read such a run accordingly: when a deterministic
 failure cancels, the job that failed and the run end as `cancelled`, while
 the failed step stays red in the job log and the step's `::error`
-annotation (`Fail fast`) names the job that failed first. So a cancelled
-job in a pull request run can mean that another job failed first. The
+annotation (`Fail fast`) names the job that failed first. The annotation
+and the job summary sit on the failed job's check run (not on the run page)
+and give the job's display name, its job id, a link by check run id and the
+step that failed. The name and step come from the jobs API on a best-effort
+basis, bounded by `LOOKUP_TIMEOUT_SECONDS` and cut off by a bash watchdog
+(the macOS callers have no GNU `timeout`); without them the message falls
+back to the job id and the link, and with an empty `job.check_run_id` the
+lookup and the job link are skipped (the run link stays). The cancel happens
+in every case. The jobs with a relocated checkout copy the `cancel-run`
+action out of the checkout first, so every job uses the same script. So a
+cancelled job in a pull request run can mean that another job failed first:
+open the cancelled jobs and look for the one whose step list has a red step
+followed by the executed `Cancel the run (fail fast)` step. The
 `test selection verdict` check still runs after the cancel and is red when
 a job it waits for failed or was cancelled. A job that hits its
 `timeout-minutes` is cancelled by GitHub and does not trigger the step, and
@@ -221,17 +232,20 @@ every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
 the workflow plans); such a job is `selection_dependent`, so a narrowed
 source never reuses any of them.
 
-If an allowlisted job body or the called `upgrade.yml` changes, the reuse guard
-fails with `job <id> changed: re-check its reuse eligibility, then update its
-pin`. In the same commit, re-check that every event/input line of the job still
-reads the same on both paths (full-selection pull request and tier=main
-dispatch), update the body's sha256 in `scripts/tests/reuse_pins.py`
-(`PINNED_BODY_HASHES`), and extend `EVALUATION_TABLE` for every new
-token-reading line; `failure()` reads false there: a reused leg was green.
-The pins and the table are checked-in data, never regenerated from the
-workflow under test. A token-reading line whose values on the two paths
-differ, or an entry no pinned body holds, fails the guard: the job
-leaves `scripts/ci-reuse.json`.
+If an allowlisted job body, the called `upgrade.yml` or the workflow text
+before `jobs:` changes, the reuse guard fails (`job <id> changed: re-check
+its reuse eligibility, then update its pin`, or `workflow preamble ...
+changed` for the text before `jobs:`). In the same commit, re-check that
+every event/input line of the job still reads the same on both paths
+(full-selection pull request and tier=main dispatch), update the body's
+sha256 in `scripts/tests/reuse_pins.py` (`PINNED_BODY_HASHES`, `PINNED_CALLEE`
+for `upgrade.yml`, `PINNED_PREAMBLE` for the text before `jobs:`), and extend
+`EVALUATION_TABLE` for every new token-reading line of a job body;
+`failure()` reads false there: a reused leg was green. The pins and the table
+are checked-in data, never regenerated from the workflow under test. A
+token-reading line whose values on the two paths differ fails the guard: the
+job leaves `scripts/ci-reuse.json`. An entry no pinned body holds fails the
+guard too: delete the entry.
 
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the

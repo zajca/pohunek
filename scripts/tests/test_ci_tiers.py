@@ -241,9 +241,9 @@ def block(text: str, name: str, indent: int = 2) -> str:
     return match.group(1)
 
 
-# The step that ends a PR or dispatch run when a verdict job fails in a
-# deterministic way (#1075, narrowed by #2205: only a verdict-set job may
-# cancel, and only a non-infrastructure failure does).
+# The step that ends a PR or dispatch run when a cancelling-set job fails
+# in a deterministic way (#1075, #2205): a job outside the cancelling set
+# and an infrastructure-tagged failure never cancel.
 FAIL_FAST_STEP = "Cancel the run (fail fast)"
 # The step that records an infrastructure-tagged failure, which never cancels
 # (issue #2205).
@@ -1444,7 +1444,9 @@ class FailFastTests(unittest.TestCase):
     # fail-open selectors (`test-selection`, `reuse`, `package-selection`)
     # run everything instead of ending the run, so they must not end the run.
     EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection", "reuse"}
-    # The two cancelling jobs outside the verdict set (issue #2205 ruling).
+    # The two cancelling jobs outside the verdict set: a deterministic
+    # failure of the docs check or the version bump gate decides the pull
+    # request, so it ends the run instead of waiting on the verdict.
     OUTSIDE = {"package-version-bump", "docs"}
     # Called workflows of ci.yml (checked against the workflow, not copied).
     CALLED = {
@@ -1506,7 +1508,7 @@ class FailFastTests(unittest.TestCase):
 
     def test_every_network_step_has_an_infra_id_and_every_id_is_in_both_conditions(self):
         jobs = workflow_jobs()
-        for name in sorted(self.cancelling_set() - self.OUTSIDE):
+        for name in sorted(self.cancelling_set()):
             with self.subTest(job=name):
                 network = []
                 for step in named_steps(jobs[name]):
@@ -1533,7 +1535,7 @@ class FailFastTests(unittest.TestCase):
         for name in sorted(self.cancelling_set()):
             with self.subTest(job=name):
                 step = job_steps(jobs[name])[NOTICE_STEP]
-                self.assertIn("::notice title=Infrastructure failure::tagged as infrastructure", step)
+                self.assertIn("::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure", step)
                 self.assertIn("check the step log", step)
                 self.assertNotIn("gh run cancel", step)
                 self.assertNotIn("always()", step)
@@ -1599,15 +1601,12 @@ class FailFastTests(unittest.TestCase):
         # The two `if:` texts over the four cases: a code failure, a failed
         # infra step, an exhausted ci-retry marker, and a push event. On a
         # pull request the two never hold at once; on a push neither holds.
-        def evaluate(expression, *, event, marker, failed_infra):
-            # failure() holds (a step failed); the infra clause model: the
-            # marker is set, or every infra step failed / a specific one did.
-            # We model: marker != '', and each infra id outcome failure only
-            # for failed_infra (the set of ids that failed).
+        def evaluate(expression, *, event, marker, failed_infra, ids):
+            # failure() holds (a step failed); the infra clause model:
+            # the marker is set, and each infra id reads failure only
+            # when it is in failed_infra (the set of ids that failed).
             env = {"CI_INFRA_FAILURE": marker}
-            ids = infra_ids_cache
-            python = expression
-            python = python.replace("failure()", "True")
+            python = expression.replace("failure()", "True")
             for step_id in ids:
                 outcome = "failure" if step_id in failed_infra else "success"
                 python = python.replace(f"steps.{step_id}.outcome", f"'{outcome}'")
@@ -1621,27 +1620,30 @@ class FailFastTests(unittest.TestCase):
             }))
 
         jobs = workflow_jobs()
-        for name in sorted(self.cancelling_set() - self.OUTSIDE):
+        for name in sorted(self.cancelling_set()):
             with self.subTest(job=name):
                 steps = job_steps(jobs[name])
-                infra_ids_cache = infra_ids(jobs[name])
+                ids = infra_ids(jobs[name])
                 ff = re.search(r"(?m)^        if: (.+)$", steps[FAIL_FAST_STEP]).group(1)
                 notice = re.search(r"(?m)^        if: (.+)$", steps[NOTICE_STEP]).group(1)
-                first = infra_ids_cache[0]
+                first = ids[0]
                 cases = [
                     # (marker, failed infra ids, event, expect_cancel, expect_notice)
                     ("", set(), "pull_request", True, False),      # code failure
                     ("", {first}, "pull_request", False, True),   # failed infra step
+                    ("", set(ids), "pull_request", False, True),  # every infra step failed
                     ("cargo-fetch", set(), "pull_request", False, True),  # ci-retry marker
                     ("", set(), "push", False, False),            # push event
                 ]
                 for marker, failed_infra, event, expect_cancel, expect_notice in cases:
-                    cancel = evaluate(ff, event=event, marker=marker, failed_infra=failed_infra)
-                    note = evaluate(notice, event=event, marker=marker, failed_infra=failed_infra)
+                    cancel = evaluate(ff, event=event, marker=marker, failed_infra=failed_infra, ids=ids)
+                    note = evaluate(notice, event=event, marker=marker, failed_infra=failed_infra, ids=ids)
                     self.assertEqual((cancel, note), (expect_cancel, expect_notice),
                                      f"{name} marker={marker!r} infra={sorted(failed_infra)} event={event}")
                     if event == "pull_request":
-                        self.assertFalse(cancel and note, f"{name}: cancel and notice both hold on pull_request")
+                        # On a pull request exactly one of the two holds:
+                        # the run cancels or it records the infra tag.
+                        self.assertTrue(cancel != note, f"{name}: cancel={cancel} notice={note} on pull_request")
 
     def test_the_composite_cancels_the_run_and_fails_soft(self):
         action = (ROOT / ".github" / "actions" / "cancel-run" / "action.yml").read_text()
@@ -3225,10 +3227,10 @@ class DeltaReuseWiringTests(unittest.TestCase):
         Each token-reading line of the pinned body outside the
         positional job `if:` and the exact `save-if:`/`shard:` texts
         must appear in the checked-in evaluation table with the
-        expected value on both paths; a line with no entry, or an entry
-        no pinned body holds, fails. `failure()` evaluates as false
-        (a reused leg was green). The job-level `if:` is the first
-        `if:` line of its own job body, never matched by text.
+        expected value on both paths; a line with no entry fails.
+        `failure()` evaluates as false (a reused leg was green). The
+        job-level `if:` is the first `if:` line of its own job body,
+        never matched by text.
         """
 
         pairs = config.get("pairs", {})
@@ -3247,12 +3249,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
             dispatch_changes["hermes_macos"] = "true"
 
         # 0. Workflow preamble (before `jobs:`) must match its pin.
-        pre = (ROOT / ".github/workflows/ci.yml").read_text().split("jobs:", 1)[0]
-        self.assertEqual(
-            reuse_pins.pinned_hash(pre), reuse_pins.pinned_preamble(),
-            "workflow preamble (env:/defaults: of ci.yml) changed: "
-            "re-check its reuse eligibility, then update its pin",
-        )
+        self.check_preamble_matches((ROOT / ".github/workflows/ci.yml").read_text())
         # 1. Body pin.
         pinned = reuse_pins.pinned_bodies()
         self.assertIn(job_id, pinned, f"job {job_id!r} has no body pin")
@@ -3350,7 +3347,9 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 f"job {job_id!r} line {stripped!r} does not table the legs "
                 f"{legs} of the job",
             )
-            # Ruling 4: the same line must read the same on both paths.
+            # A line reused on the dispatch path must read the same as on
+            # the pull request: a reused leg ran the pinned body, so a
+            # line that differs between the paths decides work.
             for leg in legs:
                 pair = entry["legs"][leg]
                 self.assertEqual(
@@ -3380,6 +3379,13 @@ class DeltaReuseWiringTests(unittest.TestCase):
                     )
         self._held_lines = held
 
+    def check_preamble_matches(self, ci_text):
+        pre = reuse_pins.split_preamble(ci_text)
+        self.assertEqual(
+            reuse_pins.pinned_hash(pre), reuse_pins.pinned_preamble(),
+            "workflow preamble (the text before `jobs:`) changed: "
+            "re-check its reuse eligibility, then update its pin",
+        )
 
     def test_the_pin_update_procedure(self):
         # Copies of the real workflow and the real called workflow, so
@@ -3438,8 +3444,17 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 callee_text=callee_edited,
             )
         # 4. Pin updated without the table: hash the edited body into
-        # the pin, the new token line has no table entry and fails.
-        edited_body = jobs_from(edited)["test"]
+        # the pin, the new step-level token line has no table entry
+        # and fails. The planted line sits in a step (after the job's
+        # own positional `if:`), so it is not exempt.
+        edited_step = ci_text.replace(
+            "      - name: Check formatting\n",
+            "      - name: Check formatting\n"
+            "        if: ${{ github.event_name == 'pull_request' }}\n",
+            1,
+        )
+        self.assertNotEqual(edited_step, ci_text)
+        edited_body = jobs_from(edited_step)["test"]
         original = reuse_pins.PINNED_BODY_HASHES.get("test")
         try:
             reuse_pins.PINNED_BODY_HASHES["test"] = reuse_pins.pinned_hash(edited_body)
@@ -3453,36 +3468,73 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 reuse_pins.PINNED_BODY_HASHES.pop("test", None)
             else:
                 reuse_pins.PINNED_BODY_HASHES["test"] = original
+        # 5. A line in the preamble fails the preamble pin; updating
+        # the pin accepts it (the preamble has no evaluation table).
+        edited_pre = ci_text.replace(
+            '  TEST_SELECTION_SPARSE: "false"\n',
+            '  TEST_SELECTION_SPARSE: "false"\n  PLANTED: "never"\n',
+            1,
+        )
+        self.assertNotEqual(edited_pre, ci_text)
+        with self.assertRaisesRegex(AssertionError, "preamble.*changed"):
+            self.check_preamble_matches(edited_pre)
+        original_preamble = reuse_pins.pinned_preamble()
+        try:
+            reuse_pins.PINNED_PREAMBLE = reuse_pins.pinned_hash(
+                reuse_pins.split_preamble(edited_pre))
+            self.check_preamble_matches(edited_pre)
+        finally:
+            reuse_pins.PINNED_PREAMBLE = original_preamble
 
-    def test_no_reused_job_decides_work_on_a_step_level_event_or_input(self):
-        jobs = workflow_jobs()
-        config = reuse_config()
-        held_anywhere = set()
+    def test_split_preamble_cuts_at_the_jobs_line(self):
+        # A `jobs:` substring above the section (for example in a header
+        # comment) stays in the preamble; the section line itself does not.
+        text = ("# the test jobs: fast, heavy\n"
+                "on: pull_request\n"
+                "jobs:\n"
+                "  test:\n")
+        self.assertEqual(
+            reuse_pins.split_preamble(text),
+            "# the test jobs: fast, heavy\non: pull_request\n",
+        )
+
+    def held_lines_of_allowlisted_jobs(self, config, jobs):
+        """Run the pin and table check of every allowlisted job; return its held lines."""
+        held = set()
         for job_id in config["jobs"]:
             body = jobs[job_id]
             # The fast-tests matrix line is read wherever it sits (the
             # block carries `fail-fast:` and a comment); a matrix job's
-            # legs must be exactly FAST_SHARDS.
+            # `shard:` line must name every FAST_SHARDS leg.
             has_matrix = re.search(r"(?m)^        shard: ", body) is not None
-            legs = partitions_module().FAST_SHARDS if has_matrix else [""]
+            legs = list(partitions_module().FAST_SHARDS) if has_matrix else [""]
             if has_matrix:
-                self.assertEqual(list(legs), list(partitions_module().FAST_SHARDS))
+                shard = re.search(r"(?m)^        shard: (.+)$", body).group(1)
+                for leg in partitions_module().FAST_SHARDS:
+                    self.assertIn(f'"{leg}"', shard)
             self.check_reused_paths_identical(
-                config, job_id=job_id, body=body, legs=list(legs),
+                config, job_id=job_id, body=body, legs=legs,
             )
-            held_anywhere.update(self._held_lines)
+            held.update(self._held_lines)
+        return held
+
+    def assert_no_stale_table_entries(self, config, jobs):
         # Every table entry must be held by some pinned body (no stale
         # entries): an entry nothing evaluates is not evidence.
+        held = self.held_lines_of_allowlisted_jobs(config, jobs)
         stale = [entry["text"] for entry in reuse_pins.EVALUATION_TABLE
-                 if entry["text"] not in held_anywhere]
+                 if entry["text"] not in held]
         self.assertEqual(
             stale, [],
             f"evaluation table entries held by no pinned body: {stale}",
         )
 
+    def test_no_reused_job_decides_work_on_a_step_level_event_or_input(self):
+        self.assert_no_stale_table_entries(reuse_config(), workflow_jobs())
+
     def test_the_paths_guard_catches_a_line_that_differs_between_paths(self):
-        # Ruling 4's per-leg line in fast-tests: pin and table updated
-        # with truthful but different values must fail with "differs
+        # A per-leg line of fast-tests, pinned and tabled with truthful
+        # but different values per path, must fail with "differs
         # between".
         ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
         config = reuse_config()
@@ -3523,26 +3575,14 @@ class DeltaReuseWiringTests(unittest.TestCase):
         # An entry no pinned body holds fails the loop test.
         jobs = workflow_jobs()
         config = reuse_config()
-        held_anywhere = set()
-        for job_id in config["jobs"]:
-            body = jobs[job_id]
-            has_matrix = re.search(r"(?m)^        shard: ", body) is not None
-            legs = partitions_module().FAST_SHARDS if has_matrix else [""]
-            self.check_reused_paths_identical(
-                config, job_id=job_id, body=body, legs=list(legs),
-            )
-            held_anywhere.update(self._held_lines)
         original_table = list(reuse_pins.EVALUATION_TABLE)
         try:
             reuse_pins.EVALUATION_TABLE.append({
                 "text": "if: ${{ github.event_name == 'never' }}",
                 "legs": {"": {"pull_request": "false", "workflow_dispatch": "false"}},
             })
-            stale = [entry["text"] for entry in reuse_pins.EVALUATION_TABLE
-                     if entry["text"] not in held_anywhere]
-            self.assertEqual(
-                stale, ["if: ${{ github.event_name == 'never' }}"],
-            )
+            with self.assertRaisesRegex(AssertionError, "held by no pinned body"):
+                self.assert_no_stale_table_entries(config, jobs)
         finally:
             reuse_pins.EVALUATION_TABLE[:] = original_table
 
