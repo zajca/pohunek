@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 
 use self::buffered_output::{BufferedOutput, OUTPUT_QUEUE_BYTES};
-use self::shortcut::{parse_decimal, MenuInputMode, Shortcut, ShortcutDecoder};
+use self::shortcut::{arrow_event, MenuInputMode, Shortcut, ShortcutDecoder};
 use crate::client::{Client, PinnedHost, RawStream};
 use crate::commands::{request_id, request_with_params};
 use crate::error::CliError;
@@ -114,16 +114,18 @@ const MENU_PASTE_END: &[u8] = b"\x1b[201~";
 const MENU_CSI_OPEN: u8 = b'[';
 /// SS3 reports use `ESC O`, used by application cursor mode.
 const MENU_SS3_OPEN: u8 = b'O';
+/// Bytes of the `ESC [` prefix of a CSI report.
+const MENU_CSI_PREFIX_LEN: usize = 2;
 /// SS3 reports are `ESC O <final>`.
 const MENU_SS3_REPORT_LEN: usize = 3;
 /// CSI final bytes occupy the inclusive ECMA-48 `0x40..=0x7e` range.
 const MENU_CSI_FINAL_START: u8 = 0x40;
 /// Upper bound of the ECMA-48 CSI final-byte range.
 const MENU_CSI_FINAL_END: u8 = 0x7e;
+/// SS3 final bytes occupy the inclusive ECMA-48 `0x40..=0x7e` range.
+const MENU_SS3_FINAL_END: u8 = 0x7e;
 /// Kitty event type `3` is a key release.
 const MENU_EVENT_RELEASE: u32 = 3;
-/// Kitty event type `1` is a key press and is omitted when it is the default.
-const MENU_EVENT_PRESS: u32 = 1;
 /// Parameter bytes of a CSI stop at the first byte below the parameter range.
 const MENU_CSI_PARAM_START: u8 = 0x20;
 /// Parameter bytes of a CSI stop at the first byte above the parameter range.
@@ -1422,6 +1424,15 @@ fn parse_ss3_menu_key(input: &[u8]) -> ParsedMenuKey {
             key: None,
         };
     }
+    if !(MENU_CSI_FINAL_START..=MENU_SS3_FINAL_END).contains(&input[2]) {
+        // Not an SS3 final byte: the Escape is a lone Escape and the rest is
+        // re-parsed, so a following Escape or detach byte is not swallowed.
+        return ParsedMenuKey {
+            consumed: 1,
+            pending: false,
+            key: Some(MenuKey::Esc),
+        };
+    }
     let key = match input[2] {
         MENU_ARROW_UP => Some(MenuKey::Up),
         MENU_ARROW_DOWN => Some(MenuKey::Down),
@@ -1446,16 +1457,13 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
     else {
         return pending_menu_csi(input);
     };
-    let body_end = body_end + 2;
-    let body = &input[2..body_end];
+    let body_end = body_end + MENU_CSI_PREFIX_LEN;
+    let body = &input[MENU_CSI_PREFIX_LEN..body_end];
     let final_byte = input[body_end];
     let is_final = (MENU_CSI_FINAL_START..=MENU_CSI_FINAL_END).contains(&final_byte);
     if !is_final {
-        if matches!(final_byte, MENU_ARROW_UP | MENU_ARROW_DOWN) {
-            return pending_menu_csi(input);
-        }
         return ParsedMenuKey {
-            consumed: 2,
+            consumed: MENU_CSI_PREFIX_LEN,
             pending: false,
             key: None,
         };
@@ -1465,7 +1473,7 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
         MENU_ARROW_UP | MENU_ARROW_DOWN => {
             // Kitty event-typed arrows (`ESC [ 1 ; <mods> [ : <event> ] A`) are
             // a press, a repeat, or a release to swallow.
-            if menu_arrow_event(body) == MENU_EVENT_RELEASE {
+            if arrow_event(body) == MENU_EVENT_RELEASE {
                 return ParsedMenuKey {
                     consumed,
                     pending: false,
@@ -1494,7 +1502,13 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
                 parse_sgr_menu_mouse(input)
             }
         }
-        MENU_PASTE_FINAL => parse_paste_menu_key(body, consumed),
+        MENU_PASTE_FINAL if body == MENU_PASTE_OPEN_PARAMS || body == MENU_PASTE_CLOSE_PARAMS => {
+            ParsedMenuKey {
+                consumed,
+                pending: false,
+                key: None,
+            }
+        }
         _ => ParsedMenuKey {
             // A complete unrecognized CSI is swallowed whole: focus reports
             // (`ESC [ I/O`), colour-scheme reports and other finals must not
@@ -1503,21 +1517,6 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
             pending: false,
             key: None,
         },
-    }
-}
-
-fn parse_paste_menu_key(params: &[u8], consumed: usize) -> ParsedMenuKey {
-    if params == MENU_PASTE_OPEN_PARAMS || params == MENU_PASTE_CLOSE_PARAMS {
-        return ParsedMenuKey {
-            consumed,
-            pending: false,
-            key: None,
-        };
-    }
-    ParsedMenuKey {
-        consumed,
-        pending: false,
-        key: None,
     }
 }
 
@@ -1533,27 +1532,10 @@ fn pending_menu_csi(input: &[u8]) -> ParsedMenuKey {
         }
     } else {
         ParsedMenuKey {
-            consumed: 2,
+            consumed: MENU_CSI_PREFIX_LEN,
             pending: false,
             key: None,
         }
-    }
-}
-
-fn menu_arrow_event(params: &[u8]) -> u32 {
-    let mut fields = params.split(|byte| *byte == b';');
-    // The first field carries the key number (`1`) and any subparameters.
-    let _ = fields.next();
-    match fields.next() {
-        Some(field) => {
-            let mut parts = field.split(|byte| *byte == b':');
-            let _ = parts.next();
-            match parts.next() {
-                Some(bytes) => parse_decimal(bytes).unwrap_or(MENU_EVENT_PRESS),
-                None => MENU_EVENT_PRESS,
-            }
-        }
-        None => MENU_EVENT_PRESS,
     }
 }
 

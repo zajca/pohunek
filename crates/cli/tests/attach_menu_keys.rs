@@ -86,8 +86,8 @@ const KITTY_ESCAPE_PRESS_EVENT: &[u8] = b"\x1b[27;1:1u";
 /// Kitty CSI-u Escape release: it must not leak to the attached program after
 /// the menu closed in response to the press.
 const KITTY_ESCAPE_RELEASE: &[u8] = b"\x1b[27;1:3u";
-/// Kitty CSI-u of the escape-code that reports no canonical byte movement
-/// (`1`): the menu must consume it whole instead of reading `1` as a key.
+/// Kitty CSI-u of code `1`: normalized to byte `0x01`, a no-op in the menu
+/// that must not move the selection or close the menu.
 const KITTY_CSI_U_CODE_ONE: &[u8] = b"\x1b[1;1:1u";
 /// Application-cursor-mode up arrow (SS3).
 const SS3_UP: &[u8] = b"\x1bOA";
@@ -98,8 +98,24 @@ const LEGACY_DOWN: &[u8] = b"\x1b[B";
 /// Legacy lone Escape closes the menu.
 const LEGACY_ESCAPE: &[u8] = b"\x1b";
 /// Lone Escape immediately followed by a legacy arrow in the same read: the
-/// Escape closes the menu and the arrow is re-parsed.
+/// Escape is decoded on its own and closes the menu; the arrow does not
+/// reach the program as input.
 const LEGACY_ESCAPE_ARROW: &[u8] = b"\x1b\x1b[B";
+/// Modified kitty arrow without an event field (`ESC[1;9A`, shift bit): never
+/// followed by a release, so it must not prime release suppression.
+const KITTY_SHIFT_UP_MODIFIED: &[u8] = b"\x1b[1;9A";
+/// Event-typed up release, seated after a menu closed without priming.
+const KITTY_UP_RELEASE: &[u8] = b"\x1b[1;1:3A";
+/// `ESC [` cut by Enter in the same read (`ESC [ \r x`): the CSI is aborted,
+/// the Escape is passed, and the tail is parsed as plain input. In the menu
+/// the CR is Enter, so the abort leaves the menu open after `x`.
+const CSI_ABORTED_BY_ENTER: &[u8] = b"\x1b[\r";
+/// `ESC O` followed by Escape: the SS3 prefix is a lone Escape and the
+/// second Escape closes the menu.
+const SS3_PREFIX_THEN_ESCAPE: &[u8] = b"\x1bO\x1b";
+/// `ESC O` followed by the detach byte: the SS3 prefix is a lone Escape and
+/// the detach byte still detaches.
+const SS3_PREFIX_THEN_DETACH: &[u8] = b"\x1bO\x1d";
 /// Focus-in report (`ESC [ I`): its `I` byte must not act as a menu key.
 const FOCUS_IN: &[u8] = b"\x1b[I";
 /// Mode-report answer (`ESC [ ? 2031 ; 0 $ y`): consumed whole.
@@ -535,8 +551,9 @@ fn csi_u_and_report_bytes_never_become_menu_keys() {
     open_menu(&mut attach);
     attach.expect_highlighted("Kill session", "the menu opens on the kill item");
 
-    // A kitty CSI-u of escape code `1` has no canonical byte: it must be
-    // consumed whole, not read as `ESC` (which would close the menu) + `1`.
+    // A kitty CSI-u of code `1` has no canonical byte movement: it is
+    // normalized to byte `0x01`, a no-op in the menu that neither moves the
+    // selection nor closes it.
     attach.type_key(KITTY_CSI_U_CODE_ONE);
     attach.expect_highlighted(
         "Kill session",
@@ -604,8 +621,9 @@ fn escape_close_per_encoding_never_leaks_its_release_to_the_program() {
         assert_only_sentinel("a lone Escape close leaks no release", &mut attach);
         detach(&mut attach);
     };
-    // Lone Escape and a legacy arrow in the same read: the Escape is handled
-    // on its own and the arrow is re-parsed instead of being swallowed.
+    // Lone Escape and a legacy arrow in the same read: the Escape is
+    // decoded on its own and closes the menu; the arrow does not reach the
+    // attached program as input.
     {
         let mut attach = attach_with_fixture();
         open_menu(&mut attach);
@@ -681,6 +699,69 @@ fn an_unconsumed_release_is_forwarded_to_the_program() {
 }
 
 #[test]
+fn a_modified_arrow_without_event_field_does_not_prime_release_suppression() {
+    let mut attach = attach_with_fixture();
+    open_menu(&mut attach);
+    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+
+    // Modified arrow (`ESC[1;9A`): its modifiers are non-zero, so the report is
+    // normalized to nothing the menu reads as movement; no release ever
+    // follows it, so it must not prime release suppression for the arrow.
+    attach.type_key(KITTY_SHIFT_UP_MODIFIED);
+
+    let before_close = attach.output.lock().expect("output lock").len();
+    attach.type_key(LEGACY_ESCAPE);
+    attach.expect_menu_closed(before_close, "Escape closes the menu");
+
+    // A release the arrow never primed reaches the program.
+    attach.type_key(KITTY_UP_RELEASE);
+    poll_until("the unprimed release to reach the program", || {
+        if attach.fixture.program_input() == KITTY_UP_RELEASE {
+            return Some(());
+        }
+        None
+    });
+
+    detach(&mut attach);
+}
+
+#[test]
+fn a_closed_repeat_untracks_the_key_so_its_release_reaches_the_program() {
+    let mut attach = attach_with_fixture();
+    open_menu(&mut attach);
+    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+
+    // Down is pressed in the menu and tracked for its release.
+    attach.type_key(KITTY_DOWN_PRESS);
+    attach.expect_highlighted(
+        "Terminate and delete session",
+        "kitty down press moves once",
+    );
+
+    let before_close = attach.output.lock().expect("output lock").len();
+    attach.type_key(LEGACY_ESCAPE);
+    attach.expect_menu_closed(before_close, "Escape closes the menu");
+
+    // The key is still held: its repeat is forwarded to the program and
+    // untracks it, so its release reaches the program too.
+    attach.type_key(KITTY_DOWN_REPEAT);
+    attach.type_key(KITTY_DOWN_RELEASE);
+    poll_until(
+        "the forwarded repeat and the untracked release to reach the program",
+        || {
+            let mut expected = KITTY_DOWN_REPEAT.to_vec();
+            expected.extend_from_slice(KITTY_DOWN_RELEASE);
+            if attach.fixture.program_input() == expected {
+                return Some(());
+            }
+            None
+        },
+    );
+
+    detach(&mut attach);
+}
+
+#[test]
 fn an_held_rollover_release_does_not_leak_after_close() {
     let mut attach = attach_with_fixture();
     open_menu(&mut attach);
@@ -704,4 +785,63 @@ fn an_held_rollover_release_does_not_leak_after_close() {
     assert_only_sentinel("held-key and Escape releases must not leak", &mut attach);
 
     detach(&mut attach);
+}
+
+#[test]
+fn an_aborted_csi_in_open_mode_does_not_swallow_later_keys() {
+    let mut attach = attach_with_fixture();
+    open_menu(&mut attach);
+    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+
+    // `ESC [` cut by Enter in the same read: the shortcut layer passes the
+    // Escape and re-parses the tail, so the menu sees Escape then Enter and
+    // opens the kill confirmation. Backing out of it with `n` returns to the
+    // root list, and a later Escape closes the menu, so only the sentinel
+    // reaches the program.
+    attach.type_key(CSI_ABORTED_BY_ENTER);
+    attach.type_key(b"n");
+    let before_close = attach.output.lock().expect("output lock").len();
+    attach.type_key(LEGACY_ESCAPE);
+    attach.expect_menu_closed(before_close, "Escape closes the menu");
+    assert_only_sentinel("an aborted CSI swallows no input", &mut attach);
+
+    detach(&mut attach);
+}
+
+#[test]
+fn an_ss3_prefix_then_escape_behaves_as_a_lone_escape_in_open_mode() {
+    let mut attach = attach_with_fixture();
+    open_menu(&mut attach);
+    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+
+    // `ESC O` is a lone Escape (its third byte is not an SS3 final), so it
+    // passes to the menu and closes it.
+    let before_close = attach.output.lock().expect("output lock").len();
+    attach.type_key(SS3_PREFIX_THEN_ESCAPE);
+    attach.expect_menu_closed(before_close, "the SS3 prefix Escape closes the menu");
+
+    detach(&mut attach);
+}
+
+#[test]
+fn an_ss3_prefix_then_detach_still_detaches_with_the_menu_open() {
+    let mut attach = attach_with_fixture();
+    open_menu(&mut attach);
+    attach.expect_highlighted("Kill session", "the menu opens on the kill item");
+
+    // `ESC O` is a lone Escape, so the detach byte behind it is still read as
+    // a shortcut: the attach detaches even with the menu open.
+    attach.type_key(SS3_PREFIX_THEN_DETACH);
+    poll_until("the attach to end after the detach byte", || {
+        attach.fixture.stream_closed().then_some(())
+    });
+    assert!(
+        attach
+            .fixture
+            .methods()
+            .iter()
+            .any(|method| method == protocol::method::SESSION_DETACH),
+        "the detach request reaches the fixture: {:?}",
+        attach.fixture.methods()
+    );
 }

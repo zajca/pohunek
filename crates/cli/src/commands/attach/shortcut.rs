@@ -60,6 +60,18 @@ const MAX_PENDING_BYTES: usize = 64;
 /// protocol reports releases for every key held at once, and a person cannot
 /// hold more keys than this at the same time.
 const MAX_TRACKED_RELEASES: usize = 8;
+/// CSI parameter bytes start at the ECMA-48 minimum (`0x20`).
+const CSI_PARAM_START: u8 = 0x20;
+/// CSI parameter bytes end at the ECMA-48 maximum (`0x3f`).
+const CSI_PARAM_END: u8 = 0x3f;
+/// SS3 final bytes occupy the inclusive ECMA-48 `0x40..=0x7e` range.
+const SS3_FINAL_START: u8 = 0x40;
+/// SS3 final bytes end at the ECMA-48 maximum (`0x7e`).
+const SS3_FINAL_END: u8 = 0x7e;
+/// SS3 reports are `ESC O <final>`.
+const SS3_REPORT_LEN: usize = 3;
+/// Bytes of the `ESC [` prefix of a CSI report.
+const CSI_PREFIX_LEN: usize = 2;
 
 /// Attach-menu state relevant to shortcut decoding and key normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,8 +114,6 @@ pub(super) struct ShortcutDecoder {
     pending: Vec<u8>,
     /// Keys the open menu consumed whose release has not arrived yet.
     pending_releases: Vec<PendingRelease>,
-    /// Set when a flushed lone Escape may be pending inside `pending`.
-    deferred_escape: bool,
 }
 
 /// Key whose release report the shortcut decoder must swallow once.
@@ -126,20 +136,9 @@ impl ShortcutDecoder {
     /// Bytes after the first shortcut are intentionally dropped, matching the
     /// historical single-byte shortcut behavior. A suffix that can still be a
     /// split CSI sequence remains pending until the next push or timeout.
-    /// A flushed lone Escape is already decoded, so while it is deferred a
-    /// read starting with its own Escape is decoded on its own first byte
-    /// instead of merging into the flushed bytes.
     pub(super) fn push(&mut self, input: &[u8], menu_mode: MenuInputMode) -> DecodedInput {
         let mut joined = std::mem::take(&mut self.pending);
-        // A lone Escape flushed after its timeout was decoded on its own
-        // already. The next read that begins with its own Escape must be
-        // decoded on its own first byte too, not joined to the flushed byte,
-        // or the two merge into one (wrong) sequence.
-        if self.deferred_escape && input.first() == Some(&ESC) {
-            joined.clear();
-        }
         joined.extend_from_slice(input);
-        self.deferred_escape = false;
 
         let mut bytes = Vec::with_capacity(joined.len());
         let mut index = 0;
@@ -212,22 +211,30 @@ impl ShortcutDecoder {
         true
     }
 
+    /// Forgets one remembered key, e.g. when its press or repeat is forwarded
+    /// to the program in Closed mode.
+    fn forget_release(&mut self, release: PendingRelease) {
+        if let Some(position) = self.pending_releases.iter().position(|key| *key == release) {
+            self.pending_releases.remove(position);
+        }
+    }
+
     /// Forgets every remembered release after the menu closed.
     ///
-    /// The next press starts a fresh set, so a stale release from a terminal
-    /// that never reports event types cannot swallow an unrelated release
-    /// of a later physical press.
+    /// Called when the menu opens: the next press starts a fresh set, so a
+    /// stale release from a terminal that never reports event types cannot
+    /// swallow an unrelated release of a later physical press.
     pub(super) fn clear_pending_releases(&mut self) {
         self.pending_releases.clear();
     }
 
     /// Releases an incomplete sequence unchanged after its ambiguity timeout.
+    //
+    // `flush` returns the bytes to `route_stdin_input` first, and the caller
+    // routes them before the next `push`, so a flushed lone Escape never
+    // merges with a following read.
     pub(super) fn flush(&mut self) -> Vec<u8> {
-        let flushed = std::mem::take(&mut self.pending);
-        // The next read that begins with its own Escape must be decoded on
-        // its own first byte instead of joining the flushed byte.
-        self.deferred_escape = flushed.len() == 1;
-        flushed
+        std::mem::take(&mut self.pending)
     }
 }
 
@@ -287,13 +294,29 @@ fn parse_csi(input: &[u8], menu_mode: MenuInputMode, decoder: &mut ShortcutDecod
         // it, and a shortcut byte right after Escape is not left pending.
         return Parse::Pass;
     }
-    let Some(final_offset) = input[2..]
+    // The CSI body runs over ECMA-48 parameter bytes only. A byte outside
+    // the parameter range before any final byte (CR, ESC, DEL, ...) aborts
+    // the sequence: the Escape is passed and the rest is re-parsed, so a
+    // stray byte can no longer swallow following keys.
+    if let Some(abort) = input[2..]
         .iter()
-        .position(|byte| (CSI_FINAL_START..=CSI_FINAL_END).contains(byte))
-    else {
-        return Parse::Pending;
-    };
-    let final_index = final_offset + 2;
+        .position(|byte| !(CSI_PARAM_START..=CSI_PARAM_END).contains(byte))
+    {
+        let candidate = abort + CSI_PREFIX_LEN;
+        if input[candidate] >= CSI_FINAL_START && input[candidate] <= CSI_FINAL_END {
+            return parse_csi_body(input, candidate, menu_mode, decoder);
+        }
+        return Parse::Pass;
+    }
+    Parse::Pending
+}
+
+fn parse_csi_body(
+    input: &[u8],
+    final_index: usize,
+    menu_mode: MenuInputMode,
+    decoder: &mut ShortcutDecoder,
+) -> Parse {
     let consumed = final_index + 1;
     let final_byte = input[final_index];
     let params = &input[2..final_index];
@@ -347,14 +370,21 @@ fn parse_arrow_sequence(
         {
             return Parse::Consumed { consumed };
         }
+        // A press or repeat the program receives clears the tracked key: its
+        // release, whenever it arrives, must reach the program.
+        if event != EVENT_RELEASE {
+            decoder.forget_release(PendingRelease::Arrow(final_byte));
+        }
         return Parse::Pass;
     }
     if event == EVENT_RELEASE {
         let _ = decoder.take_matching_release(PendingRelease::Arrow(final_byte));
         return Parse::Consumed { consumed };
     }
-    // A legacy report with no event field carries no release to suppress.
-    if !params.is_empty() {
+    // Only a press with an explicit event field can be followed by a release
+    // to suppress; a modified arrow (`ESC[1;5A`) carries no event field and
+    // must not prime the slot.
+    if arrow_event_present(params) {
         decoder.remember_press(PendingRelease::Arrow(final_byte));
     }
     let bytes = if final_byte == ARROW_UP_FINAL {
@@ -369,7 +399,8 @@ fn parse_arrow_sequence(
     }
 }
 
-fn arrow_event(params: &[u8]) -> u32 {
+/// Kitty event type of an arrow parameter list (`ESC[1;<mods>[:<event>]A`).
+pub(super) fn arrow_event(params: &[u8]) -> u32 {
     let mut fields = params.split(|byte| *byte == b';');
     // The first field carries the key number (`1`) and any subparameters.
     let _ = fields.next();
@@ -386,9 +417,25 @@ fn arrow_event(params: &[u8]) -> u32 {
     }
 }
 
+/// Whether an arrow parameter list carries an explicit `:event` subfield.
+fn arrow_event_present(params: &[u8]) -> bool {
+    let mut fields = params.split(|byte| *byte == b';');
+    let _ = fields.next();
+    match fields.next() {
+        Some(field) => field.contains(&b':'),
+        None => false,
+    }
+}
+
 fn parse_ss3(input: &[u8], menu_mode: MenuInputMode) -> Parse {
-    if input.len() < 3 {
+    if input.len() < SS3_REPORT_LEN {
         return Parse::Pending;
+    }
+    if !(SS3_FINAL_START..=SS3_FINAL_END).contains(&input[2]) {
+        // Not an SS3 final byte: the Escape is a lone Escape and the rest is
+        // re-parsed, so a flush after the timeout cannot swallow Escape or
+        // the detach byte.
+        return Parse::Pass;
     }
     if menu_mode != MenuInputMode::Open {
         return Parse::Pass;
@@ -398,13 +445,15 @@ fn parse_ss3(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     match input[2] {
         ARROW_UP_FINAL => Parse::Emit {
             bytes: LEGACY_UP,
-            consumed: 3,
+            consumed: SS3_REPORT_LEN,
         },
         ARROW_DOWN_FINAL => Parse::Emit {
             bytes: LEGACY_DOWN,
-            consumed: 3,
+            consumed: SS3_REPORT_LEN,
         },
-        _ => Parse::Consumed { consumed: 3 },
+        _ => Parse::Consumed {
+            consumed: SS3_REPORT_LEN,
+        },
     }
 }
 
@@ -439,6 +488,11 @@ fn parse_csi_u_sequence(
             && decoder.take_matching_release(PendingRelease::Unicode(key.key))
         {
             return Parse::Consumed { consumed };
+        }
+        // A press or repeat the program receives clears the tracked key: its
+        // release, whenever it arrives, must reach the program.
+        if key.is_actionable() {
+            decoder.forget_release(PendingRelease::Unicode(key.key));
         }
         return Parse::Pass;
     }
