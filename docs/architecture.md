@@ -798,16 +798,6 @@ Two rules keep the window bounded:
   written for the version it strands, and the release notes announce the break.
   Additive changes (optional fields, new methods, new error codes) need no
   bump; an event or enum value new to the daemon is withheld from an older
-
-Two rules keep the window bounded:
-
-- **Semantic change rule.** An adapter cannot paper over a change of meaning: a
-  new required parameter, a removed method or event, a changed error code or
-  changed behavior behind an unchanged name. Such a change raises
-  `MIN_PROTOCOL_VERSION` to `PROTOCOL_VERSION` in the same bump, no adapter is
-  written for the version it strands, and the release notes announce the break.
-  Additive changes (optional fields, new methods, new error codes) need no
-  bump; an event or enum value new to the daemon is withheld from an older
   subscriber by the adapter's known-event and known-value lists.
 - **New-in-N rule.** A method added after the previous release has no
   previous-release fixture and no older shape to translate to. It goes on the

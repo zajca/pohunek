@@ -5554,7 +5554,7 @@ Host resolution:
   this machine's own overlay name) are the CLI's and the Rust client's; the SDK
   holds no copy of them. The daemon's typed errors keep their `code`, message
   and recovery hint (`host_unknown`, `overlay_host_ambiguous`,
-  `overlay_host_unavailable`, `host_identity_unpinnable`), and a daemon of the
+  `overlay_host_unavailable`, `host_identity_unpinnable`), and a daemon of
   another protocol version fails with `version_mismatch`. `display` is
   the route as the caller typed it.
 - `pinnedRoute` names the peer by its stable identity. Resolving it again
