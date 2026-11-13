@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use pohunek_test_support::env::TestEnv;
 
-use super::{branch_exists, fetch_origin, worktree_add_new, worktree_remove};
+use super::fetch::fetch_origin;
+use super::{branch_exists, worktree_add_new, worktree_remove};
 
 /// Variables the child starts with: each points Git at a repository, index or
 /// worktree that does not exist.

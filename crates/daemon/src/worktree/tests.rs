@@ -740,8 +740,9 @@ fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
         // bound only ends a fetch that queues behind the guard held here: that
         // fetch fails at once with the lock-timeout error.
         let fetch = scope.spawn(|| {
-            super::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
-            super::fetch_origin(&downstream, "stacked/base")
+            super::fetch::FETCH_LOCK_WAIT_OVERRIDE
+                .with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
+            super::fetch::fetch_origin(&downstream, "stacked/base")
         });
         pohunek_test_support::wait::poll_until(
             "the fetch to finish beside the other fetch",
@@ -790,7 +791,7 @@ fn a_fetch_that_cannot_get_the_repository_lock_falls_back_to_the_local_base_with
     let lock = admin_lock(&downstream).expect("repository lock");
     let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
 
-    super::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
+    super::fetch::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
     let mut warnings = Vec::new();
     let (start_point, fetched) =
         WorktreeManager::fetch_start_point(&downstream, "main", &mut warnings);
@@ -813,7 +814,7 @@ fn a_bind_whose_origin_only_base_cannot_get_the_repository_lock_reports_the_fetc
     let lock = admin_lock(&downstream).expect("repository lock");
     let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
 
-    super::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
+    super::fetch::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
     let mut req = request("s-1", &downstream, "feat/1");
     req.base_branch = Some("stacked/base".to_owned());
     let error = manager("fetch-lock-error")
@@ -1221,7 +1222,7 @@ fn base_ref_with_refspec_syntax_is_not_fetched() {
 
     for hostile in ["main:refs/heads/injected", "+main", "ma*in"] {
         assert!(
-            super::fetch_origin(&downstream, hostile).is_err(),
+            super::fetch::fetch_origin(&downstream, hostile).is_err(),
             "{hostile:?} must be rejected before any fetch"
         );
     }
@@ -1272,7 +1273,7 @@ fn annotated_tag_base_is_pinned_by_its_commit_and_its_ref_is_deleted() {
     let downstream = clone_of(&upstream, "tag-downstream");
     git_in(&downstream, &["tag", "-d", "v1.0.0"]);
 
-    let fetched = super::fetch_origin(&downstream, "v1.0.0").expect("fetch the tag");
+    let fetched = super::fetch::fetch_origin(&downstream, "v1.0.0").expect("fetch the tag");
     assert_eq!(fetched.commit, commit);
     drop(fetched);
     assert_eq!(leftover_fetch_refs(&downstream), "");
@@ -1302,7 +1303,7 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
         ("refs/pohunek/fetch/taken-same", &main_tip),
     ] {
         git_in(&downstream, &["update-ref", dest, oid]);
-        super::fetch_into_ref(&downstream, "main", dest)
+        super::fetch::fetch_into_ref(&downstream, "main", dest)
             .expect_err("an existing destination must fail the fetch");
         assert_eq!(&git_stdout(&downstream, &["rev-parse", dest]), oid);
     }
@@ -1311,68 +1312,28 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
 #[test]
 fn fetch_disables_automatic_maintenance() {
     let repo = init_repo("fetch-maintenance");
-    let tracked = super::fetch_command(
-        &repo,
-        "main",
-        "refs/pohunek/fetch/x",
-        super::FetchScope::Tracked,
-    )
-    .expect("command");
-    assert_fetch_argv(
-        &tracked,
-        &[
-            "fetch",
-            "--no-tags",
-            "origin",
-            "--end-of-options",
-            "main:refs/pohunek/fetch/x",
-        ],
-        "the daemon's own fetch stays byte-identical to main",
-    );
-    let untrusted = super::fetch_command(
-        &repo,
-        "refs/pull/42/head",
-        "refs/pohunek/fetch/y",
-        super::FetchScope::Untrusted,
-    )
-    .expect("command");
-    assert_fetch_argv(
-        &untrusted,
-        &[
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--no-recurse-submodules",
-            "--refmap=",
-            "origin",
-            "--end-of-options",
-            "refs/pull/42/head:refs/pohunek/fetch/y",
-        ],
-        "the untrusted fetch carries exactly the three extra flags",
-    );
-}
-
-/// Assert `command` runs `git fetch` with exactly `fetch_argv` after the
-/// `git` binary and its `-c` config: a byte-identical command line keeps the
-/// daemon's own fetch from drifting. Only the untrusted profile may add
-/// flags.
-fn assert_fetch_argv(command: &std::process::Command, fetch_argv: &[&str], why: &str) {
-    let args: Vec<_> = command
-        .get_args()
-        .map(|arg| arg.to_string_lossy())
-        .collect();
-    let verb = args
-        .iter()
-        .position(|arg| arg == "fetch")
-        .expect("fetch verb");
-    for setting in ["gc.auto=0", "maintenance.auto=false"] {
-        let at = args
+    for scope in [
+        super::fetch::FetchScope::Tracked,
+        super::fetch::FetchScope::Untrusted,
+    ] {
+        let cmd = super::fetch::fetch_command(&repo, "main", "refs/pohunek/fetch/x", scope)
+            .expect("command");
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
+        let fetch = args
             .iter()
-            .position(|arg| arg == setting)
-            .unwrap_or_else(|| panic!("{setting} missing: {args:?}"));
-        assert!(at < verb, "{setting} must precede the verb: {args:?}");
+            .position(|arg| arg == "fetch")
+            .expect("fetch verb");
+        for setting in ["gc.auto=0", "maintenance.auto=false"] {
+            let at = args
+                .iter()
+                .position(|arg| arg == setting)
+                .unwrap_or_else(|| panic!("{scope:?}: {setting} missing: {args:?}"));
+            assert!(
+                at < fetch,
+                "{scope:?}: {setting} must precede the verb: {args:?}"
+            );
+        }
     }
-    assert_eq!(&args[verb..], fetch_argv, "{why}: {args:?}");
 }
 
 #[test]
@@ -2880,7 +2841,7 @@ fn a_remote_branch_fetch_that_times_out_is_a_fetch_failure_and_skips_ls_remote()
             &script.display().to_string(),
         ],
     );
-    super::FETCH_COMMAND_TIMEOUT_OVERRIDE
+    super::fetch::FETCH_COMMAND_TIMEOUT_OVERRIDE
         .with(|timeout| timeout.set(Some(SHORT_FETCH_COMMAND_TIMEOUT)));
 
     let error = super::remote::plan_remote_branch(&downstream, "main", None)

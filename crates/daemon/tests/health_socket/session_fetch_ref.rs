@@ -212,15 +212,14 @@ impl Rig {
     /// Installs an uncommitted in-repo `pre-create` hook: the script file
     /// sits on disk in the repository checkout without any commit, so the
     /// base head stays put (the same pattern the `branch_source` CAS
-    /// scenario uses). The hook scenarios below assert what the daemon
+    /// scenario uses). The scenario that installs it asserts what the daemon
     /// reports: the daemon runs `pre-create` in the repository checkout,
     /// before it promotes the session ref.
     ///
     /// The hook records the commit the session ref holds at hook time
     /// through `seen` (empty when the session ref is not promoted yet).
-    /// The caller owns `seen` through a live [`temp_dir`] guard; the helper
-    /// creates the hooks directory, which outlives the scenario with the
-    /// repository, the same way `branch_source`'s CAS hook installer does.
+    /// The caller owns `seen` through a live [`temp_dir`] guard; the hooks
+    /// directory lives in the repository checkout and is removed with it.
     fn in_repo_pre_create_hook(&self, seen: &Path) {
         let path = self.repo.cwd().join(".pohunek/hooks/pre-create");
         std::fs::create_dir_all(path.parent().expect("hook parent"))
@@ -440,6 +439,54 @@ async fn a_pull_request_head_is_fetched_without_checkout() {
         rig.rev(&fetched.fetched_ref),
         None,
         "session.remove deletes the session ref"
+    );
+    rig.stop().await;
+}
+
+/// The two fetch profiles, observed on the repository's remote-tracking
+/// refs: the daemon's base fetch moves `refs/remotes/origin/main` like an
+/// owner's fetch, while the `fetch_ref` fetch moves no remote-tracking ref,
+/// even one a configured `remote.origin.fetch` refspec maps.
+#[tokio::test]
+async fn the_base_fetch_moves_the_tracking_ref_and_the_fetch_ref_fetch_does_not() {
+    let mut rig = Rig::start("fetch-ref-tracking").await;
+    // Map pull-request heads the way many owners configure GitHub remotes.
+    // Without this mapping, `refs/pull/42/head` matches no refmap and the
+    // assertion would pass vacuously.
+    rig.git(&[
+        "config",
+        "--add",
+        "remote.origin.fetch",
+        "+refs/pull/*/head:refs/remotes/origin/pr/*",
+    ]);
+    rig.git(&["fetch", "-q", "origin"]);
+    let stale = rig
+        .rev("refs/remotes/origin/main")
+        .expect("origin/main is tracked");
+    let advanced = rig.origin_publish_ref("refs/heads/main", "advanced.txt");
+    assert_ne!(advanced, stale, "origin's main moved past the tracking ref");
+    let expected = rig.origin_source_ref();
+    assert_eq!(
+        rig.rev("refs/remotes/origin/pr/42"),
+        None,
+        "no tracking ref for the pull request before the create"
+    );
+    let (_session, fetched) = started(rig.new_session(rig.params(SOURCE_REF, &expected)).await);
+    assert_eq!(rig.rev(&fetched.fetched_ref), Some(expected.clone()));
+    assert_eq!(
+        rig.rev("refs/remotes/origin/main"),
+        Some(advanced),
+        "the daemon's base fetch moves the remote-tracking ref like an owner's fetch"
+    );
+    assert_eq!(
+        rig.rev("refs/remotes/origin/pr/42"),
+        None,
+        "the fetch_ref fetch moves no remote-tracking ref, even one a configured refspec maps"
+    );
+    assert_eq!(
+        rig.git(&["for-each-ref", "refs/remotes/origin/pr"]),
+        "",
+        "the fetch_ref fetch moves no remote-tracking ref, even one a configured refspec maps"
     );
     rig.stop().await;
 }
@@ -704,7 +751,7 @@ async fn a_malformed_fetch_ref_is_rejected() {
     rig.stop().await;
 }
 
-/// Row 12 of the case table, first half: the extra fetch composes with
+/// Row 12 of the case table: the extra fetch composes with
 /// `branch_source: remote` — the checkout follows the branch's remote head
 /// while the session ref pins the unrelated pull-request commit.
 #[tokio::test]
@@ -767,9 +814,9 @@ async fn a_failing_required_post_create_hook_compensates_the_session_ref() {
     rig.stop().await;
 }
 
-/// Row 12 of the case table, second half: a `pre-create` hook runs after
-/// the extra fetch but before promotion, so the session ref is not there
-/// yet — the hook recording an empty resolve pins the order.
+/// Hook order (no case-table row): a `pre-create` hook runs after the extra
+/// fetch but before promotion, so the session ref is not there yet — the
+/// hook recording an empty resolve pins the order.
 #[tokio::test]
 async fn the_pre_create_hook_runs_before_promotion() {
     let mut rig = Rig::start("fetch-ref-pre-sees").await;
@@ -817,7 +864,7 @@ async fn the_pre_create_hook_runs_before_promotion() {
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
-    reason = "the row-5 scenario builds the two-commit submodule origin, the v1 gitlink, the populated store and the move commit in one flow"
+    reason = "the submodule probe builds the two-commit submodule origin, the v1 gitlink, the populated store and the move commit in one flow"
 )]
 async fn fetch_ref_does_not_recurse_into_submodules() {
     let mut rig = Rig::start("fetch-ref-submodule").await;
@@ -936,9 +983,10 @@ async fn fetch_ref_does_not_recurse_into_submodules() {
     // config, `.git/modules/sub`'s `origin/main` reset to v1, and the
     // parent head moved to the v2 gitlink. A recursing `fetch_ref` fetch
     // would move the probe back to v2; the flag under test keeps it at v1.
-    // The `-c protocol.file.allow=always` knob stays scoped to these two
-    // `file://` calls: without it the hermetic git refuses both the
-    // `update --init` clone and the daemon's own fetch below.
+    // The `-c protocol.file.allow=always` knob is passed only to the two
+    // submodule commands below (`update --init`, which clones the fixture's
+    // `file://` url, and `sync`); the daemon's fetch reads the plain-path
+    // `origin` without recursing and needs none.
     rig.git_in(
         rig.repo.cwd(),
         &[
@@ -1073,13 +1121,13 @@ async fn fetch_ref_does_not_recurse_into_submodules() {
         .success(),
         "the submodule v2 commit stayed out of the parent store"
     );
-    // The worktree starts from the move commit the daemon just fetched,
-    // not from the scenario's base tip: the checkout's gitlink at v2
-    // keeps the session reproducible.
+    // The worktree starts from the local `base` tip, which is the move
+    // commit (`origin` has no `base`, so the base fetch falls back to the
+    // local branch); the checkout's gitlink at v2 keeps it reproducible.
     assert_eq!(
         rig.git_in(worktree, &["rev-parse", "HEAD:sub"]),
         sub_v2,
-        "the checkout starts from the fetched move commit"
+        "the checkout starts from the local base tip, the move commit"
     );
     rig.stop().await;
 }

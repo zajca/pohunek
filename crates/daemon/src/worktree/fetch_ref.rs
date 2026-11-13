@@ -17,10 +17,10 @@ use std::path::Path;
 use protocol::{ErrorClass, FetchRefRequest, FetchedRef, ProtocolError};
 use tracing::warn;
 
+use super::fetch::{fetch_into_ref_with, fetch_ref_name, FetchScope, FetchedBase};
 use super::{
-    error, fetch_into_ref_with, fetch_ref_name, git_command, git_run, has_origin,
-    output_failure_message, run_output_bounded, worktree_add_error, FetchScope, FetchedBase,
-    GIT_COMMAND_TIMEOUT,
+    error, git_command, git_run, has_origin, output_failure_message, run_output_bounded,
+    worktree_add_error, GIT_COMMAND_TIMEOUT,
 };
 
 /// Namespace of the per-session refs a `fetch_ref` fetch pins.
@@ -152,9 +152,9 @@ pub(crate) fn fetch_session_temp(
 
 /// Promote `temp` to the session ref of `session_id` and report it.
 ///
-/// Runs once the checkout stands and before the post-create hook runs, so a
-/// pre-create hook (which fires before the fetch) never observes a session
-/// ref for a binding that does not exist yet. The write
+/// Runs once the checkout stands and before the post-create hook runs. The
+/// pre-create hook runs after the fetch and before this promotion, so it never
+/// observes a session ref for a binding that does not exist yet. The write
 /// is create-only: a ref that already holds the expected commit is success, a
 /// ref that holds another commit is `worktree_add_failed`. The temp ref dies
 /// with its guard.
