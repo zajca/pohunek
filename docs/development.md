@@ -111,7 +111,11 @@ The repository has no branch ruleset, so the required set is what CI itself
 decides, listed here by the check names of `.github/workflows/ci.yml`. A pull
 request head is ready when every check on it is green: a check the workflow
 skips by its own paths filter, narrowed selection or docs-only path counts as
-passed, and a failing, cancelled or still pending check does not.
+passed, and a failing, cancelled or still pending check does not. On the
+docs-only path `build tests (nextest archive)` and `real systemd supervision`
+skip through the `changes` job's `docs_only` output, without waiting for
+`test selection`; the verdict fails the run if the selection does not take
+that path too.
 
 - `test selection verdict` is the aggregate. It fails when a test job, a gate
   job, the macOS lane or the Hermes macOS job that the selection requires did
@@ -921,8 +925,10 @@ how a difference is handled.
 (`release-rehearsal-build`, `release-rehearsal`) and starts the separate
 `release-rehearsal-scenarios` call alongside the build in the nightly tier (the daily
 schedule and a `tier=nightly` dispatch) and on pull requests that change the
-release workflows, `packaging/**`, `scripts/release-workflow/**`,
-`crates/xtask/**`, `compat/**`, `runtime-packages/**`, the consumer suite, the
+release workflows, `packaging/**`, `scripts/release-workflow/**`, the xtask
+files its xtask runs can execute (the manifest, `main.rs`, `lib.rs` and the
+module closure of each command, which `scripts/tests/test_ci_tiers.py`
+computes), `compat/**`, `runtime-packages/**`, the consumer suite, the
 release workflow tests, or another input of its `release_rehearsal` filter.
 Push to main and a `tier=main` dispatch do not run it; the release gate takes
 it from the nightly evidence of the release commit. It

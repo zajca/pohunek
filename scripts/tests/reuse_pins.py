@@ -31,7 +31,7 @@ def pinned_callee():
 # Populated by the pin-update procedure; see docs/development.md (Delta dispatch).
 PINNED_BODY_HASHES = {
   "build-bins": "fe2f2655ee5dd89c177f8bd4bf72a4cb7b766ca5c133304d2a5611ff7bf3d983",
-  "build-tests": "c41fed73008a67441e2c1e6777885b0498307f4d2d5fb786e146ce2bd7f0856b",
+  "build-tests": "e184799016c58f03a64f9f3e2cf99d5d1af46d2905215225605a6658c0928c7c",
   "darwin-check": "4a82af03b6684e8d7c970cd338a799007bbca51e5dfd7681c1e4ccdbfb62612b",
   "docs": "06499e3f4e9ade20bfd77c7c4f55b0d1c8cdead3de485bcbb2be2b69528544b2",
   "doctests": "7978d844ac8b29ecbbf12db1808456dbb830fb70431c85d7afa3eb8a1ba24326",
@@ -46,7 +46,7 @@ PINNED_BODY_HASHES = {
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "8e9684845342c677bb4155e024c73fd205e8d1be7582a73a81b75bdff4046c62",
-  "systemd-supervision": "a3f5a65e0c40ab41febe5b9e5a4505577d93338ea1399105c3c00007f6c1b3ef",
+  "systemd-supervision": "4d67597b01aba3f4abe135be42474c79ae44ee9fbc2e097415c16d1dee46c887",
   "test": "1023fc9dbabe6f12b693140cd47eb1d7e67f76085a119cf1069f724ff771ba99",
   "ts-drift": "d18b132a9b0a47f66735ed031448f0503a5af9840521fb481c69db78d6dc4cc1",
   "udeps": "71da2c358e8873c1d9075d2410840afa7d476d50e01a8909716a25f51dbef38f",
@@ -58,7 +58,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "062690e1a0df78904db933882d7cb937b53848ebf166e78adeb2822bd6b901e6"
+PINNED_PREAMBLE = "f417a86f42f619a6b1eda97ccee35b45b8b582fc61a35c785327dccd21ee4640"
 
 
 def pinned_preamble():

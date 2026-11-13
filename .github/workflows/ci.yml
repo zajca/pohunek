@@ -12,6 +12,10 @@ name: CI
 # and publishes nothing; it is part of the nightly tier, not of the main tier.
 # The rehearsal's synthetic-archive smoke scenarios (#1259) are their own job
 # that needs only this checkout, so they start in parallel with the build.
+# A pull request whose every change is on the selector's docs-only path skips
+# `build-tests` and `systemd-supervision` through the `changes` job's
+# `docs_only` output (#2210); the test selection verdict fails the run unless
+# the selection takes that path too.
 # Runner images are pinned (#1731), never ubuntu-latest. The nextest archive producer (build-tests) and every job
 # that consumes its archive run on ubuntu-26.04, together, so they share one glibc. Jobs that build or run the
 # shipped binaries stay on ubuntu-24.04: the acceptance guests carry glibc 2.41 and `glibc-check` rejects binaries
@@ -1038,8 +1042,12 @@ jobs:
   # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
-    needs: reuse
-    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') }}
+    # A pull request whose every change is on the docs-only path skips the
+    # build (#2210). The `changes` paths filter decides that in seconds, so
+    # the build never waits for `test-selection`; the verdict fails the run
+    # unless the selection also takes the docs-only path.
+    needs: [reuse, changes]
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') && !(github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1242,6 +1250,9 @@ jobs:
       release_rehearsal: ${{ steps.filter.outputs.release_rehearsal }}
       release_gate: ${{ steps.filter.outputs.release_gate }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
+      # Every changed file is on a docs-only path of the selector and none on
+      # a path it maps (the `docs_only_*` filters below).
+      docs_only: ${{ steps.filter.outputs.docs_only_paths_count == steps.filter.outputs.docs_only_all_count && steps.filter.outputs.docs_only_mapped_count == '0' }}
     steps:
       # Push events (after merge to main) resolve the filter with git commands
       # against the previous commit, which needs more than a depth-1 checkout.
@@ -1430,9 +1441,14 @@ jobs:
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, the scripts the rows
             # and the archive smoke run, the SDK pack inputs, and the crates the
-            # assembler and the signed catalog live in. The product crates,
+            # assembler and the signed catalog live in. Of crates/xtask it lists
+            # the files the rehearsal's xtask runs can execute (#2211): the
+            # manifest, main.rs, lib.rs and the module closure of each
+            # `cargo xtask` / `"$XTASK"` command; the guard in
+            # scripts/tests/test_ci_tiers.py computes that closure and requires
+            # exactly these xtask entries. The product crates,
             # docs and SDK sources it also reads are left out on purpose; the
-            # guard in scripts/tests/test_ci_tiers.py names them. The rehearsal
+            # guard names them. The rehearsal
             # builds the Linux release artifacts from this commit, runs every
             # matrix row, assembles and signs a bundle with a throwaway key and
             # runs the network-isolated archive smoke on it.
@@ -1446,7 +1462,36 @@ jobs:
               - 'scripts/release-workflow/**'
               - 'scripts/tests/test_release_workflow.py'
               - 'scripts/tests/test_release_workflow_scripts.py'
-              - 'crates/xtask/**'
+              - 'crates/xtask/Cargo.toml'
+              - 'crates/xtask/src/main.rs'
+              - 'crates/xtask/src/lib.rs'
+              - 'crates/xtask/src/affected/**'
+              - 'crates/xtask/src/attestation.rs'
+              - 'crates/xtask/src/catalog.rs'
+              - 'crates/xtask/src/catalog_key.rs'
+              - 'crates/xtask/src/generators.rs'
+              - 'crates/xtask/src/generators/**'
+              - 'crates/xtask/src/knowledge_log.rs'
+              - 'crates/xtask/src/package_evidence.rs'
+              - 'crates/xtask/src/plugin.rs'
+              - 'crates/xtask/src/plugin/build.rs'
+              - 'crates/xtask/src/plugin/host.rs'
+              - 'crates/xtask/src/plugin/prove.rs'
+              - 'crates/xtask/src/plugin_index.rs'
+              - 'crates/xtask/src/plugin_index/admit.rs'
+              - 'crates/xtask/src/plugin_index/build.rs'
+              - 'crates/xtask/src/plugin_index/sign.rs'
+              - 'crates/xtask/src/plugin_index/throwaway.rs'
+              - 'crates/xtask/src/release.rs'
+              - 'crates/xtask/src/release_inventory.rs'
+              - 'crates/xtask/src/release_policy.rs'
+              - 'crates/xtask/src/release_tree.rs'
+              - 'crates/xtask/src/runtime_package.rs'
+              - 'crates/xtask/src/site.rs'
+              - 'crates/xtask/src/test_code.rs'
+              - 'crates/xtask/src/test_runtime.rs'
+              - 'crates/xtask/src/throwaway_trust.rs'
+              - 'crates/xtask/src/upstream_stage.rs'
               - 'crates/package/**'
               - 'compat/**'
               - 'runtime-packages/**'
@@ -1506,6 +1551,35 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+            # The docs-only path of a pull request (#2210), decided by
+            # counting: the `docs_only` output is true when every changed file
+            # matches `docs_only_paths` and none matches `docs_only_mapped`.
+            # The pinned paths-filter has only a per-step `predicate-quantifier`,
+            # and `every` there means "a file matches all patterns", so the rule
+            # is expressed with the per-filter `_count` outputs instead.
+            # `docs_only_paths` are the selector's `NoRustTests` rules whose only
+            # reminder is `docs check` (or none), and `docs_only_mapped` the rules
+            # that select tests or other gates inside them (crates/xtask/src/
+            # affected/mod.rs); scripts/tests/test_ci_tiers.py derives both lists
+            # from the selector and requires these exact lists. A toolchain
+            # change is never on the docs-only path, so these filters omit
+            # the toolchain inputs the other filters list.
+            docs_only_all:
+              - '**'
+            docs_only_paths:
+              - 'docs/**'
+              - 'changelog.d/**'
+              - '.claude/**'
+              - '.agents/**'
+              - 'assets/**'
+              - '*.md'
+              - 'LICENSE'
+              - 'bacon.toml'
+            docs_only_mapped:
+              - 'docs/knowledge/**'
+              - 'docs/public-api.md'
+              - 'rust-toolchain*'
+              - 'tsconfig*'
       - name: Cancel the run (fail fast)
         if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -1642,8 +1716,11 @@ jobs:
   # not carry one.
   systemd-supervision:
     name: real systemd supervision
-    needs: reuse
-    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'systemd-supervision') }}
+    # Skipped on the docs-only path of a pull request by the same `changes`
+    # clause as `build-tests` (#2210); the verdict's check of that skip
+    # against the selection covers this job too.
+    needs: [reuse, changes]
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'systemd-supervision') && !(github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1966,6 +2043,10 @@ jobs:
   # a pull request that plans nothing for it. The gate
   # jobs of the docs-only path must succeed or be skipped by that path, and the
   # macOS lane by its paths filter or a narrowed selection without lane tests.
+  # `build tests` (and with it `test selection check`) may be skipped by the
+  # `changes` docs-only clause only when the selection takes the docs-only
+  # path too; `real systemd supervision` shares that clause, so a docs-only
+  # skip the selection does not confirm always fails this job.
   test-selection-verdict:
     name: test selection verdict
     needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos, reuse]
@@ -1979,10 +2060,10 @@ jobs:
           echo "::error::the reuse job failed, so no skip is trusted"
           exit 1
       - name: Fail a test job that failed or was skipped without a narrowed selection or a reuse skip
-        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests')) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')))) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')))) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
+        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') || (github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true'))) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')))) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')))) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success' && !(needs.test-selection-check.result == 'skipped' && github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
         shell: bash
         env:
-          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }}"
+          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} changes=${{ needs.changes.result }} changes_docs_only=${{ needs.changes.outputs.docs_only }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }}"
         run: |
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1

@@ -502,6 +502,15 @@ class CiTierWorkflowTests(unittest.TestCase):
     def test_every_paths_filter_reacts_to_a_toolchain_change(self):
         for name in filter_names():
             with self.subTest(filter=name):
+                if name in DOCS_ONLY_FILTERS:
+                    # These filters start no job: they skip jobs on the
+                    # docs-only path, which a toolchain change never takes.
+                    self.assertFalse(any(
+                        glob_covers(pattern, path)
+                        for pattern in filter_paths("docs_only_paths")
+                        for path in TOOLCHAIN_INPUTS
+                    ))
+                    continue
                 self.assertLessEqual(TOOLCHAIN_INPUTS, filter_paths(name))
 
     def test_nightly_runs_daily_and_manual_dispatch_requires_a_tier(self):
@@ -871,8 +880,8 @@ REHEARSAL_FILTER_EXCEPTIONS = {
     "crates/session-worker/**": "product crate; pull-request CI builds and tests it",
     "docs/knowledge/**": (
         "read by `cargo xtask docs site`; `docs check` runs the same bundle build "
-        "on every pull request, and the site renderer is in crates/xtask, which "
-        "the filter lists"
+        "on every pull request, and the site renderer (crates/xtask/src/site.rs) "
+        "is in the filter"
     ),
     "README.md": "copied verbatim into every archive; the guard checks it exists",
     "LICENSE": "copied verbatim into every archive and SDK tarball; the guard checks it exists",
@@ -943,6 +952,185 @@ def glob_covers(pattern: str, path: str) -> bool:
     return re.fullmatch(regex, path) is not None
 
 
+# `cargo xtask <command> <action>` in a workflow step and `"$XTASK" <command>
+# <action>` in a script: the runs of the xtask binary the rehearsal makes.
+# Every line that names the binary as a command must parse as one.
+REHEARSAL_XTASK_RUN = re.compile(r'(?:\bcargo xtask|"?\$\{?XTASK\}?"?)\s+([a-z][a-z-]*)\s+([a-z][a-z-]*)')
+REHEARSAL_XTASK_MENTION = re.compile(r'\bcargo xtask\b|"?\$\{?XTASK\}?"?\s+(?![\]|&;])\S')
+XTASK_SOURCE = ROOT / "crates" / "xtask" / "src"
+# Constructs that load code the module scan cannot follow, outside comments.
+XTASK_UNFOLLOWED = re.compile(r"(?m)^\s*#\[path\b|^\s*macro_rules!|\binclude!\(")
+
+
+def rehearsal_xtask_runs(lines: list[str], origin: str) -> set[tuple[str, str]]:
+    """The `(command, action)` pairs of the xtask runs in `lines`; a line that
+    runs the binary in a form the guard cannot read fails."""
+    runs: set[tuple[str, str]] = set()
+    for line in lines:
+        found = REHEARSAL_XTASK_RUN.findall(line)
+        if len(found) != len(REHEARSAL_XTASK_MENTION.findall(line)):
+            raise AssertionError(f"{origin}: an xtask run the guard cannot read: {line.strip()!r}")
+        runs.update(found)
+    return runs
+
+
+def camel(word: str) -> str:
+    """The clap variant name of a kebab-case subcommand."""
+    return "".join(part.capitalize() for part in word.split("-"))
+
+
+def rust_items(text: str, pattern: str) -> list[str]:
+    """Top-level items whose first line matches `pattern`, each from that
+    line to the closing brace at column 0."""
+    return re.findall(rf"(?ms)^{pattern}.*?^\}}$", text)
+
+
+def lib_functions(lib: str) -> dict[str, str]:
+    """The top-level functions of `lib.rs` by name; a name defined once per
+    `cfg` maps to every definition."""
+    functions: dict[str, str] = {}
+    for body in rust_items(lib, r"(?:pub(?:\(crate\))? )?fn \w+"):
+        name = re.match(r"(?:pub(?:\(crate\))? )?fn (\w+)", body).group(1)  # type: ignore[union-attr]
+        functions[name] = functions.get(name, "") + body + "\n"
+    return functions
+
+
+def match_arms(text: str, variant: str) -> list[str]:
+    """The `match` arms of `text` that start with the enum path `variant`.
+
+    An arm runs to the next line at its indentation that does not close it
+    (`}`, `)`), or to a line indented less.
+    """
+    lines = text.splitlines()
+    found = []
+    for index, line in enumerate(lines):
+        start = re.match(rf"( *){re.escape(variant)}\b", line)
+        if start is None:
+            continue
+        indent = len(start.group(1))
+        end = index + 1
+        while end < len(lines):
+            stripped = lines[end].lstrip()
+            depth = len(lines[end]) - len(stripped)
+            if stripped and (depth < indent or (depth == indent and not stripped.startswith(("}", ")")))):
+                break
+            end += 1
+        found.append("\n".join(lines[index:end]))
+    return found
+
+
+def xtask_dispatch(lib: str, command: str, action: str) -> list[str]:
+    """The `lib.rs` text that runs `xtask <command> <action>`.
+
+    The `TopCommand` arm of `run`, narrowed to its `<Command>Action::<Action>`
+    arms, inline or in the `lib.rs` function the arm calls; an arm that hands
+    the action to a module (`attestation::run`) stays whole.
+    """
+    (run,) = rust_items(lib, r"pub fn run<")
+    arms = match_arms(run, f"TopCommand::{camel(command)}")
+    if not arms:
+        raise AssertionError(f"xtask {command} {action}: lib.rs `run` has no TopCommand::{camel(command)} arm")
+    functions = lib_functions(lib)
+    variant = f"{camel(command)}Action::{camel(action)}"
+    texts = []
+    for arm in arms:
+        narrowed = match_arms(arm, variant)
+        for name in re.findall(r"(?<![\w:.])(\w+)\(action\b", arm):
+            if name in functions:
+                narrowed += match_arms(functions[name], variant)
+        texts += narrowed or [arm]
+    return texts
+
+
+def xtask_module_files(source: Path, name: str, parent: Path) -> list[Path]:
+    files = [path for path in (parent / f"{name}.rs", parent / name / "mod.rs") if path.is_file()]
+    if not files:
+        raise AssertionError(f"module {name} below {parent} has no file")
+    return files
+
+
+def xtask_closure(source: Path, lib_texts: list[str]) -> tuple[set[Path], set[str]]:
+    """The xtask source files `lib_texts` can run, and the files they embed.
+
+    From `lib.rs` text: the `lib.rs` functions it calls and the crate modules
+    it names. From a module file: its `mod` children and the crate modules
+    it names through `crate::` or through `super::` up to the crate root.
+    Lines that are comments are skipped; any other over-reading only grows
+    the set. `#[path]`, `include!`, a macro and an `include_*!` of an
+    expression fail: the scan cannot follow them.
+    """
+    repo = source.parents[2]
+    lib = (source / "lib.rs").read_text()
+    modules = set(re.findall(r"(?m)^(?:pub(?:\(crate\))? )?mod (\w+);", lib))
+    functions = lib_functions(lib)
+    texts = list(lib_texts)
+    called: set[str] = set()
+    named: set[str] = set()
+    while texts:
+        text = texts.pop()
+        named |= {name for name in re.findall(r"(?<![\w:])(\w+)::", text) if name in modules}
+        # `run` is the dispatch itself: its arms are the roots.
+        for name in re.findall(r"(?<![\w:.])(\w+)\(", text):
+            if name in functions and name != "run" and name not in called:
+                called.add(name)
+                texts.append(functions[name])
+    files: set[Path] = set()
+    embedded: set[str] = set()
+    stack = [path for name in sorted(named) for path in xtask_module_files(source, name, source)]
+    while stack:
+        path = stack.pop()
+        if path in files:
+            continue
+        files.add(path)
+        text = "\n".join(line for line in path.read_text().splitlines() if not line.lstrip().startswith("//"))
+        if XTASK_UNFOLLOWED.search(text):
+            raise AssertionError(f"{path} loads code the module scan cannot follow")
+        includes = re.findall(r'\binclude_(?:str|bytes)!\(\s*"([^"]+)"\s*\)', text)
+        if len(includes) != len(re.findall(r"\binclude_(?:str|bytes)!\(", text)):
+            raise AssertionError(f"{path} embeds a file named by an expression")
+        embedded |= {
+            Path(os.path.normpath(path.parent / include)).relative_to(repo).as_posix()
+            for include in includes
+        }
+        children = path.parent if path.name == "mod.rs" else path.with_suffix("")
+        for name in re.findall(r"(?m)^\s*(?:pub(?:\(crate\))? )?mod (\w+);", text):
+            stack += xtask_module_files(source, name, children)
+        depth = len(path.relative_to(source).parts) - (1 if path.name == "mod.rs" else 0)
+        root = rf"(?:\bcrate::|(?<![\w:])(?:super::){{{depth}}})"
+        names = set(re.findall(rf"{root}(\w+)", text))
+        for group in re.findall(rf"{root}\{{([^;]*)\}}", text, re.S):
+            names |= set(re.findall(r"(?:^|[{,])\s*(\w+)", group))
+        for name in sorted(names & modules):
+            stack += xtask_module_files(source, name, source)
+    return files, embedded
+
+
+def rehearsal_xtask_inputs(commands: set[tuple[str, str]], source: Path = XTASK_SOURCE) -> dict[str, str]:
+    """The xtask files the rehearsal's runs of xtask read: the manifest,
+    `main.rs`, `lib.rs`, the module closure of each command's dispatch, and
+    the files those modules embed. Every run passes the start of `run` (the
+    checkout check) and may end in `XtaskError`, so both join every closure."""
+    lib = (source / "lib.rs").read_text()
+    (run,) = rust_items(lib, r"pub fn run<")
+    common = [run.split("match command.command", 1)[0]]
+    common += rust_items(lib, r"pub enum XtaskError\b")
+    common += rust_items(lib, r"impl\b[^\n]*\bXtaskError \{")
+    repo = source.parents[2]
+    crate = source.parent.relative_to(repo).as_posix()
+    inputs = {
+        f"{crate}/Cargo.toml": "the xtask manifest",
+        f"{crate}/src/main.rs": "the xtask binary",
+        f"{crate}/src/lib.rs": "the xtask dispatch",
+    }
+    for command, action in sorted(commands):
+        files, embedded = xtask_closure(source, common + xtask_dispatch(lib, command, action))
+        for path in sorted(files):
+            inputs.setdefault(path.relative_to(repo).as_posix(), f"xtask {command} {action}")
+        for path in sorted(embedded):
+            inputs.setdefault(path, f"embedded by the modules of xtask {command} {action}")
+    return inputs
+
+
 def rehearsal_inputs() -> dict[str, str]:
     """Every repository path the rehearsal reads, mapped to where it is read.
 
@@ -951,7 +1139,9 @@ def rehearsal_inputs() -> dict[str, str]:
     crates of the `cargo -p` packages they build; steps and jobs of mode
     `release` alone are left out. One level down, the scripts those steps run
     give the paths they name, `stage-archive` its `release_files`, and the
-    compatibility locks the provisioner scripts the rows run.
+    compatibility locks the provisioner scripts the rows run. For xtask, the
+    inputs are the files its runs in the steps and scripts can execute
+    (`rehearsal_xtask_inputs`), not the whole crate.
     """
     packages = {
         tomllib.loads(manifest.read_text())["package"]["name"]: f"crates/{manifest.parent.name}/**"
@@ -959,6 +1149,7 @@ def rehearsal_inputs() -> dict[str, str]:
     }
     inputs: dict[str, str] = {}
     commands = []
+    xtask_runs: set[tuple[str, str]] = set()
     for workflow in REHEARSAL_WORKFLOWS:
         inputs[f".github/workflows/{workflow}"] = workflow
         for job_name, job in workflow_jobs((ROOT / ".github" / "workflows" / workflow).read_text()).items():
@@ -970,11 +1161,14 @@ def rehearsal_inputs() -> dict[str, str]:
                     continue
                 lines = code_lines(step)
                 commands.extend(lines)
+                xtask_runs |= rehearsal_xtask_runs(lines, f"{workflow} job {job_name}")
                 for path in path_references(lines):
                     inputs.setdefault(path, f"{workflow} job {job_name}")
                 for line in lines:
                     if "cargo " in line:
                         for package in REHEARSAL_CARGO_PACKAGE.findall(line):
+                            if package == "xtask":
+                                continue
                             inputs.setdefault(packages[package], f"{workflow} job {job_name}: cargo -p {package}")
     for command, paths in REHEARSAL_COMMAND_INPUTS.items():
         if any(command in line for line in commands):
@@ -993,6 +1187,7 @@ def rehearsal_inputs() -> dict[str, str]:
         ):
             continue
         text = script.read_text()
+        xtask_runs |= rehearsal_xtask_runs(code_lines(text), path)
         for reference in path_references(code_lines(text)):
             inputs.setdefault(reference, f"read by {path}")
         release_files = re.search(r"(?m)^release_files='([^']*)'$", text)
@@ -1004,6 +1199,9 @@ def rehearsal_inputs() -> dict[str, str]:
             provisioner = json.loads(lock.read_text()).get("upstream", {}).get("provisioner")
             if provisioner:
                 inputs.setdefault(provisioner, f"provisioner of {lock.relative_to(ROOT)}")
+    if any(re.search(r"\bcargo\b.*\s-p\s+xtask\b", line) for line in commands) or xtask_runs:
+        for path, origin in rehearsal_xtask_inputs(xtask_runs).items():
+            inputs.setdefault(path, origin)
     return inputs
 
 
@@ -1039,7 +1237,11 @@ class ReleaseRehearsalFilterTests(unittest.TestCase):
             "scripts/smoke-hermes-plugin-release",
             "scripts/tests/test_smoke_archive.py",
             "packaging/smoke-archive",
-            "crates/xtask/**",
+            "crates/xtask/Cargo.toml",
+            "crates/xtask/src/lib.rs",
+            "crates/xtask/src/release.rs",
+            "crates/xtask/src/site.rs",
+            "crates/xtask/src/upstream_stage.rs",
             "README.md",
             "sdk/ts/sdk/**",
         ):
@@ -1047,6 +1249,83 @@ class ReleaseRehearsalFilterTests(unittest.TestCase):
                 self.assertIn(path, inputs)
         # Steps of mode `release` alone are not rehearsal inputs.
         self.assertNotIn("scripts/build-hermes-package", inputs)
+        # xtask files no rehearsal run of xtask executes are not inputs.
+        for path in ("crates/xtask/**", "crates/xtask/src/ts.rs", "crates/xtask/src/checks.rs",
+                     "crates/xtask/tests/docs_validation.rs"):
+            with self.subTest(outside=path):
+                self.assertNotIn(path, inputs)
+
+    def test_the_filter_lists_no_xtask_file_outside_the_closure(self):
+        # #2211: a pull request that changes an xtask file the rehearsal never
+        # runs (a test, a fixture, a module of another command) does not start it.
+        patterns = filter_paths("release_rehearsal")
+        inputs = rehearsal_inputs()
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", "crates/xtask"], cwd=ROOT, check=True,
+            capture_output=True, text=True,
+        ).stdout.split()
+        self.assertIn("crates/xtask/src/ts.rs", tracked)
+        for path in tracked:
+            with self.subTest(path=path):
+                if any(glob_covers(pattern, path) for pattern in patterns):
+                    self.assertIn(path, inputs, f"{path} is in the release_rehearsal filter but outside the xtask closure")
+
+    def test_every_xtask_run_of_the_rehearsal_is_read(self):
+        self.assertEqual(rehearsal_xtask_runs([
+            'run: cargo xtask docs site',
+            '"$XTASK" compat attest --report "$report" \\',
+            '[ -n "${XTASK:-}" ] && [ -x "$XTASK" ] || fail "XTASK must name the built xtask binary"',
+            'XTASK="$PWD/target/debug/xtask" scripts/release-workflow/assemble',
+        ], "here"), {("docs", "site"), ("compat", "attest")})
+        for line in ('"$XTASK" "$action" --dir x', "$XTASK release assemble; ${XTASK} $verb",
+                     "cargo xtask --verbose docs site"):
+            with self.subTest(line=line):
+                with self.assertRaisesRegex(AssertionError, "cannot read"):
+                    rehearsal_xtask_runs([line], "here")
+
+    def test_the_xtask_runs_are_the_commands_the_dispatch_narrows_to(self):
+        lib = (XTASK_SOURCE / "lib.rs").read_text()
+        # An inline arm and an arm in the function the dispatch calls narrow
+        # to the action; an arm handed to a module stays whole.
+        self.assertEqual(len(xtask_dispatch(lib, "docs", "site")), 1)
+        self.assertIn("build_site", xtask_dispatch(lib, "docs", "site")[0])
+        self.assertNotIn("check_docs", xtask_dispatch(lib, "docs", "site")[0])
+        self.assertTrue(all("PackageAction::Build" in arm for arm in xtask_dispatch(lib, "package", "build")))
+        self.assertEqual(xtask_dispatch(lib, "compat", "attest"), match_arms(
+            rust_items(lib, r"pub fn run<")[0], "TopCommand::Compat"))
+        with self.assertRaisesRegex(AssertionError, "no TopCommand::Nothing arm"):
+            xtask_dispatch(lib, "nothing", "here")
+
+    def test_the_xtask_closure_follows_modules_and_fails_on_what_it_cannot_follow(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "crates" / "xtask" / "src"
+            (source / "b").mkdir(parents=True)
+            (source / "lib.rs").write_text(
+                "mod a;\nmod b;\nmod c;\nmod d;\nmod e;\n"
+                "pub fn run<I>(args: I) {\n    match command.command {\n"
+                "        TopCommand::Go { action } => go(action),\n    }\n}\n"
+                "fn go(action: GoAction) {\n    a::start();\n}\n"
+            )
+            (source / "a.rs").write_text("use crate::{b, XtaskError};\npub fn start() { b::x(); }\n")
+            (source / "b.rs").write_text("mod inner;\n")
+            (source / "b" / "inner.rs").write_text(
+                "// crate::e is named only in a comment\nfn f() { super::super::d::g(); }\n")
+            (source / "c.rs").write_text("pub fn unused() {}\n")
+            (source / "d.rs").write_text("pub fn g() {}\n")
+            (source / "e.rs").write_text("pub fn h() {}\n")
+            lib = (source / "lib.rs").read_text()
+            files, embedded = xtask_closure(source, xtask_dispatch(lib, "go", "now"))
+            self.assertEqual(
+                {path.relative_to(source).as_posix() for path in files},
+                {"a.rs", "b.rs", "b/inner.rs", "d.rs"},
+            )
+            self.assertEqual(embedded, set())
+            for planted in ('#[path = "x.rs"]\nmod x;\n', 'include!("x.rs");\n',
+                            "macro_rules! m { () => {} }\n", "const X: &str = include_str!(concat!(\"x\"));\n"):
+                with self.subTest(planted=planted):
+                    (source / "d.rs").write_text(planted)
+                    with self.assertRaises(AssertionError):
+                        xtask_closure(source, xtask_dispatch(lib, "go", "now"))
 
     def test_every_named_file_input_exists(self):
         # A deleted or renamed file the rehearsal copies, such as a
@@ -4111,6 +4390,100 @@ class DeltaReuseWiringTests(unittest.TestCase):
                     )))
 
 
+# The `changes` filters that decide the docs-only path of a pull request, the
+# jobs that path skips without waiting for the selection, and the clause that
+# skips them.
+DOCS_ONLY_FILTERS = ("docs_only_all", "docs_only_paths", "docs_only_mapped")
+DOCS_ONLY_EARLY_JOBS = ("build-tests", "systemd-supervision")
+DOCS_ONLY_CHANGES_CLAUSE = (
+    "!(github.event_name == 'pull_request' && needs.changes.result == 'success' "
+    "&& needs.changes.outputs.docs_only == 'true')"
+)
+SELECTOR_PATTERN = re.compile(r'Pattern::(File|Dir|RootPrefix|RootSuffix)\("([^"]+)"\)')
+
+
+def selector_rules(source: str) -> tuple[list[tuple[tuple[str, str], str, frozenset[str]]], list[tuple[str, str]]]:
+    """The `RULES` of `cargo xtask affected` as `(pattern, effect, reminders)`,
+    and the patterns of its `CI_RULES`, read from the source text. A rule
+    that is not one `rule(...)` or `reminding(...)` with one pattern and one
+    effect fails."""
+    block = source.split("const RULES: &[Rule] = &[\n", 1)[1].split("\n];\n", 1)[0]
+    starts = list(re.finditer(r"(?m)^    (rule|reminding)\(", block))
+    if len(starts) != len(re.findall(r"\b(?:rule|reminding)\(", block)):
+        raise AssertionError("a selector rule is not a top-level rule(...) or reminding(...) entry")
+    rules = []
+    for index, start in enumerate(starts):
+        text = block[start.start():starts[index + 1].start() if index + 1 < len(starts) else len(block)]
+        patterns = SELECTOR_PATTERN.findall(text)
+        effects = re.findall(r"\bEffect::(\w+)", text)
+        reminders = frozenset(re.findall(r"\bReminder::(\w+)", text))
+        if (len(patterns) != 1 or len(effects) != 1 or text.count("Pattern::") != 1
+                or (start.group(1) == "reminding") != bool(reminders)):
+            raise AssertionError(f"unreadable selector rule: {text!r}")
+        rules.append((patterns[0], effects[0], reminders))
+    ci = source.split("pub(crate) const CI_RULES: &[(Pattern, &str)] = &[\n", 1)[1].split("\n];\n", 1)[0]
+    ci_patterns = SELECTOR_PATTERN.findall(ci)
+    if len(ci_patterns) != ci.count("Pattern::"):
+        raise AssertionError("unreadable CI rule")
+    return rules, ci_patterns
+
+
+def selector_contains(outer: tuple[str, str], inner: tuple[str, str]) -> bool:
+    """Whether every path selector pattern `inner` matches also matches `outer`."""
+    (outer_kind, outer_value), (inner_kind, inner_value) = outer, inner
+    if outer_kind == "Dir":
+        return (inner_kind == "Dir" and inner_value == outer_value) or (
+            inner_kind in ("Dir", "File") and inner_value.startswith(outer_value + "/"))
+    if outer_kind == "File":
+        return inner_kind == "File" and inner_value == outer_value
+    root_match = str.endswith if outer_kind == "RootSuffix" else str.startswith
+    if inner_kind == "File":
+        return "/" not in inner_value and root_match(inner_value, outer_value)
+    return inner_kind == outer_kind and root_match(inner_value, outer_value)
+
+
+def selector_overlaps(first: tuple[str, str], second: tuple[str, str]) -> bool:
+    """Whether some path matches both patterns; a root prefix and a root
+    suffix always share one (`<prefix><suffix>`)."""
+    return (selector_contains(first, second) or selector_contains(second, first)
+            or {first[0], second[0]} == {"RootPrefix", "RootSuffix"})
+
+
+def selector_glob(pattern: tuple[str, str]) -> str:
+    kind, value = pattern
+    return {"Dir": f"{value}/**", "File": value, "RootSuffix": f"*{value}", "RootPrefix": f"{value}*"}[kind]
+
+
+def selector_docs_only_globs(source: str, manifest: dict) -> tuple[set[str], set[str]]:
+    """The docs-only paths of the CI selection as paths-filter globs, and the
+    patterns of the paths it maps inside them.
+
+    A docs-only rule is `NoRustTests` with no reminder but `DocsCheck`; it
+    stays docs-only where no other rule, `CI_RULES` entry or workspace member
+    covers it. Every such pattern that overlaps a docs-only one is mapped.
+    """
+    if "package" in manifest:
+        raise AssertionError("a root package owns every root file: no root file is docs-only")
+    rules, ci = selector_rules(source)
+    members = [("Dir", member) for member in manifest["workspace"]["members"]]
+
+    def docs_only(effect, reminders):
+        return effect == "NoRustTests" and reminders <= {"DocsCheck"}
+
+    others = [pattern for pattern, effect, reminders in rules if not docs_only(effect, reminders)] + ci + members
+    docs = [pattern for pattern, effect, reminders in rules if docs_only(effect, reminders)
+            and not any(selector_contains(other, pattern) for other in others)]
+    mapped = {selector_glob(other) for other in others if any(selector_overlaps(other, path) for path in docs)}
+    return {selector_glob(pattern) for pattern in docs}, mapped
+
+
+def selector_source_and_manifest() -> tuple[str, dict]:
+    return (
+        (ROOT / "crates" / "xtask" / "src" / "affected" / "mod.rs").read_text(),
+        tomllib.loads((ROOT / "Cargo.toml").read_text()),
+    )
+
+
 class DocsOnlyPathTests(unittest.TestCase):
     """A pull request whose every change is prose skips the build and lint gates."""
 
@@ -4155,6 +4528,102 @@ class DocsOnlyPathTests(unittest.TestCase):
         for job in ("build-tests", "systemd-supervision"):
             with self.subTest(job=job):
                 self.assertNotIn(TEST_SELECTOR, job_needs(workflow_jobs()[job]))
+
+    def test_the_docs_only_filters_are_the_selectors_docs_only_rules(self):
+        # #2210: the paths filter skips the early jobs exactly where the
+        # selector would take the docs-only path, read from its rules.
+        paths, mapped = selector_docs_only_globs(*selector_source_and_manifest())
+        self.assertIn("changelog.d/**", paths)
+        self.assertIn("docs/knowledge/**", mapped)
+        self.assertNotIn(".github/**", paths)
+        self.assertEqual(filter_paths("docs_only_paths"), paths)
+        self.assertEqual(filter_paths("docs_only_mapped"), mapped)
+        self.assertEqual(filter_paths("docs_only_all"), {"**"})
+        self.assertIn(
+            "docs_only: ${{ steps.filter.outputs.docs_only_paths_count == "
+            "steps.filter.outputs.docs_only_all_count && "
+            "steps.filter.outputs.docs_only_mapped_count == '0' }}",
+            workflow_jobs()["changes"],
+        )
+
+    def test_the_selector_rules_are_read_strictly(self):
+        source, manifest = selector_source_and_manifest()
+        for broken in (
+            source.replace('rule(Pattern::File("bacon.toml")', 'rule(Pattern::Glob("bacon.toml")', 1),
+            source.replace("    rule(Pattern::Dir(\"assets\")", "    if_ci(rule(Pattern::Dir(\"assets\")", 1),
+            source.replace("reminding(\n        Pattern::File(\"LICENSE\"),\n        Effect::NoRustTests,\n"
+                           "        &[Reminder::DocsCheck],",
+                           "reminding(\n        Pattern::File(\"LICENSE\"),\n        Effect::NoRustTests,\n        &[],", 1),
+        ):
+            with self.subTest():
+                self.assertNotEqual(broken, source)
+                with self.assertRaises(AssertionError):
+                    selector_docs_only_globs(broken, manifest)
+        with self.assertRaises(AssertionError):
+            selector_docs_only_globs(source, {**manifest, "package": {"name": "root"}})
+
+    def test_the_early_jobs_skip_only_on_the_docs_only_path_of_a_pull_request(self):
+        for job in DOCS_ONLY_EARLY_JOBS:
+            condition = job_condition(job)
+            with self.subTest(job=job):
+                # One clause in both jobs: the verdict's check of the
+                # `build-tests` skip covers the systemd job.
+                self.assertIn(f"&& {DOCS_ONLY_CHANGES_CLAUSE}", condition)
+                self.assertIn("changes", job_needs(workflow_jobs()[job]))
+
+                def runs(event="pull_request", result="success", docs_only="true", cancelled=False):
+                    return bool(evaluate_needs_expression(
+                        condition, event=event, cancelled=cancelled,
+                        results={"changes": result}, changes={"docs_only": docs_only},
+                    ))
+
+                self.assertFalse(runs())
+                self.assertFalse(runs(cancelled=True))
+                for kwargs in (
+                    {"docs_only": "false"}, {"docs_only": ""},
+                    {"result": "failure"}, {"result": "cancelled"}, {"result": "skipped"},
+                    {"event": "push"}, {"event": "schedule"}, {"event": "workflow_dispatch"},
+                ):
+                    with self.subTest(**kwargs):
+                        self.assertTrue(runs(**kwargs))
+
+    def test_the_verdict_fails_a_docs_only_skip_the_selection_does_not_confirm(self):
+        job = workflow_jobs()[TEST_VERDICT]
+        self.assertIn("changes", job_needs(job))
+        condition = step_condition(
+            job_steps(job)["Fail a test job that failed or was skipped without a narrowed selection or a reuse skip"]
+        )
+        skipped = {"build-tests": "skipped", TEST_CHECK: "skipped",
+                   "fast-tests": "skipped", "integration": "skipped"}
+        plan = {**DOCS_ONLY_PLAN, "fast_shards": "[]", "heavy": "false"}
+
+        def fails(results=None, selection_plan=None, selection="success", changes="success",
+                  docs_only="true", event="pull_request"):
+            return bool(evaluate_needs_expression(
+                condition, event=event,
+                results={**skipped, TEST_SELECTOR: selection, "changes": changes, **(results or {})},
+                outputs={TEST_SELECTOR: plan if selection_plan is None else selection_plan},
+                changes={"docs_only": docs_only},
+            ))
+
+        self.assertFalse(fails())
+        for kwargs in (
+            # The selection does not take the docs-only path.
+            {"selection_plan": {**plan, "docs_only": "false"}},
+            {"selection_plan": {**plan, "mode": "packages"}},
+            {"selection_plan": {**plan, "narrowed": "false"}},
+            {"selection_plan": {}},
+            {"selection": "failure"}, {"selection": "skipped"},
+            # The paths filter did not take it.
+            {"docs_only": "false"}, {"changes": "failure"},
+            {"event": "push"},
+            # A job that ran must pass.
+            {"results": {"build-tests": "failure"}},
+            {"results": {TEST_CHECK: "failure"}},
+            {"results": {TEST_CHECK: "cancelled"}},
+        ):
+            with self.subTest(**kwargs):
+                self.assertTrue(fails(**kwargs))
 
     def test_the_verdict_fails_a_gate_job_skipped_without_the_docs_only_path(self):
         job = workflow_jobs()[TEST_VERDICT]
