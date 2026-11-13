@@ -1931,11 +1931,11 @@ owner-configured static peers (`overlays.toml` `[netbird.static_peers.<name>]`:
 `host discover`/`host list`, never this host's own listener. When a full status
 is available it wins and the static table is cross-checked against it
 (`overlay_configuration_invalid` on a contradiction). The client verifies the
-pin with `host.governance.inspect` before any other request on a static peer
-and refuses a mismatch as `host_identity_mismatch`, with the typed error and
-advice to run `pohunek host governance inspect local` and correct the file.
-The trust anchor is the owner-chosen pinned host id alone, and the daemon's
-registry (`host.resolve`, and so the TypeScript SDK) builds its registry without
+pin with `host.governance.inspect` before any other request on that
+connection and refuses a mismatch as `host_identity_mismatch`, with the typed
+error and advice to run `pohunek host governance inspect local` and correct
+the file. The trust anchor is the owner-chosen pinned host id, and the
+daemon's registry builds its registry without
 static peers, so it never resolves them.
 
 1. The daemon/CLI reads local NetBird state via `netbird status --json` (no

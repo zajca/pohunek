@@ -397,7 +397,8 @@ fn a_mismatching_host_id_refuses_and_dials_nothing_after_the_check() {
     );
 }
 
-/// S2: a raw address is never matched against the static table. The
+/// Row 2 (raw shape, CLI side): a raw address is never matched against the
+/// static table. The
 /// `netbird_state_restricted` code is asserted, so the test fails if the raw
 /// literal started to resolve (or if the code changed).
 #[test]
@@ -426,7 +427,8 @@ fn a_raw_address_is_never_matched_against_the_static_table() {
     );
 }
 
-/// S5: a name absent from the table fails with the restricted error rather
+/// Row 5 (no-table shape, CLI side): a name absent from the table fails with
+/// the restricted error rather
 /// than `host_unknown`. The `netbird_state_restricted` code is asserted, so
 /// the test fails if the code changed. (Empty table => `overlays.toml`
 /// without `[netbird]`.)
@@ -477,7 +479,7 @@ fn a_restricted_overview_without_the_table_keeps_failing_closed() {
     );
 }
 
-/// S4: a `Connecting` overview never resolves the static peer. The restricted
+/// Row 4: a `Connecting` overview never resolves the static peer. The restricted
 /// fixture's `Connected` is replaced once at write time, so the check is not
 /// a tautology. The `netbird_state_restricted` code is asserted.
 #[test]
@@ -533,7 +535,7 @@ fn a_connecting_overview_never_resolves_the_static_peer() {
     );
 }
 
-/// S6: a restricted overview never names a static peer in discovery or
+/// Row 6: a restricted overview never names a static peer in discovery or
 /// listing. `host discover --json` and `host list --json` both fail with the
 /// restricted code and no peer record carries the static name or FQDN.
 #[test]
@@ -563,7 +565,7 @@ fn host_discover_does_not_name_a_static_peer() {
     );
 }
 
-/// S11: the daemon builds its registry **without** static peers. A real
+/// Row 11: the daemon builds its registry **without** static peers. A real
 /// `pohunekd` with the static-peer `overlays.toml` and a fake restricted
 /// `netbird` answers `host.resolve` over its local Unix socket with
 /// `netbird_state_restricted`, never a `Remote` resolution for the static
@@ -651,7 +653,7 @@ fn the_daemon_never_resolves_a_static_peer() {
     );
 }
 
-/// S5: an unmatched name fails closed with the restricted error, never with
+/// Row 5: an unmatched name fails closed with the restricted error, never with
 /// `host_unknown`, and dials nothing.
 #[test]
 fn an_unmatched_name_fails_with_the_restricted_error() {
@@ -674,7 +676,8 @@ fn an_unmatched_name_fails_with_the_restricted_error() {
     );
 }
 
-/// M2: an fqdn that is the raw IP must not make a raw-IP selector match the
+/// Guard (raw-IP fqdn): an fqdn that is the raw IP must not make a raw-IP
+/// selector match the
 /// table. Without the guard, `--host 100.64.0.21` would resolve the static
 /// entry; with it, it must fail closed.
 #[test]
@@ -729,7 +732,8 @@ fn a_raw_ip_bound_fqdn_never_matches_the_table() {
     );
 }
 
-/// S7a: an address outside the subnet is `overlay_configuration_invalid` and
+/// Row 7 (address field): an address outside the subnet is
+/// `overlay_configuration_invalid` and
 /// the provider is never called.
 #[test]
 fn a_static_address_outside_the_subnet_is_refused_at_load() {
@@ -799,7 +803,8 @@ fn a_static_address_outside_the_subnet_is_refused_at_load() {
     );
 }
 
-/// S7b: `[netbird]` with a `tailscale` provider is `overlay_configuration_invalid`
+/// Row 7 (provider field): `[netbird]` with a `tailscale` provider is
+/// `overlay_configuration_invalid`
 /// and the provider is never called.
 #[test]
 fn a_netbird_table_with_a_tailscale_provider_is_refused_at_load() {
@@ -861,7 +866,8 @@ fn a_netbird_table_with_a_tailscale_provider_is_refused_at_load() {
     assert!(!marker.exists(), "no provider call");
 }
 
-/// S7c: a malformed `host_id` is `overlay_configuration_invalid` and the
+/// Row 7 (host-id field): a malformed `host_id` is `overlay_configuration_invalid`
+/// and the
 /// provider is never called.
 #[test]
 fn a_bad_host_id_is_refused_at_load() {
@@ -926,7 +932,8 @@ fn a_bad_host_id_is_refused_at_load() {
     assert!(!marker.exists(), "no provider call");
 }
 
-/// S7d: two entries sharing a short name are `overlay_configuration_invalid`
+/// Row 7 (uniqueness, short name): two entries sharing a short name are
+/// `overlay_configuration_invalid`
 /// and the provider is never called.
 #[test]
 fn a_shared_short_name_is_refused_at_load() {
@@ -993,7 +1000,8 @@ fn a_shared_short_name_is_refused_at_load() {
     );
 }
 
-/// S8: a full status that contradicts the static table is
+/// Row 8 (cross-check, selector side): a full status that contradicts the
+/// static table is
 /// `overlay_configuration_invalid`, names the entry, and dials nothing.
 #[test]
 fn a_contradicting_full_status_is_refused_at_load() {
@@ -1052,7 +1060,7 @@ fn a_contradicting_full_status_is_refused_at_load() {
     );
 }
 
-/// S9: a full status that agrees with the table resolves through the status
+/// Row 9: a full status that agrees with the table resolves through the status
 /// address and serves no `host.governance.inspect` (the daemon pin).
 #[test]
 fn a_consistent_full_status_dials_without_the_pin_check() {
@@ -1122,7 +1130,7 @@ fn a_consistent_full_status_dials_without_the_pin_check() {
     );
 }
 
-/// S3 (CLI side): `pohunek --host vps2 session input s-1 hello --until working`
+/// Row 3 (CLI side): `pohunek --host vps2 session input s-1 hello --until working`
 /// resolves the session through a pinned connection, then dials a dedicated
 /// connection for `session.input`; each connection must carry
 /// `host.governance.inspect` before any other method, and the dedicated
@@ -1208,13 +1216,15 @@ fn a_dedicated_cli_connection_reproves_the_pin() {
     );
 }
 
-/// S10: `pohunek --host vps2 attach s-1` goes through `Client::attach_raw` on
-/// a pinned client: a framed control connection resolves `vps2` (proving the
-/// pin), then `attach_raw` opens a fresh framed connection and proves the pin
-/// again before any raw byte. The fixture reports the pinned id on the first
-/// connection and a different id from the second; the attach then fails with
-/// `host_identity_mismatch` before any raw attach prelude is served, and
-/// `session.attach` is never served.
+/// Row 10 (raw `attach` shape, CLI side): `pohunek --host vps2 attach s-1`
+/// dials a framed control connection that resolves `vps2` (proving the pin),
+/// then a second framed connection for `attach_raw`. This test proves the
+/// path through `resolve_selector` plus the earlier framed refusal: the
+/// fixture reports the pinned id on the first connection and a different id
+/// from the second, so the attach fails with `host_identity_mismatch` before
+/// any raw attach prelude is served, and `session.attach` is never served.
+/// (`attach_raw`'s own pre-verify is proven in the client crate, where the
+/// raw prelude is reachable without stdio.)
 #[test]
 fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
     let pinned = host_id(b'A');
@@ -1275,12 +1285,13 @@ fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
     );
 }
 
-/// S8 (pinned-route side): a pinned-route action under a contradicting full
-/// status is refused with `overlay_configuration_invalid` and dials nothing.
-/// `session list` on `--host vps2` resolves through `resolve_peer` (host-name
-/// route), so this re-proves the same cross-check from the CLI side.
-/// The identity path (`resolve_peer_identity`, `netbird:fqdn~` route) is
-/// proven in the client crate, where it is reachable without stdio.
+/// Row 8 (cross-check side, CLI): a `session list` action on `--host vps2`
+/// under a contradicting full status is refused with
+/// `overlay_configuration_invalid` and dials nothing. The host-name route
+/// goes through `resolve_selector`, so this proves the cross-check arm in
+/// that method; the `resolve_peer` and `resolve_peer_identity` arms are
+/// proven in the client crate, where the qualified routes are reachable
+/// without stdio. Sibling of `a_contradicting_full_status_is_refused_at_load`.
 #[test]
 fn a_pinned_route_under_a_contradicting_full_status_is_refused() {
     let pinned = host_id(b'A');
@@ -1332,16 +1343,9 @@ fn a_pinned_route_under_a_contradicting_full_status_is_refused() {
     assert!(captured.is_empty(), "nothing is dialed: {captured}");
 }
 
-/// S7: the four uniqueness rules each fail alone: a shared address, a shared
-/// fqdn, a shared host id, and a shared short name (`{key, first fqdn label}`
-/// sets). Each block asserts its exact `check_uniqueness` message, so a
-/// decision-1.5 message change or an arm removal is caught. A shared fqdn
-/// only reaches its arm before the selector-name arm, and its message names
-/// `share an fqdn` where the selector arm would say `share a selector name`.
-/// Shared hermetic scaffold for one uniqueness arm: the owner-private
+/// Hermetic scaffold shared by one uniqueness arm: the owner-private
 /// directories, `overlays.toml` with `table`, and a fake `netbird` on `PATH`
-/// that touches `marker` when consulted. Returns the command environment,
-/// the marker, and the dial capture.
+/// that touches `marker` when consulted.
 struct UniquenessSetup {
     env: TestEnv,
     marker: std::path::PathBuf,
@@ -1411,6 +1415,12 @@ fn uniqueness_arm_refuses(setup: &UniquenessSetup, label: &str, code: &str, mess
 }
 
 #[test]
+/// Row 7: the four uniqueness rules each fail alone: a shared address, a
+/// shared fqdn, a shared host id, and a shared short name (`{key, first fqdn
+/// label}` sets). Each arm asserts its exact `check_uniqueness` message, so
+/// a decision-1.5 message change or an arm removal is caught. A shared fqdn
+/// only reaches its arm before the selector-name arm, and its message names
+/// `share an fqdn` where the selector arm would say `share a selector name`.
 fn each_uniqueness_rule_fails_alone() {
     // Shared address arm.
     let pinned = host_id(b'A');

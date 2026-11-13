@@ -103,10 +103,9 @@ trailing dot. The `address` must lie inside the subnet and not be the
 network or broadcast address. Error messages name the entry key and never
 a value from the file.
 
-The trust anchor is the owner-chosen `host_id` alone: it names the exact
-daemon that must answer at the static `address`, verified by
-`host.governance.inspect` before any other request, and it is also the
-argument against which the failure is reported.
+The trust anchor is the owner-chosen `host_id`: it names the exact daemon
+that must answer at the static `address`, verified by
+`host.governance.inspect` before any other request.
 
 - **Accounts that do not own the connection.** Find the subnet and the
   peer `fqdn` from `netbird status --json` run as the owning account (or
@@ -121,12 +120,6 @@ argument against which the failure is reported.
   `host_identity_mismatch` means the dialled daemon does not report the
   pinned host id: run `pohunek host governance inspect local` on the
   peer and correct the `address`/`host_id`.
-- A daemon of an older release ignores the file and binds the environment value
-  or 18722, and so does a client of an earlier release (a CLI on another host,
-  a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
-  Upgrade every client and restart every daemon before you set `port`, or those
-  clients dial a port nothing listens on; a pinned client adopts the file when
-  it bumps its pin.
 
 ### Diagnostics
 

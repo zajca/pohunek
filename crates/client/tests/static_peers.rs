@@ -4,6 +4,9 @@
 //! reports the pinned id, a different id, or refuses; the framed connection and
 //! the raw attach connection must fail with the same typed error before any
 //! real request is served.
+//!
+//! The by-host raw proof needs Linux (`LD_PRELOAD` interposition), so it is
+//! Linux-gated; the remaining checks run on every platform.
 
 // Rust guideline compliant 2026-11-13
 
@@ -15,21 +18,19 @@ use pohunek_test_support::process_env::{in_own_process, ProcessEnv};
 
 use overlay::{
     BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, LocalIdentity,
-    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
-    ResolvedSelector,
+    OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, RegistryError,
+    ResolvedPeer, ResolvedSelector,
 };
 use pohunek_client::protocol::{self, Request, Response};
 use pohunek_client::{Client, ClientError, ClientOptions, OriginSource};
 use serde_json::{json, Value};
 
 /// Display name of the static peer; the port is the daemon's ephemeral port.
-/// A static address is an overlay-range IP, never loopback. The by-host raw
-/// test therefore drives its child through the loopback shortcut the hermetic
-/// CLI harness installs: the child sets `POHUNEK_TEST_CONNECT_REDIRECT_PORT`
-/// to its loopback fixture, so the static address dials the fixture.
 const PEER_NAME: &str = "vps2";
 const PEER_FQDN: &str = "vps2.remote-box.netbird.test";
 /// The owner-configured static address of the peer (an overlay-range IP).
+/// Linux-only: the by-host raw proof redirects it to a loopback fixture.
+#[cfg(target_os = "linux")]
 const PEER_STATIC_IP: &str = "100.64.0.21";
 
 fn host_id(byte: u8) -> String {
@@ -380,8 +381,9 @@ async fn a_mismatching_pin_refuses_the_attach_connection() {
     );
 }
 
-/// M1: `session.input` with a wait goes through `call_dedicated`, which dials
-/// a fresh connection and must re-prove the pin before `session.input` on it.
+/// Row 3 (dedicated shape, client crate): `session.input` with a wait goes
+/// through `call_dedicated`, which dials a fresh connection and must re-prove
+/// the pin before `session.input` on it.
 #[tokio::test(flavor = "current_thread")]
 async fn a_dedicated_static_connection_reproves_the_pin() {
     let pinned = host_id(b'A');
@@ -416,9 +418,10 @@ async fn a_dedicated_static_connection_reproves_the_pin() {
     );
 }
 
-/// S3: a dedicated connection to a static peer whose daemon now reports a
-/// different id must be refused with `host_identity_mismatch` before
-/// `session.input` is served on the fresh connection.
+/// Row 3 (fresh mismatch, client crate): a dedicated connection to a static
+/// peer whose daemon now reports a different id must be refused with
+/// `host_identity_mismatch` before `session.input` is served on the fresh
+/// connection.
 #[tokio::test(flavor = "current_thread")]
 async fn a_dedicated_static_connection_refuses_a_fresh_mismatch() {
     let pinned = host_id(b'A');
@@ -460,15 +463,20 @@ async fn a_dedicated_static_connection_refuses_a_fresh_mismatch() {
     );
 }
 
-/// S10 (raw by-host shape, at the client registry boundary):
+/// Row 10 (raw by-host shape, at the client registry boundary; Linux only:
+/// needs the `LD_PRELOAD` connect interposer below):
 /// `connect_raw_with_options` resolves the static host through
 /// `default_overlay_registry()` and, in the production code, proves the pin
 /// on a framed connection before it opens the raw stream. The child half below
 /// (`raw_by_host_child_probes_the_pin_first`) runs with the static table and a
 /// `LD_PRELOAD` redirect, so it dials the real by-host raw path; the parent
-/// half drives it as a subprocess and asserts the refusal.
+/// half drives it as a subprocess and asserts the refusal. The interposer
+/// maps the static address to a loopback fixture: the child sets
+/// `POHUNEK_TEST_CONNECT_REDIRECT_PORT` to its loopback port, so the static
+/// address dials the fixture.
 ///
 /// The parent half keeps no hermetic setup of its own: the child builds it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_raw_by_host_connection_proves_the_pin_first() {
     if !in_own_process() {
@@ -502,20 +510,19 @@ fn a_raw_by_host_connection_proves_the_pin_first() {
 }
 
 /// Marker the parent half sets; the child setup half runs only with it.
+/// Linux only: the by-host raw proof re-executes Linux-gated children.
+#[cfg(target_os = "linux")]
 const RAW_CHILD_MARKER: &str = "POHUNEK_STATIC_PEERS_RAW_CHILD";
 
 /// Marker the setup child sets before it re-executes the dial grandchild.
+/// Linux only: set together with the child marker on the grandchild.
+#[cfg(target_os = "linux")]
 const RAW_GRANDCHILD_MARKER: &str = "POHUNEK_STATIC_PEERS_RAW_GRANDCHILD";
-
-/// Marker the dial grandchild prints after a successful by-host raw pin proof.
-/// Kept for the log line the grandchild emits; the parent and child halves
-/// assert the process exit status and the served-methods log instead, so the
-/// marker survives harness output capture.
-const RAW_CHILD_DONE: &str = "RAW_BY_HOST_PIN_PROVED";
 
 /// C source of the `connect()` interposer the raw by-host child compiles: it
 /// redirects the `100.64.0.0/10` overlay range to loopback on the port in
-/// `POHUNEK_TEST_CONNECT_REDIRECT_PORT`.
+/// `POHUNEK_TEST_CONNECT_REDIRECT_PORT`. Linux only.
+#[cfg(target_os = "linux")]
 const CONNECT_REDIRECT_C: &str = "#define _GNU_SOURCE\n\
 #include <arpa/inet.h>\n\
 #include <dlfcn.h>\n\
@@ -549,6 +556,7 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {\n\
 /// Hermetic static-peer setup the raw by-host child and grandchild share:
 /// owner-private config with the pinned table plus a fake `netbird` on `PATH`
 /// reporting the restricted overview.
+#[cfg(target_os = "linux")]
 struct RawChildSetup {
     env: pohunek_test_support::env::TestEnv,
     root: std::path::PathBuf,
@@ -557,6 +565,7 @@ struct RawChildSetup {
 
 /// Write the static-peer config and the fake `netbird` into a fresh hermetic
 /// home, returning the home and its `bin` directory.
+#[cfg(target_os = "linux")]
 fn raw_child_setup(pinned: &str) -> RawChildSetup {
     let env = pohunek_test_support::env::TestEnv::new().expect("create the test environment");
     let root = env.root().to_path_buf();
@@ -590,6 +599,7 @@ fn raw_child_setup(pinned: &str) -> RawChildSetup {
 }
 
 /// Compile the `connect()` interposer in `root` and return its library path.
+#[cfg(target_os = "linux")]
 fn raw_child_redirect(root: &std::path::Path) -> std::path::PathBuf {
     let source = root.join("connect-redirect.c");
     let library = root.join("connect-redirect.so");
@@ -618,6 +628,8 @@ fn raw_child_redirect(root: &std::path::Path) -> std::path::PathBuf {
 ///
 /// Runs only in the re-executed child the parent half spawns; a plain test
 /// run returns at once so the hermetic setup never disturbs other tests.
+/// Linux only.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
 async fn raw_by_host_child_probes_the_pin_first() {
     if std::env::var_os(RAW_CHILD_MARKER).is_none() {
@@ -627,15 +639,13 @@ async fn raw_by_host_child_probes_the_pin_first() {
     let setup = raw_child_setup(&pinned);
     let library = raw_child_redirect(&setup.root);
     // The fixture daemon reports another id; the framed pre-verify must
-    // refuse before `connect_raw_overlay_addr` opens the raw stream. The
-    // fixture binds loopback on an ephemeral port here only to discover the
-    // port; the grandchild below serves it. `LD_PRELOAD` takes effect at
-    // process start, so the grandchild re-executes this test binary with the
-    // redirect in its exec environment. A marker file carries the
-    // served-method log out of the grandchild: it alone sees the dial.
-    let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("probe a free port");
-    let port = probe.local_addr().expect("fixture address").port();
-    drop(probe);
+    // refuse before `connect_raw_overlay_addr` opens the raw stream.
+    // `LD_PRELOAD` takes effect at process start, so the grandchild
+    // re-executes this test binary with the redirect in its exec environment.
+    // The grandchild binds its own port and sets both redirect variables
+    // in-process, so no other process can take the port in between. A marker
+    // file carries the served-method log out of the grandchild: it alone
+    // sees the dial.
     let served_log = setup.root.join("served-methods");
     let log_path = served_log.to_string_lossy().into_owned();
     let exe = std::env::current_exe().expect("test executable");
@@ -650,8 +660,6 @@ async fn raw_by_host_child_probes_the_pin_first() {
         .env("XDG_CONFIG_HOME", setup.env.config_home())
         .env("PATH", &setup.bin)
         .env("LD_PRELOAD", &library)
-        .env("POHUNEK_TEST_CONNECT_REDIRECT_PORT", port.to_string())
-        .env("POHUNEK_REMOTE_PORT", port.to_string())
         .env("POHUNEK_STATIC_PEERS_SERVED_LOG", log_path.as_str())
         .env(RAW_GRANDCHILD_MARKER, "1")
         .env(RAW_CHILD_MARKER, "1")
@@ -685,7 +693,8 @@ async fn raw_by_host_child_probes_the_pin_first() {
 /// mismatching fixture in-process, dials the real `connect_raw_with_options`
 /// by host name, and expects `host_identity_mismatch`. It records the served
 /// methods into `POHUNEK_STATIC_PEERS_SERVED_LOG` so the child can assert the
-/// proof shape.
+/// proof shape. Linux only.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
 async fn raw_by_host_grandchild_dials_the_pin_first() {
     if std::env::var_os(RAW_GRANDCHILD_MARKER).is_none() {
@@ -696,12 +705,19 @@ async fn raw_by_host_grandchild_dials_the_pin_first() {
     }
     let pinned = host_id(b'A');
     let reported = host_id(b'B');
-    let redirect_port: u16 = std::env::var("POHUNEK_TEST_CONNECT_REDIRECT_PORT")
-        .expect("redirect port")
-        .parse()
-        .expect("redirect port parses");
-    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, redirect_port))
-        .expect("bind the fixture on the redirected port");
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind the fixture on a free port");
+    let redirect_port = listener.local_addr().expect("fixture address").port();
+    // The interposer reads `POHUNEK_TEST_CONNECT_REDIRECT_PORT` on every
+    // `connect()`, so the fixture port set here redirects this process's own
+    // dials to the fixture. `POHUNEK_REMOTE_PORT` also points the framed
+    // pre-verify at the same fixture address.
+    let mut process_env = ProcessEnv::lock();
+    process_env.set(
+        "POHUNEK_TEST_CONNECT_REDIRECT_PORT",
+        redirect_port.to_string(),
+    );
+    process_env.set("POHUNEK_REMOTE_PORT", redirect_port.to_string());
     let served = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&served);
     std::thread::spawn(move || {
@@ -733,24 +749,25 @@ async fn raw_by_host_grandchild_dials_the_pin_first() {
     let log_path =
         std::env::var_os("POHUNEK_STATIC_PEERS_SERVED_LOG").expect("the served-methods log path");
     std::fs::write(log_path, methods.join("\n")).expect("write the served-methods log");
-    println!("{RAW_CHILD_DONE}");
 }
 
-/// S8 (`resolve_peer` side): an unqualified selector in the qualified route
-/// (`netbird:{PEER_NAME}`) drives `resolve_peer`, the sibling of
-/// `resolve_peer_identity` in `resolve_qualified_host`. A contradicting full
-/// status is refused the same way, before any dial. The fake `netbird`
-/// prints the contradicting full status; the only dial is the status probe,
-/// and no other dial follows.
-#[tokio::test(flavor = "current_thread")]
-async fn a_contradicting_full_status_is_refused_on_peer_resolution() {
-    if !in_own_process() {
-        return;
-    }
-    let pinned = host_id(b'A');
+/// Hermetic static-peer table plus a fake `netbird` printing a full status
+/// that contradicts the table (the peer `fqdn` at another address).
+/// Returns the config directory with the file owner-private and the `bin`
+/// directory with the fake, so the caller can route `PATH` and the config
+/// home at it.
+struct ContradictingStatusSetup {
+    _env: pohunek_test_support::env::TestEnv,
+    config_dir: std::path::PathBuf,
+    bin: std::path::PathBuf,
+    config_home: std::path::PathBuf,
+}
+
+fn contradicting_status_setup(pinned: &str) -> ContradictingStatusSetup {
     let env = pohunek_test_support::env::TestEnv::new().expect("create the test environment");
     let root = env.root().to_path_buf();
-    let config_dir = env.config_home().join("pohunek");
+    let config_home = env.config_home().to_path_buf();
+    let config_dir = config_home.join("pohunek");
     std::fs::create_dir_all(&config_dir).expect("create the config directory");
     std::fs::set_permissions(
         &config_dir,
@@ -785,24 +802,48 @@ async fn a_contradicting_full_status_is_refused_on_peer_resolution() {
         format!("#!/bin/sh\nprintf '%s\\n' '{carrier}'\n"),
     )
     .expect("write fake netbird");
+    ContradictingStatusSetup {
+        _env: env,
+        config_dir,
+        bin,
+        config_home,
+    }
+}
+
+/// Row 8 (`resolve_peer` side): an unqualified selector in the qualified route
+/// (`netbird:{PEER_NAME}`) drives `resolve_peer`, the sibling of
+/// `resolve_peer_identity` in `resolve_qualified_host`. A contradicting full
+/// status is refused the same way, before resolving. The fake `netbird`
+/// prints the contradicting full status; resolution alone dials nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn a_contradicting_full_status_is_refused_on_peer_resolution() {
+    if !in_own_process() {
+        return;
+    }
+    let pinned = host_id(b'A');
+    let setup = contradicting_status_setup(&pinned);
     let mut process_env = ProcessEnv::lock();
-    process_env.set("PATH", bin.as_os_str());
-    if let Some(path) = env.config_home().to_str() {
+    process_env.set("PATH", setup.bin.as_os_str());
+    if let Some(path) = setup.config_home.to_str() {
         process_env.set("XDG_CONFIG_HOME", path);
     }
     async {
         let config =
-            pohunek_client::OverlayConfig::load_from(&config_dir).expect("the config loads");
+            pohunek_client::OverlayConfig::load_from(&setup.config_dir).expect("the config loads");
         let registry = config.registry().expect("registry with static peers");
         let host = format!("netbird:{PEER_NAME}");
         let error = registry
             .resolve_host(&host)
             .await
             .expect_err("a contradicting full status is refused");
-        let message = format!("{error}");
         assert!(
-            message.contains("overlay_configuration_invalid")
-                || format!("{error:?}").contains("InvalidConfig"),
+            matches!(
+                error,
+                RegistryError::HostUnavailable { ref failures, .. }
+                    if failures
+                        .iter()
+                        .any(|failure| matches!(failure.error, OverlayError::InvalidConfig { .. }))
+            ),
             "the typed cross-check refusal: {error:?}"
         );
     }
@@ -831,74 +872,41 @@ fn b64url(bytes: &[u8]) -> String {
     out
 }
 
-/// S8 (identity side): `resolve_peer_identity` (`netbird:fqdn~` route) also
+/// Row 8 (identity side): `resolve_peer_identity` (`netbird:fqdn~` route) also
 /// cross-checks the static table against a full status. A contradicting
-/// full status is `overlay_configuration_invalid` and dials nothing; the
-/// session list runs over `resolve_selector` (S8 CLI side), so this proves
-/// the identity-flavoured branch of the same cross-check. The fake `netbird`
-/// prints the contradicting full status; the only dial is the status probe,
-/// and no other dial follows.
+/// full status is `overlay_configuration_invalid`; the session list runs over
+/// `resolve_selector` (row 8 CLI side), so this proves the identity-flavoured
+/// branch of the same cross-check. The fake `netbird` prints the
+/// contradicting full status; resolution alone dials nothing.
 #[tokio::test(flavor = "current_thread")]
 async fn a_contradicting_full_status_is_refused_on_identity_resolution() {
     if !in_own_process() {
         return;
     }
     let pinned = host_id(b'A');
-    let env = pohunek_test_support::env::TestEnv::new().expect("create the test environment");
-    let root = env.root().to_path_buf();
-    let config_dir = env.config_home().join("pohunek");
-    std::fs::create_dir_all(&config_dir).expect("create the config directory");
-    std::fs::set_permissions(
-        &config_dir,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .expect("make the config directory private");
-    let file = config_dir.join("overlays.toml");
-    std::fs::write(
-        &file,
-        format!(
-            "providers = [\"netbird\"]\n\n[netbird]\nsubnet = \"100.64.0.0/10\"\n\n\
-             [netbird.static_peers.{PEER_NAME}]\naddress = \"100.64.0.21\"\n\
-             fqdn = \"{PEER_FQDN}\"\nhost_id = \"{pinned}\"\n"
-        ),
-    )
-    .expect("write overlays.toml");
-    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .expect("make overlays.toml private");
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin).expect("create the bin directory");
-    let carrier = serde_json::json!({
-        "daemonStatus": "Connected",
-        "management": {"url": "https://api.netbird.io:443", "connected": true},
-        "netbirdIp": "100.64.0.1",
-        "publicKey": "key-self",
-        "fqdn": "self.netbird.test",
-        "peers": [{"publicKey": "key-one", "fqdn": PEER_FQDN, "netbirdIp": "100.64.0.99", "status": "Connected"}],
-        "details": null,
-    });
-    pohunek_test_support::fs::write_executable(
-        bin.join("netbird"),
-        format!("#!/bin/sh\nprintf '%s\\n' '{carrier}'\n"),
-    )
-    .expect("write fake netbird");
+    let setup = contradicting_status_setup(&pinned);
     let mut process_env = ProcessEnv::lock();
-    process_env.set("PATH", bin.as_os_str());
-    if let Some(path) = env.config_home().to_str() {
+    process_env.set("PATH", setup.bin.as_os_str());
+    if let Some(path) = setup.config_home.to_str() {
         process_env.set("XDG_CONFIG_HOME", path);
     }
     async {
         let config =
-            pohunek_client::OverlayConfig::load_from(&config_dir).expect("the config loads");
+            pohunek_client::OverlayConfig::load_from(&setup.config_dir).expect("the config loads");
         let registry = config.registry().expect("registry with static peers");
         let selector = format!("netbird:fqdn~{}", b64url(PEER_FQDN.as_bytes()));
         let error = registry
             .resolve_host(&selector)
             .await
             .expect_err("a contradicting full status is refused");
-        let message = format!("{error}");
         assert!(
-            message.contains("overlay_configuration_invalid")
-                || format!("{error:?}").contains("InvalidConfig"),
+            matches!(
+                error,
+                RegistryError::HostUnavailable { ref failures, .. }
+                    if failures
+                        .iter()
+                        .any(|failure| matches!(failure.error, OverlayError::InvalidConfig { .. }))
+            ),
             "the typed cross-check refusal: {error:?}"
         );
     }
