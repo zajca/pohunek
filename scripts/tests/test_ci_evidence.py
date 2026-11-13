@@ -135,6 +135,7 @@ def names_a_workflow_job(required, workflow_path):
 
 
 FAKE_GH = r'''#!/usr/bin/env python3
+import base64
 import json
 import os
 from pathlib import Path
@@ -185,10 +186,21 @@ elif "/actions/workflows/" in endpoint:
 elif "/contents/" in endpoint:
     # The config in the tree of the ref, served raw as the contents API does.
     ref = endpoint.split("?ref=", 1)[1]
-    configs = fixture.get("tree_configs", {})
-    if ref not in configs:
+    if any("application/vnd.github.raw+json" in arg for arg in args) and "scripts/ci-evidence.json" not in endpoint:
+        # A raw workflow file of the tree, for the reuse alias resolver.
+        path = endpoint.split("/contents/", 1)[1].split("?", 1)[0]
+        texts = fixture.get("tree_files", {})
+        if ref in texts and path in texts[ref]:
+            print(texts[ref][path], end="")
+            raise SystemExit(0)
         print("gh: Not Found (HTTP 404)", file=sys.stderr)
         raise SystemExit(1)
+    configs = fixture.get("tree_configs", {})
+    if ref not in configs:
+        configs = fixture.get("tree_config", {})
+        if ref not in configs:
+            print("gh: Not Found (HTTP 404)", file=sys.stderr)
+            raise SystemExit(1)
     print(json.dumps(configs[ref]))
 elif "/git/commits/" in endpoint:
     sha = endpoint.rsplit("/", 1)[1]
@@ -200,8 +212,42 @@ elif "/commits" in endpoint:
     print(json.dumps([{"sha": fixture.get("resolved_ref")}]))
 elif endpoint.endswith("/artifacts"):
     run_id = endpoint.split("/")[-2]
-    names = fixture.get("artifacts", {}).get(run_id, [])
-    print(json.dumps([{"artifacts": [{"name": name} for name in names]}]))
+    entries = fixture.get("artifacts", {}).get(run_id, [])
+    artifacts = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            artifacts.append({
+                "name": entry["name"],
+                "id": entry.get("id", 1),
+                "expired": entry.get("expired", False),
+            })
+        else:
+            artifacts.append({"name": entry})
+    # The real `gh` honours the pagination flags: `--paginate
+    # --slurp` prints a JSON array of page objects, bare `--paginate`
+    # concatenates them, and neither prints the whole list at once. A
+    # script that drops the flags gets a single page object and must fail
+    # on the `isinstance(pages, list)` check.
+    page = {"artifacts": artifacts}
+    if "--paginate" in args and "--slurp" in args:
+        print(json.dumps([page]))
+    else:
+        print(json.dumps(page))
+elif "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
+    artifact_id = str(endpoint.split("/")[-2])
+    zips = {str(key): value for key, value in fixture.get("artifact_zips", {}).items()}
+    if artifact_id not in zips:
+        print("gh: Not Found (HTTP 404)", file=sys.stderr)
+        raise SystemExit(1)
+    sys.stdout.buffer.write(base64.b64decode(zips[artifact_id]))
+elif "/actions/runs/" in endpoint and "/jobs" not in endpoint and not endpoint.endswith("/artifacts"):
+    # A single run by id, for the reuse source run.
+    run_id = str(endpoint.rsplit("/", 1)[1])
+    runs = {str(key): value for key, value in fixture.get("runs_by_id", {}).items()}
+    if run_id not in runs:
+        print("gh: Not Found (HTTP 404)", file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps(runs[run_id]))
 elif "/actions/runs/" in endpoint:
     run_id = endpoint.split("/")[-2]
     page = fixture.get("jobs_by_run", {}).get(run_id, fixture.get("jobs_page", {"jobs": []}))
@@ -223,6 +269,7 @@ def run_doc(
     run_id=456,
     repo=None,
     head_repo=None,
+    created_at="2026-11-12T12:00:00Z",
 ):
     document = {
         "id": run_id,
@@ -236,6 +283,7 @@ def run_doc(
         "status": status,
         "conclusion": conclusion,
         "html_url": f"https://github.com/example/pohunek/actions/runs/{run_id}",
+        "created_at": created_at,
     }
     if repo is not None:
         document["repository"] = {"full_name": repo}
@@ -262,11 +310,16 @@ def page(runs):
     return {"workflow_runs": runs}
 
 
-def jobs_page(*, overrides=None, omit=(), extra=()):
+def jobs_page(*, overrides=None, omit=(), extra=(), completed_at="2026-11-12T11:00:00Z"):
     overrides = overrides or {}
     names = [name for name in REQUIRED_JOBS if name not in omit]
     jobs = [
-        {"name": name, "status": "completed", "conclusion": overrides.get(name, "success")}
+        {
+            "name": name,
+            "status": "completed",
+            "conclusion": overrides.get(name, "success"),
+            "completed_at": completed_at,
+        }
         for name in names
     ]
     for job in extra:
@@ -275,6 +328,72 @@ def jobs_page(*, overrides=None, omit=(), extra=()):
     return {
         "jobs": jobs
     }
+
+
+REUSE_SOURCE_ID = 777
+REUSE_JOB = "matrix check (linux)"
+
+
+def reuse_config(base):
+    """A config copy with the delta-reuse section the candidate allows."""
+    config = json.loads(json.dumps(base))
+    config["reuse"] = {"max_age_hours": 24, "source_events": ["pull_request"]}
+    return config
+
+
+def reuse_zip(tree, jobs, source_run_id=REUSE_SOURCE_ID):
+    """A base64 zip holding the `ci-reuse-<tree>` record for the fixture."""
+    import base64
+    import io
+    import zipfile
+
+    record = {
+        "schema_version": 1,
+        "tree": tree,
+        "source_run_id": source_run_id,
+        "source_url": f"https://github.com/example/pohunek/actions/runs/{source_run_id}",
+        "source_event": "pull_request",
+        "source_head_sha": SHA,
+        "jobs": {
+            job_id: {
+                "run_id": source_run_id,
+                "names": names,
+                "source_job_ids": [1000 + index for index, _ in enumerate(names)],
+                "completed_at": ["2026-11-12T11:00:00Z" for _ in names],
+            }
+            for job_id, names in jobs.items()
+        },
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"ci-reuse-{tree}.json", json.dumps(record))
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def union_fixture(test, **values):
+    """A fixture where the evidence run 456 on SHA skipped REUSE_JOB and its
+    `ci-reuse-<TREE>` record names the green pull request run 777 on SHA."""
+    source = run_doc(
+        sha=SHA, event="pull_request", branch="zajca/feature", run_id=REUSE_SOURCE_ID,
+        repo=REPO, head_repo=REPO,
+    )
+    base = {
+        "trees": {SHA: TREE},
+        "artifacts": {
+            "456": [{"name": f"ci-reuse-{TREE}", "id": 11}],
+            str(REUSE_SOURCE_ID): [f"tested-tree-{TREE}"],
+        },
+        "artifact_zips": {"11": reuse_zip(TREE, {"matrix": [REUSE_JOB]})},
+        "runs_by_id": {str(REUSE_SOURCE_ID): source},
+        "jobs_by_run": {
+            "456": jobs_page(overrides={REUSE_JOB: "skipped"}),
+            str(REUSE_SOURCE_ID): jobs_page(),
+        },
+    }
+    base.update(values)
+    test.write_fixture(run_pages=[page([run_doc()])], **base)
+    test.config_data = reuse_config(test.config_data)
+    test.write_config()
 
 
 class CiEvidenceCliTests(unittest.TestCase):
@@ -1110,6 +1229,296 @@ class CiEvidenceCliTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("workflow conclusion", result.stderr)
                 self.assertIn("/actions/runs/456", result.stderr)
+
+    def test_a_delta_dispatch_title_with_suffix_counts_for_tier_and_dispatch(self):
+        self.write_fixture(
+            run_pages=[page([run_doc(event="workflow_dispatch", title="CI [tier=main] [dispatch=__REQUEST_ID__] [delta]")])],
+            jobs_page=jobs_page(),
+        )
+        result = self.invoke("main")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_reuse_union_is_accepted_and_names_both_runs(self):
+        union_fixture(self)
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIn("reused_from", report)
+        self.assertEqual(report["reused_from"]["run_id"], REUSE_SOURCE_ID)
+        self.assertEqual(
+            report["reused_from"]["url"],
+            f"https://github.com/example/pohunek/actions/runs/{REUSE_SOURCE_ID}",
+        )
+        self.assertEqual(report["reused_from"]["jobs"], ["matrix"])
+        text = self.invoke("main")
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("/actions/runs/456", text.stdout)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", text.stdout)
+
+    def test_a_reuse_union_accepts_a_skipped_matrix_job(self):
+        # A skipped matrix job is shown under its display `name:` in the
+        # evidence run, exactly as the Actions API shows it on a real run:
+        # `tests (${{ matrix.shard }}, fast)` with the expression
+        # uninterpolated, while the record names the legs it reused
+        # (`tests (core, fast)`). The union accepts it through the alias.
+        workflow = """name: ci
+jobs:
+  fast-tests:
+    name: tests (${{ matrix.shard }}, fast)
+    strategy:
+      matrix:
+        shard: ${{ fromJSON(github.event_name == 'pull_request' && false || '["core"]') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+  required:
+    name: required check
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+        evidence_page = jobs_page(overrides={}, extra=[
+            {"name": "tests (${{ matrix.shard }}, fast)", "status": "completed", "conclusion": "skipped",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        source_page = jobs_page(extra=[
+            {"name": "tests (core, fast)", "status": "completed", "conclusion": "success",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        union_fixture(
+            self,
+            tree_files={SHA: {WORKFLOW_PATH: workflow}},
+            artifact_zips={"11": reuse_zip(TREE, {"fast-tests": ["tests (core, fast)"]})},
+            jobs_by_run={"456": evidence_page, str(REUSE_SOURCE_ID): source_page},
+        )
+        self.config_data["required_jobs"]["main"].append("tests (core, fast)")
+        self.write_config()
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["reused_from"]["jobs"], ["fast-tests"])
+
+    def test_a_reuse_union_accepts_a_skipped_called_workflow_job(self):
+        # A skipped called-workflow job is shown under the caller display
+        # `name:` (`upgrade from the previous release`), while the record
+        # names `caller / called job`.
+        workflow = """name: ci
+jobs:
+  upgrade-test:
+    name: upgrade from the previous release
+    uses: ./.github/workflows/callee.yml
+  required:
+    name: required check
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+        callee = """name: callee
+jobs:
+  inner:
+    name: inner job
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo hi
+"""
+        leg = "upgrade from the previous release / inner job"
+        evidence_page = jobs_page(overrides={}, extra=[
+            {"name": "upgrade from the previous release", "status": "completed", "conclusion": "skipped",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        source_page = jobs_page(extra=[
+            {"name": leg, "status": "completed", "conclusion": "success",
+             "completed_at": "2026-11-12T11:00:00Z"},
+        ])
+        union_fixture(
+            self,
+            tree_files={SHA: {WORKFLOW_PATH: workflow, ".github/workflows/callee.yml": callee}},
+            artifact_zips={"11": reuse_zip(TREE, {"upgrade-test": [leg]})},
+            jobs_by_run={"456": evidence_page, str(REUSE_SOURCE_ID): source_page},
+        )
+        self.config_data["required_jobs"]["main"].append(leg)
+        self.write_config()
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["reused_from"]["jobs"], ["upgrade-test"])
+
+    def test_a_reuse_union_on_the_tree_path_is_accepted_and_refused(self):
+        # The tree-matching dispatch run carries the reuse record; its union
+        # decides like the exact-commit path. The source
+        # run and the dispatch run share one commit (OTHER_SHA — the
+        # branch head); the candidate SHA only names its tree.
+        union_fixture(self)
+        # Move the record onto the tree-matched dispatch run 789.
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=OTHER_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        self.fixture.write_text(json.dumps(fixture))
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["match"], "tree")
+        self.assertEqual(report["reused_from"]["run_id"], REUSE_SOURCE_ID)
+
+    def test_a_reuse_union_on_the_tree_path_is_refused_for_a_third_commit(self):
+        # A source run on neither the candidate nor the dispatch commit is
+        # refused even when its recorded tree matches.
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=THIRD_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match", result.stderr)
+        self.assertIn("head SHA", result.stderr)
+
+    def test_a_reuse_union_on_the_tree_path_is_refused_for_a_red_source(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["jobs_by_run"][str(REUSE_SOURCE_ID)] = jobs_page(overrides={REUSE_JOB: "failure"})
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match", result.stderr)
+
+    def test_a_reuse_union_is_refused_when_a_source_job_is_red(self):
+        union_fixture(
+            self,
+            jobs_by_run={
+                "456": jobs_page(overrides={REUSE_JOB: "skipped"}),
+                str(REUSE_SOURCE_ID): jobs_page(overrides={REUSE_JOB: "failure"}),
+            },
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"source job {REUSE_JOB}", result.stderr)
+        self.assertIn("concluded failure", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+
+    def test_a_reuse_union_is_refused_when_the_source_job_is_too_old(self):
+        union_fixture(
+            self,
+            jobs_by_run={
+                "456": jobs_page(overrides={REUSE_JOB: "skipped"}),
+                str(REUSE_SOURCE_ID): jobs_page(completed_at="2026-11-10T11:00:00Z"),
+            },
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("older than 24h", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+
+    def test_a_reuse_union_is_refused_for_a_fork_source_run(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        source = run_doc(
+            sha=SHA, event="pull_request", branch="fork/feature", run_id=REUSE_SOURCE_ID,
+            repo=REPO, head_repo="someone/pohunek",
+        )
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a run of this repository", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+
+    def test_a_reuse_union_is_refused_when_the_source_tree_differs(self):
+        union_fixture(
+            self,
+            artifacts={
+                "456": [{"name": f"ci-reuse-{TREE}", "id": 11}],
+                str(REUSE_SOURCE_ID): [f"tested-tree-{OTHER_TREE}"],
+            },
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"recorded tested tree {OTHER_TREE}, expected {TREE}", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+
+    def test_a_reuse_union_is_refused_when_the_record_names_a_job_that_ran(self):
+        # The evidence run skipped REUSE_JOB, so the union is read; the record
+        # also names "required check", which ran green in the evidence run.
+        union_fixture(
+            self,
+            artifact_zips={
+                "11": reuse_zip(
+                    TREE, {"matrix": [REUSE_JOB], "check": ["required check"]}
+                )
+            },
+        )
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reuse record names required check, but it ran", result.stderr)
+        self.assertIn("/actions/runs/456", result.stderr)
+
+    def test_a_reuse_union_is_refused_for_a_disallowed_source_event(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        source = run_doc(
+            sha=SHA, event="workflow_dispatch", branch="zajca/feature", run_id=REUSE_SOURCE_ID,
+            repo=REPO, head_repo=REPO,
+        )
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not allow for reuse", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+
+    def test_a_run_with_a_skipped_job_and_no_reuse_record_keeps_the_old_output(self):
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["artifacts"]["456"] = []
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"required job {REUSE_JOB}: skipped", result.stderr)
+        self.assertNotIn("reused_from", result.stderr)
+        self.assertFalse(any(
+            "/actions/artifacts/" in arg for call in self.calls_json() for arg in call
+        ))
 
     def test_invalid_sha_and_missing_dispatch_ref_fail_closed(self):
         self.write_fixture(run_pages=[page([])])

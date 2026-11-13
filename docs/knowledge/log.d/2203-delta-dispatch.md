@@ -1,0 +1,3 @@
+## Unreleased (2026-11-12, delta dispatch reuse, #2203)
+
+- A `workflow_dispatch` run of `ci.yml` with `tier=main` accepts `delta: true`: the `delta reuse` job finds the newest pull request run of the same tree (within 24 hours) and reuses its green legs; the reusable jobs those legs name skip instead of running again. `scripts/ci-reuse` decides the skip list from `scripts/ci-reuse.json` (21 jobs, `mode == "full"` required for the selection-dependent ones, ambiguous sources run everything). A full dispatch (`delta: false`) stays the default and `scripts/release` keeps dispatching full runs. `scripts/ci-evidence` accepts the union of the evidence run and the recorded source run as evidence for the commit and names both runs in its report.

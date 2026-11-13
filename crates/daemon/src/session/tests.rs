@@ -29363,6 +29363,15 @@ async fn an_older_snapshot_keeps_the_activity_waiting_for_a_deferred_commit() {
             .await
             .recorded
     );
+    // The worker exit watcher applies the worker's newest snapshot at its next
+    // poll once imports are unblocked, so it is parked until the older
+    // snapshot's effect is checked.
+    let poll = registry.hold_next_input(&created.id, "worker_snapshot");
+    guard(
+        "the worker exit watcher parks at its next snapshot",
+        poll.entered.notified(),
+    )
+    .await;
     registry
         .inner
         .worker_imports_blocked
@@ -29377,6 +29386,7 @@ async fn an_older_snapshot_keeps_the_activity_waiting_for_a_deferred_commit() {
             .is_some(),
         "the older snapshot does not settle the waiting activity"
     );
+    poll.release.notify_one();
     sync_from(&registry, &created.id, &worker).await;
 
     assert_eq!(

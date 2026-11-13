@@ -79,6 +79,25 @@ class SameOsDuplicateTests(DuplicateScenario):
         self.assertIn("| macos | `xtask` | hermes-macos-junit/harness + macos-tier-junit | 1 | 1.5 | **no** |",
                       summary.read_text())
 
+
+    def test_a_mixed_run_directory_counts_source_and_own_reports_once_each(self):
+        # On a delta dispatch the junit directory holds both the
+        # source run's reports (downloaded first) and this run's own
+        # reports (downloaded over them). A test only in the source row
+        # is not a duplicate of itself.
+        self.artifact("macos-lane-junit", [("xtask", "hermes::tests::a", 1.5)])
+        self.artifact("hermes-macos-junit", [("xtask", "other", 0.1)], file="harness")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_mixed_directory_fails_only_on_the_shared_test(self):
+        self.artifact("macos-lane-junit", [("xtask", "hermes::tests::a", 1.5), ("xtask", "other", 0.1)])
+        self.artifact("hermes-macos-junit", [("xtask", "hermes::tests::a", 2.0)], file="harness")
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("hermes-macos-junit/harness and macos-lane-junit", result.stderr)
+        self.assertNotIn("other", result.stderr)
+
     def test_the_same_test_on_two_operating_systems_is_platform_coverage(self):
         self.artifact("macos-lane-junit", [("pohunek-cli::pi_package", "a", 1.0)])
         self.artifact("nextest-junit-cli", [("pohunek-cli::pi_package", "a", 1.0)])

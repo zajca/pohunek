@@ -114,7 +114,9 @@ PR. Move anything else to the next milestone with a one-line reason.
   `main` moved.
 - Close the issue on merge with the PR CI run id (and dispatch id).
 - On the release clock, fire the dispatch for a branch of this repository in
-  parallel with PR CI and cancel the other on a real failure. A docs-only delta after a green dispatch keeps
+  parallel with PR CI and cancel the other on a real failure. A delta
+  dispatch (`delta: true`) only reuses green legs of the same-tree PR and is
+  evidence through `scripts/ci-evidence`'s union, never on its own. A docs-only delta after a green dispatch keeps
   that dispatch as evidence (verify the delta with `git diff --name-only`).
 - Merge without pausing for a `main` run: pushes to `main` drain, so every
   started main run completes and reports a verdict (#1209). A red `main` run
@@ -155,7 +157,8 @@ PR. Move anything else to the next milestone with a one-line reason.
 3. **Rehearse the real release tree before GO:** in a throwaway worktree, apply
    exactly what the release commit will change (fold the changelog fragments,
    bump the version, refresh the lock), then run the full gate set on that
-   tree, `scripts/ci-evidence` read-only against the candidate's own runs, and
+   tree, `scripts/ci-evidence` read-only against the candidate's own runs
+   (a delta dispatch's union with its recorded source run counts), and
    the `scripts/release --dry-run` with a no-writes check. A dry run alone does
    not see a folded tree or renamed CI jobs.
 4. **Notes:** draft from the changelog fragments, keep a draft marker the

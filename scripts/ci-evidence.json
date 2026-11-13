@@ -101,5 +101,11 @@
         "step": "Rebuild from a cold release directory and compare"
       }
     ]
+  },
+  "reuse": {
+    "max_age_hours": 24,
+    "source_events": [
+      "pull_request"
+    ]
   }
 }
