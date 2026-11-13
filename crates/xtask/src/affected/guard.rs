@@ -274,8 +274,8 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
     ),
     (
         "crates/xtask/tests/affected_ci.rs",
-        &["crates", "rust-toolchain.toml"],
-        "the guard run over every crate's test code, and the toolchain pin the fixtures copy",
+        &["scripts", ".github/workflows/ci.yml"],
+        "test jobs run scripts read at run time from the workflow, and the script paths they are checked against",
     ),
     (
         "crates/xtask/tests/dependency_policy.rs",

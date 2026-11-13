@@ -760,38 +760,44 @@ list generated from the Rust adapter, so `cargo xtask ts check` catches drift
 ([#527](https://github.com/zajca/pohunek/issues/527)).
 
 Core types describe only the current wire shape. `crates/protocol/src/compat/`
-holds the entry points and would hold one adapter module per older version in
-the window; it holds none, because the window is `5..=5`. When an older
-version is admitted, its adapter translates by shape only: renames and moved
-fields at typed locations (free-form values such as session metadata are
-never walked), plus withholding what the older version cannot decode (events
-it never defined, enum values such as warning kinds it never knew). The
-daemon applies it at two choke points: `handle_request` upgrades the request
-parameters and downgrades the response, and the subscription writer
-downgrades every event for its own connection, because the negotiated version
-is fixed for the connection's life. Handlers and the event bus only ever see
-the current shape; at one version the choke points pass payloads through
-unchanged.
+holds one adapter module per older version in the window (none in the current window). An adapter
+translates by shape only: renames and moved fields at typed locations (free-form
+values such as session metadata are never walked), plus withholding what the
+older version cannot decode (events it never defined, enum values such as
+warning kinds it never knew). The daemon applies it at two choke points:
+`handle_request` upgrades the request parameters and downgrades the response,
+and the subscription writer downgrades every event for its own connection,
+because the negotiated version is fixed for the connection's life. Handlers and
+the event bus only ever see the current shape.
 
 The Rust client applies the inverse at its own choke points
 (`crates/client/src/transport.rs`). Once its connection has selected N-1 it
-would downgrade each request (`compat::downgrade_request`, pinning the request
-to the selected version) and upgrade every success payload and subscription
-event (`compat::upgrade_result`, `compat::upgrade_event`), so callers, `--json`
-output and `Subscription::next_line` only ever carry the current shape; at one
-version the downgrade and upgrade are the identity. A fresh connection sends
-a request that means the same in every version of the window as it is and
-learns the version from the first response; a request whose translation
-depends on the version (it carries a worker identity, or the method is new in
-N) first sends `daemon.health` on the connection. A dedicated wait/output
-connection inherits the version its parent selected. A payload the adapter
-cannot translate, or a daemon that sends the current spelling under N-1, is
-refused with `daemon/version_translation_failed`. Discovery probes offer the
-asking client's range and classify a peer as reachable when it answers inside
-it, so `host list` and the multi-host fan-out include N-1 hosts for a client
-that can speak to them. `daemon.health` and `host.inspect` report the version
-negotiated for the asking connection, which is what an N-1 SDK handshake
-compares with its own version.
+downgrades each request (`compat::downgrade_request`, pinning the request to the
+selected version) and upgrades every success payload and subscription event
+(`compat::upgrade_result`, `compat::upgrade_event`), so callers, `--json` output
+and `Subscription::next_line` only ever carry the current shape. A fresh
+connection sends a request that means the same in both versions as it is and
+learns the version from the first response; a request whose translation depends
+on the version (it carries a worker identity, or the method is new in N) first
+sends `daemon.health` on the connection. A dedicated wait/output connection
+inherits the version its parent selected. A payload the adapter cannot
+translate, or a daemon that sends the current spelling under N-1, is refused
+with `daemon/version_translation_failed`. Discovery probes offer the asking
+client's range and classify a peer as reachable when it answers inside it, so
+`host list` and the multi-host fan-out include N-1 hosts for a client that can
+speak to them. `daemon.health` and
+`host.inspect` report the version negotiated for the asking connection, which is
+what an N-1 SDK handshake compares with its own version.
+
+Two rules keep the window bounded:
+
+- **Semantic change rule.** An adapter cannot paper over a change of meaning: a
+  new required parameter, a removed method or event, a changed error code or
+  changed behavior behind an unchanged name. Such a change raises
+  `MIN_PROTOCOL_VERSION` to `PROTOCOL_VERSION` in the same bump, no adapter is
+  written for the version it strands, and the release notes announce the break.
+  Additive changes (optional fields, new methods, new error codes) need no
+  bump; an event or enum value new to the daemon is withheld from an older
 
 Two rules keep the window bounded:
 

@@ -493,8 +493,7 @@ pub struct SessionNewParams {
     /// fill and every declared name is required; values are never listed,
     /// persisted or logged. A daemon that does not advertise
     /// `HostCapabilities::session_new_secret_env_supported` would drop the field
-    /// silently, so a client checks the flag before sending it (a client of
-    /// another protocol version is refused earlier with `daemon/version_mismatch`).
+    /// silently, so a client checks the flag before sending it.
     #[serde(default, skip_serializing_if = "SessionSecretEnv::is_unset")]
     #[cfg_attr(feature = "ts", ts(optional, type = "Record<string, string>"))]
     pub secret_env: SessionSecretEnv,
@@ -512,8 +511,7 @@ pub struct SessionNewParams {
     /// `session_request_in_progress`. A removed session frees its key, and so
     /// does a create that was rolled back. A daemon that does not advertise
     /// `HostCapabilities::session_new_request_id_supported` would drop the field
-    /// silently, so a client checks the flag before sending it (a client of
-    /// another protocol version is refused earlier with `daemon/version_mismatch`).
+    /// silently, so a client checks the flag before sending it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub client_request_id: Option<String>,
@@ -539,8 +537,7 @@ pub struct SessionNewParams {
     /// bound; the commit must already exist on `origin` (nothing is uploaded).
     /// A daemon that does not advertise
     /// `HostCapabilities::session_new_fetch_ref_supported` would drop the
-    /// field silently, so a client checks the flag before sending it (a client
-    /// of another protocol version is refused earlier with `daemon/version_mismatch`).
+    /// field silently, so a client checks the flag before sending it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub fetch_ref: Option<FetchRefRequest>,

@@ -1030,27 +1030,12 @@ fn a_gate_receipt_change_selects_the_receipt_guard_the_cli_package_and_the_scrip
     assert_eq!(selection["script_tests"], true, "{selection:#}");
 }
 
-/// The CI workflow path, whose parent chain is the repository root.
-fn ci_workflow_path() -> std::path::PathBuf {
-    pohunek_test_support::workspace_root().join(".github/workflows/ci.yml")
-}
-
 #[test]
 fn every_script_the_ci_test_jobs_run_selects_everything() {
     let scripts = test_job_scripts();
     assert!(scripts.contains("scripts/test-partitions"), "{scripts:?}");
-    let root = ci_workflow_path()
-        .parent()
-        .and_then(|path| path.parent())
-        .and_then(|path| path.parent())
-        .expect("the workflow path sits below the root")
-        .to_path_buf();
     for path in scripts {
-        // The extracted paths are runtime values read from the workflow file,
-        // so the affected guard cannot resolve them: the existence check runs
-        // through a path joined onto `root`, which the guard does not see as
-        // a fresh read of the workspace.
-        let exists = root.join(&path).exists();
+        let exists = pohunek_test_support::workspace_root().join(&path).exists();
         assert!(
             exists,
             "CI test jobs run {path} but the path does not exist"

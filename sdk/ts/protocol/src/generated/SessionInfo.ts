@@ -215,8 +215,7 @@ export type SessionInfo = {
    * open past the stop deadline or past the drain after the root's own
    * exit. The session still ended with its root's exit; output the holder
    * wrote after the close is not retained. Set only on a terminal session
-   * whose exit was observed, and omitted from the wire form when false. The
-   * protocol 3 adapter drops it.
+   * whose exit was observed, and omitted from the wire form when false.
    */
   output_force_closed?: boolean;
   /**

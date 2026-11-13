@@ -166,8 +166,7 @@ Pohunek core ships no user interface. GUIs, the web control center, and desktop
 launchers are external clients developed in `zajca/pohunek-work`. They use public
 contracts only: the CLI with `--json`, or the public protocol through the Rust
 crates (pinned by git tag) and the TypeScript SDK (release tarballs pinned by URL
-and integrity). They pin the protocol version they were built against (a daemon also serves the
-previous version), and the core
+and integrity). They pin the protocol version they were built against (a daemon serves the versions of its protocol window, today the current one only), and the core
 crates they link are a pinned, not a stable, API. Issue and PR providers live
 only in `zajca/pohunek-work`.
 
