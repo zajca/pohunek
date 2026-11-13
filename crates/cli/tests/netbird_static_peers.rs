@@ -397,10 +397,9 @@ fn a_mismatching_host_id_refuses_and_dials_nothing_after_the_check() {
     );
 }
 
-/// Row 2 (raw shape, CLI side): a raw address is never matched against the
-/// static table. The
-/// `netbird_state_restricted` code is asserted, so the test fails if the raw
-/// literal started to resolve (or if the code changed).
+/// Guard (raw address): a raw address is never matched against the static
+/// table. The `netbird_state_restricted` code is asserted, so the test
+/// fails if the raw literal started to resolve (or if the code changed).
 #[test]
 fn a_raw_address_is_never_matched_against_the_static_table() {
     let pinned = host_id(b'A');
@@ -427,11 +426,10 @@ fn a_raw_address_is_never_matched_against_the_static_table() {
     );
 }
 
-/// Row 5 (no-table shape, CLI side): a name absent from the table fails with
-/// the restricted error rather
-/// than `host_unknown`. The `netbird_state_restricted` code is asserted, so
-/// the test fails if the code changed. (Empty table => `overlays.toml`
-/// without `[netbird]`.)
+/// Row 5 (no-table shape, CLI side): a name absent from the table fails
+/// with the restricted error rather than `host_unknown`. The
+/// `netbird_state_restricted` code is asserted, so the test fails if the
+/// code changed. (Empty table => `overlays.toml` without `[netbird]`.)
 #[test]
 fn a_restricted_overview_without_the_table_keeps_failing_closed() {
     let env = TestEnv::new().expect("create the hermetic test environment");
@@ -677,9 +675,8 @@ fn an_unmatched_name_fails_with_the_restricted_error() {
 }
 
 /// Guard (raw-IP fqdn): an fqdn that is the raw IP must not make a raw-IP
-/// selector match the
-/// table. Without the guard, `--host 100.64.0.21` would resolve the static
-/// entry; with it, it must fail closed.
+/// selector match the table. Without the guard, `--host 100.64.0.21` would
+/// resolve the static entry; with it, it must fail closed.
 #[test]
 fn a_raw_ip_bound_fqdn_never_matches_the_table() {
     let pinned = host_id(b'A');
@@ -733,8 +730,7 @@ fn a_raw_ip_bound_fqdn_never_matches_the_table() {
 }
 
 /// Row 7 (address field): an address outside the subnet is
-/// `overlay_configuration_invalid` and
-/// the provider is never called.
+/// `overlay_configuration_invalid` and the provider is never called.
 #[test]
 fn a_static_address_outside_the_subnet_is_refused_at_load() {
     let pinned = host_id(b'A');
@@ -804,8 +800,7 @@ fn a_static_address_outside_the_subnet_is_refused_at_load() {
 }
 
 /// Row 7 (provider field): `[netbird]` with a `tailscale` provider is
-/// `overlay_configuration_invalid`
-/// and the provider is never called.
+/// `overlay_configuration_invalid` and the provider is never called.
 #[test]
 fn a_netbird_table_with_a_tailscale_provider_is_refused_at_load() {
     let pinned = host_id(b'A');
@@ -866,9 +861,8 @@ fn a_netbird_table_with_a_tailscale_provider_is_refused_at_load() {
     assert!(!marker.exists(), "no provider call");
 }
 
-/// Row 7 (host-id field): a malformed `host_id` is `overlay_configuration_invalid`
-/// and the
-/// provider is never called.
+/// Row 7 (host-id field): a malformed `host_id` is
+/// `overlay_configuration_invalid` and the provider is never called.
 #[test]
 fn a_bad_host_id_is_refused_at_load() {
     let env = TestEnv::new().expect("create the hermetic test environment");
@@ -933,8 +927,7 @@ fn a_bad_host_id_is_refused_at_load() {
 }
 
 /// Row 7 (uniqueness, short name): two entries sharing a short name are
-/// `overlay_configuration_invalid`
-/// and the provider is never called.
+/// `overlay_configuration_invalid` and the provider is never called.
 #[test]
 fn a_shared_short_name_is_refused_at_load() {
     let pinned = host_id(b'A');
@@ -1001,8 +994,8 @@ fn a_shared_short_name_is_refused_at_load() {
 }
 
 /// Row 8 (cross-check, selector side): a full status that contradicts the
-/// static table is
-/// `overlay_configuration_invalid`, names the entry, and dials nothing.
+/// static table is `overlay_configuration_invalid`, names the entry, and
+/// dials nothing.
 #[test]
 fn a_contradicting_full_status_is_refused_at_load() {
     let pinned = host_id(b'A');
@@ -1217,14 +1210,17 @@ fn a_dedicated_cli_connection_reproves_the_pin() {
 }
 
 /// Row 10 (raw `attach` shape, CLI side): `pohunek --host vps2 attach s-1`
-/// dials a framed control connection that resolves `vps2` (proving the pin),
-/// then a second framed connection for `attach_raw`. This test proves the
-/// path through `resolve_selector` plus the earlier framed refusal: the
-/// fixture reports the pinned id on the first connection and a different id
-/// from the second, so the attach fails with `host_identity_mismatch` before
-/// any raw attach prelude is served, and `session.attach` is never served.
-/// (`attach_raw`'s own pre-verify is proven in the client crate, where the
-/// raw prelude is reachable without stdio.)
+/// runs `PinnedHost::resolve` (pin lookup only, no dial), then a framed
+/// control connection that proves the pin and serves `session.attach`,
+/// then `attach_raw`, which re-proves the pin on a separate framed
+/// connection before opening the raw stream. The fixture reports the
+/// pinned id on the first connection and a different id from the second,
+/// so the attach fails with `host_identity_mismatch` when `attach_raw`
+/// re-proves the pin, before the raw stream opens. This test proves the
+/// CLI-level select-and-connect flow through resolution plus the framed
+/// pin check; the `attach_raw` pre-verify itself is guarded by the
+/// client-crate test `a_mismatching_pin_refuses_the_attach_connection`,
+/// where the raw path is reachable without CLI stdio.
 #[test]
 fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
     let pinned = host_id(b'A');
@@ -1414,13 +1410,13 @@ fn uniqueness_arm_refuses(setup: &UniquenessSetup, label: &str, code: &str, mess
     assert!(captured.is_empty(), "nothing dialed: {captured}");
 }
 
-#[test]
 /// Row 7: the four uniqueness rules each fail alone: a shared address, a
 /// shared fqdn, a shared host id, and a shared short name (`{key, first fqdn
 /// label}` sets). Each arm asserts its exact `check_uniqueness` message, so
-/// a decision-1.5 message change or an arm removal is caught. A shared fqdn
-/// only reaches its arm before the selector-name arm, and its message names
-/// `share an fqdn` where the selector arm would say `share a selector name`.
+/// a message change or an arm removal is caught. A shared fqdn only reaches
+/// its arm before the selector-name arm, and its message names `share an
+/// fqdn` where the selector arm would say `share a selector name`.
+#[test]
 fn each_uniqueness_rule_fails_alone() {
     // Shared address arm.
     let pinned = host_id(b'A');

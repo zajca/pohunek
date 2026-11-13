@@ -1104,8 +1104,10 @@ async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
     // slice. The scenario does not depend on the oomd D-Bus API. Whether
     // oomd registered the slice is read from the oomd debug journal (the
     // varlink registration line and the memory-pressure line oomd logs on
-    // the tick that meets the limit and duration) and from
-    // the cgroup files in the failure dump; `oomctl` prints the monitored
+    // the tick that meets the limit and the duration with recent reclaim
+    // activity; that line shows oomd chose to act on the slice, while
+    // registration alone is shown by the varlink line) and from the
+    // cgroup files in the failure dump; `oomctl` prints the monitored
     // set only on a host where oomd owns its bus name, so there it is
     // best-effort output, never a pass/fail gate.
     wait_until(
