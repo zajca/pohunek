@@ -82,11 +82,12 @@ fn read_256k() -> Vec<u8> {
     vec![b'x'; 256 * 1024]
 }
 
-/// Fills the screen with 50 lines of 199 printable chars plus `\r\n`.
+/// Fills the screen with `ROWS` lines of `COLS - 1` printable chars plus `\r\n`.
 fn fill_screen() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(50 * 201);
-    for _ in 0..50 {
-        bytes.extend_from_slice(&[b'y'; 199]);
+    const LINE: usize = COLS as usize - 1;
+    let mut bytes = Vec::with_capacity(ROWS as usize * (LINE + 2));
+    for _ in 0..ROWS {
+        bytes.extend_from_slice(&[b'y'; LINE]);
         bytes.extend_from_slice(b"\r\n");
     }
     bytes
@@ -118,8 +119,20 @@ async fn run_reads(
     }
 }
 
+/// Reads of the output measured loop with a 4 KiB payload.
+const READS_4K: u64 = 10_000;
+
+/// Reads of the output measured loop with a 256 KiB payload.
+const READS_256K: u64 = 500;
+
 /// Repaints of the terminal measured loop.
 const REPAINTS: u64 = 200;
+
+/// Bytes the ring warm-up pushes before the measured loop.
+const WARMUP_BYTES: usize = 2 << 20;
+
+/// Reads the ring warm-up pushes.
+const WARMUP_READS: usize = WARMUP_BYTES / (4 * 1024);
 
 async fn run_repaints(
     hub: &OutputHub,
@@ -173,7 +186,7 @@ async fn bench_output(
     let hub = OutputHub::new(HISTORY_BYTES, SUBSCRIBER_BYTES, ROWS, COLS).expect("create hub");
     // Warm the ring with 2 MiB of pushes (4 KiB reads of printable bytes).
     let warm = read_4k();
-    for _ in 0..(2 * 1024 * 1024 / (4 * 1024)) {
+    for _ in 0..WARMUP_READS {
         hub.push(&warm).expect("warm the ring");
     }
     let mut subscribers = Vec::with_capacity(count);
@@ -254,7 +267,7 @@ async fn output_path_allocations_and_time_per_read() {
             "output 4KiB",
             count,
             &payload_4k,
-            10_000,
+            READS_4K,
             &stream_id,
             &instance,
         )
@@ -263,7 +276,7 @@ async fn output_path_allocations_and_time_per_read() {
             "output 256KiB",
             count,
             &payload_256k,
-            500,
+            READS_256K,
             &stream_id,
             &instance,
         )
