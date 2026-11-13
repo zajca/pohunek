@@ -1101,9 +1101,10 @@ async fn a_worker_killed_by_systemd_oomd_reports_the_managed_kill() {
     // Arm systemd-oomd only once the fixture has finished one full pass
     // over its buffer, then keep the pressure and reclaim running until
     // the kill, so the verdict does not depend on when oomd registers the
-    // slice. The scenario does not depend on the oomd D-Bus API. Where
+    // slice. The scenario does not depend on the oomd D-Bus API. Whether
     // oomd registered the slice is read from the oomd debug journal (the
-    // varlink registration line and its per-tick pressure lines) and from
+    // varlink registration line and the memory-pressure line oomd logs on
+    // the tick that meets the limit and duration) and from
     // the cgroup files in the failure dump; `oomctl` prints the monitored
     // set only on a host where oomd owns its bus name, so there it is
     // best-effort output, never a pass/fail gate.
