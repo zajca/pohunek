@@ -4025,7 +4025,7 @@ where
 /// Frames one output or replay payload; the framing caller keeps stream identity explicit.
 #[expect(
     clippy::too_many_arguments,
-    reason = "stream framing keeps authenticated stream identity and lease explicit"
+    reason = "stream framing keeps authenticated stream identity explicit"
 )]
 async fn write_output_chunks<W>(
     writer: &mut W,
