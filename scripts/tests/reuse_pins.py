@@ -6,10 +6,8 @@ and the evaluation table below in the same commit. This file is the
 source data - it is never recomputed from the workflow under test.
 """
 import hashlib
-import json
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+
 
 def pinned_hash(text):
     return hashlib.sha256(text.encode()).hexdigest()
@@ -53,7 +51,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # (the first `if:` of its own job) and exempt; `save-if:` and the
 # `shard:` line are exempt by exact text. `failure()` reads false
 # (a reused leg was green). Legs: `legs` are the matrix values the
-# entry is computed with; `both` fills pull_request and dispatch.
+# entry is computed with; each leg records both paths.
 EVALUATION_TABLE = [
     {
         "text": "NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}",
@@ -118,3 +116,10 @@ EVALUATION_TABLE = [
         },
     },
 ]
+
+def pinned_preamble():
+    # sha256 of the workflow text before `jobs:` (env:, defaults:), taken
+    # from ci.yml at pin time.
+    return PINNED_PREAMBLE
+
+PINNED_PREAMBLE = "11150566b689134605836bf908672791311c550d5bb36a773eae52c44679079a"

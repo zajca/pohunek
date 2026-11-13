@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import reuse_pins
 import shutil
 import subprocess
 import tempfile
@@ -3096,7 +3097,6 @@ class DeltaReuseWiringTests(unittest.TestCase):
         (a reused leg was green). The job-level `if:` is the first
         `if:` line of its own job body, never matched by text.
         """
-        import reuse_pins
 
         pairs = config.get("pairs", {})
         tokens = ("github.event_name", "github.event.", "inputs.", "github.ref")
@@ -3113,6 +3113,13 @@ class DeltaReuseWiringTests(unittest.TestCase):
             pr_changes["hermes_macos"] = "true"
             dispatch_changes["hermes_macos"] = "true"
 
+        # 0. Workflow preamble (before `jobs:`) must match its pin.
+        pre = (ROOT / ".github/workflows/ci.yml").read_text().split("jobs:", 1)[0]
+        self.assertEqual(
+            reuse_pins.pinned_hash(pre), reuse_pins.pinned_preamble(),
+            "workflow preamble (env:/defaults: of ci.yml) changed: "
+            "re-check its reuse eligibility, then update its pin",
+        )
         # 1. Body pin.
         pinned = reuse_pins.pinned_bodies()
         self.assertIn(job_id, pinned, f"job {job_id!r} has no body pin")
@@ -3170,24 +3177,28 @@ class DeltaReuseWiringTests(unittest.TestCase):
         # 3. Evaluation table: each pinned token line (except the
         # positional job `if:` and the two exact exempt texts) has an
         # entry with its expected value on both paths, evaluated here.
-        job_if_line = None
-        for raw in body.splitlines():
+        job_if_index = None
+        for index, raw in enumerate(body.splitlines()):
             if re.match(r"^    if:", raw):
-                job_if_line = raw.strip()
+                job_if_index = index
                 break
         exempt_exact = {
             "save-if: ${{ github.ref == 'refs/heads/main' }}",
         }
+        if job_id == "fast-tests":
+            exempt_exact.add(
+                "shard: ${{ fromJSON(github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.fast_shards || '[\"core\", \"daemon\", \"cli\"]') }}"
+            )
         held = set()
         evaluator = {
             ("pull_request", ""): pr_changes,
             ("workflow_dispatch", "main"): dispatch_changes,
         }
-        for raw in body.splitlines():
+        for index, raw in enumerate(body.splitlines()):
             stripped = raw.strip()
             if not any(token in stripped for token in tokens):
                 continue
-            if stripped == job_if_line or stripped in exempt_exact or stripped.startswith("shard: ${{ fromJSON("):
+            if index == job_if_index or stripped in exempt_exact:
                 continue
             held.add(stripped)
         entries = {entry["text"]: entry for entry in reuse_pins.EVALUATION_TABLE}
@@ -3199,33 +3210,42 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 "extended in the same commit",
             )
             entry = entries[stripped]
-            # An entry may table a single leg ("" for a non-matrix job)
-            # or the job's full legs; never a leg outside the job's.
+            # The table may also carry "" for a non-matrix job; a matrix
+            # job's entry must cover its legs.
             self.assertTrue(
                 set(legs) <= set(entry["legs"].keys()),
                 f"job {job_id!r} line {stripped!r} does not table the legs "
                 f"{legs} of the job",
             )
-            if stripped in entries:
-                expression = stripped.split(":", 1)[1].strip()
-                if expression.startswith("${{") and expression.endswith("}}"):
-                    expression = expression[3:-3].strip()
-                for shard in legs:
-                    matrix = {"shard": shard} if shard else {}
-                    for (event, tier), changes in evaluator.items():
-                        value = evaluate_needs_expression(
-                            expression, event=event, tier=tier,
-                            results=dict(source_results),
-                            outputs={k: dict(v) for k, v in full_outputs.items()},
-                            changes=dict(changes), matrix=dict(matrix),
-                        )
-                        got = value if isinstance(value, str) else ("true" if value else "false")
-                        self.assertEqual(
-                            got, entry["legs"][shard][event],
-                            f"line {stripped!r} of job {job_id!r} (leg {shard!r}) "
-                            f"is {got!r}, the table expects "
-                            f"{entry['legs'][shard][event]!r} on {event}",
-                        )
+            # Ruling 4: the same line must read the same on both paths.
+            for leg in legs:
+                pair = entry["legs"][leg]
+                self.assertEqual(
+                    pair["pull_request"], pair["workflow_dispatch"],
+                    f"line {stripped!r} of job {job_id!r} differs between "
+                    "the pull request and the dispatch; the job must leave "
+                    "the allowlist",
+                )
+            expression = stripped.split(":", 1)[1].strip()
+            if expression.startswith("${{") and expression.endswith("}}"):
+                expression = expression[3:-3].strip()
+            for shard in legs:
+                matrix = {"shard": shard} if shard else {}
+                for (event, tier), changes in evaluator.items():
+                    value = evaluate_needs_expression(
+                        expression, event=event, tier=tier,
+                        results=dict(source_results),
+                        outputs={k: dict(v) for k, v in full_outputs.items()},
+                        changes=dict(changes), matrix=dict(matrix),
+                    )
+                    got = value if isinstance(value, str) else ("true" if value else "false")
+                    self.assertEqual(
+                        got, entry["legs"][shard][event],
+                        f"line {stripped!r} of job {job_id!r} (leg {shard!r}) "
+                        f"is {got!r}, the table expects "
+                        f"{entry['legs'][shard][event]!r} on {event}",
+                    )
+        self._held_lines = held
 
 
     def test_the_pin_update_procedure(self):
@@ -3254,18 +3274,22 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 config, job_id="test",
                 body=jobs_from(edited)["test"], legs=[""],
             )
-        # 2. The same edit in a non-allowlisted job: the guard never
-        # walks it, so the check passes on a real allowlisted job.
+        # 2. The same edit in a non-allowlisted job: the guard walks every
+        # allowlisted job of the edited text, and all pins still match
+        # for the jobs it did not touch.
         edited_other = ci_text.replace(
             "  package-selection:\n",
             "  package-selection:\n    if: ${{ github.event_name == 'pull_request' }}\n",
             1,
         )
         self.assertNotEqual(edited_other, ci_text)
-        self.check_reused_paths_identical(
-            config, job_id="test",
-            body=jobs_from(edited_other)["test"], legs=[""],
-        )
+        for other_id in config["jobs"]:
+            other_body = jobs_from(edited_other)[other_id]
+            has_matrix = re.search(r"(?m)^        shard: ", other_body) is not None
+            legs = partitions_module().FAST_SHARDS if has_matrix else [""]
+            self.check_reused_paths_identical(
+                config, job_id=other_id, body=other_body, legs=list(legs),
+            )
         # 3. A line in upgrade.yml fails (the callee pin).
         callee = (ROOT / ".github/workflows/upgrade.yml").read_text()
         callee_edited = callee.replace(
@@ -3283,7 +3307,6 @@ class DeltaReuseWiringTests(unittest.TestCase):
         # 4. Pin updated without the table: hash the edited body into
         # the pin, the new token line has no table entry and fails.
         edited_body = jobs_from(edited)["test"]
-        import reuse_pins
         original = reuse_pins.PINNED_BODY_HASHES.get("test")
         try:
             reuse_pins.PINNED_BODY_HASHES["test"] = reuse_pins.pinned_hash(edited_body)
@@ -3301,6 +3324,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_no_reused_job_decides_work_on_a_step_level_event_or_input(self):
         jobs = workflow_jobs()
         config = reuse_config()
+        held_anywhere = set()
         for job_id in config["jobs"]:
             body = jobs[job_id]
             # The fast-tests matrix line is read wherever it sits (the
@@ -3313,6 +3337,81 @@ class DeltaReuseWiringTests(unittest.TestCase):
             self.check_reused_paths_identical(
                 config, job_id=job_id, body=body, legs=list(legs),
             )
+            held_anywhere.update(self._held_lines)
+        # Every table entry must be held by some pinned body (no stale
+        # entries): an entry nothing evaluates is not evidence.
+        stale = [entry["text"] for entry in reuse_pins.EVALUATION_TABLE
+                 if entry["text"] not in held_anywhere]
+        self.assertEqual(
+            stale, [],
+            f"evaluation table entries held by no pinned body: {stale}",
+        )
+
+    def test_the_paths_guard_catches_a_line_that_differs_between_paths(self):
+        # Ruling 4's per-leg line in fast-tests: pin and table updated
+        # with truthful but different values must fail with "differs
+        # between".
+        ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
+        config = reuse_config()
+        edited = ci_text.replace(
+            "      - name: Download test archive\n",
+            "      - name: Download test archive\n"
+            "        if: matrix.shard == 'core' && github.event_name != 'pull_request'\n",
+            1,
+        )
+        self.assertNotEqual(edited, ci_text)
+        edited_body = workflow_jobs(edited)["fast-tests"]
+        original_hash = reuse_pins.PINNED_BODY_HASHES.get("fast-tests")
+        original_table = list(reuse_pins.EVALUATION_TABLE)
+        entry = {
+            "text": "if: matrix.shard == 'core' && github.event_name != 'pull_request'",
+            "legs": {
+                "core": {"pull_request": "false", "workflow_dispatch": "true"},
+                "daemon": {"pull_request": "false", "workflow_dispatch": "false"},
+                "cli": {"pull_request": "false", "workflow_dispatch": "false"},
+            },
+        }
+        try:
+            reuse_pins.PINNED_BODY_HASHES["fast-tests"] = reuse_pins.pinned_hash(edited_body)
+            reuse_pins.EVALUATION_TABLE.append(entry)
+            with self.assertRaisesRegex(AssertionError, "differs between"):
+                self.check_reused_paths_identical(
+                    config, job_id="fast-tests", body=edited_body,
+                    legs=list(partitions_module().FAST_SHARDS),
+                )
+        finally:
+            if original_hash is None:
+                reuse_pins.PINNED_BODY_HASHES.pop("fast-tests", None)
+            else:
+                reuse_pins.PINNED_BODY_HASHES["fast-tests"] = original_hash
+            reuse_pins.EVALUATION_TABLE[:] = original_table
+
+    def test_the_paths_guard_catches_a_stale_table_entry(self):
+        # An entry no pinned body holds fails the loop test.
+        jobs = workflow_jobs()
+        config = reuse_config()
+        held_anywhere = set()
+        for job_id in config["jobs"]:
+            body = jobs[job_id]
+            has_matrix = re.search(r"(?m)^        shard: ", body) is not None
+            legs = partitions_module().FAST_SHARDS if has_matrix else [""]
+            self.check_reused_paths_identical(
+                config, job_id=job_id, body=body, legs=list(legs),
+            )
+            held_anywhere.update(self._held_lines)
+        original_table = list(reuse_pins.EVALUATION_TABLE)
+        try:
+            reuse_pins.EVALUATION_TABLE.append({
+                "text": "if: ${{ github.event_name == 'never' }}",
+                "legs": {"": {"pull_request": "false", "workflow_dispatch": "false"}},
+            })
+            stale = [entry["text"] for entry in reuse_pins.EVALUATION_TABLE
+                     if entry["text"] not in held_anywhere]
+            self.assertEqual(
+                stale, ["if: ${{ github.event_name == 'never' }}"],
+            )
+        finally:
+            reuse_pins.EVALUATION_TABLE[:] = original_table
 
     def test_the_paths_guard_catches_the_skip_owned_by_case_without_pairs(self):
         # `platform-contracts` without `pairs` sets `SKIP_OWNED_BY` to

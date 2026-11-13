@@ -219,7 +219,9 @@ dispatch), update the body's sha256 in `scripts/tests/reuse_pins.py`
 (`PINNED_BODY_HASHES`), and extend `EVALUATION_TABLE` for every new
 token-reading line; `failure()` reads false there: a reused leg was green.
 The pins and the table are checked-in data, never regenerated from the
-workflow under test.
+workflow under test. A token-reading line whose values on the two paths
+differ, or an entry no pinned body holds, fails the guard: the job
+leaves `scripts/ci-reuse.json`.
 
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the
