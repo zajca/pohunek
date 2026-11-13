@@ -1651,6 +1651,23 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR}/bus" >> "$GITHUB_ENV"
           systemctl --user is-system-running --wait || systemctl --user is-system-running | grep -qx degraded
 
+      # The oomd scenario asserts swap exists: the host must expose it.
+      # Some runners have none, so make the precondition true here.
+      - name: Ensure swap for the systemd-oomd scenario
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          if [ "$(tail -n +2 /proc/swaps | grep -c . || true)" -gt 0 ]; then
+            echo "swap is present:"; cat /proc/swaps
+          else
+            sudo fallocate -l 2G /swapfile-pohunek
+            sudo chmod 600 /swapfile-pohunek
+            sudo mkswap /swapfile-pohunek
+            sudo swapon /swapfile-pohunek
+            echo "swap created:"; cat /proc/swaps
+          fi
+          [ "$(tail -n +2 /proc/swaps | grep -c . || true)" -gt 0 ] || { echo "no swap after setup"; exit 1; }
+
       # The exit-evidence OOM scenarios need the user manager to enforce
       # MemoryMax, which requires the memory controller to be delegated to
       # it; the step also prints swap and system PSI for the oomd
