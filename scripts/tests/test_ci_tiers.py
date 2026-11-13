@@ -1289,15 +1289,21 @@ class SameOsDuplicateTests(unittest.TestCase):
         self.assertEqual(set(config["artifacts"]), artifacts)
         check = self.jobs["test-duplicates"]
         needs = set(re.findall(r"(?m)^      - ([a-z0-9-]+)$", block(check, "needs", indent=4)))
-        # The delta reuse job is a scheduling dependency, not a JUnit
+        # The reuse job is a scheduling dependency, not a JUnit
         # producer: the check still reads every artifact its jobs upload.
         self.assertEqual(needs - {"reuse"}, set(uploads))
         self.assertIn("reuse", needs, "the duplicate check waits for the reuse decision")
-        # The inline age-ordered downloader names the JUnit prefixes,
-        # not the `pattern:` of the action.
+        # The reused download is a script: its per-job table names the
+        # JUnit prefixes its record entries may carry. This run's own
+        # download is the pinned action: its `pattern:` line names what the
+        # job waits for. The globs below come from that line, not from a
+        # literal list in this test.
+        self.assertIn("scripts/ci-reuse-junit", check)
+        pattern = re.search(r"(?m)^\s+pattern: '([^']+)'$", check)
+        self.assertIsNotNone(pattern, "the own download names its pattern")
+        globs = [glob.strip().strip("{}") for glob in pattern.group(1).split(",")]
         for prefix in ("nextest-junit-", "package-junit-", "macos-lane-junit", "macos-tier-junit", "hermes-macos-junit"):
             self.assertIn(prefix, check, prefix)
-        globs = [p + "*" if not p.endswith("junit") else p for p in ("nextest-junit-", "package-junit-", "macos-lane-junit", "macos-tier-junit", "hermes-macos-junit")]
         for artifact in artifacts:
             with self.subTest(artifact=artifact):
                 self.assertTrue(any(fnmatch.fnmatchcase(artifact, glob) for glob in globs))
@@ -4545,8 +4551,10 @@ class SelectionAuditTests(unittest.TestCase):
         self.assertIn("          name: test-selection-audit\n", job)
         check = workflow_jobs()["test-duplicates"]
         self.assertNotIn(AUDIT_JOB, job_needs(check))
-        self.assertNotIn("test-selection-audit", check)
-        self.assertFalse(any(fnmatch.fnmatchcase("test-selection-audit", glob) for glob in ("nextest-junit-*", "package-junit-*")))
+        pattern = re.search(r"(?m)^          pattern: '([^']+)'$", check)
+        self.assertIsNotNone(pattern, "the own download names its pattern")
+        self.assertFalse(any(fnmatch.fnmatchcase("test-selection-audit", glob.strip().strip("{}"))
+                             for glob in pattern.group(1).split(",")))
 
     def runs(self, *, event, tier="", cancelled=False, build="success"):
         return bool(evaluate_needs_expression(
