@@ -982,8 +982,7 @@ fn test_job_scripts() -> std::collections::BTreeSet<String> {
         r#"(?m)(?:^|[\s"'=(])(?:\$GITHUB_WORKSPACE(?:/[A-Za-z0-9_.-]+)*?/)?((?:\.github/)?scripts/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"#,
     )
     .expect("script pattern");
-    let bare =
-        regex::Regex::new(r"scripts/[A-Za-z0-9_.-]").expect("bare script pattern");
+    let bare = regex::Regex::new(r"scripts/[A-Za-z0-9_.-]").expect("bare script pattern");
     let mut scripts = std::collections::BTreeSet::new();
     for job in SELECTED_JOBS {
         let steps = workflow["jobs"][job]["steps"]

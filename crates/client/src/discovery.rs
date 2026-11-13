@@ -753,15 +753,15 @@ mod tests {
 
         // A previous-version requester: a daemon of that version is reachable,
         // a current-version one is not.
-        let v3_only = single_version_stub(previous).await;
-        let actual = classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
+        let previous_only = single_version_stub(previous).await;
+        let actual = classify(previous_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
         assert_eq!(actual, reachable);
         assert_eq!(
             serde_json::to_value(&actual).expect("serialize classification"),
             serde_json::json!({"classification": "reachable_daemon", "daemon_version": "stub"})
         );
-        let v4_only = single_version_stub(PROTOCOL_VERSION).await;
-        let actual = classify(v4_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
+        let current_only = single_version_stub(PROTOCOL_VERSION).await;
+        let actual = classify(current_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
         assert_eq!(actual, mismatch(PROTOCOL_VERSION));
         assert_eq!(
             serde_json::to_value(&actual).expect("serialize classification"),
@@ -772,10 +772,10 @@ mod tests {
         );
 
         // A current-only requester sees the opposite.
-        let v3_only = single_version_stub(previous).await;
+        let previous_only = single_version_stub(previous).await;
         assert_eq!(
             classify(
-                v3_only,
+                previous_only,
                 DEFAULT_PROBE_TIMEOUT,
                 None,
                 CURRENT_PROTOCOL_VERSIONS
@@ -783,10 +783,10 @@ mod tests {
             .await,
             mismatch(previous)
         );
-        let v4_only = single_version_stub(PROTOCOL_VERSION).await;
+        let current_only = single_version_stub(PROTOCOL_VERSION).await;
         assert_eq!(
             classify(
-                v4_only,
+                current_only,
                 DEFAULT_PROBE_TIMEOUT,
                 None,
                 CURRENT_PROTOCOL_VERSIONS
