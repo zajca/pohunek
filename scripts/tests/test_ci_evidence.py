@@ -1468,7 +1468,7 @@ jobs:
         self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
 
     def test_a_dispatch_evidence_refuses_a_same_tree_source_on_another_commit(self):
-        # Row 15 regression: evidence on the tree path (dispatch
+        # Evidence on the tree path (dispatch
         # consumer) must not accept a same-tree PR source on another commit.
         union_fixture(self)
         fixture = json.loads(self.fixture.read_text())

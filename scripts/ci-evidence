@@ -47,8 +47,9 @@ REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # Artifact the `required jobs (paths filter)` job of ci.yml uploads with the tree
 # its run checked out.
 TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
-# Record the `reuse` job of a delta dispatch uploads: which source run each
-# reused job was taken from (issue #2203).
+# Record the `reuse` job uploads: which source run each reused job was
+# taken from (one entry per job; a delta dispatch or a push may name more
+# than one run).
 REUSE_RECORD_ARTIFACT = re.compile(r"^ci-reuse-([0-9a-f]{40})$")
 REUSE_SCHEMA_VERSION = 1
 EARLIEST_MOMENT = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)

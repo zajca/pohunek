@@ -34,7 +34,7 @@ on:
         required: false
         type: string
       delta:
-        description: Reuse the green jobs of the pull request run of the same tree (opt-in; scripts/release dispatches stay full)
+        description: Reuse the green jobs of the same-tree runs (newest green leg per job; scripts/release dispatches stay full)
         required: false
         default: false
         type: boolean
@@ -959,8 +959,8 @@ jobs:
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection/
-          # A delta dispatch reuses the newest same-tree pull request run
-          # within 24 hours, and reads its selection record; keep it alive.
+          # A delta dispatch or push reuses the newest same-tree runs
+          # within 24 hours, and reads their selection records; keep it alive.
           retention-days: 2
           if-no-files-found: error
 
@@ -976,7 +976,7 @@ jobs:
   # its `skip` output (a failed `reuse` run fails the verdict, so no job
   # is wrongly skipped).
   reuse:
-    name: delta reuse
+    name: reuse green jobs
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'main' && inputs.delta) || github.event_name == 'push' }}
