@@ -15,6 +15,7 @@ import virtual_clock
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "release"
 EVIDENCE = ROOT / "scripts" / "ci-evidence"
+ELIGIBILITY = ROOT / "scripts" / "ci_eligibility.py"
 CHANGELOG_TOOL = ROOT / "scripts" / "changelog"
 CONFIG = ROOT / "scripts" / "ci-evidence.json"
 
@@ -187,6 +188,9 @@ class ReleaseEvidenceTests(unittest.TestCase):
         # the release calls runs under the virtual clock, so the deadline
         # and the dispatch sleeps cannot race host load.
         self.write_copy("scripts/ci-evidence-real", EVIDENCE.read_text(), executable=True)
+        # ci-evidence loads the shared eligibility rule from the script
+        # directory, so the throwaway repo carries the module too.
+        self.write_copy("scripts/ci_eligibility.py", ELIGIBILITY.read_text())
         real = self.repo / "scripts" / "ci-evidence-real"
         self.write_copy(
             "scripts/ci-evidence",
@@ -242,6 +246,11 @@ class ReleaseEvidenceTests(unittest.TestCase):
             "GH_STATE": str(self.state),
             "EVIDENCE_CONFIG": str(self.repo / "scripts/ci-evidence.json"),
             "TMPDIR": str(self.scratch),
+            # The release runs python3 scripts (changelog, ci-evidence)
+            # inside the fixture repo; without this their imports write
+            # `__pycache__/` next to the committed scripts and dirty the
+            # release commit's status check.
+            "PYTHONDONTWRITEBYTECODE": "1",
         })
         if remote_sha is not None:
             env["REMOTE_SHA"] = remote_sha
