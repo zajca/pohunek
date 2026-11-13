@@ -114,7 +114,7 @@ const MENU_PASTE_END: &[u8] = b"\x1b[201~";
 const MENU_CSI_OPEN: u8 = b'[';
 /// SS3 reports use `ESC O`, used by application cursor mode.
 const MENU_SS3_OPEN: u8 = b'O';
-/// Bytes of the `ESC [` prefix of a CSI report.
+/// Bytes of the `ESC [` or `ESC O` prefix of a menu terminal sequence.
 const MENU_CSI_PREFIX_LEN: usize = 2;
 /// SS3 reports are `ESC O <final>`.
 const MENU_SS3_REPORT_LEN: usize = 3;
@@ -122,8 +122,6 @@ const MENU_SS3_REPORT_LEN: usize = 3;
 const MENU_CSI_FINAL_START: u8 = 0x40;
 /// Upper bound of the ECMA-48 CSI final-byte range.
 const MENU_CSI_FINAL_END: u8 = 0x7e;
-/// SS3 final bytes share the CSI final-byte range, so no separate
-/// SS3 range constants are needed.
 /// Kitty event type `3` is a key release.
 const MENU_EVENT_RELEASE: u32 = 3;
 /// Parameter bytes of a CSI stop at the first byte below the parameter range.
@@ -1419,7 +1417,8 @@ fn parse_ss3_menu_key(input: &[u8]) -> ParsedMenuKey {
         };
     }
     if !(MENU_CSI_FINAL_START..=MENU_CSI_FINAL_END).contains(&input[MENU_CSI_PREFIX_LEN]) {
-        // Not an SS3 final byte: the Escape is a lone Escape and the rest is
+        // An SS3 final byte uses the CSI final-byte range; anything else is
+        // not an SS3 final: the Escape is a lone Escape and the rest is
         // re-parsed, so a following Escape or detach byte is not swallowed.
         return ParsedMenuKey {
             consumed: 1,
@@ -1427,7 +1426,7 @@ fn parse_ss3_menu_key(input: &[u8]) -> ParsedMenuKey {
             key: Some(MenuKey::Esc),
         };
     }
-    let key = match input[2] {
+    let key = match input[MENU_CSI_PREFIX_LEN] {
         MENU_ARROW_UP => Some(MenuKey::Up),
         MENU_ARROW_DOWN => Some(MenuKey::Down),
         _ => None,
@@ -1445,7 +1444,7 @@ fn parse_csi_menu_key(input: &[u8]) -> ParsedMenuKey {
     // fresh ESC, ...) aborts the sequence: only `ESC [` is consumed and the
     // rest is re-parsed, so a stray byte can no longer buffer Escape, Enter,
     // Backspace or digits indefinitely.
-    let Some(body_end) = input[2..]
+    let Some(body_end) = input[MENU_CSI_PREFIX_LEN..]
         .iter()
         .position(|byte| !(MENU_CSI_PARAM_START..=MENU_CSI_PARAM_END).contains(byte))
     else {

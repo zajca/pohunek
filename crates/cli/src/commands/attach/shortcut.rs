@@ -64,11 +64,9 @@ const MAX_TRACKED_RELEASES: usize = 8;
 const CSI_PARAM_START: u8 = 0x20;
 /// CSI parameter bytes end at the ECMA-48 maximum (`0x3f`).
 const CSI_PARAM_END: u8 = 0x3f;
-/// SS3 final bytes share the CSI final-byte range, so no separate
-/// SS3 range constants are needed.
 /// SS3 reports are `ESC O <final>`.
 const SS3_REPORT_LEN: usize = 3;
-/// Bytes of the `ESC [` prefix of a CSI report.
+/// Bytes of the `ESC [` or `ESC O` prefix of a terminal sequence.
 const CSI_PREFIX_LEN: usize = 2;
 
 /// Attach-menu state relevant to shortcut decoding and key normalization.
@@ -217,11 +215,11 @@ impl ShortcutDecoder {
         }
     }
 
-    /// Forgets every remembered release after the menu closed.
+    /// Forgets every remembered release; called when the menu opens.
     ///
-    /// Called when the menu opens: the next press starts a fresh set, so a
-    /// stale release from a terminal that never reports event types cannot
-    /// swallow an unrelated release of a later physical press.
+    /// The next press starts a fresh set, so a stale release from a terminal
+    /// that never reports event types cannot swallow an unrelated release of
+    /// a later physical press.
     pub(super) fn clear_pending_releases(&mut self) {
         self.pending_releases.clear();
     }
@@ -430,7 +428,8 @@ fn parse_ss3(input: &[u8], menu_mode: MenuInputMode) -> Parse {
         return Parse::Pending;
     }
     if !(CSI_FINAL_START..=CSI_FINAL_END).contains(&input[CSI_PREFIX_LEN]) {
-        // Not an SS3 final byte: the Escape is a lone Escape and the rest is
+        // An SS3 final byte uses the CSI final-byte range; anything else is
+        // not an SS3 final: the Escape is a lone Escape and the rest is
         // re-parsed, so a flush after the timeout cannot swallow Escape or
         // the detach byte.
         return Parse::Pass;
@@ -440,7 +439,7 @@ fn parse_ss3(input: &[u8], menu_mode: MenuInputMode) -> Parse {
     }
     // SS3 reports carry no event field, so nothing here can be followed by a
     // release and no press needs remembering for release suppression.
-    match input[2] {
+    match input[CSI_PREFIX_LEN] {
         ARROW_UP_FINAL => Parse::Emit {
             bytes: LEGACY_UP,
             consumed: SS3_REPORT_LEN,

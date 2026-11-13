@@ -101,9 +101,8 @@ const LEGACY_ESCAPE: &[u8] = b"\x1b";
 /// Escape is decoded on its own and closes the menu; the arrow does not
 /// reach the program as input.
 const LEGACY_ESCAPE_ARROW: &[u8] = b"\x1b\x1b[B";
-/// Super/Meta-modified kitty arrow without an event field
-/// (`ESC[1;2A`, Shift): never followed by a release, so it must not prime
-/// release suppression.
+/// Shift-modified kitty arrow without an event field (`ESC[1;2A`): never
+/// followed by a release, so it must not prime release suppression.
 const KITTY_SHIFT_UP_MODIFIED: &[u8] = b"\x1b[1;2A";
 /// Event-typed up release, seated after a menu closed without priming.
 const KITTY_UP_RELEASE: &[u8] = b"\x1b[1;1:3A";
@@ -796,20 +795,15 @@ fn an_aborted_csi_in_open_mode_does_not_swallow_later_keys() {
     open_menu(&mut attach);
     attach.expect_highlighted("Kill session", "the menu opens on the kill item");
 
-    // `ESC [` aborted by a bare Escape in the same read (`ESC [ ESC x` in one
-    // write): the abort stops at the second Escape, so the Escape alone
-    // closes the menu. The tail `x` behind it is then processed in the closed
-    // menu, where it is dropped by the state machine; only the sentinel
-    // after it reaches the program.
+    // `ESC [` aborted by a bare Escape in the same read (one write,
+    // `ESC [ ESC x`): the abort stops at the second Escape, so the Escape
+    // alone closes the menu. The tail `x` behind it is then processed in
+    // the closed menu, where it is dropped by the state machine; only the
+    // sentinel after it reaches the program.
     let before_close = attach.output.lock().expect("output lock").len();
-    // Two writes with no pause between them (the aborted `ESC [` plus the
-    // `ESC x` tail) land as one read; the Escape alone closes the menu.
-    attach
-        .writer
-        .write_all(CSI_ABORTED_BY_ESCAPE)
-        .expect("type the aborted CSI and its tail");
-    attach.writer.flush().expect("flush the key");
-    thread::sleep(KEY_PAUSE);
+    // One write: the aborted `ESC [` and its `ESC x` tail land in the same
+    // read; the Escape alone closes the menu.
+    attach.type_key(CSI_ABORTED_BY_ESCAPE);
     attach.expect_menu_closed(before_close, "Escape closes the menu");
     assert_only_sentinel("an aborted CSI swallows no input", &mut attach);
 
