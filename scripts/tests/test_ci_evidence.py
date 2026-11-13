@@ -223,7 +223,18 @@ elif endpoint.endswith("/artifacts"):
             })
         else:
             artifacts.append({"name": entry})
-    print(json.dumps([{"artifacts": artifacts}]))
+    # The real `gh` honours the pagination flags (r2 M4, r3 L8): `--paginate
+    # --slurp` prints a JSON array of page objects, bare `--paginate`
+    # concatenates them, and neither prints the whole list at once. A
+    # script that drops the flags gets a single page object and must fail
+    # on the `isinstance(pages, list)` check.
+    page = {"artifacts": artifacts}
+    if "--paginate" in args and "--slurp" in args:
+        print(json.dumps([page]))
+    elif "--paginate" in args:
+        print(json.dumps(page))
+    else:
+        print(json.dumps(page))
 elif "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
     artifact_id = str(endpoint.split("/")[-2])
     zips = {str(key): value for key, value in fixture.get("artifact_zips", {}).items()}
@@ -1247,8 +1258,10 @@ class CiEvidenceCliTests(unittest.TestCase):
         self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", text.stdout)
 
     def test_a_reuse_union_accepts_a_skipped_matrix_job(self):
-        # A skipped matrix job is shown under its job id in the evidence
-        # run (`fast-tests`), while the record names the legs it reused
+        # A skipped matrix job is shown under its display `name:` in the
+        # evidence run, exactly as the Actions API shows it on a real run:
+        # `tests (${{ matrix.shard }}, fast)` with the expression
+        # uninterpolated, while the record names the legs it reused
         # (`tests (core, fast)`). The union accepts it through the alias.
         workflow = """name: ci
 jobs:
@@ -1267,7 +1280,7 @@ jobs:
       - run: echo hi
 """
         evidence_page = jobs_page(overrides={}, extra=[
-            {"name": "fast-tests", "status": "completed", "conclusion": "skipped",
+            {"name": "tests (${{ matrix.shard }}, fast)", "status": "completed", "conclusion": "skipped",
              "completed_at": "2026-11-12T11:00:00Z"},
         ])
         source_page = jobs_page(extra=[
@@ -1288,8 +1301,9 @@ jobs:
         self.assertEqual(report["reused_from"]["jobs"], ["fast-tests"])
 
     def test_a_reuse_union_accepts_a_skipped_called_workflow_job(self):
-        # A skipped called-workflow job is shown under the caller id
-        # (`upgrade-test`), while the record names `caller / called job`.
+        # A skipped called-workflow job is shown under the caller display
+        # `name:` (`upgrade from the previous release`), while the record
+        # names `caller / called job`.
         workflow = """name: ci
 jobs:
   upgrade-test:
@@ -1311,7 +1325,7 @@ jobs:
 """
         leg = "upgrade from the previous release / inner job"
         evidence_page = jobs_page(overrides={}, extra=[
-            {"name": "upgrade-test", "status": "completed", "conclusion": "skipped",
+            {"name": "upgrade from the previous release", "status": "completed", "conclusion": "skipped",
              "completed_at": "2026-11-12T11:00:00Z"},
         ])
         source_page = jobs_page(extra=[
@@ -1333,7 +1347,9 @@ jobs:
 
     def test_a_reuse_union_on_the_tree_path_is_accepted_and_refused(self):
         # The tree-matching dispatch run carries the reuse record; its union
-        # decides like the exact-commit path (r1 M8 scenario).
+        # decides like the exact-commit path (r1 M8 scenario). The source
+        # run and the dispatch run share one commit (OTHER_SHA — the
+        # branch head); the candidate SHA only names its tree.
         union_fixture(self)
         # Move the record onto the tree-matched dispatch run 789.
         fixture = json.loads(self.fixture.read_text())
@@ -1346,6 +1362,10 @@ jobs:
         fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
         del fixture["artifact_zips"]["11"]
         fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=OTHER_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
         self.fixture.write_text(json.dumps(fixture))
         fixture["run_pages"] = [page([]), page([])]
         self.fixture.write_text(json.dumps(fixture))
@@ -1354,6 +1374,32 @@ jobs:
         report = json.loads(result.stdout)
         self.assertEqual(report["match"], "tree")
         self.assertEqual(report["reused_from"]["run_id"], REUSE_SOURCE_ID)
+
+    def test_a_reuse_union_on_the_tree_path_is_refused_for_a_third_commit(self):
+        # A source run on neither the candidate nor the dispatch commit is
+        # refused even when its recorded tree matches.
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["trees"] = {SHA: TREE, OTHER_SHA: TREE, THIRD_SHA: TREE}
+        fixture["tree_runs"] = [dispatch_doc()]
+        fixture["artifacts"]["789"] = [
+            {"name": f"tested-tree-{TREE}", "id": 21},
+            {"name": f"ci-reuse-{TREE}", "id": 22},
+        ]
+        fixture["artifact_zips"]["22"] = fixture["artifact_zips"]["11"]
+        del fixture["artifact_zips"]["11"]
+        fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=THIRD_SHA, event="pull_request", branch="zajca/feature",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["artifacts"]["456"] = []
+        fixture["run_pages"] = [page([]), page([])]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tree match", result.stderr)
+        self.assertIn("head SHA", result.stderr)
 
     def test_a_reuse_union_on_the_tree_path_is_refused_for_a_red_source(self):
         union_fixture(self)

@@ -920,7 +920,7 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # Finds the newest green same-tree pull request run and decides which jobs
+  # Finds the newest same-tree pull request run and decides which jobs
   # a delta dispatch reuses from it (issue #2203). Runs only on a tier=main
   # dispatch with delta=true; every other event skips it, and each reusable
   # job reads its `skip` output (a failed `reuse` run fails the verdict, so

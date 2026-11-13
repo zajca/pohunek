@@ -93,7 +93,7 @@ def load_config(text: str, source: str) -> dict:
         raise ReuseError(f"cannot parse config {source}: {error}") from error
     if not isinstance(config, dict):
         raise ReuseError(f"config {source} must be a JSON object")
-    for field in ("max_age_hours", "source_events", "not_dispatch_consumers", "jobs"):
+    for field in ("max_age_hours", "source_events", "not_dispatch_consumers", "pairs", "jobs"):
         if field not in config:
             raise ReuseError(f"config {source} is missing {field}")
     if not isinstance(config["max_age_hours"], int) or config["max_age_hours"] <= 0:
@@ -106,6 +106,11 @@ def load_config(text: str, source: str) -> dict:
         raise ReuseError(f"config {source} source_events must be a non-empty string list")
     if not isinstance(config["not_dispatch_consumers"], dict):
         raise ReuseError(f"config {source} not_dispatch_consumers must be an object")
+    if not isinstance(config["pairs"], dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in config["pairs"].items()
+    ):
+        raise ReuseError(f"config {source} pairs must be a string-to-string object")
     if not isinstance(config["jobs"], dict) or not config["jobs"]:
         raise ReuseError(f"config {source} jobs must be a non-empty object")
     for job_id, job in config["jobs"].items():
@@ -128,6 +133,12 @@ def load_config(text: str, source: str) -> dict:
             raise ReuseError(f"config {source} job {job_id} consumers must be a string list")
         if not isinstance(job["reason"], str) or not job["reason"]:
             raise ReuseError(f"config {source} job {job_id} reason must be a non-empty string")
+    jobs = config["jobs"]
+    for job_id, partner in config["pairs"].items():
+        if job_id not in jobs:
+            raise ReuseError(f"config {source} pairs names unknown job {job_id!r}")
+        if partner not in jobs:
+            raise ReuseError(f"config {source} pair partner {partner!r} is not an allowlisted job")
     return config
 
 
@@ -217,10 +228,6 @@ def artifact_names(repo: str, run_id: int) -> list[str]:
     return names
 
 
-def run_artifacts(repo: str, run_id: int) -> list[str]:
-    return artifact_names(repo, run_id)
-
-
 def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
     try:
         pages = list_artifact_pages(repo, run_id)
@@ -233,28 +240,39 @@ def download_artifact(repo: str, run_id: int, name: str, path: str) -> bool:
                 artifact_id = artifact.get("id")
     if artifact_id is None:
         return False
-    fetch = subprocess.run(
-        [
-            "gh", "api", "--method", "GET",
-            f"repos/{repo}/actions/artifacts/{artifact_id}/zip",
-        ],
-        capture_output=True,
-        check=False,
-        timeout=120,
-    )
+    try:
+        fetch = subprocess.run(
+            [
+                "gh", "api", "--method", "GET",
+                f"repos/{repo}/actions/artifacts/{artifact_id}/zip",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except FileNotFoundError:
+        return False
+    except subprocess.TimeoutExpired:
+        return False
     if fetch.returncode != 0:
         return False
     target = Path(path)
     target.mkdir(parents=True, exist_ok=True)
     archive = target / f"{name}.zip"
     archive.write_bytes(fetch.stdout)
-    unzip = subprocess.run(
-        ["unzip", "-o", "-q", str(archive), "-d", str(target)],
-        capture_output=True,
-        check=False,
-        timeout=120,
-    )
-    archive.unlink(missing_ok=True)
+    try:
+        unzip = subprocess.run(
+            ["unzip", "-o", "-q", str(archive), "-d", str(target)],
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except FileNotFoundError:
+        return False
+    except subprocess.TimeoutExpired:
+        return False
+    finally:
+        archive.unlink(missing_ok=True)
     return unzip.returncode == 0
 
 
@@ -266,7 +284,7 @@ def source_selection_narrowed(repo: str, run_id: int) -> bool | None:
     so a `selection_dependent` job is reused only from a full selection."""
     names: list[str] | None = None
     try:
-        names = run_artifacts(repo, run_id)
+        names = artifact_names(repo, run_id)
     except ReuseError:
         return None
     if "test-selection" not in (names or []):
@@ -309,7 +327,7 @@ def decide(
     )
     for run in candidates:
         try:
-            names = run_artifacts(repo, run["id"])
+            names = artifact_names(repo, run["id"])
         except ReuseError as error:
             return [], None, f"cannot list artifacts of run {run['id']}: {error}"
         trees = {
@@ -353,16 +371,21 @@ def decide(
                     continue
             skip.append(job_id)
         skip_set = set(skip)
-        # Pairs: a pair member is reused only together with its partner
-        # (closure rules apply to the union, so drop both if one is out).
-        pairs = config.get("pairs", {})
-        for job_id, partner in pairs.items():
-            if job_id in skip_set and partner not in skip_set:
-                skip_set.discard(job_id)
-        # Closure: drop every job with a consumer outside skip.
+        # Closure to a fixed point, pairs included: a pair member is reused
+        # only together with its partner, so the member whose partner is
+        # out leaves; a producer whose consumer is out leaves too. Both
+        # rules only remove jobs, and the pair rules drop both members when
+        # either is out (see the `pairs` guard below).
         changed = True
         while changed:
             changed = False
+            for job_id, partner in config["pairs"].items():
+                if job_id in skip_set and partner not in skip_set:
+                    skip_set.discard(job_id)
+                    changed = True
+                if partner in skip_set and job_id not in skip_set:
+                    skip_set.discard(partner)
+                    changed = True
             for job_id in list(skip_set):
                 consumers = config["jobs"][job_id]["consumers"]
                 if any(consumer not in skip_set for consumer in consumers):
@@ -382,7 +405,11 @@ def summarize(config: dict, skip: list[str], source: dict | None, reason: str) -
         if job_id in skip and source is not None:
             lines.append(f"| {job_id} | reused from {link} |")
         else:
-            lines.append(f"| {job_id} | runs ({reason})" if reason else f"| {job_id} | runs here |")
+            lines.append(
+                f"| {job_id} | runs ({reason}) |"
+                if reason
+                else f"| {job_id} | runs here |"
+            )
     return "\n".join(lines)
 
 

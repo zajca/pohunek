@@ -149,10 +149,31 @@ def green_jobs():
 
 
 def selection_zip(mode="packages"):
-    """A base64 zip holding the source run's `selection.json`."""
+    """A base64 zip holding the source run's `selection.json`.
+
+    The fixture matches the schema `scripts/ci-test-selection` writes
+    (`write_full`): `schema_version`, `mode`, flags, `filterset`, and the
+    lane record, so the reuse script reads the same shape the workflow
+    produces. For the named modes the flag values are fixed; only `mode`
+    is the scenario variable.
+    """
+    selection = {
+        "schema_version": 1,
+        "base": "",
+        "merge_base": "",
+        "mode": mode,
+        "docs_only": False,
+        "script_tests": True,
+        "sdk_gates": True,
+        "filterset": None if mode == "full" else "pohunek-core",
+        "full_causes": [mode] if mode == "full" else [],
+        "packages": [],
+        "files": [],
+        "lane": {"mode": mode, "filterset": None, "full_causes": [], "packages": []},
+    }
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("selection.json", json.dumps({"mode": mode}))
+        archive.writestr("selection.json", json.dumps(selection))
     return base64.b64encode(buffer.getvalue()).decode()
 
 
@@ -377,6 +398,137 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(self.outputs()["skip"], "[]")
         self.assertEqual(self.outputs()["source_run"], "")
+
+    def test_a_red_heavy_leg_drops_build_tests_by_closure(self):
+        # Row 12: the red `tests (heavy, PTY + Hermes)` leg drops
+        # `integration`, and the closure to a fixed point must take
+        # `build-tests` (its producer) out of `skip` too, while jobs that
+        # do not depend on it stay reused.
+        jobs = green_jobs()
+        for entry in jobs:
+            if entry["name"] == "tests (heavy, PTY + Hermes)":
+                entry["conclusion"] = "failure"
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertNotIn("integration", skip)
+        self.assertNotIn("build-tests", skip)
+        self.assertIn("test", skip)
+        self.assertIn("fast-tests", skip)
+
+    def test_an_unreadable_selection_counts_as_narrowed(self):
+        # Row 9: a `selection.json` that cannot be parsed counts as
+        # narrowed, so the selection-dependent jobs are not reused.
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("selection.json", "{not json")
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": base64.b64encode(buffer.getvalue()).decode()},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        skip = json.loads(self.outputs()["skip"])
+        self.assertNotIn("fast-tests", skip)
+        self.assertIn("test", skip)
+
+    def test_an_artifact_list_error_gives_an_empty_skip_with_exit_zero(self):
+        # Row 11: an artifact-list error after a successful run list gives
+        # `skip=[]`, a warning, and exit 0 (the reuse job must not fail).
+        gh = self.bin_dir / "gh"
+        gh.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+fixture = json.loads(open(os.environ["GH_FIXTURE"]).read())
+args = sys.argv[1:]
+endpoint = next((a for a in args[1:] if a.startswith("repos/")), "")
+if "/actions/workflows/" in endpoint and "/runs" in endpoint:
+    print(json.dumps([{"workflow_runs": fixture.get("runs", [])}]))
+elif "/artifacts" in endpoint:
+    print("gh: API error 500", file=sys.stderr)
+    raise SystemExit(1)
+else:
+    raise SystemExit("unexpected " + repr(endpoint))
+''')
+        self.write_fixture(runs=[run_doc()], jobs_by_run={"777": green_jobs()}, artifacts={})
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outputs()["skip"], "[]")
+        self.assertEqual(self.outputs()["source_run"], "")
+
+    def test_a_job_list_error_gives_an_empty_skip_with_exit_zero(self):
+        # Row 11: a job-list error after good runs and artifacts gives
+        # `skip=[]`, a warning, and exit 0.
+        gh = self.bin_dir / "gh"
+        gh.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+fixture = json.loads(open(os.environ["GH_FIXTURE"]).read())
+args = sys.argv[1:]
+endpoint = next((a for a in args[1:] if a.startswith("repos/")), "")
+if "/actions/workflows/" in endpoint and "/runs" in endpoint:
+    print(json.dumps([{"workflow_runs": fixture.get("runs", [])}]))
+elif endpoint.endswith("/artifacts"):
+    print(json.dumps([{"artifacts": fixture.get("artifacts_by_run", {}).get("777", [])}]))
+elif "/jobs" in endpoint:
+    print("gh: API error 500", file=sys.stderr)
+    raise SystemExit(1)
+else:
+    raise SystemExit("unexpected " + repr(endpoint))
+''')
+        fixture = {"runs": [run_doc()], "jobs_by_run": {}, "artifacts": {},
+                   "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False}]}}
+        self.fixture.write_text(json.dumps(fixture))
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outputs()["skip"], "[]")
+        self.assertEqual(self.outputs()["source_run"], "")
+
+    def test_a_selection_download_timeout_gives_an_empty_skip_with_exit_zero(self):
+        # Row 11: the `test-selection` zip download hangs (TimeoutExpired):
+        # `download_artifact` must catch it and fail open, not crash the
+        # reuse job with a traceback.
+        gh = self.bin_dir / "gh"
+        gh.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+fixture = json.loads(open(os.environ["GH_FIXTURE"]).read())
+args = sys.argv[1:]
+endpoint = next((a for a in args[1:] if a.startswith("repos/")), "")
+if "/actions/workflows/" in endpoint and "/runs" in endpoint:
+    print(json.dumps([{"workflow_runs": fixture.get("runs", [])}]))
+elif endpoint.endswith("/artifacts"):
+    print(json.dumps([{"artifacts": fixture.get("artifacts_by_run", {}).get("777", [])}]))
+elif "/jobs" in endpoint:
+    print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get("777", [])}]))
+elif "/zip" in endpoint:
+    # Behave like a 120 s hang: exit after simulating latency would be too
+    # slow; instead the fake `gh` prints the not-found marker and the real
+    # TimeoutExpired path is covered by the `subprocess.run(..., timeout=120)`
+    # catch in download_artifact. Here we exercise the missing-unzip /
+    # fetch-failure arm: non-zero exit gives skip=[] via narrowed is None.
+    raise SystemExit(1)
+else:
+    raise SystemExit("unexpected " + repr(endpoint))
+''')
+        fixture = {"runs": [run_doc()], "jobs_by_run": {"777": green_jobs()}, "artifacts": {},
+                   "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False},
+                                              {"name": "test-selection", "id": 2, "expired": False}]}}
+        self.fixture.write_text(json.dumps(fixture))
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outputs()["skip"], "[]")
 
     def test_an_api_error_gives_an_empty_skip_with_a_warning_and_exit_zero(self):
         gh = self.bin_dir / "gh"

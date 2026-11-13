@@ -226,11 +226,12 @@ def reuse_aliases(repo: str, sha: str, workflow_path: str, reused_names: set[str
     """The evidence-run display name for each reused leg name.
 
     A matrix or called-workflow job that is skipped in the evidence run is
-    shown under its job id (or id-less name); the record names the legs it
-    reused. The alias maps each leg name onto the name Actions shows for
-    that job in the evidence run, derived from the workflow definition of
-    the same tree. A leg that is itself a required job of the evidence run
-    needs no alias and is absent from the map."""
+    shown under its display `name:` (the job id only when the job has no
+    `name:`); the record names the legs it reused. The alias maps each leg
+    name onto the name Actions shows for that job in the evidence run,
+    derived from the workflow definition of the same tree. A leg that is
+    itself a required job of the evidence run needs no alias and is absent
+    from the map."""
     try:
         jobs = _workflow_jobs(repo, sha, workflow_path)
     except EvidenceError:
@@ -249,12 +250,12 @@ def reuse_aliases(repo: str, sha: str, workflow_path: str, reused_names: set[str
             }
             for leg in reused_names:
                 if leg in inner_legs and leg not in aliases:
-                    aliases[leg] = job_id
+                    aliases[leg] = name
         else:
             legs = set(_leg_names(name, matrix))
             for leg in reused_names:
                 if leg in legs and leg != name and leg not in aliases:
-                    aliases[leg] = job_id
+                    aliases[leg] = name
     return aliases
 
 
@@ -582,7 +583,7 @@ def verify_reuse(
     sha: str,
     cache: dict[str, str],
     evidence_jobs: list[dict[str, Any]],
-) -> tuple[set[str], list[str], dict[str, Any] | None]:
+) -> tuple[set[str], list[str], dict[str, Any] | None, dict[str, str]]:
     """The union of the evidence run with its delta-reuse source run.
 
     The required jobs that are `skipped` in the evidence run and named in its
@@ -647,10 +648,10 @@ def verify_reuse(
             job.get("conclusion") or "missing"
         )
     reused_names = {name for entry in record["jobs"].values() for name in entry["names"]}
-    # A skipped matrix or called-workflow job is shown under its job id in
-    # the evidence run, while the record names the legs it reused. Without
-    # the alias the union is refused: the evidence job looks like it ran
-    # under a name the record never mentions.
+    # A skipped matrix or called-workflow job is shown under its display
+    # name in the evidence run, while the record names the legs it reused.
+    # Without the alias the union is refused: the evidence job looks like
+    # it ran under a name the record never mentions.
     alias = reuse_aliases(repo, sha, config["workflow_path"], reused_names)
     for name in sorted(reused_names):
         conclusions = evidence_by_name.get(name)
@@ -722,7 +723,7 @@ def verify_reuse(
             for conclusion in evidence_by_name.get(name) or evidence_by_name.get(alias.get(name, ""), [])
         )
     }
-    return reused, [], {"run_id": source_id, "url": source_url, "jobs": sorted(record["jobs"])}, alias 
+    return reused, [], {"run_id": source_id, "url": source_url, "jobs": sorted(record["jobs"])}, alias
 
 
 def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str, Any]]:
@@ -1055,8 +1056,11 @@ def tree_evidence(
             reused_from = None
             if recorded == {tree} and failures and run.get("conclusion") == "success":
                 jobs = get_jobs(args.repo, run["id"])
+                # The source run and the dispatch run share one commit (the
+                # owner policy: ci-reuse requires head_sha == GITHUB_SHA);
+                # the candidate SHA is only for the tree.
                 reused, reuse_failures, reused_from, alias = verify_reuse(
-                    args.repo, run, config, args.tier, args.sha, cache, jobs
+                    args.repo, run, config, args.tier, run["head_sha"], cache, jobs
                 )
                 if reuse_failures:
                     failures = [*reuse_failures, *failures]

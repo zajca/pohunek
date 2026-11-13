@@ -445,7 +445,7 @@ Release packaging and contributor verification:
   exact commit, with optional dispatch and bounded polling; accepts a delta
   dispatch's union with its recorded source run.
 - `scripts/ci-reuse` — decides which jobs a `tier=main` delta dispatch reuses
-  from the newest green pull request run of the same tree; allowlist in
+  from the newest pull request run of the same tree; allowlist in
   `scripts/ci-reuse.json`.
 - `scripts/provision-hermes-compat`
 - `scripts/tests/provision-hermes-compat.sh`

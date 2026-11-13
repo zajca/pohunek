@@ -187,9 +187,9 @@ Dependabot pull request has a read-only token, so the cancel call is refused and
 the run keeps its real failure.
 
 **Delta dispatch.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
-accepts `delta: true`: the `delta reuse` job finds the newest green pull
-request run of the same tree (within 24 hours) and the reusable jobs it names
-skip, reusing those legs instead of running them again. Reused legs must be
+accepts `delta: true`: the `delta reuse` job finds the newest pull
+request run of the same tree (within 24 hours) and reuses its green legs;
+the reusable jobs those legs name skip instead of running again. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the
 evidence script uses, so a renamed job cannot be silently skipped and a
@@ -198,12 +198,16 @@ decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
 `scripts/tests/test_ci_tiers.py` guards); the source selection must be `mode == "full"`,
 and an ambiguous source runs everything. A full
 dispatch (`delta: false`) stays the default, and `scripts/release` keeps
-dispatching full runs. A job of the allowlist whose `needs:` names a reusable
+dispatching full runs. A job that `needs:` a reusable
 job but that can never run on a tier=main dispatch is not a reuse consumer:
 such jobs are listed in the config's `not_dispatch_consumers` with the reason,
-and the guards derive the restriction from the workflow rather than this text. `scripts/ci-evidence` accepts the union of the evidence
+and the guards derive the restriction from the workflow rather than this text.
+`pairs` names a job that is reused only together with its partner (see
+`scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
 run and the recorded source run as evidence for the commit, and names both
-runs in its report.
+runs in its report. For the dynamic-matrix `fast-tests` job the allowlist names
+every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
+the workflow plans), so a narrowed source never reuses any of them.
 
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the

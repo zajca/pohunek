@@ -157,7 +157,8 @@ PR. Move anything else to the next milestone with a one-line reason.
 3. **Rehearse the real release tree before GO:** in a throwaway worktree, apply
    exactly what the release commit will change (fold the changelog fragments,
    bump the version, refresh the lock), then run the full gate set on that
-   tree, `scripts/ci-evidence` read-only against the candidate's own runs, and
+   tree, `scripts/ci-evidence` read-only against the candidate's own runs
+   (a delta dispatch's union with its recorded source run counts), and
    the `scripts/release --dry-run` with a no-writes check. A dry run alone does
    not see a folded tree or renamed CI jobs.
 4. **Notes:** draft from the changelog fragments, keep a draft marker the
