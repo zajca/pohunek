@@ -435,6 +435,19 @@ jobs:
           name: ${{ matrix.fixture == 'memory' && 'macos-lane-junit-memory' || 'macos-lane-junit' }}
           path: target/nextest/macos/junit.xml
           if-no-files-found: warn
+
+      # PROBE-ONLY (#2199): peak RAM-disk usage after the lane tests.
+      - name: Report RAM disk peak usage for probe
+        if: ${{ always() && matrix.fixture == 'memory' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /Volumes/r ]; then
+            df -k /Volumes/r
+          else
+            echo "probe: /Volumes/r not mounted"
+          fi
+
       - name: Cancel the run (fail fast)
         if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && steps.infra-3.outcome != 'failure' && steps.infra-4.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
