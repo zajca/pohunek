@@ -145,6 +145,52 @@ fn serve(reported: String) -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, served)
 }
 
+/// A daemon that records every method served, grouped per connection so a
+/// test can assert that `host.governance.inspect` is first on each dialed
+/// connection. Answers the governance inspect with `reported`.
+fn serve_per_connection(reported: String) -> (u16, Arc<Mutex<Vec<Vec<String>>>>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&calls);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept a fixture connection");
+            let seen = Arc::clone(&seen);
+            let reported = reported.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let mut methods: Vec<String> = Vec::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).expect("read a fixture line") == 0 {
+                        seen.lock().expect("per-connection calls").push(methods);
+                        return;
+                    }
+                    let request: Request =
+                        serde_json::from_str(line.trim_end()).expect("parse a request");
+                    methods.push(request.method().to_owned());
+                    let result = match request.method() {
+                        protocol::method::HOST_GOVERNANCE_INSPECT => governance_status(&reported),
+                        protocol::method::SESSION_LIST => json!([]),
+                        _ => json!({}),
+                    };
+                    let response = Response::ok(protocol::PROTOCOL_VERSION, request.id(), result)
+                        .expect("valid fixture response");
+                    writeln!(
+                        reader.get_mut(),
+                        "{}",
+                        serde_json::to_string(&response).expect("serialize the response")
+                    )
+                    .expect("write the fixture response");
+                }
+            });
+        }
+    });
+    (port, calls)
+}
+
 /// A daemon whose reported host id can change between connections: `(port,
 /// served methods, current reported host id)`.
 #[allow(
@@ -394,7 +440,7 @@ async fn a_dedicated_static_connection_reproves_the_pin() {
             allow_prompt_accepted: None,
         }),
     };
-    let _ = client.session_input(params).await;
+    let result = client.session_input(params).await;
     let inspect_count = served
         .lock()
         .expect("served lock")
@@ -402,8 +448,49 @@ async fn a_dedicated_static_connection_reproves_the_pin() {
         .filter(|m| m.as_str() == protocol::method::HOST_GOVERNANCE_INSPECT)
         .count();
     assert!(
-        inspect_count >= 1,
-        "inspect served {inspect_count}: {:?}",
+        inspect_count == 2,
+        "the initial connection and the dedicated connection each probe: {inspect_count}: {:?}",
         *served.lock().expect("served")
+    );
+    assert!(
+        result.is_ok() || result.is_err(),
+        "the input call completed: {result:?}"
+    );
+}
+
+/// N1a: a dedicated connection to a static peer whose daemon now reports a
+/// different id must be refused with `host_identity_mismatch` before
+/// `session.input` is served on the fresh connection.
+#[tokio::test(flavor = "current_thread")]
+async fn a_dedicated_static_connection_refuses_a_fresh_mismatch() {
+    let pinned = host_id(b'A');
+    let (port, served, reported) = serve_switchable();
+    let mut client = Client::connect_with_registry_and_options(
+        PEER_NAME,
+        std::path::Path::new("/nonexistent/daemon.sock"),
+        registry(port, &pinned),
+        options(),
+    )
+    .await
+    .expect("the matching connection");
+    // The daemon starts reporting another id after the initial connection;
+    // the dedicated connection must re-prove the pin and refuse.
+    *reported.lock().expect("reported id") = host_id(b'B');
+    let params = protocol::SessionInputParams {
+        session_id: protocol::SessionId("s-1".to_owned()),
+        text: "hello".to_owned(),
+        wait: Some(protocol::SessionInputWait {
+            until: Some(vec![protocol::AgentActivity::Working]),
+            timeout_ms: Some(100),
+            allow_prompt_accepted: None,
+        }),
+    };
+    let error = client
+        .session_input(params)
+        .await
+        .expect_err("the fresh mismatch is refused");
+    assert!(
+        matches!(error, ClientError::HostIdentityMismatch { .. }),
+        "the dedicated refusal: {error:?}"
     );
 }

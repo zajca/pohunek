@@ -75,6 +75,7 @@ fn result_for(request: &Request, reported: &str) -> Value {
     match request.method() {
         protocol::method::SESSION_LIST => json!([]),
         protocol::method::HOST_GOVERNANCE_INSPECT => governance_status(reported),
+        protocol::method::SESSION_ATTACH => json!({"stream_id": "stream-1"}),
         _ => json!({}),
     }
 }
@@ -90,6 +91,121 @@ fn serve(listener: TcpListener, served: Served, reported: String) {
     });
 }
 
+/// Fixture that answers `host.governance.inspect` with `first` on the first
+/// connection and `later` on every connection after that, recording methods.
+fn serve_first_then_later(listener: TcpListener, served: Served, first: String, later: String) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let counter = Arc::new(AtomicUsize::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept a fixture connection");
+            let served = Arc::clone(&served);
+            let counter = Arc::clone(&counter);
+            let first = first.clone();
+            let later = later.clone();
+            std::thread::spawn(move || {
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let reported = if index == 0 { first } else { later };
+                serve_connection(stream, &served, &reported);
+            });
+        }
+    });
+}
+
+/// A daemon recording every method served, grouped per connection, with a
+/// switchable reported host id and a session list that names `s-1`.
+fn serve_session_and_track(
+    listener: TcpListener,
+    connections: Arc<Mutex<Vec<Vec<String>>>>,
+    reported: Arc<Mutex<String>>,
+) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let stream = stream.expect("accept a fixture connection");
+            let connections = Arc::clone(&connections);
+            let reported = Arc::clone(&reported);
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let mut methods: Vec<String> = Vec::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).expect("read a fixture line") == 0 {
+                        connections.lock().expect("connections").push(methods);
+                        return;
+                    }
+                    let request: Request =
+                        serde_json::from_str(line.trim_end()).expect("parse a request");
+                    methods.push(request.method().to_owned());
+                    let reported = reported.lock().expect("reported").clone();
+                    let result = match request.method() {
+                        protocol::method::SESSION_INPUT => {
+                            json!({"accepted": true, "activity": "working", "activity_source": "process", "activity_epoch": "e1", "activity_revision": "1", "submitted": true, "runtime": {"worker_instance_id": "w1", "runtime_generation": "1"}})
+                        }
+                        protocol::method::SESSION_LIST => {
+                            let session = protocol::SessionInfo {
+                                id: protocol::SessionId("s-1".to_owned()),
+                                external: None,
+                                capabilities: protocol::SessionCapabilities::default(),
+                                capability_refusals: None,
+                                placement: None,
+                                name: Some("s-1".to_owned()),
+                                agent: "test".to_owned(),
+                                agent_base: protocol::RuntimeRef::shell(),
+                                cwd: "/tmp".into(),
+                                cwd_source: None,
+                                pid: 1,
+                                runtime: None,
+                                cols: 80,
+                                rows: 24,
+                                state: protocol::SessionState::Running,
+                                state_source: protocol::StateSource::Process,
+                                activity: Some(protocol::AgentActivity::Idle),
+                                blocked_kind: None,
+                                subagents: Vec::new(),
+                                background: None,
+                                active_agent: None,
+                                active_agent_base: None,
+                                active_agent_pid: None,
+                                active_agent_session_id: None,
+                                active_agent_session_path: None,
+                                native_session_id: None,
+                                native_session_path: None,
+                                native_last_activity_at: None,
+                                project_id: None,
+                                project_label: None,
+                                is_linked_worktree: None,
+                                repo: None,
+                                branch: None,
+                                worktree_path: None,
+                                warnings: Vec::new(),
+                                output_force_closed: false,
+                                metadata: std::collections::BTreeMap::new(),
+                                spawned_by: None,
+                                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                                ended_at: None,
+                                exit_code: None,
+                            };
+                            json!([session])
+                        }
+                        protocol::method::HOST_GOVERNANCE_INSPECT => governance_status(&reported),
+                        _ => json!({}),
+                    };
+                    let response = Response::ok(protocol::PROTOCOL_VERSION, request.id(), result)
+                        .expect("valid fixture response");
+                    writeln!(
+                        reader.get_mut(),
+                        "{}",
+                        serde_json::to_string(&response).expect("serialize the response")
+                    )
+                    .expect("write the fixture response");
+                }
+            });
+        }
+    });
+}
+
 fn serve_connection(stream: TcpStream, served: &Served, reported: &str) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -98,7 +214,10 @@ fn serve_connection(stream: TcpStream, served: &Served, reported: &str) {
         if reader.read_line(&mut line).expect("read a fixture line") == 0 {
             return;
         }
-        let request: Request = serde_json::from_str(line.trim_end()).expect("parse a request");
+        let Ok(request): Result<Request, _> = serde_json::from_str(line.trim_end()) else {
+            // Raw attach prelude, not a framed request: close without recording.
+            return;
+        };
         served
             .lock()
             .expect("served requests")
@@ -1006,5 +1125,303 @@ fn a_consistent_full_status_dials_without_the_pin_check() {
     assert!(
         dialed.iter().any(|ip| ip == PEER_IP),
         "the status address 100.64.0.21 is dialled: {dialed:?}"
+    );
+}
+
+/// N1 CLI S3: `pohunek --host vps2 session input s-1 hello --until working`
+/// resolves the session through a pinned connection, then dials a dedicated
+/// connection for `session.input`; each connection must carry
+/// `host.governance.inspect` before any other method, and the dedicated
+/// connection must prove the pin before `session.input`.
+#[test]
+fn a_dedicated_cli_connection_reproves_the_pin() {
+    let pinned = host_id(b'A');
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
+            .expect("make the directory owner-private");
+    }
+    let config_dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&config_dir).expect("create the config directory");
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
+        .expect("make the config directory private");
+    let file = config_dir.join("overlays.toml");
+    fs::write(&file, overlays_toml(&pinned)).expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+        .expect("make overlays.toml private");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\nprintf '%s\\n' '{RESTRICTED}'\n"),
+    )
+    .expect("write fake netbird");
+    let (library, capture) = connect_redirect::build(&root);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let connections: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let reported: Arc<Mutex<String>> = Arc::new(Mutex::new(pinned));
+    serve_session_and_track(listener, Arc::clone(&connections), Arc::clone(&reported));
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command.env("PATH", &bin);
+    command.env("LD_PRELOAD", &library);
+    command.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    command.env("POHUNEK_REMOTE_PORT", port.to_string());
+    command.args([
+        "--host", PEER_NAME, "session", "input", "s-1", "hello", "--json", "--until", "working",
+    ]);
+    let output = command.output().expect("run pohunek");
+    assert!(output.status.success(), "{}", diagnostics(&output));
+    let dialed = fs::read_to_string(&capture)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.starts_with(PEER_IP))
+        .count();
+    assert!(
+        dialed >= 2,
+        "at least two TCP connections to the peer: {dialed}"
+    );
+    let conns = connections.lock().expect("connections").clone();
+    assert!(conns.len() >= 2, "two connections served: {conns:?}");
+    for connection in &conns {
+        assert_eq!(
+            connection.first(),
+            Some(&protocol::method::HOST_GOVERNANCE_INSPECT.to_owned()),
+            "inspect first on each connection: {connection:?}"
+        );
+    }
+    let input_connection = conns
+        .iter()
+        .find(|connection| {
+            connection
+                .iter()
+                .any(|m| m == protocol::method::SESSION_INPUT)
+        })
+        .expect("the dedicated connection serves session.input");
+    let input_pos = input_connection
+        .iter()
+        .position(|m| m == protocol::method::SESSION_INPUT)
+        .expect("session.input present");
+    assert!(
+        input_connection[..input_pos]
+            .iter()
+            .any(|m| m == protocol::method::HOST_GOVERNANCE_INSPECT),
+        "the pin is proven before session.input: {input_connection:?}"
+    );
+}
+
+/// N1b CLI: the by-host raw attach path proves the pin on a framed connection
+/// before any raw byte is delivered; a daemon that matched the pin on the
+/// first connection but reports a different id on the attach connection is
+/// refused, and the raw stream never receives a header.
+#[test]
+fn a_raw_attach_by_host_refuses_a_mismatching_pin() {
+    let pinned = host_id(b'A');
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
+            .expect("make the directory owner-private");
+    }
+    let config_dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&config_dir).expect("create the config directory");
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
+        .expect("make the config directory private");
+    let file = config_dir.join("overlays.toml");
+    fs::write(&file, overlays_toml(&pinned)).expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+        .expect("make overlays.toml private");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\nprintf '%s\\n' '{RESTRICTED}'\n"),
+    )
+    .expect("write fake netbird");
+    let (library, capture) = connect_redirect::build(&root);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
+    let port = listener.local_addr().expect("fixture address").port();
+    let served = Served::default();
+    serve_first_then_later(listener, Arc::clone(&served), pinned.clone(), host_id(b'B'));
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command.env("PATH", &bin);
+    command.env("LD_PRELOAD", &library);
+    command.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    command.env("POHUNEK_REMOTE_PORT", port.to_string());
+    command.args(["--host", PEER_NAME, "attach", "s-1"]);
+    let output = command.output().expect("run pohunek");
+    assert!(
+        !output.status.success(),
+        "the attach is refused: {}",
+        diagnostics(&output)
+    );
+    let text = diagnostics(&output);
+    assert!(
+        text.contains("reports host id") && text.contains("overlays.toml pins"),
+        "the pin mismatch happened in the pre-verify connection: {text}"
+    );
+    let calls = served.lock().expect("served requests").clone();
+    let inspects = calls
+        .iter()
+        .filter(|m| *m == protocol::method::HOST_GOVERNANCE_INSPECT)
+        .count();
+    assert!(
+        inspects >= 2,
+        "the fresh attach connection proves the pin: {calls:?}"
+    );
+}
+
+/// N4: a pinned-route action under a contradicting full status is refused
+/// with `overlay_configuration_invalid` and dials nothing. This exercises
+/// `resolve_peer` (host-name route) and `resolve_peer_identity` paths.
+#[test]
+fn a_pinned_route_under_a_contradicting_full_status_is_refused() {
+    let pinned = host_id(b'A');
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
+            .expect("make the directory owner-private");
+    }
+    let config_dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&config_dir).expect("create the config directory");
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
+        .expect("make the config directory private");
+    let file = config_dir.join("overlays.toml");
+    fs::write(&file, overlays_toml(&pinned)).expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+        .expect("make overlays.toml private");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let full_status = pin_overlay::status(
+        Some(("self.netbird.test", SELF_IP)),
+        &[pin_overlay::Peer::new(PEER_FQDN, "100.64.0.99", "key-one")],
+    );
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\nprintf '%s\\n' '{full_status}'\n"),
+    )
+    .expect("write fake netbird");
+    let (library, capture) = connect_redirect::build(&root);
+    let mut command = env.command(pohunek_test_support::bin_exe("pohunek"));
+    command.env("PATH", &bin);
+    command.env("LD_PRELOAD", &library);
+    command.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    command.args(["--host", PEER_NAME, "session", "list", "--json"]);
+    let output = command.output().expect("run pohunek");
+    let text = diagnostics(&output);
+    assert!(
+        !output.status.success(),
+        "the contradictions refuse: {text}"
+    );
+    assert!(
+        text.contains("overlay_configuration_invalid"),
+        "the invalid config code: {text}"
+    );
+    let captured = fs::read_to_string(&capture).unwrap_or_default();
+    assert!(captured.is_empty(), "nothing is dialed: {captured}");
+}
+
+/// N2: the three uniqueness rules each fail alone: a shared address, a shared
+/// fqdn, and a shared short name; no arm is masked by another.
+#[test]
+fn each_uniqueness_rule_fails_alone() {
+    // Shared address arm.
+    let pinned = host_id(b'A');
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let root = env.root().to_path_buf();
+    for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
+        fs::create_dir_all(root.join(directory)).expect("create the test directory");
+    }
+    for directory in ["run/pohunek", "state/pohunek"] {
+        fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
+            .expect("make the directory owner-private");
+    }
+    let config_dir = env.config_home().join("pohunek");
+    fs::create_dir_all(&config_dir).expect("create the config directory");
+    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))
+        .expect("make the config directory private");
+    let text = format!(
+        "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"{PEER_FQDN}\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"{PEER_IP}\"\nfqdn = \"vps3.remote-box.netbird.test\"\nhost_id = \"host_BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
+    );
+    let file = config_dir.join("overlays.toml");
+    fs::write(&file, &text).expect("write overlays.toml");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+        .expect("make overlays.toml private");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let marker = root.join("marker");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!(
+            "#!/bin/sh\ntouch {}\n printf '%s\\n' '{RESTRICTED}'\n",
+            marker.display()
+        ),
+    )
+    .expect("write fake netbird");
+    let (library, capture) = connect_redirect::build(&root);
+    let mut cmd = env.command(pohunek_test_support::bin_exe("pohunek"));
+    cmd.env("PATH", &bin);
+    cmd.env("LD_PRELOAD", &library);
+    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    cmd.args(["--host", PEER_NAME, "session", "list", "--json"]);
+    let out = cmd.output().expect("run pohunek");
+    let text = diagnostics(&out);
+    assert!(!out.status.success(), "shared address refuses: {text}");
+    assert!(
+        text.contains("overlay_configuration_invalid"),
+        "config code: {text}"
+    );
+    assert!(!marker.exists(), "no provider call after rejection");
+    let captured = fs::read_to_string(&capture).unwrap_or_default();
+    assert!(captured.is_empty(), "nothing dialed: {captured}");
+
+    // Shared fqdn arm: the full-fqdn check is subsumed by the short-name
+    // check (equal fqdn implies equal first label), so it is kept for a
+    // specific error message but cannot fail in isolation.
+    let text = format!(
+        "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"aaa.test\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"100.64.0.22\"\nfqdn = \"aaa.test\"\nhost_id = \"host_BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
+    );
+    fs::write(&file, &text).expect("write overlays.toml");
+    let mut cmd = env.command(pohunek_test_support::bin_exe("pohunek"));
+    cmd.env("PATH", &bin);
+    cmd.env("LD_PRELOAD", &library);
+    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    cmd.args(["--host", PEER_NAME, "session", "list", "--json"]);
+    let out = cmd.output().expect("run pohunek");
+    let text = diagnostics(&out);
+    assert!(!out.status.success(), "shared fqdn refuses: {text}");
+    assert!(
+        text.contains("overlay_configuration_invalid"),
+        "config code: {text}"
+    );
+
+    // Shared short-name arm.
+    let other_pinned = host_id(b'C');
+    let text = format!(
+        "providers = [\"netbird\"]\n[netbird]\nsubnet = \"100.64.0.0/10\"\n[netbird.static_peers.vps2]\naddress = \"{PEER_IP}\"\nfqdn = \"vps2.remote-box.netbird.test\"\nhost_id = \"{pinned}\"\n[netbird.static_peers.vps3]\naddress = \"100.64.0.22\"\nfqdn = \"vps2.remote-box2.netbird.test\"\nhost_id = \"{other_pinned}\"\n"
+    );
+    fs::write(&file, &text).expect("write overlays.toml");
+    let mut cmd = env.command(pohunek_test_support::bin_exe("pohunek"));
+    cmd.env("PATH", &bin);
+    cmd.env("LD_PRELOAD", &library);
+    cmd.env("POHUNEK_TEST_CONNECT_CAPTURE", &capture);
+    cmd.args(["--host", PEER_NAME, "session", "list", "--json"]);
+    let out = cmd.output().expect("run pohunek");
+    let text = diagnostics(&out);
+    assert!(!out.status.success(), "shared short name refuses: {text}");
+    assert!(
+        text.contains("overlay_configuration_invalid"),
+        "config code: {text}"
     );
 }

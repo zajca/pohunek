@@ -90,12 +90,15 @@ status_timeout_secs = 10  # optional
   - **Accounts that do not own the connection.** Find the subnet from
     `netbird status --json` of the owning account, or from the Dashboards
     settings; the peer `fqdn` and host id from `pohunek host governance
-    inspect <host>` on the peer. The pin does not protect against a daemon
-    that reports another host id; a mesh member that took the address and
-    reports the pinned id is not detected (the id is self-reported).
-    `host_identity_mismatch` means the dialled daemon is not the pinned
-    host: run `pohunek host governance inspect local` on the peer and
-    correct the `address`/`host_id`.
+    inspect <host>` on the peer. The pin compares the host id the dialled
+    daemon reports with `host.governance.inspect` against the pinned one
+    before any other request; a different id is refused as
+    `host_identity_mismatch`. The pin does not protect against a different
+    mesh member that took the pinned address and reports the pinned host
+    id itself (the id is self-reported and not detected).
+    `host_identity_mismatch` means the dialled daemon does not report the
+    pinned host id: run `pohunek host governance inspect local` on the
+    peer and correct the `address`/`host_id`.
 - A daemon of an older release ignores the file and binds the environment value
   or 18722, and so does a client of an earlier release (a CLI on another host,
   a Rust client pinned to an earlier tag such as the `pohunek-work` gateway).
