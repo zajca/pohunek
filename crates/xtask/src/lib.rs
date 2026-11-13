@@ -393,10 +393,15 @@ pub fn check_doc_drift(repo: impl AsRef<Path>) -> Result<Vec<&'static str>, Xtas
     doc_drift::check(repo.as_ref())
 }
 
-fn run_claude(
-    action: claude_canary::ClaudeAction,
-) -> Result<claude_canary::CompareOutcome, XtaskError> {
-    claude_canary::run(action)
+/// Dispatch of the `claude` command; a nonzero outcome becomes the
+/// [`XtaskError::ExitCode`] the process exits with (without an error line).
+fn run_claude(action: claude_canary::ClaudeAction) -> Result<(), XtaskError> {
+    let outcome = claude_canary::run(action)?;
+    if outcome.exit_code() == 0 {
+        Ok(())
+    } else {
+        Err(XtaskError::ExitCode(outcome.exit_code()))
+    }
 }
 
 #[expect(
@@ -498,16 +503,7 @@ where
             }
         },
         TopCommand::Hermes { action } => run_hermes(action, &root),
-        TopCommand::Claude { action } => match run_claude(action) {
-            Ok(outcome) => {
-                if outcome.exit_code() == 0 {
-                    Ok(())
-                } else {
-                    Err(XtaskError::ExitCode(outcome.exit_code()))
-                }
-            }
-            Err(error) => Err(error),
-        },
+        TopCommand::Claude { action } => run_claude(action),
         TopCommand::Affected(options) => affected::run(&root, &options),
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
@@ -613,8 +609,6 @@ enum TopCommand {
     },
     /// The Claude OSC 7501 canary.
     ///
-    /// `capture` records the canonical 7501 status records of the real
-    /// installed Claude on the owner's account into `capture.json`;
     /// `compare` diffs a capture against the expected table. A row whose
     /// expected value is `null` is UNVERIFIED by definition and never a
     /// pass; expectations change only by a reviewed hand edit.
