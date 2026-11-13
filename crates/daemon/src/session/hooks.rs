@@ -1,7 +1,7 @@
 //! Session-layer lifecycle hooks and the agent-state hook dispatcher.
 
 use super::{
-    broadcast, event, is_terminal, mpsc, run_hook, warn, AgentActivity, CancellationToken,
+    broadcast, event, is_terminal, mpsc, run_hook, warn, AgentActivity, Arc, CancellationToken,
     Duration, Event, HashMap, HashSet, HookContext, HookEvent, JoinHandle, PathBuf, RuntimeRef,
     SessionId, SessionRegistry, Value, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION,
     ENV_SESSION_ID, ENV_SOCKET_PATH, PROTOCOL_VERSION,
@@ -252,7 +252,7 @@ impl SessionRegistry {
 
 pub(super) fn spawn_agent_state_hook_dispatcher(
     registry: SessionRegistry,
-    mut events: broadcast::Receiver<Event>,
+    mut events: broadcast::Receiver<Arc<Event>>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let spawner = registry.clone();
@@ -348,7 +348,7 @@ pub(super) fn spawn_agent_state_hook_dispatcher(
 
 async fn drain_buffered_agent_state_events(
     registry: &SessionRegistry,
-    events: &mut broadcast::Receiver<Event>,
+    events: &mut broadcast::Receiver<Arc<Event>>,
     last_fired: &mut HashMap<SessionId, AgentActivity>,
     pending: &mut HashMap<SessionId, (AgentActivity, tokio::time::Instant)>,
 ) {

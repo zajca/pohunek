@@ -641,7 +641,7 @@ mod tests {
     }
 
     async fn next_agent_state(
-        events: &mut broadcast::Receiver<protocol::Event>,
+        events: &mut broadcast::Receiver<Arc<protocol::Event>>,
     ) -> protocol::AgentStateEvent {
         tokio::time::timeout(TEST_EVENT_CEILING, async {
             loop {
@@ -664,7 +664,7 @@ mod tests {
     struct StableDetector {
         registry: SessionRegistry,
         session: protocol::SessionInfo,
-        events: broadcast::Receiver<protocol::Event>,
+        events: broadcast::Receiver<Arc<protocol::Event>>,
         output: super::DetectorFeed,
         cancel: CancellationToken,
         // Held so the detector loop's resize, config and preview channels stay open.
@@ -799,7 +799,7 @@ mod tests {
 
     /// Whether another `agent_state` event arrives within `window` of virtual time.
     async fn agent_state_within(
-        events: &mut broadcast::Receiver<protocol::Event>,
+        events: &mut broadcast::Receiver<Arc<protocol::Event>>,
         window: Duration,
     ) -> bool {
         tokio::time::timeout(window, async {

@@ -1,5 +1,7 @@
 //! User/initial input framing and PTY delivery.
 
+use std::sync::Arc;
+
 use pohunek_worker_protocol::{InputFragment as WorkerInputFragment, SecretBytes};
 
 use protocol::{
@@ -925,7 +927,7 @@ impl SessionRegistry {
         session_id: &SessionId,
         wait: SessionInputWait,
         submission: InputSubmission,
-        events: &mut broadcast::Receiver<protocol::Event>,
+        events: &mut broadcast::Receiver<Arc<protocol::Event>>,
     ) -> Result<SessionInputResult, ProtocolError> {
         let until = wait.until.as_deref().unwrap_or_default();
         let targets: &[AgentActivity] = if until.is_empty() {

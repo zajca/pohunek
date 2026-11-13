@@ -139,7 +139,7 @@ async fn observed_pids(registry: &SessionRegistry, id: &SessionId) -> Vec<u32> {
 /// refuses breaks its control connection, so the exit watcher reconnects at a
 /// moment the scenarios do not control.
 async fn next_transition_after_reconnects(
-    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
 ) -> String {
     loop {
         let name = next_runtime_event(events).await;

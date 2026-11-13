@@ -3,6 +3,7 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use protocol::{
@@ -324,7 +325,7 @@ struct Deferred {
 
 #[derive(Debug)]
 enum DeferredInput {
-    Event(Event, EventOrigin),
+    Event(Arc<Event>, EventOrigin),
     Snapshot(Box<SessionInfo>),
     Edge(TurnEdge),
 }
@@ -336,7 +337,7 @@ impl ProjectorState {
         &mut self,
         notifications: &NotificationService,
         attention: &AttentionCoordinator,
-        event: &Event,
+        event: &Arc<Event>,
         produced: StdInstant,
         origin: EventOrigin,
     ) {
@@ -349,7 +350,7 @@ impl ProjectorState {
             if self.deferred.contains_key(&session_id) {
                 self.defer(
                     &session_id,
-                    DeferredInput::Event(event.clone(), origin),
+                    DeferredInput::Event(Arc::clone(event), origin),
                     ResolveAsOf::at(produced),
                 );
                 return;
@@ -359,7 +360,7 @@ impl ProjectorState {
             if !self.seed_transition_epochs(notifications, session_id).await {
                 self.defer(
                     session_id,
-                    DeferredInput::Event(event.clone(), origin),
+                    DeferredInput::Event(Arc::clone(event), origin),
                     ResolveAsOf::at(produced),
                 );
                 return;

@@ -1441,8 +1441,8 @@ where
 async fn run_event_subscription<S>(
     framed: &mut Framed<S, LinesCodec>,
     (session_events, notification_events): (
-        &mut broadcast::Receiver<Event>,
-        &mut broadcast::Receiver<Event>,
+        &mut broadcast::Receiver<Arc<Event>>,
+        &mut broadcast::Receiver<Arc<Event>>,
     ),
     version: protocol::ProtocolVersion,
     stopping: &CancellationToken,
@@ -1492,7 +1492,7 @@ where
 /// open, so the stop signal has to end it.
 async fn forward_until_stopped<S>(
     framed: &mut Framed<S, LinesCodec>,
-    event: Event,
+    event: Arc<Event>,
     version: protocol::ProtocolVersion,
     stopping: &CancellationToken,
 ) -> Result<bool, io::Error>
@@ -1513,17 +1513,18 @@ where
 /// the subscription.
 async fn forward_event<S>(
     framed: &mut Framed<S, LinesCodec>,
-    event: Event,
+    event: Arc<Event>,
     version: protocol::ProtocolVersion,
 ) -> Result<(), io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     if version == protocol::PROTOCOL_VERSION {
-        return send_event_line(framed, &event.with_version(version)).await;
+        // Bus events are built at the current version (`crate::events::event`).
+        return send_event_line(framed, &event).await;
     }
     let name = event.event().to_owned();
-    match protocol::compat::downgrade_event(event, version) {
+    match protocol::compat::downgrade_event(Event::clone(&event), version) {
         Ok(Some(adapted)) => send_event_line(framed, &adapted).await,
         Ok(None) => Ok(()),
         Err(error) => {

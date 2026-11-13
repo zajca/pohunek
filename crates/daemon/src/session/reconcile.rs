@@ -21195,7 +21195,7 @@ generation "$1"
                     .await
                     .expect("the lost event arrives")
                     .expect("event stream");
-                let text = serde_json::to_string(&event).expect("event json");
+                let text = serde_json::to_string(&*event).expect("event json");
                 if text.contains(crate::session::event::SESSION_RUNTIME_LOST) {
                     break text;
                 }
@@ -21308,7 +21308,7 @@ generation "$1"
                     .await
                     .expect("the lost event arrives")
                     .expect("event stream");
-                let text = serde_json::to_string(&event).expect("event json");
+                let text = serde_json::to_string(&*event).expect("event json");
                 if text.contains(crate::session::event::SESSION_RUNTIME_LOST) {
                     break text;
                 }

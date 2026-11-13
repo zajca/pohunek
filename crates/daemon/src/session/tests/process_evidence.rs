@@ -58,7 +58,9 @@ async fn create_session(registry: &SessionRegistry) -> SessionId {
 }
 
 /// Waits until the detector published a process-sourced `working`.
-async fn process_working_published(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) {
+async fn process_working_published(
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
+) {
     pohunek_test_support::wait::guard("the detector to publish Working/Process", async {
         loop {
             match events.recv().await {

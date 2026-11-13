@@ -398,7 +398,7 @@ pub struct NotificationService {
 struct NotificationServiceInner {
     store: NotificationStore,
     settings: NotificationSettings,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<Arc<Event>>,
     next_id: AtomicU64,
 }
 
@@ -461,7 +461,7 @@ impl NotificationService {
 
     /// Subscribe to notification lifecycle events.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<Event>> {
         self.inner.events.subscribe()
     }
 
@@ -785,7 +785,7 @@ impl NotificationService {
             event::NOTIFICATION_CREATED,
             serde_json::to_value(payload).expect("notification_created payload serializes"),
         );
-        let _ = self.inner.events.send(event);
+        let _ = self.inner.events.send(Arc::new(event));
     }
 
     fn emit_updated(&self, record: &NotificationRecord) {
@@ -796,7 +796,7 @@ impl NotificationService {
             event::NOTIFICATION_UPDATED,
             serde_json::to_value(payload).expect("notification_updated payload serializes"),
         );
-        let _ = self.inner.events.send(event);
+        let _ = self.inner.events.send(Arc::new(event));
     }
 
     fn emit_deleted(&self, id: &NotificationId) {
@@ -807,7 +807,7 @@ impl NotificationService {
             event::NOTIFICATION_DELETED,
             serde_json::to_value(payload).expect("notification_deleted payload serializes"),
         );
-        let _ = self.inner.events.send(event);
+        let _ = self.inner.events.send(Arc::new(event));
     }
 }
 

@@ -660,7 +660,7 @@ async fn a_record_without_input_changes_the_activity() {
 
 /// Waits until the detector has published a process-sourced `working`.
 async fn wait_process_working(
-    events: &std::sync::Mutex<tokio::sync::broadcast::Receiver<protocol::Event>>,
+    events: &std::sync::Mutex<tokio::sync::broadcast::Receiver<Arc<protocol::Event>>>,
 ) {
     wait_until("the detector to publish Working/Process", || async {
         saw_process_working(&mut events.lock().expect("event receiver lock")).then_some(())
@@ -899,8 +899,8 @@ async fn a_background_agents_child_records_never_change_the_session_activity() {
 
 /// The `agent.state` events received so far.
 fn agent_states(
-    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
-) -> Vec<protocol::Event> {
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
+) -> Vec<Arc<protocol::Event>> {
     let mut states = Vec::new();
     while let Ok(event) = events.try_recv() {
         if event.event() == protocol::event::AGENT_STATE {
@@ -911,7 +911,9 @@ fn agent_states(
 }
 
 /// Whether the events include a process-sourced `working` activity.
-fn saw_process_working(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> bool {
+fn saw_process_working(
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
+) -> bool {
     agent_states(events).iter().any(|event| {
         event.payload()["activity"] == "working" && event.payload()["source"] == "process"
     })
