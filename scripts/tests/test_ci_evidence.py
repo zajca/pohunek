@@ -337,7 +337,7 @@ REUSE_JOB = "matrix check (linux)"
 def reuse_config(base):
     """A config copy with the delta-reuse section the candidate allows."""
     config = json.loads(json.dumps(base))
-    config["reuse"] = {"max_age_hours": 24, "source_events": ["pull_request", "push", "workflow_dispatch"]}
+    config["reuse"] = {"max_age_hours": 24, "source_events": ["pull_request"]}
     return config
 
 
@@ -507,6 +507,9 @@ class CiEvidenceCliTests(unittest.TestCase):
         script = repository / "scripts" / "ci-evidence"
         script.write_bytes(SCRIPT.read_bytes())
         script.chmod(0o755)
+        (repository / "scripts" / "ci_eligibility.py").write_bytes(
+            (ROOT / "scripts" / "ci_eligibility.py").read_bytes()
+        )
         config = repository / "scripts" / "ci-evidence.json"
         config.write_text(json.dumps(committed))
         git = ["git", "-C", str(repository), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
@@ -1378,6 +1381,11 @@ jobs:
         # one from push run 888; both must verify against their own run IDs.
         OTHER_SOURCE = 888
         union_fixture(self)
+        self.config_data["reuse"] = {
+            "max_age_hours": 24,
+            "source_events": ["pull_request", "push", "workflow_dispatch"],
+        }
+        self.write_config()
         fixture = json.loads(self.fixture.read_text())
         fixture["artifact_zips"]["11"] = reuse_zip(
             TREE,
@@ -1564,7 +1572,7 @@ jobs:
         del fixture["artifact_zips"]["11"]
         fixture["jobs_by_run"]["789"] = jobs_page(overrides={REUSE_JOB: "skipped"})
         fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
-            sha=THIRD_SHA, event="workflow_dispatch", branch="main",
+            sha=THIRD_SHA, event="pull_request", branch="zajca/feature",
             run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
         )
         fixture["artifacts"]["456"] = []
@@ -1673,7 +1681,26 @@ jobs:
         union_fixture(self)
         fixture = json.loads(self.fixture.read_text())
         source = run_doc(
-            sha=SHA, event="schedule", branch="zajca/feature", run_id=REUSE_SOURCE_ID,
+            sha=SHA, event="workflow_dispatch", branch="zajca/feature", run_id=REUSE_SOURCE_ID,
+            repo=REPO, head_repo=REPO,
+        )
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not allow for reuse", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+
+    def test_a_reuse_union_is_refused_for_a_nightly_source_event(self):
+        union_fixture(self)
+        self.config_data["reuse"] = {
+            "max_age_hours": 24,
+            "source_events": ["pull_request", "push", "workflow_dispatch"],
+        }
+        self.write_config()
+        fixture = json.loads(self.fixture.read_text())
+        source = run_doc(
+            sha=SHA, event="schedule", branch="main", run_id=REUSE_SOURCE_ID,
             repo=REPO, head_repo=REPO,
         )
         fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.util
 import io
 import json
 import re
@@ -50,6 +51,18 @@ TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
 # reused job was taken from (issue #2203).
 REUSE_RECORD_ARTIFACT = re.compile(r"^ci-reuse-([0-9a-f]{40})$")
 REUSE_SCHEMA_VERSION = 1
+EARLIEST_MOMENT = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def _load_eligibility() -> Any:
+    path = Path(__file__).resolve().parent / "ci_eligibility.py"
+    loader = importlib.util.spec_from_file_location("ci_eligibility", path)
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    return module
+
+
+eligibility = _load_eligibility()
 
 
 class EvidenceError(Exception):
@@ -87,19 +100,6 @@ def gh_bytes(*arguments: str) -> bytes:
         detail = result.stderr.decode(errors="replace").strip()
         raise EvidenceError(detail or f"gh exited with status {result.returncode}")
     return result.stdout
-
-
-def parse_moment(value: Any) -> datetime.datetime | None:
-    """An Actions timestamp as an aware datetime, or None when unreadable."""
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment
 
 
 def local_commit_file(sha: str, path: str) -> str | None:
@@ -351,21 +351,7 @@ def load_config(text: str, source: str) -> dict[str, Any]:
     return config
 
 
-def run_tier(run: dict[str, Any], workflow_path: str) -> str | None:
-    if (run.get("path") or "").split("@", 1)[0] != workflow_path:
-        return None
-    event = run.get("event")
-    if event == "push" and run.get("head_branch") == "main":
-        return "main"
-    if event == "schedule":
-        return "nightly"
-    if event == "workflow_dispatch":
-        title = run.get("display_title") or run.get("displayTitle") or ""
-        for tier in ("main", "nightly"):
-            marker = f"CI [tier={tier}]"
-            if title == marker or title.startswith(marker + " "):
-                return tier
-    return None
+run_tier = eligibility.run_tier
 
 
 def run_dispatch_id(run: dict[str, Any]) -> str | None:
@@ -613,7 +599,7 @@ def verify_reuse(
     evidence_url = run.get("html_url") or f"run {run.get('id', 'unknown')}"
     failures: list[str] = []
     source_ids = sorted({entry["run_id"] for entry in record["jobs"].values()})
-    created = parse_moment(run.get("created_at"))
+    created = eligibility.parse_moment(run.get("created_at"))
     if created is None:
         failures.append(f"evidence {evidence_url} has no readable created_at")
     runs_by_id: dict[int, tuple[dict[str, Any], str, dict[str, list[dict[str, Any]]]]] = {}
@@ -625,52 +611,56 @@ def verify_reuse(
             failures.append(f"cannot read source run {source_id} reused by {evidence_url}: {error}")
             continue
         source_url = source.get("html_url") or f"run {source_id}"
-        if (source.get("repository") or {}).get("full_name") != repo or (
-            source.get("head_repository") or {}
-        ).get("full_name") != repo:
-            failures.append(f"source {source_url} is not a run of this repository (evidence {evidence_url})")
-        if source.get("event") not in reuse["source_events"]:
-            failures.append(
-                f"source {source_url} ran on event {source.get('event')!r}, "
-                f"which the candidate does not allow for reuse (evidence {evidence_url})"
-            )
-        ev_event = source.get("event")
-        if ev_event == "push" and run_tier(source, config["workflow_path"]) != "main":
-            failures.append(f"source {source_url} is not a main push (evidence {evidence_url})")
-        if ev_event == "workflow_dispatch" and run_tier(source, config["workflow_path"]) != "main":
-            failures.append(f"source {source_url} is not a tier=main dispatch (evidence {evidence_url})")
-        if source.get("conclusion") != "success" or source.get("status") != "completed":
-            failures.append(f"source {source_url} did not conclude success (evidence {evidence_url})")
+        # The shared rule decides the run-level eligibility; the checks
+        # below name the same rule's pieces so the refusal says which
+        # guard failed.
+        moment = eligibility.parse_moment(source.get("created_at"))
+        eligible = eligibility.source_is_eligible(
+            source, repo, config["workflow_path"], moment or EARLIEST_MOMENT,
+            datetime.timedelta(hours=reuse["max_age_hours"]),
+            reuse["source_events"],
+        )
+        if not eligible:
+            if (source.get("repository") or {}).get("full_name") != repo or (
+                source.get("head_repository") or {}
+            ).get("full_name") != repo:
+                failures.append(f"source {source_url} is not a run of this repository (evidence {evidence_url})")
+            if source.get("event") not in reuse["source_events"]:
+                failures.append(
+                    f"source {source_url} ran on event {source.get('event')!r}, "
+                    f"which the candidate does not allow for reuse (evidence {evidence_url})"
+                )
+            ev_event = source.get("event")
+            if ev_event == "push" and run_tier(source, config["workflow_path"]) != "main":
+                failures.append(f"source {source_url} is not a main push (evidence {evidence_url})")
+            if ev_event == "workflow_dispatch" and run_tier(source, config["workflow_path"]) != "main":
+                failures.append(f"source {source_url} is not a tier=main dispatch (evidence {evidence_url})")
+            if source.get("conclusion") != "success" or source.get("status") != "completed":
+                failures.append(f"source {source_url} did not conclude success (evidence {evidence_url})")
+            if moment is None or (
+                created is not None and created - moment > datetime.timedelta(hours=reuse["max_age_hours"])
+            ):
+                failures.append(f"source {source_url} is older than the reuse window (evidence {evidence_url})")
+            if not failures or not any(source_url in failure for failure in failures):
+                failures.append(f"source {source_url} is not eligible for reuse (evidence {evidence_url})")
         # A dispatched delta run reuses the same commit; a push reuses the
         # same tree. A `pull_request` source is matched by its recorded
         # tested tree (owner policy, issue #2204: a `main` run may rely on
         # a PR run of the identical tree; the PR head differs from the
         # merge commit). Push evidence compares the merge tree.
-        same_commit_or_tree = False
         if evidence_event == "push":
-            if source.get("event") == "pull_request":
-                same_commit_or_tree = True  # recorded tree checked below
-            elif source.get("head_sha") == sha:
-                same_commit_or_tree = True
-            else:
-                try:
-                    source_tree = commit_tree(repo, source.get("head_sha") or "", cache) if source.get("head_sha") else ""
-                except EvidenceError as error:
-                    source_tree = f"<unreadable: {error}>"
-                if source_tree == tree:
-                    same_commit_or_tree = True
+            mismatch = eligibility.evidence_tree_match(
+                source, sha, tree,
+                lambda commit: commit_tree(repo, commit, cache),
+            )
         else:
             # A dispatched delta run reuses the same commit (SHA). The
             # tree-matched dispatch evidence passes `sha` = the dispatch
             # run's own head_sha, so a pull_request source on another
             # commit is refused here.
-            if source.get("head_sha") == sha:
-                same_commit_or_tree = True
-        if not same_commit_or_tree:
-            failures.append(
-                f"source {source_url} has neither the commit nor the tree of "
-                f"{evidence_url} (evidence {evidence_url})"
-            )
+            mismatch = eligibility.evidence_commit_match(source, sha)
+        if mismatch is not None:
+            failures.append(f"source {source_url} {mismatch} (evidence {evidence_url})")
         try:
             recorded = recorded_trees(repo, source_id)
         except EvidenceError as error:
@@ -727,18 +717,26 @@ def verify_reuse(
                 failures.append(f"source {source_url} never ran {name} reused by {evidence_url}")
                 continue
             newest = newest_attempt(attempts)
-            if newest.get("conclusion") != "success":
-                failures.append(
-                    f"source job {name} in {source_url} concluded "
-                    f"{newest.get('conclusion')} (evidence {evidence_url})"
-                )
+            refusal = eligibility.source_is_reused(
+                source, job_id, newest, created, window, None, False,
+            )
+            if refusal is not None:
+                if refusal == "is older than the reuse window":
+                    failures.append(
+                        f"source job {name} in {source_url} is older than "
+                        f"{reuse['max_age_hours']}h (evidence {evidence_url})"
+                    )
+                elif refusal.startswith("concluded"):
+                    failures.append(
+                        f"source job {name} in {source_url} {refusal} "
+                        f"(evidence {evidence_url})"
+                    )
+                else:
+                    failures.append(
+                        f"source job {name} in {source_url} {refusal} "
+                        f"(evidence {evidence_url})"
+                    )
                 continue
-            completed = parse_moment(newest.get("completed_at"))
-            if completed is None or created is None or created - completed > window:
-                failures.append(
-                    f"source job {name} in {source_url} is older than "
-                    f"{reuse['max_age_hours']}h (evidence {evidence_url})"
-                )
     for required in config["required_steps"][tier]:
         if required["job"] not in reused_names:
             continue

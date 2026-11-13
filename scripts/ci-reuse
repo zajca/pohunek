@@ -8,10 +8,10 @@ recent `ci.yml` runs of this repository whose event is in `source_events` of
 (`GITHUB_EVENT_NAME`) is read from the environment: on `workflow_dispatch`
 every candidate must have `head_sha == GITHUB_SHA`; on `push` candidates may
 come from another commit and are matched by their recorded tree. Candidates
-are filtered and ordered by the shared eligibility helper
-`source_is_eligible` (identical rule in `scripts/ci-evidence`; a push source
-must be a main-branch push, a dispatch source must be a `tier=main` dispatch,
-per `run_tier`). Only runs whose run-level `conclusion` is `success` supply
+are filtered and ordered by the shared eligibility rule in
+`scripts/ci_eligibility.py` (used identically by `scripts/ci-evidence`; a
+push source must be a main-branch push, a dispatch source must be a
+`tier=main` dispatch). Only runs whose run-level `conclusion` is `success` supply
 jobs; a cancelled, failing or in-progress run contributes nothing.
 
 Per job the script takes the newest leg-complete `success` (never `skipped`)
@@ -32,6 +32,7 @@ record or outputs, for CI proof.
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import json
 import os
 import re
@@ -42,6 +43,16 @@ from pathlib import Path
 
 CHECKOUT = Path(__file__).resolve().parents[1]
 CONFIG_IN_TREE = "scripts/ci-reuse.json"
+def _load_eligibility():
+    path = Path(__file__).resolve().parent / "ci_eligibility.py"
+    loader = importlib.util.spec_from_file_location("ci_eligibility", path)
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    return module
+
+
+eligibility = _load_eligibility()
+
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
@@ -154,76 +165,19 @@ def commit_tree(sha: str) -> str:
     return result.stdout.strip()
 
 
-def parse_time(value) -> datetime.datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment
-
-
-def run_tier(run: dict, workflow_path: str = ".github/workflows/ci.yml") -> str | None:
-    if (run.get("path") or "").split("@", 1)[0] != workflow_path:
-        return None
-    event = run.get("event")
-    if event == "push" and run.get("head_branch") == "main":
-        return "main"
-    if event == "schedule":
-        return "nightly"
-    if event == "workflow_dispatch":
-        title = run.get("display_title") or run.get("displayTitle") or ""
-        for tier in ("main", "nightly"):
-            marker = f"CI [tier={tier}]"
-            if title == marker or title.startswith(marker + " "):
-                return tier
-    return None
-
-
-def source_is_eligible(run: dict, repo: str, workflow_path: str,
-                       now: datetime.datetime, max_age: datetime.timedelta) -> bool:
-    """Eligibility rule shared with `scripts/ci-evidence`: same repo, no fork,
-    tier main, run-level success, fresh."""
-    if (run.get("repository") or {}).get("full_name") != repo:
-        return False
-    if (run.get("head_repository") or {}).get("full_name") != repo:
-        return False
-    event = run.get("event")
-    if event == "push" and run.get("head_branch") != "main":
-        return False
-    if event == "workflow_dispatch" and run_tier(run, workflow_path) != "main":
-        return False
-    if run.get("conclusion") != "success" or run.get("status") != "completed":
-        return False
-    created = parse_moment(run.get("created_at"))
-    if created is None or now - created > max_age:
-        return False
-    return True
-
-
-def _run_age(run: dict) -> str:
-    """Age of a source leg for the summary, or empty when unknown."""
-    created = parse_moment(run.get("created_at"))
-    if created is None:
+def _run_age(run: dict, completed_at, now: datetime.datetime) -> str:
+    """Age of a source leg for the summary, from its `completed_at` against
+    the injected `now`, or empty when unknown; always shown, even below one
+    hour (the usual case for a merge)."""
+    completed = eligibility.parse_moment(completed_at)
+    if completed is None:
         return ""
-    age = datetime.datetime.now(datetime.timezone.utc) - created
+    age = now - completed
     hours = int(age.total_seconds() // 3600)
-    return f" ({hours}h old)" if hours else ""
-
-
-def parse_moment(value: str | None) -> datetime.datetime | None:
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        moment = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment
+    if hours:
+        return f" ({hours}h old)"
+    minutes = int(age.total_seconds() // 60)
+    return f" ({minutes}m old)" if minutes else " (just now)"
 
 
 def list_runs(repo: str, workflow_file: str,
@@ -384,21 +338,17 @@ def decide(
     Per job (issue #2204): the newest leg-complete `success` (not `skipped`)
     among the candidate runs whose `tested-tree-*` record is exactly `tree`.
     A dispatch-source leg that was itself skipped is never a source."""
-    max_age = datetime.timedelta(hours=config["max_age_hours"])
-    def _same_commit(run: dict) -> bool:
-        # A delta dispatch reuses the same commit; a push consumer may
-        # reuse another commit with the same tree.
-        if consumer_event == "push":
-            return True
-        if consumer_event == "workflow_dispatch":
-            return run.get("head_sha") == sha
-        return False
+    window_hours = config["max_age_hours"]
+    max_age = datetime.timedelta(hours=window_hours)
     candidates = [
         run for run in runs
         if run.get("event") in config["source_events"]
         and isinstance(run.get("id"), int)
-        and source_is_eligible(run, repo, ".github/workflows/ci.yml", now, max_age)
-        and _same_commit(run)
+        and eligibility.source_is_eligible(
+            run, repo, ".github/workflows/ci.yml", now, max_age,
+            config["source_events"],
+        )
+        and eligibility.consumer_matches(run, consumer_event, sha)
     ]
     # Newest first.
     candidates.sort(
@@ -447,8 +397,10 @@ def decide(
             if any(leg.get("conclusion") != "success" for leg in legs):
                 per_run_reasons.setdefault(job_id, "a leg did not succeed in the source run")
                 continue
-            completed = [parse_time(leg.get("completed_at")) for leg in legs]
-            if any(moment is None or now - moment > max_age for moment in completed):
+            if not all(
+                eligibility.leg_is_fresh(leg.get("completed_at"), now, max_age)
+                for leg in legs
+            ):
                 per_run_reasons.setdefault(job_id, "a leg is older than the reuse window")
                 continue
             if job["selection_dependent"]:
@@ -469,6 +421,7 @@ def decide(
         if per_run_reasons:
             return [], {}, "no same-tree green run within 24 hours", per_run_reasons
         return [], {}, "no same-tree run", {}
+    # The newest green leg wins per job; the audit job is never allowlisted.
     skip_set = set(selected)
     closure_reasons: dict[str, str] = {}
     changed = True
@@ -501,12 +454,17 @@ def summarize(
     fallback: dict | None,
     reason: str,
     job_reasons: dict[str, str] | None = None,
+    leg_completed: dict[str, str] | None = None,
+    now: datetime.datetime | None = None,
 ) -> str:
     lines = ["| job | decision |", "| --- | --- |"]
     for job_id in config["jobs"]:
         run = (sources or {}).get(job_id) or fallback if job_id in skip else None
         if job_id in skip and run is not None:
-            link = f"[run {run['id']}]({run.get('html_url')}){_run_age(run)}"
+            age = ""
+            if leg_completed and now is not None:
+                age = _run_age(run, leg_completed.get(job_id), now)
+            link = f"[run {run['id']}]({run.get('html_url')}){age}"
             lines.append(f"| {job_id} | reused from {link} |")
         elif job_reasons and job_id in job_reasons:
             lines.append(f"| {job_id} | runs: {job_reasons[job_id]} |")
@@ -656,14 +614,21 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     output("skip", json.dumps(skip, separators=(",", ":")))
     output("source_run", str(source["id"]) if source else "")
     output("source_runs", json.dumps(ordered_run_ids if sources else []))
+    leg_completed: dict[str, str] = {}
+    for job_id, entry in record.get("jobs", {}).items():
+        stamps = entry.get("completed_at") or []
+        stamp = max((stamp for stamp in stamps if stamp), default=None)
+        if stamp is not None:
+            leg_completed[job_id] = stamp
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    table = summarize(config, skip, sources, source, reason, job_reasons, leg_completed, moment)
     if summary:
         with open(summary, "a") as stream:
             stream.write(f"### Reuse (tree `{tree}`)\n\n")
-            stream.write(summarize(config, skip, sources, source, reason, job_reasons,))
+            stream.write(table)
             stream.write("\n")
     else:
-        print(summarize(config, skip, sources, source, reason, job_reasons,))
+        print(table)
     record_name = f"ci-reuse-{tree}"
     record_path = Path(os.environ["RUNNER_TEMP"]) / f"{record_name}.json"
     record_path.write_text(json.dumps(record, indent=2) + "\n")
