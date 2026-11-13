@@ -467,13 +467,17 @@ async fn a_dedicated_static_connection_refuses_a_fresh_mismatch() {
 /// needs the `LD_PRELOAD` connect interposer below):
 /// `connect_raw_with_options` resolves the static host through
 /// `default_overlay_registry()` and, in the production code, proves the pin
-/// on a framed connection before it opens the raw stream. The child half below
-/// (`raw_by_host_child_probes_the_pin_first`) runs with the static table and a
-/// `LD_PRELOAD` redirect, so it dials the real by-host raw path; the parent
-/// half drives it as a subprocess and asserts the refusal. The interposer
-/// maps the static address to a loopback fixture: the child sets
-/// `POHUNEK_TEST_CONNECT_REDIRECT_PORT` to its loopback port, so the static
-/// address dials the fixture.
+/// on a framed connection before it opens the raw stream. The child half
+/// (`raw_by_host_child_probes_the_pin_first`) builds the hermetic static-peer
+/// setup, compiles the `LD_PRELOAD` connect interposer, then re-executes the
+/// grandchild (`raw_by_host_grandchild_dials_the_pin_first`) with `LD_PRELOAD`
+/// in its exec environment and asserts the served-method log it writes; the
+/// grandchild binds and serves the mismatching fixture in-process, sets
+/// `POHUNEK_TEST_CONNECT_REDIRECT_PORT` (and `POHUNEK_REMOTE_PORT`) in-process
+/// so the interposer redirects the static address to its own loopback port,
+/// dials the real by-host raw path, expects `host_identity_mismatch`, and
+/// writes the served methods to the log. The parent half drives the child as
+/// a subprocess and asserts only that the child passed.
 ///
 /// The parent half keeps no hermetic setup of its own: the child builds it.
 #[cfg(target_os = "linux")]
@@ -484,8 +488,10 @@ fn a_raw_by_host_connection_proves_the_pin_first() {
     }
     // The child half re-executes this test binary with
     // `POHUNEK_STATIC_PEERS_RAW_CHILD` set; it builds the hermetic setup
-    // itself (config, fake netbird, LD_PRELOAD redirect, fixture daemon) and
-    // dials the real by-host raw path. The parent only asserts the outcome.
+    // itself (static-peer config, fake netbird, compiled connect
+    // interposer) and re-executes the grandchild with `LD_PRELOAD` to
+    // serve the fixture and dial the by-host raw path. The parent only
+    // asserts the child passed.
     let exe = std::env::current_exe().expect("test executable");
     let output = std::process::Command::new(exe)
         .args(pohunek_test_support::exact_test_filter(
@@ -621,10 +627,11 @@ fn raw_child_redirect(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Child half of [`a_raw_by_host_connection_proves_the_pin_first`]: build the
-/// hermetic static-peer setup, redirect the static address to a loopback
-/// fixture, dial the real `connect_raw_with_options` by host name against a
-/// daemon that reports another id, and expect `host_identity_mismatch` before
-/// any raw byte is served.
+/// hermetic static-peer setup, compile the `LD_PRELOAD` connect interposer,
+/// then re-execute the grandchild with the redirect in its exec environment
+/// and assert the served-method log it writes: the framed pre-verify probed
+/// the pin with `host.governance.inspect`, and no other request reached the
+/// fixture.
 ///
 /// Runs only in the re-executed child the parent half spawns; a plain test
 /// run returns at once so the hermetic setup never disturbs other tests.
@@ -751,11 +758,10 @@ async fn raw_by_host_grandchild_dials_the_pin_first() {
     std::fs::write(log_path, methods.join("\n")).expect("write the served-methods log");
 }
 
-/// Hermetic static-peer table plus a fake `netbird` printing a full status
-/// that contradicts the table (the peer `fqdn` at another address).
-/// Returns the config directory with the file owner-private and the `bin`
-/// directory with the fake, so the caller can route `PATH` and the config
-/// home at it.
+/// Hermetic static-peer setup: a config directory with the static-peer
+/// table owner-private, and a `bin` directory holding a fake `netbird`
+/// that prints a full status contradicting the table (the peer `fqdn` at
+/// another address). The caller routes `PATH` and the config home at it.
 struct ContradictingStatusSetup {
     _env: pohunek_test_support::env::TestEnv,
     config_dir: std::path::PathBuf,
@@ -763,6 +769,7 @@ struct ContradictingStatusSetup {
     config_home: std::path::PathBuf,
 }
 
+/// Write the hermetic static-peer setup of [`ContradictingStatusSetup`].
 fn contradicting_status_setup(pinned: &str) -> ContradictingStatusSetup {
     let env = pohunek_test_support::env::TestEnv::new().expect("create the test environment");
     let root = env.root().to_path_buf();
