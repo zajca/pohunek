@@ -295,26 +295,37 @@ sources, which the filter leaves out, surfaces in the nightly tier. Ordinary
 worker, PTY, hook, daemon, and CLI changes need no dispatch: pull-request CI
 already runs the macOS lanes.
 
-**Fail fast.** When a required job of a pull request run or a
-`workflow_dispatch` run of `ci.yml` fails, its last step (`Cancel the run (fail
-fast)`, the composite `.github/actions/cancel-run`) cancels the run, so the jobs
-that are still running free their runners for other work. The five jobs that
-call a reusable workflow have a `cancel-after-<job>` job instead, which cancels
-when the called workflow ends red. Push runs (`main` drains), scheduled runs,
-the advisory `cargo-audit` job and a job that was itself cancelled never
-trigger it. Read such a run accordingly: the job that failed and the run end as
-`cancelled`, while the failed step stays red in the job log and the step's
-`::error` annotation (`Fail fast`) names the job that failed first. So a
-cancelled job in a pull request run can mean that another job failed first.
-The `test selection verdict` check still runs after the cancel and is red when
-a job it waits for failed or was cancelled; for a job that decides the pull
-request outside the verdict, look for the `Fail fast` annotation. A job that
-hits its `timeout-minutes` is cancelled by GitHub and does not trigger the
-step (a called workflow's watcher fires only when the call ends as failed, which
-a timeout inside it does not guarantee), and the two selector jobs (`test selection`, `runtime package selection`)
-do not carry it, because a failed selection runs everything instead of
-ending the run. A fork or Dependabot pull request has a read-only token, so the
-cancel call is refused and the run keeps its real failure.
+**Fail fast.** When a verdict-set job of a pull request run or a
+`workflow_dispatch` run of `ci.yml` fails for a deterministic cause, its
+`Cancel the run (fail fast)` step (the composite `.github/actions/cancel-run`)
+cancels the run, so the jobs that are still running free their runners for
+other work. Only the jobs in the `test-selection-verdict` `needs:` list carry
+that step (minus the advisory `cargo-audit`, the two fail-open selectors and
+the verdict itself), so a job outside the verdict set never cancels the run:
+the five `cancel-after-<job>` watchers of the called workflows are gone, and
+`systemd-supervision` no longer cancels either. Push runs (`main` drains),
+scheduled runs, the advisory `cargo-audit` job and a job that was itself
+cancelled never trigger it. An infrastructure failure on a verdict job never
+cancels either (issue #2205): a network `uses:` step of the brief's list
+(`taiki-e/install-action`, `actions/download-artifact` and `upload-artifact`,
+`actions/setup-node`, `actions/cache` restore, `oven-sh/setup-bun`,
+`actions/checkout`) carries an `infra-` `id:`, and a `ci-retry` run whose
+retries are exhausted sets `env.CI_INFRA_FAILURE`; the fail-fast step's `if:`
+requires all of them to be clear, and the following `Note the infrastructure
+failure (no cancel)` step writes a `::notice` instead, so the run continues
+and rerunning the failed job alone recovers from a flaky download. Read such a
+run accordingly: when a deterministic failure cancels, the job that failed and
+the run end as `cancelled`, while the failed step stays red in the job log and
+the step's `::error` annotation (`Fail fast`) names the job that failed first.
+So a cancelled job in a pull request run can mean that another job failed
+first. The `test selection verdict` check still runs after the cancel and is
+red when a job it waits for failed or was cancelled; a job that decides the
+pull request outside the verdict no longer ends the run. A job that hits its
+`timeout-minutes` is cancelled by GitHub and does not trigger the step, and
+the two selector jobs (`test selection`, `runtime package selection`) do not
+carry it, because a failed selection runs everything instead of ending the
+run. A fork or Dependabot pull request has a read-only token, so the cancel
+call is refused and the run keeps its real failure.
 
 **Network retries.** Every network install step (apt-get, npm ci, bun install,
 rustup, uv, cargo fetch) runs through `.github/scripts/ci-retry`, with

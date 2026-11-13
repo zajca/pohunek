@@ -115,12 +115,16 @@ class CancelAttributionTests(unittest.TestCase):
         self.assertIn("${GITHUB_ACTION_PATH}/cancel-run.sh", action)
 
     def test_no_job_cancels_the_run_inline(self):
-        # Only the watchers of called workflows cancel inline: they have no job of their own to resolve.
+        # Every cancel goes through the cancel-run composite (which runs
+        # cancel-run.sh); no workflow step issues `gh run cancel` directly.
+        # The called-workflow watchers are gone (issue #2205).
         for workflow in WORKFLOWS:
             for step in steps_of(workflow.read_text()):
                 if "gh run cancel" in step:
                     with self.subTest(workflow=workflow.name):
-                        self.assertIn("(a called workflow) failed first", step)
+                        self.assertNotIn("gh run cancel", step)
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        self.assertNotIn("gh run cancel", ci)
 
     def run_script(
         self,

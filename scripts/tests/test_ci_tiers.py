@@ -241,11 +241,62 @@ def block(text: str, name: str, indent: int = 2) -> str:
     return match.group(1)
 
 
-# The step that ends a PR or dispatch run when a required job fails (#1075).
+# The step that ends a PR or dispatch run when a verdict job fails in a
+# deterministic way (#1075, narrowed by #2205: only a verdict-set job may
+# cancel, and only a non-infrastructure failure does).
 FAIL_FAST_STEP = "Cancel the run (fail fast)"
-FAIL_FAST_CONDITION = (
-    "failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')"
+# The step that records an infrastructure-tagged failure, which never cancels
+# (issue #2205).
+NOTICE_STEP = "Note the infrastructure failure (no cancel)"
+# The event clause both steps share: a push run, a scheduled run and a job
+# that was itself cancelled never cancel the run.
+FAIL_FAST_EVENTS = "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')"
+# A network `uses:` step of a fail-fast job carries an `infra-` id, so the
+# fail-fast step can tell an infrastructure failure from a code failure
+# (issue #2205): a failed infra step (or an exhausted ci-retry, which sets
+# `env.CI_INFRA_FAILURE`) never cancels. Only the steps the brief's 1b list
+# names are tagged: `Swatinem/rust-cache`, `actions/setup-python` and the
+# `setup-*` composites that fetch through ci-retry are not.
+INFRA_USES = (
+    "taiki-e/install-action@",
+    "actions/download-artifact@",
+    "actions/upload-artifact@",
+    "actions/setup-node@",
+    "oven-sh/setup-bun@",
+    "actions/checkout@",
 )
+INFRA_CACHE = "actions/cache@v4"
+
+
+def infra_ids(job):
+    return re.findall(r"(?m)^        id: (infra-\d+)$", job)
+
+
+def fail_fast_condition(ids):
+    clauses = " && ".join(f"steps.{name}.outcome != 'failure'" for name in ids)
+    return (
+        f"failure() && env.CI_INFRA_FAILURE == '' && {clauses}"
+        if clauses
+        else "failure() && env.CI_INFRA_FAILURE == ''"
+    ) + f" && {FAIL_FAST_EVENTS}"
+
+
+def notice_condition(ids):
+    clauses = " || ".join(f"steps.{name}.outcome == 'failure'" for name in ids)
+    return f"failure() && (env.CI_INFRA_FAILURE != '' || {clauses})"
+
+
+def named_steps(job):
+    # All step blocks of a job, including the unnamed `uses:` steps that
+    # `job_steps` skips (network steps are usually unnamed).
+    header, *steps = re.split(r"(?ms)^      - ", job)
+    return [step for step in steps if step]
+
+
+def is_network_step(step):
+    if re.search(r"(?m)^\s*uses: (?:taiki-e/install-action@|actions/download-artifact@|actions/upload-artifact@|actions/setup-node@|oven-sh/setup-bun@|actions/checkout@|actions/cache@v4\b)", step):
+        return True
+    return False
 
 
 def workflow_jobs(workflow: str = CI) -> dict[str, str]:
@@ -1373,11 +1424,20 @@ class SetupUvActionTests(unittest.TestCase):
 
 
 class FailFastTests(unittest.TestCase):
-    """A required job that fails cancels the rest of a PR or dispatch run, and nothing else does (#1075)."""
+    """Only a verdict-set job that fails in a deterministic way cancels (#2205).
+
+    The brief: a job outside the verdict set does not cancel, and a failure
+    on an infrastructure-tagged step does not cancel either. The verdict set
+    is read from `test-selection-verdict`'s `needs:`; the infrastructure
+    marking is the `env.CI_INFRA_FAILURE` marker (set by `.github/scripts/
+    ci-retry` when its retries are exhausted) plus an `infra-` `id:` on
+    every network step of the brief's 1b list. The `cancel-after-*` watchers
+    are gone (every called workflow sits outside the verdict set)."""
 
     # The RustSec audit is advisory; the verdict reports after the cancel (it runs under `always()`); the two selectors fail open (a failed selection runs everything), so they must not end the run. The reuse decision fails open too (no source means running everything), and every job it gates waits on it.
     EXCLUDED = {"audit", "test-selection-verdict", "test-selection", "package-selection", "reuse"}
-    REUSABLE = {
+    # Called workflows of ci.yml (checked against the workflow, not copied).
+    CALLED = {
         "upgrade-test",
         "release-rehearsal-build",
         "release-rehearsal-scenarios",
@@ -1392,56 +1452,104 @@ class FailFastTests(unittest.TestCase):
             return {}
         return dict(re.findall(r"(?m)^      ([a-z-]+): (\S+)$", match.group(1)))
 
-    def direct_jobs(self) -> dict[str, str]:
+    def verdict_jobs(self) -> dict[str, str]:
+        jobs = workflow_jobs()
         return {
-            name: job
-            for name, job in workflow_jobs().items()
-            if "\n    steps:\n" in job and name not in self.EXCLUDED and not name.startswith("cancel-after-")
+            name: jobs[name]
+            for name in job_needs(jobs["test-selection-verdict"])
+            if name not in self.EXCLUDED
         }
+
+    def direct_jobs(self) -> dict[str, str]:
+        # The jobs that carry the cancel step: exactly the verdict set minus
+        # the excluded advisory, fail-open and aggregate jobs.
+        return self.verdict_jobs()
 
     def test_no_workflow_level_actions_write_exists(self):
         header = CI.split("\njobs:\n", 1)[0]
         self.assertNotIn("actions:", header.split("permissions:", 1)[1].split("\n\n", 1)[0])
 
-    def test_every_required_job_ends_with_the_step_and_its_exact_condition(self):
+    def test_every_verdict_job_ends_with_the_step_the_notice_and_their_exact_conditions(self):
         direct = self.direct_jobs()
-        self.assertGreaterEqual(len(direct), 30)
+        self.assertEqual(len(direct), 14)
         for name, job in direct.items():
             with self.subTest(job=name):
                 steps = list(job_steps(job).items())
-                last_name, last = steps[-1]
-                self.assertEqual(last_name, FAIL_FAST_STEP)
+                self.assertEqual(steps[-2][0], FAIL_FAST_STEP)
+                self.assertEqual(steps[-1][0], NOTICE_STEP)
                 self.assertEqual([n for n, _ in steps].count(FAIL_FAST_STEP), 1)
-                self.assertIn(f"        if: {FAIL_FAST_CONDITION}\n", last)
+                self.assertEqual([n for n, _ in steps].count(NOTICE_STEP), 1)
+                ids = infra_ids(job)
+                self.assertIn(f"        if: {fail_fast_condition(ids)}\n", steps[-2][1])
+                self.assertIn(f"        if: {notice_condition(ids)}\n", steps[-1][1])
                 self.assertEqual(self.permissions(job).get("actions"), "write")
                 self.assertNotRegex(job, r"(?m)^    continue-on-error:")
 
-    def test_a_job_with_a_sparse_or_relocated_tree_reaches_the_action_and_the_others_use_it_in_place(self):
-        # A sparse or relocated checkout holds no .github/actions at the workspace root when the step runs.
-        # Relocated jobs copy the action out of the checkout; the sparse `scripts` job lists the action in its sparse set.
+    def test_only_verdict_jobs_carry_the_step(self):
+        jobs = workflow_jobs()
+        for name, job in jobs.items():
+            if FAIL_FAST_STEP in job:
+                self.assertIn(name, self.direct_jobs(), name)
+        for name in self.EXCLUDED:
+            self.assertNotIn(FAIL_FAST_STEP, jobs[name])
+
+    def test_every_network_step_has_an_infra_id_and_every_id_is_in_both_conditions(self):
+        for name, job in self.direct_jobs().items():
+            with self.subTest(job=name):
+                network = [
+                    (step, re.search(r"(?m)^        id: (infra-\d+)$", step).group(1))
+                    for step in named_steps(job)
+                    if is_network_step(step)
+                ]
+                self.assertTrue(network, f"{name} has no network step")
+                for step, step_id in network:
+                    self.assertRegex(step_id, r"^infra-\d+$")
+                ids = sorted({step_id for _, step_id in network}, key=lambda s: int(s.split("-")[1]))
+                self.assertEqual(ids, [f"infra-{i + 1}" for i in range(len(ids))])
+                self.assertEqual(infra_ids(job), ids)
+                steps = job_steps(job)
+                ff_clauses = re.findall(r"steps\.(infra-\d+)\.outcome != 'failure'", steps[FAIL_FAST_STEP])
+                self.assertEqual(sorted(ff_clauses), ids)
+                notice_clauses = re.findall(r"steps\.(infra-\d+)\.outcome == 'failure'", steps[NOTICE_STEP])
+                self.assertEqual(sorted(notice_clauses), ids)
+
+    def test_every_ci_retry_in_a_verdict_job_marks_the_fail_fast_condition(self):
+        for name, job in self.direct_jobs().items():
+            if "ci-retry" not in job:
+                continue
+            with self.subTest(job=name):
+                self.assertIn("env.CI_INFRA_FAILURE == ''", step_condition(job_steps(job)[FAIL_FAST_STEP]))
+
+    def test_the_notice_step_records_infrastructure_failure_without_cancelling(self):
+        for name, job in self.direct_jobs().items():
+            with self.subTest(job=name):
+                step = job_steps(job)[NOTICE_STEP]
+                self.assertIn("::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-infrastructure step failure}", step)
+                self.assertIn("not cancelling", step)
+                self.assertNotIn("gh run cancel", step)
+                self.assertNotIn("always()", step)
+
+    def test_a_job_with_a_relocated_tree_reaches_the_action_and_the_others_use_it_in_place(self):
+        # A relocated checkout holds no .github/actions at the workspace root when the step runs; those jobs copy the action out of the checkout first.
         relocated = set()
-        sparse = set()
         for name, job in self.direct_jobs().items():
             if re.search(r"(?m)^ +path: relocated$", job):
                 relocated.add(name)
-            elif re.search(r"(?m)^ +sparse-checkout:", job):
-                sparse.add(name)
         self.assertGreaterEqual(relocated, {"fast-tests", "integration", "test-selection-check"})
-        self.assertEqual(sparse, {"test-duplicates"})
+        self.assertEqual(relocated, {"fast-tests", "integration", "test-selection-check"})
         for name, job in self.direct_jobs().items():
             steps = job_steps(job)
-            last = list(steps.values())[-1]
+            cancel = steps[FAIL_FAST_STEP]
             with self.subTest(job=name):
-                self.assertNotIn("gh run cancel", last)
+                self.assertNotIn("gh run cancel", cancel)
                 if name in relocated:
-                    self.assertRegex(last, r"(?m)^        uses: \./cancel-run-action$")
+                    self.assertRegex(cancel, r"(?m)^        uses: \./cancel-run-action$")
                     keep = steps["Keep the fail-fast action"]
                     self.assertIn('cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"', keep)
                     self.assertLess(list(steps).index("Keep the fail-fast action"), 2)
                 else:
-                    self.assertRegex(last, r"(?m)^        uses: \./\.github/actions/cancel-run$")
-                    self.assertNotIn("relocated", last)
-        self.assertIn("            .github/actions/cancel-run\n", self.direct_jobs()["test-duplicates"])
+                    self.assertRegex(cancel, r"(?m)^        uses: \./\.github/actions/cancel-run$")
+                    self.assertNotIn("relocated", cancel)
 
     def test_every_checkout_of_a_job_with_actions_write_drops_the_persisted_token(self):
         # The token stays out of git config, so later build scripts and tests cannot read it from there.
@@ -1465,46 +1573,31 @@ class FailFastTests(unittest.TestCase):
                 else:
                     self.assertNotIn("actions", self.permissions(jobs[name]))
 
-    def test_actions_write_is_granted_only_to_jobs_that_carry_the_step_or_watch_a_called_workflow(self):
-        direct = set(self.direct_jobs())
-        watchers = {f"cancel-after-{name}" for name in self.REUSABLE}
-        for name, job in workflow_jobs().items():
-            with self.subTest(job=name):
-                # The reuse decision reads runs and artifacts but never
-                # cancels: actions: read without the fail-fast step.
-                if name == "reuse":
-                    self.assertEqual(self.permissions(job).get("actions"), "read")
-                    continue
-                self.assertEqual("actions" in self.permissions(job), name in direct | watchers)
+    def test_actions_write_is_granted_only_to_jobs_that_carry_the_step(self):
+        # The duplicate check keeps write after the step left (issue #2203):
+        # it downloads other runs' artifacts by run id.
+        write_jobs = {
+            name for name, job in workflow_jobs().items()
+            if self.permissions(job).get("actions") == "write"
+        }
+        self.assertEqual(write_jobs, set(self.direct_jobs()) | {"test-duplicates"})
 
-    def test_each_called_workflow_has_a_watcher_that_fires_only_on_its_failure(self):
+    def test_no_watcher_jobs_remain_after_the_narrowing(self):
         jobs = workflow_jobs()
+        self.assertEqual({name for name in jobs if name.startswith("cancel-after-")}, set())
         called = {name for name, job in jobs.items() if re.search(r"(?m)^    uses: \./\.github/workflows/", job)}
-        self.assertEqual(called, self.REUSABLE)
-        for name in self.REUSABLE:
-            with self.subTest(call=name):
-                watcher = jobs[f"cancel-after-{name}"]
-                self.assertIn(f"    needs: {name}\n", watcher)
-                self.assertIn(
-                    f"    if: ${{{{ !cancelled() && needs.{name}.result == 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}}}\n",
-                    watcher,
-                )
-                self.assertEqual(self.permissions(watcher), {"actions": "write"})
-                (step,) = job_steps(watcher).values()
-                self.assertIn("        continue-on-error: true\n", step)
-                self.assertIn('gh run cancel "$RUN_ID"', step)
+        self.assertEqual(called, self.CALLED)
 
     def test_the_condition_never_becomes_always_cancelled_or_push_and_schedule_safe(self):
         for word in ("always()", "cancelled()", "push", "schedule"):
-            self.assertNotIn(word, FAIL_FAST_CONDITION)
+            self.assertNotIn(word, FAIL_FAST_EVENTS)
         for name, job in workflow_jobs().items():
-            if FAIL_FAST_STEP in job:
-                step = job_steps(job)[FAIL_FAST_STEP]
-                self.assertNotIn("always()", step, name)
-        for name in self.REUSABLE:
-            watcher = workflow_jobs()[f"cancel-after-{name}"]
-            self.assertNotIn("always()", watcher)
-            self.assertIn("!cancelled()", watcher)
+            for step_name in (FAIL_FAST_STEP, NOTICE_STEP):
+                if step_name not in job:
+                    continue
+                step = job_steps(job)[step_name]
+                self.assertNotIn("always()", step, f"{name} {step_name}")
+                self.assertNotIn("cancelled()", step, f"{name} {step_name}")
 
     def test_the_composite_cancels_the_run_and_fails_soft(self):
         action = (ROOT / ".github" / "actions" / "cancel-run" / "action.yml").read_text()
@@ -2471,6 +2564,8 @@ def evaluate_needs_expression(
     """
     python = expression.replace("!cancelled()", "(not cancelled)")
     python = python.replace("failure()", "(False)")  # a reused leg was green
+    # A step outcome of a reused (green) leg is success (issue #2205).
+    python = re.sub(r"steps\.[A-Za-z0-9_-]+\.outcome", "'success'", python)
     python = python.replace("always()", "(True)")
     python = python.replace("success()", "(True)")
     python = python.replace("fromJSON(", "fromjson(")
@@ -3015,7 +3110,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
             "reuse",
         } | cancel_after_jobs()
         allowlisted = set(reuse_config()["jobs"])
-        self.assertTrue(cancel_after_jobs(), "the never set covers the cancellations")
+        # The fail-fast narrowing removed every watcher (issue #2205).
+        self.assertEqual(cancel_after_jobs(), set())
         self.assertEqual(allowlisted & never, set())
         for job_id in reuse_config()["not_dispatch_consumers"]:
             self.assertNotIn(job_id, allowlisted)
@@ -3052,10 +3148,8 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_the_config_consumers_match_the_workflow_needs(self):
         needed_by = reverse_needs()
         aggregators = REUSE_AGGREGATORS | cancel_after_jobs()
-        self.assertTrue(
-            cancel_after_jobs(),
-            "the aggregator set must cover the fail-fast cancellations",
-        )
+        # No watcher jobs remain (issue #2205).
+        self.assertEqual(cancel_after_jobs(), set())
         for job_id, entry in reuse_config()["jobs"].items():
             with self.subTest(job=job_id):
                 self.assertEqual(

@@ -8,6 +8,8 @@ description: >-
   when this runs and must grant `actions: write` to its job. The call is
   allowed to fail: a token without that scope (a fork or Dependabot pull
   request) must not change the result of the run, which stays the real failure.
+  Only verdict-set jobs of `ci.yml` call it now (issue #2205): a job outside
+  the verdict set and an infrastructure-tagged failure never reach it.
 
 runs:
   using: composite
