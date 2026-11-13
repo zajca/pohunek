@@ -253,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
           size_blocks=$((POHUNEK_FIXTURE_RAMDISK_MB * 2048))
-          dev=$(hdiutil attach -nomount ram://"$size_blocks")
+          dev=$(hdiutil attach -nomount ram://"$size_blocks" | awk '{print $1}')  # PROBE-ONLY (#2199)
           diskutil erasevolume APFS r "$dev"
           mount_point=$(df /Volumes/r | awk 'NR==2 {print $NF}')
           test "$mount_point" = "/Volumes/r" || { echo "unexpected mount point: $mount_point" >&2; exit 1; }
