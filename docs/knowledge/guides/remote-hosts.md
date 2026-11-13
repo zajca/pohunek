@@ -263,12 +263,18 @@ macOS-specific routing, bridging, or relay mode.
   sent again. After wake, compare `worker_instance_id` before and after: the same id
   is continuity.
 - **Troubleshooting.** Run `netbird status` (or `tailscale status`) in the same
-  shell. Since NetBird 0.83, `netbird status` shows peers only to the account that owns the NetBird connection (and root); pohunek run as another account fails with `netbird_state_restricted` unless the owner lists the peer as a static peer in `overlays.toml` with its pinned host id (see above). Run pohunek as the owning account, pin NetBird to 0.82.x, or configure the static peer. Without an `overlays.toml` the NetBird default is not retried: if the
+  shell. Without an `overlays.toml` the NetBird default is not retried: if the
   daemon logged `overlay CLI missing; listener disabled`, fix the CLI lookup
   above and restart the daemon. For an overlay listed in `overlays.toml` the
   daemon logs `overlay CLI missing; serving local-only and retrying` and binds as
   soon as the CLI is found. For a VPN that was not ready, wait one retry
   interval and look for `serving control protocol over overlay`.
+  - **NetBird 0.83 non-owner account.** `netbird status` shows peers only to
+    the account that owns the NetBird connection (and root); pohunek run as
+    another account fails with `netbird_state_restricted` unless the owner
+    lists the peer as a static peer in `overlays.toml` with its pinned host
+    id. Run pohunek as the owning account, pin NetBird to 0.82.x, or
+    configure the static peer.
 
 The future public team relay does not replace this direct overlay model and does
 not require NetBird. After host enrollment and transport work land, an enrolled
