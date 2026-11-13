@@ -408,6 +408,18 @@ fn capture_allowlist_branches_are_refused() {
             "capture-pohunek-version-tail.json",
             "`pohunek_version` is not a pohunek version line",
         ),
+        (
+            "capture-pohunek-version-pre-build.json",
+            "`pohunek_version` is not a pohunek version line",
+        ),
+        (
+            "capture-pohunek-version-pre.json",
+            "`pohunek_version` is not a pohunek version line",
+        ),
+        (
+            "capture-pohunek-version-build.json",
+            "`pohunek_version` is not a pohunek version line",
+        ),
     ] {
         let output = canary.compare("expected.json", fixture);
         assert_eq!(

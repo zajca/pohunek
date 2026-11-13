@@ -81,9 +81,9 @@ carry only the top-level keys `schema`, `runtime`, `claude_version`,
 five, any unknown key at either level, a wrong shape or any other unknown
 string exits 2. The version lines are the only exception: `claude_version`
 is the line printed by `claude --version` and is free-form, while
-`pohunek_version` must match the exact output of `pohunek --version`
-(`pohunek <MAJOR.MINOR.PATCH>` with an optional prerelease and build
-tail).
+`pohunek_version` must match exactly `^pohunek [0-9]+\.[0-9]+\.[0-9]+$`
+(the release version line): `pohunek `, a space, three decimal numbers
+separated by dots, nothing else.
 
 Exit codes:
 
