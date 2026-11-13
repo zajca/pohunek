@@ -509,20 +509,19 @@ fn the_daemon_never_resolves_a_static_peer() {
     use std::os::unix::net::UnixStream;
     use std::process::{Child, Command, Stdio};
 
-    let mut daemon = Command::new(
-        pohunek_test_support::bin_exe("pohunek").with_file_name("pohunekd"),
-    )
-        .env_clear()
-        .envs(env.environment())
-        .env("PATH", &bin)
-        .env("SHELL", "/bin/sh")
-        .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
-        .env("POHUNEK_WORKER_BIN", pohunek_test_support::worker_binary())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn pohunekd");
+    let mut daemon =
+        Command::new(pohunek_test_support::bin_exe("pohunek").with_file_name("pohunekd"))
+            .env_clear()
+            .envs(env.environment())
+            .env("PATH", &bin)
+            .env("SHELL", "/bin/sh")
+            .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
+            .env("POHUNEK_WORKER_BIN", pohunek_test_support::worker_binary())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pohunekd");
     struct Guard(Child);
     impl Drop for Guard {
         fn drop(&mut self) {
