@@ -182,9 +182,8 @@ fn compare(expected_path: &Path, capture_path: &Path) -> Result<CompareReport, X
             unknown.join(", ")
         )));
     }
-    // `claude_version` is a required field of the capture schema and is
-    // already validated by `policy_scan`; read it as everyone requires it
-    // to be there.
+    // `claude_version` is validated by `policy_scan`, so it is present and
+    // a string here.
     let claude_version = capture
         .get("claude_version")
         .and_then(Value::as_str)
@@ -390,8 +389,7 @@ const ATTENTION_KINDS: [&str; 6] = [
 /// (`crates/protocol/src/session.rs`), the only values a session carries.
 const ACTIVITIES: [&str; 3] = ["working", "blocked", "idle"];
 
-/// The keys the capture document may carry, at each level: the top level and
-/// one scenario row.
+/// The keys the top level of the capture may carry.
 const TOP_LEVEL_KEYS: [&str; 5] = [
     "schema",
     "runtime",
@@ -431,13 +429,17 @@ fn render_pair(row: &Value) -> String {
 /// Checks a capture document against the closed allowlists of its schema.
 ///
 /// Every string leaf in the document must sit in a slot the schema defines:
-/// `claude_version` is the version line, a scenario name from [`SCENARIOS`],
-/// a record checked by [`check_record`], an `attention` entry from
-/// [`ATTENTION_KINDS`], or an `activity` from [`ACTIVITIES`]. The first
-/// offending leaf fails the whole capture as a policy breach (exit 2), so no
-/// base64 message tail can be smuggled through any field, however it is
-/// nested. `pohunek_version` carries no string leaf semantics of its own;
-/// it must be a `pohunek` version line.
+/// a scenario name from [`SCENARIOS`], a record checked by [`check_record`],
+/// an `attention` entry from [`ATTENTION_KINDS`], or an `activity` from
+/// [`ACTIVITIES`]. Two version lines are the only remaining leaves:
+/// `claude_version`, the line printed by `claude --version`, is the only
+/// free-form string in the document, and `pohunek_version` must match the
+/// exact output format of `pohunek --version` (a semver shape with an
+/// optional prerelease and build tail) as described in
+/// [`is_pohunek_version`]. Any unknown key, unknown scenario name, wrong
+/// shape or unknown string anywhere else fails the whole capture as a
+/// policy breach (exit 2), so no base64 message tail can pass through any
+/// closed field.
 fn policy_scan(capture: &Value) -> Result<(), String> {
     let Some(top) = capture.as_object() else {
         return Err("the capture is not a JSON object".to_owned());
@@ -555,9 +557,73 @@ fn check_no_unknown_keys(
     Ok(())
 }
 
-/// Whether `line` is a `pohunek` version line, for example `pohunek 0.42.0`.
+/// Whether `line` is the exact output format of `pohunek --version`: the
+/// literal `pohunek ` followed by a semver shape `MAJOR.MINOR.PATCH`
+/// (decimal digits, no leading zeroes for `0` itself), an optional
+/// `-<pre>` of `[0-9A-Za-z.-]` characters and an optional `+<build>` of
+/// `[0-9A-Za-z.-]` characters, all within a bounded length. A
+/// character-class-only check would let base64 through, so the digits and
+/// dots are required positions, not just allowed characters.
 fn is_pohunek_version(line: &str) -> bool {
-    line.starts_with("pohunek ") && line.len() > "pohunek ".len()
+    /// The version line is at most 64 bytes: `pohunek ` plus a semver core,
+    /// a prerelease and a build part.
+    const MAX_VERSION_LINE_BYTES: usize = 64;
+    const PREFIX: &str = "pohunek ";
+    let Some(version) = line.strip_prefix(PREFIX) else {
+        return false;
+    };
+    if version.is_empty() || line.len() > MAX_VERSION_LINE_BYTES {
+        return false;
+    }
+    let (core, tail) = match version.split_once('-') {
+        Some((core, tail)) => (core, tail),
+        None => (version, ""),
+    };
+    let mut parts = core.split('.');
+    let core_ok = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(major), Some(minor), Some(patch), None) => {
+            is_semver_number(major) && is_semver_number(minor) && is_semver_number(patch)
+        }
+        _ => false,
+    };
+    core_ok && is_semver_tail(tail)
+}
+
+/// Whether `text` is a semver numeric part: one or more digits, no leading
+/// zero unless the part is exactly `0`.
+fn is_semver_number(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|byte| byte.is_ascii_digit())
+        && (text.len() == 1 || !text.starts_with('0'))
+}
+
+/// Whether `tail` is empty or a prerelease/build tail: the part after the
+/// first `-`, itself an optional `+<build>` of `[0-9A-Za-z.-]` characters
+/// whose dot-separated identifiers are non-empty.
+fn is_semver_tail(tail: &str) -> bool {
+    if tail.is_empty() {
+        return true;
+    }
+    if !tail
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    {
+        return false;
+    }
+    let (pre, build) = match tail.split_once('+') {
+        Some((pre, build)) => (pre, build),
+        None => (tail, ""),
+    };
+    let whole = [pre, build];
+    whole.iter().all(|section| is_dot_list(section))
+}
+
+/// Whether `section` is a dot-separated list of non-empty identifiers.
+fn is_dot_list(section: &str) -> bool {
+    !section.is_empty()
+        && !section.starts_with('.')
+        && !section.ends_with('.')
+        && !section.contains("..")
 }
 
 /// Checks one record string against the canonical grammar

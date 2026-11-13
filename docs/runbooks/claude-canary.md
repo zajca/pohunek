@@ -45,11 +45,13 @@ write and `compare` reads:
 ```
 
 `records` are the canonical 7501 records in order. `attention` is the sorted
-list of unread attention kinds from `notifications list`
-(`approval_required`, `agent_blocked`). `activity` is the `session inspect`
-activity. Every `records` entry and every `final_record` must match the
-canonical grammar `[app=..:]state=<state>[:kind=<kind>]` and nothing else; a
-`msg=` segment or an unknown segment is refused.
+list of unread attention kinds from `notifications list`: one of the six
+notification kinds `agent_blocked`, `approval_required`, `turn_completed`,
+`session_finished`, `error`, `system`. `activity` is the `session inspect`
+activity: one of `working`, `blocked`, `idle`. Every `records` entry and
+every `final_record` must match the canonical grammar
+`[app=..:]state=<state>[:kind=<kind>]` and nothing else; a `msg=` segment or
+an unknown segment is refused.
 
 ## Comparing
 
@@ -72,6 +74,16 @@ path in a stable sorted-key order:
 A key present on only one side prints only its `-` or `+` line. Arrays
 compare by index. A capture that stores a message (`msg`, `title` or
 `progress`, or a raw base64 message tail inside a record) is refused.
+The closed allowlist of the schema is enforced as well: the capture may
+carry only the top-level keys `schema`, `runtime`, `claude_version`,
+`pohunek_version` and `scenarios`, and each row may carry only `records`,
+`final_record`, `activity` and `attention`. A scenario name outside the
+five, any unknown key at either level, a wrong shape or any other unknown
+string exits 2. The version lines are the only exception: `claude_version`
+is the line printed by `claude --version` and is free-form, while
+`pohunek_version` must match the exact output of `pohunek --version`
+(`pohunek <MAJOR.MINOR.PATCH>` with an optional prerelease and build
+tail).
 
 Exit codes:
 

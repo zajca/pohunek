@@ -26,6 +26,9 @@
 //! - I: the capture carries a base64 message in `attention` (or an unknown
 //!   extra key in a row): compare refuses it as exit 2, naming `attention`
 //!   (or the unknown field).
+//! - J: the capture allowlist branches (unknown top-level key, unknown
+//!   scenario name, unknown `activity`, `pohunek_version` with a free tail):
+//!   each refuses it as exit 2, naming the field.
 
 // Rust guideline compliant 2026-11-13
 
@@ -389,4 +392,34 @@ fn capture_with_an_unknown_extra_key_is_refused() {
         diagnostic.contains("unknown field `note`"),
         "the refusal names the unknown field: {diagnostic}"
     );
+}
+
+#[test]
+fn capture_allowlist_branches_are_refused() {
+    let canary = Canary::new();
+    for (fixture, field) in [
+        ("capture-top-extra-key.json", "unknown field `note`"),
+        (
+            "capture-extra-scenario.json",
+            "unknown scenario `usage_limit`",
+        ),
+        ("capture-activity-base64.json", "unknown `activity`"),
+        (
+            "capture-pohunek-version-tail.json",
+            "`pohunek_version` is not a pohunek version line",
+        ),
+    ] {
+        let output = canary.compare("expected.json", fixture);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{fixture} is a usage error: stderr {}",
+            stderr_of(&output)
+        );
+        let diagnostic = format!("{}{}", stdout_of(&output), stderr_of(&output));
+        assert!(
+            diagnostic.contains(field),
+            "the refusal names {field}: {diagnostic}"
+        );
+    }
 }
