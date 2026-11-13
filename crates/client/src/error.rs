@@ -601,9 +601,10 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
             ErrorClass::Configuration,
             "overlay_configuration_invalid",
             format!("overlays.toml does not match current {overlay} state: {detail}"),
-            Some(format!(
+            Some(
                 "correct or remove the static peer in overlays.toml; `netbird status` run as the account that owns the NetBird connection shows the current addresses"
-            )),
+                    .to_string(),
+            ),
         ),
         overlay::OverlayError::ListenerAddressMissing { reason, .. } => ProtocolError::new(
             ErrorClass::Discovery,

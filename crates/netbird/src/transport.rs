@@ -42,7 +42,7 @@ impl NetbirdTransport {
     }
 
     /// Create the adapter with `status_deadline` and owner-configured static
-    /// peers. The peers are used only while NetBird withholds its status.
+    /// peers. The peers are used only while `NetBird` withholds its status.
     #[must_use]
     pub fn with_static_peers(status_deadline: Duration, static_peers: Option<StaticPeers>) -> Self {
         Self {
@@ -138,7 +138,6 @@ impl OverlayTransport for NetbirdTransport {
                             .as_ref()
                             .and_then(|peers| peers.match_fqdn(identity.value()))
                             .map(static_peer)
-                            .or_else(|| None)
                             .ok_or(restricted),
                         ExternalIdentityKind::PeerId => Err(restricted),
                     }
@@ -471,7 +470,7 @@ mod tests {
             peer.expected_host_id.as_deref(),
             Some("host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         );
-        assert!(transport.static_peer("nobody", "Connected").is_err());
-        assert!(transport.static_peer("vps2", "Connecting").is_err());
+        transport.static_peer("nobody", "Connected").unwrap_err();
+        transport.static_peer("vps2", "Connecting").unwrap_err();
     }
 }

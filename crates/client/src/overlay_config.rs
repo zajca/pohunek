@@ -83,7 +83,7 @@ const KNOWN_PROVIDER_IDS: [&str; 2] = [NETBIRD_OVERLAY_ID, TAILSCALE_OVERLAY_ID]
 /// Largest number of static peers one `overlays.toml` may list.
 const MAX_STATIC_PEERS: usize = 32;
 
-/// The CGNAT range NetBird assigns addresses from, as an IPv4 network and prefix.
+/// The CGNAT range `NetBird` assigns addresses from, as an IPv4 network and prefix.
 const NETBIRD_CGNAT: (Ipv4Addr, u8) = (Ipv4Addr::new(100, 64, 0, 0), 10);
 
 /// A provider the loader knows how to construct.
@@ -441,7 +441,7 @@ fn parse(text: &str) -> Result<OverlayConfig, String> {
     };
     let static_peers = match raw.netbird {
         None => None,
-        Some(netbird) => Some(parse_static_peers(&providers, netbird)?),
+        Some(netbird) => Some(parse_static_peers(&providers, &netbird)?),
     };
     Ok(OverlayConfig {
         providers,
@@ -457,7 +457,7 @@ fn parse(text: &str) -> Result<OverlayConfig, String> {
 /// The first failure wins, in the order: provider, subnet, entry count,
 /// per-entry fields, then uniqueness across entries. Messages name the
 /// validated entry key but never a value from the file.
-fn parse_static_peers(providers: &[Provider], netbird: RawNetbird) -> Result<StaticPeers, String> {
+fn parse_static_peers(providers: &[Provider], netbird: &RawNetbird) -> Result<StaticPeers, String> {
     if providers != [Provider::Netbird] {
         return Err("the netbird table requires providers = [\"netbird\"]".to_owned());
     }

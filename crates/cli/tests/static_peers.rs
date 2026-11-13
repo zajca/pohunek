@@ -1,4 +1,4 @@
-//! NetBird static peers under a restricted overview.
+//! `NetBird` static peers under a restricted overview.
 //!
 //! The fake `netbird` prints a restricted `0.83` status (no peer details); the
 //! CLI under test must resolve the owner-configured static peer in
@@ -13,7 +13,19 @@ use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Command as ProcCommand, Stdio};
 use std::sync::{Arc, Mutex};
+
+/// A daemon process, killed and reaped on drop.
+struct Daemon(Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, PROTOCOL_VERSION};
@@ -505,12 +517,8 @@ fn the_daemon_never_resolves_a_static_peer() {
     )
     .expect("write fake netbird");
 
-    use std::io::Write as _;
-    use std::os::unix::net::UnixStream;
-    use std::process::{Child, Command, Stdio};
-
-    let mut daemon =
-        Command::new(pohunek_test_support::bin_exe("pohunek").with_file_name("pohunekd"))
+    let daemon =
+        ProcCommand::new(pohunek_test_support::bin_exe("pohunek").with_file_name("pohunekd"))
             .env_clear()
             .envs(env.environment())
             .env("PATH", &bin)
@@ -522,14 +530,7 @@ fn the_daemon_never_resolves_a_static_peer() {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn pohunekd");
-    struct Guard(Child);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let _guard = Guard(daemon);
+    let _guard = Daemon(daemon);
 
     let socket = root.join("run/pohunek/daemon.sock");
     let stream = pohunek_test_support::wait::poll_until("the daemon to serve", || {

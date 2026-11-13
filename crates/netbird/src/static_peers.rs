@@ -1,20 +1,20 @@
-//! Owner-configured static peers for an account that does not own the NetBird connection.
+//! Owner-configured static peers for an account that does not own the `NetBird` connection.
 //!
-//! NetBird 0.83 and later withhold the detailed status from such an account.
+//! `NetBird` 0.83 and later withhold the detailed status from such an account.
 //! The owner lists the peers it wants to reach in `overlays.toml`; each entry
 //! carries the address, the DNS name and the pohunek host id of the daemon
 //! that must answer at that address.
 
 use std::net::{IpAddr, Ipv4Addr};
 
-/// One owner-configured peer, used only while NetBird withholds its status.
+/// One owner-configured peer, used only while `NetBird` withholds its status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticPeer {
     /// The `overlays.toml` table key of the entry.
     pub name: String,
     /// The provider-qualified DNS name of the peer.
     pub fqdn: String,
-    /// The NetBird address of the peer.
+    /// The `NetBird` address of the peer.
     pub address: Ipv4Addr,
     /// The pohunek host id the daemon at [`Self::address`] must report.
     pub host_id: String,
@@ -122,7 +122,6 @@ impl StaticPeers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     fn table() -> StaticPeers {
         StaticPeers::new(

@@ -48,7 +48,6 @@ fn governance_status(reported: &str) -> Value {
 #[derive(Debug)]
 struct StaticOverlay {
     id: OverlayId,
-    port: u16,
     pinned: String,
 }
 
@@ -144,7 +143,9 @@ fn serve(reported: String) -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, served)
 }
 
-/// A daemon whose reported host id can change between connections.
+/// A daemon whose reported host id can change between connections: `(port,
+/// served methods, current reported host id)`.
+#[allow(clippy::type_complexity, reason = "(port, served methods, reported id) triple used by the fixture daemon")]
 fn serve_switchable() -> (u16, Arc<Mutex<Vec<String>>>, Arc<Mutex<String>>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
     let port = listener.local_addr().expect("fixture address").port();
@@ -198,7 +199,6 @@ fn serve_connection(stream: TcpStream, served: &Arc<Mutex<Vec<String>>>, reporte
 fn registry(port: u16, pinned: &str) -> OverlayRegistry {
     let transport = StaticOverlay {
         id: OverlayId::new("stub").expect("overlay id"),
-        port,
         pinned: pinned.to_owned(),
     };
     let _ = port;
@@ -254,7 +254,7 @@ async fn the_daemon_registry_without_static_peers_never_names_one() {
         None => bin.as_os_str().to_owned(),
     };
     std::env::set_var("PATH", &path);
-    let result = async {
+    async {
         let config =
             pohunek_client::OverlayConfig::load_from(&config_dir).expect("the config loads");
         let with_static = config.registry().expect("registry with static peers");
@@ -280,7 +280,6 @@ async fn the_daemon_registry_without_static_peers_never_names_one() {
         Some(value) => std::env::set_var("PATH", value),
         None => std::env::remove_var("PATH"),
     }
-    result;
 }
 
 #[tokio::test]
