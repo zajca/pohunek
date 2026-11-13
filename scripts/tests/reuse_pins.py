@@ -170,5 +170,3 @@ EVALUATION_TABLE = [
         },
     },
 ]
-
-

@@ -2802,7 +2802,6 @@ jobs:
   # credential and no model call. The always-running unit tests in the same
   # test binary keep the descriptor, the supported range and the lock in sync;
   # this job proves the locked release still behaves as they say.
-
   pi-package:
     name: Pi runtime package (locked release, model-free)
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
