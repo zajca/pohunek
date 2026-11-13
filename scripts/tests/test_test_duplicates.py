@@ -81,7 +81,7 @@ class SameOsDuplicateTests(DuplicateScenario):
 
 
     def test_a_mixed_run_directory_counts_source_and_own_reports_once_each(self):
-        # on a delta dispatch the junit directory holds both the
+        # On a delta dispatch the junit directory holds both the
         # source run's reports (downloaded first) and this run's own
         # reports (downloaded over them). A test only in the source row
         # is not a duplicate of itself.

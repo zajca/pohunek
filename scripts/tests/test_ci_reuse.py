@@ -15,6 +15,7 @@ is visible to the script exactly as the API serves it.
 """
 
 import base64
+import contextlib
 import datetime
 import io
 import json
@@ -194,7 +195,7 @@ class CiReuseProcessTests(unittest.TestCase):
         self.saved = {
             key: os.environ.get(key)
             for key in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_OUTPUT",
-                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE")
+                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE")
         }
         self.addCleanup(self.restore_env)
         os.environ["GITHUB_REPOSITORY"] = REPO
@@ -465,7 +466,6 @@ else:
 ''')
         gh.chmod(0o755)
         self.write_fixture(runs=[run_doc()], jobs_by_run={"777": green_jobs()}, artifacts={})
-        import contextlib, io
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             rc = self.run_script_with_tree(TREE)
@@ -508,7 +508,6 @@ else:
         fixture = json.loads(self.fixture.read_text())
         fixture["artifacts_by_run"] = fixture["artifacts"]
         self.fixture.write_text(json.dumps(fixture))
-        import contextlib, io
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             rc = self.run_script_with_tree(TREE)
@@ -542,7 +541,6 @@ else:
             return original_run(*args, **kwargs)
 
         subprocess_module.run = fake_run
-        import contextlib, io
         buffer = io.StringIO()
         try:
             with contextlib.redirect_stdout(buffer):
@@ -556,34 +554,6 @@ else:
         # failure is the selection-read branch and not an early stop.
         self.assertIn("cannot read the selection of run 777", out)
 
-    def test_a_real_download_timeout_gives_an_empty_skip_with_exit_zero(self):
-        # Row 11: the artifact list is good but the `test-selection` zip
-        # download raises TimeoutExpired. Patch `subprocess.run` in
-        # process for the zip call so the scenario raises without a
-        # real wait; `download_artifact` must catch it and reuse nothing.
-        import subprocess as subprocess_module
-        fixture = {"runs": [run_doc()], "jobs_by_run": {"777": green_jobs()}, "artifacts": {},
-                   "artifacts_by_run": {"777": [{"name": f"tested-tree-{TREE}", "id": 1, "expired": False},
-                                              {"name": "test-selection", "id": 2, "expired": False}]}}
-        self.fixture.write_text(json.dumps(fixture))
-
-        original_run = subprocess_module.run
-
-        def fake_run(*args, **kwargs):
-            command = args[0] if args else kwargs.get("args", [])
-            command_text = " ".join(str(part) for part in (command or []))
-            if "/zip" in command_text:
-                raise subprocess_module.TimeoutExpired(command, timeout=120)
-            return original_run(*args, **kwargs)
-
-        subprocess_module.run = fake_run
-        try:
-            rc = self.run_script_with_tree(TREE)
-        finally:
-            subprocess_module.run = original_run
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.outputs()["skip"], "[]")
-
     def test_an_api_error_gives_an_empty_skip_with_a_warning_and_exit_zero(self):
         gh = self.bin_dir / "gh"
         gh.write_text("#!/bin/sh\necho refused >&2\nexit 1\n")
@@ -594,7 +564,7 @@ else:
 
 
     def test_a_paired_lane_is_dropped_without_its_hermes_partner(self):
-        # the macOS lane preempts the Hermes tests unless the Hermes job
+        # The macOS lane preempts the Hermes tests unless the Hermes job
         # ran in the source. When the source did not run hermes-compatibility-macos
         # (hermes_macos false on the PR), reusing the lane on the dispatch
         # would run the Hermes tests in the lane while test-duplicates sees

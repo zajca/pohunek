@@ -200,7 +200,8 @@ and an ambiguous source runs everything. A full
 dispatch (`delta: false`) stays the default, and `scripts/release` keeps
 dispatching full runs. A job that `needs:` a reusable
 job but that can never run on a tier=main dispatch is not a reuse consumer:
-such jobs are listed in `not_dispatch_consumers` with the reason; each such job's own `if:` restricts it to events that cannot run the dispatch.
+such jobs are listed in `not_dispatch_consumers` with the reason; each such job's own
+`if:` restricts it to events that cannot run the dispatch.
 `pairs` names a job pair that is reused only together, in either direction:
 platform-contracts and hermes-compatibility-macos (see
 `scripts/ci-reuse.json`); `scripts/ci-evidence` accepts the union of the evidence
@@ -209,6 +210,16 @@ runs in its report. For the dynamic-matrix `fast-tests` job the allowlist names
 every full-selection leg (`tests (core|daemon|cli, fast)`, the `FAST_SHARDS`
 the workflow plans); such a job is `selection_dependent`, so a narrowed
 source never reuses any of them.
+
+If an allowlisted job body or the called `upgrade.yml` changes, the reuse guard
+fails with `job <id> changed: re-check its reuse eligibility, then update its
+pin`. In the same commit, re-check that every event/input line of the job still
+reads the same on both paths (full-selection pull request and tier=main
+dispatch), update the body's sha256 in `scripts/tests/reuse_pins.py`
+(`PINNED_BODY_HASHES`), and extend `EVALUATION_TABLE` for every new
+token-reading line; `failure()` reads false there: a reused leg was green.
+The pins and the table are checked-in data, never regenerated from the
+workflow under test.
 
 **Step bounds.** Every step that waits on a network or a local archive has an
 upper bound that fails the job with an error. The mold install is always the

@@ -389,6 +389,7 @@ jobs:
         with:
           name: macos-lane-junit
           path: target/nextest/macos/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -476,6 +477,7 @@ jobs:
         with:
           name: macos-tier-junit
           path: target/nextest/macos/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -916,6 +918,7 @@ jobs:
           # A delta dispatch reuses the newest same-tree pull request run
           # within 24 hours, and reads its selection record; keep it alive.
           retention-days: 2
+          if-no-files-found: error
 
   # Finds the newest same-tree pull request run and decides which jobs
   # a delta dispatch reuses from it (issue #2203). Runs only on a tier=main
@@ -1121,6 +1124,7 @@ jobs:
         with:
           name: nextest-junit-${{ matrix.shard }}
           path: relocated/target/nextest/ci/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./cancel-run-action
@@ -1519,6 +1523,7 @@ jobs:
         with:
           name: nextest-junit-heavy
           path: relocated/target/nextest/heavy/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./cancel-run-action
@@ -1782,6 +1787,7 @@ jobs:
         with:
           name: test-selection-audit
           path: ${{ runner.temp }}/test-selection-audit/
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -2486,6 +2492,7 @@ jobs:
         with:
           name: package-junit-hermes
           path: target/nextest/package/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -2921,6 +2928,7 @@ jobs:
         with:
           name: package-junit-pi
           path: target/nextest/package/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -3068,6 +3076,7 @@ jobs:
         with:
           name: package-junit-codex
           path: target/nextest/package/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -3228,6 +3237,7 @@ jobs:
         with:
           name: package-junit-claude
           path: target/nextest/package/junit.xml
+          if-no-files-found: warn
       - name: Cancel the run (fail fast)
         if: failure() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -3560,6 +3570,7 @@ jobs:
         with:
           name: hermes-macos-junit
           path: ${{ runner.temp }}/hermes-junit/
+          if-no-files-found: warn
 
       # Persist the staged runtime only after the gate and smoke passed.
       - name: Persist Hermes runtime cache
