@@ -342,8 +342,7 @@ def decide(
     max_age = datetime.timedelta(hours=window_hours)
     candidates = [
         run for run in runs
-        if run.get("event") in config["source_events"]
-        and isinstance(run.get("id"), int)
+        if isinstance(run.get("id"), int)
         and eligibility.source_is_eligible(
             run, repo, ".github/workflows/ci.yml", now, max_age,
             config["source_events"],

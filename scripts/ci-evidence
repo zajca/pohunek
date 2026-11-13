@@ -351,9 +351,6 @@ def load_config(text: str, source: str) -> dict[str, Any]:
     return config
 
 
-run_tier = eligibility.run_tier
-
-
 def run_dispatch_id(run: dict[str, Any]) -> str | None:
     title = run.get("display_title") or run.get("displayTitle") or ""
     # A delta dispatch appends ` [delta]` to the run title; it names the
@@ -406,7 +403,7 @@ def matching_runs(
 ) -> list[dict[str, Any]]:
     return [
         run for run in runs
-        if run.get("head_sha") == sha and run_tier(run, workflow_path) == tier
+        if run.get("head_sha") == sha and eligibility.run_tier(run, workflow_path) == tier
     ]
 
 
@@ -611,38 +608,20 @@ def verify_reuse(
             failures.append(f"cannot read source run {source_id} reused by {evidence_url}: {error}")
             continue
         source_url = source.get("html_url") or f"run {source_id}"
-        # The shared rule decides the run-level eligibility; the checks
-        # below name the same rule's pieces so the refusal says which
-        # guard failed.
-        moment = eligibility.parse_moment(source.get("created_at"))
-        eligible = eligibility.source_is_eligible(
-            source, repo, config["workflow_path"], moment or EARLIEST_MOMENT,
+        # The shared rule decides the run-level eligibility and names the
+        # failed pieces, so the refusal says which guard failed.
+        if not eligibility.source_is_eligible(
+            source, repo, config["workflow_path"], created or EARLIEST_MOMENT,
             datetime.timedelta(hours=reuse["max_age_hours"]),
             reuse["source_events"],
-        )
-        if not eligible:
-            if (source.get("repository") or {}).get("full_name") != repo or (
-                source.get("head_repository") or {}
-            ).get("full_name") != repo:
-                failures.append(f"source {source_url} is not a run of this repository (evidence {evidence_url})")
-            if source.get("event") not in reuse["source_events"]:
-                failures.append(
-                    f"source {source_url} ran on event {source.get('event')!r}, "
-                    f"which the candidate does not allow for reuse (evidence {evidence_url})"
-                )
-            ev_event = source.get("event")
-            if ev_event == "push" and run_tier(source, config["workflow_path"]) != "main":
-                failures.append(f"source {source_url} is not a main push (evidence {evidence_url})")
-            if ev_event == "workflow_dispatch" and run_tier(source, config["workflow_path"]) != "main":
-                failures.append(f"source {source_url} is not a tier=main dispatch (evidence {evidence_url})")
-            if source.get("conclusion") != "success" or source.get("status") != "completed":
-                failures.append(f"source {source_url} did not conclude success (evidence {evidence_url})")
-            if moment is None or (
-                created is not None and created - moment > datetime.timedelta(hours=reuse["max_age_hours"])
-            ):
-                failures.append(f"source {source_url} is older than the reuse window (evidence {evidence_url})")
-            if not failures or not any(source_url in failure for failure in failures):
-                failures.append(f"source {source_url} is not eligible for reuse (evidence {evidence_url})")
+        ):
+            reasons = eligibility.run_source_reasons(
+                source, repo, config["workflow_path"], created,
+                datetime.timedelta(hours=reuse["max_age_hours"]),
+                reuse["source_events"],
+            )
+            for reason in reasons or ["is not eligible for reuse"]:
+                failures.append(f"source {source_url} {reason} (evidence {evidence_url})")
         # A dispatched delta run reuses the same commit; a push reuses the
         # same tree. A `pull_request` source is matched by its recorded
         # tested tree (owner policy, issue #2204: a `main` run may rely on
@@ -786,6 +765,10 @@ def verify_reuse(
 
 
 def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str, Any]]:
+    """Newest dispatch runs of `tier`, used only to find the run for a
+    dispatch request. These are not reuse sources: same-repository is the
+    only eligibility piece that applies here (a fork cannot dispatch this
+    workflow), and the tier marker picks the right lane."""
     """Dispatch runs of `tier` in `repo` within the tree-match window, in any
     state, newest first. Other events never supply evidence by tree."""
     since = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(
@@ -797,7 +780,7 @@ def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str
             repo, config["workflow_file"], event="workflow_dispatch", created_since=since
         )
         if run.get("event") == "workflow_dispatch"
-        and run_tier(run, config["workflow_path"]) == tier
+        and eligibility.run_tier(run, config["workflow_path"]) == tier
         and isinstance(run.get("id"), int)
         and (run.get("repository") or {}).get("full_name") == repo
         and (run.get("head_repository") or {}).get("full_name") == repo
@@ -1000,7 +983,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             new_dispatches = [
                 item for item in recent_dispatches
                 if item.get("id") not in dispatched_ids
-                and run_tier(item, config["workflow_path"]) == args.tier
+                and eligibility.run_tier(item, config["workflow_path"]) == args.tier
                 and run_dispatch_id(item) == dispatch_request_id
             ]
             if new_dispatches:

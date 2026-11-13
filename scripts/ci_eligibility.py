@@ -143,6 +143,47 @@ def job_is_reused(
     return True
 
 
+def run_source_reasons(
+    source: dict,
+    repo: str,
+    workflow_path: str,
+    evidence_created,
+    max_age: datetime.timedelta,
+    allowed_events,
+) -> list[str]:
+    """Why `source` fails the shared run-level rule, one line per guard.
+
+    The rule itself lives in `source_is_eligible`; this names the failed
+    pieces so a refusal says which guard failed. A caller passes the
+    evidence run's `created_at` as the clock so the window reads against
+    the evidence run (one-sided age), and the check drops to the epoch
+    when the source timestamp is unreadable instead of failing open."""
+    reasons: list[str] = []
+    if (source.get("repository") or {}).get("full_name") != repo or (
+        source.get("head_repository") or {}
+    ).get("full_name") != repo:
+        reasons.append("is not a run of this repository")
+    if source.get("event") not in allowed_events:
+        reasons.append(
+            f"ran on event {source.get('event')!r}, "
+            "which the candidate does not allow for reuse"
+        )
+    event = source.get("event")
+    if event == "push" and run_tier(source, workflow_path) != "main":
+        reasons.append("is not a main push")
+    if event == "workflow_dispatch" and run_tier(source, workflow_path) != "main":
+        reasons.append("is not a tier=main dispatch")
+    if source.get("conclusion") != "success" or source.get("status") != "completed":
+        reasons.append("did not conclude success")
+    moment = parse_moment(source.get("created_at"))
+    if evidence_created is None:
+        if moment is None:
+            reasons.append("has no readable created_at")
+    elif moment is None or evidence_created - moment > max_age:
+        reasons.append("is older than the reuse window")
+    return reasons
+
+
 def evidence_commit_match(source: dict, sha: str) -> str | None:
     """Why `source` does not answer a dispatch consumer, or None when the
     source's commit is the evidence run's commit."""
