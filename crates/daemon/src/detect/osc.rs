@@ -16,9 +16,10 @@ const UNMAPPED_PROGRAM_STATUS_TARGET: &str = "session.program_status.unmapped";
 
 /// Longest payload token the journal echoes.
 ///
-/// The journal echoes untrusted tokens, which the grammar does not bound: an
-/// unknown `state` or `kind`, or the `app` of a rejected payload. The bound
-/// keeps such a token from turning into a long log line.
+/// The journal echoes raw tokens the grammar does not bound to this
+/// length: an unknown `state` or `kind`, an `app` the grammar drops
+/// (invalid), or a valid `app` (up to `MAX_APP_BYTES`). The bound keeps
+/// such a token from turning into a long log line.
 const MAX_JOURNAL_TOKEN_CHARS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,10 +411,11 @@ impl<'a> JournalTokens<'a> {
     /// Collects the tokens of `payload`.
     ///
     /// Pairs split as the parser splits them: on `:` first, then on the first
-    /// `=`; a pair without `=` and a pair with an empty key carry no token. A
-    /// repeated key keeps its last value; the parser does the same except
-    /// that it rejects the payload at the first unknown `state`, so the
-    /// journal's `state` of a rejected payload can be a later value.
+    /// `=`; a pair without `=` and a pair with an empty key carry no token.
+    /// A repeated key keeps its last raw value, while the parser stops at
+    /// its first rejection (an unknown `state`, an oversized key, or an
+    /// invalid `msg` or `title`) and drops an invalid `app` or an unknown
+    /// `kind`, so a journaled token can be one the parser never read.
     fn of(payload: &'a [u8]) -> Self {
         let mut tokens = Self::default();
         for pair in payload.split(|&byte| byte == b':') {
