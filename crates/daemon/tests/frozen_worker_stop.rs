@@ -10,10 +10,10 @@
 //! `stopped`; a removal returns a typed runtime error, keeps the session listed
 //! and succeeds on a retry after `SIGCONT`.
 //!
-//! The registry reads the host through [`readable_host::ReadableHost`], so a
-//! stop's marker sweep stays hermetic: an unrelated process of the loaded
-//! test host whose environment the kernel hides cannot keep the sweep
-//! unconfirmed.
+//! The registry reads the host through [`readable_host::ReadableHost`], so the
+//! marker sweep of a stop or a removal stays hermetic: an unrelated process
+//! of the loaded test host whose environment the kernel hides cannot keep
+//! the sweep unconfirmed.
 
 // Rust guideline compliant 2026-10-20
 

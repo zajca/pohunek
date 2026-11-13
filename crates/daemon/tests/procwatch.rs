@@ -7,6 +7,9 @@ pohunek_test_support::hold_image!();
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
 
+#[path = "../src/procwatch/readable_host.rs"]
+mod readable_host;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -263,13 +266,16 @@ impl ProcessInspector for PollBlindInspector {
         match self.frozen_view(pid, |last_seen| last_seen.markers.clone()) {
             Some(markers) => Ok(markers),
             // A process the scenario does not own whose environment the host
-            // withholds (a non-dumpable helper of the developer's session, such
-            // as `op`) reads as a foreign process with no markers. Left
-            // unreadable, one that started after the worker would keep the
-            // removal unconfirmed by the rule under test elsewhere; the
-            // scenario's own bystander is the `unreadable_pid` above.
+            // withholds (a non-dumpable helper of the developer's session such
+            // as `op`, or another test's process between images) reads as a
+            // foreign process with no markers. Left unreadable, one that
+            // started after the worker would keep the removal unconfirmed by
+            // the rule under test elsewhere; the scenario's own bystander is
+            // the `unreadable_pid` above.
             None => match self.host.ownership_markers(pid) {
-                Err(ProcwatchError::PermissionDenied { .. }) => Ok(OwnershipMarkers::default()),
+                Err(
+                    ProcwatchError::PermissionDenied { .. } | ProcwatchError::Unobservable { .. },
+                ) => Ok(OwnershipMarkers::default()),
                 other => other,
             },
         }
@@ -580,7 +586,10 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                     let first = worker_backed_registry_with_launcher(
                         &env,
                         config.clone(),
-                        Arc::new(HostInspector::new()),
+                        // The registry reads the host through ReadableHost, so any
+                        // marker sweep of this registry ignores unrelated processes
+                        // whose environment the kernel hides.
+                        Arc::new(readable_host::ReadableHost::new()),
                         Arc::clone(&launcher),
                         &catalog,
                     );
@@ -836,7 +845,10 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             procwatch_poll: CWD_PROCWATCH_POLL,
             ..SessionRegistryConfig::default()
         },
-        Arc::new(HostInspector::new()),
+        // The registry reads the host through ReadableHost, so any marker sweep
+        // of this registry ignores unrelated processes whose environment the
+        // kernel hides.
+        Arc::new(readable_host::ReadableHost::new()),
     )
     .await;
     let created = registry
