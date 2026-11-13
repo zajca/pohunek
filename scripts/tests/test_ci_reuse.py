@@ -50,8 +50,9 @@ import sys
 from pathlib import Path
 
 fixture_path = Path(os.environ["GH_FIXTURE"])
-fixture = json.loads(fixture_path.read_text())
 args = sys.argv[1:]
+with Path(os.environ["GH_CALLS"]).open("a") as stream:
+    stream.write(json.dumps(args) + "\n")
 
 if args[:2] == ["api", "--method"]:
     endpoint = next((arg for arg in args[1:] if arg.startswith("repos/")), "")
@@ -59,10 +60,20 @@ if args[:2] == ["api", "--method"]:
     # alone concatenates them. The fixtures carry real artifacts on later
     # pages, so a script that reads only the first page misses them.
     slurped = "--paginate" in args and "--slurp" in args
-    def listing(key):
+    fixture = json.loads(fixture_path.read_text())
+    def listing(key, run_id=None):
         pages = fixture.get("pages", {}).get(key)
         if pages is None:
             pages = fixture.get(f"{key}_pages")
+        if pages is None and run_id is not None:
+            per_run = (fixture.get("pages", {}).get(f"{key}_by_run", {}) or {}).get(str(run_id))
+            if per_run is not None:
+                fixture.setdefault("run_call_counts", {}).setdefault(str(run_id), {})
+                fixture["run_call_counts"][str(run_id)].setdefault(key, 0)
+                seen = fixture["run_call_counts"][str(run_id)][key]
+                fixture["run_call_counts"][str(run_id)][key] += 1
+                fixture_path.write_text(json.dumps(fixture))
+                pages = per_run[min(seen, len(per_run) - 1)]
         if pages is None:
             return None
         if slurped:
@@ -104,7 +115,7 @@ if args[:2] == ["api", "--method"]:
         sys.stdout.buffer.write(base64.b64decode(zips[artifact_id]))
     elif "/actions/runs/" in endpoint and "/jobs" in endpoint:
         run_id = str(endpoint.split("/")[-2])
-        if listing("jobs") is None:
+        if listing("jobs", run_id) is None:
             print(json.dumps([{"jobs": fixture.get("jobs_by_run", {}).get(run_id, [])}]))
     else:
         raise SystemExit("unexpected Actions API endpoint: " + repr(endpoint))
@@ -200,12 +211,14 @@ class CiReuseProcessTests(unittest.TestCase):
         gh.chmod(0o755)
         self.bin_dir = bin_dir
         self.fixture = self.directory / "fixture.json"
+        self.calls = self.directory / "calls.jsonl"
+        self.calls.write_text("")
         self.output = self.directory / "output"
         self.output.write_text("")
         self.saved = {
             key: os.environ.get(key)
             for key in ("GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_OUTPUT",
-                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE", "GITHUB_EVENT_NAME")
+                        "RUNNER_TEMP", "PATH", "WORKFLOW_FILE", "GH_FIXTURE", "GH_CALLS", "GITHUB_EVENT_NAME")
         }
         self.addCleanup(self.restore_env)
         os.environ["GITHUB_REPOSITORY"] = REPO
@@ -214,6 +227,7 @@ class CiReuseProcessTests(unittest.TestCase):
         os.environ["GITHUB_OUTPUT"] = str(self.output)
         os.environ["RUNNER_TEMP"] = str(self.directory)
         os.environ["WORKFLOW_FILE"] = "ci.yml"
+        os.environ["GH_CALLS"] = str(self.calls)
         os.environ["PATH"] = f"{bin_dir}{os.pathsep}{self.saved['PATH']}"
         self.git_tree = None
 
@@ -764,9 +778,62 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    def test_a_source_on_a_disallowed_event_supplies_nothing(self):
+        # A run whose event is not in the candidate's allowlist (for example
+        # a schedule run) never supplies reuse, even when everything else
+        # is green and fresh.
+        self.write_fixture(
+            runs=[run_doc(run_id=777, event="schedule")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_run_from_another_repository_supplies_nothing(self):
+        # The listing only names this repository's runs; a same-tree run
+        # recorded under another owner never supplies reuse, even when the
+        # head repository matches.
+        self.write_fixture(
+            runs=[{**run_doc(run_id=777, event="push"),
+                    "repository": {"full_name": "someone/pohunek"}}],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
     def test_a_push_never_uses_a_fork_source(self):
         self.write_fixture(
             runs=[run_doc(run_id=777, event="push", head_repo="someone/pohunek")],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_dispatch_source_of_another_tier_supplies_nothing(self):
+        # A dispatch source whose title names another tier (here nightly)
+        # never supplies main reuse, even when the tree matches.
+        self.write_fixture(
+            runs=[{**run_doc(run_id=777, event="workflow_dispatch",
+                           head_sha=SHA, branch="main"),
+                    "display_title": "CI [tier=nightly]"}],
             jobs_by_run={"777": green_jobs()},
             artifacts={"777": [
                 {"name": f"tested-tree-{TREE}", "id": 1},
@@ -782,6 +849,46 @@ else:
         # A push source must be a main-branch push (run_tier main).
         self.write_fixture(
             runs=[{**run_doc(run_id=777, event="push"), "head_branch": "zajca/feature"}],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+
+    def test_a_consumer_on_an_unknown_event_refuses_reuse(self):
+        # `ci-reuse` answers only push and delta-dispatch consumers: a
+        # schedule consumer refuses before any listing, so the refusal
+        # text names the event instead of reusing anything.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "schedule"
+            rc = self.run_script_with_tree(TREE)
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
+
+    def test_a_run_created_before_the_window_supplies_nothing(self):
+        # A run created more than 24h ago never supplies reuse, even when
+        # every leg is green and fresh: the run-level age guard drops it
+        # before any job is considered.
+        old = {**run_doc(run_id=777, event="push"),
+               "created_at": "2026-11-10T11:00:00Z"}
+        self.write_fixture(
+            runs=[old],
             jobs_by_run={"777": green_jobs()},
             artifacts={"777": [
                 {"name": f"tested-tree-{TREE}", "id": 1},
@@ -841,21 +948,55 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
-    def test_a_query_is_bounded_by_date_not_by_count(self):
-        # L6 guard: the API filter is `created>=now-24h` in the query and
-        # there is no page/candidate cap; a listing with 150 candidates
-        # makes 150 candidate lookups, not a silent cap at 100.
-        runs = [run_doc(run_id=1000 + i, event="pull_request", head_sha="b" * 40) for i in range(150)]
-        jobs_by_run = {str(1000 + i): green_jobs() for i in range(150)}
-        artifacts = {str(1000 + i): [{"name": "tested-tree-" + "d" * 40, "id": 1}] for i in range(150)}
-        self.write_fixture(runs=runs, jobs_by_run=jobs_by_run, artifacts=artifacts)
+    def test_a_leg_lost_between_listings_runs_everything(self):
+        # A leg that was green in the decide listing but is gone when the
+        # record entries are read resets the whole decision: the record
+        # must not name a job the source no longer lists.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        # The record entries are read off a second jobs listing, after
+        # decide: drop every leg there so the source no longer lists the
+        # reused legs and the whole decision resets.
+        fixture = json.loads(self.fixture.read_text())
+        fixture["pages"] = {"jobs_by_run": {"777": [[{"jobs": green_jobs()}], [{"jobs": []}]]}}
+        self.fixture.write_text(json.dumps(fixture))
         rc = self.run_script_with_tree(TREE)
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
-        fixture = json.loads(self.fixture.read_text())
-        self.assertEqual(fixture.get("queried_runs", 1), 1)  # one listing, no cap claim; kill by inspecting query args in dry-run
+        record = self.record(TREE)
+        self.assertEqual(record["jobs"], {})
+        self.assertEqual(record["source_runs"], [])
 
-    def test_dry_run_prints_the_query_args(self):
+    def test_a_listing_query_filters_by_the_reuse_window(self):
+        # The listing query carries the reuse window to the API: the `created`
+        # filter starts at now-24h, so the listing never grows unbounded.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [{"name": f"tested-tree-{TREE}", "id": 1}]},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        listings = [
+            json.loads(line) for line in self.calls.read_text().splitlines()
+            if "actions/workflows/ci.yml/runs" in " ".join(json.loads(line))
+        ]
+        self.assertEqual(len(listings), 1)
+        query = " ".join(listings[0])
+        self.assertIn("per_page=100", query)
+        since = (NOW - datetime.timedelta(hours=24)).date().isoformat()
+        self.assertIn(f"created=>={since}", query.replace(" ", ""))
+
+    def test_dry_run_reports_the_decision_without_writing_outputs(self):
+        # `--dry-run` prints the decision but writes neither the record nor
+        # the step outputs: a planning probe must not publish reuse.
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": green_jobs()},
@@ -873,10 +1014,10 @@ else:
         out = buffer.getvalue()
         self.assertEqual(rc, 0)
         lines = [line for line in out.strip().splitlines() if line.startswith("{")]
-        payload = json.loads(lines[0])
-        self.assertEqual(payload["query"]["per_page"], 100)
-        self.assertIn("created_since", payload["query"])
-        self.assertIn("skip", json.loads(lines[-1]))
+        decision = json.loads(lines[-1])
+        self.assertIn("test", decision["skip"])
+        self.assertEqual(self.output.read_text(), "")
+        self.assertFalse((self.directory / f"ci-reuse-{TREE}.json").exists())
 
 
 if __name__ == "__main__":

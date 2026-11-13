@@ -516,7 +516,7 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
         runs = []
         listed = False
     if dry_run:
-        print(json.dumps({"query": {"workflow_file": workflow_file, "created_since": (moment - datetime.timedelta(hours=24)).date().isoformat(), "per_page": 100}, "consumer_event": consumer_event}))
+        print(json.dumps({"consumer_event": consumer_event}))
     job_reasons: dict[str, str] = {}
     sources: dict[str, dict] = {}
     skip: list[str] = []

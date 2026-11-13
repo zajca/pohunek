@@ -1389,14 +1389,14 @@ jobs:
         fixture = json.loads(self.fixture.read_text())
         fixture["artifact_zips"]["11"] = reuse_zip(
             TREE,
-            {"matrix": [REUSE_JOB], "extra": ["extra check (linux)"]},
+            {"matrix": [REUSE_JOB], "required": ["required check"]},
             source_run_id=REUSE_SOURCE_ID,
         )
         # The per-job run of the second job is overridden to 888.
         import base64, io, zipfile as _zip
         record_zip = _zip.ZipFile(io.BytesIO(base64.b64decode(fixture["artifact_zips"]["11"])))
         record = json.loads(record_zip.read(f"ci-reuse-{TREE}.json"))
-        record["jobs"]["extra"]["run_id"] = OTHER_SOURCE
+        record["jobs"]["required"]["run_id"] = OTHER_SOURCE
         buffer = io.BytesIO()
         with _zip.ZipFile(buffer, "w", _zip.ZIP_DEFLATED) as archive:
             archive.writestr(f"ci-reuse-{TREE}.json", json.dumps(record))
@@ -1406,12 +1406,11 @@ jobs:
             repo=REPO, head_repo=REPO,
         )
         fixture["artifacts"][str(OTHER_SOURCE)] = [f"tested-tree-{TREE}"]
-        source_jobs = jobs_page()
-        extra_job = source_jobs["jobs"][0]
-        extra_job = dict(extra_job, name="extra check (linux)", conclusion="success")
-        fixture["jobs_by_run"][str(OTHER_SOURCE)] = {"jobs": [extra_job]}
+        source_jobs = jobs_page(overrides={"required check": "success"})
+        second = [job for job in source_jobs["jobs"] if job["name"] == "required check"]
+        fixture["jobs_by_run"][str(OTHER_SOURCE)] = {"jobs": second}
         # The evidence run 456 shows both jobs skipped.
-        fixture["jobs_by_run"]["456"] = jobs_page(overrides={REUSE_JOB: "skipped", "extra check (linux)": "skipped"})
+        fixture["jobs_by_run"]["456"] = jobs_page(overrides={REUSE_JOB: "skipped", "required check": "skipped"})
         self.fixture.write_text(json.dumps(fixture))
         result = self.invoke("main", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1440,16 +1439,33 @@ jobs:
         self.assertEqual(report["reused_from"]["run_ids"], [REUSE_SOURCE_ID])
 
     def test_a_push_reuse_union_is_refused_for_an_audit_record_entry(self):
-        # Cargo-audit is never excused — a record naming it is refused.
+        # Cargo-audit is never excused — a record naming the audit job
+        # refuses the union even when the source leg is green. The
+        # evidence run shows the audit leg skipped (reused) and the
+        # source 777 lists it green.
         union_fixture(self)
         fixture = json.loads(self.fixture.read_text())
         fixture["artifact_zips"]["11"] = reuse_zip(
-            TREE, {"matrix": [REUSE_JOB], "cargo-audit": ["cargo-audit (RustSec advisories)"]},
+            TREE, {"matrix": [REUSE_JOB], "audit": ["cargo-audit (RustSec advisories)"]},
             source_run_id=REUSE_SOURCE_ID,
         )
+        source_jobs = fixture["jobs_by_run"][str(REUSE_SOURCE_ID)]["jobs"]
+        source_jobs.append(dict(
+            source_jobs[0], name="cargo-audit (RustSec advisories)",
+            conclusion="success",
+        ))
+        fixture["jobs_by_run"]["456"]["jobs"].append({
+            "name": "cargo-audit (RustSec advisories)",
+            "status": "completed",
+            "conclusion": "skipped",
+            "completed_at": "2026-11-12T11:00:00Z",
+        })
         self.fixture.write_text(json.dumps(fixture))
         result = self.invoke("main", "--json")
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is never reused", result.stderr)
+        self.assertIn("cargo-audit (RustSec advisories)", result.stderr)
+        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
 
     def test_a_dispatch_evidence_refuses_a_same_tree_source_on_another_commit(self):
         # Row 15 regression: evidence on the tree path (dispatch
@@ -1537,14 +1553,15 @@ jobs:
         import json as _json
         raw = _zip.ZipFile(io.BytesIO(base64.b64decode(fixture["artifact_zips"]["11"])))
         record = _json.loads(raw.read(f"ci-reuse-{TREE}.json"))
-        record["jobs"]["extra"] = {"run_id": 888, "names": ["extra check (linux)"], "source_job_ids": [], "completed_at": []}
+        record["jobs"]["required"] = {"run_id": 888, "names": ["required check"], "source_job_ids": [], "completed_at": []}
         buffer = io.BytesIO()
         with _zip.ZipFile(buffer, "w", _zip.ZIP_DEFLATED) as archive:
             archive.writestr(f"ci-reuse-{TREE}.json", _json.dumps(record))
         fixture["artifact_zips"]["11"] = base64.b64encode(buffer.getvalue()).decode()
         fixture["runs_by_id"]["888"] = run_doc(sha=SHA, event="pull_request", branch="zajca/feature", run_id=888, repo=REPO, head_repo=REPO)
         fixture["artifacts"]["888"] = [f"tested-tree-{TREE}"]
-        fixture["jobs_by_run"]["888"] = {"jobs": [{"name": "extra check (linux)", "conclusion": "success", "completed_at": "2026-11-12T11:00:00Z"}]}
+        fixture["jobs_by_run"]["888"] = {"jobs": [{"name": "required check", "status": "completed", "conclusion": "success", "completed_at": "2026-11-12T11:00:00Z"}]}
+        fixture["jobs_by_run"]["456"] = jobs_page(overrides={REUSE_JOB: "skipped", "required check": "skipped"})
         self.fixture.write_text(json.dumps(fixture))
         result = self.invoke("main", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1702,14 +1719,14 @@ jobs:
         self.assertIn("/actions/runs/456", result.stderr)
 
     def test_a_reuse_union_is_refused_for_a_disallowed_source_event(self):
+        # `workflow_dispatch` is a lawful source event; narrowing the
+        # allowlist to just `push` refuses the dispatch source by name.
         union_fixture(self)
-        fixture = json.loads(self.fixture.read_text())
-        source = run_doc(
-            sha=SHA, event="workflow_dispatch", branch="zajca/feature", run_id=REUSE_SOURCE_ID,
-            repo=REPO, head_repo=REPO,
-        )
-        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source
-        self.fixture.write_text(json.dumps(fixture))
+        self.config_data["reuse"] = {
+            "max_age_hours": 24,
+            "source_events": ["push"],
+        }
+        self.write_config()
         result = self.invoke("main")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not allow for reuse", result.stderr)
