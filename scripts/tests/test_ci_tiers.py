@@ -3802,16 +3802,25 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertTrue(value, "a failed reuse job must fail the verdict")
 
     def test_the_duplicates_step_counts_both_runs_reports(self):
-        # The inline step downloads every source run in sorted age order
-        # then this run's own, so same-name reports overwrite with the
-        # newest. The primary source download must precede the own one.
+        # Reused reports come from the record's per-job runs first, then
+        # this run's own reports overwrite them through the pinned
+        # download action. The reused download must precede the own one.
         body = workflow_jobs()["test-duplicates"]
-        self.assertIn("needs.reuse.outputs.source_runs", body)
+        self.assertIn("needs.reuse.outputs.tree", body)
         self.assertIn('python3 scripts/test-duplicates "$RUNNER_TEMP/junit"', body)
-        self.assertIn("Download the reused and own JUnit reports in age order", body)
-        self.assertIn("sorted", body, "source runs are downloaded in sorted age order")
-        self.assertIn("SOURCE_RUNS:", body)
-        self.assertNotIn("merge-multiple", body)
+        self.assertIn("scripts/ci-reuse-junit", body)
+        self.assertIn("ci-reuse-${{ needs.reuse.outputs.tree }}", body)
+        reused_at = body.index("scripts/ci-reuse-junit")
+        own_at = body.index("Download the run's JUnit reports")
+        self.assertLess(
+            reused_at, own_at,
+            "the per-job record download must precede this run's own download",
+        )
+        self.assertIn(
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+            body[own_at:],
+            "this run's own reports arrive through the pinned download action",
+        )
 
     def test_the_reuse_job_runs_only_on_a_delta_dispatch(self):
         job = workflow_jobs()[REUSE_JOB]

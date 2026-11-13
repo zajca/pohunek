@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Download the reused jobs' JUnit reports from their source runs (#2204).
+
+Reads the `ci-reuse-<tree>` record the `reuse` job uploaded: each entry of
+`jobs` names the source run the job was reused from (`run_id`). For every
+reused job that produces a JUnit artifact, this script downloads that job's
+artifact from the run its record entry names, never by run age: two source
+runs holding the same artifact name each supply only the jobs the record
+takes from them. Jobs the record does not name are never touched, so this
+run's own reports (downloaded afterwards by the pinned
+`actions/download-artifact`) win every name collision.
+
+`gh` failures are retried a bounded number of times; an exhausted retry
+fails the step, so `test-duplicates` never checks a silently partial set.
+A missing record (reuse skipped or the kill switch off), a record without
+jobs, and a missing or expired artifact are not errors: the job simply has
+no reused report to contribute.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+
+# Every reused job that uploads a JUnit report, with the artifact names the
+# workflow uploads for it. Jobs without a JUnit report (lint, docs, builds)
+# are absent: the record may name them, but there is nothing to download.
+JOB_JUNIT: dict[str, tuple[str, ...]] = {
+    "platform-contracts": ("macos-lane-junit",),
+    "macos-tier": ("macos-tier-junit",),
+    "hermes-compatibility-macos": ("hermes-macos-junit",),
+    "fast-tests": (
+        "nextest-junit-core",
+        "nextest-junit-daemon",
+        "nextest-junit-cli",
+    ),
+    "integration": ("nextest-junit-heavy",),
+}
+
+MAX_ATTEMPTS = 3
+LIST_TIMEOUT = 60
+ZIP_TIMEOUT = 120
+
+
+class JunitError(Exception):
+    """A download this step cannot complete: fail so no partial set is checked."""
+
+
+def warn(message: str) -> None:
+    print(f"::warning::ci-reuse-junit: {message}", flush=True)
+
+
+def run_gh(arguments: list[str], timeout: int, kind: str) -> bytes:
+    """Run `gh` with bounded retries; return stdout on success."""
+    last = "unknown error"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                ["gh", *arguments],
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+            )
+        except FileNotFoundError as error:
+            raise JunitError("gh is required to download JUnit reports") from error
+        except subprocess.TimeoutExpired:
+            last = f"gh timed out ({kind})"
+        else:
+            if result.returncode == 0:
+                return result.stdout
+            detail = result.stderr.decode(errors="replace").strip() if isinstance(result.stderr, bytes) else str(result.stderr or "").strip()
+            last = detail or f"gh exited with status {result.returncode} ({kind})"
+        if attempt < MAX_ATTEMPTS:
+            warn(f"{last}; retrying ({attempt}/{MAX_ATTEMPTS})")
+            time.sleep(attempt)
+    raise JunitError(f"{last}; giving up after {MAX_ATTEMPTS} attempts ({kind})")
+
+
+def list_artifacts(repo: str, run_id: int) -> dict[str, int]:
+    """The live (non-expired) artifacts of one run, by name."""
+    raw = run_gh(
+        [
+            "api", "--method", "GET", "--paginate", "--slurp",
+            f"repos/{repo}/actions/runs/{run_id}/artifacts",
+            "-f", "per_page=100",
+        ],
+        LIST_TIMEOUT,
+        f"list artifacts of run {run_id}",
+    )
+    try:
+        pages = json.loads(raw.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise JunitError(f"run {run_id} returned invalid artifact JSON") from error
+    if not isinstance(pages, list):
+        raise JunitError(f"run {run_id} returned an invalid artifact list")
+    found: dict[str, int] = {}
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        artifacts = page.get("artifacts")
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            name = artifact.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            if artifact.get("expired"):
+                continue
+            artifact_id = artifact.get("id")
+            if not isinstance(artifact_id, int):
+                continue
+            found.setdefault(name, artifact_id)
+    return found
+
+
+def download_zip(repo: str, artifact_id: int, artifact_name: str, run_id: int) -> bytes:
+    return run_gh(
+        [
+            "api", "--method", "GET",
+            f"repos/{repo}/actions/artifacts/{artifact_id}/zip",
+        ],
+        ZIP_TIMEOUT,
+        f"download {artifact_name} of run {run_id}",
+    )
+
+
+def download_record_jobs(record: dict, repo: str, dest: Path) -> list[str]:
+    """Download every reused job's JUnit artifacts; return the names written."""
+    jobs = record.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        return []
+    wanted: dict[int, list[str]] = {}
+    for job_id, entry in jobs.items():
+        artifacts = JOB_JUNIT.get(job_id)
+        if not artifacts:
+            continue
+        if not isinstance(entry, dict):
+            warn(f"record entry for {job_id} is not an object; skipping")
+            continue
+        run_id = entry.get("run_id")
+        if not isinstance(run_id, int):
+            warn(f"record entry for {job_id} names no run id; skipping")
+            continue
+        wanted.setdefault(run_id, [])
+        for name in artifacts:
+            if name not in wanted[run_id]:
+                wanted[run_id].append(name)
+    downloaded: list[str] = []
+    for run_id in sorted(wanted):
+        try:
+            available = list_artifacts(repo, run_id)
+        except JunitError as error:
+            raise JunitError(f"cannot list artifacts of source run {run_id}: {error}") from error
+        for name in wanted[run_id]:
+            artifact_id = available.get(name)
+            if artifact_id is None:
+                warn(f"source run {run_id} has no live {name}; skipping")
+                continue
+            try:
+                raw = download_zip(repo, artifact_id, name, run_id)
+            except JunitError as error:
+                raise JunitError(f"cannot download {name} of source run {run_id}: {error}") from error
+            try:
+                archive = zipfile.ZipFile(io.BytesIO(raw))
+            except zipfile.BadZipFile as error:
+                raise JunitError(f"{name} of source run {run_id} is not a zip") from error
+            target = dest / name
+            target.mkdir(parents=True, exist_ok=True)
+            try:
+                archive.extractall(target)
+            except (OSError, EOFError, zipfile.BadZipFile) as error:
+                raise JunitError(f"cannot unpack {name} of source run {run_id}: {error}") from error
+            downloaded.append(name)
+    return downloaded
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Download reused jobs' JUnit reports from their record runs.",
+    )
+    parser.add_argument("--record", type=Path, required=True,
+                        help="the ci-reuse-<tree>.json record file")
+    parser.add_argument("--dest", type=Path, required=True,
+                        help="the junit directory to write into")
+    parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
+                        help="owner/name (default: $GITHUB_REPOSITORY)")
+    args = parser.parse_args(argv)
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
+        print("ci-reuse-junit: --repo is not in owner/name form", file=sys.stderr)
+        return 1
+    try:
+        text = args.record.read_text()
+    except OSError:
+        print(f"ci-reuse-junit: no record at {args.record}; nothing reused", flush=True)
+        return 0
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError as error:
+        print(f"ci-reuse-junit: unreadable record {args.record}: {error}", file=sys.stderr)
+        return 1
+    if not isinstance(record, dict):
+        print(f"ci-reuse-junit: unreadable record {args.record}", file=sys.stderr)
+        return 1
+    args.dest.mkdir(parents=True, exist_ok=True)
+    try:
+        downloaded = download_record_jobs(record, args.repo, args.dest)
+    except JunitError as error:
+        print(f"ci-reuse-junit: {error}", file=sys.stderr)
+        return 1
+    if downloaded:
+        print(f"ci-reuse-junit: downloaded {', '.join(sorted(set(downloaded)))}")
+    else:
+        print("ci-reuse-junit: nothing reused; no reports downloaded", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
