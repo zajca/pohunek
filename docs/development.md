@@ -210,7 +210,7 @@ call is refused and the run keeps its real failure.
 **Delta dispatch and push reuse.** A `workflow_dispatch` run of `ci.yml` with `tier=main`
 accepts `delta: true`, and a `main` push reuses green jobs while the workflow-level
 `CI_REUSE_PUSH` kill switch is `"true"` (issue #2204; set it to `"false"` to turn
-push reuse off — a tier=main delta dispatch is unaffected): the `delta reuse` job
+push reuse off — a tier=main delta dispatch is unaffected): the `reuse` job
 finds the newest green legs of the previous runs of the same tree from this
 repository — pull request runs, prior main pushes, and tier=main delta dispatches,
 each within 24 hours, fork runs never — and reuses those green legs (per job, the

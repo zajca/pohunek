@@ -442,8 +442,8 @@ Release packaging and contributor verification:
 - `scripts/changelog` — validates the `changelog.d/` fragments and folds them
   into the committed `CHANGELOG.md`; `notes` prints the release-body block.
 - `scripts/ci-evidence` — verifies successful Actions jobs and steps for an
-  exact commit, with optional dispatch and bounded polling; accepts a delta
-  dispatch's union with its recorded source run.
+  exact commit, with optional dispatch; accepts the evidence run's union
+  with every recorded source run.
 - `scripts/ci-reuse` — decides which jobs a `tier=main` delta dispatch or a
   `main` push reuses from the newest green legs of same-tree runs of this
   repo (PR, push, tier=main dispatch, within 24h, fork never, recorded
