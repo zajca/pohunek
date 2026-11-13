@@ -1651,12 +1651,16 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR}/bus" >> "$GITHUB_ENV"
           systemctl --user is-system-running --wait || systemctl --user is-system-running | grep -qx degraded
 
-      # The exit-evidence OOM scenario needs the user manager to enforce
-      # MemoryMax, which requires the memory controller to be delegated to it.
+      # The exit-evidence OOM scenarios need the user manager to enforce
+      # MemoryMax, which requires the memory controller to be delegated to
+      # it; the step also prints swap and system PSI for the oomd
+      # scenario's diagnosis.
       - name: Show the controllers delegated to the user manager
         run: |
           systemctl show -p Delegate -p DelegateControllers user@"$(id -u)".service || true
           cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers" || true
+          swapon --show || true
+          cat /proc/pressure/memory || true
 
       # The exit-evidence scenario for a worker that systemd-oomd kills needs
       # the daemon running on the host; the scenario fails with a stated
@@ -1674,6 +1678,11 @@ jobs:
             --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
             sudo sh -c 'apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y systemd-oomd'
           sudo systemctl enable --now systemd-oomd
+          # Debug without D-Bus: a drop-in sets the level, then restart.
+          sudo install -d /etc/systemd/system/systemd-oomd.service.d
+          printf '[Service]\nEnvironment=SYSTEMD_LOG_LEVEL=debug\n' | sudo tee /etc/systemd/system/systemd-oomd.service.d/10-log-level.conf >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl restart systemd-oomd
           systemctl is-active systemd-oomd
 
       - name: Build daemon, worker, and CLI binaries
@@ -1689,6 +1698,12 @@ jobs:
 
       - name: Platform systemd backend
         run: cargo test --locked -p pohunek-platform --test systemd -- --ignored --test-threads 1
+
+      - name: systemd-oomd journal on failure
+        if: failure()
+        timeout-minutes: 10
+        run: |
+          sudo journalctl -u systemd-oomd --no-pager -o short-monotonic || true
 
       - name: Daemon durability on transient units
         if: ${{ !cancelled() }}

@@ -37,7 +37,7 @@ PINNED_BODY_HASHES = {
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "91fd4a3eba97ea08007c9203aeb3607395904db4fdd4799b799fdb30c98f2b76",
-  "systemd-supervision": "136b7ca4ff89be58ac9bf88690141c2ddca660d72817d7b0ff8982fc9627da3a",
+  "systemd-supervision": "a04fe11b2d6067b7e86548f20a07d951c5485b11e5629c86e5ab9281424b4f86",
   "test": "57d245e3425664af417be6791a9dc8eead22f2c0eb2a2d09f21a5d5bb445600b",
   "ts-drift": "d18b132a9b0a47f66735ed031448f0503a5af9840521fb481c69db78d6dc4cc1",
   "udeps": "71da2c358e8873c1d9075d2410840afa7d476d50e01a8909716a25f51dbef38f",
