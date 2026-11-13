@@ -1104,7 +1104,7 @@ async fn wait_for_observed_pid(
 /// triggered.
 async fn wait_for_cleared_agent(
     id: &SessionId,
-    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
 ) -> SessionInfo {
     guard("the event reporting no active agent", async {
         loop {
@@ -1135,7 +1135,7 @@ async fn wait_for_scans_after_thaw(inspector: &PollBlindInspector) {
 ///
 /// A lagged receiver panics: a skipped event could be the one being awaited.
 async fn next_session_event(
-    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
     name: &str,
 ) -> SessionInfo {
     loop {
@@ -1188,7 +1188,7 @@ async fn assert_external_detection_unavailable(registry: &SessionRegistry, id: &
 /// triggered.
 async fn wait_for_external_gone(
     id: &SessionId,
-    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
 ) {
     guard("the removal event of the external session", async {
         loop {

@@ -848,7 +848,8 @@ struct SessionRegistryInner {
     profiles: ProfileRegistry,
     /// Version-probe results shared by every `host.inspect`.
     probe_cache: crate::capabilities::ProbeCache,
-    events: broadcast::Sender<Event>,
+    /// Session lifecycle events. Every subscriber shares one allocation per event.
+    events: broadcast::Sender<Arc<Event>>,
     /// The same events with the instant each was published, for the consumers
     /// that order an event against other producers' records.
     produced_events: broadcast::Sender<ProducedEvent>,
@@ -2832,7 +2833,7 @@ impl SessionRegistry {
 
     /// Subscribe to session lifecycle events.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<Event>> {
         self.inner.events.subscribe()
     }
 
@@ -2846,9 +2847,10 @@ impl SessionRegistry {
     /// Publishes `event` to every subscriber, stamping the moment it is
     /// produced, before any subscriber's queue holds it.
     fn publish(&self, event: Event) {
+        let event = Arc::new(event);
         let produced = std::time::Instant::now();
         let _ = self.inner.produced_events.send(ProducedEvent {
-            event: event.clone(),
+            event: Arc::clone(&event),
             produced,
             origin: EventOrigin::Live,
         });
@@ -8283,9 +8285,12 @@ impl SessionRegistry {
     /// unchanged. The notification projector takes it as a baseline and
     /// notifies nothing.
     fn emit_replayed(&self, name: &str, info: &SessionInfo) {
-        let event = crate::events::event(name, event_payload(SessionEventRef { session: info }));
+        let event = Arc::new(crate::events::event(
+            name,
+            event_payload(SessionEventRef { session: info }),
+        ));
         let _ = self.inner.produced_events.send(ProducedEvent {
-            event: event.clone(),
+            event: Arc::clone(&event),
             produced: std::time::Instant::now(),
             origin: EventOrigin::Replayed,
         });

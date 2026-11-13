@@ -56,6 +56,7 @@ use super::{
     WorkerMetadataProgress, WorkerMetadataRetryCause, WorkerMetadataTracker,
     MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
+use crate::events::{EventOrigin, ProducedEvent};
 
 mod cline_hook;
 mod codex_no_daemon;
@@ -1942,7 +1943,7 @@ pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str)
 /// Panics when the receiver lagged past the terminal event or no terminal
 /// event arrives within [`HANG_GUARD`].
 pub(super) async fn exit_settled(
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<Event>>,
     id: &SessionId,
 ) {
     guard(&format!("the terminal event of session {}", id.0), async {
@@ -1980,7 +1981,7 @@ pub(super) async fn exit_settled(
 /// [`HANG_GUARD`].
 pub(super) async fn stop_settled(
     registry: &SessionRegistry,
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<Event>>,
     id: &SessionId,
 ) {
     exit_settled(events, id).await;
@@ -2064,7 +2065,7 @@ struct MockInspectorState {
     /// Pids whose exit watch cannot be armed; the flag marks the process as
     /// gone once arming was attempted.
     exit_watch_failures: HashMap<Pid, bool>,
-    events_expected_before_watch: HashMap<Pid, tokio::sync::broadcast::Receiver<Event>>,
+    events_expected_before_watch: HashMap<Pid, tokio::sync::broadcast::Receiver<Arc<Event>>>,
     ownership_markers: HashMap<Pid, OwnershipMarkers>,
     descendant_scans_started: usize,
     descendant_scans_finished: usize,
@@ -2265,7 +2266,7 @@ impl MockInspector {
     fn expect_created_before_exit_watch(
         &self,
         pid: Pid,
-        events: tokio::sync::broadcast::Receiver<Event>,
+        events: tokio::sync::broadcast::Receiver<Arc<Event>>,
     ) {
         self.inner
             .lock()
@@ -3266,7 +3267,7 @@ async fn a_reported_turn_takes_the_input_it_answers() {
 }
 
 /// The `agent_state` events the registry broadcast since `events` was taken.
-fn agent_states(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
+fn agent_states(events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>) -> usize {
     std::iter::from_fn(|| events.try_recv().ok())
         .filter(|event| event.event() == protocol::event::AGENT_STATE)
         .count()
@@ -4132,7 +4133,9 @@ fn pohunek_env_keys(env: &std::collections::HashMap<String, String>) -> Vec<Stri
     keys
 }
 
-async fn next_session_updated(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
+async fn next_session_updated(
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<Event>>,
+) -> SessionInfo {
     let event = guard("the session_updated event", async {
         loop {
             let event = rx.recv().await.expect("receive session event");
@@ -4145,7 +4148,9 @@ async fn next_session_updated(rx: &mut tokio::sync::broadcast::Receiver<Event>) 
     serde_json::from_value(event.payload()["session"].clone()).expect("session info payload")
 }
 
-async fn next_session_removed(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
+async fn next_session_removed(
+    rx: &mut tokio::sync::broadcast::Receiver<Arc<Event>>,
+) -> SessionInfo {
     let event = guard("the session_removed event", async {
         loop {
             let event = rx.recv().await.expect("receive session event");
@@ -6826,19 +6831,19 @@ async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
         .await;
     let (tx, rx) = tokio::sync::broadcast::channel(1);
     for n in 0..8 {
-        let _ = tx.send(crate::events::event(
+        let _ = tx.send(Arc::new(crate::events::event(
             protocol::event::SESSION_UPDATED,
             serde_json::json!({ "n": n }),
-        ));
+        )));
     }
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handle = super::spawn_agent_state_hook_dispatcher(registry.clone(), rx, shutdown.clone());
     wait_for_file_contains(&marker, "working").await;
     for n in 8..16 {
-        let _ = tx.send(crate::events::event(
+        let _ = tx.send(Arc::new(crate::events::event(
             protocol::event::SESSION_UPDATED,
             serde_json::json!({ "n": n }),
-        ));
+        )));
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     let contents = fs::read_to_string(&marker).expect("read marker after same-state lag");
@@ -6851,14 +6856,14 @@ async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
     registry
         .record_activity(&created.id, transition(AgentActivity::Blocked))
         .await;
-    tx.send(crate::events::event(
+    tx.send(Arc::new(crate::events::event(
         protocol::event::AGENT_STATE,
         serde_json::json!({
             "session_id": created.id.clone(),
             "activity": "blocked",
             "source": "process",
         }),
-    ))
+    )))
     .expect("send blocked event");
     wait_for_file_contains(&marker, "blocked").await;
 
@@ -6903,14 +6908,14 @@ async fn agent_state_hook_dispatcher_flushes_buffered_event_on_shutdown() {
     let (tx, rx) = tokio::sync::broadcast::channel(16);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let handle = super::spawn_agent_state_hook_dispatcher(registry.clone(), rx, shutdown.clone());
-    tx.send(crate::events::event(
+    tx.send(Arc::new(crate::events::event(
         protocol::event::AGENT_STATE,
         serde_json::json!({
             "session_id": created.id.clone(),
             "activity": "working",
             "source": "process",
         }),
-    ))
+    )))
     .expect("send buffered event");
     shutdown.cancel();
     handle.await.expect("dispatcher joins after cancellation");
@@ -11918,7 +11923,92 @@ async fn session_input_wait_uses_rapid_target_event_after_latest_state_changes()
     registry.stop(&created.id).await.expect("stop the session");
 }
 
-fn drain_agent_state(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
+fn sleeping_registry() -> SessionRegistry {
+    SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    })
+}
+
+#[tokio::test]
+async fn one_session_event_reaches_every_subscriber_as_one_shared_value() {
+    let registry = sleeping_registry();
+    let mut first = registry.subscribe();
+    let mut second = registry.subscribe();
+    let mut produced = registry.subscribe_produced();
+    let created = registry
+        .create(params())
+        .await
+        .expect("create shell session");
+    let first_event = guard_created_event(&mut first, &created.id).await;
+    let second_event = guard_created_event(&mut second, &created.id).await;
+    let produced_event = guard_created_produced(&mut produced, &created.id).await;
+    assert!(
+        Arc::ptr_eq(&first_event, &second_event),
+        "both session subscribers share one event allocation"
+    );
+    assert!(
+        Arc::ptr_eq(&first_event, &produced_event.event),
+        "the produced channel shares the session subscribers' allocation"
+    );
+    assert_eq!(
+        produced_event.origin,
+        EventOrigin::Live,
+        "the created event arrives on the produced channel as live"
+    );
+    registry.stop(&created.id).await.expect("stop the session");
+}
+
+async fn guard_created_event(
+    events: &mut tokio::sync::broadcast::Receiver<Arc<Event>>,
+    id: &SessionId,
+) -> Arc<Event> {
+    guard(&format!("the created event of session {}", id.0), async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .expect("the event receiver keeps up with the registry");
+            if event.event() == protocol::event::SESSION_CREATED {
+                let info: SessionInfo = serde_json::from_value(event.payload()["session"].clone())
+                    .expect("session info payload");
+                if info.id == *id {
+                    return event;
+                }
+            }
+        }
+    })
+    .await
+}
+
+async fn guard_created_produced(
+    events: &mut tokio::sync::broadcast::Receiver<ProducedEvent>,
+    id: &SessionId,
+) -> ProducedEvent {
+    guard(
+        &format!("the produced created event of session {}", id.0),
+        async {
+            loop {
+                let produced = events
+                    .recv()
+                    .await
+                    .expect("the produced receiver keeps up with the registry");
+                if produced.event.event() == protocol::event::SESSION_CREATED {
+                    let info: SessionInfo =
+                        serde_json::from_value(produced.event.payload()["session"].clone())
+                            .expect("session info payload");
+                    if info.id == *id {
+                        return produced;
+                    }
+                }
+            }
+        },
+    )
+    .await
+}
+
+fn drain_agent_state(events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>) -> usize {
     let mut count = 0;
     while let Ok(event) = events.try_recv() {
         if event.event() == protocol::event::AGENT_STATE {
@@ -11939,14 +12029,6 @@ async fn shell_session(registry: &SessionRegistry) -> protocol::SessionInfo {
         .detector_cancel
         .cancel();
     created
-}
-
-fn sleeping_registry() -> SessionRegistry {
-    SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
-        ..SessionRegistryConfig::default()
-    })
 }
 
 #[tokio::test]
@@ -16917,9 +16999,9 @@ struct NativeIdExitRace {
     store_path: PathBuf,
     id: SessionId,
     /// Receives every event from before the report on.
-    events: tokio::sync::broadcast::Receiver<Event>,
+    events: tokio::sync::broadcast::Receiver<Arc<Event>>,
     /// Settles the session after the assertions on `events`.
-    settle_events: tokio::sync::broadcast::Receiver<Event>,
+    settle_events: tokio::sync::broadcast::Receiver<Arc<Event>>,
     held: crate::runtime::lifecycle::tests::StartGate,
     reporting: tokio::task::JoinHandle<protocol::SessionReportNativeIdResult>,
 }
@@ -18162,7 +18244,7 @@ async fn assert_exit_transition_committed(
     panic!("{context}: exit transition remained concurrently stale");
 }
 
-async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>) -> String {
+async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Arc<Event>>) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
         let event = tokio::time::timeout_at(deadline, events.recv())
@@ -18176,7 +18258,7 @@ async fn next_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>
 }
 
 async fn next_agent_state_event(
-    events: &mut tokio::sync::broadcast::Receiver<Event>,
+    events: &mut tokio::sync::broadcast::Receiver<Arc<Event>>,
 ) -> protocol::AgentStateEvent {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     loop {
@@ -18191,7 +18273,7 @@ async fn next_agent_state_event(
     }
 }
 
-async fn assert_no_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Event>) {
+async fn assert_no_runtime_event(events: &mut tokio::sync::broadcast::Receiver<Arc<Event>>) {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
     loop {
         let Ok(event) = tokio::time::timeout_at(deadline, events.recv()).await else {

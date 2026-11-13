@@ -58,7 +58,7 @@ pub(crate) fn event(name: &str, payload: serde_json::Value) -> Event {
 /// own queue delays.
 #[derive(Debug, Clone)]
 pub(crate) struct ProducedEvent {
-    pub(crate) event: Event,
+    pub(crate) event: Arc<Event>,
     pub(crate) produced: std::time::Instant,
     /// Whether the event is a change or announces a state the registry
     /// already held unchanged.
@@ -96,7 +96,7 @@ const EVENT_DROPPED: &str = "events_dropped";
 /// What the drain tasks send to the writer thread.
 enum Command {
     /// Journal one event, unless it restates a session's last journaled state.
-    Append(Event),
+    Append(Arc<Event>),
     /// Acknowledge once every earlier command has been processed.
     Flush(oneshot::Sender<()>),
 }
@@ -157,7 +157,7 @@ impl EventLog {
     }
 
     /// Queue one event for the writer thread, waiting while the queue is full.
-    pub async fn append(&self, event: Event) {
+    pub async fn append(&self, event: Arc<Event>) {
         let name = event.event().to_owned();
         if self.queue.send(Command::Append(event)).await.is_err() {
             warn!(event = %name, "event journal writer stopped; event not recorded");
@@ -308,7 +308,7 @@ impl HeartbeatFilter {
 #[must_use]
 pub fn spawn_drain(
     log: Arc<EventLog>,
-    mut events: broadcast::Receiver<Event>,
+    mut events: broadcast::Receiver<Arc<Event>>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -332,7 +332,7 @@ pub fn spawn_drain(
 
 /// Drain every currently-buffered event without awaiting new ones, used for the
 /// final flush on shutdown.
-async fn drain_buffered(log: &EventLog, events: &mut broadcast::Receiver<Event>) {
+async fn drain_buffered(log: &EventLog, events: &mut broadcast::Receiver<Arc<Event>>) {
     loop {
         match events.try_recv() {
             Ok(event) => log.append(event).await,
@@ -348,8 +348,11 @@ async fn drain_buffered(log: &EventLog, events: &mut broadcast::Receiver<Event>)
 /// stays honest about the gap.
 async fn record_lag(log: &EventLog, dropped: u64) {
     warn!(dropped, "event log lagged; some events were not recorded");
-    log.append(event(EVENT_DROPPED, json!({ "dropped": dropped })))
-        .await;
+    log.append(Arc::new(event(
+        EVENT_DROPPED,
+        json!({ "dropped": dropped }),
+    )))
+    .await;
 }
 
 #[cfg(test)]
@@ -431,7 +434,7 @@ mod tests {
     async fn journal(dir: &Path, retention: EventRetention, events: Vec<Event>) -> Arc<EventLog> {
         let log = Arc::new(EventLog::open(dir, retention).expect("open log"));
         for event in events {
-            log.append(event).await;
+            log.append(Arc::new(event)).await;
         }
         log.flush().await;
         log
@@ -627,7 +630,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let drain = spawn_drain(Arc::clone(&log), rx, shutdown.clone());
         for n in 0..8 {
-            tx.send(updated(n)).expect("broadcast send");
+            tx.send(Arc::new(updated(n))).expect("broadcast send");
         }
 
         // The only thread of this runtime is free while the writer sits on the lock.
@@ -654,7 +657,8 @@ mod tests {
         // more; the rest overflow the broadcast buffer while the drain waits.
         let total = WRITER_QUEUE_CAPACITY + 1 + 32;
         for n in 0..total {
-            tx.send(updated(n as u64)).expect("broadcast send");
+            tx.send(Arc::new(updated(n as u64)))
+                .expect("broadcast send");
             tokio::task::yield_now().await;
         }
 
@@ -685,7 +689,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(16);
         let handle = spawn_drain(Arc::clone(&log), rx, CancellationToken::new());
         for n in 0..3 {
-            tx.send(updated(n)).expect("broadcast send");
+            tx.send(Arc::new(updated(n))).expect("broadcast send");
         }
         // Dropping the sender closes the channel; the drain finishes after the
         // writer has every buffered event on disk, so awaiting it is a flush.
@@ -706,7 +710,7 @@ mod tests {
         // The real daemon keeps the broadcast Sender alive at shutdown, so the
         // drain never sees Closed and must rely on the cancellation flush.
         for n in 0..4 {
-            tx.send(updated(n)).expect("broadcast send");
+            tx.send(Arc::new(updated(n))).expect("broadcast send");
         }
         shutdown.cancel();
         handle.await.expect("drain joins after shutdown");
@@ -721,7 +725,7 @@ mod tests {
         let (tx, rx) = broadcast::channel(2);
         // Fill beyond capacity before the drain starts so the first recv lags.
         for n in 0..8 {
-            let _ = tx.send(updated(n));
+            let _ = tx.send(Arc::new(updated(n)));
         }
         let handle = spawn_drain(Arc::clone(&log), rx, CancellationToken::new());
         drop(tx);

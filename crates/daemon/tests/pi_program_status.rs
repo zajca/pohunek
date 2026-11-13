@@ -444,7 +444,7 @@ async fn wait_screen(fixture: &Fixture, id: &SessionId, needle: &str, present: b
 }
 
 /// The `agent_state` events published since `events` was subscribed.
-fn agent_states(events: &mut tokio::sync::broadcast::Receiver<protocol::Event>) -> usize {
+fn agent_states(events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>) -> usize {
     let mut count = 0;
     while let Ok(event) = events.try_recv() {
         if event.event() == protocol::event::AGENT_STATE {
