@@ -58,7 +58,9 @@ use crate::agent::host::{
     decide_claim, is_reserved, version_order, Authority, PackageRejection, PackageStore,
     RuntimeDefinition, RuntimeHost,
 };
-use crate::agent::{apply_pin, parse_head, Pin, ProfileRegistry, ValidatedLaunchProgram};
+use crate::agent::{
+    apply_pin, is_preset, parse_head, Pin, ProfileRegistry, ValidatedLaunchProgram,
+};
 use crate::catalog_anchor::CatalogTrust;
 use crate::integration::{config_path_kind, ConfigPath, Home};
 use crate::session::runtime_host_over;
@@ -748,6 +750,11 @@ fn gather(
                 continue;
             }
         };
+        // A preset pins nothing and is never rewritten: its sessions launch
+        // from its parent, which this scan reaches as a profile of its own.
+        if is_preset(&source) {
+            continue;
+        }
         let head = match parse_head(&source) {
             Ok(head) => head,
             Err(_detail) => {

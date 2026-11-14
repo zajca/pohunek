@@ -66,6 +66,13 @@ pub(super) struct RawOption {
     choices: BTreeMap<String, RawChoice>,
 }
 
+impl RawOption {
+    /// Whether the option declares the choice `choice`.
+    pub(super) fn offers(&self, choice: &str) -> bool {
+        self.choices.contains_key(choice)
+    }
+}
+
 /// One `choices.<id>` entry of a profile option.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

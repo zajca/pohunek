@@ -24,7 +24,7 @@ use super::{
 use crate::agent::host::ServedBy;
 use std::sync::Arc;
 
-use crate::agent::{apply_pin, parse_head, BindError, Pin, ProfileRegistry};
+use crate::agent::{apply_pin, is_preset, parse_head, BindError, Pin, ProfileRegistry};
 
 impl PackageService {
     /// Pins the host agent profile `params.profile` to an installed package.
@@ -192,6 +192,12 @@ pub(super) fn bind_profile(
         dir.remove_stale_temporaries();
     }
     let file = dir.read(name).map_err(|error| bind_kind(name, error))?;
+    if is_preset(file.text()) {
+        return Err(unusable(
+            name,
+            "a preset has no package pin; migrate its parent",
+        ));
+    }
     let head = parse_head(file.text()).map_err(|detail| unusable(name, &detail))?;
     // Compared with the pin of the text this call read; the publish below
     // leaves a profile edited after that read as found, so the comparison and

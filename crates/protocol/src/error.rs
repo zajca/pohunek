@@ -779,6 +779,22 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/agent_options_locked` error: a selection is
+    /// sent for a locked preset, whose choices a launch cannot change. Names
+    /// the preset only.
+    #[must_use]
+    pub fn agent_options_locked(agent: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_options_locked",
+            format!("agent preset '{agent}' is locked; its options cannot be selected"),
+            Some(
+                "start the session without agent options, or start the preset's parent profile"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/agent_option_choice_unavailable` error: a
     /// selected choice declares a `min_runtime` the runtime does not meet, or
     /// the runtime reports no version to compare. Names the ids only.

@@ -356,8 +356,8 @@ pub(crate) enum LabelRead {
 ///
 /// The label-only read of `session list`/`inspect` enrichment. It follows
 /// the existing `read_profile_text` file rules (owner-secure, bounded
-/// UTF-8) with `toml::from_str::<RawProfile>`: no base resolution, no
-/// package lookup.
+/// UTF-8) and parses the file as a profile or a preset, whose own label it
+/// returns: no parent read, no base resolution, no package lookup.
 pub(crate) fn display_name_of(registry: &super::ProfileRegistry, name: &str) -> LabelRead {
     let Some(dir) = registry.dir.as_deref() else {
         return LabelRead::NoLabel;
@@ -376,10 +376,14 @@ pub(crate) fn display_name_of(registry: &super::ProfileRegistry, name: &str) -> 
             LabelRead::Gone
         };
     };
-    let Ok(raw) = toml::from_str::<super::RawProfile>(&content) else {
-        return LabelRead::Broken;
+    let label = match super::preset::parse(name, &content) {
+        Ok(super::preset::RawFile::Profile(raw)) => {
+            raw.display_name.map(|label| label.as_str().to_owned())
+        }
+        Ok(super::preset::RawFile::Preset(preset)) => {
+            super::preset::display_name(&preset).map(str::to_owned)
+        }
+        Err(_error) => return LabelRead::Broken,
     };
-    raw.display_name.map_or(LabelRead::NoLabel, |label| {
-        LabelRead::Label(label.as_str().to_owned())
-    })
+    label.map_or(LabelRead::NoLabel, LabelRead::Label)
 }

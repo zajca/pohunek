@@ -284,7 +284,13 @@ fn host_capabilities_for(
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
         enrich_agent_labels(entry, &agent);
-        if let Some(profile) = agent.profile.as_ref() {
+        // A locked preset offers no choice to a picker; a launch of it
+        // refuses any selection.
+        if let Some(profile) = agent
+            .profile
+            .as_ref()
+            .filter(|profile| !profile.preset.as_ref().is_some_and(|preset| preset.locked))
+        {
             entry.options = options::inspected(&profile.options);
         }
         if launchable.is_ok() {

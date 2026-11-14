@@ -21,7 +21,7 @@ const LAUNCH_OUT: &str = "launch.out";
 /// script records `"$@"` (the profile's trailing `sh` is `$0`, so every
 /// choice arg lands in `"$@"`) and the two option variables, then sleeps.
 /// The file is renamed into place so a reader never sees a partial write.
-const RECORDING_HEAD: &str = r#"base = "shell"
+pub(super) const RECORDING_HEAD: &str = r#"base = "shell"
 program = "/bin/sh"
 args = ['-c', 'printf "%s\n" "$@" > launch.tmp; printf "MODE=%s\nDEPTH=%s\n" "$PH_OPT_MODE" "$PH_OPT_DEPTH" >> launch.tmp; mv launch.tmp launch.out; exec sleep 30', 'sh']
 "#;
@@ -29,7 +29,7 @@ args = ['-c', 'printf "%s\n" "$@" > launch.tmp; printf "MODE=%s\nDEPTH=%s\n" "$P
 /// Two options declared in reverse id order: `mode` before `depth`. The
 /// composed argv takes the selected choices in option-id order, so `depth`
 /// comes first.
-const TWO_OPTIONS: &str = r#"
+pub(super) const TWO_OPTIONS: &str = r#"
 [options.mode]
 label = "Mode"
 default = "calm"
@@ -49,12 +49,12 @@ const MARKER: &str = "MarkerQ7x2";
 
 /// A daemon over an isolated agents directory with a private host state, so
 /// profile sessions can freeze their revision.
-struct OptionRig {
-    socket: TestSocket,
+pub(super) struct OptionRig {
+    pub(super) socket: TestSocket,
     shutdown: tokio::sync::oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
-    control: Framed<UnixStream, LinesCodec>,
-    agents_dir: PathBuf,
+    pub(super) control: Framed<UnixStream, LinesCodec>,
+    pub(super) agents_dir: PathBuf,
     /// Sessions created so far; numbers each session's directory.
     created: usize,
     /// The registry configuration, reused by [`Self::restarted`].
@@ -64,7 +64,7 @@ struct OptionRig {
 impl OptionRig {
     /// Starts a daemon over an empty agents directory; `plugins` enables the
     /// package store.
-    async fn start(tag: &str, plugins: bool) -> Self {
+    pub(super) async fn start(tag: &str, plugins: bool) -> Self {
         let socket = temp_socket(tag);
         let agents_dir = socket.dir.join("agents");
         std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -91,7 +91,7 @@ impl OptionRig {
 
     /// Stops the daemon and starts a new one over the same store, profiles,
     /// packages and socket path, as a daemon restart does.
-    async fn restarted(self) -> Self {
+    pub(super) async fn restarted(self) -> Self {
         let Self {
             socket,
             shutdown,
@@ -126,7 +126,7 @@ impl OptionRig {
     }
 
     /// Stops session `id` through `session.stop`.
-    async fn stop(&mut self, id: &SessionId) {
+    pub(super) async fn stop(&mut self, id: &SessionId) {
         let request = Request::make(
             "agent-options-stop",
             method::SESSION_STOP,
@@ -136,7 +136,7 @@ impl OptionRig {
     }
 
     /// `session.resume` of `id`, accepting a changed profile when `accept`.
-    async fn resume(&mut self, id: &SessionId, accept: bool) -> Response {
+    pub(super) async fn resume(&mut self, id: &SessionId, accept: bool) -> Response {
         let params = if accept {
             serde_json::json!({ "session_id": id, "accept_profile_change": true })
         } else {
@@ -150,7 +150,7 @@ impl OptionRig {
     }
 
     /// The session `id` as `session.list` reports it.
-    async fn listed(&mut self, id: &SessionId) -> SessionInfo {
+    pub(super) async fn listed(&mut self, id: &SessionId) -> SessionInfo {
         let request = Request::make("agent-options-list", method::SESSION_LIST, Value::Null);
         let sessions: Vec<SessionInfo> =
             serde_json::from_value(ok_payload(exchange(&mut self.control, &request).await))
@@ -161,25 +161,25 @@ impl OptionRig {
             .expect("the session is listed")
     }
 
-    async fn finish(self) {
+    pub(super) async fn finish(self) {
         drop(self.control);
         let _ = self.shutdown.send(());
         let _ = self.handle.await;
     }
 
-    fn write_profile(&self, name: &str, text: &str) {
+    pub(super) fn write_profile(&self, name: &str, text: &str) {
         std::fs::write(self.agents_dir.join(format!("{name}.toml")), text)
             .expect("write the agent profile");
     }
 
     /// `session.new` of `agent` in a fresh directory of its own.
-    async fn create(&mut self, agent: &str) -> (Response, PathBuf) {
+    pub(super) async fn create(&mut self, agent: &str) -> (Response, PathBuf) {
         self.create_with(agent, &[], None).await
     }
 
     /// `session.new` of `agent` selecting `options` (option id, choice id),
     /// keyed with `key` when one is given, in a fresh directory of its own.
-    async fn create_with(
+    pub(super) async fn create_with(
         &mut self,
         agent: &str,
         options: &[(&str, &str)],
@@ -200,7 +200,7 @@ impl OptionRig {
 
     /// Runs `host.inspect` and returns its runtime inventory. Its profile
     /// enumeration logs every profile it skips together with its load error.
-    async fn inspect_host(&mut self) -> Vec<protocol::AgentRuntime> {
+    pub(super) async fn inspect_host(&mut self) -> Vec<protocol::AgentRuntime> {
         let request = Request::make("agent-options-inspect", method::HOST_INSPECT, Value::Null);
         let capabilities: protocol::HostCapabilities =
             serde_json::from_value(ok_payload(exchange(&mut self.control, &request).await))
@@ -213,7 +213,7 @@ impl OptionRig {
     }
 
     /// The ids of every session the daemon lists.
-    async fn session_ids(&mut self) -> Vec<SessionId> {
+    pub(super) async fn session_ids(&mut self) -> Vec<SessionId> {
         let request = Request::make("agent-options-list", method::SESSION_LIST, Value::Null);
         let sessions: Vec<SessionInfo> =
             serde_json::from_value(ok_payload(exchange(&mut self.control, &request).await))
@@ -224,7 +224,11 @@ impl OptionRig {
     /// The refusal of `session.new` of `agent` selecting `options`, after
     /// checking that it created nothing: no session is listed and the
     /// launch script never ran.
-    async fn refused(&mut self, agent: &str, options: &[(&str, &str)]) -> protocol::ProtocolError {
+    pub(super) async fn refused(
+        &mut self,
+        agent: &str,
+        options: &[(&str, &str)],
+    ) -> protocol::ProtocolError {
         let before = self.session_ids().await;
         let (response, cwd) = self.create_with(agent, options, None).await;
         let error = err_payload(response);
@@ -241,7 +245,7 @@ impl OptionRig {
     }
 
     /// The `invalid_profile` detail `session.new` of `agent` fails with.
-    async fn load_error(&mut self, agent: &str) -> String {
+    pub(super) async fn load_error(&mut self, agent: &str) -> String {
         let (response, _cwd) = self.create(agent).await;
         let error = err_payload(response);
         assert_eq!(error.code, "invalid_profile", "{agent}: {error:?}");
@@ -255,7 +259,7 @@ impl OptionRig {
 
 /// `session.new` params of `agent` in `cwd` selecting `options`, keyed
 /// with `key` when one is given.
-fn selection_params(
+pub(super) fn selection_params(
     agent: &str,
     cwd: &Path,
     options: &[(&str, &str)],
@@ -272,7 +276,7 @@ fn selection_params(
 }
 
 /// What the launch script recorded in `cwd`, once it has written it.
-async fn recorded_launch(cwd: &Path) -> String {
+pub(super) async fn recorded_launch(cwd: &Path) -> String {
     let path = cwd.join(LAUNCH_OUT);
     wait_until("the launch script records its argv and env", || async {
         std::fs::read_to_string(&path).ok()
@@ -281,7 +285,7 @@ async fn recorded_launch(cwd: &Path) -> String {
 }
 
 /// The text of every daemon log file under `dir`.
-fn log_text(dir: &Path) -> String {
+pub(super) fn log_text(dir: &Path) -> String {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
@@ -331,7 +335,7 @@ async fn an_options_profile_launches_with_its_defaults() {
 }
 
 /// The stored `profile_revision` hex of `id` in the store at `path`.
-fn stored_revision_hex(path: &Path, id: &SessionId) -> String {
+pub(super) fn stored_revision_hex(path: &Path, id: &SessionId) -> String {
     Store::new(path.to_path_buf())
         .load_sessions()
         .expect("read the durable records")
@@ -523,7 +527,7 @@ fn probed_package(program: &Path) -> (Vec<u8>, package::PackageDigest) {
 /// The archive of an `acme.runtime.pi` package launching `program`, with
 /// `requires` after the header, `runtime` lines in its `[runtime]` table and
 /// `tables` after the descriptor.
-fn pi_package(
+pub(super) fn pi_package(
     requires: &str,
     program: &str,
     runtime: &str,
@@ -568,7 +572,7 @@ async fn install_home_package(rig: &mut OptionRig) -> package::PackageDigest {
 
 /// Installs the package `archive` with the `digest`, enabled and selected,
 /// and returns the digest.
-async fn install_package(
+pub(super) async fn install_package(
     rig: &mut OptionRig,
     (archive, digest): (Vec<u8>, package::PackageDigest),
 ) -> package::PackageDigest {
@@ -825,7 +829,7 @@ async fn a_malformed_selection_is_a_bad_request() {
 
 /// The choices `host.inspect` reports for option `option` of profile
 /// `agent`, by choice id.
-fn inspected_choices(
+pub(super) fn inspected_choices(
     runtimes: &[protocol::AgentRuntime],
     agent: &str,
     option: &str,
@@ -1016,7 +1020,7 @@ async fn a_keyed_create_fingerprints_its_selection() {
 }
 
 /// `pairs` (option id, choice id) as a selection map.
-fn selection(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(super) fn selection(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(option, choice)| ((*option).to_owned(), (*choice).to_owned()))
@@ -1038,7 +1042,7 @@ const RESUMABLE_PROGRAM: &str = "#!/bin/sh\n\
 
 /// The options of the resumable profile: `mode` (default `calm`) and
 /// `depth` (default `shallow`), as `(option table)` lines.
-const RESUMABLE_OPTIONS: &str = r#"
+pub(super) const RESUMABLE_OPTIONS: &str = r#"
 [options.mode]
 label = "Mode"
 default = "calm"
@@ -1056,7 +1060,7 @@ choices.deep = { label = "Deep", args = ["--depth=9"] }
 /// package with an assigned native reference and no existence check, so a
 /// stopped session resumes) and the profile `work` over it with
 /// [`RESUMABLE_OPTIONS`]. Returns the rig and the package digest.
-async fn resumable_rig(tag: &str) -> (OptionRig, package::PackageDigest) {
+pub(super) async fn resumable_rig(tag: &str) -> (OptionRig, package::PackageDigest) {
     let mut rig = OptionRig::start(tag, true).await;
     let program = rig.socket.dir.join("resumable-agent");
     std::fs::write(&program, RESUMABLE_PROGRAM).expect("write the fixture runtime");
@@ -1072,13 +1076,13 @@ async fn resumable_rig(tag: &str) -> (OptionRig, package::PackageDigest) {
 }
 
 /// The profile text of `work`: pinned to `digest`, with `options`.
-fn resumable_profile(digest: &package::PackageDigest, options: &str) -> String {
+pub(super) fn resumable_profile(digest: &package::PackageDigest, options: &str) -> String {
     format!("base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n{options}")
 }
 
 /// The launch blocks the fixture runtime recorded in `cwd`, once there are
 /// `count` of them.
-async fn launches(cwd: &Path, count: usize) -> Vec<Vec<String>> {
+pub(super) async fn launches(cwd: &Path, count: usize) -> Vec<Vec<String>> {
     let path = cwd.join(LAUNCHES_LOG);
     wait_until("the fixture runtime records its launches", || async {
         let text = std::fs::read_to_string(&path).ok()?;
@@ -1108,7 +1112,7 @@ async fn stopped_bold_session(rig: &mut OptionRig) -> (SessionInfo, PathBuf) {
 }
 
 /// The argv lines of launch `block` (every line before the env line).
-fn argv(block: &[String]) -> Vec<&str> {
+pub(super) fn argv(block: &[String]) -> Vec<&str> {
     block
         .iter()
         .take_while(|line| !line.starts_with("MODE="))
