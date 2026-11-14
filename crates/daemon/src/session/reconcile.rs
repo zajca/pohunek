@@ -24295,6 +24295,7 @@ generation "$1"
             wait_for_directory, Reporter, RetryInspector, V0_33_0_STORE, V0_33_1_DAMAGED_STORE,
         };
         use crate::procwatch::ProcessInspector;
+        use crate::runtime::lifecycle::tests::LogCapture;
         use crate::session::{SessionRegistry, SessionRegistryConfig};
         use crate::store::Store;
 
@@ -24581,7 +24582,10 @@ generation "$1"
 
         #[tokio::test]
         async fn a_live_worker_started_by_the_previous_release_is_adopted_and_usable() {
+            let logs = LogCapture::default();
+            let _log_guard = logs.install();
             for previous in SHAPES {
+                let log_len = logs.text().len();
                 let label = format!("{} / {}", previous.generation, previous.agent);
                 let root = temp_root();
                 let runtime_root = root.join("runtime/workers");
@@ -24640,7 +24644,11 @@ generation "$1"
                     "{label}"
                 );
                 let report = registry.shutdown().await;
-                assert!(report.is_quiescent(), "{label}: {report:?}");
+                assert!(
+                    report.is_quiescent(),
+                    "{label}: {report:?}\nlogs of this shape:\n{}",
+                    &logs.text()[log_len..]
+                );
                 worker.server_task.finish().await;
                 drop(worker.reporter);
             }
