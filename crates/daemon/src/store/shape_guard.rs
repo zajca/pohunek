@@ -509,6 +509,7 @@ fn assert_every_field_is_reviewed(
         loss_reason,
         exit,
         loss_cause,
+        generation_recorded: _,
     }) = session_runtime
     {
         let _: &RuntimeState = runtime_state;

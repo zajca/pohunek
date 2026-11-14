@@ -1230,6 +1230,7 @@ impl Fixture {
                 loss_reason: None,
                 exit: None,
                 loss_cause: None,
+                generation_recorded: None,
             }),
             cols: 80,
             rows: 24,

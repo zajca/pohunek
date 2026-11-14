@@ -5777,8 +5777,9 @@ fn a_runtime_state_from_a_newer_daemon_is_possibly_live_and_never_stoppable_or_r
 
 /// A client reads `can_stop`/`can_remove` off the decoded wire form: a conflict
 /// that names its worker and worker instance is offered the actions the daemon
-/// accepts after its identity proof, any other conflict is not, and a result
-/// that skipped the proof says so on the wire.
+/// accepts after its identity proof, unless it reports `generation_recorded`
+/// as `false`; any other conflict is not, and a result that skipped the
+/// proof says so on the wire.
 #[test]
 fn a_conflict_naming_its_worker_is_stoppable_and_removable_to_a_client() {
     let decode = |runtime: serde_json::Value| -> SessionInfo {
@@ -5796,6 +5797,45 @@ fn a_conflict_naming_its_worker_is_stoppable_and_removable_to_a_client() {
     }));
     assert!(named.can_stop());
     assert!(named.can_remove());
+
+    let recorded_true = decode(json!({
+        "state": "conflict",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "resume_binding_shape_mismatch",
+        "generation_recorded": true
+    }));
+    assert!(recorded_true.can_stop());
+    assert!(recorded_true.can_remove());
+
+    let recorded_false = decode(json!({
+        "state": "conflict",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "resume_binding_shape_mismatch",
+        "generation_recorded": false
+    }));
+    assert!(!recorded_false.can_stop());
+    assert!(!recorded_false.can_remove());
+
+    // The flag only acts on a conflict.
+    let lost_with_flag = decode(json!({
+        "state": "lost",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "runtime_lost",
+        "generation_recorded": false
+    }));
+    assert_eq!(lost_with_flag.can_stop(), decode(json!({
+        "state": "lost",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "runtime_lost"
+    })).can_stop());
 
     for runtime in [
         json!({"state": "conflict", "runtime_generation": "1"}),

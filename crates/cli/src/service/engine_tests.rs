@@ -895,6 +895,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         }),
     }
 }

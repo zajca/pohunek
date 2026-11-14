@@ -559,7 +559,7 @@ impl SessionRegistry {
             }
             let evidence = self.apply_reported_activity(entry, id, activity, &pending.epoch);
             entry.info.updated_at = timestamp_now();
-            (entry.info.clone(), evidence)
+            (entry.published_info(), evidence)
         };
         self.emit(event::SESSION_UPDATED, &info);
         if let Some(evidence) = evidence {

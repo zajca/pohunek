@@ -688,6 +688,7 @@ mod tests {
             loss_reason: (state == RuntimeState::Lost).then(|| "worker_unavailable".to_owned()),
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         }
     }
 

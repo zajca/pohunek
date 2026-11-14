@@ -981,7 +981,7 @@ impl SessionRegistry {
             }
             break (
                 changed,
-                entry.info.clone(),
+                entry.published_info(),
                 subagent_events,
                 background_changed,
             );
@@ -2107,7 +2107,7 @@ impl SessionRegistry {
             &Unavailability::other(RuntimeState::Conflict),
             SUPERVISION_AMBIGUOUS,
         );
-        let info = entry.info.clone();
+        let info = entry.published_info();
         self.install_session_entry(&id, entry).await;
         warn_unavailable(
             &id.0,
@@ -2549,7 +2549,8 @@ impl SessionRegistry {
         }
         let removed = self.remove_session_entry(id).await;
         if let Some(entry) = removed {
-            self.emit(event::SESSION_REMOVED, &entry.info);
+            let info = entry.published_info();
+            self.emit(event::SESSION_REMOVED, &info);
         }
         true
     }
@@ -3622,6 +3623,7 @@ impl SessionRegistry {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         });
         self.insert_unavailable_record(record, RuntimeState::Terminal, "worker_journal_terminal")
             .await
@@ -4219,6 +4221,7 @@ impl SessionRegistry {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         });
         record.info.updated_at = now;
         record.transaction = None;
@@ -4495,7 +4498,7 @@ impl SessionRegistry {
         let (classified, entry) = self.unavailable_entry(record.clone(), &classification, reason);
         // Boxed so the entry does not widen the futures of the callers.
         let entry = Box::new(entry);
-        let mut info = entry.info.clone();
+        let mut info = entry.published_info();
         // A placeholder that already logged this very classification does not
         // log it again once the write succeeds.
         let logged = self
@@ -4622,6 +4625,7 @@ impl SessionRegistry {
             loss_reason: Some(reason.to_owned()),
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         });
         classification.apply_exit(runtime);
         runtime.state = state;
@@ -4801,6 +4805,7 @@ impl SessionRegistry {
                         loss_reason: None,
                         exit: None,
                         loss_cause: None,
+            generation_recorded: None,
                     })
                     .state = RuntimeState::Terminal;
                 let imported = self
@@ -9578,6 +9583,7 @@ while os.getppid() == parent:
                 loss_reason: None,
                 exit: None,
                 loss_cause: None,
+                generation_recorded: None,
             }),
             cols: 80,
             rows: 24,
@@ -9679,6 +9685,7 @@ while os.getppid() == parent:
                         loss_reason: None,
                         exit: None,
                         loss_cause: None,
+                        generation_recorded: None,
                     }),
                     ..info
                 },
@@ -11154,6 +11161,7 @@ while os.getppid() == parent:
                     loss_reason: None,
                     exit: None,
                     loss_cause: None,
+                    generation_recorded: None,
                 }),
                 cols: 80,
                 rows: 24,
@@ -12818,7 +12826,7 @@ handler = "codex-hook-v1"
             ServiceObservation, ServiceState, Supervisor,
         };
         use pohunek_session_worker::{Journal, JournalRecord, RuntimePhase as JournalRuntimePhase};
-        use protocol::{RuntimeInventoryStatus, RuntimeState, SessionId};
+        use protocol::{RuntimeInventoryStatus, RuntimeState, SessionId, SessionInfo};
 
         use super::super::super::supervision::{
             RUNTIME_LOST, RUNTIME_LOST_CLEANUP_UNCONFIRMED, STALE_GENERATION, UNSUPERVISED_WORKER,
@@ -15301,6 +15309,7 @@ generation "$1"
                 loss_reason: Some("runtime_lost".to_owned()),
                 exit: None,
                 loss_cause: Some("host_restarted".to_owned()),
+                generation_recorded: None,
             });
             store.record_session(&record).expect("store failed+lost");
             let notifications = NotificationService::open(&fixture.root.join("notifications"))
@@ -20745,6 +20754,26 @@ generation "$1"
                     fixture
                         .registry
                         .insert_lost_record(
+                            unbound.clone(),
+                            reason,
+                            crate::session::LossProof::Unproven,
+                            None,
+                        )
+                        .await
+                } else {
+                    fixture
+                        .registry
+                        .insert_unavailable_record(unbound.clone(), state, reason)
+                        .await
+                };
+                assert!(committed);
+                let mut events = fixture.registry.subscribe();
+                // Resubscribing drops the classification event above, so
+                // reclassify to observe what a subscriber sees.
+                let again = if state == RuntimeState::Lost {
+                    fixture
+                        .registry
+                        .insert_lost_record(
                             unbound,
                             reason,
                             crate::session::LossProof::Unproven,
@@ -20757,7 +20786,23 @@ generation "$1"
                         .insert_unavailable_record(unbound, state, reason)
                         .await
                 };
-                assert!(committed);
+                assert!(again);
+                if state == RuntimeState::Conflict {
+                    let mut announced = false;
+                    while let Ok(event) = events.try_recv() {
+                        if event.event() == protocol::event::SESSION_RUNTIME_CONFLICT {
+                            let session: SessionInfo = serde_json::from_value(
+                                event.payload()["session"].clone(),
+                            )
+                            .expect("decode the announced session");
+                            let runtime = session.runtime.as_ref().expect("runtime");
+                            assert_eq!(runtime.generation_recorded, Some(false));
+                            assert!(!session.can_stop() && !session.can_remove());
+                            announced = true;
+                        }
+                    }
+                    assert!(announced, "{session}: the conflict is announced to subscribers");
+                }
                 let before = stop_intent_of(&fixture.root, session);
 
                 let error = fixture
@@ -24707,6 +24752,7 @@ generation "$1"
                     ended_at: None,
                 }),
                 loss_cause: Some("user_manager_lost".to_owned()),
+                generation_recorded: None,
             });
             store.record_session(&record).expect("store failed+lost");
             let registry = upgraded_registry(

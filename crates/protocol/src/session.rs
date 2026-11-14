@@ -2824,13 +2824,25 @@ pub struct SessionRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub loss_cause: Option<String>,
+    /// Whether the daemon's record of this `conflict` runtime names the worker
+    /// generation (the supervised job) that `session.stop` and `session.remove`
+    /// prove before they act. Set only while [`Self::state`] is `conflict`;
+    /// stored records never carry it. `None` from a daemon that predates the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub generation_recorded: Option<bool>,
 }
 
 impl SessionRuntime {
-    /// Whether the runtime names both the worker and the worker instance the
-    /// daemon proves before it stops or removes a conflicted session.
-    fn names_recorded_worker(&self) -> bool {
-        self.worker_id.is_some() && self.worker_instance_id.is_some()
+    /// Whether a `conflict` runtime names what the daemon proves before it
+    /// stops or removes the session: the worker, the worker instance, and a
+    /// recorded generation. A peer that predates
+    /// [`Self::generation_recorded`] is taken to record one.
+    fn names_provable_conflict(&self) -> bool {
+        self.worker_id.is_some()
+            && self.worker_instance_id.is_some()
+            && self.generation_recorded != Some(false)
     }
 }
 
@@ -3351,11 +3363,12 @@ impl SessionInfo {
     /// An external observe-only entry has no PTY to stop, a terminal session has
     /// already stopped, and a runtime that is neither connected nor on its way
     /// back cannot be asked to shut one down; neither can a runtime in a state
-    /// this build does not know. A [`RuntimeState::Conflict`] runtime that names
-    /// its worker and worker instance is stoppable, because the daemon stops it
-    /// by that recorded identity once the worker journal and the service
-    /// manager's job prove it; the call can still be refused when the proof
-    /// fails. A session with no runtime at all predates worker-backed runtimes
+    /// this build does not know. A [`RuntimeState::Conflict`] runtime is
+    /// stoppable when it names its worker and worker instance and does not
+    /// report [`SessionRuntime::generation_recorded`] as `false`, because the
+    /// daemon stops it by that recorded identity once the worker journal and the
+    /// service manager's job prove it; the call can still be refused when the
+    /// proof fails. A session with no runtime at all predates worker-backed runtimes
     /// and is treated as stoppable.
     #[must_use]
     pub fn can_stop(&self) -> bool {
@@ -3366,7 +3379,7 @@ impl SessionInfo {
             .as_ref()
             .is_none_or(|runtime| match runtime.state {
                 RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting => true,
-                RuntimeState::Conflict => runtime.names_recorded_worker(),
+                RuntimeState::Conflict => runtime.names_provable_conflict(),
                 _ => false,
             })
     }
@@ -3376,10 +3389,13 @@ impl SessionInfo {
     /// Removal is refused for an external entry the daemon does not own, for an
     /// [`RuntimeState::Incompatible`] or [`RuntimeState::Unknown`] runtime, and
     /// for a [`RuntimeState::Conflict`] runtime that does not name its worker and
-    /// worker instance: the identity backing such a session is unresolved and
+    /// worker instance, or that reports [`SessionRuntime::generation_recorded`]
+    /// as `false`: the identity backing such a session is unresolved and
     /// evicting the record could strand a live PTY. A conflict that does name
     /// them is removable, because the daemon proves the recorded identity before
     /// it retires anything; the call can still be refused when the proof fails.
+    /// A conflict without a recorded generation is removed only through
+    /// `session.remove_accepting_unconfirmed`, which this helper does not model.
     /// Everything else is removable once it is terminal, still stoppable, or
     /// lost. The daemon's retention sweep applies this rule and additionally
     /// never selects a conflict.
@@ -3392,7 +3408,7 @@ impl SessionInfo {
             matches!(
                 runtime.state,
                 RuntimeState::Incompatible | RuntimeState::Unknown
-            ) || (runtime.state == RuntimeState::Conflict && !runtime.names_recorded_worker())
+            ) || (runtime.state == RuntimeState::Conflict && !runtime.names_provable_conflict())
         }) {
             return false;
         }

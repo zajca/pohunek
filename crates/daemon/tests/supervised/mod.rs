@@ -804,6 +804,7 @@ impl Installation {
                 loss_reason: runtime.reason.clone(),
                 exit: None,
                 loss_cause: None,
+                generation_recorded: None,
             }),
             cols: 80,
             rows: 24,

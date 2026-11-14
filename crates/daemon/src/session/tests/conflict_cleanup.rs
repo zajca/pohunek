@@ -132,6 +132,7 @@ impl Fixture {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         });
         db.record_session(&record)
             .expect("record supervised generation");
@@ -863,6 +864,7 @@ async fn a_resume_binding_shape_conflict_is_offered_and_removed_by_its_proven_id
     let runtime = listed.runtime.as_ref().expect("runtime");
     assert_eq!(runtime.state, RuntimeState::Conflict);
     assert_eq!(runtime.loss_reason.as_deref(), Some(SHAPE_MISMATCH));
+    assert_eq!(runtime.generation_recorded, Some(true));
     assert!(listed.can_stop(), "{listed:?}");
     assert!(listed.can_remove(), "{listed:?}");
 
@@ -924,9 +926,29 @@ async fn a_conflict_without_a_generation_is_removed_only_with_consent_and_says_s
         listed.runtime.as_ref().map(|runtime| runtime.state),
         Some(RuntimeState::Conflict)
     );
-    // The wire form carries no service generation, so a client still sees the
-    // actions; the daemon refuses them below.
-    assert!(listed.can_stop() && listed.can_remove());
+    // The published form says the daemon recorded no generation to prove,
+    // so a client no longer sees the actions; the daemon refuses them below.
+    assert!(!listed.can_stop() && !listed.can_remove());
+    assert_eq!(
+        listed
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.generation_recorded),
+        Some(false)
+    );
+    let from_list = fixture
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .find(|info| info.id == fixture.id)
+        .expect("the conflict is listed");
+    assert_eq!(from_list.runtime, listed.runtime, "list and inspect agree");
+    let stored = std::fs::read_to_string(&fixture.store).expect("read the store");
+    assert!(
+        !stored.contains("generation_recorded"),
+        "the store never holds the projected flag"
+    );
 
     for error in [
         fixture
@@ -987,6 +1009,16 @@ async fn the_consent_does_not_skip_the_proof_of_a_recorded_or_partial_generation
         RecordedGeneration::Partial,
     )
     .await;
+    let listed = partial.registry.inspect(&partial.id).await.expect("listed");
+    assert_eq!(
+        listed
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.generation_recorded),
+        Some(false),
+        "a partial generation is published as unrecorded"
+    );
+    assert!(!listed.can_stop() && !listed.can_remove());
     partial
         .registry
         .remove_with(&partial.id, accept)

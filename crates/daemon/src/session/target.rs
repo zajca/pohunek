@@ -881,6 +881,7 @@ impl SessionRegistry {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         };
         let preparing_info = SessionInfo {
             blocked_kind: None,
@@ -1502,6 +1503,7 @@ impl SessionRegistry {
                 loss_reason: None,
                 exit: None,
                 loss_cause: None,
+            generation_recorded: None,
             }),
         })
     }

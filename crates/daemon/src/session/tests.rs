@@ -19439,6 +19439,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
             ended_at: None,
         }),
         loss_cause: None,
+        generation_recorded: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -20123,6 +20124,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         });
         drop(sessions);
         let error = registry
@@ -28023,6 +28025,7 @@ async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
         loss_reason: Some("test_runtime_lost".to_owned()),
         exit: None,
         loss_cause: None,
+        generation_recorded: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -28137,6 +28140,7 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         loss_reason: Some("test_runtime_lost".to_owned()),
         exit: None,
         loss_cause: None,
+        generation_recorded: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
