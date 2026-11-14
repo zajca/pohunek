@@ -960,8 +960,8 @@ publish its output or feed it to `release assemble`.
 
 `cargo xtask claude canary compare` diffs a canary capture against the
 expected table in `compat/claude/canary/expected.json`; the runbook
-`docs/runbooks/claude-canary.md` documents the command, the exit codes and
-how a difference is handled.
+`docs/runbooks/claude-canary.md` documents the `capture` and `compare`
+commands, the exit codes and how a difference is handled.
 
 ### Release rehearsal
 

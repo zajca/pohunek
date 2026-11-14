@@ -397,18 +397,20 @@ const RULES: &[Rule] = &[
              binary(=timing_deadline_ratchet) | \
              binary(=lifecycle_result_ratchet) | binary(=detached_spawn_ratchet) | \
              binary(=exact_filter_guard) | binary(=dependency_policy) | \
+             binary(=claude_canary_capture) | \
              (binary(=affected_ci) and test(=every_repository_read_of_the_test_code_selects_its_reader)) | \
              (kind(lib) and test(/^affected::tests::/))",
         )]),
-        "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, timing_deadline_ratchet, lifecycle_result_ratchet, detached_spawn_ratchet, exact_filter_guard, the affected guard and include scan) and resolved by its dependency_policy test",
+        "every crate's sources and manifests, scanned by xtask's repository guards (hermetic_scan, no_special_dispatch, test_artifact_lookup_guard, timing_ratchet, timing_deadline_ratchet, lifecycle_result_ratchet, detached_spawn_ratchet, exact_filter_guard, the affected guard and include scan), resolved by its dependency_policy test, and built into the head binaries its claude_canary_capture test drives",
     ),
     rule(
         Pattern::Dir("runtime-packages"),
         Effect::Tests(&[readers(
             "xtask",
-            "kind(lib) and test(/^(attestation|release_tests|test_runtime|upstream_stage_tests)::/)"
+            "binary(=claude_canary_capture) | \
+             kind(lib) and test(/^(attestation|release_tests|test_runtime|upstream_stage_tests)::/)"
         )]),
-        "official package sources listed by xtask's matrix check and upstream staging scenarios and built by its release and test-runtime scenarios",
+        "official package sources listed by xtask's matrix check and upstream staging scenarios and built by its release and test-runtime scenarios, including the Claude package the claude_canary_capture test builds its capture tree from",
     ),
     rule(
         Pattern::File("scripts/provision-hermes-compat"),

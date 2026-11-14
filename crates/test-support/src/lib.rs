@@ -242,10 +242,27 @@ pub fn tempdir() -> std::io::Result<tempfile::TempDir> {
 ///
 /// Returns the I/O error when the directory cannot be created.
 pub fn tempdir_with_prefix(prefix: &str) -> std::io::Result<tempfile::TempDir> {
+    private_tempdir(tempfile::Builder::new().prefix(prefix))
+}
+
+/// Creates a private fixture directory under [`temp_root`] whose name is
+/// `random_bytes` random characters and nothing else.
+///
+/// For a caller whose socket budget leaves no room for a prefix or the
+/// default six random characters.
+///
+/// # Errors
+///
+/// Returns the I/O error when the directory cannot be created.
+pub fn tempdir_with_random_bytes(random_bytes: usize) -> std::io::Result<tempfile::TempDir> {
+    private_tempdir(tempfile::Builder::new().prefix("").rand_bytes(random_bytes))
+}
+
+/// Creates the directory `builder` names under [`temp_root`], owner-only.
+fn private_tempdir(builder: &mut tempfile::Builder<'_, '_>) -> std::io::Result<tempfile::TempDir> {
     // The mode requested at creation keeps the directory owner-only from the
     // first instant; the explicit chmod makes it exactly 0700 under any umask.
-    let dir = tempfile::Builder::new()
-        .prefix(prefix)
+    let dir = builder
         .permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
         .tempdir_in(temp_root())?;
     make_private(dir.path())?;

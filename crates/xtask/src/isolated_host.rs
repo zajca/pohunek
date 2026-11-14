@@ -1,4 +1,4 @@
-//! The isolated daemon `plugin prove` installs through.
+//! The isolated daemon used by `plugin prove` and the Claude canary.
 //!
 //! The root directory holds a private home, XDG directories, a copy of the
 //! release executables with the trust anchor and the index channel file beside
@@ -52,6 +52,13 @@ const SHORT_TEMP_PARENT: &str = "/tmp";
 /// Socket path below the root: `XDG_RUNTIME_DIR` plus the application
 /// directory and socket file the daemon appends to it.
 const SOCKET_RELATIVE_PATH: &str = "xdg-runtime/pohunek/daemon.sock";
+
+/// Prefix of a session root's directory name: a root that runs sessions
+/// nests worker sockets deeper than the daemon socket.
+const SESSION_ROOT_PREFIX: &str = "pc-";
+
+/// Random characters `tempfile` appends to a session root's name.
+const SESSION_ROOT_RANDOM_BYTES: usize = 4;
 
 /// Socket paths of this length or longer are refused: the platform's `sun_path`
 /// holds the path and its terminator.
@@ -116,14 +123,14 @@ const HOME_DIRECTORIES: [&str; 5] = ["home", "xdg-config", "xdg-cache", "xdg-dat
 /// The isolation root, removed with its contents when [`Root::remove`] runs or
 /// the value drops.
 #[derive(Debug)]
-pub(super) struct Root {
+pub(crate) struct Root {
     temp: TempDir,
 }
 
 impl Root {
     /// Creates the root with its private directories below a canonical parent
     /// whose control socket path fits the platform limit.
-    pub(super) fn create() -> Result<Self, String> {
+    pub(crate) fn create() -> Result<Self, String> {
         let candidates = [std::env::temp_dir(), PathBuf::from(SHORT_TEMP_PARENT)];
         let mut last = String::from("no temporary directory is available");
         for parent in candidates {
@@ -157,6 +164,82 @@ impl Root {
         Err(last)
     }
 
+    /// Creates a root that runs agent sessions directly below `parent`, after
+    /// [`Root::check_session_parent`] accepted it. There is no fallback
+    /// parent: the caller names the directory.
+    pub(crate) fn create_for_sessions(parent: &Path) -> Result<Self, String> {
+        let parent = Self::check_session_parent(parent)?;
+        let temp = tempfile::Builder::new()
+            .prefix(SESSION_ROOT_PREFIX)
+            .rand_bytes(SESSION_ROOT_RANDOM_BYTES)
+            .tempdir_in(&parent)
+            .map_err(|error| format!("cannot create the isolation root: {error}"))?;
+        let root = Self { temp };
+        root.create_directories()?;
+        Ok(root)
+    }
+
+    /// Resolves `parent` and checks that a session root below it leaves room
+    /// for every socket the daemon and its session workers bind. The check
+    /// is the daemon's own: its paths resolved from the root's environment,
+    /// and the longest worker socket of the longest session ID validated with
+    /// its staged bind name, as the daemon does before it spawns a worker.
+    /// Returns the canonical parent; nothing is created.
+    pub(crate) fn check_session_parent(parent: &Path) -> Result<PathBuf, String> {
+        let parent = fs::canonicalize(parent)
+            .map_err(|error| format!("cannot resolve `{}`: {error}", parent.display()))?;
+        // A placeholder of the root's name length stands for the random name.
+        let name = format!(
+            "{SESSION_ROOT_PREFIX}{}",
+            "0".repeat(SESSION_ROOT_RANDOM_BYTES)
+        );
+        let root = parent.join(name);
+        let environment = root_environment(&root);
+        let variable = |name: &str| {
+            environment
+                .iter()
+                .find(|(key, _value)| key == name)
+                .map(|(_key, value)| value.clone())
+        };
+        let path_env = pohunek_paths::PathEnv {
+            xdg_runtime_dir: variable("XDG_RUNTIME_DIR"),
+            xdg_data_home: variable("XDG_DATA_HOME"),
+            xdg_state_home: variable("XDG_STATE_HOME"),
+            xdg_cache_home: variable("XDG_CACHE_HOME"),
+            xdg_config_home: variable("XDG_CONFIG_HOME"),
+            home: variable("HOME"),
+        };
+        let too_long = |error: &dyn std::fmt::Display| {
+            format!(
+                "`{}` is too long for the session sockets below it ({error}); choose a shorter directory",
+                parent.display()
+            )
+        };
+        let platform = pohunek_paths::Platform::current().map_err(|error| error.to_string())?;
+        let paths = pohunek_paths::BasePaths::resolve_for(
+            platform,
+            rustix::process::geteuid().as_raw(),
+            &path_env,
+        )
+        .map_err(|error| too_long(&error))?;
+        let session_id = format!(
+            "{}{}",
+            pohunek_paths::WORKER_SESSION_ID_PREFIX,
+            "0".repeat(
+                pohunek_paths::MAX_WORKER_SESSION_ID_BYTES
+                    - pohunek_paths::WORKER_SESSION_ID_PREFIX.len()
+            )
+        );
+        match pohunek_paths::worker_socket_path(&paths.worker_runtime_root(), &session_id, platform)
+        {
+            Ok(Some(_socket)) => Ok(parent),
+            Ok(None) => Err(format!(
+                "`{session_id}` is not a worker session ID; the socket check cannot run"
+            )),
+            Err(error) => Err(too_long(&error)),
+        }
+    }
+
     fn create_directories(&self) -> Result<(), String> {
         let make = |name: &str, mode: u32| {
             fs::DirBuilder::new()
@@ -172,12 +255,22 @@ impl Root {
     }
 
     /// The root directory.
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         self.temp.path()
     }
 
+    /// The isolated `XDG_CONFIG_HOME`.
+    pub(crate) fn config_home(&self) -> PathBuf {
+        self.path().join("xdg-config")
+    }
+
+    /// The file the daemon's combined output is written to.
+    pub(crate) fn daemon_log(&self) -> PathBuf {
+        self.path().join(DAEMON_LOG_FILE)
+    }
+
     /// Removes the root and its contents.
-    pub(super) fn remove(self) -> Result<(), String> {
+    pub(crate) fn remove(self) -> Result<(), String> {
         self.temp
             .close()
             .map_err(|error| format!("cannot remove the isolation root: {error}"))
@@ -185,20 +278,7 @@ impl Root {
 
     /// The environment of every child process.
     fn environment(&self) -> Vec<(OsString, OsString)> {
-        let path = |name: &str| self.path().join(name).into_os_string();
-        vec![
-            ("HOME".into(), path("home")),
-            ("XDG_CONFIG_HOME".into(), path("xdg-config")),
-            ("XDG_CACHE_HOME".into(), path("xdg-cache")),
-            ("XDG_DATA_HOME".into(), path("xdg-data")),
-            ("XDG_STATE_HOME".into(), path("xdg-state")),
-            ("XDG_RUNTIME_DIR".into(), path(RUNTIME_DIRECTORY)),
-            ("PATH".into(), CHILD_PATH.into()),
-            ("LANG".into(), CHILD_LOCALE.into()),
-            ("LC_ALL".into(), CHILD_LOCALE.into()),
-            ("NO_COLOR".into(), "1".into()),
-            ("TERM".into(), "dumb".into()),
-        ]
+        root_environment(self.path())
     }
 
     /// Replaces the root path in `text`.
@@ -213,16 +293,34 @@ impl Root {
     }
 }
 
+/// The environment of every child process of a root at `root`.
+fn root_environment(root: &Path) -> Vec<(OsString, OsString)> {
+    let path = |name: &str| root.join(name).into_os_string();
+    vec![
+        ("HOME".into(), path("home")),
+        ("XDG_CONFIG_HOME".into(), path("xdg-config")),
+        ("XDG_CACHE_HOME".into(), path("xdg-cache")),
+        ("XDG_DATA_HOME".into(), path("xdg-data")),
+        ("XDG_STATE_HOME".into(), path("xdg-state")),
+        ("XDG_RUNTIME_DIR".into(), path(RUNTIME_DIRECTORY)),
+        ("PATH".into(), CHILD_PATH.into()),
+        ("LANG".into(), CHILD_LOCALE.into()),
+        ("LC_ALL".into(), CHILD_LOCALE.into()),
+        ("NO_COLOR".into(), "1".into()),
+        ("TERM".into(), "dumb".into()),
+    ]
+}
+
 /// What a finished CLI command left.
-pub(super) struct Output {
-    pub(super) code: Option<i32>,
-    pub(super) stdout: Vec<u8>,
+pub(crate) struct Output {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
 }
 
 /// A running copy of the release daemon and the CLI copy that talks to it.
 /// Dropping it ends the daemon's whole process group.
 #[derive(Debug)]
-pub(super) struct Host {
+pub(crate) struct Host {
     root: PathBuf,
     prefix: PathBuf,
     environment: Vec<(OsString, OsString)>,
@@ -234,7 +332,7 @@ impl Host {
     /// Copies the release executables from `release_dir` into the prefix
     /// below `root` and puts `anchor` and `channel` beside the daemon. No
     /// process runs yet.
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         root: &Root,
         release_dir: &Path,
         anchor: &Path,
@@ -279,7 +377,7 @@ impl Host {
     }
 
     /// Starts the daemon of the prefix and waits until it accepts connections.
-    pub(super) fn launch(&mut self, root: &Root) -> Result<(), String> {
+    pub(crate) fn launch(&mut self, root: &Root) -> Result<(), String> {
         let log = File::create(root.path().join(DAEMON_LOG_FILE))
             .map_err(|error| format!("cannot create the daemon log: {error}"))?;
         let log_err = log
@@ -305,7 +403,7 @@ impl Host {
     }
 
     /// Runs `pohunekd --version` and returns its first output line.
-    pub(super) fn core_version(&mut self) -> Result<String, String> {
+    pub(crate) fn core_version(&mut self) -> Result<String, String> {
         let output = self.run_program("pohunekd", &["--version"])?;
         let text = String::from_utf8_lossy(&output.stdout);
         match (output.code, text.lines().next()) {
@@ -315,20 +413,47 @@ impl Host {
     }
 
     /// Runs the installed `pohunek` with `arguments`.
-    pub(super) fn cli(&mut self, arguments: &[&str]) -> Result<Output, String> {
+    pub(crate) fn cli(&mut self, arguments: &[&str]) -> Result<Output, String> {
         self.run_program("pohunek", arguments)
     }
 
+    /// Runs `program`, an executable outside the prefix, with `arguments` in
+    /// the isolated environment plus `extra_environment`.
+    pub(crate) fn run_external(
+        &mut self,
+        program: &Path,
+        arguments: &[&str],
+        extra_environment: &[(OsString, OsString)],
+    ) -> Result<Output, String> {
+        let label = program.file_name().map_or_else(
+            || program.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        self.run_executable(program, &label, arguments, extra_environment)
+    }
+
     fn run_program(&mut self, program: &str, arguments: &[&str]) -> Result<Output, String> {
+        let executable = self.prefix.join(program);
+        self.run_executable(&executable, program, arguments, &[])
+    }
+
+    fn run_executable(
+        &mut self,
+        executable: &Path,
+        program: &str,
+        arguments: &[&str],
+        extra_environment: &[(OsString, OsString)],
+    ) -> Result<Output, String> {
         let output_path = self.root.join(format!("command-{}.out", self.commands));
         self.commands += 1;
         let output = File::create(&output_path)
             .map_err(|error| format!("cannot create the command output file: {error}"))?;
-        let mut child = Command::new(self.prefix.join(program))
+        let mut child = Command::new(executable)
             .args(arguments)
             .current_dir(self.root.join(WORK_DIRECTORY))
             .env_clear()
             .envs(self.environment.iter().cloned())
+            .envs(extra_environment.iter().cloned())
             .stdin(Stdio::null())
             .stdout(output)
             .stderr(Stdio::null())
@@ -399,7 +524,7 @@ impl Host {
 
     /// Signals the daemon with SIGTERM and requires a successful exit within
     /// [`STOP_TIMEOUT`].
-    pub(super) fn stop(mut self) -> Result<(), String> {
+    pub(crate) fn stop(mut self) -> Result<(), String> {
         let Some(mut daemon) = self.daemon.take() else {
             return Ok(());
         };
