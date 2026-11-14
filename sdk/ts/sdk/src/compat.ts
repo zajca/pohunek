@@ -112,6 +112,23 @@ export function setsAttentionIsolationFlag(params: unknown): boolean {
   );
 }
 
+/** Whether `session.list` params carry a tree filter the daemon must honor. */
+export function carriesTreeListFilter(params: unknown): boolean {
+  if (!isObject(params) || !Array.isArray(params["filters"])) {
+    return false;
+  }
+  return (params["filters"] as Array<unknown>).some(
+    (filter) =>
+      isObject(filter) &&
+      (filter["key"] === "top_level" || filter["key"] === "has_spawned_by"),
+  );
+}
+
+/** Whether `session.retention.sweep` params carry a selector the daemon must honor. */
+export function carriesRetentionSelector(params: unknown): boolean {
+  return isObject(params) && (isSet(params["spawned_by"]) || isSet(params["session_ids"]));
+}
+
 function requireCurrent(version: number): void {
   if (version !== PROTOCOL_VERSION) {
     throw new CompatError({ kind: "unsupportedVersion", version });

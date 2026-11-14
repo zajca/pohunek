@@ -2,7 +2,7 @@ import { describe, expect, jest, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_SESSION_WAIT_MS, PROTOCOL_VERSION } from "@pohunek/protocol";
+import { MAX_SESSION_REMOVE_TREE_SESSIONS, MAX_SESSION_WAIT_MS, PROTOCOL_VERSION } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -11,10 +11,12 @@ import {
   RESUME_SWEEP_PASSES,
   SESSION_NEW_REQUEST_BUDGET_MS,
   SESSION_REMOVE_REQUEST_BUDGET_MS,
+  SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
   SESSION_RESUME_REQUEST_BUDGET_MS,
   SESSION_STOP_REQUEST_BUDGET_MS,
   WORKTREE_HOOK_TIMEOUT_MS,
   connectLocal,
+  connectTcp,
   type ClientErrorKind,
   type ConnectOptions,
 } from "@pohunek/sdk";
@@ -24,8 +26,10 @@ import {
   parseRequestLine,
   requestIdFromLine,
   startMemoryDaemon,
+  startTcpDaemon,
   startUnixDaemon,
   type MockDaemon,
+  type ScriptStep,
 } from "./mock-daemon";
 
 // The delayed reply outlasts an explicit deadline that still fits a direct
@@ -37,7 +41,12 @@ const SCENARIO_TIMEOUT_MS = 10_000;
 const fixturePath = join(dirname(fileURLToPath(import.meta.url)), "fixtures/lifecycle-budgets.json");
 
 interface LifecycleCase {
-  readonly method: "session.resume" | "session.stop" | "session.remove" | "session.remove_accepting_unconfirmed";
+  readonly method:
+    | "session.resume"
+    | "session.stop"
+    | "session.remove"
+    | "session.remove_accepting_unconfirmed"
+    | "session.remove_tree";
   readonly params: unknown;
   readonly result: unknown;
   readonly kind: ClientErrorKind;
@@ -73,7 +82,37 @@ const LIFECYCLE_CASES: readonly LifecycleCase[] = [
     kind: "sessionRemoveOutcomeUnknown",
     code: "session_remove_outcome_unknown",
   },
+  {
+    method: "session.remove_tree",
+    params: { session_id: "s-target" },
+    result: {
+      removed: 1,
+      kept: 0,
+      refused: 0,
+      sessions: [{ session_id: "s-target", depth: 0, outcome: "removed", keep_reason: null }],
+    },
+    kind: "sessionRemoveTreeOutcomeUnknown",
+    code: "session_remove_tree_outcome_unknown",
+  },
 ];
+
+function inspectStep(flags: Record<string, unknown>): ScriptStep {
+  // The probe answer keeps the channel open: the dedicated connection sends
+  // the tree request on this same channel right after the probe.
+  return {
+    kind: "gate",
+    ready: Promise.resolve(),
+    line: (line) =>
+      okResponseLine(requestIdFromLine(line), {
+        daemon_version: "0.0.0-test",
+        protocol_version: PROTOCOL_VERSION,
+        supported_agents: [],
+        runtimes: [],
+        git_available: true,
+        ...flags,
+      }),
+  };
+}
 
 function healthLine(requestLine: string): string {
   return okResponseLine(requestIdFromLine(requestLine), {
@@ -83,20 +122,38 @@ function healthLine(requestLine: string): string {
   });
 }
 
-async function startLifecycleDaemon(result: unknown): Promise<MockDaemon> {
-  return startUnixDaemon([
-    { kind: "reply", line: healthLine },
-    {
-      kind: "delay",
-      ms: LIFECYCLE_REPLY_DELAY_MS,
-      line: (line) => okResponseLine(requestIdFromLine(line), result),
-    },
-  ]);
+function inspectFlagsFor(method: LifecycleCase["method"]): Record<string, unknown> {
+  if (method === "session.remove_tree") {
+    return { session_remove_tree_supported: true };
+  }
+  return {};
+}
+
+async function startLifecycleDaemon(
+  lifecycle: LifecycleCase,
+  result: unknown,
+): Promise<MockDaemon> {
+  // `session.remove_tree` probes `host.inspect` for its capability flag before
+  // the dedicated connection sends the request, so its scenario answers the
+  // probe first and only then delays the tree reply.
+  const inspect = inspectStep(inspectFlagsFor(lifecycle.method));
+  const delayed = {
+    kind: "delay",
+    ms: LIFECYCLE_REPLY_DELAY_MS,
+    line: (line: string) => okResponseLine(requestIdFromLine(line), result),
+  } as const;
+  if (lifecycle.method === "session.remove_tree") {
+    return startTcpDaemon([inspect, delayed]);
+  }
+  return startUnixDaemon([{ kind: "reply", line: healthLine }, delayed]);
 }
 
 async function connect(daemon: MockDaemon, options?: ConnectOptions): Promise<Client> {
   if (daemon.endpoint.kind === "memory") {
     return Client.connectTransport(daemon.endpoint.transport, options);
+  }
+  if (daemon.endpoint.kind === "tcp") {
+    return connectTcp("lifecycle-budgets", { host: daemon.endpoint.host, port: daemon.endpoint.port }, options);
   }
   if (daemon.endpoint.kind !== "unix") {
     throw new Error("lifecycle scenarios use the Unix or in-memory daemon");
@@ -125,9 +182,13 @@ describe("lifecycle response budgets", () => {
       session_stop_request_budget_ms: SESSION_STOP_REQUEST_BUDGET_MS,
       worktree_hook_timeout_ms: WORKTREE_HOOK_TIMEOUT_MS,
       session_remove_request_budget_ms: SESSION_REMOVE_REQUEST_BUDGET_MS,
+      session_remove_tree_request_budget_ms: SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
     }).toEqual(fixture);
     expect(SESSION_REMOVE_REQUEST_BUDGET_MS).toBe(
       SESSION_STOP_REQUEST_BUDGET_MS + 4 * WORKTREE_HOOK_TIMEOUT_MS,
+    );
+    expect(SESSION_REMOVE_TREE_REQUEST_BUDGET_MS).toBe(
+      MAX_SESSION_REMOVE_TREE_SESSIONS * SESSION_REMOVE_REQUEST_BUDGET_MS,
     );
   });
 
@@ -137,10 +198,28 @@ describe("lifecycle response budgets", () => {
       const ready = new Promise<void>((resolve) => {
         releaseReply = resolve;
       });
-      const daemon = startMemoryDaemon([
-        { kind: "gate", ready, line: (line) => okResponseLine(requestIdFromLine(line), lifecycle.result) },
-        { kind: "reply", line: healthLine },
-      ]);
+      // `session.remove_tree` probes `host.inspect` first, so its gate waits
+      // behind the capability reply.
+      const steps: ScriptStep[] =
+        lifecycle.method === "session.remove_tree"
+          ? [
+            inspectStep(inspectFlagsFor(lifecycle.method)),
+            {
+              kind: "gate",
+              ready,
+              line: (line) => okResponseLine(requestIdFromLine(line), lifecycle.result),
+            },
+            { kind: "reply", line: healthLine },
+          ]
+          : [
+            {
+              kind: "gate",
+              ready,
+              line: (line) => okResponseLine(requestIdFromLine(line), lifecycle.result),
+            },
+            { kind: "reply", line: healthLine },
+          ];
+      const daemon = startMemoryDaemon(steps);
       if (daemon.endpoint.kind !== "memory") {
         throw new Error("memory daemon returned a different transport");
       }
@@ -150,6 +229,13 @@ describe("lifecycle response budgets", () => {
       try {
         const client = await Client.connectTransport(daemon.endpoint.transport);
         const call = client.call(lifecycle.method, lifecycle.params as never);
+        // The dedicated connection writes its first request before the test
+        // starts draining; a flush hands the turn to the mock's gate reply.
+        await Promise.resolve();
+        await Promise.resolve();
+        if (lifecycle.method === "session.remove_tree") {
+          expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("host.inspect");
+        }
         expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe(lifecycle.method);
         jest.advanceTimersByTime(DEFAULT_REQUEST_TIMEOUT_MS + 1_000);
         releaseReply();
@@ -169,14 +255,21 @@ describe("lifecycle response budgets", () => {
     });
 
     test(`an explicit timeout wins over the ${lifecycle.method} budget and reports an unknown outcome`, async () => {
-      const daemon = await startLifecycleDaemon(lifecycle.result);
+      const daemon = await startLifecycleDaemon(lifecycle, lifecycle.result);
       try {
         const client = await connect(daemon, { requestTimeoutMs: EXPLICIT_REQUEST_TIMEOUT_MS });
         await client.call("daemon.health", null);
 
         const error = await expectClientError(client.call(lifecycle.method, lifecycle.params as never));
         expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("daemon.health");
-        expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe(lifecycle.method);
+        if (lifecycle.method === "session.remove_tree") {
+          // The capability probe itself outlasts the explicit deadline, so the
+          // tree request never reaches the wire: the unknown outcome already
+          // covers the cascade.
+          expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe("host.inspect");
+        } else {
+          expect(parseRequestLine(await daemon.nextRequest())["method"]).toBe(lifecycle.method);
+        }
 
         expect(error.kind).toBe(lifecycle.kind);
         expect(error.errorClass).toBe("transport");

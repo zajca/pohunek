@@ -72,6 +72,7 @@ fn changes_session(method: &str) -> bool {
             | method::SESSION_RESUME
             | method::SESSION_REMOVE
             | method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+            | method::SESSION_REMOVE_TREE
             | method::SESSION_INPUT
             | method::SESSION_DETACH
             | method::SESSION_SET_METADATA

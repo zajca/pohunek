@@ -69,6 +69,7 @@ mod native_recovery;
 mod native_supersede;
 mod process_evidence;
 mod prompt_accepted;
+mod session_tree;
 mod stale_worker_metadata;
 mod stop_monitoring;
 mod terminal_acknowledgement;
@@ -21239,6 +21240,43 @@ fn retention_registry_over(
     retention_registry_configured(tag, inspector, None)
 }
 
+/// An external (read-only discovery) session in `registry`, built from a
+/// managed create the way the stale-exit-watch tests do, so tree tests can
+/// name an external root or child without touching discovery.
+pub(super) async fn external_session_fixture(
+    registry: &SessionRegistry,
+    pid: u32,
+) -> protocol::SessionInfo {
+    let created = registry
+        .create(params())
+        .await
+        .expect("create managed session fixture");
+    let external_id = external_session_id(pid);
+    let mut external = created.clone();
+    external.id = external_id;
+    external.pid = pid;
+    external.external = Some(true);
+    registry
+        .inner
+        .external
+        .upsert_if_current(
+            ProcessIdentity {
+                pid,
+                start_identity: StartIdentity::new(1),
+            },
+            external,
+            || Ok::<_, std::convert::Infallible>(true),
+            |_| {},
+        )
+        .await
+        .expect("infallible external session validation")
+        .expect("current external session");
+    registry
+        .inspect(&external_session_id(pid))
+        .await
+        .expect("external session listed")
+}
+
 /// [`retention_registry_over`] with a worker log directory that is a symlink
 /// to a real directory, which log cleanup refuses, so a removal fails after
 /// its marker sweep.
@@ -21672,6 +21710,7 @@ async fn retention_sweep_stops_at_the_removal_budget() {
         .sweep_retention(&protocol::SessionRetentionParams {
             dry_run: false,
             limit: Some(1),
+            ..Default::default()
         })
         .await
         .expect("sweep");

@@ -82,6 +82,8 @@ import type {
   SessionReleaseAgentParams,
   SessionReleaseAgentResult,
   SessionRemoveResult,
+  SessionRemoveTreeParams,
+  SessionRemoveTreeResult,
   SessionRenameParams,
   SessionRenameResult,
   SessionReportAgentParams,
@@ -154,6 +156,7 @@ export interface Methods {
   "session.release_agent": { params: SessionReleaseAgentParams; output: SessionReleaseAgentResult };
   "session.remove": { params: SessionId; output: SessionRemoveResult };
   "session.remove_accepting_unconfirmed": { params: SessionId; output: SessionRemoveResult };
+  "session.remove_tree": { params: SessionRemoveTreeParams; output: SessionRemoveTreeResult };
   "session.rename": { params: SessionRenameParams; output: SessionRenameResult };
   "session.report_agent": { params: SessionReportAgentParams; output: SessionReportAgentResult };
   "session.report_native_id": { params: SessionReportNativeIdParams; output: SessionReportNativeIdResult };
@@ -217,6 +220,7 @@ export const METHOD_NAMES = [
   "session.release_agent",
   "session.remove",
   "session.remove_accepting_unconfirmed",
+  "session.remove_tree",
   "session.rename",
   "session.report_agent",
   "session.report_native_id",

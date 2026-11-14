@@ -152,6 +152,7 @@ fn serve_session_and_track(
                                 external: None,
                                 capabilities: protocol::SessionCapabilities::default(),
                                 capability_refusals: None,
+                                children: None,
                                 placement: None,
                                 name: Some("s-1".to_owned()),
                                 agent: "test".to_owned(),

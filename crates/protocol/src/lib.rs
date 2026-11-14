@@ -42,6 +42,7 @@ mod project;
 mod runtime_id;
 mod secret_env;
 mod session;
+mod session_tree;
 mod store;
 pub mod tolerant;
 mod turn_wait;
@@ -76,9 +77,11 @@ pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
     AGENT_OPTION_CHOICE_MISSING_CODE, SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE,
-    SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE, SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE,
-    SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
+    SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE, SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE,
+    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
+    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
     SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
+    SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE,
 };
 #[doc(inline)]
 pub use governance::{
@@ -177,19 +180,23 @@ pub use session::{
     SessionNativeRecoveredEvent, SessionNewParams, SessionNewResult, SessionOutputGap,
     SessionOutputParams, SessionOutputResult, SessionPlacement, SessionPlacementProcess,
     SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
-    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionCandidate,
-    SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
-    SessionRetentionResult, SessionRuntime, SessionRuntimeIdentity, SessionScreenParams,
-    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
-    SessionWarningKind, SpawnedBy, SubagentInfo, SubagentLifecycle, SubagentStateEvent,
-    TerminalCursor, TerminalDimensions, TerminalDimensionsError, UnconfirmedProcess,
-    WorktreeSource, ATTENTION_CHILDREN_ISOLATE, ATTENTION_CHILDREN_METADATA_KEY,
-    MAX_CLIENT_REQUEST_ID_BYTES,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRemoveTreeParams, SessionRemoveTreeResult, SessionRenameParams, SessionRenameResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionResumeResult, SessionRetentionCandidate, SessionRetentionHold, SessionRetentionParams,
+    SessionRetentionPolicy, SessionRetentionReason, SessionRetentionResult, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionTreeKeepReason,
+    SessionTreeOutcome, SessionTreeRemoval, SessionWaitParams, SessionWaitReason,
+    SessionWaitResult, SessionWarning, SessionWarningKind, SpawnedBy, SubagentInfo,
+    SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
+    TerminalDimensionsError, UnconfirmedProcess, WorktreeSource, ATTENTION_CHILDREN_ISOLATE,
+    ATTENTION_CHILDREN_METADATA_KEY, MAX_CLIENT_REQUEST_ID_BYTES, MAX_RETENTION_SELECTOR_IDS,
+    MAX_SESSION_REMOVE_TREE_SESSIONS,
 };
+#[doc(inline)]
+pub use session_tree::{SessionTree, TreeNode};
 #[doc(inline)]
 pub use store::{StoreRejectedLine, STORE_REJECTED_TEXT_MAX_BYTES};
 #[doc(inline)]

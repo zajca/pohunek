@@ -31,6 +31,8 @@ mod project_cwd;
 mod readable_host;
 #[path = "health_socket/required_hooks.rs"]
 mod required_hooks;
+#[path = "health_socket/retention_selector.rs"]
+mod retention_selector;
 #[path = "support/root_reporter.rs"]
 mod root_reporter;
 #[path = "health_socket/session_ended_at.rs"]
@@ -41,6 +43,8 @@ mod session_fetch_ref;
 mod session_metadata;
 #[path = "health_socket/session_request.rs"]
 mod session_request;
+#[path = "health_socket/session_tree.rs"]
+mod session_tree;
 #[path = "health_socket/spawned_by.rs"]
 mod spawned_by;
 #[path = "health_socket/store_memo.rs"]
@@ -64,10 +68,11 @@ use protocol::{
     Response, RuntimeId, RuntimeRef, SessionAttachParams, SessionAttachResult, SessionDetachParams,
     SessionDetachResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
     SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, SessionWarningKind, StateSource, TerminalDimensions, WorktreeRemoveParams,
-    WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
+    SessionRemoveTreeParams, SessionRemoveTreeResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
+    SessionTreeKeepReason, SessionWarningKind, StateSource, TerminalDimensions,
+    WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;

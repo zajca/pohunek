@@ -180,7 +180,11 @@ admission policy: the `spawned_by` attribution of a session
 ([#1300](https://github.com/zajca/pohunek/issues/1300)) and durable session
 metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); both have
 shipped. Metadata stays opaque to the daemon, and attribution is never an
-authorization input.
+authorization input. The same attribution keys the session-tree views:
+`session.list` counts direct children per entry, `--tree` and the
+`top_level` / `spawned_by` list filters read them, `session.retention.sweep`
+selects by spawner, and `session.remove_tree` removes a subtree deepest
+first with every node under the normal removal safety.
 
 ### Shipped host identity and local governance
 
@@ -1654,7 +1658,7 @@ profile session operations with exact unique-name resolution. `full` alone
 registers stop and remove. The plugin repeats the daemon's origin-session guard
 before subprocess start: it denies exactly `session.stop`, `session.resume`,
 `session.remove`, `session.resize`, `session.set_metadata`,
-`session.rename`, and `session.input` when they target the hosting session. The plugin exposes no consent removal, so it has no counterpart for the daemon's denial of `session.remove_accepting_unconfirmed`. The
+`session.rename`, and `session.input` when they target the hosting session. The plugin exposes no cascade and no consent removal, so it has no counterpart for the daemon's denial of `session.remove_tree` or `session.remove_accepting_unconfirmed`. The
 only origin-session exceptions are the lifecycle reports
 `session.report_agent`, `session.release_agent`, and
 `session.report_native_id`; the daemon remains authoritative.
@@ -2305,7 +2309,7 @@ that remain are cheap, free-by-default, or inherited:
   `origin_session_id` and `origin_daemon_id` envelope markers. When both identify
   the target as the caller's origin, the daemon rejects exactly `session.stop`,
   `session.resume`, `session.remove`, `session.remove_accepting_unconfirmed`,
-  `session.resize`, `session.set_metadata`, `session.rename`,
+  `session.remove_tree`, `session.resize`, `session.set_metadata`, `session.rename`,
   and `session.input` with `plugin_self_target_denied`. Read-only observation is allowed. The lifecycle
   reports `session.report_agent`, `session.release_agent`, and
   `session.report_native_id` are also deliberately allowed: managed hooks must

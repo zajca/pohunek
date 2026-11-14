@@ -344,7 +344,20 @@ request without an origin records nothing; `daemon_id` names the daemon instance
 that launched the spawner's runtime (an earlier instance on this host or another
 host) and is kept as received, never resolved against local sessions. `pohunek session list --spawned-by <session-id>` returns
 exactly the sessions that session spawned and combines with `--meta-eq`,
-`--meta-has` and `--filter` using AND semantics. The link is attribution written
+`--meta-has` and `--filter` using AND semantics. `--top-level` keeps only the
+roots: sessions with no `spawned_by`, plus orphans whose spawner is gone (its
+record was removed, or the origin names another host). Every `session list`
+answer reports the direct-child count as `children` on each entry (list-only:
+inspect, events and the store never carry it). `--tree` renders the listed
+sessions indented under their spawner, parents before children, orphans as
+roots. `pohunek session rm <id> --with-children` removes a session
+together with its descendants, deepest first: every descendant goes through
+the normal `session rm` safety with one exception (a live descendant is kept
+and never stopped; only the named root is stopped first like `session rm`
+stops it), a dirty-worktree node is held and keeps its ancestors even under
+`--accept-unconfirmed-cleanup`, a kept or refused node keeps its ancestors,
+a child added while the cascade runs is kept, and the tree is bounded at
+64 sessions. The link is attribution written
 by the host from the request origin, not a security boundary: a process of the
 same user can omit the origin variables, and then nothing is recorded.
 
@@ -1305,7 +1318,11 @@ start, naming the file.
 
 `pohunek session retention sweep --dry-run` reports exactly what the current
 policy selects without touching anything; `--apply` removes the selection, and
-`--limit` lowers the cap for that one sweep. A manual sweep works whether or not
+`--limit` lowers the cap for that one sweep. `--spawned-by <session-id>`
+narrows the sweep to the direct children of that session (orphans whose parent
+is gone included), `--session <session-id>` (repeatable) to the named
+sessions; the two selectors exclude each other and a selector that names
+nothing selects nothing. A manual sweep works whether or not
 automatic sweeps are enabled and never exceeds the policy's own cap.
 
 A sweep removes through the same path as `session rm`, so it stops a runtime

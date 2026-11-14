@@ -4,10 +4,11 @@
 
 use std::path::PathBuf;
 
+use pohunek_client::protocol as client_protocol;
 use pohunek_client::{
     LIFECYCLE_STEP_BOUND_MS, RESUME_SWEEP_PASSES, SESSION_NEW_REQUEST_BUDGET_MS,
-    SESSION_REMOVE_REQUEST_BUDGET_MS, SESSION_RESUME_REQUEST_BUDGET_MS,
-    SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
+    SESSION_REMOVE_REQUEST_BUDGET_MS, SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
+    SESSION_RESUME_REQUEST_BUDGET_MS, SESSION_STOP_REQUEST_BUDGET_MS, WORKTREE_HOOK_TIMEOUT_MS,
 };
 use serde_json::{json, Value};
 
@@ -25,6 +26,7 @@ fn the_typescript_sdk_fixture_matches_the_client_budgets() {
         "session_stop_request_budget_ms": SESSION_STOP_REQUEST_BUDGET_MS,
         "worktree_hook_timeout_ms": WORKTREE_HOOK_TIMEOUT_MS,
         "session_remove_request_budget_ms": SESSION_REMOVE_REQUEST_BUDGET_MS,
+        "session_remove_tree_request_budget_ms": SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
     });
     // A removal waits for the stop it performs and for four hook runs (the
     // pre-remove and post-remove events, each with a host and a repository
@@ -32,6 +34,14 @@ fn the_typescript_sdk_fixture_matches_the_client_budgets() {
     assert_eq!(
         SESSION_REMOVE_REQUEST_BUDGET_MS,
         SESSION_STOP_REQUEST_BUDGET_MS + 4 * WORKTREE_HOOK_TIMEOUT_MS
+    );
+    // A cascade runs the per-remove lifecycle once per tree node, root
+    // included, so the budget scales with the tree cap.
+    assert_eq!(
+        SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
+        u32::try_from(client_protocol::MAX_SESSION_REMOVE_TREE_SESSIONS)
+            .expect("the tree cap fits u32")
+            * SESSION_REMOVE_REQUEST_BUDGET_MS
     );
     let path = fixture_path();
     let stored = std::fs::read_to_string(&path).unwrap_or_else(|error| {

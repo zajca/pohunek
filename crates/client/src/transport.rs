@@ -14,10 +14,11 @@ use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
-    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionNewParams,
-    SessionNewResult, SessionOutputParams, SessionOutputResult, SessionReadParams,
-    SessionReadResult, SessionRemoveResult, SessionResizeParams, SessionResizeResult,
-    SessionResumeParams, SessionResumeResult, SessionScreenParams, SessionScreenResult,
+    SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionOutputParams, SessionOutputResult,
+    SessionReadParams, SessionReadResult, SessionRemoveResult, SessionRemoveTreeParams,
+    SessionRemoveTreeResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionResumeResult, SessionRetentionParams, SessionScreenParams, SessionScreenResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
     SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
     ATTENTION_CHILDREN_METADATA_KEY, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
@@ -87,6 +88,13 @@ const SESSION_REMOVE_HOOK_RUNS: u32 = 2 * 2;
 /// budget is the stop budget plus every hook run at its timeout.
 pub const SESSION_REMOVE_REQUEST_BUDGET_MS: u32 =
     SESSION_STOP_REQUEST_BUDGET_MS + SESSION_REMOVE_HOOK_RUNS * WORKTREE_HOOK_TIMEOUT_MS;
+/// One `session.remove_tree` call removes up to
+/// [`protocol::MAX_SESSION_REMOVE_TREE_SESSIONS`] sessions, each through the
+/// normal removal safety, so its budget is the per-remove budget times the
+/// cap.
+#[allow(clippy::cast_possible_truncation, reason = "the tree cap fits u32")]
+pub const SESSION_REMOVE_TREE_REQUEST_BUDGET_MS: u32 =
+    protocol::MAX_SESSION_REMOVE_TREE_SESSIONS as u32 * SESSION_REMOVE_REQUEST_BUDGET_MS;
 /// Transport processing budget added after a validated daemon-side deadline.
 ///
 /// One second leaves room for request framing, waiter teardown, scheduling,
@@ -402,6 +410,13 @@ struct Conn<S> {
     remote_host: Option<String>,
     request_timeout: Duration,
     poisoned: Option<String>,
+}
+
+/// The outcome of routing one generic `call` through the gated typed helpers:
+/// either the helper already answered, or the params come back unclaimed.
+enum CallGate<Params> {
+    Routed(serde_json::Value),
+    Unclaimed(Params),
 }
 
 impl Client {
@@ -795,94 +810,110 @@ impl Client {
     /// This is the public SDK path for normal request/response methods.
     /// `session.input`, `session.new`, `session.resume`,
     /// `session.stop`, `session.remove`, `session.remove_accepting_unconfirmed`,
-    /// `session.wait`, `session.wait_turn`, and `session.output` take the same
-    /// dedicated-connection budgets as their typed helpers. The lower-level
+    /// `session.wait`, `session.wait_turn`, `session.output`, `session.list`,
+    /// `session.retention.sweep`, and `session.remove_tree` take the same
+    /// dedicated-connection budgets and capability gates as their typed
+    /// helpers. The lower-level
     /// [`Self::request`] remains available for callers that need raw JSON
     /// envelopes or are testing framing behavior directly.
     pub async fn call<M>(&mut self, params: M::Params) -> Result<M::Output, ClientError>
     where
         M: Method,
     {
-        if M::NAME == protocol::method::SESSION_INPUT {
+        match self.call_gated::<M>(M::NAME, params).await? {
+            CallGate::Routed(value) => Ok(protocol::tolerant::from_value(value)?),
+            CallGate::Unclaimed(params) => self.call_direct::<M>(params).await,
+        }
+    }
+
+    /// Routes one generic `call` through the gated typed helper when the
+    /// method name matches, handing the params back for an unclaimed method.
+    async fn call_gated<M>(
+        &mut self,
+        name: &'static str,
+        params: M::Params,
+    ) -> Result<CallGate<M::Params>, ClientError>
+    where
+        M: Method,
+    {
+        if name == protocol::method::SESSION_INPUT {
             let params =
                 serde_json::from_value::<SessionInputParams>(serde_json::to_value(params)?)?;
             let result = self.session_input(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_WAIT_TURN {
+        if name == protocol::method::SESSION_WAIT_TURN {
             let params =
                 serde_json::from_value::<SessionWaitTurnParams>(serde_json::to_value(params)?)?;
             let result = self.session_wait_turn(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_NEW {
+        if name == protocol::method::SESSION_NEW {
             let params = serde_json::from_value::<SessionNewParams>(serde_json::to_value(params)?)?;
             let result = self.session_new(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_RESUME {
+        if name == protocol::method::SESSION_RESUME {
             let params =
                 serde_json::from_value::<SessionResumeParams>(serde_json::to_value(params)?)?;
             let result = self.session_resume_with(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_STOP {
+        if name == protocol::method::SESSION_STOP {
             let session_id = serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
             let result = self.session_stop(session_id).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_REMOVE {
+        if name == protocol::method::SESSION_REMOVE {
             let session_id = serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
             let result = self.session_remove(session_id).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED {
+        if name == protocol::method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED {
             let session_id = serde_json::from_value::<SessionId>(serde_json::to_value(params)?)?;
             let result = self
                 .session_remove_accepting_unconfirmed(session_id)
                 .await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_WAIT {
+        if name == protocol::method::SESSION_WAIT {
             let params =
                 serde_json::from_value::<SessionWaitParams>(serde_json::to_value(params)?)?;
             let result = self.session_wait(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::COMMAND_RUN {
+        if name == protocol::method::COMMAND_RUN {
             let params = serde_json::from_value::<protocol::CommandRunParams>(
                 serde_json::to_value(params)?,
             )?;
             let result = self.command_run(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        if M::NAME == protocol::method::SESSION_OUTPUT {
+        if name == protocol::method::SESSION_OUTPUT {
             let params =
                 serde_json::from_value::<SessionOutputParams>(serde_json::to_value(params)?)?;
             let result = self.session_output(params).await?;
-            return Ok(protocol::tolerant::from_value(serde_json::to_value(
-                result,
-            )?)?);
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
         }
-        self.call_direct::<M>(params).await
+        if name == protocol::method::SESSION_LIST {
+            let params =
+                serde_json::from_value::<SessionListParams>(serde_json::to_value(params)?)?;
+            let result = self.session_list(params).await?;
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
+        }
+        if name == protocol::method::SESSION_RETENTION_SWEEP {
+            let params =
+                serde_json::from_value::<SessionRetentionParams>(serde_json::to_value(params)?)?;
+            let result = self.session_retention_sweep(params).await?;
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
+        }
+        if name == protocol::method::SESSION_REMOVE_TREE {
+            let params =
+                serde_json::from_value::<SessionRemoveTreeParams>(serde_json::to_value(params)?)?;
+            let result = self.session_remove_tree(params).await?;
+            return Ok(CallGate::Routed(serde_json::to_value(result)?));
+        }
+        Ok(CallGate::Unclaimed(params))
     }
 
     /// Start a session on a dedicated connection whose response budget covers
@@ -1080,6 +1111,93 @@ impl Client {
         }
     }
 
+    /// List sessions, refusing before sending when a tree filter needs a
+    /// daemon that does not advertise it.
+    ///
+    /// A filter of `TopLevel` or `HasSpawnedBy` is checked on the same
+    /// connection first: a daemon that predates the filters would ignore
+    /// them silently and return the wrong set, so the check fails with
+    /// `session_list_tree_filters_unsupported` before `session.list` goes
+    /// out. Any other filter list skips the probe and is sent directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails, the daemon reports
+    /// an error, or the daemon predates tree list filters.
+    pub async fn session_list(
+        &mut self,
+        params: protocol::SessionListParams,
+    ) -> Result<Vec<protocol::SessionInfo>, ClientError> {
+        let needs_tree = params.filters.iter().any(|filter| {
+            matches!(
+                filter,
+                protocol::SessionListFilter::TopLevel | protocol::SessionListFilter::HasSpawnedBy
+            )
+        });
+        if needs_tree {
+            let mut probe = self
+                .connect_dedicated(
+                    self.options
+                        .with_request_timeout(self.options.request_timeout),
+                )
+                .await?;
+            let capabilities = probe
+                .host_inspect_with(protocol::HostInspectParams {
+                    skip_runtime_probes: Some(true),
+                })
+                .await?;
+            if !capabilities.session_list_tree_filters_supported {
+                return Err(ClientError::Protocol(
+                    protocol::ProtocolError::session_list_tree_filters_unsupported(
+                        self.remote_host(),
+                    ),
+                ));
+            }
+        }
+        self.call_direct::<protocol::method::SessionList>(params)
+            .await
+    }
+
+    /// Run a retention sweep, refusing a selector the daemon cannot honor.
+    ///
+    /// A sweep with `spawned_by` or `session_ids` set is checked on the same
+    /// connection first: a daemon that predates the selector would ignore it
+    /// and sweep everything eligible, so the check fails with
+    /// `session_retention_selector_unsupported` before `session.retention.sweep`
+    /// goes out. A selector-free sweep is sent directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails, the daemon reports
+    /// an error, or the daemon predates sweep selectors.
+    pub async fn session_retention_sweep(
+        &mut self,
+        params: protocol::SessionRetentionParams,
+    ) -> Result<protocol::SessionRetentionResult, ClientError> {
+        if params.spawned_by.is_some() || params.session_ids.is_some() {
+            let mut probe = self
+                .connect_dedicated(
+                    self.options
+                        .with_request_timeout(self.options.request_timeout),
+                )
+                .await?;
+            let capabilities = probe
+                .host_inspect_with(protocol::HostInspectParams {
+                    skip_runtime_probes: Some(true),
+                })
+                .await?;
+            if !capabilities.session_retention_selector_supported {
+                return Err(ClientError::Protocol(
+                    protocol::ProtocolError::session_retention_selector_unsupported(
+                        self.remote_host(),
+                    ),
+                ));
+            }
+        }
+        self.call_direct::<protocol::method::SessionRetentionSweep>(params)
+            .await
+    }
+
     /// Run a command an installed package declared, on a dedicated connection
     /// whose response budget follows the run's wire timeout.
     ///
@@ -1247,6 +1365,49 @@ impl Client {
             session_id,
             SESSION_REMOVE_REQUEST_BUDGET_MS,
             |host, timeout| ClientError::SessionRemoveOutcomeUnknown { host, timeout },
+        )
+        .await
+    }
+
+    /// Remove a session together with its descendants, deepest first.
+    ///
+    /// The daemon must advertise
+    /// `session_remove_tree_supported`: an older daemon answers
+    /// `method_not_found` before it touches anything, so the client refuses
+    /// to send without the flag. The budget is the per-remove budget times
+    /// the tree cap; the call returns
+    /// [`ClientError::SessionRemoveTreeOutcomeUnknown`] when the deadline
+    /// elapses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the transport fails, the daemon lacks
+    /// the method, or the daemon reports an error such as
+    /// `session_not_found`.
+    pub async fn session_remove_tree(
+        &mut self,
+        params: SessionRemoveTreeParams,
+    ) -> Result<SessionRemoveTreeResult, ClientError> {
+        let mut probe = self
+            .connect_dedicated(
+                self.options
+                    .with_request_timeout(self.options.request_timeout),
+            )
+            .await?;
+        let capabilities = probe
+            .host_inspect_with(protocol::HostInspectParams {
+                skip_runtime_probes: Some(true),
+            })
+            .await?;
+        if !capabilities.session_remove_tree_supported {
+            return Err(ClientError::Protocol(
+                protocol::ProtocolError::session_remove_tree_unsupported(self.remote_host()),
+            ));
+        }
+        self.call_lifecycle::<protocol::method::SessionRemoveTree>(
+            params,
+            SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
+            |host, timeout| ClientError::SessionRemoveTreeOutcomeUnknown { host, timeout },
         )
         .await
     }

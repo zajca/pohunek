@@ -45,6 +45,12 @@ export type SessionInfo = {
    */
   capability_refusals?: SessionCapabilityRefusals;
   /**
+   * Direct-child count, set only on `session.list` responses: the sessions
+   * in that answer whose `spawned_by` names this session. Stored records,
+   * events and `session.inspect` never carry it; absent means unknown.
+   */
+  children?: number;
+  /**
    * The latest placement escape check of a live session, set only on
    * `session.inspect` responses. Stored records, events and list entries
    * never carry it.

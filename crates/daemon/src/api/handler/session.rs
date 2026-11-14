@@ -9,10 +9,10 @@ use protocol::{
     ErrorClass, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
     SessionDetectionParams, SessionDiffParams, SessionId, SessionInputParams, SessionListParams,
     SessionNewParams, SessionNewResult, SessionOutputParams, SessionReadParams,
-    SessionReleaseAgentParams, SessionRenameParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionResizeParams, SessionResumeParams, SessionResumeResult,
-    SessionRetentionParams, SessionScreenParams, SessionSetMetadataParams, SessionWaitParams,
-    SessionWaitTurnParams,
+    SessionReleaseAgentParams, SessionRemoveTreeParams, SessionRenameParams,
+    SessionReportAgentParams, SessionReportNativeIdParams, SessionResizeParams,
+    SessionResumeParams, SessionResumeResult, SessionRetentionParams, SessionScreenParams,
+    SessionSetMetadataParams, SessionWaitParams, SessionWaitTurnParams,
 };
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
@@ -70,8 +70,39 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
         return error_value(request, err);
     }
     let mut list = sessions.list().await;
+    // The tree is built over the unfiltered list: `TopLevel` keeps an
+    // orphan even when its parent was filtered out of view, and `children`
+    // counts its direct children whether or not they pass the filters. The
+    // counts are collected first because the tree borrows the list.
+    let counts: Vec<u32> = {
+        let tree = protocol::SessionTree::new(&list);
+        list.iter()
+            .map(|session| tree.child_count(&session.id))
+            .collect()
+    };
+    for (session, count) in list.iter_mut().zip(counts) {
+        session.children = Some(count);
+    }
     if !params.filters.is_empty() {
-        list.retain(|session| params.filters.iter().all(|filter| filter.matches(session)));
+        // `retain` cannot close over the tree (it borrows the drained
+        // list), so the answer is rebuilt from a keep-vector instead.
+        let tree = protocol::SessionTree::new(&list);
+        let keep: Vec<bool> = list
+            .iter()
+            .map(|session| {
+                params
+                    .filters
+                    .iter()
+                    .all(|filter| filter.matches_in(session, &tree))
+            })
+            .collect();
+        let mut kept = Vec::with_capacity(list.len());
+        for (session, keep) in std::mem::take(&mut list).into_iter().zip(keep) {
+            if keep {
+                kept.push(session);
+            }
+        }
+        list = kept;
     }
     sessions.enrich_native_activity(&mut list).await;
     // Response-only presentation labels, after the activity snapshot: the
@@ -179,6 +210,21 @@ async fn remove_session(
         Err(err) => return error_value(request, err),
     };
     match sessions.remove_with(&id, cleanup).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
+}
+
+/// `session.remove_tree`: remove a session together with its descendants.
+pub(super) async fn handle_session_remove_tree(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<SessionRemoveTreeParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match crate::session::remove_tree::remove_tree(sessions, &params).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

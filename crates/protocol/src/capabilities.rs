@@ -253,6 +253,30 @@ pub struct HostCapabilities {
     /// `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_attention_isolation_supported: bool,
+    /// Whether `session.list` honors the `top_level` and `has_spawned_by`
+    /// filters and reports `children` on every listed session.
+    ///
+    /// A daemon that predates the flag omits it, which decodes as `false`; it
+    /// would ignore the tree filters and leave `children` unset. `false` is
+    /// likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_list_tree_filters_supported: bool,
+    /// Whether `session.retention.sweep` honors the `spawned_by` and
+    /// `session_ids` selectors and sweeps only that subset.
+    ///
+    /// A daemon that predates the fields omits it, which decodes as `false`;
+    /// it would ignore a selector and sweep everything eligible. `false` is
+    /// likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_retention_selector_supported: bool,
+    /// Whether the daemon accepts `session.remove_tree`, removing a session
+    /// together with its descendants deepest first.
+    ///
+    /// A daemon that predates the method omits it, which decodes as `false`;
+    /// it would answer `method_not_found`. `false` is likewise omitted on
+    /// the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_remove_tree_supported: bool,
     /// Whether `package.install` and `package.link` accept `accept_commands`
     /// and install packages that declare commands.
     ///

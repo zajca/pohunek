@@ -31,10 +31,10 @@ use protocol::{
     SessionWarningKind, SpawnedBy, StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision,
     TerminalCursor, TerminalDimensions, TerminalWatermark, CLIENT_PROTOCOL_VERSIONS,
     MAX_COMMAND_OUTPUT_BYTES, MAX_COMMAND_TIMEOUT_MS, MAX_CONTROL_LINE_BYTES,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_TURN_CURSOR_BYTES,
-    MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS, MAX_SESSION_WAIT_TURN_TARGETS,
-    MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_REMOVE_TREE_SESSIONS,
+    MAX_SESSION_TURN_CURSOR_BYTES, MAX_SESSION_WAIT_MS, MAX_SESSION_WAIT_TURN_MS,
+    MAX_SESSION_WAIT_TURN_TARGETS, MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -270,6 +270,31 @@ fn emit_previous_version_tables(body: &mut String) {
     body.push_str("] as const;\n");
 }
 
+/// Ceilings a session lifecycle caller applies before it sends the request:
+/// how much one session may hold, and how many sessions one cascade walks.
+fn emit_session_limits(body: &mut String) {
+    writeln!(
+        body,
+        "export const MAX_SESSION_INPUT_BYTES = {MAX_SESSION_INPUT_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_OUTPUT_BYTES = {MAX_SESSION_OUTPUT_BYTES} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_WAIT_MS = {MAX_SESSION_WAIT_MS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const MAX_SESSION_REMOVE_TREE_SESSIONS = {MAX_SESSION_REMOVE_TREE_SESSIONS} as const;"
+    )
+    .expect("writing to a String cannot fail");
+}
+
 /// Ceilings a `command.run` caller applies before it sends the request.
 fn emit_command_limits(body: &mut String) {
     writeln!(
@@ -333,21 +358,7 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
         "export const MAX_WORKER_INSTANCE_ID_BYTES = {MAX_WORKER_INSTANCE_ID_BYTES} as const;"
     )
     .expect("writing to a String cannot fail");
-    writeln!(
-        body,
-        "export const MAX_SESSION_INPUT_BYTES = {MAX_SESSION_INPUT_BYTES} as const;"
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        body,
-        "export const MAX_SESSION_OUTPUT_BYTES = {MAX_SESSION_OUTPUT_BYTES} as const;"
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        body,
-        "export const MAX_SESSION_WAIT_MS = {MAX_SESSION_WAIT_MS} as const;"
-    )
-    .expect("writing to a String cannot fail");
+    emit_session_limits(&mut body);
     emit_command_limits(&mut body);
     writeln!(
         body,
@@ -726,6 +737,7 @@ fn session_minimal() -> SessionInfo {
         worktree_path: None,
         warnings: Vec::new(),
         capability_refusals: None,
+        children: None,
         placement: None,
         output_force_closed: false,
         metadata: BTreeMap::new(),
@@ -841,6 +853,7 @@ fn session_full() -> SessionInfo {
             detail: Some("origin unreachable in fixture environment".to_owned()),
         }],
         capability_refusals: None,
+        children: None,
         placement: None,
         output_force_closed: true,
         metadata,

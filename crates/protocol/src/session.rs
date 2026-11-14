@@ -689,10 +689,21 @@ pub enum SessionListFilter {
     /// unique on its own, and a cross-host origin is a reference, not a
     /// session this daemon resolves.
     SpawnedBy(String),
+    /// Match the sessions with no `spawned_by`, or whose `spawned_by` names a
+    /// session absent from this daemon's list (an orphan, including an origin
+    /// on another host). Needs the listed registry, so [`Self::matches`]
+    /// never answers it; the daemon handler uses [`Self::matches_in`].
+    TopLevel,
+    /// Match the sessions that carry any `spawned_by` attribution.
+    HasSpawnedBy,
 }
 
 impl SessionListFilter {
     /// Whether this filter matches `session` exactly.
+    ///
+    /// A context-free check: `TopLevel` needs the listed registry to tell an
+    /// orphan from a filtered-out parent, so it always answers `false` here
+    /// and is decided by [`Self::matches_in`] instead.
     #[must_use]
     pub fn matches(&self, session: &SessionInfo) -> bool {
         match self {
@@ -718,6 +729,28 @@ impl SessionListFilter {
                 .spawned_by
                 .as_ref()
                 .is_some_and(|spawned_by| spawned_by.session_id.0 == *id),
+            // `TopLevel` needs the listed registry to tell an orphan from a
+            // nested session, so it stays non-matching here; see
+            // `matches_in`. `HasSpawnedBy` is context-free.
+            Self::TopLevel => false,
+            Self::HasSpawnedBy => session.spawned_by.is_some(),
+        }
+    }
+
+    /// Whether this filter matches `session` within the listed `tree`.
+    ///
+    /// The daemon handler filters with this one predicate: `TopLevel` and
+    /// `HasSpawnedBy` are resolved against the unfiltered list the tree was
+    /// built from, and every other variant behaves exactly as
+    /// [`Self::matches`].
+    #[must_use]
+    pub fn matches_in(&self, session: &SessionInfo, tree: &crate::SessionTree<'_>) -> bool {
+        match self {
+            // Resolved against the unfiltered list: an orphan stays
+            // top-level even when its parent was filtered out of view.
+            Self::TopLevel => tree.is_top_level(session),
+            Self::HasSpawnedBy => session.spawned_by.is_some(),
+            _ => self.matches(session),
         }
     }
 }
@@ -3166,6 +3199,12 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub capability_refusals: Option<SessionCapabilityRefusals>,
+    /// Direct-child count, set only on `session.list` responses: the sessions
+    /// in that answer whose `spawned_by` names this session. Stored records,
+    /// events and `session.inspect` never carry it; absent means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub children: Option<u32>,
     /// The latest placement escape check of a live session, set only on
     /// `session.inspect` responses. Stored records, events and list entries
     /// never carry it.
@@ -3787,6 +3826,161 @@ pub struct SessionRemoveResult {
     pub warnings: Vec<SessionWarning>,
 }
 
+/// Maximum sessions one `session.remove_tree` call removes, root included.
+///
+/// A bounded tree keeps one call's request, report and runtime bounded: the
+/// cascade removes through the normal per-session safety, so one oversized
+/// tree would otherwise hold the caller's lifecycle lock far past the honest
+/// budget the client can offer.
+pub const MAX_SESSION_REMOVE_TREE_SESSIONS: usize = 64;
+
+/// Parameters for `session.remove_tree`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRemoveTreeParams.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionRemoveTreeParams {
+    /// The session whose descendants are removed first, then itself.
+    pub session_id: SessionId,
+    /// Consent for this call only to accept the unproven cleanup on every
+    /// node, like `session.remove_accepting_unconfirmed`. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub accept_unconfirmed_cleanup: bool,
+}
+
+/// How one node of a `session.remove_tree` call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionTreeOutcome.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum SessionTreeOutcome {
+    /// The daemon evicted the session entry (a concurrent remove counts).
+    Removed,
+    /// The daemon kept the session entry, for the recorded keep reason.
+    Kept,
+    /// The removal failed with the recorded error.
+    Refused,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(SessionTreeOutcome);
+
+impl SessionTreeOutcome {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::Kept => "kept",
+            Self::Refused => "refused",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Why `session.remove_tree` kept one node of the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionTreeKeepReason.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum SessionTreeKeepReason {
+    /// The session is still live and was never stopped: the cascade stops
+    /// nothing below the named root.
+    Live,
+    /// The session is live but cannot be stopped, or its runtime cannot be
+    /// removed: a generationless `conflict` kept without consent, an
+    /// incompatible runtime, or a state `session.remove` would refuse.
+    NotRemovable,
+    /// The session is external to this daemon's ownership.
+    External,
+    /// A pohunek-owned worktree of the session holds unsaved or unpushed
+    /// work; `hold` names the reason.
+    WorktreeHeld,
+    /// One of its descendants was kept or refused.
+    DescendantKept,
+    /// A new direct child appeared after the cascade enumerated the node.
+    DescendantAdded,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(SessionTreeKeepReason);
+
+impl SessionTreeKeepReason {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::NotRemovable => "not_removable",
+            Self::External => "external",
+            Self::WorktreeHeld => "worktree_held",
+            Self::DescendantKept => "descendant_kept",
+            Self::DescendantAdded => "descendant_added",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One node of a `session.remove_tree` call, in removal order, root last.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionTreeRemoval.ts"))]
+pub struct SessionTreeRemoval {
+    /// The removed or kept session.
+    pub session_id: SessionId,
+    /// The session its record names as the origin, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub parent: Option<SessionId>,
+    /// The node's depth below the named root, which is depth 0.
+    pub depth: u32,
+    /// How this node ended.
+    pub outcome: SessionTreeOutcome,
+    /// Why the node was kept; set only with `kept`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub keep_reason: Option<SessionTreeKeepReason>,
+    /// The worktree hold that kept the node; set only with `worktree_held`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub hold: Option<SessionRetentionHold>,
+    /// The error that refused the node; set only with `refused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub error: Option<ProtocolError>,
+    /// The per-session removal result; set only with `removed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub removal: Option<SessionRemoveResult>,
+}
+
+/// Result returned by `session.remove_tree`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionRemoveTreeResult.ts"))]
+pub struct SessionRemoveTreeResult {
+    /// Nodes the cascade evicted from the registry.
+    pub removed: u32,
+    /// Nodes the cascade kept, for the recorded reasons.
+    pub kept: u32,
+    /// Nodes the cascade refused, with the recorded errors.
+    pub refused: u32,
+    /// Every node in removal order, the named root last.
+    pub sessions: Vec<SessionTreeRemoval>,
+}
+
 /// Default interval between daemon-owned session retention sweeps.
 ///
 /// Six hours matches the notification retention cadence. Unrecoverable sessions
@@ -3983,6 +4177,12 @@ pub struct SessionRetentionCandidate {
     pub removed: bool,
 }
 
+/// Maximum session ids a retention sweep selector accepts.
+///
+/// A bounded selector keeps one sweep's request and report small; a whole
+/// subtree is `session.remove_tree`'s job, not the sweep's.
+pub const MAX_RETENTION_SELECTOR_IDS: usize = 256;
+
 /// Parameters for `session.retention.sweep`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -3995,6 +4195,21 @@ pub struct SessionRetentionParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub limit: Option<u32>,
+    /// Sweep only the direct children of this session, matched like the
+    /// `session.list` `spawned_by` filter, including orphans whose record
+    /// names the id. A daemon that predates
+    /// `session_retention_selector_supported` ignores the selector and
+    /// sweeps everything eligible, so a client refuses to send one without
+    /// the flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub spawned_by: Option<SessionId>,
+    /// Sweep only these sessions, by id. Unknown ids are not examined and
+    /// not reported. Same older-daemon hazard and client refusal as
+    /// [`Self::spawned_by`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub session_ids: Option<Vec<SessionId>>,
 }
 
 /// Result returned by `session.retention.sweep`.
@@ -4159,6 +4374,7 @@ mod tests {
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            children: None,
             placement: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),

@@ -178,6 +178,7 @@ use forward::Forwarded;
 pub use native_attestation::ControlPeer;
 pub use reconcile::upgrade_preflight;
 pub(crate) use rejected_lines::RejectedLinesState;
+pub(crate) mod remove_tree;
 mod resume;
 mod retention;
 mod settle;
@@ -5902,7 +5903,7 @@ impl SessionRegistry {
         sessions
     }
 
-    async fn list_raw(&self) -> Vec<SessionInfo> {
+    pub(crate) async fn list_raw(&self) -> Vec<SessionInfo> {
         let activity_epoch = self.daemon_instance_id().to_owned();
         let mut sessions = self
             .inner
@@ -8679,6 +8680,7 @@ fn external_session_info(
         worktree_path: association.worktree_path,
         warnings: Vec::new(),
         capability_refusals: None,
+        children: None,
         placement: None,
         output_force_closed: false,
         metadata: BTreeMap::new(),
@@ -8935,6 +8937,7 @@ fn create_intent_record(
         spawned_by: spawned_by.cloned(),
         warnings: Vec::new(),
         capability_refusals: None,
+        children: None,
         placement: None,
         output_force_closed: false,
         created_at: created_at.clone(),
@@ -9871,7 +9874,7 @@ fn validate_agent_session_path(session_id: &SessionId, value: Option<&str>) -> O
     })
 }
 
-fn session_not_found(id: &str) -> ProtocolError {
+pub(super) fn session_not_found(id: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "session_not_found",
@@ -9902,7 +9905,7 @@ fn session_not_running(id: &SessionId) -> ProtocolError {
     )
 }
 
-fn session_external_read_only(id: &SessionId) -> ProtocolError {
+pub(super) fn session_external_read_only(id: &SessionId) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "session_external_read_only",

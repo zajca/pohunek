@@ -1,0 +1,4 @@
+---
+kind: added
+---
+`pohunek session list` reports the session tree: every listed entry carries its direct-child count as `children` (counted over the unfiltered list, so a filtered view keeps full counts), `--top-level` keeps only the roots (sessions with no `spawned_by`, plus orphans whose spawner is absent from the list), and `--tree` renders the human table as an indented parent-before-child hierarchy with orphans as roots. The new `session.list` predicates are `top_level` and `has_spawned_by`, advertised by `HostCapabilities.session_list_tree_filters_supported` (clients refuse them against an older daemon before the request is sent, and a protocol-3 daemon is refused likewise); `session.inspect`, events and stored records never carry `children`. ([#2163](https://github.com/zajca/pohunek/issues/2163))
