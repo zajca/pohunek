@@ -1507,7 +1507,7 @@ impl SessionRegistry {
                 loss_reason: None,
                 exit: None,
                 loss_cause: None,
-            generation_recorded: None,
+                generation_recorded: None,
             }),
         })
     }

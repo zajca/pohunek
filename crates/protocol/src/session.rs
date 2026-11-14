@@ -3433,6 +3433,34 @@ impl SessionInfo {
                 .as_ref()
                 .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
     }
+
+    /// The activity cursor of this snapshot, when `session.list` or
+    /// `session.inspect` reported one: the daemon epoch scoping the revision
+    /// plus the newest recorded activity revision.
+    #[must_use]
+    pub fn activity_cursor(&self) -> Option<(&str, ActivityRevision)> {
+        match (self.activity_epoch.as_deref(), self.activity_revision) {
+            (Some(epoch), Some(revision)) => Some((epoch, revision)),
+            _ => None,
+        }
+    }
+
+    /// Whether a buffered `agent_state` event is older than this snapshot.
+    ///
+    /// Returns `Some(true)` when the event carries the cursor's epoch with a
+    /// revision at or below the cursor, `Some(false)` when it carries the
+    /// cursor's epoch with a newer revision, and `None` when either side has
+    /// no cursor or the epochs differ and the two cannot be ordered.
+    #[must_use]
+    pub fn agent_state_is_stale(&self, event: &AgentStateEvent) -> Option<bool> {
+        let (epoch, revision) = self.activity_cursor()?;
+        let event_epoch = event.activity_epoch.as_deref()?;
+        let event_revision = event.revision?;
+        if event_epoch != epoch {
+            return None;
+        }
+        Some(event_revision <= revision)
+    }
 }
 
 /// Payload shared by session lifecycle events.

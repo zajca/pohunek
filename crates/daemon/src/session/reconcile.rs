@@ -4805,7 +4805,7 @@ impl SessionRegistry {
                         loss_reason: None,
                         exit: None,
                         loss_cause: None,
-            generation_recorded: None,
+                        generation_recorded: None,
                     })
                     .state = RuntimeState::Terminal;
                 let imported = self
@@ -11143,8 +11143,8 @@ while os.getppid() == parent:
             native_identity_ordering: None,
             info: SessionInfo {
                 blocked_kind: None,
-            activity_epoch: None,
-            activity_revision: None,
+                activity_epoch: None,
+                activity_revision: None,
                 spawned_by: None,
                 attention_isolated_by: None,
                 id: SessionId("s-identity".to_owned()),
@@ -20795,17 +20795,19 @@ generation "$1"
                     let mut announced = false;
                     while let Ok(event) = events.try_recv() {
                         if event.event() == protocol::event::SESSION_RUNTIME_CONFLICT {
-                            let session: SessionInfo = serde_json::from_value(
-                                event.payload()["session"].clone(),
-                            )
-                            .expect("decode the announced session");
+                            let session: SessionInfo =
+                                serde_json::from_value(event.payload()["session"].clone())
+                                    .expect("decode the announced session");
                             let runtime = session.runtime.as_ref().expect("runtime");
                             assert_eq!(runtime.generation_recorded, Some(false));
                             assert!(!session.can_stop() && !session.can_remove());
                             announced = true;
                         }
                     }
-                    assert!(announced, "{session}: the conflict is announced to subscribers");
+                    assert!(
+                        announced,
+                        "{session}: the conflict is announced to subscribers"
+                    );
                 }
                 let before = stop_intent_of(&fixture.root, session);
 

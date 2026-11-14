@@ -12,16 +12,16 @@ use time::OffsetDateTime;
 
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use protocol::{
-    method, ActivityRevision, AgentActivity, CwdSource, DetectionRegionKind, DetectionRegionPreview, ErrorClass,
-    Event, OutputOffset, PackageId, PackageIdentity, PackageVersion, ProcessStartIdentity,
-    ProjectSource, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId, RuntimeRef,
-    RuntimeState, SessionAttachParams, SessionDetectionParams, SessionId, SessionInfo,
-    SessionNativeRecoveredEvent, SessionNewParams, SessionOutputParams, SessionReadFormat,
-    SessionReadParams, SessionReadSource, SessionReleaseAgentParams, SessionReportAgentParams,
-    SessionReportNativeIdParams, SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity,
-    SessionState, SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo,
-    SubagentLifecycle, SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
-    MAX_REQUEST_ID_BYTES,
+    method, ActivityRevision, AgentActivity, CwdSource, DetectionRegionKind,
+    DetectionRegionPreview, ErrorClass, Event, OutputOffset, PackageId, PackageIdentity,
+    PackageVersion, ProcessStartIdentity, ProjectSource, ReportSequence, Request, Response,
+    RuntimeGeneration, RuntimeId, RuntimeRef, RuntimeState, SessionAttachParams,
+    SessionDetectionParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
+    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
+    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
+    SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
+    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::host::fixture::{
@@ -3249,7 +3249,10 @@ async fn listed_and_inspected_sessions_carry_their_activity_cursor() {
             let updated: protocol::SessionEvent =
                 serde_json::from_value(event.payload().clone()).expect("decode the event");
             assert_eq!(
-                (updated.session.activity_epoch, updated.session.activity_revision),
+                (
+                    updated.session.activity_epoch,
+                    updated.session.activity_revision
+                ),
                 (None, None),
                 "events never carry the list/inspect cursor"
             );
@@ -3274,7 +3277,10 @@ async fn listed_and_inspected_sessions_carry_their_activity_cursor() {
         .expect("the session is listed");
     assert_eq!(
         (from_list.activity_epoch, from_list.activity_revision),
-        (inspected.activity_epoch.clone(), inspected.activity_revision),
+        (
+            inspected.activity_epoch.clone(),
+            inspected.activity_revision
+        ),
         "list and inspect agree on the cursor"
     );
 

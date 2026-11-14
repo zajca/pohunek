@@ -5,37 +5,37 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use proptest::prelude::*;
 use protocol::{
-    event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, ApprovalKeyReference,
-    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, BackgroundItem,
-    BackgroundKind, BackgroundRevision, BackgroundStatus, BlockedKind, ConceptDeprecation,
-    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
-    DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
-    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin, HostApprovalSignature,
-    HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
-    IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
-    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
-    IntegrationRecovery, IntegrationUninstallState, NotificationCreateParams,
-    NotificationCreateResult, NotificationCreatedEvent, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationListParams, NotificationRecord, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdatedEvent, ObservationParamsError,
-    OutputOffset, OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault,
-    PackageFindingKind, PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason,
-    PackageTrust, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
-    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
-    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult,
-    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
-    SessionDetectionParams, SessionDetectionResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
-    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, AgentStateEvent,
+    ApprovalKeyReference, AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader,
+    BackgroundItem, BackgroundKind, BackgroundRevision, BackgroundStatus, BlockedKind,
+    ConceptDeprecation, ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult,
+    DetectionRegionKind, DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus,
+    EnrollmentInfo, EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin,
+    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
+    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
+    IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
+    IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery,
+    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeletedEvent, NotificationId, NotificationKind,
+    NotificationListParams, NotificationRecord, NotificationSeverity, NotificationSource,
+    NotificationStatus, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault, PackageFindingKind,
+    PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PackageTrust, PrincipalId,
+    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
+    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
+    Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
+    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
+    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -1076,6 +1076,60 @@ fn session_info_json_shape_roundtrips_with_activity_cursor() {
     let decoded: SessionInfo = serde_json::from_value(bare).expect("decode session info");
     assert_eq!(decoded.activity_epoch, None);
     assert_eq!(decoded.activity_revision, None);
+}
+
+#[test]
+fn session_info_orders_buffered_agent_state_against_its_activity_cursor() {
+    let event = |epoch: Option<&str>, revision: Option<u64>| AgentStateEvent {
+        session_id: SessionId("s-42".to_owned()),
+        activity: AgentActivity::Working,
+        source: StateSource::Report,
+        blocked_kind: None,
+        runtime: None,
+        activity_epoch: epoch.map(str::to_owned),
+        revision: revision.map(ActivityRevision::new),
+    };
+    let snapshotted = SessionInfo {
+        activity_epoch: Some("d-epoch-1".to_owned()),
+        activity_revision: Some(ActivityRevision::new(7)),
+        ..running_shell_session(None)
+    };
+    assert_eq!(
+        snapshotted.activity_cursor(),
+        Some(("d-epoch-1", ActivityRevision::new(7)))
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(7))),
+        Some(true)
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(3))),
+        Some(true)
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(8))),
+        Some(false)
+    );
+    // Another epoch cannot be ordered against the snapshot.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-2"), Some(1))),
+        None
+    );
+    // Without a cursor on either side there is nothing to order by.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(None, Some(9))),
+        None
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), None)),
+        None
+    );
+    let bare = running_shell_session(None);
+    assert_eq!(bare.activity_cursor(), None);
+    assert_eq!(
+        bare.agent_state_is_stale(&event(Some("d-epoch-1"), Some(1))),
+        None
+    );
 }
 
 #[test]
@@ -5876,13 +5930,17 @@ fn a_conflict_naming_its_worker_is_stoppable_and_removable_to_a_client() {
         "loss_reason": "runtime_lost",
         "generation_recorded": false
     }));
-    assert_eq!(lost_with_flag.can_stop(), decode(json!({
-        "state": "lost",
-        "runtime_generation": "1",
-        "worker_id": "w-1",
-        "worker_instance_id": "r-1",
-        "loss_reason": "runtime_lost"
-    })).can_stop());
+    assert_eq!(
+        lost_with_flag.can_stop(),
+        decode(json!({
+            "state": "lost",
+            "runtime_generation": "1",
+            "worker_id": "w-1",
+            "worker_instance_id": "r-1",
+            "loss_reason": "runtime_lost"
+        }))
+        .can_stop()
+    );
 
     for runtime in [
         json!({"state": "conflict", "runtime_generation": "1"}),
