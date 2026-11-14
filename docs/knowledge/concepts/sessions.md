@@ -1010,6 +1010,14 @@ the runtime is faulted instead of ended, the stop fails with
 (`runtime_lost_cleanup_unconfirmed` when its own sweep cannot confirm either).
 The worker log names each process that kept the cleanup open.
 
+A worker answers a stop once the runtime's terminal outcome is committed to its
+journal. When that commit is still pending after the worker's 10 s wait (a
+loaded host), it refuses the stop as retryable after the processes were already
+stopped; the daemon sends the same stop once more, which only waits up to
+another 10 s for the commit. A commit still pending after both waits fails the
+stop or removal with `worker_operation_failed`, and the pending stop intent
+decides the outcome once the commit lands.
+
 The same applies when the root exits on its own and such a helper keeps the
 terminal open past the drain window: the worker force-closes the output, sweeps
 the runtime's marked processes, and the session ends `done` or `failed` with

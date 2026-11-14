@@ -782,14 +782,15 @@ async fn an_unattributable_holder_keeps_the_forced_close_from_ending_the_session
         .expect("the session is removable once its holder is gone");
 }
 
-/// How much longer than the worker's wait for its terminal commit the
+/// How much longer than both of a stop's waits for the terminal commit the
 /// late-exit scenario's stop grace is.
 ///
 /// The worker answers a stop once its terminal journal is committed, or with a
-/// retryable fault after `terminal_commit_wait_timeout`. With a holder that
-/// ignores `SIGTERM`, the forced-close sweep takes one stop grace before its
-/// `SIGKILL`, so a grace longer than that wait by this margin makes the commit
-/// land after the stop gave up, with time to spare on a loaded host.
+/// retryable fault after `terminal_commit_wait_timeout`; the daemon then sends
+/// the stop once more, which waits that long again. With a holder that ignores
+/// `SIGTERM`, the forced-close sweep takes one stop grace before its
+/// `SIGKILL`, so a grace longer than the two waits by this margin makes the
+/// commit land after the stop gave up, with time to spare on a loaded host.
 const LATE_COMMIT_MARGIN: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Exit status of a root that exits on its own while its holder keeps the
@@ -826,16 +827,16 @@ fn persist_stop_intent(store: &Path) {
 /// stopped session when the worker's terminal commit lands only after the stop
 /// gave up waiting for it: the durable stop intent decides the outcome.
 ///
-/// It runs for about three stop graces (about 42 s). The grace must outlast
-/// the worker's 10 s terminal-commit wait, which the real `pohunek-sessiond`
-/// fixes and no configuration it reads can shorten.
+/// It runs for about three stop graces (about 72 s). The grace must outlast
+/// both of the stop's waits for the worker's 10 s terminal commit, which the
+/// real `pohunek-sessiond` fixes and no configuration it reads can shorten.
 #[tokio::test]
 async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
     let mut scenario = Scenario::new(Holder::Image, Root::Exits(ROOT_EXIT_STATUS));
-    scenario.config.stop_grace = pohunek_session_worker::WorkerConfig::new()
+    scenario.config.stop_grace = 2 * pohunek_session_worker::WorkerConfig::new()
         .terminal_commit_wait_timeout
         + LATE_COMMIT_MARGIN;
     // A worker rejects a post-kill reap deadline shorter than its grace. The
@@ -848,7 +849,7 @@ async fn a_late_exit_after_the_stop_gave_up_honours_the_stop_intent() {
     });
 
     let error = guard(
-        "a stop that outlasts the worker's terminal-commit wait",
+        "a stop that outlasts both of its waits for the terminal commit",
         Box::pin(registry.stop(&created.id)),
     )
     .await

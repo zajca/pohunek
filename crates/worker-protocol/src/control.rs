@@ -1609,6 +1609,15 @@ pub struct OutputGap {
     pub missing_end: u64,
 }
 
+/// Message of the retryable [`ControlCode::RuntimeFault`] that answers a stop
+/// whose wait for the runtime's terminal journal commit elapsed.
+///
+/// The worker sends it only after the process group was stopped, so the same
+/// stop sent again only waits for that commit. Every worker of the protocol
+/// window sends this exact text, which is how the daemon tells this refusal
+/// from the other retryable stop faults.
+pub const TERMINAL_COMMIT_PENDING: &str = "terminal journal commit is still pending; retry stop";
+
 /// Carries a structured worker request failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
 #[error("{code:?}: {message}")]
