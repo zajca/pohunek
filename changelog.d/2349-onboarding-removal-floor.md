@@ -1,4 +1,4 @@
 ---
 kind: fixed
 ---
-The onboarding guide's floor and its Claude deny rules for the `pohunek-onboard` launch profile now also refuse `pohunek session retention sweep --apply` and `pohunek plugin profile rm`, so an onboarding session never removes sessions or profiles, not even after a permission prompt. ([#2349](https://github.com/zajca/pohunek/issues/2349))
+The onboarding guide's floor and the Claude deny rules of its `pohunek-onboard` launch profile now also cover `pohunek session retention sweep --apply` and `pohunek plugin profile rm`: written as the guide writes them, both are refused instead of only prompting. Like the guide's other `Bash` deny rules, they match the usual spellings of a command and are not a security boundary. ([#2349](https://github.com/zajca/pohunek/issues/2349))

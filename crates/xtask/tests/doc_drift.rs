@@ -605,3 +605,42 @@ fn a_guide_without_its_floor_or_deny_table_fails_the_onboarding_floor_check() {
         vec!["onboarding-floor"]
     );
 }
+
+#[test]
+fn a_floor_flag_without_a_rule_carrying_it_fails_the_onboarding_floor_check() {
+    let dropped = with_guide_edit(
+        "| `Bash(pohunek integration install *--skill*)` | always | skill files |\n",
+        "",
+    );
+    assert_eq!(dropped.failed_checks(), vec!["onboarding-floor"]);
+
+    let mistyped = with_guide_edit(
+        "`Bash(pohunek session retention sweep *--apply*)`",
+        "`Bash(pohunek session retention sweep *--aply*)`",
+    );
+    assert_eq!(mistyped.failed_checks(), vec!["onboarding-floor"]);
+
+    let longer = with_guide_edit(
+        "`Bash(pohunek session retention sweep *--apply*)`",
+        "`Bash(pohunek session retention sweep *--apply-all*)`",
+    );
+    assert_eq!(longer.failed_checks(), vec!["onboarding-floor"]);
+}
+
+#[test]
+fn a_floor_flag_outside_a_command_bullet_needs_a_rule_for_every_command() {
+    let dropped = with_guide_edit(
+        "| `Bash(pohunek *--host*)` | always | another host through `--host` |\n",
+        "",
+    );
+    assert_eq!(dropped.failed_checks(), vec!["onboarding-floor"]);
+}
+
+#[test]
+fn a_floor_flag_listed_without_a_rule_must_stay_in_the_floor() {
+    let dropped = with_guide_edit(
+        "with `--all-profiles`, `--skill` or without `--profile`.",
+        "with `--all-profiles` or `--skill`.",
+    );
+    assert_eq!(dropped.failed_checks(), vec!["onboarding-floor"]);
+}
