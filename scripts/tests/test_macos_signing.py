@@ -65,6 +65,19 @@ def write_shim(directory, name, text):
     path.chmod(0o755)
 
 
+def canonical_use(use: str) -> str:
+    """Strip the comment and collapse an `actions/cache` subpath.
+
+    `actions/cache/restore@sha` and `actions/cache/save@sha` spell the same
+    pinned action with its slashed subpath; both directions stay pinned, so
+    compare them as `actions/cache@sha`.
+    """
+    ref = use.split("@", 1)[1].split()[0] if "@" in use else ""
+    repo = use.split("@", 1)[0]
+    repo = re.sub(r"^(actions/cache)/(?:restore|save)$", r"\1", repo)
+    return f"{repo}@{ref}" if ref else repo
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="pohunek-signing-")).resolve()
@@ -358,11 +371,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for name, job in self.macos.items():
             for use in re.findall(r"uses: (\S+)", job):
                 # A local composite action comes from the release commit
-                # itself; the actions it uses must be pinned to a commit.
+                # itself; the actions it uses must be pinned to a commit. A
+                # nested local composite resolves from the same commit too.
                 if re.fullmatch(r"\./\.github/actions/[a-z-]+", use):
-                    nested = (ROOT / use / "action.yml").read_text()
+                    nested = (ROOT / use[2:] / "action.yml").read_text()
                     for inner in re.findall(r"uses: (\S+)", nested):
-                        self.assertRegex(inner, r"@[0-9a-f]{40}", "%s: %s: %s" % (name, use, inner))
+                        if re.fullmatch(r"\./\.github/actions/[a-z-]+", inner):
+                            deep_text = (ROOT / inner[2:] / "action.yml").read_text()
+                            for deep in re.findall(r"uses: (\S+)", deep_text):
+                                self.assertRegex(canonical_use(deep), r"@[0-9a-f]{40}", "%s: %s: %s: %s" % (name, use, inner, deep))
+                        else:
+                            self.assertRegex(canonical_use(inner), r"@[0-9a-f]{40}", "%s: %s: %s" % (name, use, inner))
                     continue
                 self.assertRegex(use, r"@[0-9a-f]{40}", "%s: %s" % (name, use))
 

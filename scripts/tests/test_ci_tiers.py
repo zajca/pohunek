@@ -66,6 +66,7 @@ MACOS_PATH_OWNERSHIP = {
             ".github/workflows/ci.yml",
             "rust-toolchain.toml",
             ".github/actions/setup-rust/**",
+            ".github/actions/pinned-cache/**",
         },
         # Platform-neutral data whose readers all run on Linux (#1225).
         "main": {"docs/knowledge/**"},
@@ -139,6 +140,7 @@ MACOS_PATH_OWNERSHIP = {
             "rust-toolchain.toml",
             ".github/actions/setup-rust/**",
             ".github/actions/setup-uv/**",
+            ".github/actions/pinned-cache/**",
         },
         "main": {
             "Cargo.toml",
@@ -259,9 +261,16 @@ FAIL_FAST_EVENTS = "(github.event_name == 'pull_request' || github.event_name ==
 # network actions `is_network_step` matches: a `uses:` step whose action
 # starts with one of these prefixes is a network step. Only the listed
 # actions are tagged: `Swatinem/rust-cache`, `actions/setup-python` and the
-# `setup-*` composites that fetch through ci-retry are not.
+# `setup-*` composites that fetch through ci-retry are not. The pinned-cache
+# composite replaces the `taiki-e/install-action` network steps (and the
+# inline apt/npm installs) and restores one `actions/cache` entry, so it
+# counts as a network step. A relocated job copies the
+# action out of the checkout first (`./pinned-cache-action`, next to
+# `./cancel-run-action`), so that path counts too.
 INFRA_USES = (
     "taiki-e/install-action@",
+    "./.github/actions/pinned-cache",
+    "./pinned-cache-action",
     "actions/download-artifact@",
     "actions/upload-artifact@",
     "actions/setup-node@",
@@ -303,6 +312,102 @@ def is_network_step(step):
         return False
     action = match.group(1)
     return any(action.startswith(prefix) for prefix in INFRA_USES)
+
+
+def strip_dot_prefix(path: str) -> str:
+    return path[2:] if path.startswith("./") else path
+
+
+def action_exists(relative: str) -> bool:
+    return (ROOT / strip_dot_prefix(relative) / "action.yml").is_file()
+
+
+def job_checkout_dirs(job: str) -> set[str]:
+    # The `path:` of each `actions/checkout` step of one job; a checkout
+    # without `path:` lands at the workspace root (".").
+    dirs = set()
+    for step in re.split(r"(?m)^      - ", job)[1:]:
+        if re.search(r"(?m)^\s*uses:\s*actions/checkout@", step):
+            match = re.search(r"(?m)^\s*path:\s*(\S+)\s*$", step)
+            dirs.add(match.group(1) if match else ".")
+    return dirs
+
+
+def job_copied_actions(job: str) -> dict[str, str]:
+    # `cp -R <src> "$GITHUB_WORKSPACE/<dest>"`: the workspace-relative
+    # source of each action a relocated job copies out of its checkout.
+    return {
+        dest: strip_dot_prefix(src)
+        for src, dest in re.findall(r'cp -R (\S+) "\$GITHUB_WORKSPACE/([^"]+)"', job)
+    }
+
+
+def resolve_job_local_use(job: str, use: str) -> str | None:
+    # The repository action path a job's local `uses:` resolves to on the
+    # runner, or None when no checkout or copy step of the job provides it.
+    # `./relocated/...` reads the relocated checkout; `./.github/...` the
+    # root checkout; a bare `./<name>` the copy step that created it — only
+    # when that copy step runs before the step that uses it (a copy after
+    # the use resolves to nothing: the runner reads the workspace the using
+    # step runs in).
+    # GitHub resolves every other local `uses:` against the workspace root,
+    # which only a root checkout provides.
+    dirs = job_checkout_dirs(job)
+    if use.startswith("./relocated/"):
+        rest = use[len("./relocated/"):]
+        if "relocated" in dirs and action_exists(rest):
+            return strip_dot_prefix(rest)
+        return None
+    if use.startswith("./") and "/" not in use[2:]:
+        src = job_copied_actions(job).get(use[2:])
+        if src is None or not action_exists(src):
+            return None
+        steps = named_steps(job)
+        copy_index = next(
+            (index for index, step in enumerate(steps)
+             if f'cp -R {src} "$GITHUB_WORKSPACE/{use[2:]}"' in step),
+            None,
+        )
+        use_index = next(
+            (index for index, step in enumerate(steps)
+             if re.search(rf"(?m)^\s*uses:\s*{re.escape(use)}\s*$", step) is not None),
+            None,
+        )
+        if copy_index is None or use_index is None or copy_index > use_index:
+            return None
+        return src
+    if use.startswith("./"):
+        if "." in dirs and action_exists(use[2:]):
+            return strip_dot_prefix(use[2:])
+        return None
+    return None
+
+
+def action_local_uses(relative: str) -> list[str]:
+    text = (ROOT / relative / "action.yml").read_text()
+    return re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", text)
+
+
+def job_local_use_closure(job: str) -> dict[str, str | None]:
+    # Every local `uses:` of a job and of the composites it nests
+    # (setup-mold, setup-uv and setup-zig nest pinned-cache), mapped to the
+    # repository action path the runner resolves it to, or None.
+    # Jobs without a local `uses:` (pure `workflow_call` fan-out, or jobs
+    # with no steps at all) resolve vacuously.
+    resolved: dict[str, str | None] = {}
+    local = sorted(set(re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job)))
+    if not local:
+        return resolved
+    for use in sorted(set(re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job))):
+        if use.endswith(".yml"):
+            continue
+        target = resolve_job_local_use(job, use)
+        resolved[use] = target
+        if target is not None:
+            for nested in action_local_uses(target):
+                if not nested.endswith(".yml"):
+                    resolved.setdefault(nested, strip_dot_prefix(nested[2:]) if action_exists(nested[2:]) else None)
+    return resolved
 
 
 def workflow_jobs(workflow: str = CI) -> dict[str, str]:
@@ -1397,7 +1502,9 @@ class MacosLanePackageSetTests(unittest.TestCase):
         hermes = workflow_jobs()["hermes-compatibility-macos"]
         self.assertNotIn("cargo test", hermes)
         steps = job_steps(hermes)
-        self.assertIn("tool: cargo-nextest", steps["Install cargo-nextest"])
+        restore = steps["Restore the pinned cargo-nextest"]
+        self.assertIn("item: nextest", restore)
+        self.assertIn("version: ${{ env.NEXTEST_VERSION }}", restore)
         harness = steps["Test Hermes harness natively"]
         self.assertIn(
             "cargo nextest run --locked --profile macos -p xtask --lib -E 'test(hermes)'\n",
@@ -1709,6 +1816,10 @@ class SetupUvActionTests(unittest.TestCase):
             self.assertIsNotNone(match, name)
         self.assertEqual(len(set(re.findall(r"UV_SHA256_\w+: ([0-9a-f]{64})", action))), 4)
         self.assertRegex(action, r"version: \$\{\{ steps\.seed\.outputs\.version \}\}")
+        # Each full sha appears once, in the seed table; the pinned-cache key
+        # repeats only its 12-hex prefix (test_pinned_cache checks those).
+        for sha in re.findall(r"UV_SHA256_\w+: ([0-9a-f]{64})", action):
+            self.assertEqual(action.count(sha), 1, sha)
 
     def test_the_download_is_verified_before_extraction_and_the_installed_uv_is_required(self):
         action = self.ACTION.read_text()
@@ -1834,6 +1945,28 @@ class FailFastTests(unittest.TestCase):
                 self.assertIn("check the step log", step)
                 self.assertNotIn("gh run cancel", step)
                 self.assertNotIn("always()", step)
+
+    def test_every_local_use_resolves_on_the_runner_including_nested_composites(self):
+        # Every local `uses:` of every job resolves to a repository action
+        # on the runner: `./.github/...` reads the root checkout, `./<name>`
+        # the copy step that created it, `./relocated/...` the relocated
+        # checkout, and the nested `uses:` of the reached composites (the
+        # setup-* actions nest pinned-cache) resolve against the repository.
+        for name, job in workflow_jobs().items():
+            with self.subTest(job=name):
+                closure = job_local_use_closure(job)
+                if not closure:
+                    # No local `uses:`: `workflow_call` fan-out or stepless job.
+                    continue
+                for use, target in sorted(closure.items()):
+                    self.assertIsNotNone(target, f"{name}: {use} resolves to no repository action")
+                    assert target is not None
+                    self.assertTrue(action_exists(target), f"{name}: {use} reaches no action.yml at {target}")
+                # A relocated job holds no `.github/...` use: the relocated
+                # checkout has no `.github/actions` path at the workspace root.
+                if "relocated" in job_checkout_dirs(job):
+                    for use in closure:
+                        self.assertFalse(use.startswith("./.github/"), f"{name}: {use} misses the workspace root")
 
     def test_a_job_with_a_relocated_tree_reaches_the_action_and_the_others_use_it_in_place(self):
         # A relocated checkout holds no .github/actions at the workspace root when the step runs; those jobs copy the action out of the checkout first.
@@ -2125,8 +2258,10 @@ class RuntimePackageReportTests(unittest.TestCase):
                 self.assertEqual(len(runs), 1, f"{job} runs {command!r} once")
                 test_step = steps[runs[0]]
                 self.assertNotIn("cargo test", text)
-                self.assertLess(names.index("Install cargo-nextest"), names.index(runs[0]))
-                self.assertIn("tool: cargo-nextest", steps["Install cargo-nextest"])
+                self.assertLess(names.index("Restore the pinned cargo-nextest"), names.index(runs[0]))
+                restore = steps["Restore the pinned cargo-nextest"]
+                self.assertIn("item: nextest", restore)
+                self.assertIn("version: ${{ env.NEXTEST_VERSION }}", restore)
                 # A report the build cache restored never stands in for this run.
                 self.assertLess(test_step.index(f"rm -f {self.report_path()}"), test_step.index(command))
 
@@ -5185,6 +5320,77 @@ def partitions_module():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+class PinnedInstallToolTests(unittest.TestCase):
+    """taiki-e/install-action never resolves a tool to latest (issue #2202).
+
+    cargo-hack and cargo-udeps are pinned as `tool: <name>@${{ env.<PIN> }}`;
+    cargo-nextest is installed only by the pinned-cache composite, as
+    `tool: cargo-nextest@${{ inputs.version }}`, and every nextest site passes
+    the workflow's `NEXTEST_VERSION`. Only cargo-audit (advisory database)
+    and the already-pinned cargo-shear stay as they are.
+    """
+
+    PINNED_BY_ENV = {"cargo-hack": "CARGO_HACK_VERSION", "cargo-udeps": "CARGO_UDEPS_VERSION"}
+    WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+    ACTIONS = sorted((ROOT / ".github" / "actions").glob("*/action.yml"))
+
+    def test_every_install_action_tool_is_pinned(self):
+        failures = []
+        for path in [*self.WORKFLOWS, *self.ACTIONS]:
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                stripped = line.split("#", 1)[0]
+                match = re.search(r"tool:\s*(\S+)", stripped)
+                if not match:
+                    continue
+                tool = match.group(1)
+                if tool in ("cargo-audit",) or tool.startswith("cargo-shear@"):
+                    continue
+                if "@" not in tool:
+                    failures.append(f"{path.name}:{number}: unpinned {tool}")
+        self.assertEqual(failures, [])
+
+    def test_each_pin_comes_from_one_workflow_env_value(self):
+        for path in self.WORKFLOWS:
+            text = path.read_text()
+            for tool, env_name in self.PINNED_BY_ENV.items():
+                if f"tool: {tool}" not in text:
+                    continue
+                with self.subTest(workflow=path.name, tool=tool):
+                    self.assertNotRegex(text, rf"tool: {tool}(?!@\$\{{\{{ env\.{env_name} \}}\}})")
+                    match = re.search(rf'(?m)^  {env_name}: "([^"]+)"$', text)
+                    self.assertIsNotNone(match, f"{env_name} missing in {path.name}")
+                    self.assertRegex(match.group(1), r"^\d+\.\d+\.\d+$")
+        composite = (ROOT / ".github" / "actions" / "pinned-cache" / "action.yml").read_text()
+        self.assertEqual(re.findall(r"tool: (cargo-nextest.*)", composite), ["cargo-nextest@${{ inputs.version }}"])
+
+    def test_the_gates_skill_names_the_pinned_versions(self):
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        skill = (ROOT / ".agents" / "skills" / "gates" / "SKILL.md").read_text()
+        for tool, env_name in self.PINNED_BY_ENV.items():
+            with self.subTest(tool=tool):
+                pinned = re.search(rf'(?m)^  {env_name}: "([^"]+)"$', ci).group(1)
+                self.assertEqual(re.findall(rf"{tool}@(\d+\.\d+\.\d+)", skill), [pinned])
+
+    def test_every_nextest_site_passes_one_pin_at_or_above_the_repo_floor(self):
+        required = re.search(r'nextest-version = \{ required = "([^"]+)" \}', (ROOT / ".config" / "nextest.toml").read_text())
+        self.assertIsNotNone(required)
+        floor = [int(part) for part in required.group(1).split(".")]
+        pins = set()
+        for path in self.WORKFLOWS:
+            text = path.read_text()
+            sites = re.findall(r"(?m)^ +item: nextest\n +version: (.+)$", text)
+            if not sites:
+                continue
+            with self.subTest(workflow=path.name):
+                self.assertEqual(set(sites), {"${{ env.NEXTEST_VERSION }}"})
+                self.assertEqual(len(sites), text.count("item: nextest"))
+                match = re.search(r'(?m)^  NEXTEST_VERSION: "(\d+\.\d+\.\d+)"$', text)
+                self.assertIsNotNone(match, path.name)
+                self.assertGreaterEqual([int(part) for part in match.group(1).split(".")], floor)
+                pins.add(match.group(1))
+        self.assertEqual(len(pins), 1, pins)
 
 
 if __name__ == "__main__":

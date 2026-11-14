@@ -108,7 +108,11 @@ USES = re.compile(r"^\s+(?:- )?uses:\s*(\S+)", re.M)
 RUN = re.compile(r"^(\s+)(?:- )?run:\s*(.*)$", re.M)
 PINNED = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 # A local composite action runs from the same commit as the workflow; every
-# action it uses is pinned to a commit in turn.
+# non-local action it uses is pinned to a commit in turn. A nested local
+# `uses:` resolves from the same commit, so it is accepted and recursed
+# into; `actions/cache/restore@` and `actions/cache/save@` spell the same
+# action with its slashed subpath, which the PINNED shape below rejects, so
+# strip an optional `/restore` or `/save` before matching.
 LOCAL_ACTION = re.compile(r"^\./\.github/actions/[a-z-]+$")
 
 PERMISSIONS_LINE = re.compile(r"^\s*['\"]?permissions['\"]?\s*:", re.M)
@@ -493,6 +497,19 @@ def workflow_violations(
 
 def all_uses(text: str) -> list[str]:
     return USES.findall(text)
+
+
+def canonical_action(use: str) -> str:
+    """Strip the comment and collapse an `actions/cache` subpath.
+
+    `actions/cache/restore@sha` and `actions/cache/save@sha` spell the same
+    pinned action with its slashed subpath, which the PINNED shape rejects;
+    both directions stay pinned, so compare them as `actions/cache@sha`.
+    """
+    ref = use.split("@", 1)[1].split()[0] if "@" in use else ""
+    repo = use.split("@", 1)[0]
+    repo = re.sub(r"^(actions/cache)/(?:restore|save)$", r"\1", repo)
+    return f"{repo}@{ref}" if ref else repo
 
 
 class ReleaseWorkflowFiles(unittest.TestCase):
@@ -1068,9 +1085,16 @@ class PinningTests(ReleaseWorkflowFiles):
             for action in all_uses(text):
                 with self.subTest(file=file, action=action):
                     if LOCAL_ACTION.match(action):
-                        nested = (ROOT / action / "action.yml").read_text()
+                        nested = (ROOT / action[2:] / "action.yml").read_text()
                         for inner in all_uses(nested):
-                            self.assertRegex(inner, PINNED)
+                            # A nested local composite also resolves from
+                            # the same commit; its own uses stay pinned.
+                            if LOCAL_ACTION.match(inner):
+                                deep_text = (ROOT / inner[2:] / "action.yml").read_text()
+                                for deep in all_uses(deep_text):
+                                    self.assertRegex(canonical_action(deep), PINNED)
+                            else:
+                                self.assertRegex(canonical_action(inner), PINNED)
                     elif action.startswith("./"):
                         self.assertRegex(action, r"^\./\.github/workflows/[a-z-]+\.yml$")
                     else:
@@ -1586,7 +1610,9 @@ class GateTestsRunLikeCiTests(ReleaseWorkflowFiles):
         self.assertIn("run: cargo test --doc --workspace --all-features", self.gate)
 
     def test_the_gate_installs_nextest_before_using_it(self):
-        self.assertLess(self.gate.index("tool: cargo-nextest"), self.gate.index("cargo nextest archive"))
+        installs = [m.start() for m in re.finditer(r"item: nextest|tool: cargo-nextest", self.gate)]
+        self.assertTrue(installs, "the gate installs nextest nowhere")
+        self.assertLess(min(installs), self.gate.index("cargo nextest archive"))
 
 
 class SharedGateTests(ReleaseWorkflowFiles):
@@ -1602,6 +1628,18 @@ class SharedGateTests(ReleaseWorkflowFiles):
         "rust-toolchain.toml",
         ".github/actions/setup-rust/**",
         ".github/actions/setup-mold/**",
+        ".github/actions/setup-sccache/**",
+        ".github/actions/pinned-cache/**",
+    )
+    # The call paths the filter must also cover: the called workflow and
+    # every local composite it nests reach their files when the gate runs,
+    # so a pull request changing them must start the gate too.
+    GATE_CALLED_USES = (
+        ".github/workflows/gate-tests.yml",
+        ".github/actions/pinned-cache/**",
+        ".github/actions/setup-mold/**",
+        ".github/actions/setup-rust/**",
+        ".github/actions/setup-sccache/**",
     )
     CI_IF = (
         "if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && "
@@ -1647,6 +1685,24 @@ class SharedGateTests(ReleaseWorkflowFiles):
         listed = re.findall(r"'([^']+)'", filter_block.group(1))
         self.assertEqual(sorted(listed), sorted(self.GATE_INPUTS))
         self.assertIn("release_gate: ${{ steps.filter.outputs.release_gate }}", self.ci)
+
+    def test_the_gate_filter_covers_the_called_workflow_and_the_composites_it_nests(self):
+        # Every local `uses:` the called tests workflow nests resolves to an
+        # action file the gate runs, so each must be in the filter: drop one
+        # and the guard below fails on the pull request that changes it.
+        called = self.gate_tests_jobs["tests"]
+        declared = set(re.findall(r"(?m)^\s*uses:\s*(\./\.github/actions/\S+)\s*$", called))
+        self.assertIn("./.github/actions/pinned-cache", declared)
+        for use in declared:
+            nested = set(re.findall(
+                r"(?m)^\s*uses:\s*(\./\.github/actions/\S+)\s*$",
+                (ROOT / use[2:] / "action.yml").read_text(),
+            ))
+            declared |= nested
+        covered = {f"{use[2:]}/**" for use in declared} | {".github/workflows/gate-tests.yml"}
+        self.assertEqual(covered, set(self.GATE_CALLED_USES))
+        missing = covered - filter_paths(self.ci, "release_gate")
+        self.assertEqual(missing, set(), f"release_gate misses the called uses: {sorted(missing)}")
 
     def test_the_nightly_evidence_requires_the_gate_and_the_main_tier_does_not(self):
         config = json.loads((ROOT / "scripts" / "ci-evidence.json").read_text())

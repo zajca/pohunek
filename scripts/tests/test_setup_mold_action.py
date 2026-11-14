@@ -58,13 +58,22 @@ BACKOFF_RETRIES = "3"
 RETRY_ANNOUNCEMENT = re.compile(r"(?:Will retry|Retrying) in (\d+) seconds?")
 
 
-def action_run_script() -> str:
-    """Return the body of the action's single `run: |` block, dedented."""
+def action_run_script(name: str = "Install mold linker") -> str:
+    """Return the body of one of the action's `run: |` blocks, dedented."""
     text = ACTION.read_text()
-    match = re.search(r"^ {6}run: \|\n((?: {8}[^\n]*\n|\n)+)", text, re.M)
-    if match is None:
-        raise AssertionError(f"`run: |` block not found in {ACTION}")
-    return "".join(line[8:] if line.strip() else line for line in match.group(1).splitlines(True))
+    names = [match.group(1) for match in re.finditer(r"^    - name: (.+)$", text, re.M)]
+    blocks = re.findall(r"^ {6}run: \|\n((?: {8}[^\n]*\n|\n)+)", text, re.M)
+    # Only `shell: bash` steps carry a `run: |` block; cache steps do not.
+    runnable = [
+        name for name in names
+        if re.search(rf"(?m)^    - name: {re.escape(name)}\n(?:      (?!- name: ).*\n)*?      shell: bash\n", text)
+    ]
+    if len(runnable) != len(blocks):
+        raise AssertionError(f"runnable steps and `run: |` blocks diverge in {ACTION}")
+    if name not in runnable:
+        raise AssertionError(f"step {name!r} not found in {ACTION}")
+    block = blocks[runnable.index(name)]
+    return "".join(line[8:] if line.strip() else line for line in block.splitlines(True))
 
 
 def action_env(name: str) -> str:
@@ -261,7 +270,7 @@ os.execv({curl!r}, [{curl!r}] + out)
 
 
 class SetupMoldActionTests(unittest.TestCase):
-    def run_action(self, server, sha256: str, **overrides: str):
+    def run_action(self, server, sha256: str, step: str = "Install mold linker", **overrides: str):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             shims = tmp / "shims"
@@ -288,6 +297,8 @@ class SetupMoldActionTests(unittest.TestCase):
             env = {
                 "PATH": f"{shims}:{os.environ['PATH']}",
                 "RUNNER_TEMP": str(runner_temp),
+                # The pinned-cache restore phase computes this path.
+                "PINNED_PATH": str(runner_temp / "pinned-cache" / "mold"),
                 "GITHUB_PATH": str(github_path),
                 "MOLD_VERSION": MOLD_VERSION,
                 "MOLD_SHA256": sha256,
@@ -298,7 +309,7 @@ class SetupMoldActionTests(unittest.TestCase):
                 **overrides,
             }
             result = subprocess.run(
-                ["bash", "-c", action_run_script()],
+                ["bash", "-c", action_run_script(step)],
                 env=env,
                 capture_output=True,
                 text=True,
@@ -375,6 +386,65 @@ class SetupMoldActionTests(unittest.TestCase):
             result, installed, _ = self.run_action(server, "0" * 64)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(installed)
+
+    def run_hit_step(self, stash: dict[str, bytes], sha256: str, **overrides: str):
+        """Run the hit-path step against a pre-populated stash directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            runner_temp = tmp / "runner"
+            stage = runner_temp / "pinned-cache" / "mold"
+            stage.mkdir(parents=True)
+            for name, content in stash.items():
+                (stage / name).write_bytes(content)
+            github_path = tmp / "github_path"
+            env = {
+                "PATH": os.environ["PATH"],
+                "RUNNER_TEMP": str(runner_temp),
+                "PINNED_PATH": str(stage),
+                "GITHUB_PATH": str(github_path),
+                "MOLD_VERSION": MOLD_VERSION,
+                "MOLD_SHA256": sha256,
+                "LOCAL_STEP_TIMEOUT_SECONDS": action_env("LOCAL_STEP_TIMEOUT_SECONDS"),
+                **overrides,
+            }
+            result = subprocess.run(
+                ["bash", "-c", action_run_script("Verify the pinned mold on a hit")],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=SCRIPT_TIMEOUT_SECONDS,
+            )
+            installed = (runner_temp / "mold" / "bin" / "mold").exists()
+            path_entries = github_path.read_text() if github_path.exists() else ""
+            return result, installed, path_entries
+
+    def test_a_hit_with_a_corrupted_cached_file_fails_the_sha256_check(self):
+        # A hit whose stash holds foreign bytes fails closed instead of
+        # installing them: never trust the cache more than the download.
+        body = mold_archive()
+        archive = f"mold-{MOLD_VERSION}-x86_64-linux.tar.gz"
+        result, installed, path_entries = self.run_hit_step(
+            {archive: b"not the pinned mold release"},
+            hashlib.sha256(body).hexdigest(),
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("sha256 verification of the restored", result.stdout + result.stderr)
+        self.assertFalse(installed)
+        self.assertEqual(path_entries, "")
+
+    def test_a_hit_with_a_matching_cached_file_installs_without_a_download(self):
+        # The hit path stages, extracts and links the restored archive
+        # without touching the network (no curl shim on PATH would serve it).
+        body = mold_archive()
+        archive = f"mold-{MOLD_VERSION}-x86_64-linux.tar.gz"
+        result, installed, path_entries = self.run_hit_step(
+            {archive: body},
+            hashlib.sha256(body).hexdigest(),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(installed)
+        self.assertIn(MOLD_BANNER, result.stdout)
+        self.assertNotEqual(path_entries, "")
 
 
 if __name__ == "__main__":
