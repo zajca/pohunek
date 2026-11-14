@@ -579,6 +579,14 @@ const RULES: &[Rule] = &[
          `scripts/changelog check` and folded only by `scripts/release`",
     ),
     rule(
+        Pattern::Dir(".github/scripts"),
+        Effect::Tests(&[readers(
+            "xtask",
+            "binary(=affected_ci) and test(=every_script_the_ci_test_jobs_run_selects_everything)"
+        )]),
+        "CI helper scripts the test jobs run, which xtask's affected scenario requires to exist",
+    ),
+    rule(
         Pattern::Dir(".github"),
         Effect::NoRustTests,
         "CI configuration outside the release workflow",

@@ -358,6 +358,7 @@ bacon                          # watcher: profile-fast nextest loop (bacon.toml)
 python3 scripts/test-partitions run cli    # exact CI shard (core/daemon/cli/heavy)
 python3 scripts/test-partitions run heavy --part 1/3  # one heavy part: the only K/N form CI runs
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
+python3 scripts/test-partitions check --parts 3  # also prove the 3 heavy parts hold the heavy list once
 # macOS only, from a nextest archive: `check-macos` (`--scope lane` for the PR lane archive) and `run-macos` (PR lane), `run-macos-tier` (main/nightly); see verification.md, Fast loops
 scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
     --event pull_request --conclusion success   # reproduce CI timing evidence
@@ -433,10 +434,11 @@ and the four checksums of `uv-<target>.tar.gz.sha256` together.
 
 CI runs three fast matrix shards, three heavy matrix parts and a separate
 script-regressions job without waiting for
-Clippy or release builds. Each heavy part extracts the archive once and runs
-its `hash:K/N` partition after part 1 proves the union of the parts covers
-the whole shard; heavy parts use four test processes and the real worker
-binary. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
+Clippy or release builds. Each heavy part runs its `hash:K/N` partition from
+the archive. Before that, part 1 proves on the whole tree, ahead of any
+narrowing, that every discovered test is in exactly one shard and that the
+union of the parts is the heavy shard (`check --parts N`); heavy parts use
+four test processes and the real worker binary. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
 writes `target/nextest/heavy/junit.xml`. The runtime package jobs run their

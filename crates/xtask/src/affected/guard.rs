@@ -29,8 +29,9 @@
 //! [`crate::test_code`]) and locates each read in its crate, module and test
 //! function. A read in a helper outside a test function is covered only by a
 //! filter that selects its whole crate or binary. A use that resolves to the repository root itself (a whole-repository
-//! scan, or the root passed on) is not a path the guard can judge: its file
-//! must be listed in [`SCANS`], whose declared scopes are checked in its place.
+//! scan, or the root passed on) is not a path the guard can judge: the test
+//! that makes it must be listed in [`TEST_SCANS`], or its file in [`SCANS`],
+//! whose declared scopes are checked in its place.
 //!
 //! Test code also runs workspace binaries by path. The guard finds each lookup
 //! of one: `bin_exe(..)` or `.with_file_name(..)` with a literal or string
@@ -180,6 +181,29 @@ pub(crate) const BINARY_VARIABLES: [(&str, &str); 3] = [
     ("POHUNEK_WORKER_BIN", "pohunek-sessiond"),
 ];
 
+/// Tests that use the repository root itself, with the paths each reads.
+///
+/// Each entry is `(file, test, scopes, why)`: `test` is the nextest name of
+/// the test function in `file` that makes the root read. A root read inside a
+/// listed test is checked against that test's scopes, ahead of any [`SCANS`]
+/// entry of its file, so a file whose tests read different parts of the
+/// repository declares each read exactly. An entry whose test no longer uses
+/// the root is a violation.
+pub(crate) const TEST_SCANS: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "crates/xtask/tests/affected_ci.rs",
+        "every_repository_read_of_the_test_code_selects_its_reader",
+        &["crates", "rust-toolchain.toml"],
+        "the whole-repository guard run, which scans every crate's sources and manifests under the pinned toolchain",
+    ),
+    (
+        "crates/xtask/tests/affected_ci.rs",
+        "every_script_the_ci_test_jobs_run_selects_everything",
+        &["scripts", ".github/scripts", ".github/workflows/ci.yml"],
+        "the scripts the CI test jobs run, named by the workflow and checked to exist",
+    ),
+];
+
 /// Test files that use the repository root itself, with the paths they read.
 ///
 /// Each entry is `(file, scopes, why)`. A scope is a read path as the guard
@@ -271,11 +295,6 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
             "runtime-packages",
         ],
         "upstream staging scenarios over the locks, npm projects, the Hermes provisioner and the package list",
-    ),
-    (
-        "crates/xtask/tests/affected_ci.rs",
-        &["scripts", ".github/workflows/ci.yml"],
-        "test jobs run scripts read at run time from the workflow, and the script paths they are checked against",
     ),
     (
         "crates/xtask/tests/dependency_policy.rs",
@@ -458,7 +477,16 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
             );
         }
     }
-    let violations = check(&reads, &packages, &tracked, SCANS, NOT_READS);
+    let violations = check(
+        &reads,
+        &packages,
+        &tracked,
+        Scans {
+            files: SCANS,
+            tests: TEST_SCANS,
+        },
+        NOT_READS,
+    );
     let mut binary_violations = check_binary_runs(&runs, &packages, &tracked, BINARY_USES);
     binary_violations.extend(check_undecided(&undecided, &tracked, LOOKUP_FUNCTIONS));
     for problem in &binary_violations {
@@ -484,7 +512,8 @@ pub(crate) fn run(options: &Options) -> Result<(), XtaskError> {
     }
     Err(XtaskError::Usage(format!(
         "affected guard: {} repository reads and {} binary runs of test code are not \
-         covered; map each path to its reader in RULES, declare a root scan in SCANS, \
+         covered; map each path to its reader in RULES, declare a root scan in TEST_SCANS \
+         or SCANS, \
          or add the binary run to BINARY_USES (crates/xtask/src/affected/)",
         violations.len(),
         binary_violations.len()
@@ -1531,16 +1560,36 @@ fn matches(pattern: &str, file: &str) -> bool {
             .all(|(want, have)| *want == WILDCARD || want == have)
 }
 
+/// The declared scopes of root reads: per test, then per file.
+#[derive(Clone, Copy)]
+pub(crate) struct Scans<'a> {
+    /// [`SCANS`]: `(file, scopes, why)`.
+    pub(crate) files: &'a [(&'a str, &'a [&'a str], &'a str)],
+    /// [`TEST_SCANS`]: `(file, test, scopes, why)`.
+    pub(crate) tests: &'a [(&'a str, &'a str, &'a [&'a str], &'a str)],
+}
+
+/// Whether every site of `read` lies in the test function named `test`.
+fn made_by(read: &Read, test: &str) -> bool {
+    !read.location.sites.is_empty()
+        && read
+            .location
+            .sites
+            .iter()
+            .all(|site| site.test.as_deref() == Some(test))
+}
+
 /// The violations among `reads`, judged against the tracked files and `scans`.
 pub(crate) fn check(
     reads: &[(String, Read)],
     packages: &[Package],
     tracked: &BTreeSet<String>,
-    scans: &[(&str, &[&str], &str)],
+    scans: Scans<'_>,
     not_reads: &[(&str, &str, &str)],
 ) -> Vec<Violation> {
     let mut violations = BTreeSet::new();
     let mut scanned = BTreeSet::new();
+    let mut scanned_tests = BTreeSet::new();
     let mut excused = BTreeSet::new();
     for (reader, read) in reads {
         if let Some(entry) = not_reads
@@ -1551,7 +1600,16 @@ pub(crate) fn check(
             continue;
         }
         let paths: Vec<String> = if read.path.is_empty() {
-            if let Some((file, scopes, _)) = scans.iter().find(|(file, ..)| *file == read.file) {
+            if let Some((file, test, scopes, _)) = scans
+                .tests
+                .iter()
+                .find(|(file, test, ..)| *file == read.file && made_by(read, test))
+            {
+                scanned_tests.insert((*file, *test));
+                scopes.iter().map(|scope| (*scope).to_owned()).collect()
+            } else if let Some((file, scopes, _)) =
+                scans.files.iter().find(|(file, ..)| *file == read.file)
+            {
                 scanned.insert(*file);
                 scopes.iter().map(|scope| (*scope).to_owned()).collect()
             } else {
@@ -1559,7 +1617,7 @@ pub(crate) fn check(
                     read: read.clone(),
                     reader: reader.clone(),
                     problem: "the file uses the repository root itself; declare what it \
-                              reads in SCANS (crates/xtask/src/affected/guard.rs)"
+                              reads in TEST_SCANS or SCANS (crates/xtask/src/affected/guard.rs)"
                         .to_owned(),
                 });
                 continue;
@@ -1605,40 +1663,81 @@ pub(crate) fn check(
             }
         }
     }
-    // An entry for a file that is not tracked here judges nothing; only an
-    // entry whose file exists and no longer has the use is stale.
-    for (file, path, _) in not_reads {
-        if tracked.contains(*file) && !excused.contains(&(*file, *path)) {
-            violations.insert(Violation {
-                read: Read {
-                    file: (*file).to_owned(),
-                    line: 0,
-                    path: (*path).to_owned(),
-                    anchored: false,
-                    location: Location::default(),
-                },
-                reader: String::from("NOT_READS"),
-                problem: "the entry is stale: the file no longer has this read".to_owned(),
-            });
-        }
-    }
-    for (file, _, _) in scans {
-        if tracked.contains(*file) && !scanned.contains(file) {
-            violations.insert(Violation {
-                read: Read {
-                    file: (*file).to_owned(),
-                    line: 0,
-                    path: String::new(),
-                    anchored: false,
-                    location: Location::default(),
-                },
-                reader: String::from("SCANS"),
-                problem: "the entry is stale: the file no longer uses the repository root"
-                    .to_owned(),
-            });
-        }
-    }
+    violations.extend(stale_entries(
+        tracked,
+        scans,
+        not_reads,
+        &Used {
+            excused,
+            scanned,
+            scanned_tests,
+        },
+    ));
     violations.into_iter().collect()
+}
+
+/// The allowlist entries the judged reads used.
+struct Used<'a> {
+    /// `(file, path)` of each [`NOT_READS`] entry that excused a read.
+    excused: BTreeSet<(&'a str, &'a str)>,
+    /// Each [`SCANS`] file that declared a root read.
+    scanned: BTreeSet<&'a str>,
+    /// `(file, test)` of each [`TEST_SCANS`] entry that declared a root read.
+    scanned_tests: BTreeSet<(&'a str, &'a str)>,
+}
+
+/// The allowlist entries no read used. An entry for a file that is not
+/// tracked here judges nothing; only an entry whose file exists and no
+/// longer has the use is stale.
+fn stale_entries(
+    tracked: &BTreeSet<String>,
+    scans: Scans<'_>,
+    not_reads: &[(&str, &str, &str)],
+    used: &Used<'_>,
+) -> Vec<Violation> {
+    let stale = |file: &str, path: &str, reader: &str, problem: String| Violation {
+        read: Read {
+            file: file.to_owned(),
+            line: 0,
+            path: path.to_owned(),
+            anchored: false,
+            location: Location::default(),
+        },
+        reader: reader.to_owned(),
+        problem,
+    };
+    let mut violations = Vec::new();
+    for (file, path, _) in not_reads {
+        if tracked.contains(*file) && !used.excused.contains(&(*file, *path)) {
+            violations.push(stale(
+                file,
+                path,
+                "NOT_READS",
+                "the entry is stale: the file no longer has this read".to_owned(),
+            ));
+        }
+    }
+    for (file, test, _, _) in scans.tests {
+        if tracked.contains(*file) && !used.scanned_tests.contains(&(*file, *test)) {
+            violations.push(stale(
+                file,
+                "",
+                "TEST_SCANS",
+                format!("the entry is stale: test {test} no longer uses the repository root"),
+            ));
+        }
+    }
+    for (file, _, _) in scans.files {
+        if tracked.contains(*file) && !used.scanned.contains(file) {
+            violations.push(stale(
+                file,
+                "",
+                "SCANS",
+                "the entry is stale: the file no longer uses the repository root".to_owned(),
+            ));
+        }
+    }
+    violations
 }
 
 /// Whether a direct read reaches data omitted from the reader's macOS lane.

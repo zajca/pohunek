@@ -652,11 +652,11 @@ class ArchiveActionTests(ScriptScenario):
 
 
 class PartActionTests(ScriptScenario):
-    """`run heavy --part K/N` runs one part; `--check` proves the union first.
+    """`run heavy --part K/N` runs one part; `check --parts N` proves the parts.
 
-    Part 1 verifies the whole partition and the N parts' union in the same
-    process that then runs its part, so its job extracts the archive exactly
-    once; later parts run their tests alone.
+    Every part runs its tests alone. The proof checks the whole partition and
+    the N parts' union in its own process, which CI runs before the heavy
+    job narrows its tree.
     """
 
     def setUp(self):
@@ -670,77 +670,91 @@ class PartActionTests(ScriptScenario):
             "run", "heavy", "--archive-file", str(self.archive),
             *arguments, extra_env=extra_env)
 
-    def test_a_later_part_runs_only_its_partition_without_listing(self):
-        result = self.run_part("--part", "2/3")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.nextest_calls()
-        # The part's single run is the only nextest call: it extracts the
-        # archive on its first (and only) use, like every archive run.
-        self.assertEqual(len(calls), 1)
-        argv = calls[0]["argv"]
-        self.assertEqual(argv[1], "run")
-        self.assertEqual(argv[argv.index("--partition") + 1], "hash:2/3")
-        self.assertIn("--extract-to", argv)
+    def check_parts(self, *arguments, extra_env=None):
+        return self.run_script(
+            "check", "--archive-file", str(self.archive), "--parts", "3",
+            *arguments, extra_env=extra_env)
 
-    def test_part_one_checks_then_runs_from_a_single_extraction(self):
-        result = self.run_part("--part", "1/3", "--check")
+    def test_each_part_runs_only_its_partition_without_listing(self):
+        for index in (1, 2, 3):
+            with self.subTest(part=index):
+                self.calls_log.unlink(missing_ok=True)
+                result = self.run_part("--part", f"{index}/3")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.nextest_calls()
+                # The part's single run is the only nextest call: it extracts
+                # the archive on its first (and only) use, like every archive run.
+                self.assertEqual(len(calls), 1)
+                argv = calls[0]["argv"]
+                self.assertEqual(argv[1], "run")
+                self.assertEqual(argv[argv.index("--partition") + 1], f"hash:{index}/3")
+                self.assertIn("--extract-to", argv)
+                self.assertNotIn("Coverage OK", result.stdout)
+
+    def test_check_with_parts_proves_the_partition_and_the_part_union(self):
+        result = self.check_parts()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "Coverage OK: 6 tests selected exactly once (including ignored tests)",
             result.stdout)
         self.assertIn("heavy parts OK: 3 parts hold 3 tests exactly once", result.stdout)
         calls = self.nextest_calls()
-        lists = [call for call in calls if call["argv"][1] == "list"]
-        runs = [call for call in calls if call["argv"][1] == "run"]
         # The full partition (universe plus one list per shard) plus one
-        # list per heavy part, then the part's own run: 8 lists, 1 run.
-        self.assertEqual(len(lists), 8)
-        self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0]["argv"][runs[0]["argv"].index("--partition") + 1], "hash:1/3")
+        # list per heavy part; the proof runs no test.
+        self.assertEqual([call["argv"][1] for call in calls], ["list"] * 8)
+        partitions = [
+            call["argv"][call["argv"].index("--partition") + 1]
+            for call in calls if "--partition" in call["argv"]
+        ]
+        self.assertEqual(partitions, ["hash:1/3", "hash:2/3", "hash:3/3"])
         extracts = [call for call in calls if "--extract-to" in call["argv"]]
-        self.assertEqual(len(extracts), 1, "the part-1 job extracts the archive exactly once")
+        self.assertEqual(len(extracts), 1, "the proof extracts the archive once")
         self.assertIs(extracts[0], calls[0], "extraction happens on the first list")
 
-    def test_a_part_union_that_loses_a_test_fails_before_any_run(self):
-        result = self.run_part("--part", "1/3", "--check",
-                                extra_env={"PARTITIONS_DROP_PART_TEST": "source_map::drift"})
+    def test_a_part_union_that_loses_a_test_fails(self):
+        result = self.check_parts(extra_env={"PARTITIONS_DROP_PART_TEST": "source_map::drift"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("heavy partition failed", result.stderr)
         self.assertIn("source_map::drift", result.stderr)
         self.assertIn("missing=", result.stderr)
-        calls = self.nextest_calls()
-        self.assertTrue(calls, "the check lists before it fails")
-        self.assertEqual(
-            [call for call in calls if call["argv"][1] == "run"], [],
-            "no test runs after a failed union proof")
+        self.assertNotIn("heavy parts OK", result.stdout)
+        self.assertTrue(self.nextest_calls(), "the proof lists before it fails")
 
-    def test_a_corrupt_archive_fails_part_one_before_any_run(self):
-        result = self.run_part("--part", "1/3", "--check",
-                                extra_env={"PARTITIONS_FAIL_EXTRACT": "1"})
+    def test_a_corrupt_archive_fails_the_proof_on_its_first_list(self):
+        result = self.check_parts(extra_env={"PARTITIONS_FAIL_EXTRACT": "1"})
         self.assertNotEqual(result.returncode, 0)
-        calls = self.nextest_calls()
-        self.assertEqual(len(calls), 1, "the first list already fails the extraction")
-        self.assertEqual(
-            [call for call in calls if call["argv"][1] == "run"], [],
-            "no test runs from a corrupt archive")
+        self.assertEqual(len(self.nextest_calls()), 1,
+                         "the first list already fails the extraction")
 
-    def test_part_and_check_reject_anything_but_run_heavy_part_one(self):
+    def test_part_and_parts_reject_anything_but_their_action(self):
         archive = ["--archive-file", str(self.archive)]
+        selection = self.root / "selection.json"
+        selection.write_text(json.dumps({
+            "schema_version": 1, "mode": "full", "script_tests": True,
+            "filterset": None, "packages": [],
+        }))
+        # The same plan without the flag passes, so a refusal below is the flag's.
+        self.assertEqual(
+            self.run_script("plan", "--selection", str(selection)).returncode, 0)
         for arguments in (
+            ("plan", "--selection", str(selection), "--parts", "3"),
+            ("plan", "--selection", str(selection), "--part", "1/3"),
             ("run", "core", "--part", "1/3", *archive),
-            ("run", "heavy", *archive, "--part", "2/3", "--check"),
-            ("run", "heavy", *archive, "--check"),
             ("run", "heavy", *archive, "--part", "bogus"),
             ("run", "heavy", *archive, "--part", "0/3"),
             ("run", "heavy", *archive, "--part", "4/3"),
+            ("run", "heavy", *archive, "--part", "1/3", "--parts", "3"),
             ("check", "--part", "1/3", *archive),
+            ("check", *archive, "--parts", "0"),
+            ("check", *archive, "--parts", "three"),
+            ("filter", "heavy", "--parts", "3"),
         ):
             with self.subTest(arguments=arguments):
                 result = self.run_script(*arguments)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertEqual(self.nextest_calls(), [])
 
-    def test_run_heavy_without_a_part_still_runs_whole(self):
+    def test_run_heavy_without_a_part_runs_whole(self):
         result = self.run_script("run", "heavy", "--archive-file", str(self.archive))
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.nextest_calls()
@@ -932,10 +946,10 @@ class SelectionActionTests(ScriptScenario):
                 test["selected"] = (entry["id"], name) in selected
         return binaries
 
-    def test_part_one_with_a_selection_still_checks_the_full_tree_first(self):
-        # The narrowed PR path: `--check --selection` proves the full
-        # partition first (as plain `check` does), then the narrowed check
-        # for what part 1 actually runs.
+    def test_check_with_parts_proves_the_whole_tree_before_the_narrowed_check(self):
+        # The narrowed PR path: `check --parts N --selection` checks the whole
+        # discovered list and proves the part union before the narrowed
+        # check, so the first `Coverage OK` line is the unnarrowed one.
         selection = self.write_selection("packages", self.PACKAGES)
         self.set_inventory(self.selected_inventory({
             ("pohunek-daemon-111111", "store::migrate"),
@@ -943,21 +957,36 @@ class SelectionActionTests(ScriptScenario):
             ("pohunek-knowledge-444444", "bundle::materialize"),
         }))
         result = self.run_script(
-            "run", "heavy", "--archive-file", str(self.archive),
-            "--part", "1/3", "--check", "--selection", selection,
+            "check", "--archive-file", str(self.archive),
+            "--parts", "3", "--selection", selection,
             extra_env={"PARTITIONS_FILTERSET": self.FILTERSET},
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        # Both checks ran: the full-tree proof and the narrowed one.
-        self.assertEqual(result.stdout.count("Coverage OK:"), 2)
-        self.assertIn("heavy parts OK:", result.stdout)
-        calls = self.nextest_calls()
-        lists = [call for call in calls if call["argv"][1] == "list"]
-        runs = [call for call in calls if call["argv"][1] == "run"]
-        self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0]["argv"][runs[0]["argv"].index("--partition") + 1], "hash:1/3")
-        extracts = [call for call in calls if "--extract-to" in call["argv"]]
-        self.assertEqual(len(extracts), 1, "the part-1 job extracts the archive exactly once")
+        lines = result.stdout.splitlines()
+        coverage = [line for line in lines if line.startswith("Coverage OK:")]
+        self.assertEqual(coverage, [
+            "Coverage OK: 6 tests selected exactly once (including ignored tests)",
+            "Coverage OK: 3 tests selected exactly once (including ignored tests)",
+        ])
+        parts = lines.index("heavy parts OK: 3 parts hold 3 tests exactly once")
+        self.assertLess(lines.index(coverage[0]), parts)
+        self.assertLess(parts, lines.index(coverage[1]))
+        calls = [call["argv"] for call in self.nextest_calls()]
+        self.assertEqual({argv[1] for argv in calls}, {"list"}, "the proof runs no test")
+
+        def expression(argv):
+            return argv[argv.index("-E") + 1] if "-E" in argv else None
+
+        narrowed = [
+            index for index, argv in enumerate(calls)
+            if expression(argv) is not None and self.FILTERSET in expression(argv)
+        ]
+        # The whole tree first: its universe (no filter), one list per shard
+        # and one per heavy part, none of them carrying the selection; then
+        # the narrowed universe and its shard lists.
+        self.assertIsNone(expression(calls[0]), "the first list is the whole universe")
+        self.assertEqual(narrowed, list(range(8, 8 + 1 + len(SHARD_NAMES))))
+        self.assertEqual(len(calls), 8 + 1 + len(SHARD_NAMES))
 
     def test_a_shard_runs_only_the_selected_tests_and_passes_when_it_has_none(self):
         selection = self.write_selection("packages", ["pohunek-daemon", "pohunek-knowledge"])

@@ -522,9 +522,9 @@ the measurement path behind
 The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI compiles the workspace test binaries
 once in `build-tests` (`cargo nextest archive --workspace --all-features`) and
-runs three fast matrix shards, three heavy matrix parts and the
-script-regressions job from that archive (the script job needs no archive
-itself), independently of lint/release jobs. The cost boundary is
+runs three fast matrix shards and three heavy matrix parts from that archive,
+and the script-regressions job without it, independently of lint/release
+jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
 all discovered tests, including ignored ones, are assigned exactly once.
@@ -800,6 +800,7 @@ cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/cli/heavy
 python3 scripts/test-partitions run heavy --part 1/3  # one heavy part: the only K/N form CI runs
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
+python3 scripts/test-partitions check --parts 3  # plus the heavy part union, as heavy part 1 proves it in CI
 python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy --part 1/3  # CI mode: no compile, one leg
 python3 scripts/test-partitions --archive-file A check-macos   # 14-package macOS set: exact lane/tier/bucket partition
 python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
@@ -832,9 +833,12 @@ a failed dependency diff, `.cargo/`, `.config/nextest.toml`, `rust-toolchain*`,
 lint/format configs, and any path no rule covers run everything.
 `cargo xtask affected guard` checks that every repository path the test code
 reads through `pohunek_test_support::workspace_root()` or `manifest_dir()`
-selects that test, and `cargo xtask affected ci --base REV --out DIR` writes the
+selects that test; a test that uses the repository root itself declares the
+paths it reads, per test in `TEST_SCANS` or per file in `SCANS`
+(`crates/xtask/src/affected/guard.rs`), and each declared path must select it
+too. `cargo xtask affected ci --base REV --out DIR` writes the
 selection for a pull request's CI jobs. Only a reviewed allowlist in `crates/xtask/src/affected/mod.rs` (other paths:
-`sdk/ts/`, the root Bun workspace files, `docs/`, `changelog.d/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
+`sdk/ts/`, the root Bun workspace files, `docs/`, `changelog.d/`, `.github/` (except `.github/scripts/`, which selects the xtask scenario that checks the CI test jobs' scripts exist), `.claude/`, `.agents/`, `assets/`, root `*.md`,
 `LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
 exits 0 without running nextest and names the follow-up checks (`cargo xtask
 docs check`, the `scripts/` unittests, the Bun gates). It narrows only which

@@ -9,9 +9,12 @@ is how CI shares one build across the shard jobs.
 `--selection` takes the `selection.json` of `cargo xtask affected ci`: `plan`
 prints the CI test jobs it starts, `run` narrows a shard to its selected
 tests (a shard holding none of them passes), and `check` requires the
-planned shards to hold every selected test exactly once. `run-macos` narrows
-the macOS lane to the selection's `lane` part; a selection without one, or a
-full selection, runs the whole lane.
+planned shards to hold every selected test exactly once. `check --parts N`
+first checks the whole discovered list and proves that the heavy shard's N
+parts (`run heavy --part K/N`) hold the heavy list exactly once; CI runs it
+before the heavy job narrows its tree. `run-macos` narrows the macOS lane
+to the selection's `lane` part; a selection without one, or a full
+selection, runs the whole lane.
 
 `audit-sparse` is the nightly G3 audit of #1218: it runs each package's tests
 from the archive in a sparse tree holding only the files whose change selects
@@ -214,7 +217,7 @@ def shard_plan(selection):
 
     A fast shard runs when it owns a selected package. The script
     regressions run in their own job (`script-tests`), so `shard_plan`
-    ignores `script_tests`: the new job follows
+    ignores `script_tests`: that job follows
     `selection["script_tests"]` itself. The heavy job runs whenever a
     package it holds tests of may be selected; which of its tests run is the
     selection's filterset.
@@ -758,16 +761,30 @@ def main():
         "comes from the argument itself, never from a literal in this script",
     )
     parser.add_argument(
-        "--check", action="store_true",
-        help="run heavy --part 1/N only: verify the whole partition and the "
-        "part union first, then run part 1; the part-1 job extracts the "
-        "archive exactly once and a failed check fails before any test",
+        "--parts", type=int, default=None,
+        help="check only: also prove that the heavy shard's N parts "
+        "(`--partition hash:K/N`) hold the heavy list exactly once; the "
+        "whole-tree check and this proof run before the narrowed check of "
+        "--selection, so they hold whatever the selection narrows",
     )
     args = parser.parse_args()
     if args.skip_owned_by is not None and args.action not in MACOS_RUN_SETS:
         parser.error("--skip-owned-by applies to run-macos and run-macos-tier only")
     if args.action != "audit-sparse" and (args.selector is not None or args.report_dir is not None):
         parser.error("--selector and --report-dir apply to audit-sparse only")
+    part = None
+    if args.part is not None:
+        if args.action != "run" or args.shard != "heavy":
+            parser.error("--part applies to run heavy only")
+        try:
+            part = parse_part(args.part)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.parts is not None:
+        if args.action != "check":
+            parser.error("--parts applies to check only")
+        if args.parts < 1:
+            parser.error(f"--parts is not a positive number of parts: {args.parts}")
     if args.action == "plan":
         if args.selection is None or args.shard is not None or args.archive_file is not None:
             parser.error("plan takes --selection and nothing else")
@@ -779,18 +796,6 @@ def main():
         print(f"heavy={str(plan['heavy']).lower()}")
         print(f"lane={str(plan['lane']).lower()}")
         return
-    part = None
-    if args.part is not None or args.check:
-        if args.action != "run" or args.shard != "heavy":
-            parser.error("--part and --check apply to run heavy only")
-        if args.part is None:
-            parser.error("--check needs --part 1/N: only part 1 checks before it runs")
-        try:
-            part = parse_part(args.part)
-        except ValueError as error:
-            parser.error(str(error))
-        if args.check and part[0] != 1:
-            parser.error("--check runs on part 1 only: later parts run their tests alone")
     selection = plan = None
     if args.selection is not None:
         if args.action not in ("run", "check", "run-macos"):
@@ -842,6 +847,10 @@ def main():
     if args.action == "check":
         if args.shard is not None:
             parser.error("check verifies all shards; do not specify one")
+        if args.parts is not None:
+            verify_heavy_parts(expressions, archive, args.parts)
+            if selection is None:
+                return
         verify_coverage(expressions, archive, selection, plan)
         return
     if args.shard is None:
@@ -858,34 +867,7 @@ def main():
             return
     partition = None
     if part is not None:
-        index, total = part
-        partition = part_partition(index, total)
-        if args.check:
-            # Part 1 checks first in this same process: the full partition
-            # on the whole discovered list (as `check` does without
-            # `--selection`), plus the proof that the N parts' listed
-            # heavy tests, unioned, equal the heavy list. The full check
-            # runs before the tree is narrowed, so a narrowed PR still
-            # proves every discovered test is assigned exactly once; the
-            # narrowed check afterwards is what part 1 actually runs.
-            # The extracted archive is then reused for the part's own run,
-            # so the job extracts exactly once and a failed check fails
-            # before any test runs.
-            _, full_selections = verify_coverage(expressions, archive, None, None)
-            heavy_tests = full_selections["heavy"]
-            heavy_expression = expressions["heavy"]
-            part_lists = [
-                inventory(heavy_expression, archive, partition=part_partition(n, total))
-                for n in range(1, total + 1)
-            ]
-            try:
-                validate_part_union(heavy_tests, part_lists)
-            except ValueError as error:
-                print(f"error: {error}", file=sys.stderr)
-                sys.exit(1)
-            print(f"heavy parts OK: {total} parts hold {len(heavy_tests)} tests exactly once")
-            if selection is not None:
-                verify_coverage(expressions, archive, selection, plan)
+        partition = part_partition(*part)
     # CI uploads each job's report under its shard name. Local fast shard runs
     # share the ci report path; copy it before starting the next run if needed.
     # A shard may hold none of a narrowed selection's tests.
@@ -894,13 +876,34 @@ def main():
                 partition=partition)
 
 
+def verify_heavy_parts(expressions, archive, total):
+    """Prove the whole-tree partition and the heavy shard's `total` parts; exit 1 unless exact.
+
+    Checks the whole discovered list (`verify_coverage` without a
+    selection), then requires the parts' listed heavy tests, unioned, to
+    equal the heavy list. CI runs it before the heavy job narrows its tree,
+    so a narrowed pull request still proves every discovered test is
+    assigned exactly once.
+    """
+    _, full_selections = verify_coverage(expressions, archive, None, None)
+    heavy_tests = full_selections["heavy"]
+    part_lists = [
+        inventory(expressions["heavy"], archive, partition=part_partition(index, total))
+        for index in range(1, total + 1)
+    ]
+    try:
+        validate_part_union(heavy_tests, part_lists)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(1)
+    print(f"heavy parts OK: {total} parts hold {len(heavy_tests)} tests exactly once")
+
+
 def verify_coverage(expressions, archive, selection, plan):
-    """Verify the whole partition exactly as the `check` action does.
+    """Verify the partition of `selection` (the whole list without one).
 
     Lists the universe and every shard from the archive (extracting it on the
-    first list) and requires each test exactly once. Shared by `check` and by
-    `run heavy --part 1/N --check`, so the part-1 job proves the partition
-    in the same process that then runs its part.
+    first list) and requires each test exactly once.
 
     Returns the universe and the per-shard selections, so a caller proving
     the heavy part union reuses the heavy list instead of listing twice.

@@ -38,13 +38,13 @@ PINNED_BODY_HASHES = {
   "fast-tests": "bb8a335dd5ec94c10c91f9889eaaa5196254987b611ecea329858ac6e6289a8a",
   "feature-matrix": "7f1ff717444cbe6383a275855562cbdd49a1bd8836355baf6259063527b618aa",
   "hermes-compatibility-macos": "54ee470400f5a861170bfba8698de84003b6f867ac1878ce32585804ee6a1fa5",
-  "integration": "f34976c20d4d8e6daecfcaa6134b52bf856b1f1e4269a4750a8fd3b93fda03e7",
+  "integration": "1626dbb6661d7b5cd5c2baf308d3fd3b8e3a985f7f8269a57aa515fccdd1160f",
   "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
   "macos-release-build": "3606ddebf6821c5b43a453417aa4f5077c8843fb5de0a35e0560094fc3746a38",
   "macos-tier": "5c1c709f20f1ed7f77248e9fe66d28174d0174c2f0571fc185eb79367e44c5d1",
   "platform-contracts": "2478c75e6149df6dc0c3f1968b7a69be8918f0d69ea0e1a88a2e7b6b3a0910aa",
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
-  "script-tests": "6bf890865bcac4488c6f72d4b4f6ee15010be064f17b2b2221398be1f62b1996",
+  "script-tests": "bc3133fb57737612bb959a951d7e8fb11c10d928cb50458c023abc7f19d5f1bd",
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "8e9684845342c677bb4155e024c73fd205e8d1be7582a73a81b75bdff4046c62",
   "systemd-supervision": "d3be62ecc43a3f2ede8030443abd06581d31bc381f74d49c1898c68586266e94",
@@ -59,7 +59,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "48f811fd45d188832f6119928fa1c058591a3331dc273a74442e1741c3c07bf1"
+PINNED_PREAMBLE = "befbb451de400878a965c551cbd28868b741eba0ff2ab0650e262ba071207a4d"
 
 
 def pinned_preamble():
