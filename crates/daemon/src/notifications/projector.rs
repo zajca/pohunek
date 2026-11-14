@@ -1221,6 +1221,44 @@ mod tests {
         );
     }
 
+    /// The single-chunk redraw after a root `clear`, in the order the session
+    /// publishes it whatever the terminal chunking: a screen idle straight
+    /// after the record-backed `blocked` (the redraw that skipped the process
+    /// edge), then a later bare repaint's `Working/Process`, then the
+    /// program's `working` record. Only the record resolves the approval.
+    #[test]
+    fn a_repaint_after_a_screen_idle_leaves_a_record_backed_approval_open() {
+        let (attention, mut resolves) = AttentionCoordinator::resolve_probed();
+        let mut state = ProjectorState::default();
+        let id = session_id("repaint-after-screen-idle");
+        let pending = state.pending_activity(
+            &attention,
+            &id,
+            AgentActivity::Blocked,
+            record_backed_blocked(),
+        );
+        assert!(pending.is_some(), "the blocked record opens the approval");
+        for (activity, source, expected_resolves) in [
+            (AgentActivity::Idle, StateSource::Screen, 0),
+            (AgentActivity::Working, StateSource::Process, 0),
+            (AgentActivity::Working, StateSource::OscProgress, 1),
+        ] {
+            let origin = ActivityOrigin {
+                source: Some(source),
+                blocked_kind: None,
+                fallback: false,
+            };
+            assert!(state
+                .pending_activity(&attention, &id, activity, origin)
+                .is_none());
+            assert_eq!(
+                resolves.resolves(),
+                vec![attention_dedupe_key(&id); expected_resolves],
+                "{activity:?} from {source:?}"
+            );
+        }
+    }
+
     /// The widened resolve: a fallback idle over a record-backed `blocked`
     /// sends the resolve command to the coordinator, while a non-fallback
     /// screen idle sends nothing. The probe counts resolves per run.

@@ -2011,10 +2011,13 @@ async fn a_split_redraw_after_a_cleared_record_leaves_the_approval_open() {
     cleared.finish().await;
 }
 
-/// The single-write chunking of the same redraw (`Z`: the erase and the box
-/// in one write, which reaches the detector as structured evidence unless
-/// the terminal splits it) leaves the approval `Unread` too, as does a later
-/// repaint; the program's next working record resolves it.
+/// The single-write redraw (`Z`: the erase and the box in one write, which
+/// reaches the detector as structured evidence unless the terminal splits
+/// the read) leaves the approval `Unread` too, as does a later repaint; the
+/// program's next working record resolves it. The chunking is not asserted:
+/// the outcome is the same either way, and the projector test
+/// `a_repaint_after_a_screen_idle_leaves_a_record_backed_approval_open`
+/// pins the single-chunk sequence where no read can split it.
 #[tokio::test]
 async fn a_single_write_redraw_after_a_cleared_record_leaves_the_approval_open() {
     if !pohunek_test_support::process_env::in_own_process() {

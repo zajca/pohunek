@@ -359,7 +359,11 @@ For durable notification issues:
    `acknowledged` when the projector sees the transition into `working`, keyed
    by `attention:<session_id>`. A record that never self-resolves usually means
    no `working` activity edge reached the projector (for example a session
-   whose activity is not being reported).
+   whose activity is not being reported). Check the source of the `working`
+   edge too: for an approval a `blocked` program-status record (or a `blocked`
+   reading with a kind) raised, a `working` edge with source `process` is a
+   repaint and resolves nothing; only the program's next `working` record or a
+   working screen rule resolves it.
 8. A `turn_completed` or `error` hook report creates no record: look for the
    turn event with `pohunek session wait <target>`, and for the info log
    `notification.dropped_kind` when a report of another kind was accepted and
