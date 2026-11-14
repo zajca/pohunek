@@ -3750,12 +3750,18 @@ async fn assert_codex_input_delivered_once(received: &Path) {
     );
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the captured dialog, dismissal and rollback assertions share one fixture"
+)]
 async fn codex_captured_startup_dialog(
     surface: &str,
     columns: u16,
     stale_title: bool,
     dismiss: bool,
 ) {
+    let daemon_log = connection_shutdown::Captured::default();
+    let _log_guard = connection_shutdown::capture_logs(&daemon_log);
     let socket = temp_socket("codex-startup-dialog");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -3847,7 +3853,8 @@ async fn codex_captured_startup_dialog(
                 .expect("list sessions");
         assert!(
             sessions.is_empty(),
-            "the refused session was rolled back: {sessions:?}"
+            "the refused session was rolled back: {sessions:?}\ndaemon log:\n{}",
+            daemon_log.text()
         );
         let captured = std::fs::read(&received).unwrap_or_default();
         assert!(
