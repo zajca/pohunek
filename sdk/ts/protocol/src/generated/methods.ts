@@ -41,6 +41,8 @@ import type {
   PackageInstallResult,
   PackageLinkParams,
   PackageListResult,
+  PackageRemoveProfileParams,
+  PackageRemoveProfileResult,
   PackageSelectParams,
   PackageSetEnabledParams,
   PackageUninstallParams,
@@ -133,6 +135,7 @@ export interface Methods {
   "package.install": { params: PackageInstallParams; output: PackageInstallResult };
   "package.link": { params: PackageLinkParams; output: PackageInstallResult };
   "package.list": { params: null; output: PackageListResult };
+  "package.remove_profile": { params: PackageRemoveProfileParams; output: PackageRemoveProfileResult };
   "package.select": { params: PackageSelectParams; output: PackageChangeResult };
   "package.set_enabled": { params: PackageSetEnabledParams; output: PackageChangeResult };
   "package.uninstall": { params: PackageUninstallParams; output: PackageUninstallResult };
@@ -198,6 +201,7 @@ export const METHOD_NAMES = [
   "package.install",
   "package.link",
   "package.list",
+  "package.remove_profile",
   "package.select",
   "package.set_enabled",
   "package.uninstall",

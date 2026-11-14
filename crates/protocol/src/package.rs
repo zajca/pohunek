@@ -709,6 +709,38 @@ pub struct PackageCreateProfileResult {
     pub previous: Option<ProfileDigest>,
 }
 
+/// Parameters for `package.remove_profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "PackageRemoveProfileParams.ts")
+)]
+pub struct PackageRemoveProfileParams {
+    /// Name of the host profile or preset: its file name under the agents
+    /// directory without `.toml`.
+    pub profile: String,
+    /// The digest of the profile file's current bytes, as
+    /// `plugin profile list --json --all` reports it; any other file version
+    /// is left as found.
+    pub digest: ProfileDigest,
+}
+
+/// Result of `package.remove_profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "PackageRemoveProfileResult.ts")
+)]
+pub struct PackageRemoveProfileResult {
+    /// The removed profile's name.
+    pub profile: String,
+    /// Digest of the removed file.
+    pub file_digest: ProfileDigest,
+}
+
 /// Result of `package.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -936,6 +968,16 @@ pub enum PackageErrorKind {
     /// The agents directory or one of its ancestors is a symbolic link or is
     /// not owner-private; nothing was written.
     ProfileDirUnsafe,
+    /// The name is a built-in runtime such as `shell`, which has no profile
+    /// file to remove.
+    ProfileBuiltin,
+    /// The name is a runtime an installed package serves, which has no
+    /// profile file to remove.
+    ProfilePackageRuntime,
+    /// A running session uses the profile; nothing was removed.
+    ProfileInUse,
+    /// A preset names the profile as its parent; nothing was removed.
+    ProfileHasPresets,
     /// The descriptor requires a runtime feature this core does not implement,
     /// or uses a key or compiled id of a feature it does not require.
     RuntimeFeatureUnsupported,
@@ -991,6 +1033,10 @@ impl PackageErrorKind {
             Self::ProfileHomeInvalid => "package_profile_home_invalid",
             Self::ProfileHomeUnsupported => "package_profile_home_unsupported",
             Self::ProfileDirUnsafe => "package_profile_dir_unsafe",
+            Self::ProfileBuiltin => "package_profile_builtin",
+            Self::ProfilePackageRuntime => "package_profile_package_runtime",
+            Self::ProfileInUse => "package_profile_in_use",
+            Self::ProfileHasPresets => "package_profile_has_presets",
             Self::IntegrationIncompatible => "package_integration_incompatible",
             Self::RuntimeFeatureUnsupported => "runtime_feature_unsupported",
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
@@ -1070,6 +1116,18 @@ impl PackageErrorKind {
             Self::ProfileDirUnsafe => {
                 "the agents directory or one of its ancestors is a symbolic link or not private to the owner"
             }
+            Self::ProfileBuiltin => {
+                "the name is a built-in runtime, not a host profile file, so there is nothing to remove"
+            }
+            Self::ProfilePackageRuntime => {
+                "the name is a runtime an installed package serves, not a host profile file, so there is nothing to remove"
+            }
+            Self::ProfileInUse => {
+                "a running session uses the agent profile, so it was left as found"
+            }
+            Self::ProfileHasPresets => {
+                "a preset names the agent profile as its parent, so it was left as found"
+            }
             Self::IntegrationIncompatible => {
                 "the package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected"
             }
@@ -1141,6 +1199,14 @@ impl PackageErrorKind {
             Self::ProfileHomeUnsupported => "create the profile without `--home`",
             Self::ProfileDirUnsafe => {
                 "make the agents directory a real directory owned by you and writable by you only"
+            }
+            Self::ProfileBuiltin => "a built-in runtime cannot be removed; name a host profile file",
+            Self::ProfilePackageRuntime => {
+                "disable or uninstall the package with `pohunek plugin disable` or `pohunek plugin uninstall` instead"
+            }
+            Self::ProfileInUse => "stop the sessions that run the profile, then retry",
+            Self::ProfileHasPresets => {
+                "remove the presets of the profile first; `pohunek plugin profile list --all` shows them as `preset of <name>`"
             }
             Self::IntegrationIncompatible => {
                 "stop or remove the sessions and unpin the profiles that use the other version, or uninstall it, then retry"
@@ -1284,6 +1350,16 @@ mod tests {
             PackageErrorKind::ProfileChanged,
             PackageErrorKind::ProfilePinChanged,
             PackageErrorKind::IntegrationIncompatible,
+            PackageErrorKind::ProfileExists,
+            PackageErrorKind::ProfileDigestMismatch,
+            PackageErrorKind::ProfileCredentialLiteral,
+            PackageErrorKind::ProfileHomeInvalid,
+            PackageErrorKind::ProfileHomeUnsupported,
+            PackageErrorKind::ProfileDirUnsafe,
+            PackageErrorKind::ProfileBuiltin,
+            PackageErrorKind::ProfilePackageRuntime,
+            PackageErrorKind::ProfileInUse,
+            PackageErrorKind::ProfileHasPresets,
             PackageErrorKind::RuntimeFeatureUnsupported,
             PackageErrorKind::CommandsClientUnsupported,
             PackageErrorKind::Revoked,

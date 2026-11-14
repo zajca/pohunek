@@ -132,6 +132,8 @@ export type { PackageInstallStatus } from "./PackageInstallStatus";
 export type { PackageLinkParams } from "./PackageLinkParams";
 export type { PackageListResult } from "./PackageListResult";
 export type { PackageOrigin } from "./PackageOrigin";
+export type { PackageRemoveProfileParams } from "./PackageRemoveProfileParams";
+export type { PackageRemoveProfileResult } from "./PackageRemoveProfileResult";
 export type { PackageRuntimeInfo } from "./PackageRuntimeInfo";
 export type { PackageSelectParams } from "./PackageSelectParams";
 export type { PackageSelectionBlock } from "./PackageSelectionBlock";

@@ -12,8 +12,8 @@
 use protocol::{
     PackageBindProfileParams, PackageCreatePresetParams, PackageCreateProfileParams,
     PackageDoctorParams, PackageErrorKind, PackageInspectParams, PackageInstallParams,
-    PackageLinkParams, PackageSelectParams, PackageSetEnabledParams, PackageUninstallParams,
-    ProtocolError, Request, Response,
+    PackageLinkParams, PackageRemoveProfileParams, PackageSelectParams, PackageSetEnabledParams,
+    PackageUninstallParams, ProtocolError, Request, Response,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
@@ -177,6 +177,26 @@ pub(super) async fn handle_package_create_preset(
                 .sessions
                 .packages()
                 .package_create_preset(params)
+                .await,
+        ),
+        Err(error) => error_value(request, error),
+    }
+}
+
+pub(super) async fn handle_package_remove_profile(
+    request: &Request,
+    state: &DaemonState,
+) -> Response {
+    if let Err(response) = require_local(request, state) {
+        return response;
+    }
+    match parse_params::<PackageRemoveProfileParams>(request) {
+        Ok(params) => respond(
+            request,
+            state
+                .sessions
+                .packages()
+                .package_remove_profile(params)
                 .await,
         ),
         Err(error) => error_value(request, error),

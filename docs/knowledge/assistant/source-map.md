@@ -600,6 +600,8 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/credential.rs` — the daemon's path to the credential-literal detector of `crates/package/src/credential.rs`.
 - `crates/daemon/src/agent/profile/compose.rs` — composes the text of a new profile.
 - `crates/daemon/src/packages/create.rs` — `package.create_profile` (with `options_toml`) and `package.create_preset`.
+- `crates/daemon/src/packages/remove.rs` — `package.remove_profile`: the refusals and the inode-bound removal of a profile file.
+- `crates/daemon/src/session/profile_use.rs` — which profiles running sessions use, and the create re-check under the launch guard.
 - `crates/daemon/src/agent/host/`
 - `crates/daemon/src/integration/agent_skill.rs` — the opt-in agent skill install, status and removal.
 - `crates/xtask/tests/no_special_dispatch.rs`

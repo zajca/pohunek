@@ -89,7 +89,7 @@ fn subcommand_completion_lists_each_group_in_declaration_order() {
         ),
         (
             &["pohunek", "plugin", "profile", ""],
-            &["list", "migrate", "create", "show", "fold"],
+            &["list", "migrate", "create", "rm", "show", "fold"],
         ),
     ];
     for (words, expected) in scenarios {
@@ -229,6 +229,7 @@ fn profile_completion_reads_private_agent_profiles_through_the_cli() {
         ["pohunek", "integration", "uninstall", "--profile", "wo"].as_slice(),
         ["pohunek", "plugin", "profile", "migrate", "wo"].as_slice(),
         ["pohunek", "plugin", "profile", "fold", "wo"].as_slice(),
+        ["pohunek", "plugin", "profile", "rm", "wo"].as_slice(),
         [
             "pohunek",
             "plugin",

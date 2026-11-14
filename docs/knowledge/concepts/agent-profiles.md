@@ -319,6 +319,22 @@ a [preset](#presets) instead, validated as a launch resolves it, with the same
 `--replace` and `--dry-run` rules. `plugin profile list` shows a preset with
 the state `preset` and the detail `preset of <parent>`.
 
+`pohunek plugin profile rm <name> --digest <file digest> [--json]` (the wire
+method `package.remove_profile`) removes a profile or preset file through the
+daemon, only while the file still has the `file_digest` that
+`plugin profile list --json --all` reports; a file edited since is refused with
+`package_profile_digest_mismatch` and kept. A tool that created profiles, such
+as an onboarding Undo, records each name with its digest and passes both back.
+A built-in runtime such as `shell` (`package_profile_builtin`) and a runtime a
+package serves (`package_profile_package_runtime`) have no file to remove. A
+profile that a running session uses is refused (`package_profile_in_use`), and
+so is a parent that a preset names (`package_profile_has_presets`): remove the
+presets first, then the parent. Both refusals follow the file a name opens, so
+a session or preset that reaches the profile through an in-tree symbolic link
+or another spelling of the name holds it too, and the name passed to `rm` must
+be the stored one, exactly as `plugin profile list` shows it. A stopped session of a removed profile resumes
+only after the same profile is restored (`agent_profile_missing` until then).
+
 ## Presentation labels
 
 A profile may carry two optional top-level keys that only change how it is

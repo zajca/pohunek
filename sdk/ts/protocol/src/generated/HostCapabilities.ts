@@ -238,6 +238,14 @@ export type HostCapabilities = {
    */
   package_create_preset_supported?: boolean;
   /**
+   * Whether the daemon serves `package.remove_profile`.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; it
+   * answers the method with `method_not_found`, so a client sends the call
+   * only when this is `true`. `false` is likewise omitted on the wire.
+   */
+  package_remove_profile_supported?: boolean;
+  /**
    * Whether the daemon implements the agent skill install:
    * `integration.install` accepts `skill`, `integration.uninstall` accepts
    * `skill_only`, and `integration.status` reports a `skill` per home.

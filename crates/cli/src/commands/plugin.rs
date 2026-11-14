@@ -643,6 +643,10 @@ pub(crate) enum Error {
     #[error("the local daemon is too old for `plugin profile create --preset-of`")]
     ProfileCreatePresetUnsupported,
 
+    /// The daemon predates `package.remove_profile`.
+    #[error("the local daemon is too old for `plugin profile rm`")]
+    ProfileRemoveUnsupported,
+
     /// The `--options-file` cannot be used.
     #[error("the options file cannot be used: {detail}")]
     OptionsFile {
@@ -734,6 +738,7 @@ impl Error {
             Self::ProfileCreateUnsupported => "profile_create_unsupported",
             Self::ProfileCreateOptionsUnsupported => "profile_create_options_unsupported",
             Self::ProfileCreatePresetUnsupported => "profile_create_preset_unsupported",
+            Self::ProfileRemoveUnsupported => "profile_remove_unsupported",
             Self::OptionsFile { .. } => "profile_options_file_invalid",
             Self::FoldInput { .. } => "fold_input_invalid",
             Self::FoldIncompatible { .. } => "fold_incompatible",
@@ -827,7 +832,8 @@ impl Error {
             }
             Self::ProfileCreateUnsupported
             | Self::ProfileCreateOptionsUnsupported
-            | Self::ProfileCreatePresetUnsupported => {
+            | Self::ProfileCreatePresetUnsupported
+            | Self::ProfileRemoveUnsupported => {
                 "run `pohunek service upgrade`, then repeat the command"
             }
             Self::OptionsFile { .. } => {

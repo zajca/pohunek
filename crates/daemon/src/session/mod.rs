@@ -168,6 +168,7 @@ mod profile_freeze_tests;
 mod profile_pin_tests;
 #[cfg(test)]
 mod profile_secret_env_tests;
+mod profile_use;
 mod read;
 mod reconcile;
 #[cfg(all(test, target_os = "linux"))]
@@ -955,6 +956,10 @@ struct SessionRegistryInner {
     /// Holds the next create once its target is bound, before its launch.
     #[cfg(test)]
     bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next create once its agent resolved, before it takes the
+    /// package launch guard.
+    #[cfg(test)]
+    resolved_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next resume once its profile is resolved and verified,
     /// before it launches.
     #[cfg(test)]
@@ -2815,6 +2820,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 bound_create_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                resolved_create_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 recovery_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 definition_hold: std::sync::Mutex::new(None),
@@ -4126,9 +4133,12 @@ impl SessionRegistry {
         ),
         ProtocolError,
     > {
+        #[cfg(test)]
+        self.hold_resolved_create().await;
         // Verified and held before anything is persisted, so a package that
         // fails verification launches nothing and leaves no record.
         let _package_launch = self.guard_package_launch(&resolved.definition).await?;
+        self.ensure_profile_still_resolves(&params, &resolved)?;
         if let Some(digest) = params.context_package_digest.as_ref() {
             self.verify_context_pin(digest).await?;
         }

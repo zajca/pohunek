@@ -5,7 +5,8 @@
 //! carry an explicit `package` and `digest` pin. A profile moves to another
 //! digest only through `migrate`, which asks the daemon to rewrite exactly
 //! those two keys under its package lifecycle authority; this command never
-//! writes the file itself. `list` is informational: it reads the files with its
+//! writes or removes the file itself: `create` and `rm` are daemon methods
+//! too. `list` is informational: it reads the files with its
 //! own reader, and the daemon decides what a profile resolves to.
 //!
 //! Profile files can hold secret `[env]` values. Nothing here deserializes
@@ -24,7 +25,8 @@ use protocol::{
     method, official_package_install_only_step, PackageBindProfileParams, PackageBindProfileResult,
     PackageBindStatus, PackageCreatePresetParams, PackageCreateProfileParams,
     PackageCreateProfileResult, PackageCreateProfileStatus, PackageDigest, PackageId, PackageInfo,
-    PackageOrigin, ProfileDigest, RuntimeId,
+    PackageOrigin, PackageRemoveProfileParams, PackageRemoveProfileResult, ProfileDigest,
+    RuntimeId,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -124,6 +126,17 @@ pub(crate) enum ProfileAction {
     /// it. `--dry-run` prints the profile and its digest and writes nothing.
     Create(CreateArgs),
 
+    /// Remove a host agent profile or preset whose file still has the
+    /// digest `plugin profile list --json --all` reports for it.
+    ///
+    /// The daemon removes the file under its package lifecycle authority; a
+    /// file with another digest is left as found. A built-in or
+    /// package-served runtime name, a profile a running session uses and a
+    /// profile a preset names as its parent are refused: remove the presets
+    /// first. A stopped session of a removed profile resumes only once the
+    /// profile is restored.
+    Rm(RmArgs),
+
     /// Show one agent profile as the daemon resolves it: labels, base
     /// runtime, availability, version and the options a session can select
     /// with `session new --opt OPTION=CHOICE`.
@@ -156,6 +169,7 @@ impl ProfileAction {
             Self::List { json, .. } => *json,
             Self::Migrate(args) => args.json,
             Self::Create(args) => args.json,
+            Self::Rm(args) => args.json,
             Self::Show(args) => args.json,
             Self::Fold(args) => args.json(),
         }
@@ -231,6 +245,21 @@ pub(crate) struct CreateArgs {
     /// Validate and print the profile and its digest without writing.
     #[arg(long)]
     dry_run: bool,
+    /// Emit machine-readable JSON instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Arguments of `pohunek plugin profile rm`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RmArgs {
+    /// Profile name: the file name under `agents/` without `.toml`.
+    #[arg(value_name = "NAME", value_parser = parse_profile_name)]
+    name: String,
+    /// The profile file's current digest, as `plugin profile list --json
+    /// --all` reports it in `file_digest`.
+    #[arg(long = "digest", value_name = "DIGEST", value_parser = parse_profile_digest)]
+    file_digest: ProfileDigest,
     /// Emit machine-readable JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -1069,6 +1098,7 @@ pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
         }
         ProfileAction::Migrate(args) => run_migrate(&args).await,
         ProfileAction::Create(args) => run_create(&args).await,
+        ProfileAction::Rm(args) => run_rm(&args).await,
         ProfileAction::Show(args) => run_show(&args).await,
         ProfileAction::Fold(args) => profile_fold::run(&args),
     }
@@ -1261,6 +1291,34 @@ fn read_options_file(path: &Path) -> Result<String, Error> {
         return Err(refused("the file is too large"));
     }
     String::from_utf8(bytes).map_err(|_error| refused("the file is not valid UTF-8"))
+}
+
+/// Remove the profile through the daemon.
+///
+/// The capabilities are read first, so a daemon that predates the method is
+/// told apart from a refusal and receives nothing.
+async fn run_rm(args: &RmArgs) -> Result<(), CliError> {
+    let paths = Paths::resolve()?;
+    let mut client = Client::connect(LOCAL_HOST, &paths).await?;
+    let capabilities = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?;
+    if !capabilities.package_remove_profile_supported {
+        return Err(Error::ProfileRemoveUnsupported.into());
+    }
+    let result = client
+        .call::<method::PackageRemoveProfile>(PackageRemoveProfileParams {
+            profile: args.name.clone(),
+            digest: args.file_digest.clone(),
+        })
+        .await?;
+    print_output(args.json, &result, || render_removed(&result))
+}
+
+fn render_removed(result: &PackageRemoveProfileResult) -> String {
+    format!("removed {} digest {}\n", result.profile, result.file_digest)
 }
 
 fn render_created(result: &PackageCreateProfileResult) -> String {

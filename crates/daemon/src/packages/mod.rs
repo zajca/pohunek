@@ -26,6 +26,7 @@ mod create;
 pub(crate) mod ensure;
 mod error;
 mod fault;
+mod remove;
 mod retention;
 mod revocation;
 mod selection;
@@ -37,6 +38,7 @@ pub(crate) use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority
 pub use self::retention::PackageUninstallError;
 pub(crate) use self::retention::{installed_digests, RetainedPins};
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -469,6 +471,30 @@ impl PackageService {
                 // sessions follow whichever package serves their runtime now.
                 sessions.refresh_adopted_pins().await;
                 outcome
+            })
+            .await
+            .map_err(|_join_error| PackageErrorKind::RegistryFailed)?
+    }
+
+    /// Runs `work` under the exclusive lifecycle lock with the agents of the
+    /// sessions that are not terminal, read after the lock is taken.
+    ///
+    /// No resume resolves a profile and no create commits a session while
+    /// the lock is held, so the agents stay the running set until `work`
+    /// returns. No package store is needed: `work` changes profile files
+    /// only.
+    async fn profile_transaction<T, F>(&self, work: F) -> Result<T, PackageErrorKind>
+    where
+        T: Send + 'static,
+        F: FnOnce(&BTreeSet<String>) -> Result<T, PackageErrorKind> + Send + 'static,
+    {
+        let sessions = self.sessions.clone();
+        let authority = Arc::clone(&self.authority);
+        self.sessions
+            .spawn_transaction("profile_transaction", async move {
+                let _exclusive = authority.lifecycle.write().await;
+                let live = sessions.live_agents().await;
+                blocking(move || work(&live)).await
             })
             .await
             .map_err(|_join_error| PackageErrorKind::RegistryFailed)?

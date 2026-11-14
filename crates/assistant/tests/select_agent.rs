@@ -90,6 +90,7 @@ fn capabilities(runtimes: Vec<AgentRuntime>) -> HostCapabilities {
         package_create_profile_supported: true,
         package_create_profile_options_supported: true,
         package_create_preset_supported: true,
+        package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
         session_new_agent_options_supported: true,
