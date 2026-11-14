@@ -635,6 +635,48 @@ pub(crate) enum Error {
     #[error("the local daemon is too old for `plugin profile create`")]
     ProfileCreateUnsupported,
 
+    /// A `plugin profile fold` input cannot be read or is not a full
+    /// profile file.
+    #[error("cannot fold profile {name}: {detail}")]
+    FoldInput {
+        /// The input profile name.
+        name: String,
+        /// What is wrong, naming no value.
+        detail: String,
+    },
+
+    /// The `plugin profile fold` inputs cannot share one parent: a preset, a
+    /// profile with options, or a launch key that differs.
+    #[error("cannot fold the profiles: {detail}")]
+    FoldIncompatible {
+        /// The key and profiles at fault, naming no value.
+        detail: String,
+    },
+
+    /// A `plugin profile fold` input repeats a flag, so its argument groups
+    /// have no single key.
+    #[error("cannot fold the profiles: profile {profile} repeats the flag at args[{index}]")]
+    FoldAmbiguousArgs {
+        /// The input profile name.
+        profile: String,
+        /// Index of the repeated flag in `args`.
+        index: usize,
+    },
+
+    /// A `plugin profile fold` input holds an argument that looks like a
+    /// credential, which the proposal would print.
+    #[error(
+        "cannot fold the profiles: {field}[{index}] of profile {profile} looks like a credential"
+    )]
+    FoldCredentialLiteral {
+        /// The input profile name.
+        profile: String,
+        /// The argument list: `args` or `resume.args`.
+        field: &'static str,
+        /// Index of the argument in the list.
+        index: usize,
+    },
+
     /// The migration target does not resolve to one usable package.
     #[error("profile {name}: {detail}")]
     ProfileTarget {
@@ -675,6 +717,10 @@ impl Error {
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
             Self::ProfileTarget { .. } => "profile_target_invalid",
             Self::ProfileCreateUnsupported => "profile_create_unsupported",
+            Self::FoldInput { .. } => "fold_input_invalid",
+            Self::FoldIncompatible { .. } => "fold_incompatible",
+            Self::FoldAmbiguousArgs { .. } => "fold_ambiguous_args",
+            Self::FoldCredentialLiteral { .. } => "fold_credential_literal",
         }
     }
 
@@ -764,6 +810,18 @@ impl Error {
             Self::ProfileCreateUnsupported => "run `pohunek service upgrade`, then repeat the command",
             Self::ProfileTarget { .. } => {
                 "list installed packages with `pohunek plugin list` and pass --digest"
+            }
+            Self::FoldInput { .. } => {
+                "name two or more readable full profiles from `pohunek plugin profile list --all`, and a new parent name"
+            }
+            Self::FoldIncompatible { .. } => {
+                "fold only profiles that differ in args and [env]; fold the others into a parent of their own"
+            }
+            Self::FoldAmbiguousArgs { .. } => {
+                "give each flag once in the profile's args, then fold again"
+            }
+            Self::FoldCredentialLiteral { .. } => {
+                "move the credential to a secret_env slot of the profile, then fold again"
             }
         }
     }

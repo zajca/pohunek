@@ -89,7 +89,7 @@ fn subcommand_completion_lists_each_group_in_declaration_order() {
         ),
         (
             &["pohunek", "plugin", "profile", ""],
-            &["list", "migrate", "create", "show"],
+            &["list", "migrate", "create", "show", "fold"],
         ),
     ];
     for (words, expected) in scenarios {

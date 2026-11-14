@@ -36,6 +36,8 @@
 //! - [`directory`] builds the canonical archive of a developer directory, the
 //!   input of `plugin link` and `package build`.
 //!
+//! - [`credential`] detects credential literals in agent profile inputs, shared
+//!   by the daemon's profile checks and the CLI's profile proposals.
 //! - [`version_probe`] is the one grammar of a descriptor's `version_probe`
 //!   declaration and of the version output it reads, shared by the daemon's
 //!   launch gate and the CLI's Hermes integration gate.
@@ -55,6 +57,7 @@ mod canonical;
 mod canonical_json;
 mod catalog;
 mod compression;
+pub mod credential;
 mod error;
 mod index_channel;
 mod limits;

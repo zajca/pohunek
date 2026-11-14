@@ -36,6 +36,7 @@ use super::plugin::{
 };
 use crate::client::Client;
 use crate::commands::profile_bind::{self, PinCheck, UNCHECKED_PIN_NOTE};
+use crate::commands::profile_fold::{self, FoldArgs};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::LOCAL_HOST;
@@ -127,6 +128,20 @@ pub(crate) enum ProfileAction {
     /// unavailable when its `min_runtime` is above the runtime's version, or
     /// when the runtime reports no version.
     Show(ShowArgs),
+
+    /// Propose how two or more profiles that differ only in `args` and
+    /// `[env]` collapse into one parent with `[options]` and one preset per
+    /// input; prints the proposal and writes nothing.
+    ///
+    /// `--dry-run` is required. Each differing flag group of `args` becomes
+    /// an option whose choices are the inputs' variants (`none` where an
+    /// input lacks the flag), and each differing `[env]` key an `env-<key>`
+    /// option. Env values are never printed: the proposal holds a
+    /// `<value of KEY from PROFILE>` placeholder for each. An input that is
+    /// a preset, declares `[options]` or differs in another launch key is
+    /// refused (`fold_incompatible`), as is an argument that looks like a
+    /// credential (`fold_credential_literal`).
+    Fold(FoldArgs),
 }
 
 impl ProfileAction {
@@ -137,6 +152,7 @@ impl ProfileAction {
             Self::Migrate(args) => args.json,
             Self::Create(args) => args.json,
             Self::Show(args) => args.json,
+            Self::Fold(args) => args.json(),
         }
     }
 }
@@ -230,7 +246,7 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn parse_profile_name(value: &str) -> Result<String, String> {
+pub(super) fn parse_profile_name(value: &str) -> Result<String, String> {
     if is_valid_profile_name(value) {
         Ok(value.to_owned())
     } else {
@@ -594,7 +610,7 @@ fn apply_audience_filter(entries: Vec<ProfileEntry>, all: bool) -> (Vec<ProfileE
 
 /// Why a profile file could not be loaded.
 #[derive(Debug, PartialEq, Eq)]
-enum LoadFault {
+pub(super) enum LoadFault {
     /// No such file.
     Missing,
     /// The file fails the ownership, type or permission policy.
@@ -604,7 +620,7 @@ enum LoadFault {
 }
 
 impl LoadFault {
-    fn detail(&self) -> &'static str {
+    pub(super) fn detail(&self) -> &'static str {
         match self {
             Self::Missing => "the file does not exist",
             Self::Unsafe(reason) | Self::Unreadable(reason) => reason,
@@ -644,8 +660,8 @@ fn check_file_policy(
 }
 
 /// A profile file read through the trusted directory descriptor.
-struct LoadedProfile {
-    text: String,
+pub(super) struct LoadedProfile {
+    pub(super) text: String,
 }
 
 /// The digest of profile file text, as `create --replace` compares it.
@@ -673,7 +689,7 @@ fn profile_file_name(name: &str) -> String {
 ///
 /// The directory must be owned by the current user and not group- or
 /// world-writable, the daemon's own gate for host configuration.
-fn open_agents_dir(path: &Path) -> Result<Option<TrustedDir>, FsError> {
+pub(super) fn open_agents_dir(path: &Path) -> Result<Option<TrustedDir>, FsError> {
     match TrustedDir::open_absolute_owner_safe(path, OTHERS_WRITE_BITS) {
         Ok(dir) => Ok(Some(dir)),
         Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => Ok(None),
@@ -681,7 +697,7 @@ fn open_agents_dir(path: &Path) -> Result<Option<TrustedDir>, FsError> {
     }
 }
 
-fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault> {
+pub(super) fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault> {
     let file = profile_file_name(name);
     let metadata = match std::fs::symlink_metadata(dir.path().join(&file)) {
         Ok(metadata) => metadata,
@@ -722,7 +738,7 @@ fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault
     Ok(LoadedProfile { text })
 }
 
-fn directory_error(error: &FsError) -> Error {
+pub(super) fn directory_error(error: &FsError) -> Error {
     Error::ProfileDirectory {
         detail: sanitize(&error.to_string()),
     }
@@ -943,6 +959,7 @@ pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
         ProfileAction::Migrate(args) => run_migrate(&args).await,
         ProfileAction::Create(args) => run_create(&args).await,
         ProfileAction::Show(args) => run_show(&args).await,
+        ProfileAction::Fold(args) => profile_fold::run(&args),
     }
 }
 

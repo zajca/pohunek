@@ -1,0 +1,4 @@
+---
+kind: added
+---
+Host agent profiles can be presets: a file with a `[preset]` table names a parent profile and a selection of its options (`[preset.options]`, optional `locked`, plus `display_name` and `audience`) and launches as the parent with that selection under its own name, so an old profile name keeps working as one choice of a shared parent. A locked preset refuses `--opt` (`agent_options_locked`). Sessions of a preset record their choices and resume with them; editing the parent's selected choice or the preset's parent needs `--accept-profile-change`, the preset's labels and choices do not. `pohunek plugin profile fold <name>... --into <parent> --dry-run` proposes such a parent and one preset per existing profile without writing anything or printing an env value. ([#2148](https://github.com/zajca/pohunek/issues/2148))

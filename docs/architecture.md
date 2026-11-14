@@ -1127,7 +1127,13 @@ left out, so only an edit to a selected choice needs the decision, and resume
 resolves the profile with the recorded choices; a recorded choice the profile
 no longer declares is refused (`agent_option_choice_missing`) even with the
 decision. Choice floors (`min_runtime`) are checked against the launch probe's
-release at `session.new` only. The one exception is the migration pin: for an
+release at `session.new` only. A preset session digests its parent's revision
+text (as above, with the session's recorded choices) followed by a
+`# pohunek:preset-of` line and the parent's name, so editing the parent's
+selected choice or naming another parent needs the decision, while the
+preset's own labels, `locked` and choices do not; the frozen checks and the
+pin a release step judges are the parent's, because a preset carries no pin.
+The one exception is the migration pin: for an
 adopted built-in session the comparison also accepts a profile whose revision,
 computed without its `package` and `digest` keys, equals the frozen one, with
 the stored built-in binding, the frozen program and arguments, and the profile's
