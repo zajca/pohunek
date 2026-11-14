@@ -611,6 +611,12 @@ fn terminate(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Kills the run's process group.
+///
+/// The group is stopped before it is killed: XNU signals a group one member
+/// at a time, newest first (`killpg1`), so a shell could see its pipeline
+/// die and run its next command before its own `SIGKILL` arrives. A stopped
+/// member runs nothing more until the kill ends it.
 fn terminate_group(child_id: u32) {
     #[cfg(unix)]
     {
@@ -624,6 +630,7 @@ fn terminate_group(child_id: u32) {
         // SAFETY: the child starts in a process group whose id is its positive
         // pid; negating it targets only that group.
         unsafe {
+            libc::kill(-pid, libc::SIGSTOP);
             libc::kill(-pid, libc::SIGKILL);
         }
     }

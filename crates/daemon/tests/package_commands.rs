@@ -71,6 +71,9 @@ hold)
   printf 'released'
   ;;
 big)
+  # Older group members make the kill reach this shell later than its
+  # pipeline on a kernel that signals a group one member at a time.
+  i=0; while [ "$i" -lt 32 ]; do sleep 30 > /dev/null 2>&1 & i=$((i + 1)); done
   head -c 2000000 /dev/zero | tr '\0' a
   : > "$dir/$id.after"
   ;;
