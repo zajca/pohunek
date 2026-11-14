@@ -11,6 +11,8 @@ import hashlib
 import io
 import json
 import re
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -70,17 +72,26 @@ def repository_files():
     return {path: path.read_text() for path in [*sorted(WORKFLOWS.glob("*.yml")), *sorted(ACTIONS.glob("*/action.yml"))]}
 
 
-def pinned_steps(text, name):
-    return [step for step in harness.iter_steps(text, name) if step.get("uses") in PINNED_USES]
+def workflow_job_steps(text):
+    """The parsed steps of each job of a workflow that has steps (a job
+    that calls a reusable workflow has none)."""
+    jobs = {}
+    for name in re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\n", text.split("jobs:\n", 1)[1]):
+        block = re.search(rf"(?ms)^  {re.escape(name)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text).group(1)
+        if re.search(r"(?m)^    steps:\n", block):
+            jobs[name] = harness.job_steps(text, name)
+    return jobs
 
 
 def pinned_sites(text, workflow):
-    """Every nextest pinned-cache step with its job: the job is needed to
-    resolve a relocated `./pinned-cache-action` the way the runner does."""
-    jobs = {}
-    for name in re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\n", text.split("jobs:\n", 1)[1]):
-        jobs[name] = [step for step in pinned_steps(text, name) if (step.get("with") or {}).get("item") == "nextest"]
-    return [(name, step) for name, steps in jobs.items() for step in steps]
+    """Every nextest pinned-cache step with its own job: the job is needed
+    to resolve a relocated `./pinned-cache-action` the way the runner does."""
+    return [
+        (name, step)
+        for name, steps in workflow_job_steps(text).items()
+        for step in steps
+        if step.get("uses") in PINNED_USES and (step.get("with") or {}).get("item") == "nextest"
+    ]
 
 
 def pinned_step_lists(text, name):
@@ -283,10 +294,12 @@ class NextestScenarioTests(Scenario):
                     # relocated `./pinned-cache-action` resolves through the
                     # copy the containing job makes before the step.
                     if step.get("uses") == "./pinned-cache-action":
-                        for copy in harness.iter_steps(text, job):
-                            if "cp -R .github/actions/pinned-cache" in (copy.get("run") or ""):
-                                runner.run_steps([copy], {})
-                                break
+                        copies = [
+                            copy for copy in harness.job_steps(text, job)
+                            if "cp -R .github/actions/pinned-cache" in (copy.get("run") or "")
+                        ]
+                        self.assertEqual(len(copies), 1, f"{job} has no copy step of its own")
+                        runner.run_steps(copies, {})
                     runner.run_steps([dict(step)], {})
                     first = first or self.cache.saves[0]
         self.assertEqual(len(self.cache.saves), 1)
@@ -560,6 +573,205 @@ class PinnedCachePhaseTests(Scenario):
         (stash / "a").write_text("a")
         runner.run_action(".github/actions/pinned-cache", {"phase": "save", "key": "pinned-mold-x", "path": str(stash), "hit": "true"})
         self.assertEqual(self.cache.saves, [])
+
+
+
+OFFLINE_PROOF = WORKFLOWS / "pinned-cache-offline.yml"
+OFFLINE_SCRIPT = ROOT / ".github" / "scripts" / "pinned-cache-offline"
+PINNED_ITEMS = {"mold", "zig", "uv", "nextest", "systemd-oomd", "npm:compat/pi/npm", "npm:compat/codex/npm", "npm:compat/claude/npm"}
+SETUP_ITEMS = {"./.github/actions/setup-mold": "mold", "./.github/actions/setup-zig": "zig", "./.github/actions/setup-uv": "uv"}
+# Items whose key names the runner image (systemd-oomd) or the Node major
+# (npm trees): the proof must run them on the image of their site job.
+IMAGE_KEYED = ("systemd-oomd", "npm:")
+# The runner downloads the actions nested in the composites from these
+# hosts while the proof is offline, so they must stay reachable.
+RUNNER_HOSTS = {"api.github.com", "codeload.github.com"}
+
+
+def job_runner(text, job):
+    block = re.search(rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text).group(1)
+    return re.search(r"(?m)^    runs-on: (\S+)", block).group(1)
+
+
+def item_sites(text):
+    """(item, job, step index, step) of every setup action and pinned-cache restore."""
+    sites = []
+    for job, steps in workflow_job_steps(text).items():
+        for index, step in enumerate(steps):
+            uses = step.get("uses")
+            inputs = step.get("with") or {}
+            if uses in SETUP_ITEMS:
+                sites.append((SETUP_ITEMS[uses], job, index, step))
+            elif uses in PINNED_USES and inputs.get("phase", "restore") == "restore":
+                sites.append((inputs["item"], job, index, step))
+    return sites
+
+
+def offline_step_index(steps):
+    found = [index for index, step in enumerate(steps) if "pinned-cache-offline apply" in (step.get("run") or "")]
+    return found[0] if len(found) == 1 else None
+
+
+def run_offline_script(*args):
+    return subprocess.run(
+        [sys.executable, "-I", str(OFFLINE_SCRIPT), *args], capture_output=True, text=True, timeout=60
+    )
+
+
+class OfflineProofGuardTests(unittest.TestCase):
+    """The offline proof (#2202) runs every pinned item like its ci.yml site,
+    after every miss-path download host is offline."""
+
+    def setUp(self):
+        self.proof = OFFLINE_PROOF.read_text()
+        self.ci = ci_text()
+
+    def test_every_pinned_item_runs_offline_with_the_inputs_and_image_of_its_site(self):
+        ci_sites = {}
+        for item, job, _, step in item_sites(self.ci):
+            ci_sites.setdefault(item, (job, step))
+        proof_sites = {}
+        for item, job, _, step in item_sites(self.proof):
+            self.assertNotIn(item, proof_sites, f"{item} runs twice in the proof")
+            proof_sites[item] = (job, step)
+        self.assertEqual(set(ci_sites), PINNED_ITEMS)
+        self.assertEqual(set(proof_sites), PINNED_ITEMS)
+        for item in sorted(PINNED_ITEMS):
+            ci_job, ci_step = ci_sites[item]
+            proof_job, proof_step = proof_sites[item]
+            with self.subTest(item=item):
+                self.assertEqual(proof_step["uses"], ci_step["uses"])
+                ci_inputs = dict(ci_step.get("with") or {})
+                proof_inputs = dict(proof_step.get("with") or {})
+                if item == "uv":
+                    # The uv dependency cache is not a pinned item: off, so
+                    # the proof never saves one.
+                    ci_inputs.pop("enable-cache")
+                    self.assertEqual(proof_inputs.pop("enable-cache"), "false")
+                self.assertEqual(proof_inputs, ci_inputs)
+                if item.startswith(IMAGE_KEYED):
+                    self.assertEqual(job_runner(self.proof, proof_job), job_runner(self.ci, ci_job))
+                else:
+                    self.assertRegex(job_runner(self.proof, proof_job), r"^ubuntu-\d")
+                ci_node = any(step.get("uses", "").startswith("actions/setup-node@") for step in harness.job_steps(self.ci, ci_job))
+                proof_node = any(step.get("uses", "").startswith("actions/setup-node@") for step in harness.job_steps(self.proof, proof_job))
+                if item.startswith("npm:"):
+                    self.assertEqual(proof_node, ci_node, "the Node major is part of the npm key")
+
+    def test_every_pin_and_retry_bound_equals_ci(self):
+        proof_env = harness.workflow_env(self.proof)
+        ci_env = harness.workflow_env(self.ci)
+        shared = [name for name in proof_env if name in ci_env]
+        self.assertTrue({"NEXTEST_VERSION", "MOLD_VERSION", "MOLD_SHA256", "ZIG_VERSION", "ZIG_SHA256"} <= set(shared))
+        for name in re.findall(r"\$\{\{ env\.([A-Z0-9_]+) \}\}", self.proof):
+            self.assertIn(name, proof_env)
+        for name in shared:
+            with self.subTest(name=name):
+                self.assertEqual(proof_env[name], ci_env[name])
+
+    def test_every_job_goes_offline_before_its_first_item(self):
+        jobs = workflow_job_steps(self.proof)
+        self.assertTrue(jobs)
+        sites = item_sites(self.proof)
+        for job, steps in jobs.items():
+            with self.subTest(job=job):
+                offline = offline_step_index(steps)
+                self.assertIsNotNone(offline, "exactly one offline step")
+                first = min(index for _, site_job, index, _ in sites if site_job == job)
+                self.assertLess(offline, first)
+                self.assertIn("--apt-dir /etc/apt", steps[offline]["run"])
+                for lock in sorted(ROOT.glob("compat/*/npm/package-lock.json")):
+                    self.assertIn(f"--npm-lock {lock.relative_to(ROOT)}", steps[offline]["run"])
+
+    def test_every_miss_path_download_host_is_offline(self):
+        offline = set(harness.workflow_env(self.proof)["OFFLINE_HOSTS"].split())
+        hosts = set()
+        for name in ("pinned-cache", "setup-mold", "setup-zig", "setup-uv"):
+            text = (ACTIONS / name / "action.yml").read_text()
+            code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+            hosts |= set(re.findall(r"https?://([A-Za-z0-9.-]+)", code))
+        self.assertTrue({"github.com", "ziglang.org"} <= hosts, hosts)
+        self.assertEqual(hosts - offline, set())
+        self.assertEqual(offline & RUNNER_HOSTS, set())
+
+    def test_only_a_change_to_the_proof_itself_triggers_it_on_a_pull_request(self):
+        trigger = re.search(r"(?ms)^on:\n(.*?)(?=^\S)", self.proof).group(1)
+        self.assertRegex(trigger, r"(?m)^  workflow_dispatch:$")
+        paths = re.search(r"(?ms)^  pull_request:\n    paths:\n((?:      - \S+\n)+)", trigger)
+        self.assertIsNotNone(paths, trigger)
+        self.assertEqual(
+            re.findall(r"- (\S+)", paths.group(1)),
+            [".github/workflows/pinned-cache-offline.yml", ".github/scripts/pinned-cache-offline"],
+        )
+
+
+class OfflineHostsScenarioTests(unittest.TestCase):
+    """`pinned-cache-offline entries`: the host set the proof takes offline."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.apt = self.base / "apt"
+        (self.apt / "sources.list.d").mkdir(parents=True)
+
+    def test_the_hosts_of_every_apt_source_and_npm_lock_go_to_loopback(self):
+        mirrors = self.base / "apt-mirrors.txt"
+        mirrors.write_text(
+            "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+            "# a comment\n"
+            "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+        )
+        (self.apt / "sources.list").write_text(
+            "# deb http://commented.example.org/ubuntu noble main\n"
+            "deb [arch=amd64 signed-by=/usr/share/keyrings/x.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main\n"
+        )
+        (self.apt / "sources.list.d" / "local.list").write_text("deb file:/srv/repo ./\n")
+        (self.apt / "sources.list.d" / "ubuntu.sources").write_text(
+            "Types: deb\n"
+            f"URIs: mirror+file:{mirrors}\n"
+            "Suites: noble noble-updates\n"
+            "\n"
+            "Types: deb\n"
+            "URIs: http://security.ubuntu.com/ubuntu/\n"
+            " http://ports.ubuntu.com/ubuntu-ports/\n"
+            "Suites: noble-security\n"
+        )
+        lock = self.base / "package-lock.json"
+        lock.write_text(json.dumps({"packages": {"": {}, "node_modules/a": {"resolved": "https://registry.npmjs.org/a/-/a-1.tgz"}}}))
+        result = run_offline_script("entries", "--apt-dir", str(self.apt), "--npm-lock", str(lock), "GitHub.com")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hosts = [
+            "archive.ubuntu.com", "azure.archive.ubuntu.com", "github.com", "packages.microsoft.com",
+            "ports.ubuntu.com", "registry.npmjs.org", "security.ubuntu.com",
+        ]
+        self.assertEqual(result.stdout.splitlines(), [f"{address} {host}" for host in hosts for address in ("127.0.0.1", "::1")])
+
+    def test_a_source_without_a_known_host_fails_instead_of_staying_online(self):
+        (self.apt / "sources.list.d" / "remote.sources").write_text("URIs: mirror+https://mirrors.example.org/list.txt\n")
+        result = run_offline_script("entries", "--apt-dir", str(self.apt), "github.com")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("cannot map the apt source 'mirror+https://mirrors.example.org/list.txt'", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_lock_without_a_registry_url_and_a_bad_host_name_fail(self):
+        lock = self.base / "package-lock.json"
+        lock.write_text(json.dumps({"packages": {"": {}}}))
+        result = run_offline_script("entries", "--npm-lock", str(lock), "github.com")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no resolved registry URL", result.stderr)
+        result = run_offline_script("entries", "github.com evil.example")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not a host name", result.stderr)
+
+    def test_the_repository_locks_resolve_from_the_npm_registry_only(self):
+        args = []
+        for lock in sorted(ROOT.glob("compat/*/npm/package-lock.json")):
+            args += ["--npm-lock", str(lock)]
+        self.assertEqual(len(args), 6)
+        result = run_offline_script("entries", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["127.0.0.1 registry.npmjs.org", "::1 registry.npmjs.org"])
 
 
 if __name__ == "__main__":

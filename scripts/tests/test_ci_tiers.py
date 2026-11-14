@@ -327,7 +327,7 @@ def job_checkout_dirs(job: str) -> set[str]:
     # without `path:` lands at the workspace root (".").
     dirs = set()
     for step in re.split(r"(?m)^      - ", job)[1:]:
-        if re.search(r"(?m)^\s*uses:\s*actions/checkout@", step):
+        if re.search(r"(?m)^\s*(?:-\s+)?uses:\s*actions/checkout@", step):
             match = re.search(r"(?m)^\s*path:\s*(\S+)\s*$", step)
             dirs.add(match.group(1) if match else ".")
     return dirs
@@ -370,7 +370,7 @@ def resolve_job_local_use(job: str, use: str) -> str | None:
         )
         use_index = next(
             (index for index, step in enumerate(steps)
-             if re.search(rf"(?m)^\s*uses:\s*{re.escape(use)}\s*$", step) is not None),
+             if re.search(rf"(?m)^\s*(?:-\s+)?uses:\s*{re.escape(use)}\s*$", step) is not None),
             None,
         )
         if copy_index is None or use_index is None or copy_index > use_index:
@@ -385,7 +385,7 @@ def resolve_job_local_use(job: str, use: str) -> str | None:
 
 def action_local_uses(relative: str) -> list[str]:
     text = (ROOT / relative / "action.yml").read_text()
-    return re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", text)
+    return re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\S+)\s*$", text)
 
 
 def job_local_use_closure(job: str) -> dict[str, str | None]:
@@ -395,10 +395,10 @@ def job_local_use_closure(job: str) -> dict[str, str | None]:
     # Jobs without a local `uses:` (pure `workflow_call` fan-out, or jobs
     # with no steps at all) resolve vacuously.
     resolved: dict[str, str | None] = {}
-    local = sorted(set(re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job)))
+    local = sorted(set(re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\S+)\s*$", job)))
     if not local:
         return resolved
-    for use in sorted(set(re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job))):
+    for use in sorted(set(re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\S+)\s*$", job))):
         if use.endswith(".yml"):
             continue
         target = resolve_job_local_use(job, use)
@@ -1251,7 +1251,7 @@ def composite_nested_uses(relative: str) -> set[str]:
             text = (ROOT / current / "action.yml").read_text()
         except FileNotFoundError:
             continue
-        for nested in re.findall(r"(?m)^\s*uses:\s*(\./\.github/actions/[a-z0-9-]+)\s*$", text):
+        for nested in re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\.github/actions/[a-z0-9-]+)\s*$", text):
             if nested not in seen:
                 seen.add(nested)
                 queue.append(nested[2:])
@@ -1484,12 +1484,11 @@ def filtered_job_uses_closure(job: str) -> dict[str, set[str]]:
 
     The job's own local `uses:` plus, for each called reusable workflow,
     the workflow's local `uses:` expanded through the nested composites
-    (setup-mold, setup-uv and setup-zig nest pinned-cache). The review asked
-    for exactly this derivation: a filter entry removed from `ci.yml`
-    without the action going away must fail the guard below, not the
-    nightly tier."""
-    direct = {use for use in re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job) if not use.endswith(".yml")}
-    called = {use for use in re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job) if use.endswith(".yml")}
+    (setup-mold, setup-uv and setup-zig nest pinned-cache). Deriving the
+    closure means a filter entry removed from `ci.yml` without the action
+    going away fails the guard below, not the nightly tier."""
+    direct = {use for use in re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\S+)\s*$", job) if not use.endswith(".yml")}
+    called = {use for use in re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\S+)\s*$", job) if use.endswith(".yml")}
     closure: dict[str, set[str]] = {}
     if direct:
         nested: set[str] = set()
@@ -1499,7 +1498,7 @@ def filtered_job_uses_closure(job: str) -> dict[str, set[str]]:
     for workflow in sorted(called):
         text = (ROOT / workflow[2:]).read_text()
         body = text.split("jobs:\n", 1)[1] if "jobs:\n" in text else text
-        declared = set(re.findall(r"(?m)^\s*uses:\s*(\./\.github/actions/\S+)\s*$", body))
+        declared = set(re.findall(r"(?m)^\s*(?:-\s+)?uses:\s*(\./\.github/actions/\S+)\s*$", body))
         nested = set()
         for use in declared:
             nested |= composite_nested_uses(use[2:])
@@ -1901,7 +1900,7 @@ class SetupUvActionTests(unittest.TestCase):
                 continue
             sites += text.count("uses: ./.github/actions/setup-uv\n")
             self.assertNotIn("0.9.28", text, path)
-        self.assertEqual(sites, 7)
+        self.assertEqual(sites, 8)
 
     def test_the_composite_pins_one_version_and_a_checksum_per_target(self):
         action = self.ACTION.read_text()
