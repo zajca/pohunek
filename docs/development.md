@@ -285,6 +285,22 @@ the helper, under uv's own retry and read-timeout defaults; in CI the job
 timeout bounds it. An exhausted helper retry marks the job with
 `CI_INFRA_FAILURE`.
 
+**Pinned download cache.** Pinned third-party bytes come from
+`.github/actions/pinned-cache` (#2202) first, with the network as the
+retried fallback: mold, zig and uv through their setup actions, nextest and
+`systemd-oomd` by one step each, and each locked npm tree by a restore step
+before and a save step after its release check. One `actions/cache` entry
+per item is keyed by the OS, the arch and that item's pins (version and
+sha256; the runner image for `systemd-oomd`; the lock hash, Node major and
+scripts mode of an npm tree). The save runs only on a miss and only after the
+verified install; the mold, zig and uv entries hold the release archive
+alone, and its sha256 is checked on a hit too. To bump a pin, change its
+`env` value (`NEXTEST_VERSION`, `CARGO_HACK_VERSION`, `CARGO_UDEPS_VERSION`,
+`MOLD_*`, `ZIG_*`) or the action's pin; the next run misses and saves the new
+entry. Keep the total of the `pinned-*` entries under 1 GB: the repository
+cache quota is shared with rust-cache. `scripts/tests/test_pinned_cache.py`
+runs every item's miss and hit.
+
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the
 route is in the [contribution workflow](../.agents/skills/contribute/SKILL.md)),
@@ -399,7 +415,9 @@ script-regressions job without waiting for
 Clippy or release builds. Each heavy part extracts the archive once and runs
 its `hash:K/N` partition after part 1 proves the union of the parts covers
 the whole shard; heavy parts use four test processes and the real worker
-binary. The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
+binary.
+
+The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
 their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
 sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
 writes `target/nextest/heavy/junit.xml`. The runtime package jobs run their
