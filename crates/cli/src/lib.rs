@@ -1136,6 +1136,17 @@ enum SessionAction {
         /// must peel to. Requires `--fetch-ref`.
         #[arg(long, value_name = "SHA", requires = "fetch_ref")]
         fetch_commit: Option<String>,
+        /// Choose one choice of an option the agent profile declares, as
+        /// `OPTION=CHOICE`; repeat for several options, each at most once.
+        /// An option not named takes the profile's default. `pohunek plugin
+        /// profile show <NAME>` lists the options. Needs a daemon that
+        /// advertises `session_new_agent_options_supported`.
+        #[arg(
+            long = "opt",
+            value_name = "OPTION=CHOICE",
+            value_parser = commands::session::parse_agent_option
+        )]
+        opt: Vec<(String, String)>,
         /// Initial text to inject into the session after the PTY is spawned.
         #[arg(long, group = "initial_input")]
         input: Option<String>,
@@ -1813,6 +1824,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     reset_diverged,
                     fetch_ref,
                     fetch_commit,
+                    opt,
                     input,
                     input_stdin,
                     input_ack_timeout_ms,
@@ -1849,6 +1861,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             fetch_ref: fetch_ref.zip(fetch_commit).map(|(source_ref, commit)| {
                                 protocol::FetchRefRequest { source_ref, commit }
                             }),
+                            // Checked before any connection is dialed.
+                            agent_options: commands::session::agent_option_map(opt)?,
                             input,
                             input_ack_timeout_ms,
                             request_timeout_ms,

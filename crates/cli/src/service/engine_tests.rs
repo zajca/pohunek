@@ -900,6 +900,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
             loss_cause: None,
             generation_recorded: None,
         }),
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

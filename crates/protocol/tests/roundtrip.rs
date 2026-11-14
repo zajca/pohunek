@@ -150,6 +150,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         ended_at: None,
         exit_code,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -682,6 +683,7 @@ fn session_new_params_json_shape_roundtrips() {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -721,6 +723,7 @@ fn session_new_params_roundtrips_with_metadata() {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -764,6 +767,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -805,6 +809,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -848,6 +853,7 @@ fn session_new_params_roundtrips_with_fetch_ref() {
             source_ref: "refs/pull/42/head".to_owned(),
             commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         }),
+        agent_options: std::collections::BTreeMap::new(),
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -3373,6 +3379,7 @@ fn agent_runtime_json_shape_roundtrips_with_path() {
         config_home_id: None,
         display_name: None,
         audience: None,
+        options: Vec::new(),
     };
 
     let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
@@ -3402,6 +3409,7 @@ fn agent_runtime_omits_absent_path() {
         config_home_id: None,
         display_name: None,
         audience: None,
+        options: Vec::new(),
     };
 
     let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
@@ -3437,6 +3445,7 @@ fn agent_runtime_roundtrips_optional_version_support() {
         config_home_id: None,
         display_name: None,
         audience: None,
+        options: Vec::new(),
     };
 
     assert_eq!(
@@ -3476,6 +3485,7 @@ fn agent_runtime_config_home_id_is_additive_and_roundtrips() {
         config_home_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
         display_name: None,
         audience: None,
+        options: Vec::new(),
     };
 
     assert_eq!(
@@ -3510,6 +3520,7 @@ fn agent_runtime_labels_are_additive_and_roundtrip() {
         config_home_id: None,
         display_name: Some("Night Shift".to_owned()),
         audience: Some(ProfileAudience::Agent),
+        options: Vec::new(),
     };
 
     assert_eq!(
@@ -3545,6 +3556,131 @@ fn agent_runtime_labels_are_additive_and_roundtrip() {
 }
 
 #[test]
+fn agent_runtime_options_are_additive_and_roundtrip() {
+    let runtime = AgentRuntime {
+        agent: "work".to_owned(),
+        agent_base: Some(RuntimeRef::claude()),
+        available: true,
+        path: None,
+        version: Some("2.1.0".to_owned()),
+        supported: Some(true),
+        config_home_id: None,
+        display_name: None,
+        audience: None,
+        options: vec![protocol::AgentOption {
+            id: "model".to_owned(),
+            label: "Model".to_owned(),
+            default: "opus".to_owned(),
+            choices: vec![
+                protocol::AgentOptionChoice {
+                    id: "next".to_owned(),
+                    label: "Next".to_owned(),
+                    available: false,
+                    reason: Some(protocol::AgentOptionUnavailable::RuntimeTooOld),
+                    min_runtime: Some("2.2.0".to_owned()),
+                },
+                protocol::AgentOptionChoice {
+                    id: "opus".to_owned(),
+                    label: "Opus".to_owned(),
+                    available: true,
+                    reason: None,
+                    min_runtime: None,
+                },
+            ],
+        }],
+    };
+
+    assert_eq!(
+        serde_json::to_value(&runtime).expect("serialize agent runtime"),
+        json!({
+            "agent": "work",
+            "agent_base": "claude",
+            "available": true,
+            "version": "2.1.0",
+            "supported": true,
+            "options": [{
+                "id": "model",
+                "label": "Model",
+                "default": "opus",
+                "choices": [
+                    {
+                        "id": "next",
+                        "label": "Next",
+                        "available": false,
+                        "reason": "runtime_too_old",
+                        "min_runtime": "2.2.0"
+                    },
+                    { "id": "opus", "label": "Opus", "available": true }
+                ]
+            }]
+        })
+    );
+    assert_eq!(line_roundtrip(&runtime), runtime);
+
+    // An entry from a daemon without options reads as a runtime without any.
+    let older: AgentRuntime = serde_json::from_value(json!({
+        "agent": "work",
+        "available": true
+    }))
+    .expect("an entry without options remains readable");
+    assert!(older.options.is_empty());
+
+    // A tolerant client maps a reason from a newer daemon to Unknown.
+    let newer: AgentRuntime = protocol::tolerant::from_value(json!({
+        "agent": "work",
+        "available": true,
+        "options": [{
+            "id": "model",
+            "label": "Model",
+            "default": "opus",
+            "choices": [{
+                "id": "next",
+                "label": "Next",
+                "available": false,
+                "reason": "a_reason_from_a_newer_daemon"
+            }]
+        }]
+    }))
+    .expect("tolerant decode");
+    assert_eq!(
+        newer.options[0].choices[0].reason,
+        Some(protocol::AgentOptionUnavailable::Unknown)
+    );
+}
+
+#[test]
+fn session_new_params_carry_agent_options_only_when_set() {
+    let mut params: SessionNewParams = serde_json::from_value(json!({
+        "agent": "work",
+        "cols": 80,
+        "rows": 24
+    }))
+    .expect("params without agent_options decode");
+    assert!(params.agent_options.is_empty());
+    assert!(
+        serde_json::to_value(&params)
+            .expect("serialize params")
+            .get("agent_options")
+            .is_none(),
+        "an empty selection is absent on the wire"
+    );
+    params.agent_options = [("model", "sonnet"), ("effort", "high")]
+        .into_iter()
+        .map(|(option, choice)| (option.to_owned(), choice.to_owned()))
+        .collect();
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize params"),
+        json!({
+            "agent": "work",
+            "cols": 80,
+            "rows": 24,
+            "agent_options": { "effort": "high", "model": "sonnet" }
+        })
+    );
+    assert_eq!(line_roundtrip(&params), params);
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one test asserts the wire shape of every host capability flag"
@@ -3567,6 +3703,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 config_home_id: None,
                 display_name: None,
                 audience: None,
+                options: Vec::new(),
             },
             AgentRuntime {
                 agent: "codex".to_owned(),
@@ -3578,6 +3715,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 config_home_id: None,
                 display_name: None,
                 audience: None,
+                options: Vec::new(),
             },
             AgentRuntime {
                 agent: "claude".to_owned(),
@@ -3589,6 +3727,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 config_home_id: None,
                 display_name: None,
                 audience: None,
+                options: Vec::new(),
             },
             AgentRuntime {
                 agent: "hermes".to_owned(),
@@ -3600,6 +3739,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 config_home_id: None,
                 display_name: None,
                 audience: None,
+                options: Vec::new(),
             },
         ],
         git_available: true,
@@ -3614,6 +3754,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_request_id_supported: true,
         session_new_context_pin_supported: true,
         session_new_fetch_ref_supported: true,
+        session_new_agent_options_supported: true,
         session_attention_isolation_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
@@ -3657,6 +3798,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_request_id_supported": true,
             "session_new_context_pin_supported": true,
             "session_new_fetch_ref_supported": true,
+            "session_new_agent_options_supported": true,
             "session_attention_isolation_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true,
@@ -5293,6 +5435,25 @@ fn an_error_with_a_class_from_a_newer_daemon_keeps_its_code_message_and_hint() {
     .to_string();
     let response = protocol::tolerant::from_str::<protocol::Response>(&line).expect("response");
     assert_eq!(response.into_result().expect_err("error response"), error);
+}
+
+#[test]
+fn agent_option_unavailable_is_tolerant_only_on_the_client() {
+    TolerantEnum {
+        known: vec![
+            (
+                "runtime_too_old",
+                protocol::AgentOptionUnavailable::RuntimeTooOld,
+            ),
+            (
+                "runtime_version_unknown",
+                protocol::AgentOptionUnavailable::RuntimeVersionUnknown,
+            ),
+        ],
+        unknown: protocol::AgentOptionUnavailable::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("AgentOptionUnavailable");
 }
 
 #[test]

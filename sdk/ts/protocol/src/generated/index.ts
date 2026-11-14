@@ -3,6 +3,9 @@
 export type { ActionSummary } from "./ActionSummary";
 export type { ActivityRevision } from "./ActivityRevision";
 export type { AgentActivity } from "./AgentActivity";
+export type { AgentOption } from "./AgentOption";
+export type { AgentOptionChoice } from "./AgentOptionChoice";
+export type { AgentOptionUnavailable } from "./AgentOptionUnavailable";
 export type { AgentRuntime } from "./AgentRuntime";
 export type { AgentSkillChange } from "./AgentSkillChange";
 export type { AgentSkillRemoval } from "./AgentSkillRemoval";

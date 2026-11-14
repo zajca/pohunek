@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent_options::AgentOptionUnavailable,
     runtime_id::RuntimeId,
     session::SessionId,
     version::{ProtocolVersion, ProtocolVersionRange},
@@ -28,6 +29,12 @@ pub const SESSION_REQUEST_CONFLICT_CODE: &str = "session_request_conflict";
 pub const SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE: &str = "session_new_request_id_unsupported";
 /// Error code a client raises when the daemon cannot honor `fetch_ref`.
 pub const SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE: &str = "session_new_fetch_ref_unsupported";
+/// Error code of a resume whose recorded agent option choice the profile no
+/// longer declares.
+pub const AGENT_OPTION_CHOICE_MISSING_CODE: &str = "agent_option_choice_missing";
+/// Error code a client raises when the daemon cannot honor `agent_options`.
+pub const SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE: &str =
+    "session_new_agent_options_unsupported";
 /// Error code a client raises when the daemon cannot isolate the attention of
 /// descendants of a session flagged with the reserved attention metadata key.
 pub const SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE: &str =
@@ -725,6 +732,83 @@ impl ProtocolError {
             Some(format!(
                 "install the {binary} CLI and ensure it is on PATH; run `pohunek doctor` to verify"
             )),
+        )
+    }
+
+    /// The canonical `runtime/agent_option_unknown` error: a selection names
+    /// an option the agent profile does not declare. Names the option id only.
+    #[must_use]
+    pub fn agent_option_unknown(option: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_option_unknown",
+            format!("the agent profile declares no option '{option}'"),
+            Some("select only options the profile lists in host.inspect".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_option_choice_unknown` error: a selection
+    /// names a choice its option does not declare. Names the ids only.
+    #[must_use]
+    pub fn agent_option_choice_unknown(option: &str, choice: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_option_choice_unknown",
+            format!("option '{option}' of the agent profile has no choice '{choice}'"),
+            Some("select only choices the profile lists in host.inspect".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_options_not_declared` error: a selection
+    /// is sent for a bare runtime or a profile without options.
+    #[must_use]
+    pub fn agent_options_not_declared(agent: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_options_not_declared",
+            format!("agent '{agent}' declares no options"),
+            Some("start the session without agent options".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_option_choice_unavailable` error: a
+    /// selected choice declares a `min_runtime` the runtime does not meet, or
+    /// the runtime reports no version to compare. Names the ids only.
+    #[must_use]
+    pub fn agent_option_choice_unavailable(
+        option: &str,
+        choice: &str,
+        reason: AgentOptionUnavailable,
+    ) -> Self {
+        let why = match reason {
+            AgentOptionUnavailable::RuntimeTooOld => {
+                "the runtime is older than the choice's min_runtime"
+            }
+            AgentOptionUnavailable::RuntimeVersionUnknown => {
+                "the runtime reports no version to compare with the choice's min_runtime"
+            }
+            AgentOptionUnavailable::Unknown => "the runtime does not meet the choice's floor",
+        };
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_option_choice_unavailable",
+            format!("choice '{choice}' of option '{option}' is unavailable: {why}"),
+            Some("select another choice, or upgrade the runtime".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_option_choice_missing` error: a session
+    /// recorded a choice the current agent profile no longer declares.
+    ///
+    /// No other choice stands in for it, even when a changed profile is
+    /// accepted. Names the ids only.
+    #[must_use]
+    pub fn agent_option_choice_missing(option: &str, choice: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            AGENT_OPTION_CHOICE_MISSING_CODE,
+            format!("the agent profile no longer offers choice '{choice}' of option '{option}'"),
+            Some("restore the choice in the profile, or start a new session".to_owned()),
         )
     }
 
@@ -1497,6 +1581,25 @@ impl ProtocolError {
             ErrorClass::Daemon,
             SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
             format!("{target} predates fetch_ref and would drop it silently; nothing was sent"),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_new_agent_options_unsupported` error a client
+    /// raises before it sends `session.new` to a daemon that cannot honor
+    /// `agent_options`.
+    #[must_use]
+    pub fn session_new_agent_options_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE,
+            format!(
+                "{target} predates agent_options and would launch every option with its default; nothing was sent"
+            ),
             Some("upgrade the daemon, then retry".to_owned()),
         )
     }

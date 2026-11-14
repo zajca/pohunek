@@ -461,6 +461,7 @@ impl Installation {
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
             fetch_ref: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 
@@ -843,6 +844,7 @@ impl Installation {
             updated_at: now,
             ended_at: None,
             exit_code: None,
+            agent_options: std::collections::BTreeMap::new(),
         };
         self.store()
             .record_session(&SessionRecord {
@@ -896,6 +898,7 @@ impl Installation {
             native_launch_unresolved: false,
             launch_checkout: None,
             context_pin: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 

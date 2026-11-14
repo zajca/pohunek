@@ -117,6 +117,16 @@ pub(crate) enum ProfileAction {
     /// `--replace` names the digest `plugin profile list --json` reports for
     /// it. `--dry-run` prints the profile and its digest and writes nothing.
     Create(CreateArgs),
+
+    /// Show one agent profile as the daemon resolves it: labels, base
+    /// runtime, availability, version and the options a session can select
+    /// with `session new --opt OPTION=CHOICE`.
+    ///
+    /// Reads the daemon's `host.inspect` inventory; the profile file itself is
+    /// not read, so no `[env]` or choice value is ever printed. A choice is
+    /// unavailable when its `min_runtime` is above the runtime's version, or
+    /// when the runtime reports no version.
+    Show(ShowArgs),
 }
 
 impl ProfileAction {
@@ -126,8 +136,20 @@ impl ProfileAction {
             Self::List { json, .. } => *json,
             Self::Migrate(args) => args.json,
             Self::Create(args) => args.json,
+            Self::Show(args) => args.json,
         }
     }
+}
+
+/// Arguments of `pohunek plugin profile show`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ShowArgs {
+    /// Profile name: the file name under `agents/` without `.toml`.
+    #[arg(value_name = "NAME", value_parser = parse_profile_name)]
+    name: String,
+    /// Emit the inventory entry as machine-readable JSON instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 /// Arguments of `pohunek plugin profile create`.
@@ -920,7 +942,94 @@ pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
         }
         ProfileAction::Migrate(args) => run_migrate(&args).await,
         ProfileAction::Create(args) => run_create(&args).await,
+        ProfileAction::Show(args) => run_show(&args).await,
     }
+}
+
+/// Show the inventory entry of the profile `args.name` from the daemon's full
+/// `host.inspect` answer.
+async fn run_show(args: &ShowArgs) -> Result<(), CliError> {
+    let paths = Paths::resolve()?;
+    let mut client = Client::connect(LOCAL_HOST, &paths).await?;
+    let capabilities = client
+        .host_inspect_with(protocol::HostInspectParams::default())
+        .await?;
+    let entry = capabilities
+        .runtimes
+        .into_iter()
+        .find(|entry| entry.agent == args.name)
+        .ok_or_else(|| Error::ProfileNotFound {
+            name: args.name.clone(),
+        })?;
+    print_output(args.json, &entry, || render_profile(&entry))
+}
+
+/// The human form of one inventory entry: a summary, then one table row per
+/// option choice. Labels pass through [`sanitize`] like every other daemon
+/// text this command prints.
+fn render_profile(entry: &protocol::AgentRuntime) -> String {
+    let mut output = format!("profile {}\n", entry.agent);
+    if let Some(label) = &entry.display_name {
+        let _ = writeln!(output, "  display name: {}", sanitize(label));
+    }
+    let audience = entry.audience.unwrap_or(protocol::ProfileAudience::Owner);
+    let _ = writeln!(output, "  audience: {audience}");
+    if let Some(base) = &entry.agent_base {
+        let _ = writeln!(output, "  base: {}", base.as_wire());
+    }
+    let available = if entry.available { "yes" } else { "no" };
+    let _ = writeln!(output, "  available: {available}");
+    if let Some(version) = &entry.version {
+        let support = match entry.supported {
+            Some(true) => " (supported)",
+            Some(false) => " (unsupported)",
+            None => "",
+        };
+        let _ = writeln!(output, "  version: {}{support}", sanitize(version));
+    }
+    if entry.options.is_empty() {
+        output.push_str("  options: none\n");
+        return output;
+    }
+    let mut rows = Vec::new();
+    for option in &entry.options {
+        for (index, choice) in option.choices.iter().enumerate() {
+            let first = index == 0;
+            let status = if choice.available {
+                "available".to_owned()
+            } else {
+                let reason = choice
+                    .reason
+                    .map_or_else(|| "unknown".to_owned(), |reason| reason.to_string());
+                match &choice.min_runtime {
+                    Some(floor) => format!("unavailable ({reason}, needs {})", sanitize(floor)),
+                    None => format!("unavailable ({reason})"),
+                }
+            };
+            let default = if choice.id == option.default { "*" } else { "" };
+            rows.push([
+                if first {
+                    option.id.clone()
+                } else {
+                    String::new()
+                },
+                if first {
+                    sanitize(&option.label)
+                } else {
+                    String::new()
+                },
+                format!("{}{default}", choice.id),
+                sanitize(&choice.label),
+                status,
+            ]);
+        }
+    }
+    output.push_str("options (* marks the default):\n");
+    output.push_str(&render_table(
+        ["OPTION", "LABEL", "CHOICE", "CHOICE LABEL", "STATUS"],
+        &rows,
+    ));
+    output
 }
 
 /// Create the profile through the daemon.

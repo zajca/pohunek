@@ -930,6 +930,7 @@ impl SessionRegistry {
             updated_at: created_at.clone(),
             ended_at: None,
             exit_code: None,
+            agent_options: snapshot.agent_options.clone(),
         };
         let mut preparing_record = SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
@@ -971,6 +972,7 @@ impl SessionRegistry {
                 native_launch_unresolved: false,
                 launch_checkout: snapshot.launch_checkout.clone(),
                 context_pin: snapshot.context_pin.clone(),
+                agent_options: snapshot.agent_options.clone(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
@@ -1123,6 +1125,7 @@ impl SessionRegistry {
             updated_at: now,
             ended_at: None,
             exit_code: None,
+            agent_options: snapshot.agent_options.clone(),
         };
 
         let entry = SessionEntry {

@@ -14,7 +14,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 
 const SCHEMA_18_FINISHED: &str = include_str!("../src/store/fixtures/schema-18/finished.jsonl");
 const SCHEMA_18_LOST: &str = include_str!("../src/store/fixtures/schema-18/metadata.jsonl");
-const SCHEMA_19: &str = include_str!("../src/store/fixtures/schema-19/metadata.jsonl");
+const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-20/metadata.jsonl");
 
 /// The last update of the schema-18 finished fixture.
 const FINISHED_UPDATED_AT: &str = "2026-10-13T13:53:30.947477438Z";
@@ -82,7 +82,7 @@ fn schema_18_failed_lost_session_ends_at_its_last_update() {
 #[test]
 fn a_recorded_end_time_loads_and_survives_a_rewrite() {
     let root = pohunek_test_support::tempdir().expect("private fixture root");
-    let store = fixture_store(root.path(), SCHEMA_19);
+    let store = fixture_store(root.path(), CURRENT_SCHEMA);
     let ended = Some("2026-10-14T08:00:00.123456789Z".to_owned());
 
     let mut record = store.load_sessions().expect("load the session").remove(0);

@@ -81,6 +81,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (17, include_str!("fixtures/shape/schema-17.txt")),
     (18, include_str!("fixtures/shape/schema-18.txt")),
     (19, include_str!("fixtures/shape/schema-19.txt")),
+    (20, include_str!("fixtures/shape/schema-20.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -127,6 +128,7 @@ fn resume_builtin_json() -> Value {
         },
         "native_reference_provenance": "assigned",
         "profile_revision": REVISION,
+        "agent_options": {"model": "sonnet"},
         "launch_checkout": {"cwd": "/work", "project_id": "p-1"},
         "context_pin": DIGEST
     })
@@ -317,6 +319,7 @@ fn session_json_with(recovery: &Value) -> Value {
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
     record["info"]["ended_at"] = json!("2026-01-01T00:00:01Z");
+    record["info"]["agent_options"] = json!({"model": "sonnet"});
     record
 }
 
@@ -355,6 +358,7 @@ fn assert_every_field_is_reviewed(
             launch_binding: _,
             native_reference_provenance,
             profile_revision: _,
+            agent_options: _,
             launch_checkout: _,
             context_pin: _,
         } = binding;
@@ -451,6 +455,7 @@ fn assert_every_field_is_reviewed(
         agent: _,
         agent_base: _,
         agent_display_name: _,
+        agent_options: _,
         cwd: _,
         cwd_source,
         pid: _,
@@ -818,6 +823,10 @@ const RESUME_FREE: &[&str] = &[
     "launch_binding.provenance.package_digest",
     "context_pin",
     "profile_revision",
+    // Option and choice ids are names the owner's profile declares. The leaf
+    // normalizer folds only `metadata` maps, so the entry names the sample's
+    // option id.
+    "agent_options.model",
 ];
 /// Free-text leaves of the other record kinds, by full path.
 const ABSOLUTE_FREE: &[&str] = &[
@@ -879,6 +888,7 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.info.warnings[].message",
     "session.info.warnings[].detail",
     "session.info.metadata.*",
+    "session.info.agent_options.model",
     "session.info.spawned_by.session_id",
     "session.info.spawned_by.daemon_id",
     "session.info.created_at",

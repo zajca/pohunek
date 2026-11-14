@@ -16,7 +16,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 const SCHEMA_17: &str = include_str!("../src/store/fixtures/schema-17/metadata.jsonl");
-const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-19/metadata.jsonl");
+const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-20/metadata.jsonl");
 
 /// The digest the current-schema fixture records as its context pin.
 const CONTEXT_PIN: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

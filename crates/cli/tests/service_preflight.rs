@@ -339,6 +339,7 @@ fn session_info() -> SessionInfo {
             loss_cause: None,
             generation_recorded: None,
         }),
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

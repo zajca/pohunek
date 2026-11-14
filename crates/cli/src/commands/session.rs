@@ -431,6 +431,8 @@ pub(crate) struct NewArgs {
     /// with `--fetch-commit`, carried as one value because clap `requires`
     /// already enforces the pair.
     pub fetch_ref: Option<protocol::FetchRefRequest>,
+    /// The `--opt OPTION=CHOICE` selection, one choice per option.
+    pub agent_options: BTreeMap<String, String>,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
     /// Acknowledgement window for the initial input; the result then reports
@@ -593,6 +595,38 @@ pub(crate) fn parse_meta_pair(input: &str) -> Result<(String, String), String> {
         ));
     }
     Ok((key.to_owned(), value.to_owned()))
+}
+
+/// Parse one `--opt OPTION=CHOICE` value (the clap value parser): split on
+/// the first `=`, both sides non-empty. The daemon judges whether the profile
+/// declares the ids.
+pub(crate) fn parse_agent_option(input: &str) -> Result<(String, String), String> {
+    let (option, choice) = input
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --opt {input:?}: expected OPTION=CHOICE"))?;
+    if option.is_empty() || choice.is_empty() {
+        return Err(format!(
+            "invalid --opt {input:?}: the option and the choice must not be empty"
+        ));
+    }
+    Ok((option.to_owned(), choice.to_owned()))
+}
+
+/// Build `SessionNewParams::agent_options` from parsed `--opt` pairs.
+///
+/// An option named twice is a usage error: the selection is one choice per
+/// option, so a repeat would silently keep only one of them.
+pub(crate) fn agent_option_map(
+    pairs: Vec<(String, String)>,
+) -> Result<BTreeMap<String, String>, CliError> {
+    let mut selection = BTreeMap::new();
+    for (option, choice) in pairs {
+        if selection.contains_key(&option) {
+            return Err(CliError::DuplicateAgentOption { option });
+        }
+        selection.insert(option, choice);
+    }
+    Ok(selection)
 }
 
 /// Build `SessionNewParams::metadata` from parsed `--meta` pairs.
@@ -1865,6 +1899,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: args.fetch_ref.clone(),
+        agent_options: args.agent_options.clone(),
     })
 }
 
@@ -2135,6 +2170,14 @@ fn render_new_human(
             "  fetched: {} -> {} at {}",
             fetched.source_ref, fetched.fetched_ref, fetched.commit
         );
+    }
+    if !info.agent_options.is_empty() {
+        let options: Vec<String> = info
+            .agent_options
+            .iter()
+            .map(|(option, choice)| format!("{option}={choice}"))
+            .collect();
+        let _ = writeln!(output, "  options: {}", options.join(", "));
     }
     if let Some(delivered) = prompt_delivered {
         let _ = writeln!(
@@ -3057,6 +3100,7 @@ mod tests {
             ended_at: None,
             exit_code: None,
             runtime: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 
@@ -3074,6 +3118,7 @@ mod tests {
             from_remote: false,
             reset_diverged: false,
             fetch_ref: None,
+            agent_options: BTreeMap::new(),
             input: None,
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
@@ -3172,6 +3217,7 @@ mod tests {
             from_remote: false,
             reset_diverged: false,
             fetch_ref: None,
+            agent_options: BTreeMap::new(),
             input: Some("Fix #1234".to_owned()),
             input_ack_timeout_ms: None,
             request_timeout_ms: None,

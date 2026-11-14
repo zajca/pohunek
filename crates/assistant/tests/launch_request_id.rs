@@ -352,6 +352,7 @@ fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabili
             config_home_id: None,
             display_name: None,
             audience: None,
+            options: Vec::new(),
         }],
         git_available: true,
         worktree_supported: true,
@@ -373,6 +374,7 @@ fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabili
         package_create_profile_supported: true,
         integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
+        session_new_agent_options_supported: true,
     }
 }
 

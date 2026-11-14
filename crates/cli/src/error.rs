@@ -86,6 +86,14 @@ pub(crate) enum CliError {
         key: String,
     },
 
+    /// A `session new --opt` option was supplied more than once. Caught before
+    /// any connection is dialed: the selection holds one choice per option.
+    #[error("duplicate --opt option {option:?} (each option takes one choice)")]
+    DuplicateAgentOption {
+        /// The option that was named more than once.
+        option: String,
+    },
+
     /// Input provided through stdin violated the CLI's bounded text contract.
     #[error("invalid stdin input: {detail}")]
     InvalidStdinInput {
@@ -460,6 +468,12 @@ impl CliError {
                 "cli_usage",
                 format!("duplicate --meta key {key:?} (each key may be set once)"),
                 Some("pass --meta only once per key; a repeated key would be ambiguous".to_owned()),
+            ),
+            CliError::DuplicateAgentOption { option } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "cli_usage",
+                format!("duplicate --opt option {option:?} (each option takes one choice)"),
+                Some("pass --opt only once per option".to_owned()),
             ),
             CliError::InvalidStdinInput { detail } => ProtocolError::new(
                 ErrorClass::Configuration,
@@ -1108,7 +1122,9 @@ fn clap_error_to_protocol_error(err: &clap::Error) -> ProtocolError {
 pub(crate) fn failure_exit_code(error: &CliError) -> ExitCode {
     match error {
         CliError::Plugin(plugin) if plugin.is_usage() => ExitCode::from(CLI_USAGE_EXIT_CODE),
-        CliError::SetupHooksUnknown { .. } => ExitCode::from(CLI_USAGE_EXIT_CODE),
+        CliError::SetupHooksUnknown { .. } | CliError::DuplicateAgentOption { .. } => {
+            ExitCode::from(CLI_USAGE_EXIT_CODE)
+        }
         _ => ExitCode::FAILURE,
     }
 }

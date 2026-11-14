@@ -23,6 +23,7 @@ use crate::agent::host::{
     LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy, VersionRefusal,
     RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
+use crate::agent::profile::options;
 use crate::agent::{which_executable, ProfileRegistry, ResolvedAgent, ValidatedLaunchProgram};
 use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 use crate::integration::Home;
@@ -242,6 +243,7 @@ fn host_capabilities_for(
                     config_home_id: None,
                     display_name: None,
                     audience: None,
+                    options: Vec::new(),
                 },
                 None,
             ),
@@ -282,6 +284,9 @@ fn host_capabilities_for(
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
         enrich_agent_labels(entry, &agent);
+        if let Some(profile) = agent.profile.as_ref() {
+            entry.options = options::inspected(&profile.options);
+        }
         if launchable.is_ok() {
             if let Some(profile) = agent.profile.as_ref() {
                 entry.config_home_id =
@@ -301,6 +306,11 @@ fn host_capabilities_for(
     let requests: Vec<&ProbeRequest> = pending.iter().map(|probe| &probe.request).collect();
     let outputs = cache.fetch(&requests, Instant::now());
     apply_probe_outputs(&mut runtimes, &pending, outputs);
+    // A floor is judged against the version the probe just reported; an
+    // entry without one (no probe, the host shell) fails every floor closed.
+    for entry in &mut runtimes {
+        options::apply_floors(&mut entry.options, entry.version.as_deref());
+    }
 
     capability_snapshot(daemon_version, supported_agents, runtimes)
 }
@@ -387,6 +397,7 @@ fn capability_snapshot(
         session_new_request_id_supported: true,
         session_new_context_pin_supported: true,
         session_new_fetch_ref_supported: true,
+        session_new_agent_options_supported: true,
         session_attention_isolation_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
@@ -441,6 +452,7 @@ fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
         config_home_id: None,
         display_name: None,
         audience: None,
+        options: Vec::new(),
     }
 }
 
@@ -488,6 +500,7 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
             config_home_id: None,
             display_name: None,
             audience: None,
+            options: Vec::new(),
         },
         None => AgentRuntime {
             agent: agent.to_owned(),
@@ -499,6 +512,7 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
             config_home_id: None,
             display_name: None,
             audience: None,
+            options: Vec::new(),
         },
     }
 }
@@ -529,6 +543,7 @@ fn plan_versioned_runtime(
                 config_home_id: None,
                 display_name: None,
                 audience: None,
+                options: Vec::new(),
             },
             None,
         );
@@ -556,6 +571,7 @@ fn plan_versioned_runtime(
             config_home_id: None,
             display_name: None,
             audience: None,
+            options: Vec::new(),
         },
         probe,
     )

@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{version::ProtocolVersion, RuntimeRef};
+use crate::{version::ProtocolVersion, AgentOption, RuntimeRef};
 
 /// Who an agent profile is shown to: the pickers a profile appears in.
 ///
@@ -111,6 +111,12 @@ pub struct AgentRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub audience: Option<ProfileAudience>,
+    /// The options the profile declares, in option-id order, each choice
+    /// with its availability on this host. Empty (absent on the wire) for a
+    /// bare runtime and a profile without options.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<Vec<AgentOption>>"))]
+    pub options: Vec<AgentOption>,
 }
 
 /// Optional parameters for `host.inspect`.
@@ -226,6 +232,15 @@ pub struct HostCapabilities {
     /// ref. `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_fetch_ref_supported: bool,
+    /// Whether `session.new` honors `agent_options`: it selects the named
+    /// choices of the profile's options and refuses an undeclared or
+    /// unavailable one.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; it
+    /// would drop `agent_options` silently and launch every option with its
+    /// default. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_new_agent_options_supported: bool,
     /// Whether the daemon isolates the attention of descendants of a session
     /// carrying the reserved [`crate::session::ATTENTION_CHILDREN_METADATA_KEY`]
     /// metadata key set to

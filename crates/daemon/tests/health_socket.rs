@@ -7,6 +7,8 @@
 //! response carries the daemon and protocol versions. It also covers
 //! stale-socket recovery and the `method_not_found` path.
 
+#[path = "health_socket/agent_options.rs"]
+mod agent_options;
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
 #[path = "health_socket/branch_source.rs"]
@@ -931,6 +933,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -955,6 +958,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -984,6 +988,7 @@ fn session_params_for_worktree(
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

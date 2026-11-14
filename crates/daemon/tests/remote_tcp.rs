@@ -317,6 +317,7 @@ fn session_params(socket: &Path) -> SessionNewParams {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

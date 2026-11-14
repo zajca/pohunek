@@ -181,6 +181,7 @@ async fn create_session(registry: &SessionRegistry, env: &TestEnv) -> SessionInf
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
             fetch_ref: None,
+            agent_options: std::collections::BTreeMap::new(),
         })
         .await
         .expect("create the session")

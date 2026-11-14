@@ -35,7 +35,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 19;
+pub const STORE_SCHEMA_VERSION: u32 = 20;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -125,6 +125,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 18,
         apply: migrate_v18_to_v19,
+    },
+    Migration {
+        from: 19,
+        apply: migrate_v19_to_v20,
     },
 ];
 
@@ -303,6 +307,14 @@ fn migrate_v18_to_v19(record: &mut Map<String, Value>) {
         info.insert("ended_at".to_owned(), updated_at);
     }
 }
+
+/// Schema 19 to 20: session records and resume bindings gain the optional
+/// `agent_options` (option id to choice id).
+///
+/// A record of schema 19 launched every profile with the profile's own args
+/// and env, so it recorded no choices; an absent map reads as empty. The step
+/// changes nothing.
+fn migrate_v19_to_v20(_record: &mut Map<String, Value>) {}
 
 /// Removes the fork keys from one native launch spec.
 #[expect(

@@ -68,6 +68,18 @@ export function carriesContextPackageDigest(params: unknown): boolean {
 /** The reserved metadata key whose single accepted value isolates descendants. */
 export const ATTENTION_CHILDREN_METADATA_KEY = "pohunek.attention.children";
 
+/**
+ * Whether `params` holds a non-empty `agent_options` selection, or a value the
+ * daemon must judge. An empty object counts as absent: it selects nothing.
+ */
+export function carriesAgentOptions(params: unknown): boolean {
+  if (!isObject(params) || !isSet(params["agent_options"])) {
+    return false;
+  }
+  const value = params["agent_options"];
+  return !(isObject(value) && !Array.isArray(value) && Object.keys(value).length === 0);
+}
+
 /** Whether `params` carries a `fetch_ref` the daemon must fetch and pin. */
 export function carriesFetchRef(params: unknown): boolean {
   return isObject(params) && isSet(params["fetch_ref"]);

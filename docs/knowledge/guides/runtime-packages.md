@@ -1006,7 +1006,11 @@ dir = "bundle"   # package-relative directory that holds the files
 ## Declaring a version probe
 
 A descriptor names the supported release range with `version_probe` in
-`[runtime]` (full reference in `docs/public-api.md`). Pick the parser by what
+`[runtime]` (full reference in `docs/public-api.md`). The probed release is
+also what a profile option choice's `min_runtime` floor is compared with
+([Agent profiles](../concepts/agent-profiles.md#launch-options)): a runtime
+without a version probe reports no version, so every floored choice of a
+profile over it is unavailable. Pick the parser by what
 `<program> <args>` prints on its first line:
 
 - `semver-v1` when it prints exactly `MAJOR.MINOR.PATCH` (Pi).

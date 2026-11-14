@@ -53,6 +53,7 @@ fn runtime(
         config_home_id: None,
         display_name: None,
         audience: None,
+        options: Vec::new(),
     }
 }
 
@@ -86,6 +87,7 @@ fn capabilities(runtimes: Vec<AgentRuntime>) -> HostCapabilities {
         package_create_profile_supported: true,
         integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
+        session_new_agent_options_supported: true,
     }
 }
 

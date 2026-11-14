@@ -160,4 +160,15 @@ export type SessionNewParams = {
    * field silently, so a client checks the flag before sending it.
    */
   fetch_ref?: FetchRefRequest;
+  /**
+   * The choice to launch for each named option of the agent profile:
+   * option id to choice id, at most
+   * [`MAX_PROFILE_OPTIONS`](crate::MAX_PROFILE_OPTIONS) entries. An option
+   * the map does not name takes its default; the values each choice adds
+   * to the launch stay in the profile file. A daemon that does not
+   * advertise `HostCapabilities::session_new_agent_options_supported` would
+   * drop the field silently and launch every default, so a client checks
+   * the flag before sending it.
+   */
+  agent_options?: { [key in string]: string };
 };

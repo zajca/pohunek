@@ -101,6 +101,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::agent::host::{self, InputReadiness, RuntimeDefinition, RuntimeHost};
+use crate::agent::profile::options::is_option_id;
 use crate::agent::{
     agent_not_resumable, build_pty_command, resume_pty_command_from_launch, InputRules,
     LaunchCommand, LaunchEnv, LaunchOpts, NativeReferenceProvenance, NativeSessionLaunch,
@@ -3571,6 +3572,32 @@ impl SessionRegistry {
         self.create_outcome_spawned_by(params, None).await
     }
 
+    /// The program a create of `resolved` launches, resolved on the search
+    /// path its profile env `profile_env` gives it and accepted by its
+    /// version probe, once every selected option choice's `min_runtime` is
+    /// met by the probed release.
+    ///
+    /// Floors are checked at create only: a resume relaunches the launch the
+    /// session recorded.
+    ///
+    /// # Errors
+    ///
+    /// The launch validation errors and `agent_option_choice_unavailable`.
+    fn validated_create_program(
+        &self,
+        resolved: &ResolvedAgent,
+        profile_env: &[(String, String)],
+    ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+        let launch_path = self.probe_search_path(&resolved.definition, profile_env)?;
+        let program = host::validate_launch_runtime(
+            &resolved.definition,
+            resolved.spawn(),
+            launch_path.as_deref(),
+        )?;
+        resolved.check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
+        Ok(program)
+    }
+
     /// [`Self::create_outcome`] recording `spawned_by`, the origin of the
     /// creating request, on the new session.
     ///
@@ -3606,6 +3633,7 @@ impl SessionRegistry {
         // resolution may bind a git worktree.
         let resolved = host::LaunchSource::OwnerLocal {
             name: params.agent.clone(),
+            options: params.agent_options.clone(),
         }
         .resolve(&self.inner.profiles)?;
         // Frozen into the session so a later resume can tell whether the
@@ -3617,12 +3645,7 @@ impl SessionRegistry {
             .profile
             .as_ref()
             .map_or(&[][..], |profile| profile.env.as_slice());
-        let launch_path = self.probe_search_path(&resolved.definition, profile_env)?;
-        let validated_program = host::validate_launch_runtime(
-            &resolved.definition,
-            resolved.spawn(),
-            launch_path.as_deref(),
-        )?;
+        let validated_program = self.validated_create_program(&resolved, profile_env)?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's
         // own cwd for a local session, else the daemon's. A resolved project
         // overrides this with its checkout (or worktree) path.
@@ -4637,6 +4660,7 @@ impl SessionRegistry {
                 NativeReferenceProvenance::Reported
             },
             profile_revision,
+            agent_options: resolved.agent_options(),
             launch_checkout: Some(Box::new(LaunchCheckout {
                 cwd: launch_cwd.clone(),
                 project_id: project_id.clone(),
@@ -6687,8 +6711,13 @@ impl SessionRegistry {
         id: &SessionId,
         intent: SessionRecord,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
-        self.commit_settled_intent(id, intent, "its stop intent", "session_stop_intent_busy")
-            .await
+        Box::pin(self.commit_settled_intent(
+            id,
+            intent,
+            "its stop intent",
+            "session_stop_intent_busy",
+        ))
+        .await
     }
 
     /// Commits a removal intent of a session whose runtime cannot end on its
@@ -6698,12 +6727,12 @@ impl SessionRegistry {
         id: &SessionId,
         intent: SessionRecord,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
-        self.commit_settled_intent(
+        Box::pin(self.commit_settled_intent(
             id,
             intent,
             "its removal intent",
             "session_removal_intent_busy",
-        )
+        ))
         .await
     }
 
@@ -8659,6 +8688,7 @@ fn external_session_info(
         updated_at: now,
         ended_at: None,
         exit_code: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -8806,6 +8836,20 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
         }
         crate::worktree::check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
     }
+    // Ids only reach resolution, and its error messages, in the shape a
+    // profile may declare them.
+    if params.agent_options.len() > protocol::MAX_PROFILE_OPTIONS
+        || params
+            .agent_options
+            .iter()
+            .any(|(option, choice)| !is_option_id(option) || !is_option_id(choice))
+    {
+        return Err(ProtocolError::bad_request(format!(
+            "session.new agent_options: at most {} entries, each option and choice id 1..={} bytes of [A-Za-z0-9._-], not starting with '.' or '-'",
+            protocol::MAX_PROFILE_OPTIONS,
+            protocol::MAX_PROFILE_OPTION_ID_BYTES
+        )));
+    }
     validate_session_metadata(&params.metadata)?;
     validate_reserved_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;
@@ -8850,6 +8894,7 @@ fn create_intent_record(
         agent: resolved.name.clone(),
         agent_base: RuntimeRef::from(resolved.base.clone()),
         agent_display_name: None,
+        agent_options: resolved.agent_options(),
         cwd: cwd.to_path_buf(),
         cwd_source: Some(CwdSource::Launch),
         pid: 0,

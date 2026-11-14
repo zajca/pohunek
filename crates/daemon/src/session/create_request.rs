@@ -73,6 +73,8 @@ struct FingerprintView<'a> {
     context_package_digest: Option<&'a PackageDigest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fetch_ref: Option<&'a FetchRefRequest>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    agent_options: &'a BTreeMap<String, String>,
 }
 
 /// The fingerprint of `params`, or `None` for a request without a key: the
@@ -110,6 +112,7 @@ pub(super) fn request_fingerprint(
         client_request_id: _client_request_id,
         context_package_digest,
         fetch_ref,
+        agent_options,
     } = params;
     let mut secret_env_names: Vec<&str> = secret_env.names().collect();
     secret_env_names.sort_unstable();
@@ -130,6 +133,7 @@ pub(super) fn request_fingerprint(
         metadata,
         context_package_digest: context_package_digest.as_ref(),
         fetch_ref: fetch_ref.as_ref(),
+        agent_options,
     };
     let bytes = serde_json::to_vec(&view).map_err(|_error| {
         ProtocolError::bad_request("session.new: the parameters cannot be fingerprinted")

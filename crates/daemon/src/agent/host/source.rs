@@ -16,6 +16,7 @@
 
 // Rust guideline compliant 2026-10-05
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 use zeroize::Zeroizing;
 
-use crate::agent::profile::agent_profile_not_found;
+use crate::agent::profile::{agent_profile_not_found, OptionRequest};
 use crate::agent::{ProfileRegistry, ResolvedAgent};
 use crate::host_state::HostStateDir;
 
@@ -351,6 +352,9 @@ pub enum LaunchSource {
     OwnerLocal {
         /// The agent name as typed by the owner.
         name: String,
+        /// The option choices the request selects, by option id; an option
+        /// it does not name takes its default.
+        options: BTreeMap<String, String>,
     },
     /// A profile the owner approved for relay launches, at the revision that
     /// was approved. Never a runtime id, package, program or argv.
@@ -365,12 +369,15 @@ pub enum LaunchSource {
 impl LaunchSource {
     /// Resolves the source to the agent to launch.
     ///
-    /// A relay source checks the approved revision against the profile's
-    /// current launch inputs with the host's revision key.
+    /// An owner-local source resolves with its option selection. A relay
+    /// source carries no selection: its profile resolves with every option at
+    /// its default, and the approved revision is checked against the
+    /// profile's current launch inputs with the host's revision key.
     ///
     /// # Errors
     ///
-    /// Owner-local resolution returns the profile registry's errors. A relay
+    /// Owner-local resolution returns the profile registry's errors, the
+    /// option selection errors included. A relay
     /// source returns `agent_profile_not_found` when the name is not a host
     /// profile (a bare runtime id included) and `agent_profile_revision_stale`
     /// when the profile no longer has the approved revision.
@@ -379,7 +386,9 @@ impl LaunchSource {
         profiles: &ProfileRegistry,
     ) -> Result<ResolvedAgent, ProtocolError> {
         match self {
-            Self::OwnerLocal { name } => profiles.resolve_agent(name),
+            Self::OwnerLocal { name, options } => {
+                profiles.resolve_agent_with(name, OptionRequest::Requested(options))
+            }
             Self::RelayProfile { profile, revision } => {
                 let agent = profiles.resolve_agent(profile)?;
                 let Some(inputs) = agent.profile_inputs() else {
@@ -486,6 +495,7 @@ mod tests {
 
         let wrapped = LaunchSource::OwnerLocal {
             name: "wrapped".to_owned(),
+            options: BTreeMap::new(),
         }
         .resolve(&profiles)
         .expect("profile resolves");
@@ -493,6 +503,7 @@ mod tests {
 
         let bare = LaunchSource::OwnerLocal {
             name: "shell".to_owned(),
+            options: BTreeMap::new(),
         }
         .resolve(&profiles)
         .expect("bare runtime resolves");
@@ -500,6 +511,7 @@ mod tests {
 
         let unknown = LaunchSource::OwnerLocal {
             name: "nope".to_owned(),
+            options: BTreeMap::new(),
         }
         .resolve(&profiles)
         .expect_err("unknown name");

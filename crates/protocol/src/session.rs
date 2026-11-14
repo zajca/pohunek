@@ -541,6 +541,17 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub fetch_ref: Option<FetchRefRequest>,
+    /// The choice to launch for each named option of the agent profile:
+    /// option id to choice id, at most
+    /// [`MAX_PROFILE_OPTIONS`](crate::MAX_PROFILE_OPTIONS) entries. An option
+    /// the map does not name takes its default; the values each choice adds
+    /// to the launch stay in the profile file. A daemon that does not
+    /// advertise `HostCapabilities::session_new_agent_options_supported` would
+    /// drop the field silently and launch every default, so a client checks
+    /// the flag before sending it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<BTreeMap<String, String>>"))]
+    pub agent_options: BTreeMap<String, String>,
 }
 
 /// Most bytes a [`SessionNewParams::client_request_id`] may hold.
@@ -3179,6 +3190,13 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_display_name: Option<String>,
+    /// The choice each option of the session's agent profile launched with:
+    /// option id to choice id, defaults included. Empty (absent on the wire)
+    /// for a bare runtime and a profile without options. Persisted: a resume
+    /// relaunches with these choices.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<BTreeMap<String, String>>"))]
+    pub agent_options: BTreeMap<String, String>,
     /// Current working directory for the session.
     pub cwd: PathBuf,
     /// Source that last set [`Self::cwd`].
@@ -4148,6 +4166,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             ended_at: None,
             exit_code: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 

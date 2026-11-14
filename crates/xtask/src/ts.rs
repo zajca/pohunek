@@ -733,6 +733,7 @@ fn session_minimal() -> SessionInfo {
         updated_at: UPDATED_AT.to_owned(),
         ended_at: None,
         exit_code: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -852,6 +853,7 @@ fn session_full() -> SessionInfo {
         updated_at: UPDATED_AT.to_owned(),
         ended_at: Some(UPDATED_AT.to_owned()),
         exit_code: Some(SUCCESS_EXIT_CODE),
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

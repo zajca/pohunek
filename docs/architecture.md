@@ -1114,7 +1114,16 @@ current revision with the frozen one and refuse an edited, legacy or missing
 profile with `agent_profile_changed` or `agent_profile_missing` unless the
 local owner accepts the change. The revision text excludes the
 presentation-only `display_name` and `audience` keys, and a profile without
-them is digested byte for byte, so label edits never need `--accept-profile-change`. The one exception is the migration pin: for an
+them is digested byte for byte, so label edits never need `--accept-profile-change`.
+A profile that declares `[options]` digests its effective launch: the text
+re-rendered without the labels and the `[options]` table, followed by the ids,
+args, env and floors of the choices the session selected (recorded on the
+session and its resume binding). Labels, defaults and unselected choices are
+left out, so only an edit to a selected choice needs the decision, and resume
+resolves the profile with the recorded choices; a recorded choice the profile
+no longer declares is refused (`agent_option_choice_missing`) even with the
+decision. Choice floors (`min_runtime`) are checked against the launch probe's
+release at `session.new` only. The one exception is the migration pin: for an
 adopted built-in session the comparison also accepts a profile whose revision,
 computed without its `package` and `digest` keys, equals the frozen one, with
 the stored built-in binding, the frozen program and arguments, and the profile's

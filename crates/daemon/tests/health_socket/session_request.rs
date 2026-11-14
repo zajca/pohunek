@@ -416,6 +416,7 @@ async fn a_frozen_record_replays_its_request_and_a_duplicated_key_conflicts() {
         json!({"name": "other"}),
         json!({"metadata": {"k": "v"}}),
         json!({"input": "hello"}),
+        json!({"agent_options": {"mode": "bold"}}),
     ] {
         let mut request = frozen_request.clone();
         request
