@@ -70,6 +70,17 @@ logs nothing more and emits no new event; a runtime whose worker connection
 dropped logs `worker_connection_lost` (`reconnecting`) once and a second WARN
 when it is classified again, for example `lost` with `runtime_lost`.
 
+When `session stop` or `session rm` fails with `worker_operation_failed`
+"runtime faulted before its terminal journal commit", the worker could not end
+the runtime cleanly and the answer carries no cause. The session's worker log
+(`pohunek-session-<session-id>.jsonl`) has one `worker.runtime.faulted` ERROR
+event with `error.message` naming it: an unobservable root exit, a failed PTY
+output completion, or a force-closed runtime whose marker sweep stayed
+unconfirmed ("cleanup is unconfirmed"). For the last, the preceding
+`worker.pty.output.forced_close` and `worker.runtime.sweep.blocker` events name
+each process that kept the cleanup open and why (`sweep.skip_reason`
+`MarkersUnreadable` for a same-user process whose environment the kernel hides).
+
 When `pohunek session inspect <target>` shows a subagent row that disagrees with
 the provider, read the session's worker log
 (`pohunek-session-<session-id>.jsonl`). The worker logs every admitted subagent

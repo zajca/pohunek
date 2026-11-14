@@ -1008,7 +1008,8 @@ invented and the stop fails; if the runtime's processes cannot be proven gone,
 the runtime is faulted instead of ended, the stop fails with
 `worker_operation_failed`, and the daemon handles it as a lost runtime
 (`runtime_lost_cleanup_unconfirmed` when its own sweep cannot confirm either).
-The worker log names each process that kept the cleanup open.
+The worker log names each process that kept the cleanup open, and its
+`worker.runtime.faulted` ERROR event names why the runtime faulted.
 
 A worker answers a stop once the runtime's terminal outcome is committed to its
 journal. When that commit is still pending after the worker's 10 s wait (a

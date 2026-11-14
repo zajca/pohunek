@@ -3056,6 +3056,15 @@ async fn mark_runtime_faulted_at_offset(
     error: WorkerError,
     next_output_offset: Option<u64>,
 ) {
+    // A stop answered after the fault reports only that the runtime faulted;
+    // the worker log names the cause.
+    event!(
+        name: "worker.runtime.faulted",
+        Level::ERROR,
+        error.type = "runtime",
+        error.message = %error,
+        "runtime faulted before its terminal journal commit: {{error.message}}",
+    );
     let (commit, background_cleared) = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;

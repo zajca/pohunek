@@ -44,6 +44,19 @@ impl EventLog {
             .collect()
     }
 
+    /// Every logged event whose name starts with `prefix`, one per line with
+    /// its fields, in logging order.
+    pub(crate) fn listed(&self, prefix: &str) -> String {
+        self.0
+            .lock()
+            .expect("event log")
+            .iter()
+            .filter(|event| event.name.starts_with(prefix))
+            .map(|event| format!("{} {:?}", event.name, event.fields))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Every logged event name, field name and field value, one per line:
     /// the text of every record the worker logged.
     pub(crate) fn rendered(&self) -> String {

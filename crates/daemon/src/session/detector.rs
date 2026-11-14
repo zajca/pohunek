@@ -623,6 +623,7 @@ mod tests {
         DetectorInputs, DetectorScope, RuntimeWatchIdentity, SessionRegistry,
         SessionRegistryConfig, ShellCommand,
     };
+    use crate::test_support::worker_events::EventLog;
 
     /// Detector recheck cadence of the loop under test.
     const TEST_RECHECK_AFTER: Duration = Duration::from_millis(100);
@@ -738,6 +739,9 @@ mod tests {
         events: broadcast::Receiver<Arc<protocol::Event>>,
         output: super::DetectorFeed,
         cancel: CancellationToken,
+        /// Events of the in-process worker, which runs on the test thread.
+        worker_events: EventLog,
+        _capture: tracing::subscriber::DefaultGuard,
         // Held so the detector loop's resize, config and preview channels stay open.
         _channels: (
             watch::Sender<(u16, u16)>,
@@ -748,9 +752,14 @@ mod tests {
 
     impl StableDetector {
         async fn start(manifest: &str) -> Self {
+            let worker_events = EventLog::default();
+            let capture = worker_events.install();
+            // The session ends on its own once it reads a line, so the rig
+            // never stops it: a stop that force-closes the output on a loaded
+            // host sweeps the whole same-user process table, and an unrelated
+            // process with a hidden environment then faults the runtime.
             let registry = SessionRegistry::new(SessionRegistryConfig {
-                shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-                stop_grace: Duration::from_millis(50),
+                shell_command: ShellCommand::new("/bin/sh", ["-c", "read line; exit 0"]),
                 ..SessionRegistryConfig::default()
             });
             let cwd = pohunek_test_support::tempdir().expect("private session cwd");
@@ -833,6 +842,8 @@ mod tests {
                 events,
                 output,
                 cancel,
+                worker_events,
+                _capture: capture,
                 _channels: (resize_tx, config_tx, preview_tx),
             }
         }
@@ -845,9 +856,25 @@ mod tests {
             tokio::time::resume();
             self.cancel.cancel();
             self.registry
-                .stop(&self.session.id)
+                .input(protocol::SessionInputParams {
+                    session_id: self.session.id.clone(),
+                    text: "end".to_owned(),
+                    wait: None,
+                })
                 .await
-                .expect("stop the session");
+                .expect("send the line that ends the session");
+            let ended =
+                pohunek_test_support::wait::wait_until("the session to end on its own", || async {
+                    let info = self.registry.inspect(&self.session.id).await.ok()?;
+                    info.state.is_terminal().then_some(info)
+                })
+                .await;
+            assert_eq!(
+                ended.state,
+                protocol::SessionState::Done,
+                "{ended:?}\nworker events:\n{}",
+                self.worker_events.listed("worker.")
+            );
         }
     }
 
