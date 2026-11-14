@@ -399,6 +399,7 @@ mod tests {
                     config_home_id: None,
                     display_name: None,
                     audience: None,
+                    options: Vec::new(),
                 },
                 AgentRuntime {
                     agent: "claude".to_owned(),
@@ -410,6 +411,7 @@ mod tests {
                     config_home_id: None,
                     display_name: None,
                     audience: None,
+                    options: Vec::new(),
                 },
                 AgentRuntime {
                     agent: "hermes".to_owned(),
@@ -421,10 +423,12 @@ mod tests {
                     config_home_id: None,
                     display_name: None,
                     audience: None,
+                    options: Vec::new(),
                 },
             ],
             git_available: true,
             worktree_supported: true,
+            session_new_agent_options_supported: true,
         };
         let output = render_capabilities_human("host-b", &caps);
         assert!(output.contains("host host-b capabilities"));
@@ -459,6 +463,7 @@ mod tests {
                 config_home_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
                 display_name: None,
                 audience: None,
+                options: Vec::new(),
             }],
             git_available: true,
             worktree_supported: true,
@@ -480,6 +485,7 @@ mod tests {
             package_create_profile_supported: true,
             integration_agent_skill_supported: true,
             session_new_branch_source_supported: true,
+            session_new_agent_options_supported: true,
         };
         let output = render_capabilities_human("host-b", &caps);
         assert!(output

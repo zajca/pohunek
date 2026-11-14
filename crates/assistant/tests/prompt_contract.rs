@@ -124,6 +124,7 @@ fn capabilities() -> Value {
             config_home_id: None,
             display_name: None,
             audience: None,
+            options: Vec::new(),
         }],
         git_available: true,
         worktree_supported: true,
@@ -145,6 +146,7 @@ fn capabilities() -> Value {
         package_create_profile_supported: true,
         integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
+        session_new_agent_options_supported: true,
     })
     .expect("serialize the capability snapshot")
 }

@@ -879,6 +879,7 @@ mod tests {
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
                 fetch_ref: None,
+                agent_options: std::collections::BTreeMap::new(),
             })
             .await
             .expect("create session");
@@ -974,6 +975,7 @@ mod tests {
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
                 fetch_ref: None,
+                agent_options: std::collections::BTreeMap::new(),
             })
             .await
             .expect("create session");
@@ -1040,6 +1042,7 @@ mod tests {
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
                 fetch_ref: None,
+                agent_options: std::collections::BTreeMap::new(),
             })
             .await
             .expect("create shell session");
@@ -1268,6 +1271,7 @@ mod tests {
                         secret_env: protocol::SessionSecretEnv::default(),
                         context_package_digest: None,
                         fetch_ref: None,
+                        agent_options: std::collections::BTreeMap::new(),
                     })
                     .await
             }

@@ -1853,6 +1853,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: args.fetch_ref.clone(),
+        agent_options: std::collections::BTreeMap::new(),
     })
 }
 

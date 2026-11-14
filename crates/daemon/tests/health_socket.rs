@@ -933,6 +933,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -957,6 +958,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -986,6 +988,7 @@ fn session_params_for_worktree(
         secret_env: protocol::SessionSecretEnv::default(),
         context_package_digest: None,
         fetch_ref: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

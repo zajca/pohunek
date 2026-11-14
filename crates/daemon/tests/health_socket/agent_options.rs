@@ -10,6 +10,7 @@
 // Rust guideline compliant 2026-11-14
 
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 
 use super::*;
 
@@ -59,8 +60,8 @@ struct OptionRig {
 }
 
 impl OptionRig {
-    /// Starts the daemon after `seed` wrote the profiles into the agents
-    /// directory; `plugins` enables the package store.
+    /// Starts a daemon over an empty agents directory; `plugins` enables the
+    /// package store.
     async fn start(tag: &str, plugins: bool) -> Self {
         let socket = temp_socket(tag);
         let agents_dir = socket.dir.join("agents");
@@ -97,25 +98,70 @@ impl OptionRig {
 
     /// `session.new` of `agent` in a fresh directory of its own.
     async fn create(&mut self, agent: &str) -> (Response, PathBuf) {
+        self.create_with(agent, &[], None).await
+    }
+
+    /// `session.new` of `agent` selecting `options` (option id, choice id),
+    /// keyed with `key` when one is given, in a fresh directory of its own.
+    async fn create_with(
+        &mut self,
+        agent: &str,
+        options: &[(&str, &str)],
+        key: Option<&str>,
+    ) -> (Response, PathBuf) {
         self.created += 1;
         let cwd = self
             .socket
             .dir
             .join(format!("cwd-{agent}-{}", self.created));
         std::fs::create_dir(&cwd).expect("create the session directory");
-        let mut params = session_params_in(cwd.clone());
-        agent.clone_into(&mut params.agent);
+        let params = selection_params(agent, &cwd, options, key);
         (
             create_session_with_params(&mut self.control, params).await,
             cwd,
         )
     }
 
-    /// Runs `host.inspect`, whose profile enumeration logs every profile it
-    /// skips together with its load error.
-    async fn inspect_host(&mut self) {
+    /// Runs `host.inspect` and returns its runtime inventory. Its profile
+    /// enumeration logs every profile it skips together with its load error.
+    async fn inspect_host(&mut self) -> Vec<protocol::AgentRuntime> {
         let request = Request::make("agent-options-inspect", method::HOST_INSPECT, Value::Null);
-        ok_payload(exchange(&mut self.control, &request).await);
+        let capabilities: protocol::HostCapabilities =
+            serde_json::from_value(ok_payload(exchange(&mut self.control, &request).await))
+                .expect("host capabilities");
+        assert!(
+            capabilities.session_new_agent_options_supported,
+            "the daemon advertises agent options"
+        );
+        capabilities.runtimes
+    }
+
+    /// The ids of every session the daemon lists.
+    async fn session_ids(&mut self) -> Vec<SessionId> {
+        let request = Request::make("agent-options-list", method::SESSION_LIST, Value::Null);
+        let sessions: Vec<SessionInfo> =
+            serde_json::from_value(ok_payload(exchange(&mut self.control, &request).await))
+                .expect("session list");
+        sessions.into_iter().map(|session| session.id).collect()
+    }
+
+    /// The refusal of `session.new` of `agent` selecting `options`, after
+    /// checking that it created nothing: no session is listed and the
+    /// launch script never ran.
+    async fn refused(&mut self, agent: &str, options: &[(&str, &str)]) -> protocol::ProtocolError {
+        let before = self.session_ids().await;
+        let (response, cwd) = self.create_with(agent, options, None).await;
+        let error = err_payload(response);
+        assert_eq!(
+            self.session_ids().await,
+            before,
+            "{agent}: nothing is created"
+        );
+        assert!(
+            !cwd.join(LAUNCH_OUT).exists(),
+            "{agent}: the agent never launched"
+        );
+        error
     }
 
     /// The `invalid_profile` detail `session.new` of `agent` fails with.
@@ -129,6 +175,24 @@ impl OptionRig {
             .unwrap_or_else(|| panic!("{agent}: the invalid_profile prefix: {error:?}"))
             .to_owned()
     }
+}
+
+/// `session.new` params of `agent` in `cwd` selecting `options`, keyed
+/// with `key` when one is given.
+fn selection_params(
+    agent: &str,
+    cwd: &Path,
+    options: &[(&str, &str)],
+    key: Option<&str>,
+) -> SessionNewParams {
+    let mut params = session_params_in(cwd.to_path_buf());
+    agent.clone_into(&mut params.agent);
+    params.client_request_id = key.map(str::to_owned);
+    params.agent_options = options
+        .iter()
+        .map(|(option, choice)| ((*option).to_owned(), (*choice).to_owned()))
+        .collect();
+    params
 }
 
 /// What the launch script recorded in `cwd`, once it has written it.
@@ -351,7 +415,7 @@ async fn option_structure_is_validated_on_load() {
             "{name}: echoes no text: {refused}"
         );
     }
-    rig.inspect_host().await;
+    let _runtimes = rig.inspect_host().await;
     assert_log_names_no_value(&log_dir.path().join("daemon-logs"), cases.len());
     rig.finish().await;
 }
@@ -359,16 +423,45 @@ async fn option_structure_is_validated_on_load() {
 /// The archive of a package that serves the `pi` runtime from `/bin/sh` and
 /// declares the config home `ACME_HOME` and the launch variable `PI_FLAG`.
 fn home_package() -> (Vec<u8>, package::PackageDigest) {
-    let descriptor = "schema = 1\nid = \"acme.runtime.pi\"\nversion = \"1.0.0\"\nruntime_api = 1\n\
-         requires = [\"launch-env-v1\"]\n\
-         [runtime]\nid = \"pi\"\nname = \"Pi fixture\"\nprogram = \"/bin/sh\"\nargs = []\n\
-         detect_manifest = \"detect.toml\"\nprompt_arg = true\n\
+    pi_package(
+        "requires = [\"launch-env-v1\"]\n",
+        "/bin/sh",
+        "",
+        "[config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n\
+         [launch_env]\nPI_FLAG = \"1\"\n",
+    )
+}
+
+/// The archive of a package that serves the `pi` runtime from `program`
+/// and reads its version with `program --version`, which prints
+/// `fixture <version>`, accepting `[1.0.0, 3.0.0)`.
+fn probed_package(program: &Path) -> (Vec<u8>, package::PackageDigest) {
+    pi_package(
+        "",
+        &program.display().to_string(),
+        "version_probe = { parser = \"semver-line-v1\", args = [\"--version\"], min = \"1.0.0\", below = \"3.0.0\", line = \"fixture {version}\" }\n",
+        "",
+    )
+}
+
+/// The archive of an `acme.runtime.pi` package launching `program`, with
+/// `requires` after the header, `runtime` lines in its `[runtime]` table and
+/// `tables` after the descriptor.
+fn pi_package(
+    requires: &str,
+    program: &str,
+    runtime: &str,
+    tables: &str,
+) -> (Vec<u8>, package::PackageDigest) {
+    let descriptor = format!(
+        "schema = 1\nid = \"acme.runtime.pi\"\nversion = \"1.0.0\"\nruntime_api = 1\n{requires}\
+         [runtime]\nid = \"pi\"\nname = \"Pi fixture\"\nprogram = \"{program}\"\nargs = []\n\
+         detect_manifest = \"detect.toml\"\nprompt_arg = true\n{runtime}\
          [input]\nbracketed_paste = false\nsubmit_delay_ms = 0\ntext_policy = \"unrestricted\"\n\
-         [resume]\nsupported = true\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n\
-         [native_reference]\nstrategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]\n\
-         [native_reference.existence]\ncheck = \"none\"\n\
-         [config_home]\nenv = \"ACME_HOME\"\ndefault = \".acme\"\n\
-         [launch_env]\nPI_FLAG = \"1\"\n";
+         [resume]\nsupported = true\nreference_kind = \"id\"\nargs = [\"--session\", \"{{reference}}\"]\n\
+         [native_reference]\nstrategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{{reference}}\"]\n\
+         [native_reference.existence]\ncheck = \"none\"\n{tables}"
+    );
     let archive = package::build_archive(
         &[
             package::ArchiveEntry {
@@ -384,9 +477,9 @@ fn home_package() -> (Vec<u8>, package::PackageDigest) {
         ],
         &package::Limits::DEFAULT,
     )
-    .expect("build the config-home package");
+    .expect("build the fixture package");
     let digest = package::read_archive(&archive, &package::Limits::DEFAULT)
-        .expect("read the config-home package")
+        .expect("read the fixture package")
         .digest()
         .clone();
     (archive, digest)
@@ -394,8 +487,16 @@ fn home_package() -> (Vec<u8>, package::PackageDigest) {
 
 /// Installs the [`home_package`] and returns its digest.
 async fn install_home_package(rig: &mut OptionRig) -> package::PackageDigest {
-    let (archive, digest) = home_package();
-    let archive_path = rig.socket.dir.join("home-package.tar");
+    install_package(rig, home_package()).await
+}
+
+/// Installs the package `archive` with the `digest`, enabled and selected,
+/// and returns the digest.
+async fn install_package(
+    rig: &mut OptionRig,
+    (archive, digest): (Vec<u8>, package::PackageDigest),
+) -> package::PackageDigest {
+    let archive_path = rig.socket.dir.join("package.tar");
     std::fs::write(&archive_path, archive).expect("write the package archive");
     let installed = exchange(
         &mut rig.control,
@@ -439,7 +540,7 @@ async fn choice_env_and_args_are_validated_on_load() {
             "{name}: echoes no value: {refused}"
         );
     }
-    rig.inspect_host().await;
+    let _runtimes = rig.inspect_host().await;
     assert_log_names_no_value(&log_dir.path().join("daemon-logs"), cases.len());
     rig.finish().await;
 }
@@ -543,4 +644,291 @@ fn env_cases(digest: &package::PackageDigest) -> Vec<(&'static str, String, &'st
             "option 'mode' choice 'calm': args[1] carries a credential",
         ),
     ]
+}
+
+/// A profile over the shell with the [`TWO_OPTIONS`], named `opts`, and a
+/// profile without options named `plain`.
+async fn selection_rig(tag: &str) -> OptionRig {
+    let rig = OptionRig::start(tag, false).await;
+    rig.write_profile("opts", &format!("{RECORDING_HEAD}{TWO_OPTIONS}"));
+    rig.write_profile("plain", RECORDING_HEAD);
+    rig
+}
+
+/// Row 5: a selection replaces the default of the option it names; the
+/// option it does not name keeps its default.
+#[tokio::test]
+async fn a_selected_choice_replaces_the_default_of_its_option() {
+    let mut rig = selection_rig("agent-options-select").await;
+    let (response, cwd) = rig.create_with("opts", &[("mode", "bold")], None).await;
+    ok_payload(response);
+    assert_eq!(
+        recorded_launch(&cwd).await,
+        "--depth=1\n--mode\nbold\nMODE=bold-env\nDEPTH=\n",
+        "the selected choice and the other option's default compose"
+    );
+    let (response, cwd) = rig
+        .create_with("opts", &[("depth", "deep"), ("mode", "bold")], None)
+        .await;
+    ok_payload(response);
+    assert_eq!(
+        recorded_launch(&cwd).await,
+        "--depth=9\n--mode\nbold\nMODE=bold-env\nDEPTH=deep-env\n",
+        "every selected choice composes in option-id order"
+    );
+    rig.finish().await;
+}
+
+/// Rows 6-8: a selection naming an undeclared option or choice, or any
+/// selection for a bare runtime or a profile without options, is refused
+/// before anything is created, naming the ids only.
+#[tokio::test]
+async fn an_undeclared_selection_is_refused_before_anything_is_created() {
+    let mut rig = selection_rig("agent-options-refused").await;
+    let unknown = rig.refused("opts", &[("colour", "red")]).await;
+    assert_eq!(unknown.code, "agent_option_unknown", "{unknown:?}");
+    assert_eq!(unknown.msg, "the agent profile declares no option 'colour'");
+    let choice = rig.refused("opts", &[("mode", "gpt")]).await;
+    assert_eq!(choice.code, "agent_option_choice_unknown", "{choice:?}");
+    assert_eq!(
+        choice.msg,
+        "option 'mode' of the agent profile has no choice 'gpt'"
+    );
+    for agent in ["shell", "plain"] {
+        let undeclared = rig.refused(agent, &[("mode", "bold")]).await;
+        assert_eq!(
+            undeclared.code, "agent_options_not_declared",
+            "{agent}: {undeclared:?}"
+        );
+        assert_eq!(
+            undeclared.msg,
+            format!("agent '{agent}' declares no options")
+        );
+    }
+    rig.finish().await;
+}
+
+/// A selection whose shape no profile can declare is a `bad_request`
+/// before the agent is resolved, and the message echoes no id.
+#[tokio::test]
+async fn a_malformed_selection_is_a_bad_request() {
+    let mut rig = selection_rig("agent-options-shape").await;
+    let too_many: Vec<(String, String)> = (0..=protocol::MAX_PROFILE_OPTIONS)
+        .map(|index| (format!("o{index}"), "a".to_owned()))
+        .collect();
+    let too_many: Vec<(&str, &str)> = too_many
+        .iter()
+        .map(|(option, choice)| (option.as_str(), choice.as_str()))
+        .collect();
+    let long = "x".repeat(protocol::MAX_PROFILE_OPTION_ID_BYTES + 1);
+    let cases: [(&str, Vec<(&str, &str)>); 4] = [
+        ("too many entries", too_many),
+        (
+            "an option id outside the charset",
+            vec![("mode bold", "bold")],
+        ),
+        ("a choice id with a leading '-'", vec![("mode", "-bold")]),
+        ("an overlong choice id", vec![("mode", long.as_str())]),
+    ];
+    for (case, options) in cases {
+        let error = rig.refused("opts", &options).await;
+        assert_eq!(error.code, "bad_request", "{case}: {error:?}");
+        assert!(
+            !error.msg.contains("mode bold") && !error.msg.contains("-bold"),
+            "{case}: echoes no id: {error:?}"
+        );
+    }
+    rig.finish().await;
+}
+
+/// The choices `host.inspect` reports for option `option` of profile
+/// `agent`, by choice id.
+fn inspected_choices(
+    runtimes: &[protocol::AgentRuntime],
+    agent: &str,
+    option: &str,
+) -> BTreeMap<String, protocol::AgentOptionChoice> {
+    runtimes
+        .iter()
+        .find(|entry| entry.agent == agent)
+        .unwrap_or_else(|| panic!("{agent} is inventoried"))
+        .options
+        .iter()
+        .find(|declared| declared.id == option)
+        .unwrap_or_else(|| panic!("{agent} reports option {option}"))
+        .choices
+        .iter()
+        .map(|choice| (choice.id.clone(), choice.clone()))
+        .collect()
+}
+
+/// Row 9: a floored choice on a runtime that reports no version (a profile
+/// over the shell) is unavailable in `host.inspect` and refused by
+/// `session.new`; the unfloored choice launches.
+#[tokio::test]
+async fn a_floored_choice_without_a_runtime_version_is_unavailable() {
+    let mut rig = OptionRig::start("agent-options-unknown-version", false).await;
+    rig.write_profile(
+        "floored",
+        &one_option(
+            "choices.calm = { label = \"Calm\" }\n\
+             choices.next = { label = \"Next\", args = [\"--next\"], min_runtime = \"2.2.0\" }\n",
+        ),
+    );
+    let runtimes = rig.inspect_host().await;
+    let entry = runtimes
+        .iter()
+        .find(|entry| entry.agent == "floored")
+        .expect("the profile is inventoried");
+    assert_eq!(entry.options.len(), 1);
+    assert_eq!(entry.options[0].label, "Mode");
+    assert_eq!(entry.options[0].default, "calm");
+    let choices = inspected_choices(&runtimes, "floored", "mode");
+    assert_eq!(
+        choices["next"],
+        protocol::AgentOptionChoice {
+            id: "next".to_owned(),
+            label: "Next".to_owned(),
+            available: false,
+            reason: Some(protocol::AgentOptionUnavailable::RuntimeVersionUnknown),
+            min_runtime: Some("2.2.0".to_owned()),
+        }
+    );
+    assert_eq!(
+        choices["calm"],
+        protocol::AgentOptionChoice {
+            id: "calm".to_owned(),
+            label: "Calm".to_owned(),
+            available: true,
+            reason: None,
+            min_runtime: None,
+        }
+    );
+    assert!(
+        runtimes
+            .iter()
+            .find(|entry| entry.agent == "shell")
+            .expect("the bare shell is inventoried")
+            .options
+            .is_empty(),
+        "a bare runtime declares no options"
+    );
+    let refused = rig.refused("floored", &[("mode", "next")]).await;
+    assert_eq!(
+        refused.code, "agent_option_choice_unavailable",
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.msg,
+        "choice 'next' of option 'mode' is unavailable: the runtime reports no version to compare with the choice's min_runtime"
+    );
+    let (response, cwd) = rig.create("floored").await;
+    ok_payload(response);
+    // `printf "%s\n"` without arguments prints one empty line.
+    assert_eq!(recorded_launch(&cwd).await, "\nMODE=\nDEPTH=\n");
+    rig.finish().await;
+}
+
+/// Row 10: on a package runtime whose probe reads `1.5.0`, a choice floored
+/// above it is unavailable (`runtime_too_old`) and refused, and a choice
+/// floored at or below it is available and launches.
+#[tokio::test]
+async fn a_floor_compares_with_the_probed_runtime_version() {
+    let mut rig = OptionRig::start("agent-options-probed", true).await;
+    let program = rig.socket.dir.join("pi-fixture");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fixture 1.5.0\\n'; exit 0; fi\n\
+         printf '%s\\n' \"$@\" > launch.tmp; mv launch.tmp launch.out; exec sleep 30\n",
+    )
+    .expect("write the fixture runtime");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fixture runtime executable");
+    let digest = install_package(&mut rig, probed_package(&program)).await;
+    rig.write_profile(
+        "tiers",
+        &format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n\
+             [options.tier]\nlabel = \"Tier\"\ndefault = \"base\"\n\
+             choices.base = {{ label = \"Base\" }}\n\
+             choices.newer = {{ label = \"Newer\", args = [\"--newer\"], min_runtime = \"1.6.0\" }}\n\
+             choices.older = {{ label = \"Older\", args = [\"--older\"], min_runtime = \"1.4.0\" }}\n\
+             choices.exact = {{ label = \"Exact\", args = [\"--at-floor\"], min_runtime = \"1.5.0\" }}\n"
+        ),
+    );
+    let runtimes = rig.inspect_host().await;
+    let entry = runtimes
+        .iter()
+        .find(|entry| entry.agent == "tiers")
+        .expect("the profile is inventoried");
+    assert_eq!(entry.version.as_deref(), Some("1.5.0"), "{entry:?}");
+    let choices = inspected_choices(&runtimes, "tiers", "tier");
+    assert!(!choices["newer"].available);
+    assert_eq!(
+        choices["newer"].reason,
+        Some(protocol::AgentOptionUnavailable::RuntimeTooOld)
+    );
+    assert_eq!(choices["newer"].min_runtime.as_deref(), Some("1.6.0"));
+    for available in ["base", "older", "exact"] {
+        assert!(choices[available].available, "{available}");
+        assert_eq!(choices[available].reason, None, "{available}");
+    }
+    let refused = rig.refused("tiers", &[("tier", "newer")]).await;
+    assert_eq!(
+        refused.code, "agent_option_choice_unavailable",
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.msg,
+        "choice 'newer' of option 'tier' is unavailable: the runtime is older than the choice's min_runtime"
+    );
+    for (choice, flag) in [("older", "--older"), ("exact", "--at-floor")] {
+        let (response, cwd) = rig.create_with("tiers", &[("tier", choice)], None).await;
+        ok_payload(response);
+        assert!(
+            recorded_launch(&cwd).await.lines().any(|line| line == flag),
+            "{choice}: the floored choice launches"
+        );
+    }
+    rig.finish().await;
+}
+
+/// Row 11: the selection is part of the `client_request_id` fingerprint.
+/// The same key with the same selection replays; with another selection, or
+/// with none, it conflicts. (A key stored before selections existed keeps
+/// replaying: `session_request::a_frozen_record_replays_...`.)
+#[tokio::test]
+async fn a_keyed_create_fingerprints_its_selection() {
+    let mut rig = selection_rig("agent-options-keyed").await;
+    let cwd = rig.socket.dir.join("keyed");
+    std::fs::create_dir(&cwd).expect("create the keyed session directory");
+    let send = async |rig: &mut OptionRig, options: &[(&str, &str)]| {
+        let params = selection_params("opts", &cwd, options, Some("opts-key"));
+        create_session_with_params(&mut rig.control, params).await
+    };
+    let first: protocol::SessionNewResult =
+        serde_json::from_value(ok_payload(send(&mut rig, &[("mode", "bold")]).await))
+            .expect("the first create");
+    assert_ne!(
+        first.replayed,
+        Some(true),
+        "the first create is not a replay"
+    );
+    let again: protocol::SessionNewResult =
+        serde_json::from_value(ok_payload(send(&mut rig, &[("mode", "bold")]).await))
+            .expect("the repeat replays");
+    assert_eq!(again.replayed, Some(true), "the repeat replays");
+    assert_eq!(again.session.id, first.session.id);
+    for other in [
+        &[("mode", "calm")][..],
+        &[][..],
+        &[("depth", "deep"), ("mode", "bold")][..],
+    ] {
+        let error = err_payload(send(&mut rig, other).await);
+        assert_eq!(
+            error.code, "session_request_conflict",
+            "{other:?}: {error:?}"
+        );
+    }
+    rig.finish().await;
 }

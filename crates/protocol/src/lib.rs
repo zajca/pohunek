@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agent_options;
 mod assistant;
 mod capabilities;
 mod command;
@@ -47,6 +48,8 @@ mod turn_wait;
 mod version;
 
 #[doc(inline)]
+pub use agent_options::{AgentOption, AgentOptionChoice, AgentOptionUnavailable};
+#[doc(inline)]
 pub use assistant::{
     AssistantMaterializeParams, AssistantMaterializeResult, ConceptDeprecation, ConceptIntent,
     ConceptMeta, ConceptType, ASSISTANT_CONTEXT_PACKAGE_ID,
@@ -72,9 +75,10 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
-    SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE, SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE,
-    SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
-    SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
+    SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE, SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE,
+    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
+    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REQUEST_CONFLICT_CODE,
+    SESSION_REQUEST_IN_PROGRESS_CODE,
 };
 #[doc(inline)]
 pub use governance::{

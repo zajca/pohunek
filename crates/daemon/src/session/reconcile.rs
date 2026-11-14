@@ -10079,6 +10079,7 @@ while os.getppid() == parent:
                 secret_env: protocol::SessionSecretEnv::default(),
                 context_package_digest: None,
                 fetch_ref: None,
+                agent_options: std::collections::BTreeMap::new(),
             })
             .await
             .expect("create after daemon replacement");
@@ -12803,6 +12804,7 @@ handler = "codex-hook-v1"
             secret_env: protocol::SessionSecretEnv::default(),
             context_package_digest: None,
             fetch_ref: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 
@@ -21051,6 +21053,7 @@ generation "$1"
                         secret_env: protocol::SessionSecretEnv::default(),
                         context_package_digest: None,
                         fetch_ref: None,
+                        agent_options: std::collections::BTreeMap::new(),
                     })
                     .await
                     .expect("create a supervised session");

@@ -216,7 +216,6 @@ pub(crate) struct ResolvedProfile {
     /// Picker audience from the profile's `audience` key; absent means owner.
     pub audience: Option<protocol::ProfileAudience>,
     /// The options the profile declares, in id order.
-    #[expect(dead_code, reason = "first read by host.inspect")]
     pub options: Vec<options::DeclaredOption>,
     /// Every declared option with the choice this resolution took, defaults
     /// included; empty for a profile without options.
@@ -305,6 +304,23 @@ impl ResolvedAgent {
             .as_ref()
             .map(|profile| profile.selected.clone())
             .unwrap_or_default()
+    }
+
+    /// Checks the `min_runtime` floor of every option choice this resolution
+    /// took against the release `version` the launch probe read; a bare
+    /// runtime has no options.
+    ///
+    /// # Errors
+    ///
+    /// `agent_option_choice_unavailable` for a selected choice whose floor
+    /// the runtime does not meet, or whose runtime reports no version.
+    pub(crate) fn check_option_floors(
+        &self,
+        version: Option<package::version_probe::ProbeVersion>,
+    ) -> Result<(), ProtocolError> {
+        self.profile.as_ref().map_or(Ok(()), |profile| {
+            options::check_floors(&profile.options, &profile.selected, version)
+        })
     }
 
     /// The launch inputs of the host profile this agent resolved from; `None`

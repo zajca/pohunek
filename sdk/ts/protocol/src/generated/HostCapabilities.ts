@@ -121,6 +121,16 @@ export type HostCapabilities = {
    */
   session_new_fetch_ref_supported?: boolean;
   /**
+   * Whether `session.new` honors `agent_options`: it selects the named
+   * choices of the profile's options and refuses an undeclared or
+   * unavailable one.
+   *
+   * A daemon that predates the field omits it, which decodes as `false`; it
+   * would drop `agent_options` silently and launch every option with its
+   * default. `false` is likewise omitted on the wire.
+   */
+  session_new_agent_options_supported?: boolean;
+  /**
    * Whether the daemon isolates the attention of descendants of a session
    * carrying the reserved [`crate::session::ATTENTION_CHILDREN_METADATA_KEY`]
    * metadata key set to

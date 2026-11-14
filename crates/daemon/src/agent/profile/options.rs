@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use package::version_probe::ProbeVersion;
 use protocol::{
-    ProtocolError, MAX_PROFILE_OPTIONS, MAX_PROFILE_OPTION_CHOICES, MAX_PROFILE_OPTION_ID_BYTES,
-    MAX_PROFILE_OPTION_LABEL_BYTES,
+    AgentOption, AgentOptionChoice, AgentOptionUnavailable, ProtocolError, MAX_PROFILE_OPTIONS,
+    MAX_PROFILE_OPTION_CHOICES, MAX_PROFILE_OPTION_ID_BYTES, MAX_PROFILE_OPTION_LABEL_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +47,6 @@ pub(crate) enum OptionRequest<'a> {
     /// A `session.new` selection by option id. Every id must name a declared
     /// option and one of its choices; an option it does not name takes its
     /// default.
-    #[expect(dead_code, reason = "first sent by session.new")]
     Requested(&'a BTreeMap<String, String>),
     /// The selection a session recorded. An option or choice id the profile
     /// no longer declares is refused and never replaced by another choice;
@@ -86,7 +85,6 @@ pub(super) struct RawChoice {
 
 /// A validated profile option, as `host.inspect` reports it.
 #[derive(Debug, Clone)]
-#[expect(dead_code, reason = "first read by host.inspect")]
 pub(crate) struct DeclaredOption {
     /// Option id.
     pub(crate) id: String,
@@ -100,7 +98,6 @@ pub(crate) struct DeclaredOption {
 
 /// A validated choice of a [`DeclaredOption`].
 #[derive(Debug, Clone)]
-#[expect(dead_code, reason = "first read by host.inspect")]
 pub(crate) struct DeclaredChoice {
     /// Choice id.
     pub(crate) id: String,
@@ -430,8 +427,99 @@ impl std::fmt::Debug for SelectedChoices {
     }
 }
 
-/// Whether `id` is a valid option or choice id.
-fn is_option_id(id: &str) -> bool {
+/// The `host.inspect` form of `declared`, every choice available; the
+/// floors are applied once the runtime's version is known
+/// ([`apply_floors`]).
+pub(crate) fn inspected(declared: &[DeclaredOption]) -> Vec<AgentOption> {
+    declared
+        .iter()
+        .map(|option| AgentOption {
+            id: option.id.clone(),
+            label: option.label.clone(),
+            default: option.default.clone(),
+            choices: option
+                .choices
+                .iter()
+                .map(|choice| AgentOptionChoice {
+                    id: choice.id.clone(),
+                    label: choice.label.clone(),
+                    available: true,
+                    reason: None,
+                    min_runtime: choice.min_runtime.map(|floor| floor.to_string()),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Marks every choice of `options` whose `min_runtime` the runtime `version`
+/// (as `host.inspect` reports it) does not meet as unavailable, with the
+/// reason [`floor_problem`] gives a launch.
+pub(crate) fn apply_floors(options: &mut [AgentOption], version: Option<&str>) {
+    let version = version.and_then(ProbeVersion::parse_revision);
+    for choice in options
+        .iter_mut()
+        .flat_map(|option| option.choices.iter_mut())
+    {
+        let floor = choice
+            .min_runtime
+            .as_deref()
+            .and_then(ProbeVersion::parse_revision);
+        if let Some(reason) = floor_problem(floor, version) {
+            choice.available = false;
+            choice.reason = Some(reason);
+        }
+    }
+}
+
+/// Checks the floor of every choice in `selected` against the `version` the
+/// launch probe read from the program a create launches.
+///
+/// # Errors
+///
+/// `agent_option_choice_unavailable` for the first selected choice, in
+/// option-id order, whose floor the runtime does not meet.
+pub(crate) fn check_floors(
+    declared: &[DeclaredOption],
+    selected: &BTreeMap<String, String>,
+    version: Option<ProbeVersion>,
+) -> Result<(), ProtocolError> {
+    for option in declared {
+        let Some(choice) = selected
+            .get(&option.id)
+            .and_then(|id| option.choices.iter().find(|choice| choice.id == *id))
+        else {
+            continue;
+        };
+        if let Some(reason) = floor_problem(choice.min_runtime, version) {
+            return Err(ProtocolError::agent_option_choice_unavailable(
+                &option.id, &choice.id, reason,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why a choice with the floor `floor` is unavailable on a runtime of
+/// `version`, or `None` when it is available.
+///
+/// A runtime that reports no version (no probe, the host shell, a probe that
+/// gave none) cannot meet a floor: the choice fails closed.
+fn floor_problem(
+    floor: Option<ProbeVersion>,
+    version: Option<ProbeVersion>,
+) -> Option<AgentOptionUnavailable> {
+    let floor = floor?;
+    match version {
+        None => Some(AgentOptionUnavailable::RuntimeVersionUnknown),
+        Some(version) if version < floor => Some(AgentOptionUnavailable::RuntimeTooOld),
+        Some(_) => None,
+    }
+}
+
+/// Whether `id` is a valid option or choice id: the charset of an agent
+/// name, at most [`MAX_PROFILE_OPTION_ID_BYTES`] bytes.
+pub(crate) fn is_option_id(id: &str) -> bool {
     id.len() <= MAX_PROFILE_OPTION_ID_BYTES && validate_name("option", id).is_ok()
 }
 
