@@ -15,6 +15,18 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Restore the pinned uv
+      id: pinned
+      uses: ./.github/actions/pinned-cache
+      with:
+        item: uv
+        version: 0.9.28
+        # The four 12-hex sha prefixes of the seed table below, joined
+        # by `-`: the full UV_SHA256_* values verify the bytes, the
+        # prefixes bind the key to them. Bump together with UV_VERSION
+        # and the table; the guard checks every prefix.
+        sha256: 66ad1822dd9c-382c342735ff-12163fe09eb2-3a8030881d13
+
     - name: Seed the runner tool cache with the pinned uv
       id: seed
       shell: bash
@@ -27,6 +39,8 @@ runs:
         UV_SHA256_AARCH64_LINUX: 382c342735ff29f8ba4574d88e39bca798bcbac50bff6742710ca9cd8143e7d2
         UV_SHA256_AARCH64_DARWIN: 12163fe09eb292d3ad1ea0f132a84485c902e2ff360d57562bf676e6615fcba0
         UV_SHA256_X86_64_DARWIN: 3a8030881d13b824e5168f5e4d060e715e40753249766bda3d52d6771d93b169
+        PINNED_PATH: ${{ steps.pinned.outputs.path }}
+        PINNED_HIT: ${{ steps.pinned.outputs.hit }}
         # `--retry-all-errors` retries every failure, including a connection
         # reset that plain `--retry` treats as permanent; the sha256 check
         # below still guards the bytes.
@@ -45,13 +59,12 @@ runs:
         DOWNLOAD_RETRY_MAX_TIME_SECONDS: "300"
       run: |
         set -euo pipefail
-        # The seed curl below carries its own retry and transfer limits
-        # (setup-mold parity), so it must not pass through the helper: only
-        # the astral-sh/setup-uv step is a plain installer action, and it
-        # resolves nothing because the seed placed the exact version in the
-        # tool cache. This action performs no uv download of its own: the
-        # uv installs its callers need are the ones the helper wraps in
-        # hermes-test-python.
+        # The one download of this action is the seed curl below, which
+        # carries its own retry and transfer limits (setup-mold parity)
+        # instead of the helper; astral-sh/setup-uv then resolves nothing,
+        # because the seed placed the exact version in the tool cache. uv's
+        # own network commands run in the callers, and only a caller that
+        # wraps them retries them (hermes-test-python wraps its uv installs).
         case "$(uname -s)-$(uname -m)" in
           Linux-x86_64)  arch=x86_64;  target=x86_64-unknown-linux-gnu;  sha="$UV_SHA256_X86_64_LINUX" ;;
           Linux-aarch64) arch=aarch64; target=aarch64-unknown-linux-gnu; sha="$UV_SHA256_AARCH64_LINUX" ;;
@@ -65,28 +78,42 @@ runs:
         stage="$(mktemp -d "${tool_root}/seed.XXXXXX")"
         trap 'rm -rf "$stage"' EXIT
         archive="uv-${target}.tar.gz"
-        # `|| rc=$?` keeps the exit status: inside `if !` the status is lost.
-        rc=0
-        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-          --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
-          --retry-max-time "$DOWNLOAD_RETRY_MAX_TIME_SECONDS" \
-          --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
-          --speed-limit "$DOWNLOAD_STALL_BYTES_PER_SECOND" \
-          --speed-time "$DOWNLOAD_STALL_SECONDS" \
-          --max-time "$DOWNLOAD_MAX_TIME_SECONDS" \
-          --output "${stage}/${archive}" \
-          "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${archive}" || rc=$?
-        if [ "$rc" -ne 0 ]; then
-          echo "::error::setup-uv: download of $archive failed (curl exit $rc)" >&2
-          exit 1
+        # The pinned-cache stash holds only this archive. A hit takes it from
+        # there; a miss downloads it there. Both pass the same sha256 check.
+        mkdir -p "${PINNED_PATH:?}"
+        if [ "$PINNED_HIT" = true ]; then
+          if [ ! -f "${PINNED_PATH}/${archive}" ]; then
+            echo "::error::setup-uv: the cache hit holds no $archive" >&2
+            exit 1
+          fi
+        else
+          # `|| rc=$?` keeps the exit status: inside `if !` the status is lost.
+          rc=0
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
+            --retry-max-time "$DOWNLOAD_RETRY_MAX_TIME_SECONDS" \
+            --connect-timeout "$DOWNLOAD_CONNECT_TIMEOUT_SECONDS" \
+            --speed-limit "$DOWNLOAD_STALL_BYTES_PER_SECOND" \
+            --speed-time "$DOWNLOAD_STALL_SECONDS" \
+            --max-time "$DOWNLOAD_MAX_TIME_SECONDS" \
+            --output "${PINNED_PATH}/${archive}" \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${archive}" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            rm -f "${PINNED_PATH}/${archive}"
+            echo "::error::setup-uv: download of $archive failed (curl exit $rc)" >&2
+            exit 1
+          fi
         fi
         # Fails closed: extraction only runs after the hash matches. A uv
         # already present in the tool cache is replaced, so the job always
         # runs the verified archive.
         if command -v sha256sum >/dev/null; then check="sha256sum -c -"; else check="shasum -a 256 -c -"; fi
-        (cd "$stage" && printf '%s  %s\n' "$sha" "$archive" | $check)
+        (cd "$PINNED_PATH" && printf '%s  %s\n' "$sha" "$archive" | $check) || {
+          echo "::error::setup-uv: sha256 verification of $archive failed" >&2
+          exit 1
+        }
         mkdir "${stage}/uv"
-        tar -xzf "${stage}/${archive}" -C "${stage}/uv" --strip-components=1
+        tar -xzf "${PINNED_PATH}/${archive}" -C "${stage}/uv" --strip-components=1
         rm -f "${dest}.complete"
         rm -rf "$dest"
         mv "${stage}/uv" "$dest"
@@ -114,3 +141,11 @@ runs:
           exit 1
         fi
         test "$(uv --version | cut -d' ' -f2)" = "$UV_VERSION"
+
+    - name: Save the pinned uv
+      uses: ./.github/actions/pinned-cache
+      with:
+        phase: save
+        key: ${{ steps.pinned.outputs.key }}
+        path: ${{ steps.pinned.outputs.path }}
+        hit: ${{ steps.pinned.outputs.hit }}

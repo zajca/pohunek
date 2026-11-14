@@ -1,0 +1,363 @@
+name: Pinned cache
+description: >-
+  One pinned-cache mechanism keyed by the pins (issue #2202), in two phases.
+  `phase: restore` computes the key and the path once from `runner.*` and the
+  item's pins, restores that one `actions/cache` entry and returns `key`,
+  `path` and `hit`. `phase: save` takes those three back and saves on a miss
+  only; callers run it after their own verified install, so no caller builds
+  a key or reads the cache state. nextest and systemd-oomd install and verify inside
+  the restore phase, which also saves their entry on a miss, so each of their
+  sites stays one step. Why one entry per item, not one entry for everything:
+  the jobs need different subsets (a lint job needs mold and nextest but no
+  npm tree; a package job needs one npm tree but not the others), and caches
+  are OS- and arch-specific, so a single monolithic entry would make every
+  job download every npm tree on every platform. A bumped pin misses and
+  saves fresh; an unchanged pin restores the exact pinned bytes. mold, zig
+  and uv stash only their release archive, whose sha256 the setup action
+  checks on the hit path too.
+
+inputs:
+  phase:
+    description: >-
+      `restore` (compute the key, restore, install nextest/systemd-oomd/npm
+      trees on a miss) or `save` (save `key` and `path` from a restore
+      phase when its `hit` is `false`). Every nextest and systemd-oomd site is a restore with no save
+      call of its own, so restore is the mode a site gets without `phase:`.
+    required: false
+    default: restore
+  item:
+    description: >-
+      Restore phase: `mold`, `zig`, `uv`, `nextest`, `systemd-oomd`, or
+      `npm:<project dir>` (e.g. `npm:compat/pi/npm`).
+    required: false
+    default: ""
+  version:
+    description: >-
+      Restore phase: the pinned version selecting the bytes (`MOLD_VERSION`,
+      `ZIG_VERSION`, the uv version, `NEXTEST_VERSION`). Not used by
+      `systemd-oomd` (the runner image selects the bytes) or `npm:*` (the
+      lock file does).
+    required: false
+    default: ""
+  sha256:
+    description: >-
+      Restore phase: the pinned sha256 of the archive (`mold`, `zig`) or the
+      joined 12-hex prefixes of the four uv target shas (`uv`).
+    required: false
+    default: ""
+  npm-scripts:
+    description: >-
+      Restore phase, `npm:*` only: `true` runs the package scripts during
+      `npm ci` (a postinstall links a native binary), `false` passes
+      `--ignore-scripts`. Required for `npm:*`; part of the key.
+    required: false
+    default: ""
+  key:
+    description: Save phase only, the `key` output of the restore phase.
+    required: false
+    default: ""
+  path:
+    description: Save phase only, the `path` output of the restore phase.
+    required: false
+    default: ""
+  hit:
+    description: >-
+      Save phase only, the `hit` output of the restore phase. The save
+      phase writes the entry only when it is `false`.
+    required: false
+    default: ""
+
+outputs:
+  key:
+    description: The cache key the restore phase computed.
+    value: ${{ steps.key.outputs.key }}
+  path:
+    description: The path the entry restores to and saves from.
+    value: ${{ steps.key.outputs.path }}
+  hit:
+    description: '`true` when the entry restored, `false` on a miss.'
+    value: ${{ steps.hit.outputs.hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the pinned-cache inputs
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+        ITEM: ${{ inputs.item }}
+        KEY: ${{ inputs.key }}
+        SAVE_PATH: ${{ inputs.path }}
+        HIT: ${{ inputs.hit }}
+      run: |
+        set -euo pipefail
+        case "$PHASE" in
+          restore)
+            [ -n "$ITEM" ] || { echo "::error::pinned-cache: phase restore needs input 'item'" >&2; exit 1; }
+            # The key and the path come only from this action's restore phase.
+            [ -z "$KEY$SAVE_PATH$HIT" ] || { echo "::error::pinned-cache: phase restore computes 'key', 'path' and 'hit' itself" >&2; exit 1; }
+            ;;
+          save)
+            [ -n "$KEY" ] && [ -n "$SAVE_PATH" ] && { [ "$HIT" = true ] || [ "$HIT" = false ]; } \
+              || { echo "::error::pinned-cache: phase save needs the 'key', 'path' and 'hit' outputs of the restore phase" >&2; exit 1; }
+            ;;
+          *)
+            echo "::error::pinned-cache: input 'phase' must be restore or save, not '$PHASE'" >&2
+            exit 1
+            ;;
+        esac
+
+    # The one place a key is built. Each item's key holds exactly the pins
+    # that select its bytes: mold/zig/uv version and sha, the nextest
+    # version, the runner image for the systemd-oomd .deb set (the set must
+    # match the image's systemd), and the lock hash, Node major and scripts
+    # mode of an npm tree. The runner image and the Node major are read in
+    # this shell: the `env` context does not hold runner variables.
+    - name: Compute the pinned key
+      id: key
+      if: inputs.phase == 'restore'
+      shell: bash
+      env:
+        ITEM: ${{ inputs.item }}
+        VERSION: ${{ inputs.version }}
+        SHA256: ${{ inputs.sha256 }}
+        NPM_SCRIPTS: ${{ inputs.npm-scripts }}
+      run: |
+        set -euo pipefail
+        fail() { echo "::error::pinned-cache: $*" >&2; exit 1; }
+        stash_root="${RUNNER_TEMP:?}/pinned-cache"
+        case "$ITEM" in
+          mold|zig|uv)
+            [ -n "$VERSION" ] && [ -n "$SHA256" ] || fail "item $ITEM needs inputs 'version' and 'sha256'"
+            slug="$ITEM"
+            pins="${VERSION}-${SHA256}"
+            path="${stash_root}/${ITEM}"
+            ;;
+          nextest)
+            [ -n "$VERSION" ] || fail "item nextest needs input 'version'"
+            slug=nextest
+            pins="$VERSION"
+            path="${stash_root}/nextest"
+            ;;
+          systemd-oomd)
+            [ -n "${ImageOS:-}" ] && [ -n "${ImageVersion:-}" ] \
+              || fail "item systemd-oomd needs the runner image (ImageOS, ImageVersion): the .deb set must match its systemd"
+            slug=systemd-oomd
+            pins="${ImageOS}-${ImageVersion}"
+            path="${stash_root}/systemd-oomd"
+            ;;
+          npm:*)
+            project="${ITEM#npm:}"
+            case "$NPM_SCRIPTS" in
+              true|false) ;;
+              *) fail "item $ITEM needs input 'npm-scripts' (true or false), not '$NPM_SCRIPTS'" ;;
+            esac
+            lock="${GITHUB_WORKSPACE:?}/${project}/package-lock.json"
+            [ -f "$lock" ] || fail "item $ITEM has no $lock"
+            lock_hash="$(sha256sum "$lock" | cut -d' ' -f1)"
+            node_version="$(node --version)"
+            node_major="${node_version#v}"
+            node_major="${node_major%%.*}"
+            case "$node_major" in
+              ''|*[!0-9]*) fail "cannot read the Node major from '$node_version'" ;;
+            esac
+            slug="npm-$(printf '%s' "$project" | tr '/' '-')"
+            pins="${lock_hash}-node${node_major}-scripts${NPM_SCRIPTS}"
+            path="${GITHUB_WORKSPACE}/${project}/node_modules"
+            ;;
+          *)
+            fail "unknown item '$ITEM'"
+            ;;
+        esac
+        key="pinned-${slug}-${RUNNER_OS:?}-${RUNNER_ARCH:?}-${pins}"
+        {
+          echo "key=$key"
+          echo "path=$path"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore the pinned entry
+      id: restore
+      if: inputs.phase == 'restore'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.key.outputs.path }}
+        key: ${{ steps.key.outputs.key }}
+
+    # actions/cache/restore leaves `cache-hit` empty when nothing matched, so
+    # the action's own `hit` output is always `true` or `false`.
+    - name: Report the pinned entry
+      id: hit
+      if: inputs.phase == 'restore'
+      shell: bash
+      env:
+        ITEM: ${{ inputs.item }}
+        KEY: ${{ steps.key.outputs.key }}
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        if [ "$CACHE_HIT" = true ]; then hit=true; state=hit; else hit=false; state=miss; fi
+        echo "hit=$hit" >> "$GITHUB_OUTPUT"
+        echo "pinned-cache: $ITEM $state ($KEY)"
+        echo "pinned-cache \`$ITEM\`: $state \`$KEY\`" >> "${GITHUB_STEP_SUMMARY:?}"
+
+    - name: Install cargo-nextest
+      if: inputs.phase == 'restore' && inputs.item == 'nextest' && steps.hit.outputs.hit != 'true'
+      uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      with:
+        tool: cargo-nextest@${{ inputs.version }}
+
+    - name: Put the cached cargo-nextest in place
+      if: inputs.phase == 'restore' && inputs.item == 'nextest' && steps.hit.outputs.hit == 'true'
+      shell: bash
+      env:
+        STASH: ${{ steps.key.outputs.path }}
+      run: |
+        set -euo pipefail
+        [ -x "$STASH/cargo-nextest" ] \
+          || { echo "::error::pinned-cache: the cached nextest holds no cargo-nextest binary" >&2; exit 1; }
+        bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+        mkdir -p "$bin"
+        cp "$STASH/cargo-nextest" "$bin/cargo-nextest"
+        chmod +x "$bin/cargo-nextest"
+
+    # Runs on the hit and the miss path: a stale or foreign binary fails the
+    # step instead of running the tests. The binary is called directly, not
+    # through the `cargo` shim: the rustup proxy would resolve the toolchain
+    # file of the checkout and download the pinned toolchain inside this step
+    # (issue #2202). `-V` prints one line,
+    # `cargo-nextest <version> (<commit> <date>)`; `--version` prints five.
+    - name: Check the pinned cargo-nextest version
+      if: inputs.phase == 'restore' && inputs.item == 'nextest'
+      shell: bash
+      env:
+        NEXTEST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        nextest="${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest"
+        have="$("$nextest" nextest -V | awk 'NR == 1 { print $2 }')"
+        test "$have" = "$NEXTEST_VERSION" \
+          || { echo "::error::pinned-cache: nextest '$have' is not the pinned $NEXTEST_VERSION" >&2; exit 1; }
+
+    - name: Stash the verified cargo-nextest
+      if: inputs.phase == 'restore' && inputs.item == 'nextest' && steps.hit.outputs.hit != 'true'
+      shell: bash
+      env:
+        STASH: ${{ steps.key.outputs.path }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$STASH"
+        cp "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest" "$STASH/cargo-nextest"
+
+    # One retried unit: a DNS outage (#2192) must not fail the download when
+    # the next attempt would succeed. `--download-only` resolves the package
+    # and every dependency the image lacks, as the plain install would, and
+    # leaves the .debs in the stash. apt downloads through `partial/` and
+    # leaves a root-only `lock` there; both go and the runner user owns the
+    # rest, so the save reads every file.
+    - name: Download the pinned systemd-oomd set
+      if: inputs.phase == 'restore' && inputs.item == 'systemd-oomd' && steps.hit.outputs.hit != 'true'
+      shell: bash
+      env:
+        STASH: ${{ steps.key.outputs.path }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$STASH/partial"
+        "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label apt-systemd-oomd \
+          --attempts "${CI_RETRY_ATTEMPTS:?}" \
+          --attempt-timeout "${CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS:?}" \
+          --backoff "${CI_RETRY_BACKOFF_SECONDS:?}" -- \
+          sudo sh -c 'apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o "Dir::Cache::archives=$1" install -y --download-only systemd-oomd' sh "$STASH"
+        sudo rm -rf "$STASH/partial" "$STASH/lock"
+        sudo chown -R "$(id -u):$(id -g)" "$STASH"
+
+    # The same install on the hit and the miss path, from the stash only;
+    # the path is expanded here, because sudo resets the environment.
+    - name: Install the pinned systemd-oomd set
+      if: inputs.phase == 'restore' && inputs.item == 'systemd-oomd'
+      shell: bash
+      env:
+        STASH: ${{ steps.key.outputs.path }}
+      run: |
+        set -euo pipefail
+        set -- "$STASH"/systemd-oomd_*.deb
+        [ -f "$1" ] \
+          || { echo "::error::pinned-cache: the systemd-oomd set in $STASH holds no systemd-oomd .deb" >&2; exit 1; }
+        sudo dpkg -i "$STASH"/*.deb
+        sudo systemctl enable --now systemd-oomd
+
+    # npm's own fetch retries run inside one install (npm defaults:
+    # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout and
+    # #fetch-retries); the helper bounds the total install time and retries
+    # the whole install after npm's retries are exhausted.
+    - name: Install the locked npm tree
+      if: inputs.phase == 'restore' && startsWith(inputs.item, 'npm:') && steps.hit.outputs.hit != 'true'
+      shell: bash
+      env:
+        ITEM: ${{ inputs.item }}
+        NPM_SCRIPTS: ${{ inputs.npm-scripts }}
+      run: |
+        set -euo pipefail
+        project="${GITHUB_WORKSPACE:?}/${ITEM#npm:}"
+        # compat/<runtime>/npm retries as npm-ci-<runtime>.
+        label="npm-ci-$(basename "$(dirname "$project")")"
+        if [ "$NPM_SCRIPTS" = true ]; then scripts=--ignore-scripts=false; else scripts=--ignore-scripts; fi
+        if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label "$label" \
+          --attempts "${CI_RETRY_ATTEMPTS:?}" \
+          --attempt-timeout "${CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS:?}" \
+          --backoff "${CI_RETRY_BACKOFF_SECONDS:?}" -- \
+          npm ci --prefix "$project" "$scripts" --no-audit --no-fund; then
+          echo "Failed to install the pinned npm tree from $project/package-lock.json" >&2
+          exit 1
+        fi
+
+    - name: Check the restored npm tree
+      if: inputs.phase == 'restore' && startsWith(inputs.item, 'npm:') && steps.hit.outputs.hit == 'true'
+      shell: bash
+      env:
+        ITEM: ${{ inputs.item }}
+        STASH: ${{ steps.key.outputs.path }}
+      run: |
+        set -euo pipefail
+        # `npm ci` writes the hidden lockfile last; a tree without it is not
+        # a finished install.
+        [ -f "$STASH/.package-lock.json" ] \
+          || { echo "::error::pinned-cache: the cached $ITEM holds no finished node_modules" >&2; exit 1; }
+
+    # Saves on a miss only: a hit restored this exact key already.
+    # actions/cache/save only warns when the path is missing, which would
+    # leave the entry unwritten without a red step. The two steps below run
+    # when this one wrote its outputs, which it does only after the check.
+    - name: Check the entry to save
+      id: save
+      if: (inputs.phase == 'save' && inputs.hit == 'false') || (inputs.phase == 'restore' && (inputs.item == 'nextest' || inputs.item == 'systemd-oomd') && steps.hit.outputs.hit == 'false')
+      shell: bash
+      env:
+        KEY: ${{ inputs.phase == 'save' && inputs.key || steps.key.outputs.key }}
+        SAVE_PATH: ${{ inputs.phase == 'save' && inputs.path || steps.key.outputs.path }}
+      run: |
+        set -euo pipefail
+        [ -e "$SAVE_PATH" ] && [ -n "$(ls -A "$SAVE_PATH")" ] \
+          || { echo "::error::pinned-cache: nothing to save at $SAVE_PATH for $KEY" >&2; exit 1; }
+        {
+          echo "key=$KEY"
+          echo "path=$SAVE_PATH"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Save the pinned entry
+      if: steps.save.outputs.key != ''
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ steps.save.outputs.path }}
+        key: ${{ steps.save.outputs.key }}
+
+    # actions/cache/save also only warns when another job reserved the same
+    # key first; the entry then comes from that job.
+    - name: Report the save
+      if: steps.save.outputs.key != ''
+      shell: bash
+      env:
+        KEY: ${{ steps.save.outputs.key }}
+      run: |
+        set -euo pipefail
+        echo "pinned-cache: save ran for $KEY"
+        echo "pinned-cache: save ran for \`$KEY\`" >> "${GITHUB_STEP_SUMMARY:?}"

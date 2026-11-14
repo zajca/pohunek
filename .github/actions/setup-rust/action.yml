@@ -38,7 +38,7 @@ inputs:
     default: "10"
   retry-attempt-timeout-seconds:
     description: >-
-      Seconds bounding one rustup attempt (p99 of successful main runs plus
+      Seconds bounding one rustup attempt (p90 of successful main runs plus
       headroom; calibrated next to the CI_RETRY_* values in the ci.yml
       top-level env). A caller workflow overrides it only to match its own
       CI_RETRY_ATTEMPT_TIMEOUT_RUSTUP_SECONDS.
