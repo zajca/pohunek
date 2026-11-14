@@ -39,6 +39,14 @@ pub const SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE: &str =
 /// descendants of a session flagged with the reserved attention metadata key.
 pub const SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE: &str =
     "session_attention_isolation_unsupported";
+/// Error code a client raises when the daemon cannot honor tree list filters.
+pub const SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE: &str =
+    "session_list_tree_filters_unsupported";
+/// Error code a client raises when the daemon cannot honor a retention sweep selector.
+pub const SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE: &str =
+    "session_retention_selector_unsupported";
+/// Error code a client raises when the daemon cannot honor `session.remove_tree`.
+pub const SESSION_REMOVE_TREE_UNSUPPORTED_CODE: &str = "session_remove_tree_unsupported";
 /// Error code a client raises when the daemon cannot honor
 /// `context_package_digest`.
 pub const SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE: &str = "session_new_context_pin_unsupported";
@@ -1620,6 +1628,61 @@ impl ProtocolError {
             format!(
                 "{target} predates attention isolation and would store the flag without honoring it; nothing was sent"
             ),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_list_tree_filters_unsupported` error a client raises
+    /// before it sends `session.list` with a tree filter to a daemon that
+    /// cannot honor it.
+    #[must_use]
+    pub fn session_list_tree_filters_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE,
+            format!(
+                "{target} predates tree list filters and would ignore them silently; nothing was sent"
+            ),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_retention_selector_unsupported` error a client raises
+    /// before it sends `session.retention.sweep` with a selector to a daemon
+    /// that cannot honor it.
+    #[must_use]
+    pub fn session_retention_selector_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE,
+            format!(
+                "{target} predates sweep selectors and would sweep everything eligible; nothing was sent"
+            ),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_remove_tree_unsupported` error a client raises
+    /// before it sends `session.remove_tree` to a daemon that cannot honor
+    /// it.
+    #[must_use]
+    pub fn session_remove_tree_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
+            format!("{target} predates session.remove_tree; nothing was sent"),
             Some("upgrade the daemon, then retry".to_owned()),
         )
     }

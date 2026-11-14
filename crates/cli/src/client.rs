@@ -159,6 +159,41 @@ impl Client {
             .map_err(map_client_error)
     }
 
+    /// List sessions, refusing before sending when a tree filter needs a
+    /// daemon that does not advertise it.
+    pub(crate) async fn session_list(
+        &mut self,
+        params: protocol::SessionListParams,
+    ) -> Result<Vec<protocol::SessionInfo>, CliError> {
+        self.inner
+            .session_list(params)
+            .await
+            .map_err(map_client_error)
+    }
+
+    /// Run a retention sweep, refusing a selector the daemon cannot honor.
+    pub(crate) async fn session_retention_sweep(
+        &mut self,
+        params: protocol::SessionRetentionParams,
+    ) -> Result<protocol::SessionRetentionResult, CliError> {
+        self.inner
+            .session_retention_sweep(params)
+            .await
+            .map_err(map_client_error)
+    }
+
+    /// Remove a session together with its descendants, refusing before
+    /// sending when the daemon does not advertise `session.remove_tree`.
+    pub(crate) async fn session_remove_tree(
+        &mut self,
+        params: protocol::SessionRemoveTreeParams,
+    ) -> Result<protocol::SessionRemoveTreeResult, CliError> {
+        self.inner
+            .session_remove_tree(params)
+            .await
+            .map_err(map_client_error)
+    }
+
     /// Run the daemon's redacted host diagnostics.
     pub(crate) async fn daemon_doctor(&mut self) -> Result<DoctorReport, CliError> {
         self.inner.daemon_doctor().await.map_err(map_client_error)

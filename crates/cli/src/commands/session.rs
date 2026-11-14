@@ -21,13 +21,14 @@ use protocol::{
     SessionDetectionResult, SessionDiffParams, SessionId, SessionInfo, SessionInputParams,
     SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
     SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
-    SessionResumeParams, SessionRetentionParams, SessionRetentionResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
-    SessionTurnCursor, SessionTurnEventKind, SessionTurnProgress, SessionWaitParams,
-    SessionWaitTurnParams, SessionWaitTurnReason, SessionWaitTurnResult, SessionWarningKind,
-    StateSource, SubagentLifecycle, TerminalWatermark, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_TURN_MS,
+    SessionReadSource, SessionRemoveResult, SessionRemoveTreeParams, SessionRemoveTreeResult,
+    SessionRenameParams, SessionResizeParams, SessionResumeParams, SessionRetentionParams,
+    SessionRetentionResult, SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams,
+    SessionState, SessionStopResult, SessionTreeOutcome, SessionTurnCursor, SessionTurnEventKind,
+    SessionTurnProgress, SessionWaitParams, SessionWaitTurnParams, SessionWaitTurnReason,
+    SessionWaitTurnResult, SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark,
+    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    MAX_SESSION_WAIT_TURN_MS,
 };
 
 use super::plugin::sanitize;
@@ -476,6 +477,8 @@ pub(crate) enum ListOutputMode {
     Json,
     /// One session id per line.
     Quiet,
+    /// Human-readable table with sessions indented under their spawner.
+    Tree,
 }
 
 /// A single exact-match `session list --filter key=value` predicate.
@@ -498,10 +501,20 @@ pub(crate) enum ListFilter {
     MetadataHas { key: String },
     /// Match the sessions the given session spawned.
     SpawnedBy(String),
+    /// Match top-level sessions: no `spawned_by`, or a spawner absent from
+    /// the listed set. Context-free `matches` never answers it (like the
+    /// protocol predicate); the list re-filter resolves it through the
+    /// listed tree instead.
+    TopLevel,
 }
 
 impl ListFilter {
     /// Whether this filter matches one session exactly.
+    ///
+    /// Test-only: the list re-filter resolves tree filters through the
+    /// listed tree (`session_matches_filters_in`); this context-free
+    /// predicate pins the agreement with the protocol predicate instead.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn matches(&self, session: &SessionInfo) -> bool {
         self.to_protocol_filter().matches(session)
@@ -520,6 +533,7 @@ impl ListFilter {
             },
             ListFilter::MetadataHas { key } => SessionListFilter::MetadataHas { key: key.clone() },
             ListFilter::SpawnedBy(id) => SessionListFilter::SpawnedBy(id.clone()),
+            ListFilter::TopLevel => SessionListFilter::TopLevel,
         }
     }
 }
@@ -679,8 +693,25 @@ fn parse_agent_filter(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+#[cfg(test)]
 fn session_matches_filters(session: &SessionInfo, filters: &[ListFilter]) -> bool {
     filters.iter().all(|filter| filter.matches(session))
+}
+
+/// Whether one listed session passes `filters` within the listed `tree`.
+///
+/// The daemon already applied these filters; this re-applies them as
+/// defense-in-depth against peers that ignore unknown params. Tree filters
+/// resolve through the same listed view the daemon used, so an orphan the
+/// daemon kept stays kept here.
+fn session_matches_filters_in(
+    session: &SessionInfo,
+    filters: &[ListFilter],
+    tree: &protocol::SessionTree<'_>,
+) -> bool {
+    filters
+        .iter()
+        .all(|filter| filter.to_protocol_filter().matches_in(session, tree))
 }
 
 /// Decide whether starting a session on `host` needs confirmation.
@@ -959,9 +990,7 @@ pub(crate) async fn run_list(
     output_mode: ListOutputMode,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let sessions = client
-        .call::<method::SessionList>(list_params(filters))
-        .await?;
+    let sessions = client.session_list(list_params(filters)).await?;
 
     print!("{}", render_list_output(&sessions, filters, output_mode)?);
 
@@ -1076,7 +1105,9 @@ pub(crate) async fn run_stop(
 /// to remove a session whose runtime processes could not be proven gone solely
 /// because same-user processes with unreadable environments may belong to it.
 /// It selects the `session.remove_accepting_unconfirmed` method; without it
-/// the refusing `session.remove` is called.
+/// the refusing `session.remove` is called. `with_children` removes the named
+/// session together with its descendants through `session.remove_tree`, which
+/// needs a daemon that advertises `session_remove_tree_supported`.
 ///
 /// # Errors
 ///
@@ -1088,8 +1119,12 @@ pub(crate) async fn run_remove(
     paths: &Paths,
     target: &Target,
     accept_unconfirmed_cleanup: bool,
+    with_children: bool,
     json: bool,
-) -> Result<(), CliError> {
+) -> Result<bool, CliError> {
+    if with_children {
+        return run_remove_tree(host, paths, target, accept_unconfirmed_cleanup, json).await;
+    }
     let mut sdk = Client::connect_pinned(host, paths).await?.into_sdk();
     let session_id = SessionId(target.session_id.clone());
     let notice = || {
@@ -1115,7 +1150,80 @@ pub(crate) async fn run_remove(
     } else {
         print!("{}", render_remove_human(&target.session_id, &removed));
     }
-    Ok(())
+    Ok(true)
+}
+
+/// Returns whether the cascade reached its goal: the named root removed.
+///
+/// A kept or refused descendant makes the ancestors kept but is still the
+/// cascade behaving correctly (it never stops a live session nor deletes
+/// unsaved work); only the root decides the exit code.
+fn remove_tree_succeeded(result: &SessionRemoveTreeResult, root: &str) -> bool {
+    result
+        .sessions
+        .iter()
+        .any(|node| node.session_id.0 == root && node.outcome == SessionTreeOutcome::Removed)
+}
+
+/// Run `session rm --with-children` against the daemon for `host`.
+///
+/// The cascade removes descendants deepest first, each under the normal
+/// removal safety, then the named root through `session.remove`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] the way [`run_remove`] does.
+pub(crate) async fn run_remove_tree(
+    host: &PinnedHost,
+    paths: &Paths,
+    target: &Target,
+    accept_unconfirmed_cleanup: bool,
+    json: bool,
+) -> Result<bool, CliError> {
+    let mut client = Client::connect_pinned(host, paths).await?;
+    let result = client
+        .session_remove_tree(SessionRemoveTreeParams {
+            session_id: SessionId(target.session_id.clone()),
+            accept_unconfirmed_cleanup,
+        })
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&result)?);
+    } else {
+        print!("{}", render_remove_tree_human(&result));
+    }
+    Ok(remove_tree_succeeded(&result, &target.session_id))
+}
+
+/// Renders one `session.remove_tree` node: the session, its outcome and the
+/// reason that kept or refused it, indented by depth.
+fn render_remove_tree_human(result: &SessionRemoveTreeResult) -> String {
+    let mut output = String::new();
+    for node in &result.sessions {
+        let indent = "  ".repeat(node.depth as usize);
+        let status = match node.outcome {
+            SessionTreeOutcome::Removed => "removed".to_owned(),
+            SessionTreeOutcome::Kept => match node.keep_reason {
+                Some(reason) => match node.hold {
+                    Some(hold) => format!("kept ({}: {})", reason.as_str(), hold.as_str()),
+                    None => format!("kept ({})", reason.as_str()),
+                },
+                None => "kept".to_owned(),
+            },
+            SessionTreeOutcome::Refused => match &node.error {
+                Some(error) => format!("refused ({}: {})", error.code, error.msg),
+                None => "refused".to_owned(),
+            },
+            SessionTreeOutcome::Unknown => "unknown".to_owned(),
+        };
+        let _ = writeln!(output, "{indent}{} {status}", node.session_id.0);
+    }
+    let _ = writeln!(
+        output,
+        "removed={} kept={} refused={}",
+        result.removed, result.kept, result.refused
+    );
+    output
 }
 
 /// Run `session input` against the daemon for `host`.
@@ -1777,7 +1885,7 @@ pub(crate) async fn run_diff(
 }
 
 /// Arguments accepted by `session retention sweep`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SweepArgs {
     /// Report the selection without removing anything.
     pub(crate) dry_run: bool,
@@ -1785,6 +1893,10 @@ pub(crate) struct SweepArgs {
     pub(crate) apply: bool,
     /// Maximum sessions to remove.
     pub(crate) limit: Option<u32>,
+    /// Sweep only the direct children of this session.
+    pub(crate) spawned_by: Option<String>,
+    /// Sweep only these sessions, by id.
+    pub(crate) session: Vec<String>,
 }
 
 /// Run `session retention sweep` against the daemon for `host`.
@@ -1805,9 +1917,7 @@ pub(crate) async fn run_retention_sweep(
     json: bool,
 ) -> Result<bool, CliError> {
     let mut client = Client::connect(host, paths).await?;
-    let result = client
-        .call::<method::SessionRetentionSweep>(sweep_params(args))
-        .await?;
+    let result = client.session_retention_sweep(sweep_params(&args)).await?;
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -1828,10 +1938,18 @@ fn sweep_succeeded(result: &SessionRetentionResult) -> bool {
 
 /// Builds the sweep params. `--apply` is the absence of `--dry-run`; clap
 /// requires exactly one of the two so the destructive mode is never implicit.
-fn sweep_params(args: SweepArgs) -> SessionRetentionParams {
+/// A selector travels only when the user passes one; the client refuses it
+/// before sending against a daemon that predates sweep selectors.
+fn sweep_params(args: &SweepArgs) -> SessionRetentionParams {
     SessionRetentionParams {
         dry_run: args.dry_run || !args.apply,
         limit: args.limit,
+        spawned_by: args.spawned_by.clone().map(SessionId),
+        session_ids: if args.session.is_empty() {
+            None
+        } else {
+            Some(args.session.iter().cloned().map(SessionId).collect())
+        },
     }
 }
 
@@ -2191,45 +2309,69 @@ fn render_new_human(
 }
 
 fn render_list_human(sessions: &[SessionInfo]) -> String {
+    render_list_table(
+        &sessions
+            .iter()
+            .map(|session| (session, 0))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Renders the listed sessions as an indented tree: roots first, each
+/// followed by its subtree pre-order. Sessions no root reaches (only a
+/// `spawned_by` cycle can strand one) render last at depth 0, so the tree
+/// never drops a listed session.
+fn render_list_tree(sessions: &[SessionInfo]) -> String {
+    let tree = protocol::SessionTree::new(sessions);
+    let mut output = render_list_table(&tree.display_order());
+    // The orphan lines need the unfiltered tree: `--tree` is the only
+    // human mode clap forces to be unfiltered, so only here does "not
+    // listed on this host" hold for every orphan.
+    render_list_orphans(&mut output, sessions);
+    output
+}
+
+/// One human table row per `(session, depth)` pair; depth indents the id.
+fn render_list_table(sessions: &[(&SessionInfo, u32)]) -> String {
     let id_width = sessions
         .iter()
-        .map(|s| s.id.0.len())
+        .map(|(session, depth)| tree_id_label(&session.id.0, *depth).len())
         .max()
         .unwrap_or(0)
         .max("ID".len());
     let name_width = sessions
         .iter()
-        .map(|s| name_label(s).len())
+        .map(|(session, _)| name_label(session).len())
         .max()
         .unwrap_or(0)
         .max("NAME".len());
     let agent_width = sessions
         .iter()
-        .map(|s| session_agent_label(s).len())
+        .map(|(session, _)| session_agent_label(session).len())
         .max()
         .unwrap_or(0)
         .max("AGENT".len());
     let project_width = sessions
         .iter()
-        .map(|s| project_label(s).len())
+        .map(|(session, _)| project_label(session).len())
         .max()
         .unwrap_or(0)
         .max("PROJECT".len());
     let branch_width = sessions
         .iter()
-        .map(|s| branch_label(s).len())
+        .map(|(session, _)| branch_label(session).len())
         .max()
         .unwrap_or(0)
         .max("BRANCH".len());
     let background_width = sessions
         .iter()
-        .map(|s| background_count_label(s).len())
+        .map(|(session, _)| background_count_label(session).len())
         .max()
         .unwrap_or(0)
         .max("BACKGROUND".len());
     let activity_width = sessions
         .iter()
-        .map(|s| activity_column_label(s).len())
+        .map(|(session, _)| activity_column_label(session).len())
         .max()
         .unwrap_or(0)
         .max("ACTIVITY".len());
@@ -2240,11 +2382,11 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
         "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<activity_width$}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  CWD",
         "ID", "NAME", "AGENT", "ORIGIN", "STATE", "ACTIVITY", "SOURCE", "PID", "SIZE", "PROJECT", "BRANCH", "WARN", "SUBAGENTS", "BACKGROUND",
     );
-    for session in sessions {
+    for (session, depth) in sessions {
         let _ = writeln!(
             output,
             "{:<id_width$}  {:<name_width$}  {:<agent_width$}  {:<8}  {:<12}  {:<activity_width$}  {:<12}  {:<4}  {:<6}  {:<project_width$}  {:<branch_width$}  {:<4}  {:<9}  {:<background_width$}  {}",
-            session.id.0,
+            tree_id_label(&session.id.0, *depth),
             name_label(session),
             session_agent_label(session),
             origin_label(session),
@@ -2261,14 +2403,45 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             session.cwd.display(),
         );
     }
-    render_list_footer(&mut output, sessions);
+    render_list_footer(
+        &mut output,
+        &sessions
+            .iter()
+            .map(|(session, _)| *session)
+            .collect::<Vec<_>>(),
+    );
     output
+}
+
+/// The id column of a tree row: two spaces per depth level under the root.
+fn tree_id_label(id: &str, depth: u32) -> String {
+    format!("{}{id}", "  ".repeat(depth as usize))
+}
+
+/// Appends one `orphan` line per session whose spawner is not listed.
+/// Only the unfiltered `--tree` view calls this: any filtered human list
+/// can hide a listed spawner, and the line would lie about this host.
+fn render_list_orphans(output: &mut String, sessions: &[SessionInfo]) {
+    let tree = protocol::SessionTree::new(sessions);
+    for session in sessions {
+        if tree.is_orphan(session) {
+            let parent = session
+                .spawned_by
+                .as_ref()
+                .map_or("<unknown>", |spawned_by| spawned_by.session_id.0.as_str());
+            let _ = writeln!(
+                output,
+                "orphan {}: spawned by {}, which is not listed on this host",
+                session.id.0, parent,
+            );
+        }
+    }
 }
 
 /// Appends the per-session lines that the table's columns only count: the
 /// native recovery target, the refused capabilities and native recovery
 /// warnings.
-fn render_list_footer(output: &mut String, sessions: &[SessionInfo]) {
+fn render_list_footer(output: &mut String, sessions: &[&SessionInfo]) {
     // The WARN column only counts; a lost native recovery record needs its
     // recovery hint where the operator looks for the session.
     for session in sessions {
@@ -2360,10 +2533,12 @@ fn render_list_output(
     // (`build_list_request` sends them as typed params). Re-applying the
     // predicate also protects legacy filters from peers that ignore unknown
     // params. Metadata filters are gated by protocol negotiation before send,
-    // so a protocol-3 daemon cannot silently ignore them.
+    // so a protocol-3 daemon cannot silently ignore them. Tree filters
+    // resolve through the listed view, matching the daemon's own tree.
+    let tree = protocol::SessionTree::new(sessions);
     let filtered: Vec<SessionInfo> = sessions
         .iter()
-        .filter(|session| session_matches_filters(session, filters))
+        .filter(|session| session_matches_filters_in(session, filters, &tree))
         .cloned()
         .collect();
 
@@ -2371,6 +2546,7 @@ fn render_list_output(
         ListOutputMode::Human => Ok(render_list_human(&filtered)),
         ListOutputMode::Json => crate::commands::render_json(&filtered),
         ListOutputMode::Quiet => Ok(render_list_quiet(&filtered)),
+        ListOutputMode::Tree => Ok(render_list_tree(&filtered)),
     }
 }
 
@@ -3093,6 +3269,7 @@ mod tests {
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            children: None,
             placement: None,
             output_force_closed: false,
             created_at: "2026-06-17T10:00:00Z".to_owned(),
@@ -3256,6 +3433,7 @@ mod tests {
             parse_list_filter("state=running").expect("state filter"),
             parse_list_filter("agent=claude").expect("agent filter"),
             parse_list_filter("id=s-42").expect("id filter"),
+            ListFilter::TopLevel,
         ])
         .expect("request");
 
@@ -3266,7 +3444,8 @@ mod tests {
                 "filters": [
                     { "key": "state", "value": "running" },
                     { "key": "agent", "value": "claude" },
-                    { "key": "id", "value": "s-42" }
+                    { "key": "id", "value": "s-42" },
+                    { "key": "top_level" }
                 ]
             }),
         );
@@ -3337,6 +3516,7 @@ mod tests {
             parse_list_filter("project=ui").expect("project label"),
             parse_list_filter("project=p-aaa").expect("project id"),
             parse_list_filter("project=nope").expect("project miss"),
+            ListFilter::TopLevel,
         ];
 
         for session in &sessions {
@@ -4145,6 +4325,7 @@ mod tests {
                     &paths,
                     &target,
                     accept_unconfirmed_cleanup,
+                    false,
                     true,
                 )
                 .await
@@ -4186,7 +4367,7 @@ mod tests {
             &'a Target,
             bool,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), CliError>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Result<bool, CliError>> + Send + 'a>,
         >;
         let commands: [(&str, u32, &str, Command); 2] = [
             (
@@ -4194,9 +4375,10 @@ mod tests {
                 pohunek_client::SESSION_STOP_REQUEST_BUDGET_MS,
                 "session_stop_outcome_unknown",
                 |paths, target, json| {
-                    Box::pin(
-                        async move { run_stop(&PinnedHost::local(), paths, target, json).await },
-                    )
+                    Box::pin(async move {
+                        run_stop(&PinnedHost::local(), paths, target, json).await?;
+                        Ok(true)
+                    })
                 },
             ),
             (
@@ -4205,7 +4387,7 @@ mod tests {
                 "session_remove_outcome_unknown",
                 |paths, target, json| {
                     Box::pin(async move {
-                        run_remove(&PinnedHost::local(), paths, target, false, json).await
+                        run_remove(&PinnedHost::local(), paths, target, false, false, json).await
                     })
                 },
             ),

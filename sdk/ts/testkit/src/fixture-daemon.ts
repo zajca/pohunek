@@ -1027,7 +1027,9 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
 
     let sessions = Array.from(this.sessions.values());
     for (const filter of params.filters ?? []) {
-      sessions = sessions.filter((session) => sessionMatchesFilter(session, filter));
+      sessions = sessions.filter((session) =>
+        sessionMatchesFilter(session, filter, this.sessions)
+      );
     }
     return okResponse(request.id, sessions.map((session) => cloneValue(session)));
   }
@@ -2553,7 +2555,11 @@ function isSessionMetadataEntryValid(key: string, value: string): boolean {
   return Buffer.byteLength(JSON.stringify({ [key]: value }), "utf8") <= MAX_SESSION_METADATA_SERIALIZED_BYTES;
 }
 
-function sessionMatchesFilter(session: SessionInfo, filter: SessionListFilter): boolean {
+function sessionMatchesFilter(
+  session: SessionInfo,
+  filter: SessionListFilter,
+  sessions: Map<string, SessionInfo>,
+): boolean {
   switch (filter.key) {
     case "state":
       return session.state === filter.value;
@@ -2571,6 +2577,14 @@ function sessionMatchesFilter(session: SessionInfo, filter: SessionListFilter): 
       return session.metadata !== undefined && Object.hasOwn(session.metadata, filter.value.key);
     case "spawned_by":
       return session.spawned_by?.session_id === filter.value;
+    case "top_level": {
+      // Like the daemon's tree view, an orphan counts as top-level: its
+      // spawner is absent, not merely filtered out of this answer.
+      const spawner = session.spawned_by?.session_id;
+      return spawner === undefined || !sessions.has(spawner);
+    }
+    case "has_spawned_by":
+      return session.spawned_by !== undefined;
   }
 }
 

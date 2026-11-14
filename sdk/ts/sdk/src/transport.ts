@@ -1,3 +1,4 @@
+import { MAX_SESSION_REMOVE_TREE_SESSIONS } from "@pohunek/protocol";
 import { resolveRequestOrigin, type RequestOrigin } from "./origin";
 
 export interface ConnectOptions {
@@ -75,6 +76,10 @@ const SESSION_REMOVE_HOOK_RUNS = 2 * 2;
  * stop the removal performs first plus every hook run at its timeout. */
 export const SESSION_REMOVE_REQUEST_BUDGET_MS =
   SESSION_STOP_REQUEST_BUDGET_MS + SESSION_REMOVE_HOOK_RUNS * WORKTREE_HOOK_TIMEOUT_MS;
+/** Budget for `session.remove_tree`: the per-remove budget times the tree
+ * cap (`MAX_SESSION_REMOVE_TREE_SESSIONS`). */
+export const SESSION_REMOVE_TREE_REQUEST_BUDGET_MS =
+  MAX_SESSION_REMOVE_TREE_SESSIONS * SESSION_REMOVE_REQUEST_BUDGET_MS;
 
 export function resolveConnectOptions(options: ConnectOptions = {}): ResolvedConnectOptions {
   return {

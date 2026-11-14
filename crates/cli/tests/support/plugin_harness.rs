@@ -587,6 +587,11 @@ fn registry_config(
                 .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
         ),
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
+        // Checked-out worktrees live under the test root, so durable CLI
+        // tests can create sessions with `--repo`/`--branch` and exercise
+        // worktree removal through the real `session rm` path. Worktree
+        // binding also needs the store, which only durable daemons have.
+        worktree_root: Some(env.root().join("worktrees")),
         store_path: durable.then(|| metadata_store(env)),
         event_log_dir: durable.then(|| env.root().join("events")),
         ..SessionRegistryConfig::default()

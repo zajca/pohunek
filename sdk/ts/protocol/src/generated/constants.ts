@@ -23,6 +23,7 @@ export const MAX_WORKER_INSTANCE_ID_BYTES = 128 as const;
 export const MAX_SESSION_INPUT_BYTES = 262144 as const;
 export const MAX_SESSION_OUTPUT_BYTES = 783240 as const;
 export const MAX_SESSION_WAIT_MS = 8000 as const;
+export const MAX_SESSION_REMOVE_TREE_SESSIONS = 64 as const;
 export const MAX_COMMAND_OUTPUT_BYTES = 131072 as const;
 export const MAX_COMMAND_TIMEOUT_MS = 60000 as const;
 export const MAX_SESSION_WAIT_TURN_MS = 86400000 as const;

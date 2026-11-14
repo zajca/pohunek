@@ -150,6 +150,14 @@ impl SessionRegistry {
     }
 
     /// Runs one retention sweep as if `now` were the current time.
+    /// A selector narrows the candidate set before the TTL rules apply:
+    /// `spawned_by` keeps only the direct children of that session (orphans
+    /// whose parent is gone included), `session_ids` keeps only the named
+    /// sessions. Exactly one of the two may be set; an empty or oversized
+    /// `session_ids` is a `bad_request`, matching the strict id-list rule.
+    /// A selector that names nothing selects nothing, so the sweep examines
+    /// zero sessions. Every TTL, hold, budget and dry-run rule then applies
+    /// unchanged to the narrowed set.
     pub(crate) async fn sweep_retention_at(
         &self,
         params: &SessionRetentionParams,
@@ -158,8 +166,9 @@ impl SessionRegistry {
         let _guard = self.inner.retention.sweep_lock.lock().await;
         let policy = self.retention_policy();
         let sessions = self.list_raw().await;
-        let examined = u32::try_from(sessions.len()).unwrap_or(u32::MAX);
-        let mut candidates = select_candidates(&sessions, &policy, now);
+        let selected = select_subset(&sessions, params)?;
+        let examined = count(selected.iter());
+        let mut candidates = select_candidates(&selected, &policy, now);
         self.apply_worktree_holds(&mut candidates).await;
         let held = count(
             candidates
@@ -443,6 +452,46 @@ fn count<T>(items: impl Iterator<Item = T>) -> u32 {
     u32::try_from(items.count()).unwrap_or(u32::MAX)
 }
 
+/// Narrows `sessions` to the selector of `params`, oldest-first order kept
+/// by the caller. No selector keeps every session; the daemon is the single
+/// place that resolves what `spawned_by` matches, so a child is recognized
+/// by the id alone and an orphan matches even when its parent is gone.
+fn select_subset(
+    sessions: &[SessionInfo],
+    params: &SessionRetentionParams,
+) -> Result<Vec<SessionInfo>, ProtocolError> {
+    match (&params.spawned_by, &params.session_ids) {
+        (Some(_), Some(_)) => Err(ProtocolError::bad_request(
+            "session.retention.sweep accepts either spawned_by or session_ids, never both",
+        )),
+        (Some(parent), None) => Ok(sessions
+            .iter()
+            .filter(|session| {
+                session
+                    .spawned_by
+                    .as_ref()
+                    .is_some_and(|origin| &origin.session_id == parent)
+            })
+            .cloned()
+            .collect()),
+        (None, Some(ids)) => {
+            if ids.is_empty() || ids.len() > protocol::MAX_RETENTION_SELECTOR_IDS {
+                return Err(ProtocolError::bad_request(format!(
+                    "session_ids selects 1..={} sessions, got {}",
+                    protocol::MAX_RETENTION_SELECTOR_IDS,
+                    ids.len()
+                )));
+            }
+            Ok(sessions
+                .iter()
+                .filter(|session| ids.contains(&session.id))
+                .cloned()
+                .collect())
+        }
+        (None, None) => Ok(sessions.to_vec()),
+    }
+}
+
 /// Returns the rule that applies to `session` and the timestamp it ages from.
 fn retention_reason(session: &SessionInfo) -> Option<(SessionRetentionReason, &str)> {
     let runtime = session.runtime.as_ref();
@@ -670,6 +719,7 @@ mod tests {
             worktree_path: None,
             warnings: Vec::new(),
             capability_refusals: None,
+            children: None,
             placement: None,
             output_force_closed: false,
             metadata: BTreeMap::new(),

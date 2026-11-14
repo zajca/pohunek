@@ -177,6 +177,7 @@ async fn restart_and_select(
         .sweep_retention(&SessionRetentionParams {
             dry_run: true,
             limit: None,
+            ..Default::default()
         })
         .await
         .expect("dry-run sweep");

@@ -40,7 +40,10 @@ describe("caller-owned parameters over a real TCP daemon", () => {
       // The caller may change its object once the call has returned a promise;
       // what reaches the daemon is the snapshot from the invocation.
       params.note = "changed";
-      params.filters[0]!.value = "changed";
+      const first = params.filters[0]!;
+      if (first.key === "state") {
+        first.value = "changed" as typeof first.value;
+      }
 
       expect(await outcome).toEqual([]);
       const sent = parseRequestLine(await daemon.nextRequest());

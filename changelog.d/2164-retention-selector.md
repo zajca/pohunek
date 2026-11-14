@@ -1,0 +1,4 @@
+---
+kind: added
+---
+`session.retention.sweep` accepts a selector that narrows the sweep before the TTL rules apply: `spawned_by` sweeps only the direct children of that session (orphans whose parent is gone included), `session_ids` sweeps only the named sessions (1..=256); exactly one selector may be set, a selector that names nothing selects nothing, and every TTL, hold, budget and dry-run rule applies unchanged to the narrowed set. The selector travels only to a daemon that advertises `HostCapabilities.session_retention_selector_supported` (clients refuse it against an older daemon before the request is sent, and a protocol-3 daemon is refused likewise); the CLI exposes it as `--spawned-by <session-id>` and repeatable `--session <session-id>`, which exclude each other. ([#2164](https://github.com/zajca/pohunek/issues/2164))

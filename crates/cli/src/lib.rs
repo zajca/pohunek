@@ -1215,6 +1215,26 @@ enum SessionAction {
         /// `ANDed` with the other filters.
         #[arg(long = "spawned-by", value_name = "session-id", value_parser = commands::session::parse_spawned_by_filter)]
         spawned_by: Option<String>,
+        /// Match only top-level sessions: sessions with no `spawned_by`, or
+        /// whose spawner is gone (an orphan). `ANDed` with the other
+        /// filters; child counts stay computed over the unfiltered list.
+        #[arg(long = "top-level")]
+        top_level: bool,
+        /// Render the listed sessions as an indented tree in human output.
+        /// Parents render before their children; orphans render as roots.
+        /// The tree needs the unfiltered list, so it conflicts with every
+        /// filter and with the flat `--json` and `--quiet` outputs.
+        #[arg(
+            long = "tree",
+            conflicts_with = "json",
+            conflicts_with = "quiet",
+            conflicts_with = "filters",
+            conflicts_with = "metadata_eq",
+            conflicts_with = "metadata_has",
+            conflicts_with = "spawned_by",
+            conflicts_with = "top_level"
+        )]
+        tree: bool,
     },
 
     /// Inspect one session.
@@ -1246,6 +1266,11 @@ enum SessionAction {
         /// without it the removal is refused.
         #[arg(long)]
         accept_unconfirmed_cleanup: bool,
+        /// Remove the session together with its descendants, deepest first.
+        /// A kept or refused descendant keeps its ancestors. Needs a daemon
+        /// that advertises `session_remove_tree_supported`.
+        #[arg(long)]
+        with_children: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -1502,6 +1527,15 @@ enum SessionRetentionAction {
         /// Maximum sessions to remove, capped by the policy limit.
         #[arg(long, value_name = "COUNT")]
         limit: Option<u32>,
+        /// Sweep only the direct children of this session, including
+        /// orphans that still name it. Needs a daemon that advertises
+        /// `session_retention_selector_supported`.
+        #[arg(long, value_name = "SESSION-ID", conflicts_with = "session")]
+        spawned_by: Option<String>,
+        /// Sweep only this session, by id. Repeatable. Needs a daemon that
+        /// advertises `session_retention_selector_supported`.
+        #[arg(long, value_name = "SESSION-ID", conflicts_with = "spawned_by")]
+        session: Vec<String>,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -1881,8 +1915,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     metadata_eq,
                     metadata_has,
                     spawned_by,
+                    top_level,
+                    tree,
                 } => {
                     filters.extend(spawned_by.map(commands::session::ListFilter::SpawnedBy));
+                    filters.extend(top_level.then_some(commands::session::ListFilter::TopLevel));
                     filters.extend(metadata_eq.into_iter().map(|(key, value)| {
                         commands::session::ListFilter::MetadataEq { key, value }
                     }));
@@ -1896,6 +1933,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         commands::session::ListOutputMode::Quiet
                     } else if json {
                         commands::session::ListOutputMode::Json
+                    } else if tree {
+                        commands::session::ListOutputMode::Tree
                     } else {
                         commands::session::ListOutputMode::Human
                     };
@@ -1920,6 +1959,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 SessionAction::Rm {
                     target,
                     accept_unconfirmed_cleanup,
+                    with_children,
                     json,
                 } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -1928,14 +1968,18 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         commands::session::resolve_target_pinned(&host, &paths, &target).await?;
                     commands::session::ensure_lifecycle_allowed(&host, &paths, &target, "remove")
                         .await?;
-                    commands::session::run_remove(
+                    if !commands::session::run_remove(
                         &host,
                         &paths,
                         &target,
                         accept_unconfirmed_cleanup,
+                        with_children,
                         json,
                     )
-                    .await?;
+                    .await?
+                    {
+                        exit = ExitCode::FAILURE;
+                    }
                 }
                 SessionAction::Input {
                     target,
@@ -2167,6 +2211,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         dry_run,
                         apply,
                         limit,
+                        spawned_by,
+                        session,
                         json,
                     } => {
                         let host = effective_host(&global_host, None);
@@ -2177,6 +2223,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                                 dry_run,
                                 apply,
                                 limit,
+                                spawned_by,
+                                session,
                             },
                             json,
                         )

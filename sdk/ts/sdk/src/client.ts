@@ -25,7 +25,7 @@ import {
   type SessionWaitTurnParams,
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
-import { CompatError, carriesAgentOptions, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
+import { CompatError, carriesAgentOptions, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesRetentionSelector, carriesSecretEnv, carriesTreeListFilter, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
 import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -36,6 +36,7 @@ import {
   resolveConnectOptions,
   SESSION_NEW_REQUEST_BUDGET_MS,
   SESSION_REMOVE_REQUEST_BUDGET_MS,
+  SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
   SESSION_RESUME_REQUEST_BUDGET_MS,
   SESSION_STOP_REQUEST_BUDGET_MS,
 } from "./transport";
@@ -173,6 +174,13 @@ export class Client {
         method,
         params as Methods["session.remove"]["params"],
         SESSION_REMOVE_REQUEST_BUDGET_MS,
+      );
+    }
+    if (method === "session.remove_tree") {
+      return this.callDedicated(
+        "session.remove_tree",
+        params as Methods["session.remove_tree"]["params"],
+        SESSION_REMOVE_TREE_REQUEST_BUDGET_MS,
       );
     }
     if (method === "session.input" && isWaitingSessionInput(params)) {
@@ -429,6 +437,24 @@ export class Client {
       await this.requireCapability(connection, {
         flag: "session_attention_isolation_supported",
         unsupported: (host) => ClientError.sessionAttentionIsolationUnsupported(host),
+      });
+    }
+    if (request.method === "session.list" && carriesTreeListFilter(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_list_tree_filters_supported",
+        unsupported: (host) => ClientError.sessionListTreeFiltersUnsupported(host),
+      });
+    }
+    if (request.method === "session.remove_tree") {
+      await this.requireCapability(connection, {
+        flag: "session_remove_tree_supported",
+        unsupported: (host) => ClientError.sessionRemoveTreeUnsupported(host),
+      });
+    }
+    if (request.method === "session.retention.sweep" && carriesRetentionSelector(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_retention_selector_supported",
+        unsupported: (host) => ClientError.sessionRetentionSelectorUnsupported(host),
       });
     }
     if (isPackageCommandsRequest(request)) {
@@ -723,6 +749,7 @@ export class Client {
       | "session.stop"
       | "session.remove"
       | "session.remove_accepting_unconfirmed"
+      | "session.remove_tree"
       | "session.input"
       | "session.output"
       | "session.wait"
@@ -832,6 +859,7 @@ const LIFECYCLE_OPERATIONS: ReadonlyMap<string, LifecycleOperation> = new Map([
   ["session.stop", "stop"],
   ["session.remove", "remove"],
   ["session.remove_accepting_unconfirmed", "remove"],
+  ["session.remove_tree", "remove_tree"],
 ]);
 
 /** Whether an explicit request timeout replaces the method's dedicated budget. */

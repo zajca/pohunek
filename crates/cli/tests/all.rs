@@ -96,6 +96,8 @@ mod plugin_profile_list_audience;
 mod prompt_link;
 #[path = "prompt_render.rs"]
 mod prompt_render;
+#[path = "retention_selector.rs"]
+mod retention_selector;
 #[path = "service_config_migration.rs"]
 mod service_config_migration;
 #[path = "service_launchd.rs"]
@@ -142,6 +144,8 @@ mod session_new_request_id;
 mod session_process_api;
 #[path = "session_spawned_by.rs"]
 mod session_spawned_by;
+#[path = "session_tree.rs"]
+mod session_tree;
 #[path = "session_wait_turn.rs"]
 mod session_wait_turn;
 #[path = "setup_host.rs"]

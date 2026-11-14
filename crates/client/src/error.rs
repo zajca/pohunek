@@ -261,6 +261,16 @@ pub enum ClientError {
         timeout: Duration,
     },
 
+    /// A `session.remove_tree` call elapsed its response budget, so the
+    /// cascade may still be removing sessions on the daemon.
+    #[error("the daemon did not answer `session.remove_tree` within {timeout:?}")]
+    SessionRemoveTreeOutcomeUnknown {
+        /// Remote host involved in the request, or `None` for the local daemon.
+        host: Option<String>,
+        /// Configured response deadline that elapsed.
+        timeout: Duration,
+    },
+
     /// A daemon on a remote host returned a typed protocol error.
     #[error("host '{host}': {source}")]
     RemoteProtocol {
@@ -531,6 +541,15 @@ impl ClientError {
                 lifecycle_timeout_message(host.as_deref(), *timeout, "remove the session"),
                 Some(
                     "the removal may still complete: run `pohunek session list` to see whether the session is gone before retrying"
+                        .to_owned(),
+                ),
+            ),
+            ClientError::SessionRemoveTreeOutcomeUnknown { host, timeout } => ProtocolError::new(
+                ErrorClass::Transport,
+                "session_remove_tree_outcome_unknown",
+                lifecycle_timeout_message(host.as_deref(), *timeout, "remove the session tree"),
+                Some(
+                    "the cascade may still complete: run `pohunek session list` to see which sessions are gone before retrying"
                         .to_owned(),
                 ),
             ),

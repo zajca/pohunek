@@ -36,6 +36,7 @@ export const ClientErrorCode = {
   SessionResumeOutcomeUnknown: "session_resume_outcome_unknown",
   SessionStopOutcomeUnknown: "session_stop_outcome_unknown",
   SessionRemoveOutcomeUnknown: "session_remove_outcome_unknown",
+  SessionRemoveTreeOutcomeUnknown: "session_remove_tree_outcome_unknown",
   Io: "io_error",
   Json: "json_error",
   InputWaitContract: "session_input_wait_contract_mismatch",
@@ -49,6 +50,9 @@ export const ClientErrorCode = {
   SessionNewFetchRefUnsupported: "session_new_fetch_ref_unsupported",
   SessionNewAgentOptionsUnsupported: "session_new_agent_options_unsupported",
   SessionAttentionIsolationUnsupported: "session_attention_isolation_unsupported",
+  SessionListTreeFiltersUnsupported: "session_list_tree_filters_unsupported",
+  SessionRetentionSelectorUnsupported: "session_retention_selector_unsupported",
+  SessionRemoveTreeUnsupported: "session_remove_tree_unsupported",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
@@ -63,6 +67,7 @@ export type ClientErrorKind =
   | "sessionResumeOutcomeUnknown"
   | "sessionStopOutcomeUnknown"
   | "sessionRemoveOutcomeUnknown"
+  | "sessionRemoveTreeOutcomeUnknown"
   | "remoteProtocol"
   | "io"
   | "json"
@@ -77,6 +82,9 @@ export type ClientErrorKind =
   | "sessionNewFetchRefUnsupported"
   | "sessionNewAgentOptionsUnsupported"
   | "sessionAttentionIsolationUnsupported"
+  | "sessionListTreeFiltersUnsupported"
+  | "sessionRetentionSelectorUnsupported"
+  | "sessionRemoveTreeUnsupported"
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
 
@@ -415,6 +423,55 @@ export class ClientError extends Error {
   }
 
   /**
+   * The daemon does not advertise `session_list_tree_filters_supported`, so
+   * it would ignore the tree filters silently and return the wrong set.
+   */
+  public static sessionListTreeFiltersUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates tree list filters and would ignore them silently; nothing was sent`;
+    return new ClientError(
+      "sessionListTreeFiltersUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionListTreeFiltersUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  public static sessionRetentionSelectorUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates sweep selectors and would sweep everything eligible; nothing was sent`;
+    return new ClientError(
+      "sessionRetentionSelectorUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionRetentionSelectorUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  public static sessionRemoveTreeUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates session.remove_tree; nothing was sent`;
+    return new ClientError(
+      "sessionRemoveTreeUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionRemoveTreeUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
    * The daemon does not advertise `session_new_request_id_supported`, so it
    * would drop `client_request_id` silently and a retry would create a second
    * session.
@@ -503,7 +560,7 @@ export class ClientError extends Error {
 }
 
 /** Lifecycle requests whose elapsed deadline leaves the outcome unknown. */
-export type LifecycleOperation = "resume" | "stop" | "remove";
+export type LifecycleOperation = "resume" | "stop" | "remove" | "remove_tree";
 
 const LIFECYCLE_OUTCOME_UNKNOWN: Record<
   LifecycleOperation,
@@ -526,6 +583,12 @@ const LIFECYCLE_OUTCOME_UNKNOWN: Record<
     code: ClientErrorCode.SessionRemoveOutcomeUnknown,
     action: "remove the session",
     recover: "the removal may still complete: run `pohunek session list` to see whether the session is gone before retrying",
+  },
+  remove_tree: {
+    kind: "sessionRemoveTreeOutcomeUnknown",
+    code: ClientErrorCode.SessionRemoveTreeOutcomeUnknown,
+    action: "remove the session tree",
+    recover: "the cascade may still complete: run `pohunek session list` to see which sessions are gone before retrying",
   },
 };
 

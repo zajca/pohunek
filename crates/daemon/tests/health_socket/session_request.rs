@@ -593,6 +593,7 @@ async fn retention_frees_the_key_of_the_session_it_removes() {
         .sweep_retention(&protocol::SessionRetentionParams {
             dry_run: false,
             limit: None,
+            ..Default::default()
         })
         .await
         .expect("the sweep runs");

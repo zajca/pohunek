@@ -438,6 +438,7 @@ async fn handle_negotiated(
         method::SESSION_STOP
             | method::SESSION_REMOVE
             | method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+            | method::SESSION_REMOVE_TREE
     );
     if let Some(target) = mutation_target(request).filter(|_| !releases_only) {
         if let Err(error) = state.sessions.ensure_known_agent(target).await {
@@ -462,6 +463,9 @@ async fn handle_negotiated(
         method::SESSION_REMOVE => session::handle_session_remove(request, &state.sessions).await,
         method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED => {
             session::handle_session_remove_accepting_unconfirmed(request, &state.sessions).await
+        }
+        method::SESSION_REMOVE_TREE => {
+            session::handle_session_remove_tree(request, &state.sessions).await
         }
         method::SESSION_ATTACH => session::handle_session_attach(request, &state.sessions).await,
         method::SESSION_DETACH => session::handle_session_detach(request, &state.sessions).await,
@@ -584,7 +588,8 @@ fn mutation_target(request: &Request) -> Option<&str> {
     );
     let nested = matches!(
         request.method(),
-        method::SESSION_RESIZE
+        method::SESSION_REMOVE_TREE
+            | method::SESSION_RESIZE
             | method::SESSION_SET_METADATA
             | method::SESSION_RENAME
             | method::SESSION_INPUT
@@ -684,6 +689,7 @@ mod tests {
             worktree_path: Some(path),
             warnings: Vec::new(),
             capability_refusals: None,
+            children: None,
             placement: None,
             output_force_closed: false,
             created_at: "2026-06-23T00:00:00Z".to_owned(),
@@ -749,6 +755,10 @@ mod tests {
             (
                 method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
                 serde_json::json!(target),
+            ),
+            (
+                method::SESSION_REMOVE_TREE,
+                serde_json::json!({"session_id": target}),
             ),
             (
                 method::SESSION_RESIZE,

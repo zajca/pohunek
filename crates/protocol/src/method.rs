@@ -29,13 +29,13 @@ use crate::{
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListParams,
     SessionNewParams, SessionNewResult, SessionOutputParams, SessionOutputResult,
     SessionReadParams, SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
-    SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    SessionRemoveResult, SessionRemoveTreeParams, SessionRemoveTreeResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
+    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
+    SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -212,6 +212,15 @@ method_table!(
     SessionRemoveResult,
     "SessionId",
     "SessionRemoveResult";
+
+    /// Remove a session together with its descendants, deepest first.
+    SessionRemoveTree,
+    SESSION_REMOVE_TREE,
+    "session.remove_tree",
+    SessionRemoveTreeParams,
+    SessionRemoveTreeResult,
+    "SessionRemoveTreeParams",
+    "SessionRemoveTreeResult";
 
     /// Create an attach stream for a session.
     SessionAttach,
