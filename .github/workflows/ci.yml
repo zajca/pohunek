@@ -107,11 +107,11 @@ env:
   PYTHONSAFEPATH: "1"
   # Test binaries (issue #170): job `build-tests` compiles the workspace test
   # binaries once (`cargo nextest archive --workspace --all-features`) and
-  # uploads the archive. The test jobs (fast shards, heavy parts, the script
-  # regressions job needs no archive) download
-  # it and run from it via scripts/test-partitions --archive-file; they install
-  # only cargo-nextest, no rust-cache (each heavy part also needs the fetched
-  # crate sources for xtask::dependency_policy). Tests
+  # uploads the archive. The Rust test jobs (fast shards, heavy parts)
+  # download it and run from it via scripts/test-partitions --archive-file;
+  # the script regressions job runs no Rust test and takes no archive. The
+  # Rust test jobs install only cargo-nextest, no rust-cache (each heavy part
+  # also needs the fetched crate sources for xtask::dependency_policy). Tests
   # resolve binaries and sources at run time (`CARGO_BIN_EXE_*`,
   # `CARGO_MANIFEST_DIR`, the worker beside the test binaries), so the archive
   # is relocatable: the test jobs check the repository out into `relocated/`,
@@ -1634,11 +1634,10 @@ jobs:
           echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Issue #2208: the script regressions have their own job. The job runs
-  # the same `unittest discover` the `core` fast shard used to carry, on
-  # every run except a narrowed selection whose `script_tests` output is
-  # false. Cancels the run on a deterministic
-  # failure like every other verdict-needs job; its checkout is the only
-  # network step, so its infra id is `infra-1`.
+  # `python3 -m unittest discover` over scripts/tests on every run except a
+  # narrowed selection whose `script_tests` output is false. Cancels the run
+  # on a deterministic failure like every other verdict-needs job; its
+  # checkout is the only network step, so its infra id is `infra-1`.
   script-tests:
     name: script regressions
     needs: [test-selection, reuse]
@@ -1678,10 +1677,10 @@ jobs:
           echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
   # Issue #774: the heavy shard runs as three parts (matrix `part`), so no
-  # single job waits for the whole heavy list. Part 1 proves the partition
-  # (`run heavy --part 1/N --check` checks, proves the parts' union, then
-  # runs); parts 2 and 3 run their tests alone. Each part extracts the
-  # archive exactly once, in its own process.
+  # single job waits for the whole heavy list. Part 1 first proves the
+  # partition on the whole tree (`check --parts N`: every discovered test in
+  # exactly one shard, the parts' union equal to the heavy list), before the
+  # tree may be narrowed; every part then runs its tests alone.
   integration:
     name: tests (heavy ${{ matrix.part }}/3, PTY + Hermes)
     needs: [build-tests, test-selection, reuse]
@@ -1693,7 +1692,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The heavy parts; part 1 also runs the inventory check. The count
+        # The heavy parts; part 1 also proves the partition. The count
         # stays in `HEAVY_PARTS` below: the run step builds `--part K/N`
         # from the leg and that value.
         part: [1, 2, 3]
@@ -1753,10 +1752,6 @@ jobs:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
 
-      # The heavy parts run the extracted archive's test binaries; the
-      # part-1 run step also proves the partition (`--check`) before it
-      # runs. Parts 2 and 3 run their tests alone.
-
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
         id: infra-4
@@ -1764,6 +1759,22 @@ jobs:
         with:
           name: test-selection
           path: ${{ runner.temp }}/test-selection
+
+      # Runs before the next step may narrow the tree, so a narrowed pull
+      # request still proves every discovered test is assigned exactly once.
+      # A narrowed selection's own check follows in the same process.
+      - name: Prove the test partition on the whole tree
+        if: matrix.part == 1
+        shell: bash
+        env:
+          NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
+        run: |
+          set -euo pipefail
+          selection=()
+          if [ "$NARROWED" = true ]; then
+            selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
+          fi
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check --parts "$HEAVY_PARTS" "${selection[@]}"
 
       # The tests run from a tree holding only the files whose change selects
       # them, so a read of any other path fails instead of passing with the
@@ -1791,11 +1802,7 @@ jobs:
           if [ "$NARROWED" = true ]; then
             selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
           fi
-          check=()
-          if [ "$PART" = 1 ]; then
-            check=(--check)
-          fi
-          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" --part "$PART/$HEAVY_PARTS" "${check[@]}" "${selection[@]}"
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" --part "$PART/$HEAVY_PARTS" "${selection[@]}"
 
       - name: Summarize flaky tests
         if: always()

@@ -3239,7 +3239,10 @@ def ci_rules_paths() -> list[str]:
 
 
 class TestSelectionWiringTests(unittest.TestCase):
-    """The selection plan and the jobs the selection starts."""
+    """The selection plan and the jobs the selection starts.
+
+    The Linux test jobs narrow only on a narrowed selection of a pull request.
+    """
 
     def test_the_heavy_parts_are_the_numbered_legs_of_the_heavy_env_count(self):
         # Issue #774: the integration matrix runs one leg per heavy part,
@@ -3260,8 +3263,6 @@ class TestSelectionWiringTests(unittest.TestCase):
         run = job_steps(job)["Heavy tests (bounded nextest concurrency)"]
         self.assertIn('"$PART/$HEAVY_PARTS"', step_script(run))
         self.assertEqual(step_env_expression(run, "PART"), "matrix.part")
-
-    """The Linux test jobs narrow only on a narrowed selection of a pull request."""
 
     def runs(self, job, *, event="pull_request", cancelled=False, build="success",
              selection="success", plan=None):
@@ -3617,13 +3618,22 @@ class TestSelectionWiringTests(unittest.TestCase):
                     )
         heavy = job_steps(workflow_jobs()["integration"])
         order = list(heavy)
-        self.assertLess(order.index("Download test selection"),
-                        order.index("Heavy tests (bounded nextest concurrency)"))
-        run = heavy["Heavy tests (bounded nextest concurrency)"]
-        # Only part 1 proves the partition: its run step checks, the later
-        # parts run their tests alone.
-        self.assertIn('if [ "$PART" = 1 ]; then', step_script(run))
-        self.assertIn('check=(--check)', step_script(run))
+        proof_name = "Prove the test partition on the whole tree"
+        sparse_name = "Keep only the selection's files in the tree"
+        run_name = "Heavy tests (bounded nextest concurrency)"
+        # Part 1 proves the partition on the whole tree: after the selection
+        # arrives and before the tree may turn sparse.
+        self.assertLess(order.index("Download test selection"), order.index(proof_name))
+        self.assertLess(order.index(proof_name), order.index(sparse_name))
+        self.assertLess(order.index(sparse_name), order.index(run_name))
+        proof = heavy[proof_name]
+        self.assertEqual(step_condition(proof), "matrix.part == 1")
+        self.assertEqual(step_env_expression(proof, "NARROWED"), NARROWED)
+        self.assertIn('if [ "$NARROWED" = true ]; then', step_script(proof))
+        self.assertIn('check --parts "$HEAVY_PARTS" "${selection[@]}"', step_script(proof))
+        # Every part, part 1 included, runs its tests alone.
+        run = heavy[run_name]
+        self.assertNotIn("check", step_script(run))
         self.assertIn('"$PART/$HEAVY_PARTS"', step_script(run))
         script_tests = job_condition("script-tests")
         for event, plan, runs in (
