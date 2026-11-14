@@ -437,9 +437,10 @@ adding a choice or editing a choice the session did not select resumes
 without a decision, while editing a selected choice is `agent_profile_changed`
 (with `--accept-profile-change` the relaunch keeps the frozen arguments and
 takes the choice's current env). Adding an option is a change as well: with
-`--accept-profile-change` the relaunch takes the env of the new option's
-default and records that choice, so `agent_options` keeps describing the
-running launch and a later change of that default resumes without a decision. A recorded choice the profile no longer
+`--accept-profile-change` the relaunch records the new option's default in
+`agent_options` and applies that choice's env, but not its arguments: the
+relaunch keeps the frozen arguments, and the choice's arguments apply only to
+a fresh session. A later change of that default resumes without a decision. A recorded choice the profile no longer
 declares fails with `agent_option_choice_missing`, also with the flag: start a
 new session instead.
 
