@@ -32,7 +32,11 @@ Start here:
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   [remote hosts](guides/remote-hosts.md), and the
   [Tailscale overlay](guides/tailscale.md)
-  cover common configuration paths. The
+  cover common configuration paths. The [onboarding guide](guides/onboarding.md)
+  drives an onboard session: host checks with their fix owner, project, group
+  and profile proposals, the guided and automatic mode rules with the
+  non-grantable floor, and the allowlist of the `pohunek-onboard` launch
+  profile. The
   [runtime packages guide](guides/runtime-packages.md) covers installing,
   updating, selecting, disabling, and removing runtime packages with
   `pohunek plugin`; the [Pi runtime package](guides/pi-package.md) documents
