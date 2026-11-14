@@ -1285,8 +1285,20 @@ fn render_detection_status(status: &protocol::DetectionStatus) -> String {
     let age = status
         .last_evidence_age_ms
         .map_or_else(|| "none".to_owned(), |ms| format!("{ms} ms ago"));
+    let fallback = status.fallback.as_ref().map_or_else(
+        || "none".to_owned(),
+        |fallback| {
+            format!(
+                "screen {} (rule {}; record {}, {} ms old)",
+                activity_label(fallback.screen_state),
+                terminal_text(&fallback.rule_id),
+                fallback.record_state,
+                fallback.record_age_ms
+            )
+        },
+    );
     format!(
-        "state_source: {source}\nprogram status: {record}\ngate: {gate_line}\nprobe: {probe}\nlast evidence: {age}\n"
+        "state_source: {source}\nprogram status: {record}\ngate: {gate_line}\nprobe: {probe}\nlast evidence: {age}\nfallback: {fallback}\n"
     )
 }
 

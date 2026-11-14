@@ -618,6 +618,7 @@ impl ProjectorState {
                     let origin = ActivityOrigin {
                         source: Some(payload.source),
                         blocked_kind: payload.blocked_kind,
+                        fallback: payload.fallback.is_some(),
                     };
                     return self
                         .pending_activity(attention, &payload.session_id, payload.activity, origin)
@@ -658,6 +659,9 @@ impl ProjectorState {
                 ActivityOrigin {
                     source: Some(session.state_source),
                     blocked_kind: session.blocked_kind,
+                    // A snapshot carries no fallback marker: only a published
+                    // `agent_state` event does.
+                    fallback: false,
                 },
             ));
         } else {
@@ -698,13 +702,15 @@ impl ProjectorState {
         }
         // Idle from the program's status channel (`OscProgress`, normally a 7501
         // record) right after a record-backed `blocked` means the dialog closed
-        // (Esc, a denial, an auto-denial). An idle read from the screen or the
-        // title does not resolve, and neither does an idle record that follows
-        // a dialog only the screen saw: that dialog can still be waiting.
+        // (Esc, a denial, an auto-denial). A fallback idle means the screen
+        // showed no dialog for the whole staleness window, so it resolves too.
+        // An idle read from the screen or the title does not resolve, and
+        // neither does an idle record that follows a dialog only the screen
+        // saw: that dialog can still be waiting.
         let record_backed = self.record_backed_blocks.contains(session_id);
         if activity == AgentActivity::Idle
             && previous == Some(AgentActivity::Blocked)
-            && origin.source == Some(StateSource::OscProgress)
+            && (origin.source == Some(StateSource::OscProgress) || origin.fallback)
             && record_backed
         {
             self.blocked_replay_candidates.remove(session_id);
@@ -1056,6 +1062,10 @@ struct AgentStatePayload {
     source: StateSource,
     #[serde(default)]
     blocked_kind: Option<BlockedKind>,
+    /// Present while the activity was arbitrated under a stale-record
+    /// fallback; only presence matters here. A snapshot carries no marker.
+    #[serde(default)]
+    fallback: Option<serde::de::IgnoredAny>,
 }
 
 /// Where an activity reading came from: the source and, for a blocked reading
@@ -1064,6 +1074,8 @@ struct AgentStatePayload {
 struct ActivityOrigin {
     source: Option<StateSource>,
     blocked_kind: Option<BlockedKind>,
+    /// Whether the activity was arbitrated under a stale-record fallback.
+    fallback: bool,
 }
 
 /// The notification a blocked agent maps to, by what it reports waiting for.
@@ -1125,6 +1137,105 @@ where
                 "failed to parse session event for notification projector"
             );
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_id(name: &str) -> SessionId {
+        SessionId(name.to_owned())
+    }
+
+    fn record_backed_blocked() -> ActivityOrigin {
+        ActivityOrigin {
+            source: Some(StateSource::OscProgress),
+            blocked_kind: Some(BlockedKind::Permission),
+            fallback: false,
+        }
+    }
+
+    /// A non-fallback screen idle over a record-backed `blocked` sends no
+    /// resolve to the coordinator: only the program channel's own idle and
+    /// a fallback idle close the approval.
+    #[test]
+    fn a_non_fallback_screen_idle_sends_no_resolve() {
+        let (attention, mut resolves) = AttentionCoordinator::resolve_probed();
+        let mut state = ProjectorState::default();
+        let id = session_id("plain-screen-idle-sends-no-resolve");
+
+        let pending = state.pending_activity(
+            &attention,
+            &id,
+            AgentActivity::Blocked,
+            record_backed_blocked(),
+        );
+        assert!(pending.is_some(), "the blocked record opens the approval");
+        assert!(state.record_backed_blocks.contains(&id));
+
+        let pending = state.pending_activity(
+            &attention,
+            &id,
+            AgentActivity::Idle,
+            ActivityOrigin {
+                source: Some(StateSource::Screen),
+                blocked_kind: None,
+                fallback: false,
+            },
+        );
+        assert!(
+            pending.is_none(),
+            "a non-fallback screen idle derives nothing"
+        );
+        assert!(
+            resolves.resolves().is_empty(),
+            "the plain screen idle sends no resolve"
+        );
+        // The non-record idle clears the record-backed mark, so a later
+        // idle cannot resolve against it: `activity_by_session` holds the
+        // new idle, and the mark must go with the edge that replaced it.
+        assert!(
+            !state.record_backed_blocks.contains(&id),
+            "a non-record idle clears the record-backed mark"
+        );
+    }
+
+    /// The widened resolve: a fallback idle over a record-backed `blocked`
+    /// sends the resolve command to the coordinator, while a non-fallback
+    /// screen idle sends nothing. The probe counts resolves per run.
+    #[test]
+    fn a_fallback_idle_resolves_while_a_plain_screen_idle_sends_nothing() {
+        for (fallback, expected_resolves) in [(false, 0), (true, 1)] {
+            let (attention, mut receiver) = AttentionCoordinator::resolve_probed();
+            let mut state = ProjectorState::default();
+            let id = session_id("fallback-resolve");
+
+            let pending = state.pending_activity(
+                &attention,
+                &id,
+                AgentActivity::Blocked,
+                record_backed_blocked(),
+            );
+            assert!(pending.is_some(), "the blocked record opens the approval");
+            let pending = state.pending_activity(
+                &attention,
+                &id,
+                AgentActivity::Idle,
+                ActivityOrigin {
+                    source: Some(StateSource::Screen),
+                    blocked_kind: None,
+                    fallback,
+                },
+            );
+            assert!(pending.is_none(), "an idle derives no record");
+            let expected = vec![attention_dedupe_key(&id); expected_resolves];
+            assert_eq!(
+                receiver.resolves(),
+                expected,
+                "fallback={fallback}: the coordinator gets exactly the widened resolve"
+            );
         }
     }
 }

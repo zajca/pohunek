@@ -24,17 +24,25 @@ cmdline = [
 
 # Claude Code reports its root state as OSC 7501 records once the session
 # worker answers its `ESC ] 7501 ; ? ST` probe. Every supported release reports
-# them, so a held record is authoritative: it outranks stale screen evidence,
-# and a visible dialog still wins (see the program-status layer in
+# them, so a held record is authoritative while fresh: it outranks screen
+# evidence. A record that disagrees with the screen for `stale_after_ms` (a
+# blocked record over no dialog, a working record over a dialog, an idle
+# record over a spinner) is stale: the screen decides until the next record.
+# A visible dialog still wins at once (see the program-status layer in
 # docs/architecture.md). While no record is held (before the first one, and
 # after a lag resync or a reconfigure dropped it) the two working
 # rules marked `below_authority` read a running turn from the screen; a held
-# record skips them. The prompt-box rule decides input readiness. Background
-# agents report as `id=` records, which are ignored.
+# fresh record skips them. The prompt-box rule decides input readiness.
+# Background agents report as `id=` records, which are ignored.
 [program_status]
 app = "claude-code"
 answer_probe = true
 authority_from = "2.1.309"
+# A stuck record resolves within half a minute: a healthy session's next
+# record arrives within milliseconds of an answered prompt or a missed
+# `working` report, so the window never fires there, and it stays far above
+# the ~1.2 s of virtual time each detector harness feed settles.
+stale_after_ms = 30000
 
 # Live status spinner rendered above the prompt box while a turn runs, e.g.
 # "✻ Noodling… (12s · ↓ 1.2k tokens)", "✻ Herding… (3s · thinking with high

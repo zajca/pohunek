@@ -109,6 +109,45 @@ impl GateReason {
     }
 }
 
+/// A held program-status record the screen stopped agreeing with: the
+/// detector arbitrates as if no record were held until the next record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRecord {
+    /// When the record started disagreeing with the screen.
+    pub since: Instant,
+    /// The record's state when the fallback began.
+    pub record_state: String,
+    /// How old the held record was when the fallback began.
+    pub record_age: std::time::Duration,
+    /// The screen winner that replaced the record.
+    pub rule_id: String,
+    /// The activity the screen winner reports.
+    pub screen_activity: AgentActivity,
+}
+
+/// Why the staleness fallback ended; the record is authoritative again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StalenessEnd {
+    /// A newly applied root record took over.
+    Record,
+    /// The record was dropped (root `clear`, reconfigure, lag resync).
+    Cleared,
+    /// The screen agrees with the record again.
+    Agreement,
+}
+
+/// A staleness change the session loop journals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StalenessChange {
+    /// The screen replaced a stale record.
+    Began(StaleRecord),
+    /// The record is authoritative again.
+    Ended {
+        /// Why the fallback ended.
+        reason: StalenessEnd,
+    },
+}
+
 /// The evidence state of a detector, as `session.detection` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectorStatus {
@@ -119,6 +158,8 @@ pub struct DetectorStatus {
     pub gate: AuthorityGate,
     /// Time since the latest applied evidence.
     pub last_evidence_age: Option<std::time::Duration>,
+    /// The active screen fallback, when the held record is stale.
+    pub stale: Option<StaleRecord>,
 }
 
 impl DetectorStatus {
@@ -147,6 +188,12 @@ impl DetectorStatus {
             last_evidence_age_ms: self
                 .last_evidence_age
                 .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+            fallback: self.stale.map(|stale| protocol::ProgramStatusFallback {
+                record_state: stale.record_state,
+                record_age_ms: u64::try_from(stale.record_age.as_millis()).unwrap_or(u64::MAX),
+                rule_id: stale.rule_id,
+                screen_state: stale.screen_activity,
+            }),
         }
     }
 }
@@ -432,8 +479,18 @@ pub struct Detector {
     last_evidence_at: Option<Instant>,
     /// The latest root OSC 7501 record of the active manifest's app. Held until
     /// a `clear`, a reconfigure or a lag resync; it carries no expiry because
-    /// programs report on change only.
+    /// programs report on change only. A record the screen disagrees with for
+    /// the manifest's `stale_after` window arbitrates as absent instead.
     program_status: Option<ProgramStatusRecord>,
+    /// When the held record was applied; a restated record restarts the
+    /// staleness clock.
+    program_status_at: Option<Instant>,
+    /// When the record started disagreeing with the screen, when it does.
+    disagreement_since: Option<Instant>,
+    /// The active screen fallback, when the held record is stale.
+    stale: Option<StaleRecord>,
+    /// The latest staleness change, for the session loop to journal.
+    staleness_change: Option<StalenessChange>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
     /// Whether terminal context or the active manifest changed since the last
@@ -483,6 +540,10 @@ impl Detector {
             approval_notice: false,
             last_evidence_at: None,
             program_status: None,
+            program_status_at: None,
+            disagreement_since: None,
+            stale: None,
+            staleness_change: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
             context_dirty: true,
@@ -547,13 +608,13 @@ impl Detector {
         let mut latch = ChunkLatch::new(
             self.latch_gate_open(),
             recent_before.clone(),
-            self.program_status.clone(),
+            self.effective_record().cloned(),
             self.authority_gate().open,
         );
         let mut consumed = 0;
         for (item, end) in osc_events {
             self.feed_screen_segment(&bytes[consumed..end], &mut latch);
-            if self.apply_osc_event(item, &mut latch.osc_changes) {
+            if self.apply_osc_event(now, item, &mut latch.osc_changes) {
                 applied_osc_evidence = true;
                 self.sight_full_context();
                 self.latch_at_osc_point(&mut latch);
@@ -574,6 +635,7 @@ impl Detector {
             osc_title: osc_changes.title,
             osc_progress: osc_changes.progress,
         };
+        self.update_staleness(now);
         let hit = self.activity_evidence(freshness);
         let has_structured_evidence = hit.is_some();
         // Output that changes no region and applies no event restates the
@@ -589,8 +651,7 @@ impl Detector {
         // override winner also stops the latch while the held record is
         // working, because the record's own working edge is already refused.
         let record_working = self
-            .program_status
-            .as_ref()
+            .effective_record()
             .is_some_and(|record| record.state == ProgramState::Working);
         if let Some(sighted) = sighted_working {
             if hit.as_ref().is_some_and(|hit| {
@@ -637,7 +698,7 @@ impl Detector {
 
     /// Evaluates the context after a completed OSC event.
     fn latch_at_osc_point(&self, latch: &mut ChunkLatch) {
-        latch.program_status.clone_from(&self.program_status);
+        latch.program_status = self.effective_record().cloned();
         if let Some(manifest) = self.manifest.as_deref() {
             latch.evaluate(
                 manifest,
@@ -765,7 +826,12 @@ impl Detector {
     /// sequence point. A repeated identical value still counts as a fresh
     /// arrival; the value-changed flags continue to drive the debounced
     /// classification. Returns whether the event is latch-relevant evidence.
-    fn apply_osc_event(&mut self, item: OscEvidence, changes: &mut OscChanges) -> bool {
+    fn apply_osc_event(
+        &mut self,
+        now: Instant,
+        item: OscEvidence,
+        changes: &mut OscChanges,
+    ) -> bool {
         match item {
             OscEvidence::Title(title) => {
                 changes.title |= self.latest_title.as_deref() != Some(title.as_str());
@@ -790,7 +856,7 @@ impl Detector {
                 self.latest_cwd_hint = Some(path);
                 false
             }
-            OscEvidence::ProgramStatus(report) => self.apply_program_status(report),
+            OscEvidence::ProgramStatus(report) => self.apply_program_status(now, report),
         }
     }
 
@@ -799,8 +865,9 @@ impl Detector {
     ///
     /// Only a root record naming the active manifest's app is held. A report
     /// of a child (an `id=` pair) and a record of another app are ignored, and
-    /// a root `clear` drops the record.
-    fn apply_program_status(&mut self, report: ProgramStatusReport) -> bool {
+    /// a root `clear` drops the record. Any applied record restarts the
+    /// staleness clock and ends an active fallback.
+    fn apply_program_status(&mut self, now: Instant, report: ProgramStatusReport) -> bool {
         let Some(program_status) = self
             .manifest
             .as_ref()
@@ -819,13 +886,119 @@ impl Detector {
                 if record.app.as_deref() == Some(program_status.app()) =>
             {
                 self.program_status = Some(record);
+                self.program_status_at = Some(now);
+                self.disagreement_since = None;
+                self.end_staleness(now, StalenessEnd::Record);
                 true
             }
-            ProgramStatusReport::Clear => self.program_status.take().is_some(),
+            ProgramStatusReport::Clear => {
+                let dropped = self.program_status.take().is_some();
+                if dropped {
+                    self.program_status_at = None;
+                    self.disagreement_since = None;
+                    self.end_staleness(now, StalenessEnd::Cleared);
+                }
+                dropped
+            }
             ProgramStatusReport::Record(_)
             | ProgramStatusReport::Child
             | ProgramStatusReport::Probe => false,
         }
+    }
+
+    /// The record the arbitration sees: none while the screen fallback is
+    /// active.
+    fn effective_record(&self) -> Option<&ProgramStatusRecord> {
+        if self.stale.is_some() {
+            None
+        } else {
+            self.program_status.as_ref()
+        }
+    }
+
+    /// Ends the active fallback, when one is active, and hands the change to
+    /// the session loop. Re-recording the published transition without the
+    /// fallback mark (rather than clearing it in place) keeps the published
+    /// candidate and its mirror consistent: a refresh of the still-visible
+    /// state cannot restate a fallback that is over. A reconfigure drops the
+    /// state machine (and with it the published transition), so its caller
+    /// ends the staleness before replacing the state; a missing published
+    /// transition is legitimate there.
+    fn end_staleness(&mut self, now: Instant, reason: StalenessEnd) {
+        if self.stale.take().is_some() {
+            if let Some(mut unmarked) = self.state.published_transition() {
+                unmarked.fallback = false;
+                self.state.record_published(now, unmarked);
+            }
+            self.staleness_change = Some(StalenessChange::Ended { reason });
+        }
+    }
+
+    /// Advances the staleness clock over the screen evidence without the
+    /// held record, starting or ending the fallback. Returns whether the
+    /// fallback state changed.
+    fn update_staleness(&mut self, now: Instant) -> bool {
+        let Some(window) = self.stale_window() else {
+            return false;
+        };
+        let Some(held) = self.program_status.as_ref() else {
+            return false;
+        };
+        let screen_hit = self.manifest_evidence(ContextFreshness::all(), false, false);
+        let disagrees = disagrees_with_record(held, screen_hit.as_ref());
+        if disagrees {
+            let since = *self.disagreement_since.get_or_insert(now);
+            if self.stale.is_none() && now.saturating_duration_since(since) >= window {
+                let hit = screen_hit.expect("a disagreement names a screen winner");
+                let record_state = held.state.as_str().to_owned();
+                let record_age = self
+                    .program_status_at
+                    .map(|at| now.saturating_duration_since(at))
+                    .unwrap_or_default();
+                let context = self.manifest.as_ref().map(|manifest| {
+                    match_context_for(
+                        manifest,
+                        &self.screen,
+                        evaluated_title(self.latest_title.as_deref(), self.launch_name.as_deref()),
+                        self.latest_progress.as_deref(),
+                        ContextFreshness::all(),
+                    )
+                    .with_program_status_held(false)
+                    .with_authority_open(false)
+                });
+                let rule_id = context
+                    .as_ref()
+                    .and_then(|context| {
+                        self.manifest
+                            .as_ref()
+                            .and_then(|manifest| manifest.match_context(context))
+                    })
+                    .map(|matched| matched.rule_id)
+                    .unwrap_or_default();
+                let stale = StaleRecord {
+                    since,
+                    record_state,
+                    record_age,
+                    rule_id,
+                    screen_activity: hit.evidence.activity,
+                };
+                self.stale = Some(stale.clone());
+                self.staleness_change = Some(StalenessChange::Began(stale));
+                return true;
+            }
+            return false;
+        }
+        self.disagreement_since = None;
+        if self.stale.is_some() {
+            self.end_staleness(now, StalenessEnd::Agreement);
+            return true;
+        }
+        false
+    }
+
+    /// Takes the latest staleness change, if one is pending.
+    pub fn take_staleness_change(&mut self) -> Option<StalenessChange> {
+        self.staleness_change.take()
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<ActivityTransition> {
@@ -836,18 +1009,44 @@ impl Detector {
         // runtime reconfigure asks for one full visible-context recheck so cached
         // screen/OSC context can publish under the newly active manifest.
         // A pending candidate needs repeated observations to confirm, so it
-        // keeps evaluating even over unchanged context.
-        if self.context_dirty || self.needs_visible_recheck || self.state.has_pending() {
+        // keeps evaluating even over unchanged context. A pending staleness
+        // deadline evaluates too: a record over an unchanged screen still
+        // expires, so the clock cannot stall.
+        let staleness_due = self.stale_window().is_some_and(|window| {
+            self.program_status.is_some()
+                && self.stale.is_none()
+                && self
+                    .disagreement_since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= window)
+        });
+        if self.context_dirty
+            || self.needs_visible_recheck
+            || self.state.has_pending()
+            || staleness_due
+        {
+            let stale_changed = self.update_staleness(now);
+            let held = self.effective_record().is_some();
             let screen_hit = self.manifest_evidence(
                 ContextFreshness::all(),
-                self.program_status.is_some(),
-                self.authority_gate().open && self.program_status.is_some(),
+                held,
+                self.authority_gate().open && held,
             );
             if let Some(hit) = &screen_hit {
                 self.sight_visible_blocker(hit);
             }
-            if let Some(hit) = overlay_program_status(self.program_status.as_ref(), screen_hit) {
-                if hit.evidence.activity != AgentActivity::Working || self.needs_visible_recheck {
+            if let Some(mut hit) = overlay_program_status(self.effective_record(), screen_hit) {
+                // A stale record arbitrates as absent, so a screen hit
+                // computed while the fallback lasts carries it.
+                if self.stale.is_some() {
+                    hit.evidence.fallback = true;
+                }
+                // A fallback that the new evaluation just started publishes
+                // whatever it arbitrates, including a working screen over a
+                // stale record the tick would otherwise skip.
+                if hit.evidence.activity != AgentActivity::Working
+                    || self.needs_visible_recheck
+                    || stale_changed
+                {
                     push_transition(
                         &mut transitions,
                         self.state.observe_evidence(now, hit.evidence),
@@ -859,6 +1058,14 @@ impl Detector {
         self.needs_visible_recheck = false;
         push_transition(&mut transitions, self.state.tick(now));
         transitions
+    }
+
+    /// The manifest's staleness window, when one is declared.
+    fn stale_window(&self) -> Option<std::time::Duration> {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.program_status())
+            .and_then(ProgramStatusConfig::stale_after)
     }
 
     /// Whether terminal output identifies an editable agent input reader.
@@ -898,6 +1105,11 @@ impl Detector {
 
     /// Switches detector tuning and manifest without clearing terminal context.
     pub fn reconfigure(&mut self, now: Instant, config: DetectorConfig) {
+        // The state replacement below drops the published transition, so the
+        // fallback ends first while it is still there to unmark. A reconfigure
+        // during an active fallback is a plain end: the new manifest decides
+        // what the next evidence publishes.
+        self.end_staleness(now, StalenessEnd::Cleared);
         self.context_dirty = true;
         self.state = StateMachine::new(now, config.detection);
         self.manifest = config.manifest;
@@ -911,6 +1123,8 @@ impl Detector {
             self.screen.finish_observation();
         }
         self.program_status = None;
+        self.program_status_at = None;
+        self.disagreement_since = None;
         self.process_activity.reset();
         self.state.clear_pending();
         self.needs_visible_recheck = true;
@@ -933,6 +1147,15 @@ impl Detector {
         self.latest_progress = None;
         self.latest_cwd_hint = None;
         self.program_status = None;
+        self.program_status_at = None;
+        self.disagreement_since = None;
+        // No `now` is in scope here; the state machine stays, so its
+        // `emitted_at` remains the honest refresh timestamp.
+        if self.stale.take().is_some() {
+            self.staleness_change = Some(StalenessChange::Ended {
+                reason: StalenessEnd::Cleared,
+            });
+        }
         self.screen.reset();
         self.needs_visible_recheck = false;
         // The context these sequence points name is gone; only fresh arrivals
@@ -972,6 +1195,7 @@ impl Detector {
             last_evidence_age: self
                 .last_evidence_at
                 .map(|at| now.saturating_duration_since(at)),
+            stale: self.stale.clone(),
         }
     }
 
@@ -1065,19 +1289,24 @@ impl Detector {
     fn activity_evidence(&self, freshness: ContextFreshness) -> Option<ManifestEvidenceHit> {
         // A held record is arbitrated against the whole screen: a dialog that
         // stays visible while the chunk changes nothing on screen must still win.
-        let freshness = if self.program_status.is_some() {
+        let held = self.effective_record().is_some();
+        let freshness = if held {
             ContextFreshness::all()
         } else {
             freshness
         };
-        overlay_program_status(
-            self.program_status.as_ref(),
-            self.manifest_evidence(
-                freshness,
-                self.program_status.is_some(),
-                self.authority_gate().open && self.program_status.is_some(),
-            ),
-        )
+        let mut hit = overlay_program_status(
+            self.effective_record(),
+            self.manifest_evidence(freshness, held, self.authority_gate().open && held),
+        );
+        // A stale record arbitrates as absent, so a screen hit computed while
+        // the fallback lasts carries it.
+        if let Some(hit) = hit.as_mut() {
+            if self.stale.is_some() {
+                hit.evidence.fallback = true;
+            }
+        }
+        hit
     }
 
     fn manifest_evidence(
@@ -1366,6 +1595,7 @@ fn manifest_hit(
             activity: matched.activity,
             source,
             blocked_kind: None,
+            fallback: false,
         },
         visible_blocker: matched.visible_blocker,
         overrides_program_status: matched.overrides_program_status,
@@ -1433,6 +1663,37 @@ impl ReadinessObserver<'_> {
 /// Region name of the program-status preview in `session.detection`.
 const PROGRAM_STATUS_REGION: &str = "program_status";
 
+/// Whether the held record disagrees with the screen winner evaluated
+/// without the record. The window governs only the no-dialog direction; a
+/// known dialog still wins at once through the arbitration itself. No screen
+/// winner means no fallback: the clock does not run.
+fn disagrees_with_record(
+    record: &ProgramStatusRecord,
+    screen: Option<&ManifestEvidenceHit>,
+) -> bool {
+    let Some(hit) = screen else {
+        return false;
+    };
+    let screen = hit.evidence.activity;
+    match record.state {
+        ProgramState::Blocked(_) => {
+            // An agreeing dialog or weak blocker keeps the record; the
+            // fallback covers the cases where the screen reads idle or
+            // working while nothing waits.
+            !matches!(screen, AgentActivity::Blocked)
+        }
+        ProgramState::Working => {
+            matches!(
+                screen,
+                AgentActivity::Blocked if !hit.visible_blocker
+            )
+        }
+        ProgramState::Done | ProgramState::Idle | ProgramState::Error => {
+            matches!(screen, AgentActivity::Working)
+        }
+    }
+}
+
 /// Arbitrates the screen winner with the held program-status record.
 ///
 /// A visible blocker wins over every record. Over a `blocked` record only a
@@ -1459,6 +1720,7 @@ fn overlay_program_status(
             activity,
             source: StateSource::OscProgress,
             blocked_kind,
+            fallback: false,
         },
         visible_blocker,
         overrides_program_status: false,
@@ -1728,6 +1990,7 @@ mod tests {
             activity,
             source,
             blocked_kind: None,
+            fallback: false,
         }
     }
 

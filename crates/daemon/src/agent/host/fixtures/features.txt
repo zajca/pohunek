@@ -15,3 +15,4 @@ package-context-v1 0.41.0
 version-probe-open-range-v1 0.42.0
 detect-composer-absent-v1 0.42.0
 agent-skill-v1 0.42.0
+program-status-staleness-v1 0.43.0

@@ -247,6 +247,11 @@ impl Manifest {
     }
 }
 
+/// Upper bound of the `[program_status] stale_after_ms` window in
+/// milliseconds. An hour bounds a stuck record; a longer window is not a
+/// fallback.
+const MAX_STALE_AFTER_MS: u64 = 3_600_000;
+
 /// Settings compiled from a manifest `[program_status]` table.
 ///
 /// The table opts the runtime in to OSC 7501 program-status evidence.
@@ -260,6 +265,9 @@ pub struct ProgramStatusConfig {
     /// The first runtime release whose records are authoritative. Absent: the
     /// records are authoritative for every release.
     authority_from: Option<ProbeVersion>,
+    /// How long a held record may disagree with the screen before the screen
+    /// decides. Absent: a held record never expires.
+    stale_after: Option<std::time::Duration>,
 }
 
 impl ProgramStatusConfig {
@@ -275,10 +283,20 @@ impl ProgramStatusConfig {
                     .ok_or(ManifestError::InvalidProgramStatusAuthority { value })
             })
             .transpose()?;
+        let stale_after = raw
+            .stale_after_ms
+            .map(|value| {
+                if value == 0 || value > MAX_STALE_AFTER_MS {
+                    return Err(ManifestError::InvalidProgramStatusStaleAfter { value });
+                }
+                Ok(std::time::Duration::from_millis(value))
+            })
+            .transpose()?;
         Ok(Self {
             app: raw.app,
             answer_probe: raw.answer_probe.unwrap_or(false),
             authority_from,
+            stale_after,
         })
     }
 
@@ -292,6 +310,13 @@ impl ProgramStatusConfig {
     #[must_use]
     pub fn app(&self) -> &str {
         &self.app
+    }
+
+    /// How long a held record may disagree with the screen before the
+    /// screen decides. Absent: a held record never expires.
+    #[must_use]
+    pub fn stale_after(&self) -> Option<std::time::Duration> {
+        self.stale_after
     }
 
     /// Whether the session worker answers the runtime's 7501 probe.

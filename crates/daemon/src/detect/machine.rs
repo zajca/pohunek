@@ -9,6 +9,8 @@ pub struct ActivityEvidence {
     /// What a blocked agent waits for, when its status record says so
     /// (`Unspecified` for a record that names no kind).
     pub blocked_kind: Option<BlockedKind>,
+    /// Whether the activity was arbitrated under a stale-record fallback.
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +20,8 @@ pub struct ActivityTransition {
     /// What a blocked agent waits for, when its status record says so
     /// (`Unspecified` for a record that names no kind).
     pub blocked_kind: Option<BlockedKind>,
+    /// Whether the activity was arbitrated under a stale-record fallback.
+    pub fallback: bool,
 }
 
 /// Tuning for the debounced detection state machine.
@@ -139,6 +143,7 @@ impl StateMachine {
                 activity: AgentActivity::Working,
                 source: StateSource::Process,
                 blocked_kind: None,
+                fallback: false,
             },
         )
     }
@@ -300,7 +305,17 @@ impl StateMachine {
         transition
     }
 
-    fn record_published(&mut self, now: Instant, transition: ActivityTransition) {
+    /// The last published transition, without disturbing the refresh clock.
+    /// The detector re-records it without the fallback mark when the
+    /// staleness fallback ends.
+    #[must_use]
+    pub fn published_transition(&self) -> Option<ActivityTransition> {
+        self.published.map(|published| published.transition)
+    }
+
+    /// Records a published transition with a fresh refresh timestamp. Only
+    /// the detector calls it, when the staleness fallback ends.
+    pub(crate) fn record_published(&mut self, now: Instant, transition: ActivityTransition) {
         self.published = Some(PublishedState {
             transition,
             emitted_at: now,
@@ -327,6 +342,7 @@ impl From<ActivityEvidence> for ActivityTransition {
             activity: evidence.activity,
             source: evidence.source,
             blocked_kind: evidence.blocked_kind,
+            fallback: evidence.fallback,
         }
     }
 }
@@ -386,6 +402,7 @@ mod tests {
             activity,
             source,
             blocked_kind: None,
+            fallback: false,
         }
     }
 
@@ -394,6 +411,7 @@ mod tests {
             activity,
             source,
             blocked_kind: None,
+            fallback: false,
         }
     }
 

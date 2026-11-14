@@ -3,6 +3,7 @@
 import type { ActivityRevision } from "./ActivityRevision";
 import type { AgentActivity } from "./AgentActivity";
 import type { BlockedKind } from "./BlockedKind";
+import type { ProgramStatusFallback } from "./ProgramStatusFallback";
 import type { SessionId } from "./SessionId";
 import type { SessionRuntimeIdentity } from "./SessionRuntimeIdentity";
 import type { StateSource } from "./StateSource";
@@ -40,4 +41,11 @@ export type AgentStateEvent = {
    * Exact monotonic revision within [`Self::activity_epoch`].
    */
   revision?: ActivityRevision;
+  /**
+   * The stale-record fallback the activity was arbitrated under, frozen
+   * when the fallback began. Present on every `agent_state` event whose
+   * activity comes from a fallback. Added without a protocol bump: an
+   * older reader ignores it.
+   */
+  fallback?: ProgramStatusFallback;
 };

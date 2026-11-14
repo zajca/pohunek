@@ -79,14 +79,15 @@ use pohunek_service_config::preflight::CODE_WORKER_MARKER_LEGACY;
 use pohunek_worker_protocol::LaunchProcess;
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, BackgroundStateEvent,
-    BlockedKind, CwdSource, ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId,
-    RuntimeInventoryEntry, RuntimeRef, RuntimeState, SessionAttachParams, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionNewParams,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, ATTENTION_CHILDREN_ISOLATE,
+    BlockedKind, CwdSource, ErrorClass, Event, ProgramStatusFallback, ProjectRemoveResult,
+    ProtocolError, RuntimeId, RuntimeInventoryEntry, RuntimeRef, RuntimeState, SessionAttachParams,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionNewParams, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionRuntime,
+    SessionRuntimeIdentity, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWarning, StateSource, SubagentInfo, SubagentLifecycle, SubagentRevision,
+    UnconfirmedProcess, WorktreeRemoveResult, ATTENTION_CHILDREN_ISOLATE,
     ATTENTION_CHILDREN_METADATA_KEY, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -1359,6 +1360,7 @@ struct ActivityEvidence {
     activity: AgentActivity,
     source: StateSource,
     blocked_kind: Option<BlockedKind>,
+    fallback: Option<ProgramStatusFallback>,
     runtime: SessionRuntimeIdentity,
     activity_epoch: String,
     revision: ActivityRevision,
@@ -1375,6 +1377,7 @@ impl ActivityEvidence {
             runtime: Some(self.runtime.clone()),
             activity_epoch: Some(self.activity_epoch.clone()),
             revision: Some(self.revision),
+            fallback: self.fallback.clone(),
         }
     }
 }
@@ -1430,6 +1433,7 @@ fn record_activity_evidence(
     activity: AgentActivity,
     source: StateSource,
     blocked_kind: Option<BlockedKind>,
+    fallback: Option<ProgramStatusFallback>,
     activity_epoch: &str,
 ) -> Option<ActivityEvidence> {
     entry.activity_revision = entry
@@ -1441,6 +1445,7 @@ fn record_activity_evidence(
         activity,
         source,
         blocked_kind,
+        fallback,
         runtime,
         activity_epoch: activity_epoch.to_owned(),
         revision: ActivityRevision::new(entry.activity_revision),
@@ -5303,7 +5308,14 @@ impl SessionRegistry {
                 .as_ref()
                 .map(|runtime| runtime.runtime_generation),
         });
-        record_activity_evidence(entry, activity, StateSource::Report, None, activity_epoch)
+        record_activity_evidence(
+            entry,
+            activity,
+            StateSource::Report,
+            None,
+            None,
+            activity_epoch,
+        )
     }
 
     /// Record the active nested agent currently owning a live session.

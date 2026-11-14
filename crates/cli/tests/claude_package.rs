@@ -99,7 +99,7 @@ const GOLDEN_MANIFEST_NAME: &str = "claude";
 const PACKAGE_ID: &str = "pohunek.runtime.claude";
 
 /// Version of the package the descriptor declares.
-const PACKAGE_VERSION: &str = "2.1.0";
+const PACKAGE_VERSION: &str = "2.2.0";
 
 /// Package version the golden built-in descriptor declares.
 const GOLDEN_PACKAGE_VERSION: &str = "1.0.0";
@@ -819,8 +819,8 @@ fn the_package_descriptor_file_equals_the_builtin_descriptor_file() {
     assert_eq!(agent_skill["dir"].as_str(), Some("skills"));
     assert_eq!(
         package["requires"].as_array().map(Vec::len),
-        Some(4),
-        "the descriptor requires exactly the naming, placement, program-status gate and agent skill features"
+        Some(5),
+        "the descriptor requires exactly the naming, placement, program-status gate, agent skill and staleness features"
     );
     package.remove("requires");
     // `ready` is the one key the package declares that v0.34.2 does not: the
@@ -918,6 +918,7 @@ fn the_package_manifest_file_is_the_golden_manifest_with_the_613_rules() {
             ("app".to_owned(), "claude-code".into()),
             ("answer_probe".to_owned(), true.into()),
             ("authority_from".to_owned(), "2.1.309".into()),
+            ("stale_after_ms".to_owned(), 30000.into()),
         ]))
     );
     assert_eq!(

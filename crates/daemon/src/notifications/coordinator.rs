@@ -183,6 +183,21 @@ impl AttentionCoordinator {
         )
     }
 
+    /// Create a handle whose resolve commands a test drains through the
+    /// returned probe; no task consumes them.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn resolve_probed() -> (Self, ResolveProbe) {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                commands,
+                as_of: None,
+            },
+            ResolveProbe(receiver),
+        )
+    }
+
     /// Create a handle with no backing task, for tests that never exercise debounce.
     ///
     /// `defer`/`resolve` become silent no-ops because the receiver is dropped, so
@@ -215,6 +230,25 @@ impl DeferProbe {
             }
         }
         count
+    }
+}
+
+/// Collects the resolve keys sent through a
+/// [`AttentionCoordinator::resolve_probed`] handle.
+#[cfg(test)]
+pub(crate) struct ResolveProbe(mpsc::UnboundedReceiver<Command>);
+
+#[cfg(test)]
+impl ResolveProbe {
+    /// The dedupe keys resolved since the last call.
+    pub(crate) fn resolves(&mut self) -> Vec<String> {
+        let mut keys = Vec::new();
+        while let Ok(command) = self.0.try_recv() {
+            if let Command::Resolve(key, _as_of) = command {
+                keys.push(key);
+            }
+        }
+        keys
     }
 }
 

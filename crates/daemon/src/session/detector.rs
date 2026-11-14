@@ -101,6 +101,39 @@ fn apply_detector_config(
     *applied_generation = update.generation;
 }
 
+/// Journals a staleness change on the program-status gate target, naming the
+/// record state and the screen winner but never the record's text.
+fn log_staleness_change(id: &SessionId, change: Option<crate::detect::StalenessChange>) {
+    use crate::detect::StalenessChange;
+    match change {
+        None => {}
+        Some(StalenessChange::Began(stale)) => {
+            tracing::info!(
+                target: "session.program_status.gate",
+                session = %id.0,
+                record_state = stale.record_state,
+                record_age_ms = stale.record_age.as_millis(),
+                rule_id = stale.rule_id,
+                screen_state = stale.screen_activity.as_str(),
+                "held program-status record is stale; the screen decides"
+            );
+        }
+        Some(StalenessChange::Ended { reason }) => {
+            let reason = match reason {
+                crate::detect::StalenessEnd::Record => "record",
+                crate::detect::StalenessEnd::Cleared => "cleared",
+                crate::detect::StalenessEnd::Agreement => "agreement",
+            };
+            tracing::info!(
+                target: "session.program_status.gate",
+                session = %id.0,
+                reason,
+                "program-status record authoritative again"
+            );
+        }
+    }
+}
+
 fn reply_to_preview(
     detector: &mut Detector,
     tick: &mut tokio::time::Interval,
@@ -197,15 +230,21 @@ impl SessionRegistry {
                             input_ready.send_replace(detector.input_ready());
                         }
                         for transition in detector.tick(crate::time::now()) {
+                            let fallback = transition
+                                .fallback
+                                .then(|| current_fallback(&detector))
+                                .flatten();
                             registry
                                 .record_detector_activity(
-                                &id,
-                                &runtime,
-                                applied_config_generation,
-                                transition,
-                            )
+                                    &id,
+                                    &runtime,
+                                    applied_config_generation,
+                                    transition,
+                                    fallback,
+                                )
                                 .await;
                         }
+                        log_staleness_change(&id, detector.take_staleness_change());
                         // Flush a folded lag batch whose window has elapsed, so a
                         // session that stopped lagging still reports its summary.
                         if let Some(warn_kind) = lag_warn.poll(crate::time::now()) {
@@ -233,13 +272,18 @@ impl SessionRegistry {
                                     input_ready.send_replace(detector.input_ready());
                                 }
                                 for transition in transitions {
+                                    let fallback = transition
+                                        .fallback
+                                        .then(|| current_fallback(&detector))
+                                        .flatten();
                                     registry
                                         .record_detector_activity(
-                                &id,
-                                &runtime,
-                                applied_config_generation,
-                                transition,
-                            )
+                                            &id,
+                                            &runtime,
+                                            applied_config_generation,
+                                            transition,
+                                            fallback,
+                                        )
                                         .await;
                                 }
                                 if detector.take_approval_notice()
@@ -258,6 +302,7 @@ impl SessionRegistry {
                                         .record_cwd_hint_scoped(&id, path, Some(&runtime))
                                         .await;
                                 }
+                                log_staleness_change(&id, detector.take_staleness_change());
                             }
                             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                                 // Skipped chunks are output too.
@@ -347,7 +392,8 @@ impl SessionRegistry {
 
     #[cfg(test)]
     pub(super) async fn record_activity(&self, id: &SessionId, transition: ActivityTransition) {
-        self.record_activity_scoped(id, None, transition).await;
+        self.record_activity_scoped(id, None, transition, None)
+            .await;
     }
 
     /// Binds where approval notices on session terminals become attention.
@@ -414,9 +460,15 @@ impl SessionRegistry {
         expected: &RuntimeWatchIdentity,
         config_generation: u64,
         transition: ActivityTransition,
+        fallback: Option<protocol::ProgramStatusFallback>,
     ) {
-        self.record_activity_scoped(id, Some((expected, config_generation)), transition)
-            .await;
+        self.record_activity_scoped(
+            id,
+            Some((expected, config_generation)),
+            transition,
+            fallback,
+        )
+        .await;
     }
 
     async fn record_activity_scoped(
@@ -424,6 +476,7 @@ impl SessionRegistry {
         id: &SessionId,
         expected: Option<(&RuntimeWatchIdentity, u64)>,
         transition: ActivityTransition,
+        fallback: Option<protocol::ProgramStatusFallback>,
     ) {
         let activity_epoch = self.daemon_instance_id().to_owned();
         let updated = {
@@ -512,6 +565,7 @@ impl SessionRegistry {
                 transition.activity,
                 transition.source,
                 transition.blocked_kind,
+                fallback.clone(),
                 &activity_epoch,
             );
             let rescan = (transition.activity == AgentActivity::Working)
@@ -531,6 +585,23 @@ impl SessionRegistry {
         );
         self.publish(event);
     }
+}
+
+/// The fallback descriptor of the detector's active staleness fallback, when
+/// one is active. A transition that starts a fallback always changes the
+/// source (the record's `osc_progress` to the screen's), so it is never
+/// swallowed as a restatement and the frozen values stay the same on every
+/// restated event. `None` when the fallback already ended (a refresh of the
+/// still-visible state must never carry a marker for a fallback that is
+/// over); the loop never panics on the detector task path.
+fn current_fallback(detector: &Detector) -> Option<protocol::ProgramStatusFallback> {
+    let stale = detector.status(crate::time::now()).stale?;
+    Some(protocol::ProgramStatusFallback {
+        record_state: stale.record_state,
+        record_age_ms: u64::try_from(stale.record_age.as_millis()).unwrap_or(u64::MAX),
+        rule_id: stale.rule_id,
+        screen_state: stale.screen_activity,
+    })
 }
 
 #[cfg(test)]

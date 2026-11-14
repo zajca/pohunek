@@ -142,6 +142,7 @@ export type { ProcessExit } from "./ProcessExit";
 export type { ProcessStartIdentity } from "./ProcessStartIdentity";
 export type { ProfileAudience } from "./ProfileAudience";
 export type { ProfileDigest } from "./ProfileDigest";
+export type { ProgramStatusFallback } from "./ProgramStatusFallback";
 export type { ProjectActionParams } from "./ProjectActionParams";
 export type { ProjectActionResult } from "./ProjectActionResult";
 export type { ProjectActionsParams } from "./ProjectActionsParams";
