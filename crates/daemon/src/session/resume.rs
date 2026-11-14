@@ -10,6 +10,7 @@ use super::{
     ValidatedLaunchProgram,
 };
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
@@ -1427,12 +1428,16 @@ fn adopted_profile_matches_in(
         return Ok(false);
     }
     let launch = (binding.program.as_str(), binding.args.as_slice());
+    // A session records no option choices; every option takes its
+    // default.
+    let recorded = BTreeMap::new();
     if built_in {
         return profiles.frozen_builtin_matches(
             name,
             stored,
             launch,
             (&package.id, package_digest),
+            &recorded,
             frozen,
         );
     }
@@ -1454,10 +1459,21 @@ fn adopted_profile_matches_in(
     // A profile repinned while the session was recovering is recorded under the
     // frozen binding with its new pin, so the text as it stands reproduces the
     // frozen revision.
-    Ok(
-        profiles.frozen_package_matches(name, stored, launch, (&launched, &served), frozen)?
-            || profiles.frozen_package_matches(name, stored, launch, (&served, &served), frozen)?,
-    )
+    Ok(profiles.frozen_package_matches(
+        name,
+        stored,
+        launch,
+        (&launched, &served),
+        &recorded,
+        frozen,
+    )? || profiles.frozen_package_matches(
+        name,
+        stored,
+        launch,
+        (&served, &served),
+        &recorded,
+        frozen,
+    )?)
 }
 
 /// Whether a profile that a release step repinned still matches the revision
@@ -1506,11 +1522,14 @@ fn repinned_profile_matches_in(
         package: frozen_package.id.clone(),
         digest: frozen_digest.clone(),
     };
+    // A session records no option choices; every option takes its
+    // default.
     profiles.frozen_package_matches(
         name,
         stored,
         (binding.program.as_str(), binding.args.as_slice()),
         (&launched, &current),
+        &BTreeMap::new(),
         frozen,
     )
 }

@@ -21,7 +21,9 @@ mod native_launch;
 mod native_reference;
 pub(crate) mod profile;
 
-pub(crate) use credential::{credential_arg_problem, credential_literal_problem};
+pub(crate) use credential::{
+    credential_arg_problem, credential_literal_problem, credential_name_problem,
+};
 pub use launch_env::LaunchEnv;
 pub use native_launch::{
     NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,

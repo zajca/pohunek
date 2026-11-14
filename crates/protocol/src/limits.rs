@@ -74,6 +74,31 @@ pub const MAX_SESSION_SECRET_ENV_VALUE_BYTES: usize = 16 * 1024;
 /// bounded.
 pub const MAX_PROFILE_DISPLAY_NAME_BYTES: usize = 128;
 
+/// Maximum options one agent profile declares under `[options]`.
+///
+/// An option is one picker in a launch form (model, effort, permission
+/// mode); 16 covers every runtime flag group a profile offers while keeping
+/// `host.inspect` entries and the `session.new` selection map bounded.
+pub const MAX_PROFILE_OPTIONS: usize = 16;
+
+/// Maximum choices one profile option declares.
+///
+/// A choice is one entry of a closed enumeration; 32 fits every model or
+/// mode list a runtime offers and bounds the schema `host.inspect` reports.
+pub const MAX_PROFILE_OPTION_CHOICES: usize = 32;
+
+/// Maximum bytes of a profile option id or choice id.
+///
+/// Ids are machine names a `session.new` request and a session record carry;
+/// 64 bytes fits a descriptive name and bounds both.
+pub const MAX_PROFILE_OPTION_ID_BYTES: usize = 64;
+
+/// Maximum UTF-8 bytes of a profile option or choice label, after trimming.
+///
+/// A label is the short text of one picker or picker entry; 64 bytes keeps
+/// a form row on one line.
+pub const MAX_PROFILE_OPTION_LABEL_BYTES: usize = 64;
+
 /// Maximum UTF-8 bytes in one `secret_env` variable name.
 ///
 /// Matches the portable environment-name bound used for launch environments.

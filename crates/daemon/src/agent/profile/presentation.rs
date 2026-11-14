@@ -7,12 +7,17 @@
 //! or removing a label never changes a profile revision and never invalidates
 //! a relay approval. A profile without either key resolves exactly as before,
 //! with an absent `audience` meaning the owner audience.
+//!
+//! The module also builds the revision text ([`revision_text`]), which for a
+//! profile that declares options digests the choices a launch selected.
 
 use std::borrow::Cow;
 
 use protocol::MAX_PROFILE_DISPLAY_NAME_BYTES;
 use serde::Deserialize;
-use toml_edit::ImDocument;
+use toml_edit::{DocumentMut, ImDocument};
+
+use super::options::SelectedChoices;
 
 /// A parsed profile `display_name`: trimmed free text the daemon validated
 /// on load. Custom [`Deserialize`] rejects a non-string, an empty or
@@ -196,14 +201,47 @@ impl<'de> Deserialize<'de> for ProfileAudience {
 /// `DocumentMut` round-trip that rewrites layout), while this cut is
 /// byte-preserving by design: only the label lines themselves leave, so a
 /// label-only edit never moves the digest but any other text change does.
-/// This is the single place that builds the revision text; later profile
-/// keys extend it here.
+/// This is the single place that builds the revision text.
 ///
 /// The `editing_only_labels` scenarios pin which layout the cut claims:
 /// editing a label value, or adding only a label line, keeps the revision,
 /// while adding a comment or a blank line as its own line around the
 /// labels is a real file change and the revision moves with it.
-pub(crate) fn revision_text(original: &str) -> Result<Cow<'_, str>, String> {
+///
+/// A profile whose root table holds `options` digests its effective launch
+/// instead: the text re-rendered through [`toml_edit`] without the label keys
+/// and the `options` table, followed by the `selected` choices (see
+/// [`SelectedChoices`]). That rendering is lossy (it may rewrite layout), so
+/// it applies only to profiles that declare options; a profile without an
+/// `options` key, even one that mentions the word elsewhere, takes the
+/// byte-preserving label cut and keeps every revision frozen before options
+/// existed. `selected` is ignored for such a profile.
+pub(crate) fn revision_text<'a>(
+    original: &'a str,
+    selected: &SelectedChoices,
+) -> Result<Cow<'a, str>, String> {
+    if original.contains(OPTIONS_KEY) {
+        let mut document: DocumentMut = original
+            .parse()
+            .map_err(|error: toml_edit::TomlError| unparsable(original, &error, OPTIONS_KEY))?;
+        if document.as_table().contains_key(OPTIONS_KEY) {
+            for key in ["display_name", "audience", OPTIONS_KEY] {
+                document.remove(key);
+            }
+            let mut text = document.to_string();
+            text.push_str(&selected.revision_suffix()?);
+            return Ok(Cow::Owned(text));
+        }
+    }
+    without_labels(original)
+}
+
+/// Root key of the profile options table.
+const OPTIONS_KEY: &str = "options";
+
+/// `original` with the `display_name` and `audience` label lines cut out,
+/// byte for byte otherwise; see [`revision_text`].
+fn without_labels(original: &str) -> Result<Cow<'_, str>, String> {
     if !original.contains("display_name") && !original.contains("audience") {
         return Ok(Cow::Borrowed(original));
     }
@@ -217,12 +255,8 @@ pub(crate) fn revision_text(original: &str) -> Result<Cow<'_, str>, String> {
     let mut text = Cow::Borrowed(original);
     for key in ["display_name", "audience"] {
         let parsed = text.clone().into_owned();
-        let document = ImDocument::parse(parsed.as_str()).map_err(|error| {
-            let line = parsed
-                .get(..error.span().map_or(0, |span| span.start))
-                .map_or(1, |head| head.matches('\n').count() + 1);
-            format!("line {line}: `{key}` keeps the revision text unparsable")
-        })?;
+        let document =
+            ImDocument::parse(parsed.as_str()).map_err(|error| unparsable(&parsed, &error, key))?;
         if let Some(span) = label_line_span(&document, &parsed, key) {
             let mut cut = String::with_capacity(parsed.len() - span.len());
             cut.push_str(&parsed[..span.start]);
@@ -231,6 +265,15 @@ pub(crate) fn revision_text(original: &str) -> Result<Cow<'_, str>, String> {
         }
     }
     Ok(text)
+}
+
+/// The revision-text error for `text` that does not parse while `key` is cut
+/// from it: the line and the key name, never a value.
+fn unparsable(text: &str, error: &toml_edit::TomlError, key: &str) -> String {
+    let line = text
+        .get(..error.span().map_or(0, |span| span.start))
+        .map_or(1, |head| head.matches('\n').count() + 1);
+    format!("line {line}: `{key}` keeps the revision text unparsable")
 }
 
 /// The byte range of the `key` label's own line in `text`, or `None` when

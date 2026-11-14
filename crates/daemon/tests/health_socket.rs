@@ -7,6 +7,8 @@
 //! response carries the daemon and protocol versions. It also covers
 //! stale-socket recovery and the `method_not_found` path.
 
+#[path = "health_socket/agent_options.rs"]
+mod agent_options;
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
 #[path = "health_socket/branch_source.rs"]

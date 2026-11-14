@@ -15,7 +15,7 @@
 //! package explicitly with the `package` and `digest` keys and resolves from
 //! exactly that digest; a profile over a built-in base carries neither key.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +83,10 @@ struct RawProfile {
     /// Presentation only: never in the revision.
     #[serde(default)]
     audience: Option<presentation::ProfileAudience>,
+    /// Launch options by option id: closed enumerations whose selected
+    /// choices add args and env to the launch (see [`options`]).
+    #[serde(default)]
+    options: BTreeMap<String, options::RawOption>,
 }
 
 /// A profile env value. Deserializing a non-string fails with a fixed message
@@ -187,11 +191,13 @@ struct RawResume {
 pub(crate) struct ResolvedProfile {
     /// Launch program (resolved on PATH at launch, like a base kind's program).
     pub program: String,
-    /// Launch args.
+    /// Launch args: the profile's `args`, then the args of each selected
+    /// option choice in option-id order.
     pub args: Vec<String>,
     /// PTY env from the profile's `[env]` table, with every `POHUNEK_`-prefixed
-    /// key already stripped. Secret-bearing: its `Debug` form is redacted and
-    /// it never reaches the store.
+    /// key already stripped, followed by the env of each selected option
+    /// choice. Secret-bearing: its `Debug` form is redacted and it never
+    /// reaches the store.
     pub env: LaunchEnv,
     /// Names of the secret variables every launch of this profile must fill,
     /// sorted. Empty ⇒ the profile takes no secret variables.
@@ -209,7 +215,14 @@ pub(crate) struct ResolvedProfile {
     pub display_name: Option<String>,
     /// Picker audience from the profile's `audience` key; absent means owner.
     pub audience: Option<protocol::ProfileAudience>,
-    /// Digest of the profile's launch inputs; the source of its revision.
+    /// The options the profile declares, in id order.
+    #[expect(dead_code, reason = "first read by host.inspect")]
+    pub options: Vec<options::DeclaredOption>,
+    /// Every declared option with the choice this resolution took, defaults
+    /// included; empty for a profile without options.
+    pub selected: BTreeMap<String, String>,
+    /// Digest of the profile's launch inputs, selected choices included; the
+    /// source of its revision.
     pub inputs: ProfileInputs,
 }
 
@@ -281,6 +294,17 @@ impl ResolvedAgent {
             }
         }
         Ok(bound)
+    }
+
+    /// Every option of the profile this agent resolved from with the choice
+    /// the resolution took, defaults included; empty for a bare runtime.
+    #[must_use]
+    #[expect(dead_code, reason = "first read by session.new")]
+    pub(crate) fn agent_options(&self) -> BTreeMap<String, String> {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.selected.clone())
+            .unwrap_or_default()
     }
 
     /// The launch inputs of the host profile this agent resolved from; `None`
@@ -627,21 +651,24 @@ impl ProfileRegistry {
     ///
     /// The pin keys are removed from the text, the manifest is read as a launch
     /// reads it, and `stored`, `program` and `args` stand in for the binding and
-    /// launch of the base runtime. A pin the profile carries must name the
-    /// package `served` that now serves the runtime, or the revision does not
-    /// match.
+    /// launch of the base runtime. The option choices are the session's
+    /// recorded `selected` ids, every other option taking its default. A pin
+    /// the profile carries must name the package `served` that now serves the
+    /// runtime, or the revision does not match.
     ///
     /// # Errors
     ///
     /// Returns the profile read errors, `agent_profile_not_found` without a
-    /// profile directory and `agent_profile_revision_unavailable` when the
-    /// revision key cannot be read.
+    /// profile directory, `agent_option_choice_missing` for a recorded choice
+    /// the profile no longer declares and `agent_profile_revision_unavailable`
+    /// when the revision key cannot be read.
     pub(crate) fn frozen_builtin_matches(
         &self,
         name: &str,
         stored: &LaunchBinding,
         launch: (&str, &[String]),
         served: (&PackageId, &PackageDigest),
+        selected: &BTreeMap<String, String>,
         frozen: &ProfileRevision,
     ) -> Result<bool, ProtocolError> {
         let dir = self
@@ -663,10 +690,11 @@ impl ProfileRegistry {
         let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
         let binding_json = serde_json::to_vec(stored)
             .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+        let selection = options::select(name, &raw.options, OptionRequest::Recorded(selected))?;
         // Labels are presentation only: the frozen check compares the launch
         // inputs, so the label keys leave with the pin keys.
-        let revision_content =
-            revision_text(&stripped).map_err(|detail| invalid_profile(name, &detail))?;
+        let revision_content = revision_text(&stripped, &selection.revision())
+            .map_err(|detail| invalid_profile(name, &detail))?;
         let inputs = ProfileInputs::of(
             &revision_content,
             manifest.as_ref().map(|source| source.text.as_str()),
@@ -684,20 +712,24 @@ impl ProfileRegistry {
     /// A release step that moves the profile to a newer version of its package
     /// changes only the pin keys, so the text with `launched` put back, the
     /// manifest read as a launch reads it, `stored`, `program` and `args` digest
-    /// to the frozen revision exactly when nothing else changed. The profile
-    /// must pin `served`, the package that now serves the session.
+    /// to the frozen revision exactly when nothing else changed. The option
+    /// choices are the session's recorded `selected` ids, every other option
+    /// taking its default. The profile must pin `served`, the package that
+    /// now serves the session.
     ///
     /// # Errors
     ///
     /// Returns the profile read errors, `agent_profile_not_found` without a
-    /// profile directory and `agent_profile_revision_unavailable` when the
-    /// revision key cannot be read.
+    /// profile directory, `agent_option_choice_missing` for a recorded choice
+    /// the profile no longer declares and `agent_profile_revision_unavailable`
+    /// when the revision key cannot be read.
     pub(crate) fn frozen_package_matches(
         &self,
         name: &str,
         stored: &LaunchBinding,
         launch: (&str, &[String]),
         pins: (&Pin, &Pin),
+        selected: &BTreeMap<String, String>,
         frozen: &ProfileRevision,
     ) -> Result<bool, ProtocolError> {
         let (launched, served) = pins;
@@ -718,10 +750,11 @@ impl ProfileRegistry {
         let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
         let binding_json = serde_json::to_vec(stored)
             .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+        let selection = options::select(name, &raw.options, OptionRequest::Recorded(selected))?;
         // Labels are presentation only: the frozen check compares the launch
         // inputs, so the label keys leave with the pin keys.
-        let revision_content =
-            revision_text(&at_launch).map_err(|detail| invalid_profile(name, &detail))?;
+        let revision_content = revision_text(&at_launch, &selection.revision())
+            .map_err(|detail| invalid_profile(name, &detail))?;
         let inputs = ProfileInputs::of(
             &revision_content,
             manifest.as_ref().map(|source| source.text.as_str()),
@@ -762,8 +795,24 @@ impl ProfileRegistry {
     /// 2. `<dir>/<name>.toml` exists → that profile.
     /// 3. `name` is an installed runtime id → the bare base runtime.
     /// 4. else → `agent_profile_not_found` (no silent fallback).
+    ///
+    /// Every option of a profile takes its default.
     pub(crate) fn resolve_agent(&self, name: &str) -> Result<ResolvedAgent, ProtocolError> {
-        self.resolve_agent_against(name, None)
+        self.resolve_agent_with(name, OptionRequest::Defaults)
+    }
+
+    /// [`Self::resolve_agent`] with the option choices `request` selects.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::resolve_agent`] and the selection errors of
+    /// [`OptionRequest`]: a bare runtime declares no options.
+    pub(crate) fn resolve_agent_with(
+        &self,
+        name: &str,
+        request: OptionRequest<'_>,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        self.resolve_agent_against(name, None, request)
     }
 
     /// [`Self::resolve_agent`] for a session recovering from a pinned
@@ -776,22 +825,38 @@ impl ProfileRegistry {
         name: &str,
         pinned: &Arc<RuntimeDefinition>,
     ) -> Result<ResolvedAgent, ProtocolError> {
-        self.resolve_agent_against(name, Some(pinned))
+        self.resolve_agent_pinned_with(name, pinned, OptionRequest::Defaults)
+    }
+
+    /// [`Self::resolve_agent_pinned`] with the option choices `request`
+    /// selects.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::resolve_agent_with`].
+    pub(crate) fn resolve_agent_pinned_with(
+        &self,
+        name: &str,
+        pinned: &Arc<RuntimeDefinition>,
+        request: OptionRequest<'_>,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        self.resolve_agent_against(name, Some(pinned), request)
     }
 
     fn resolve_agent_against(
         &self,
         name: &str,
         pinned: Option<&Arc<RuntimeDefinition>>,
+        request: OptionRequest<'_>,
     ) -> Result<ResolvedAgent, ProtocolError> {
         validate_name("agent", name)?;
         if let Some(dir) = &self.dir {
             let path = dir.join(format!("{name}.toml"));
             if let Some(text) = self.planned.get(name) {
-                return resolve_profile_text(name, text, dir, &self.runtimes, pinned);
+                return resolve_profile_text(name, text, dir, &self.runtimes, pinned, request);
             }
             if path.is_file() {
-                return load_profile(name, &path, dir, &self.runtimes, pinned);
+                return load_profile(name, &path, dir, &self.runtimes, pinned, request);
             }
         }
         if let Some(definition) = RuntimeId::parse(name)
@@ -803,6 +868,8 @@ impl ProfileRegistry {
                 _ => self.runtimes.resolve_id(&runtime_id).ok(),
             })
         {
+            // A bare runtime declares no options.
+            options::select(name, &BTreeMap::new(), request)?;
             return Ok(ResolvedAgent {
                 name: name.to_owned(),
                 base: definition.runtime_id().clone(),
@@ -904,7 +971,15 @@ impl ProfileRegistry {
             .dir
             .as_deref()
             .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
-        resolve_profile_text(name, content, dir, &self.runtimes, None).map(|_agent| ())
+        resolve_profile_text(
+            name,
+            content,
+            dir,
+            &self.runtimes,
+            None,
+            OptionRequest::Defaults,
+        )
+        .map(|_agent| ())
     }
 
     /// Resolves the profile `name` with file text `content` over `definition`,
@@ -920,7 +995,14 @@ impl ProfileRegistry {
             .dir
             .as_deref()
             .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
-        resolve_profile_text(name, content, dir, &self.runtimes, Some(definition))
+        resolve_profile_text(
+            name,
+            content,
+            dir,
+            &self.runtimes,
+            Some(definition),
+            OptionRequest::Defaults,
+        )
     }
 
     /// Every `*.toml` of the agents directory with its text, read through the
@@ -1388,9 +1470,10 @@ fn load_profile(
     dir: &Path,
     runtimes: &RuntimeHost,
     pinned: Option<&Arc<RuntimeDefinition>>,
+    request: OptionRequest<'_>,
 ) -> Result<ResolvedAgent, ProtocolError> {
     let content = read_profile_text(dir, name, path)?;
-    resolve_profile_text(name, &content, dir, runtimes, pinned)
+    resolve_profile_text(name, &content, dir, runtimes, pinned, request)
 }
 
 /// Resolves the profile `name` whose file text is `content`.
@@ -1398,13 +1481,15 @@ fn load_profile(
 /// This is everything a launch does with a profile after reading its file, so
 /// a candidate text validated through it (a rewrite about to be published) is
 /// accepted exactly when a launch would accept it. `pinned` supplies the
-/// definition of the base runtime when the caller already holds it.
+/// definition of the base runtime when the caller already holds it, and
+/// `request` the option choices the resolution takes.
 fn resolve_profile_text(
     name: &str,
     content: &str,
     dir: &Path,
     runtimes: &RuntimeHost,
     pinned: Option<&Arc<RuntimeDefinition>>,
+    request: OptionRequest<'_>,
 ) -> Result<ResolvedAgent, ProtocolError> {
     if u64::try_from(content.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
         return Err(invalid_profile(name, "profile file is too large"));
@@ -1445,19 +1530,33 @@ fn resolve_profile_text(
     let program = raw
         .program
         .unwrap_or_else(|| definition.program().as_str().to_owned());
-    let args = raw.args.unwrap_or_default();
     let env_keys: HashSet<String> = raw.env.keys().cloned().collect();
+    let secret_env = validate_secret_env(name, raw.secret_env, &env_keys)?;
+    let declared_options = options::declare(
+        name,
+        &raw.options,
+        &options::ReservedEnv {
+            config_home: definition.config_home().map(ConfigHome::env),
+            launch_env: definition.launch_env(),
+            secret_slots: &secret_env,
+            profile_env: &env_keys,
+        },
+    )?;
+    let selection = options::select(name, &raw.options, request)?;
+    let mut args = raw.args.unwrap_or_default();
+    args.extend(selection.args().cloned());
     // Every `POHUNEK_`-prefixed key is reserved for the daemon handshake; strip the
     // whole prefix so a profile can never shadow `POHUNEK_ENV`/`_PROTOCOL_VERSION`/…
     // (the launch path also re-asserts this by appending the handshake env last).
+    // A choice cannot name one: its keys are refused on load.
     let env: LaunchEnv = raw
         .env
         .into_iter()
         .filter(|(key, _)| !key.starts_with("POHUNEK_"))
         .map(|(key, value)| (key, value.0))
+        .chain(selection.env())
         .collect::<Vec<_>>()
         .into();
-    let secret_env = validate_secret_env(name, raw.secret_env, &env_keys)?;
     let input_rules = raw.input_rules.map(|rules| {
         definition.input_rules().with_framing(
             rules.bracketed_paste.unwrap_or(false),
@@ -1469,9 +1568,10 @@ fn resolve_profile_text(
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
     // Presentation labels never enter the revision: the digest sees the
-    // text with the label keys removed.
-    let revision_content =
-        revision_text(content).map_err(|detail| invalid_profile(name, &detail))?;
+    // text with the label keys removed, and the selected option choices
+    // in place of the `[options]` table.
+    let revision_content = revision_text(content, &selection.revision())
+        .map_err(|detail| invalid_profile(name, &detail))?;
     let inputs = ProfileInputs::of(
         &revision_content,
         manifest_source.as_ref().map(|source| source.text.as_str()),
@@ -1494,6 +1594,8 @@ fn resolve_profile_text(
             manifest_name: raw.manifest,
             display_name,
             audience,
+            options: declared_options,
+            selected: selection.ids(),
             inputs,
         }),
     })
@@ -1836,9 +1938,11 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
 
 mod bind;
 mod compose;
+pub(crate) mod options;
 pub(crate) mod presentation;
 pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
 pub(crate) use compose::{compose_profile, ProfileSpec};
+pub(crate) use options::OptionRequest;
 pub(crate) use presentation::{display_name_of, revision_text, LabelRead};
 
 #[cfg(test)]

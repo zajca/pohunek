@@ -728,6 +728,57 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/agent_option_unknown` error: a selection names
+    /// an option the agent profile does not declare. Names the option id only.
+    #[must_use]
+    pub fn agent_option_unknown(option: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_option_unknown",
+            format!("the agent profile declares no option '{option}'"),
+            Some("select only options the profile lists in host.inspect".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_option_choice_unknown` error: a selection
+    /// names a choice its option does not declare. Names the ids only.
+    #[must_use]
+    pub fn agent_option_choice_unknown(option: &str, choice: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_option_choice_unknown",
+            format!("option '{option}' of the agent profile has no choice '{choice}'"),
+            Some("select only choices the profile lists in host.inspect".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_options_not_declared` error: a selection
+    /// is sent for a bare runtime or a profile without options.
+    #[must_use]
+    pub fn agent_options_not_declared(agent: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_options_not_declared",
+            format!("agent '{agent}' declares no options"),
+            Some("start the session without agent options".to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/agent_option_choice_missing` error: a session
+    /// recorded a choice the current agent profile no longer declares.
+    ///
+    /// No other choice stands in for it, even when a changed profile is
+    /// accepted. Names the ids only.
+    #[must_use]
+    pub fn agent_option_choice_missing(option: &str, choice: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_option_choice_missing",
+            format!("the agent profile no longer offers choice '{choice}' of option '{option}'"),
+            Some("restore the choice in the profile, or start a new session".to_owned()),
+        )
+    }
+
     /// The canonical `discovery/netbird_cli_missing` error.
     ///
     /// Raised when the local `netbird` CLI cannot be found on `PATH`, so remote
