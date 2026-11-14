@@ -150,6 +150,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
         ended_at: None,
         exit_code,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 

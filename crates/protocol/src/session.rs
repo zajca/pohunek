@@ -3168,6 +3168,13 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_display_name: Option<String>,
+    /// The choice each option of the session's agent profile launched with:
+    /// option id to choice id, defaults included. Empty (absent on the wire)
+    /// for a bare runtime and a profile without options. Persisted: a resume
+    /// relaunches with these choices.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<BTreeMap<String, String>>"))]
+    pub agent_options: BTreeMap<String, String>,
     /// Current working directory for the session.
     pub cwd: PathBuf,
     /// Source that last set [`Self::cwd`].
@@ -4130,6 +4137,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             ended_at: None,
             exit_code: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 

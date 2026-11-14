@@ -73,6 +73,13 @@ export type SessionInfo = {
    */
   agent_display_name?: string;
   /**
+   * The choice each option of the session's agent profile launched with:
+   * option id to choice id, defaults included. Empty (absent on the wire)
+   * for a bare runtime and a profile without options. Persisted: a resume
+   * relaunches with these choices.
+   */
+  agent_options?: { [key in string]: string };
+  /**
    * Current working directory for the session.
    */
   cwd: string;

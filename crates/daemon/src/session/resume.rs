@@ -19,6 +19,7 @@ use super::launch_input::LaunchSubject;
 use crate::agent::host::{
     CheckoutTrust, LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost,
 };
+use crate::agent::profile::OptionRequest;
 use crate::agent::{
     InputRules, LaunchEnv, LaunchView, NativeReferenceProvenance, Pin, ProfilePin, ProfileRegistry,
     ReferenceCheckFailure, ReferenceExistence, StoreRoot,
@@ -29,8 +30,8 @@ use crate::runtime::environment::{base_environment, effective_variable};
 use crate::store::LaunchCheckout;
 use package::PackageDigest;
 use pohunek_worker_protocol::BaseEnv;
-use protocol::ErrorClass;
 use protocol::{BindingProvenance, LaunchBinding, PackageId, RuntimeRef};
+use protocol::{ErrorClass, AGENT_OPTION_CHOICE_MISSING_CODE};
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -58,6 +59,9 @@ pub(super) struct ResumeSnapshot {
     /// Keyed revision of the host profile the session was launched under;
     /// `None` for a session without a profile or a binding that never froze one.
     pub(super) profile_revision: Option<ProfileRevision>,
+    /// The choice each option of the host profile launched with, defaults
+    /// included. Set once at create, carried unchanged by every resume.
+    pub(super) agent_options: BTreeMap<String, String>,
     /// The directory and project the session was created with; the trusted
     /// checkout arguments are evaluated on this pair. Set once at create,
     /// carried unchanged by every resume.
@@ -77,6 +81,7 @@ impl ResumeSnapshot {
             launch_binding: host::LaunchPin::Unpinned,
             reference_provenance: NativeReferenceProvenance::Reported,
             profile_revision: None,
+            agent_options: BTreeMap::new(),
             launch_checkout: None,
             context_pin: None,
         }
@@ -91,6 +96,7 @@ impl ResumeSnapshot {
             launch_binding: binding.launch_binding.clone(),
             reference_provenance: binding.native_reference_provenance,
             profile_revision: binding.profile_revision.clone(),
+            agent_options: binding.agent_options.clone(),
             launch_checkout: binding.launch_checkout.clone(),
             context_pin: binding.context_pin.clone(),
         }
@@ -506,8 +512,9 @@ impl SessionRegistry {
     /// absent or cannot be verified, `agent_native_store_relocated` when the
     /// agent would keep its conversations outside the declared store,
     /// `agent_profile_changed` or `agent_profile_missing`
-    /// when the profile no longer matches the session, or any worker launch
-    /// error from recovery.
+    /// when the profile no longer matches the session,
+    /// `agent_option_choice_missing` when it no longer declares a recorded
+    /// option choice, or any worker launch error from recovery.
     pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
         self.resume_with(id, ProfileChange::Refuse).await
     }
@@ -881,10 +888,12 @@ impl SessionRegistry {
     ///
     /// Returns `agent_profile_missing` when a profile the session was launched
     /// from (frozen, or named by a binding that predates freezing) no longer
-    /// resolves, `agent_profile_changed` when its revision differs from the
-    /// frozen one or none was frozen and `change` is [`ProfileChange::Refuse`],
-    /// and `agent_profile_revision_unavailable` when the revision key cannot
-    /// be read.
+    /// resolves, `agent_option_choice_missing` when it no longer declares a
+    /// recorded option choice (whatever `change` is), `agent_profile_changed`
+    /// when its revision differs from the frozen one or none was frozen and
+    /// `change` is [`ProfileChange::Refuse`], and
+    /// `agent_profile_revision_unavailable` when the revision key cannot be
+    /// read.
     pub(super) fn resolve_recovery_profile(
         &self,
         binding: &ResumeBinding,
@@ -1002,6 +1011,7 @@ impl SessionRegistry {
             launch_binding: entry.snapshot.launch_binding.clone(),
             native_reference_provenance: entry.snapshot.reference_provenance,
             profile_revision: entry.snapshot.profile_revision.clone(),
+            agent_options: entry.snapshot.agent_options.clone(),
             native_launch_unresolved: false,
             launch_checkout: entry.snapshot.launch_checkout.clone(),
             context_pin: entry.snapshot.context_pin.clone(),
@@ -1142,6 +1152,7 @@ impl SessionRegistry {
             launch_binding: relaunch_pin,
             reference_provenance: binding.native_reference_provenance,
             profile_revision: revision,
+            agent_options: binding.agent_options.clone(),
             launch_checkout: binding.launch_checkout.clone(),
             context_pin: binding.context_pin.clone(),
         };
@@ -1428,16 +1439,14 @@ fn adopted_profile_matches_in(
         return Ok(false);
     }
     let launch = (binding.program.as_str(), binding.args.as_slice());
-    // A session records no option choices; every option takes its
-    // default.
-    let recorded = BTreeMap::new();
+    let recorded = &binding.agent_options;
     if built_in {
         return profiles.frozen_builtin_matches(
             name,
             stored,
             launch,
             (&package.id, package_digest),
-            &recorded,
+            recorded,
             frozen,
         );
     }
@@ -1464,14 +1473,14 @@ fn adopted_profile_matches_in(
         stored,
         launch,
         (&launched, &served),
-        &recorded,
+        recorded,
         frozen,
     )? || profiles.frozen_package_matches(
         name,
         stored,
         launch,
         (&served, &served),
-        &recorded,
+        recorded,
         frozen,
     )?)
 }
@@ -1522,14 +1531,12 @@ fn repinned_profile_matches_in(
         package: frozen_package.id.clone(),
         digest: frozen_digest.clone(),
     };
-    // A session records no option choices; every option takes its
-    // default.
     profiles.frozen_package_matches(
         name,
         stored,
         (binding.program.as_str(), binding.args.as_slice()),
         (&launched, &current),
-        &BTreeMap::new(),
+        &binding.agent_options,
         frozen,
     )
 }
@@ -1548,9 +1555,11 @@ fn repinned_profile_matches_in(
 ///
 /// Returns `agent_profile_missing` when a profile the session was launched
 /// from (frozen, or named by a binding that predates freezing) does not
-/// resolve, `agent_profile_changed` when its revision differs from the
-/// frozen one or none was frozen and `change` is [`ProfileChange::Refuse`],
-/// and `agent_profile_revision_unavailable` when the revision key cannot be
+/// resolve, `agent_option_choice_missing` when it no longer declares a
+/// recorded option choice (whatever `change` is), `agent_profile_changed`
+/// when its revision differs from the frozen one or none was frozen and
+/// `change` is [`ProfileChange::Refuse`], and
+/// `agent_profile_revision_unavailable` when the revision key cannot be
 /// read.
 pub(super) fn recovery_profile_in(
     profiles: &ProfileRegistry,
@@ -1576,11 +1585,26 @@ pub(super) fn recovery_profile_memo(
     resolutions: &mut PinResolutions,
 ) -> Result<RecoveryProfile, ProtocolError> {
     let frozen = binding.profile_revision.as_ref();
+    // The profile is resolved with the choices the session recorded, so its
+    // env and revision are those of the launch the session ran.
+    let recorded = OptionRequest::Recorded(&binding.agent_options);
     let resolved = match definition.map_or_else(
-        || profiles.resolve_agent(&binding.agent),
-        |definition| profiles.resolve_agent_pinned(&binding.agent, definition),
+        || profiles.resolve_agent_with(&binding.agent, recorded),
+        |definition| profiles.resolve_agent_pinned_with(&binding.agent, definition, recorded),
     ) {
         Ok(resolved) => resolved,
+        // A recorded choice the profile no longer offers is never replaced by
+        // another one, also when the owner accepts a changed profile: the
+        // refusal names the choice, and the owner starts a new session.
+        Err(error) if error.code == AGENT_OPTION_CHOICE_MISSING_CODE => {
+            warn!(
+                session_id = %binding.session_id,
+                agent = %binding.agent,
+                error_code = %error.code,
+                "a recorded agent option choice is no longer declared"
+            );
+            return Err(error);
+        }
         Err(error) => {
             warn!(
                 session_id = %binding.session_id,

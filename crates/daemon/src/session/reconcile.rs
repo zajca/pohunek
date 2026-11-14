@@ -9623,6 +9623,7 @@ while os.getppid() == parent:
                 fork: false,
                 ..Default::default()
             },
+            agent_options: std::collections::BTreeMap::new(),
         };
         let store_path = root.join("data/metadata.jsonl");
         let store = Store::new(store_path.clone());
@@ -9652,6 +9653,7 @@ while os.getppid() == parent:
             native_launch_unresolved: false,
             launch_checkout: None,
             context_pin: None,
+            agent_options: std::collections::BTreeMap::new(),
         };
         store
             .record_session(&SessionRecord {
@@ -11205,6 +11207,7 @@ while os.getppid() == parent:
                     fork: false,
                     ..Default::default()
                 },
+                agent_options: std::collections::BTreeMap::new(),
             },
             recovery: Some(ResumeBinding {
                 spawned_by: None,
@@ -11230,6 +11233,7 @@ while os.getppid() == parent:
                 native_launch_unresolved: false,
                 launch_checkout: None,
                 context_pin: None,
+                agent_options: std::collections::BTreeMap::new(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,

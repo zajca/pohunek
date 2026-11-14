@@ -194,6 +194,7 @@ fn serve_session_and_track(
                                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
                                 ended_at: None,
                                 exit_code: None,
+                                agent_options: std::collections::BTreeMap::new(),
                             };
                             json!([session])
                         }

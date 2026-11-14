@@ -691,6 +691,7 @@ mod tests {
             ended_at: None,
             exit_code: None,
             capabilities: protocol::SessionCapabilities::default(),
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 

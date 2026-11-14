@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 const SCHEMA_15: &str = include_str!("../src/store/fixtures/schema-15/metadata.jsonl");
-const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-19/metadata.jsonl");
+const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-20/metadata.jsonl");
 
 fn fixture_store(root: &std::path::Path, contents: &str) -> Store {
     let path = root.join("metadata.jsonl");

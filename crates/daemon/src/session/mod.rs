@@ -4655,6 +4655,7 @@ impl SessionRegistry {
                 NativeReferenceProvenance::Reported
             },
             profile_revision,
+            agent_options: resolved.agent_options(),
             launch_checkout: Some(Box::new(LaunchCheckout {
                 cwd: launch_cwd.clone(),
                 project_id: project_id.clone(),
@@ -6698,8 +6699,13 @@ impl SessionRegistry {
         id: &SessionId,
         intent: SessionRecord,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
-        self.commit_settled_intent(id, intent, "its stop intent", "session_stop_intent_busy")
-            .await
+        Box::pin(self.commit_settled_intent(
+            id,
+            intent,
+            "its stop intent",
+            "session_stop_intent_busy",
+        ))
+        .await
     }
 
     /// Commits a removal intent of a session whose runtime cannot end on its
@@ -6709,12 +6715,12 @@ impl SessionRegistry {
         id: &SessionId,
         intent: SessionRecord,
     ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
-        self.commit_settled_intent(
+        Box::pin(self.commit_settled_intent(
             id,
             intent,
             "its removal intent",
             "session_removal_intent_busy",
-        )
+        ))
         .await
     }
 
@@ -8670,6 +8676,7 @@ fn external_session_info(
         updated_at: now,
         ended_at: None,
         exit_code: None,
+        agent_options: std::collections::BTreeMap::new(),
     }
 }
 
@@ -8875,6 +8882,7 @@ fn create_intent_record(
         agent: resolved.name.clone(),
         agent_base: RuntimeRef::from(resolved.base.clone()),
         agent_display_name: None,
+        agent_options: resolved.agent_options(),
         cwd: cwd.to_path_buf(),
         cwd_source: Some(CwdSource::Launch),
         pid: 0,

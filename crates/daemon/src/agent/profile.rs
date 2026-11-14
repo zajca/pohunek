@@ -298,7 +298,6 @@ impl ResolvedAgent {
     /// Every option of the profile this agent resolved from with the choice
     /// the resolution took, defaults included; empty for a bare runtime.
     #[must_use]
-    #[expect(dead_code, reason = "first read by session.new")]
     pub(crate) fn agent_options(&self) -> BTreeMap<String, String> {
         self.profile
             .as_ref()

@@ -29,6 +29,9 @@ pub const SESSION_REQUEST_CONFLICT_CODE: &str = "session_request_conflict";
 pub const SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE: &str = "session_new_request_id_unsupported";
 /// Error code a client raises when the daemon cannot honor `fetch_ref`.
 pub const SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE: &str = "session_new_fetch_ref_unsupported";
+/// Error code of a resume whose recorded agent option choice the profile no
+/// longer declares.
+pub const AGENT_OPTION_CHOICE_MISSING_CODE: &str = "agent_option_choice_missing";
 /// Error code a client raises when the daemon cannot honor `agent_options`.
 pub const SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE: &str =
     "session_new_agent_options_unsupported";
@@ -803,7 +806,7 @@ impl ProtocolError {
     pub fn agent_option_choice_missing(option: &str, choice: &str) -> Self {
         Self::new(
             ErrorClass::Runtime,
-            "agent_option_choice_missing",
+            AGENT_OPTION_CHOICE_MISSING_CODE,
             format!("the agent profile no longer offers choice '{choice}' of option '{option}'"),
             Some("restore the choice in the profile, or start a new session".to_owned()),
         )

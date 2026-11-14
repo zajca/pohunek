@@ -57,6 +57,8 @@ struct OptionRig {
     agents_dir: PathBuf,
     /// Sessions created so far; numbers each session's directory.
     created: usize,
+    /// The registry configuration, reused by [`Self::restarted`].
+    config: SessionRegistryConfig,
 }
 
 impl OptionRig {
@@ -73,7 +75,8 @@ impl OptionRig {
             plugins_dir: plugins.then(|| socket.dir.join("plugins")),
             ..support::hermetic_registry_config()
         };
-        let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+        let (shutdown, handle, _) =
+            spawn_server_with_config(&socket, "0.0.0", config.clone()).await;
         let control = connect(&socket).await;
         Self {
             socket,
@@ -82,7 +85,80 @@ impl OptionRig {
             control,
             agents_dir,
             created: 0,
+            config,
         }
+    }
+
+    /// Stops the daemon and starts a new one over the same store, profiles,
+    /// packages and socket path, as a daemon restart does.
+    async fn restarted(self) -> Self {
+        let Self {
+            socket,
+            shutdown,
+            handle,
+            control,
+            agents_dir,
+            created,
+            config,
+        } = self;
+        drop(control);
+        let _ = shutdown.send(());
+        let _ = handle.await;
+        // A daemon start reconciles the sessions of the earlier daemon before
+        // it serves requests.
+        let (registry, worker_home) = worker_backed_registry(&socket, config.clone());
+        registry
+            .reconcile_workers()
+            .await
+            .expect("startup reconciles the sessions of the earlier daemon");
+        let (shutdown, handle, _) =
+            serve_registry(&socket, "0.0.0", None, registry, worker_home).await;
+        let control = connect(&socket).await;
+        Self {
+            socket,
+            shutdown,
+            handle,
+            control,
+            agents_dir,
+            created,
+            config,
+        }
+    }
+
+    /// Stops session `id` through `session.stop`.
+    async fn stop(&mut self, id: &SessionId) {
+        let request = Request::make(
+            "agent-options-stop",
+            method::SESSION_STOP,
+            serde_json::to_value(id).expect("serialize session id"),
+        );
+        ok_payload(exchange(&mut self.control, &request).await);
+    }
+
+    /// `session.resume` of `id`, accepting a changed profile when `accept`.
+    async fn resume(&mut self, id: &SessionId, accept: bool) -> Response {
+        let params = if accept {
+            serde_json::json!({ "session_id": id, "accept_profile_change": true })
+        } else {
+            serde_json::json!({ "session_id": id })
+        };
+        exchange(
+            &mut self.control,
+            &Request::make("agent-options-resume", method::SESSION_RESUME, params),
+        )
+        .await
+    }
+
+    /// The session `id` as `session.list` reports it.
+    async fn listed(&mut self, id: &SessionId) -> SessionInfo {
+        let request = Request::make("agent-options-list", method::SESSION_LIST, Value::Null);
+        let sessions: Vec<SessionInfo> =
+            serde_json::from_value(ok_payload(exchange(&mut self.control, &request).await))
+                .expect("session list");
+        sessions
+            .into_iter()
+            .find(|session| session.id == *id)
+            .expect("the session is listed")
     }
 
     async fn finish(self) {
@@ -661,7 +737,13 @@ async fn selection_rig(tag: &str) -> OptionRig {
 async fn a_selected_choice_replaces_the_default_of_its_option() {
     let mut rig = selection_rig("agent-options-select").await;
     let (response, cwd) = rig.create_with("opts", &[("mode", "bold")], None).await;
-    ok_payload(response);
+    let created: SessionInfo =
+        serde_json::from_value(ok_payload(response)).expect("the session info");
+    assert_eq!(
+        created.agent_options,
+        selection(&[("depth", "shallow"), ("mode", "bold")]),
+        "the session reports every option's choice, defaults included"
+    );
     assert_eq!(
         recorded_launch(&cwd).await,
         "--depth=1\n--mode\nbold\nMODE=bold-env\nDEPTH=\n",
@@ -930,5 +1012,333 @@ async fn a_keyed_create_fingerprints_its_selection() {
             "{other:?}: {error:?}"
         );
     }
+    rig.finish().await;
+}
+
+/// `pairs` (option id, choice id) as a selection map.
+fn selection(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(option, choice)| ((*option).to_owned(), (*choice).to_owned()))
+        .collect()
+}
+
+/// Name of the file the resumable fixture runtime appends one block to per
+/// launch, in the session directory.
+const LAUNCHES_LOG: &str = "launches.log";
+
+/// The line that ends one launch block of [`LAUNCHES_LOG`].
+const LAUNCH_END: &str = "---";
+
+/// A runtime program that appends its argv and `PH_OPT_MODE` to
+/// [`LAUNCHES_LOG`] as one block per launch, then stays alive.
+const RESUMABLE_PROGRAM: &str = "#!/bin/sh\n\
+    { printf '%s\\n' \"$@\"; printf 'MODE=%s\\n' \"$PH_OPT_MODE\"; printf '%s\\n' '---'; } >> launches.log\n\
+    exec sleep 30\n";
+
+/// The options of the resumable profile: `mode` (default `calm`) and
+/// `depth` (default `shallow`), as `(option table)` lines.
+const RESUMABLE_OPTIONS: &str = r#"
+[options.mode]
+label = "Mode"
+default = "calm"
+choices.calm = { label = "Calm", args = ["--mode", "calm"], env = { PH_OPT_MODE = "calm-env" } }
+choices.bold = { label = "Bold", args = ["--mode", "bold"], env = { PH_OPT_MODE = "bold-env" } }
+
+[options.depth]
+label = "Depth"
+default = "shallow"
+choices.shallow = { label = "Shallow", args = ["--depth=1"] }
+choices.deep = { label = "Deep", args = ["--depth=9"] }
+"#;
+
+/// A rig with the resumable fixture runtime installed (an `acme.runtime.pi`
+/// package with an assigned native reference and no existence check, so a
+/// stopped session resumes) and the profile `work` over it with
+/// [`RESUMABLE_OPTIONS`]. Returns the rig and the package digest.
+async fn resumable_rig(tag: &str) -> (OptionRig, package::PackageDigest) {
+    let mut rig = OptionRig::start(tag, true).await;
+    let program = rig.socket.dir.join("resumable-agent");
+    std::fs::write(&program, RESUMABLE_PROGRAM).expect("write the fixture runtime");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fixture runtime executable");
+    let digest = install_package(
+        &mut rig,
+        pi_package("", &program.display().to_string(), "", ""),
+    )
+    .await;
+    rig.write_profile("work", &resumable_profile(&digest, RESUMABLE_OPTIONS));
+    (rig, digest)
+}
+
+/// The profile text of `work`: pinned to `digest`, with `options`.
+fn resumable_profile(digest: &package::PackageDigest, options: &str) -> String {
+    format!("base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n{options}")
+}
+
+/// The launch blocks the fixture runtime recorded in `cwd`, once there are
+/// `count` of them.
+async fn launches(cwd: &Path, count: usize) -> Vec<Vec<String>> {
+    let path = cwd.join(LAUNCHES_LOG);
+    wait_until("the fixture runtime records its launches", || async {
+        let text = std::fs::read_to_string(&path).ok()?;
+        let blocks: Vec<Vec<String>> = text
+            .split_terminator(&format!("{LAUNCH_END}\n"))
+            .map(|block| block.lines().map(str::to_owned).collect())
+            .collect();
+        (blocks.len() == count).then_some(blocks)
+    })
+    .await
+}
+
+/// Creates a `work` session selecting `mode=bold`, waits for its launch, and
+/// stops it. Returns the session and its directory.
+async fn stopped_bold_session(rig: &mut OptionRig) -> (SessionInfo, PathBuf) {
+    let (response, cwd) = rig.create_with("work", &[("mode", "bold")], None).await;
+    let session: SessionInfo =
+        serde_json::from_value(ok_payload(response)).expect("the session info");
+    assert_eq!(
+        session.agent_options,
+        selection(&[("depth", "shallow"), ("mode", "bold")])
+    );
+    let first = launches(&cwd, 1).await;
+    assert!(first[0].contains(&"MODE=bold-env".to_owned()), "{first:?}");
+    rig.stop(&session.id).await;
+    (session, cwd)
+}
+
+/// The argv lines of launch `block` (every line before the env line).
+fn argv(block: &[String]) -> Vec<&str> {
+    block
+        .iter()
+        .take_while(|line| !line.starts_with("MODE="))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Row 12: relabelling a choice, changing a default and adding a choice
+/// leave the revision of a session that recorded its choices unchanged: it
+/// resumes without a decision, with the recorded choices (not the new
+/// default) and their env.
+#[tokio::test]
+async fn presentation_and_default_edits_resume_without_a_decision() {
+    let (mut rig, digest) = resumable_rig("agent-options-resume-keep").await;
+    let (session, cwd) = stopped_bold_session(&mut rig).await;
+    let edited = RESUMABLE_OPTIONS
+        .replace("label = \"Bold\"", "label = \"Bold and loud\"")
+        .replace("default = \"shallow\"", "default = \"deep\"")
+        + "choices.wild = { label = \"Wild\", args = [\"--depth=99\"] }\n";
+    assert_ne!(edited, RESUMABLE_OPTIONS);
+    rig.write_profile("work", &resumable_profile(&digest, &edited));
+    ok_payload(rig.resume(&session.id, false).await);
+    let blocks = launches(&cwd, 2).await;
+    let relaunch = argv(&blocks[1]);
+    assert!(
+        relaunch
+            .windows(3)
+            .any(|run| run == ["--depth=1", "--mode", "bold"]),
+        "the relaunch keeps the frozen launch args: {relaunch:?}"
+    );
+    assert!(
+        blocks[1].contains(&"MODE=bold-env".to_owned()),
+        "{blocks:?}"
+    );
+    assert_eq!(
+        rig.listed(&session.id).await.agent_options,
+        selection(&[("depth", "shallow"), ("mode", "bold")]),
+        "the recorded choices stand, not the new default"
+    );
+    rig.finish().await;
+}
+
+/// Row 13: editing the selected choice's body is a profile change: resume
+/// refuses with `agent_profile_changed`, and with acceptance relaunches as a
+/// plain profile does under acceptance: the frozen args, and the env of the
+/// choice as the profile now declares it.
+#[tokio::test]
+async fn editing_the_selected_choice_needs_a_decision() {
+    let (mut rig, digest) = resumable_rig("agent-options-resume-edit").await;
+    let (session, cwd) = stopped_bold_session(&mut rig).await;
+    let edited = RESUMABLE_OPTIONS.replace(
+        "args = [\"--mode\", \"bold\"], env = { PH_OPT_MODE = \"bold-env\" }",
+        "args = [\"--mode\", \"bold\", \"-v\"], env = { PH_OPT_MODE = \"bold-env-2\" }",
+    );
+    assert_ne!(edited, RESUMABLE_OPTIONS);
+    rig.write_profile("work", &resumable_profile(&digest, &edited));
+    let refused = err_payload(rig.resume(&session.id, false).await);
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
+    ok_payload(rig.resume(&session.id, true).await);
+    let blocks = launches(&cwd, 2).await;
+    let relaunch = argv(&blocks[1]);
+    assert!(
+        relaunch
+            .windows(3)
+            .any(|run| run == ["--depth=1", "--mode", "bold"])
+            && !relaunch.contains(&"-v"),
+        "the accepted relaunch keeps the frozen args: {relaunch:?}"
+    );
+    assert!(
+        blocks[1].contains(&"MODE=bold-env-2".to_owned()),
+        "the env comes from the current choice body: {blocks:?}"
+    );
+    rig.finish().await;
+}
+
+/// Row 14: editing a choice the session did not select leaves its revision
+/// unchanged; it resumes without a decision.
+#[tokio::test]
+async fn editing_an_unselected_choice_resumes_without_a_decision() {
+    let (mut rig, digest) = resumable_rig("agent-options-resume-other").await;
+    let (session, cwd) = stopped_bold_session(&mut rig).await;
+    let edited = RESUMABLE_OPTIONS.replace("[\"--mode\", \"calm\"]", "[\"--mode\", \"quiet\"]");
+    assert_ne!(edited, RESUMABLE_OPTIONS);
+    rig.write_profile("work", &resumable_profile(&digest, &edited));
+    ok_payload(rig.resume(&session.id, false).await);
+    let blocks = launches(&cwd, 2).await;
+    assert!(
+        blocks[1].contains(&"MODE=bold-env".to_owned()),
+        "{blocks:?}"
+    );
+    rig.finish().await;
+}
+
+/// Row 15: a recorded choice the profile no longer declares is refused with
+/// `agent_option_choice_missing`, also when the owner accepts the changed
+/// profile: no other choice stands in for it. The upgrade preflight judges
+/// the session with the same code.
+#[tokio::test]
+async fn a_removed_choice_refuses_resume_even_when_accepted() {
+    let (mut rig, digest) = resumable_rig("agent-options-resume-missing").await;
+    let (session, cwd) = stopped_bold_session(&mut rig).await;
+    let edited = RESUMABLE_OPTIONS.replace(
+        "choices.bold = { label = \"Bold\", args = [\"--mode\", \"bold\"], env = { PH_OPT_MODE = \"bold-env\" } }\n",
+        "",
+    );
+    assert_ne!(edited, RESUMABLE_OPTIONS);
+    rig.write_profile("work", &resumable_profile(&digest, &edited));
+    for accept in [false, true] {
+        let refused = err_payload(rig.resume(&session.id, accept).await);
+        assert_eq!(
+            refused.code, "agent_option_choice_missing",
+            "accept={accept}: {refused:?}"
+        );
+        assert_eq!(
+            refused.msg,
+            "the agent profile no longer offers choice 'bold' of option 'mode'"
+        );
+    }
+    assert_eq!(launches(&cwd, 1).await.len(), 1, "nothing relaunched");
+    // The upgrade preflight reaches the refusal resume returns.
+    let judged = preflight_verdict(&rig, &session.id);
+    assert_eq!(judged.code, "agent_option_choice_missing", "{judged:?}");
+    rig.finish().await;
+}
+
+/// Rows 16-17: the recorded choices survive a daemon restart, and the
+/// recovery after the restart re-derives the env of the recorded choice.
+#[tokio::test]
+async fn recorded_choices_survive_a_restart_and_drive_the_relaunch() {
+    let (mut rig, _digest) = resumable_rig("agent-options-restart").await;
+    let (session, cwd) = stopped_bold_session(&mut rig).await;
+    let mut rig = rig.restarted().await;
+    assert_eq!(
+        rig.listed(&session.id).await.agent_options,
+        selection(&[("depth", "shallow"), ("mode", "bold")]),
+        "the choices are persisted"
+    );
+    ok_payload(rig.resume(&session.id, false).await);
+    let blocks = launches(&cwd, 2).await;
+    assert!(
+        blocks[1].contains(&"MODE=bold-env".to_owned()),
+        "the relaunch carries the recorded choice's env: {blocks:?}"
+    );
+    rig.finish().await;
+}
+
+/// The upgrade preflight's verdict on the stopped session `id` of `rig`'s
+/// store, profiles and packages.
+fn preflight_verdict(
+    rig: &OptionRig,
+    id: &SessionId,
+) -> pohunek_service_config::preflight::SessionVerdict {
+    let report = pohunek_daemon::session::upgrade_preflight::run_with(
+        &pohunek_daemon::session::upgrade_preflight::PreflightInputs {
+            store_path: rig.socket.dir.join("metadata.jsonl"),
+            worker_state_root: rig.socket.dir.join("no-workers"),
+            plugins_dir: rig.socket.dir.join("plugins"),
+        },
+        &pohunek_daemon::session::upgrade_preflight::PreflightOptions {
+            probe_budget: pohunek_service_config::preflight::PROBE_BUDGET,
+            probe_clock: pohunek_daemon::capabilities::ProbeClock::default(),
+            entry: std::time::Instant::now(),
+            release: None,
+            profiles_dir: Some(rig.agents_dir.clone()),
+            host_state_dir: Some(rig.socket.dir.join("host-state")),
+            launch: Ok(pohunek_daemon::runtime::LaunchEnvironment::subprocess_default()),
+        },
+        &pohunek_daemon::procwatch::HostInspector::new(),
+    );
+    report
+        .stopped_sessions
+        .into_iter()
+        .find(|verdict| verdict.session_id == id.0)
+        .expect("the stopped session is judged")
+}
+
+/// Row 19: the upgrade preflight judges a stopped session with recorded
+/// choices and an unchanged profile as resume does: no profile change.
+#[tokio::test]
+async fn the_upgrade_preflight_judges_recorded_choices_as_resume_does() {
+    let (mut rig, _digest) = resumable_rig("agent-options-preflight").await;
+    let (session, _cwd) = stopped_bold_session(&mut rig).await;
+    let judged = preflight_verdict(&rig, &session.id);
+    assert_eq!(
+        judged.verdict,
+        pohunek_service_config::preflight::Verdict::Adoptable,
+        "{judged:?}"
+    );
+    assert_eq!(judged.code, "adoptable", "{judged:?}");
+    ok_payload(rig.resume(&session.id, false).await);
+    rig.finish().await;
+}
+
+/// Row 14b: a choice whose args are the runtime's `trusted_checkout_args`
+/// never adds them to the launch of an untrusted checkout, as for profile
+/// args: only the trust predicate adds them.
+#[tokio::test]
+async fn trusted_checkout_args_of_a_choice_never_reach_an_untrusted_launch() {
+    let mut rig = OptionRig::start("agent-options-trust", true).await;
+    let program = rig.socket.dir.join("resumable-agent");
+    std::fs::write(&program, RESUMABLE_PROGRAM).expect("write the fixture runtime");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fixture runtime executable");
+    let digest = install_package(
+        &mut rig,
+        pi_package(
+            "requires = [\"checkout-trust-args-v1\"]\n",
+            &program.display().to_string(),
+            "trusted_checkout_args = [\"--trust-workspace\"]\n\
+             trusted_checkout_paths = [\".agents\"]\n",
+            "",
+        ),
+    )
+    .await;
+    rig.write_profile(
+        "work",
+        &resumable_profile(
+            &digest,
+            "[options.trust]\nlabel = \"Trust\"\ndefault = \"yes\"\n\
+             choices.yes = { label = \"Yes\", args = [\"--marker\", \"--trust-workspace\"] }\n",
+        ),
+    );
+    let (response, cwd) = rig.create("work").await;
+    ok_payload(response);
+    let blocks = launches(&cwd, 1).await;
+    let launched = argv(&blocks[0]);
+    assert!(launched.contains(&"--marker"), "{launched:?}");
+    assert!(
+        !launched.contains(&"--trust-workspace"),
+        "an untrusted checkout never gets the trust args: {launched:?}"
+    );
     rig.finish().await;
 }

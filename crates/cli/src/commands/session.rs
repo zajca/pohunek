@@ -3046,6 +3046,7 @@ mod tests {
             ended_at: None,
             exit_code: None,
             runtime: None,
+            agent_options: std::collections::BTreeMap::new(),
         }
     }
 
