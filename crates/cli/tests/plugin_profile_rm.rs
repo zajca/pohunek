@@ -33,6 +33,15 @@ const PARENT_PROFILE: &str = "base = \"shell\"\n\
 /// A preset of `work` that selects `bold`.
 const PRESET_OF_WORK: &str = "[preset]\nparent = \"work\"\noptions = { mode = \"bold\" }\n";
 
+/// Whether `candidate` opens the file at `stored`: a case-insensitive volume
+/// folds another spelling of the name onto the stored entry.
+fn opens_the_same_file(candidate: &Path, stored: &Path) -> bool {
+    let (Ok(candidate), Ok(stored)) = (fs::metadata(candidate), fs::metadata(stored)) else {
+        return false;
+    };
+    (candidate.dev(), candidate.ino()) == (stored.dev(), stored.ino())
+}
+
 /// A digest no profile file in these tests has.
 fn other_digest() -> String {
     format!("sha256:{}", "0".repeat(64))
@@ -306,10 +315,10 @@ async fn rm_without_a_digest_or_on_a_remote_host_sends_nothing() {
 }
 
 /// Review r1 F1: a running session holds the profile when its agent name
-/// opens the same file, not only when it equals the name. `WORK.toml` links
-/// to `work.toml` in the tree, which is the lookup a case-insensitive volume
-/// makes for a session started as `--agent WORK`; the removal of `work` is
-/// refused and the file stays.
+/// opens the same file, not only when it equals the name. On a
+/// case-insensitive volume `WORK.toml` already opens `work.toml`; on a
+/// case-sensitive one an in-tree link makes the same lookup. The removal of
+/// `work` while `--agent WORK` runs is refused and the file stays.
 #[tokio::test]
 async fn rm_is_refused_while_a_session_runs_the_profile_under_another_name() {
     if !pohunek_test_support::process_env::in_own_process() {
@@ -317,8 +326,11 @@ async fn rm_is_refused_while_a_session_runs_the_profile_under_another_name() {
     }
     let harness = Harness::start().await;
     let path = harness.profile("work", SLEEPING_PROFILE);
-    std::os::unix::fs::symlink("work.toml", harness.agents.join("WORK.toml"))
-        .expect("link the other spelling");
+    let other_spelling = harness.agents.join("WORK.toml");
+    if !opens_the_same_file(&other_spelling, &path) {
+        std::os::unix::fs::symlink("work.toml", &other_spelling).expect("link the other spelling");
+    }
+    assert!(opens_the_same_file(&other_spelling, &path));
     let digest = listed_digest(&harness, "work")
         .await
         .expect("work is listed");
@@ -396,7 +408,6 @@ async fn rm_sweeps_a_removal_quarantine_left_by_an_interrupted_removal() {
 /// removal under another spelling than the stored name is refused and the
 /// file stays. On a case-sensitive volume `Work` names no file at all, so the
 /// expectation is the same.
-#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn rm_under_another_spelling_than_the_stored_name_is_refused() {
     if !pohunek_test_support::process_env::in_own_process() {
