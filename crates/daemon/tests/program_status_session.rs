@@ -111,7 +111,9 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// an `id` and a `title`, then a bare `clear`); `L` reports a record with a
 /// `kind` the grammar does not know and then one with an unknown `state`;
 /// `W` clears the screen and prints the weak blocker text a transcript would
-/// leave behind (`Waiting for permission`, no prompt box); `S` clears and
+/// leave behind (`Waiting for permission`, no prompt box); `y` clears and
+/// redraws the prompt box in several writes, `e` only clears, and `Z` clears
+/// and redraws the prompt box in one write; `S` clears and
 /// prints the status spinner above the prompt box; `M` reports a
 /// `blocked:kind=permission` record carrying a marker text as `msg=`;
 /// `m` draws a marker line. In the `screen` mode the
@@ -188,6 +190,7 @@ run() {{
     K) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit blocked ;;
     y) printf '\033[2J\033[H'; box ;;
     e) printf '\033[2J\033[H' ;;
+    Z) printf '\033[2J\033[H────────────────────────────────────────\r\n❯ \r\n────────────────────────────────────────\r\n  ? for shortcuts' ;;
     Y) emit idle; printf '\033[2J\033[H'; box ;;
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
@@ -1981,76 +1984,161 @@ async fn a_stale_blocked_fallback_idle_resolves_the_attention() {
     attention.end().await;
 }
 
-/// A root `clear` and the prompt-box redraw in the specified `C, y` shape:
-/// the approval the blocked record opened resolves only through a working
-/// edge, never through the non-fallback screen idle the redraw settles to.
-/// The redraw may pass the process edge (a split chunking) or land in one
-/// chunk as structured evidence that skips it, so the final status depends
-/// on what the session published between `C` and the idle: `Acknowledged`
-/// after a working edge, `Unread` without one. A second session's blocked
-/// record fences the projector and the coordinator, which handle the events
-/// and commands of all sessions in order.
+/// After a root `clear` dropped a blocked record, the program's redraw is a
+/// repaint and leaves the approval the record opened `Unread` when the erase
+/// passes the process edge on its own (`e`, then the box): the split chunking.
+/// A later repaint keeps it open, and the program's next working record
+/// resolves it straight after a process edge.
 #[tokio::test]
-async fn a_cleared_record_resolves_only_through_the_working_edge() {
+async fn a_split_redraw_after_a_cleared_record_leaves_the_approval_open() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
-    let fixture = Fixture::staleness(true).await;
-    let attention = Attention::start(&fixture);
-    let created = fixture.start("fake-reply-fifo").await;
-    fixture
-        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+    let mut cleared = ClearedApproval::start().await;
+    command(&cleared.fixture, b'e');
+    cleared
+        .fixture
+        .wait_activity(&cleared.id, (AgentActivity::Working, StateSource::Process))
         .await;
-    // The weak blocker keeps the screen in agreement with the blocked record
-    // until the prompt box returns, so no staleness clock runs before `y`.
-    command(&fixture, b'W');
-    command(&fixture, b'b');
-    fixture
-        .wait_activity(
-            &created.id,
-            (AgentActivity::Blocked, StateSource::OscProgress),
-        )
+    command(&cleared.fixture, b'y');
+    cleared
+        .fixture
+        .wait_activity(&cleared.id, (AgentActivity::Idle, StateSource::Screen))
         .await;
-    let record = attention.first_record(&created.id).await;
-    assert_eq!(record.kind, NotificationKind::ApprovalRequired);
-    assert_eq!(record.status, NotificationStatus::Unread);
-
-    let mut events = fixture.registry.subscribe();
-    command(&fixture, b'C');
-    command(&fixture, b'y');
-    fixture
-        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+    cleared
+        .assert_open_until_a_turn("after the split redraw")
         .await;
+    cleared.finish().await;
+}
 
-    let fence = fixture.start("fake-reply-stdin").await;
-    fixture
-        .wait_activity(&fence.id, (AgentActivity::Idle, StateSource::OscProgress))
-        .await;
-    fixture
-        .input(&fence.id, "b", AgentActivity::Blocked)
-        .await
-        .expect("input until blocked");
-    attention.first_record(&fence.id).await;
-
-    let published = activities_until_screen_idle(&mut events, &created.id);
-    let working_edge = published.iter().any(|(activity, _)| activity == "working");
-    eprintln!("working edge between the clear and the idle: {working_edge}; {published:?}");
-    let records = attention.records(&created.id);
-    assert_eq!(records.len(), 1);
-    let expected = if working_edge {
-        NotificationStatus::Acknowledged
-    } else {
-        NotificationStatus::Unread
-    };
-    assert_eq!(
-        records[0].status, expected,
-        "only a working edge resolves the approval; published after the clear: {published:?}"
-    );
-
-    for id in [&created.id, &fence.id] {
-        fixture.registry.stop(id).await.expect("stop the session");
+/// The single-write chunking of the same redraw (`Z`: the erase and the box
+/// in one write, which reaches the detector as structured evidence unless
+/// the terminal splits it) leaves the approval `Unread` too, as does a later
+/// repaint; the program's next working record resolves it.
+#[tokio::test]
+async fn a_single_write_redraw_after_a_cleared_record_leaves_the_approval_open() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
     }
-    attention.end().await;
+    let mut cleared = ClearedApproval::start().await;
+    command(&cleared.fixture, b'Z');
+    cleared
+        .fixture
+        .wait_activity(&cleared.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    cleared
+        .assert_open_until_a_turn("after the single-write redraw")
+        .await;
+    cleared.finish().await;
+}
+
+/// A session whose blocked record opened an approval and was then dropped by
+/// a root `clear`, with the projector and the coordinator running.
+struct ClearedApproval {
+    fixture: Fixture,
+    attention: Attention,
+    id: SessionId,
+    events: tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
+    fences: Vec<SessionId>,
+}
+
+impl ClearedApproval {
+    /// Opens the approval and clears the record. The weak blocker keeps the
+    /// screen in agreement with the blocked record until the prompt box
+    /// returns, so no staleness clock runs.
+    async fn start() -> Self {
+        let fixture = Fixture::staleness(true).await;
+        let attention = Attention::start(&fixture);
+        let created = fixture.start("fake-reply-fifo").await;
+        fixture
+            .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+            .await;
+        command(&fixture, b'W');
+        command(&fixture, b'b');
+        fixture
+            .wait_activity(
+                &created.id,
+                (AgentActivity::Blocked, StateSource::OscProgress),
+            )
+            .await;
+        let record = attention.first_record(&created.id).await;
+        assert_eq!(record.kind, NotificationKind::ApprovalRequired);
+        assert_eq!(record.status, NotificationStatus::Unread);
+        let events = fixture.registry.subscribe();
+        command(&fixture, b'C');
+        Self {
+            fixture,
+            attention,
+            id: created.id,
+            events,
+            fences: Vec::new(),
+        }
+    }
+
+    /// Asserts the approval is still `Unread` once the projector has handled
+    /// everything published so far, then repaints again (`e`) and asserts the
+    /// same, then reports a working record and waits for the resolve.
+    async fn assert_open_until_a_turn(&mut self, after: &str) {
+        let published = activities_until_screen_idle(&mut self.events, &self.id);
+        eprintln!("published {after}: {published:?}");
+        self.fence().await;
+        self.assert_unread(&format!("{after}; published: {published:?}"));
+
+        command(&self.fixture, b'e');
+        self.fixture
+            .wait_activity(&self.id, (AgentActivity::Working, StateSource::Process))
+            .await;
+        self.fence().await;
+        self.assert_unread("after a later repaint");
+
+        command(&self.fixture, b'g');
+        self.fixture
+            .wait_activity(&self.id, (AgentActivity::Working, StateSource::OscProgress))
+            .await;
+        wait_until("the working record to resolve the approval", || async {
+            let records = self.attention.records(&self.id);
+            (records.len() == 1 && records[0].status == NotificationStatus::Acknowledged)
+                .then_some(())
+        })
+        .await;
+    }
+
+    fn assert_unread(&self, context: &str) {
+        let records = self.attention.records(&self.id);
+        assert_eq!(records.len(), 1, "{context}");
+        assert_eq!(
+            records[0].status,
+            NotificationStatus::Unread,
+            "a repaint leaves the approval open; {context}"
+        );
+    }
+
+    /// A new session's blocked record fences the projector and the
+    /// coordinator, which handle the events and commands of all sessions in
+    /// order.
+    async fn fence(&mut self) {
+        let fence = self.fixture.start("fake-reply-stdin").await;
+        self.fixture
+            .wait_activity(&fence.id, (AgentActivity::Idle, StateSource::OscProgress))
+            .await;
+        self.fixture
+            .input(&fence.id, "b", AgentActivity::Blocked)
+            .await
+            .expect("input until blocked");
+        self.attention.first_record(&fence.id).await;
+        self.fences.push(fence.id);
+    }
+
+    async fn finish(self) {
+        for id in std::iter::once(&self.id).chain(&self.fences) {
+            self.fixture
+                .registry
+                .stop(id)
+                .await
+                .expect("stop the session");
+        }
+        self.attention.end().await;
+    }
 }
 
 /// The activities `id` published up to and including its first screen idle.

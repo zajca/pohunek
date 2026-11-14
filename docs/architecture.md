@@ -1314,12 +1314,19 @@ the screen rules stay the fallback.
   record-backed `blocked` resolves the open attention record; an idle from
   the screen or the title that is not a fallback (after a root `clear`, a
   lag resync or a reconfigure) still does not, while an `osc_progress`
-  idle keeps resolving the dismissed-dialog case. After a root `clear`,
-  whether the approval is acknowledged depends on whether the redraw
-  passes the process edge: a single-chunk redraw carries structured
-  evidence and skips the edge, so the screen settles to idle with the
-  approval still open; a split redraw resolves it through `Working/Process`
-  first. The fallback guard itself never resolves a non-fallback idle.
+  idle keeps resolving the dismissed-dialog case. An approval a
+  record-backed `blocked` opened resolves only through a working edge from
+  the program or a screen rule: the program reports its own turns, so a
+  `Working/Process` edge (output no rule names, such as the redraw after a
+  root `clear`, a lag resync or a reconfigure dropped the record) is a
+  repaint and leaves it open. The outcome is therefore the same whether the
+  redraw lands in one chunk, as structured evidence that skips the process
+  edge, or split, passing it first; the next working record or working
+  screen rule resolves it, also straight after a process edge
+  (`projector.rs`, `record_approvals`; pinned by
+  `a_split_redraw_after_a_cleared_record_leaves_the_approval_open` and
+  `a_single_write_redraw_after_a_cleared_record_leaves_the_approval_open`).
+  The fallback guard itself never resolves a non-fallback idle.
   The projector narrows the
   idle resolve to program-channel idles and fallback idles
   (`projector.rs`: the idle resolve needs `origin.source ==

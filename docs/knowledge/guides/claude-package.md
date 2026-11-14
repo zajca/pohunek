@@ -419,6 +419,12 @@ open and the records stay authoritative
   `reason=blocked`. A record that goes from `blocked` to `idle` or `done` (Esc, a
   denial, the automatic denial of a safety check) resolves the attention
   record (`a_blocked_record_followed_by_an_idle_record_resolves_the_attention`).
+  After a root `clear` dropped the `blocked` record, Claude's redraw of the
+  prompt box is a repaint, whether it arrives in one write or several: the
+  attention record stays open until the next `working` record or working
+  screen rule
+  (`a_split_redraw_after_a_cleared_record_leaves_the_approval_open`,
+  `a_single_write_redraw_after_a_cleared_record_leaves_the_approval_open`).
   The integration registers no `Notification` hook; `pohunek integration
   install` strips the ones an earlier release wrote.
 - A held record outranks the screen. Two working screen rules, `live_status_spinner`

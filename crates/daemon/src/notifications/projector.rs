@@ -296,6 +296,11 @@ struct ProjectorState {
     /// status record (it came from `OscProgress` or named a kind), not by a
     /// screen or title reading alone.
     record_backed_blocks: HashSet<SessionId>,
+    /// Sessions with an open approval that a record-backed blocked opened. The
+    /// program reports its own turns, so until a resolve only a working edge
+    /// from the program or the screen resolves it: a process edge (output no
+    /// rule names, such as a redraw after the record dropped) is a repaint.
+    record_approvals: HashSet<SessionId>,
     lifecycle_by_session: HashMap<SessionId, SessionState>,
     transition_epochs: HashMap<(SessionId, NotificationKind), u64>,
     /// Sessions whose transition epochs continue from the store's records.
@@ -668,6 +673,7 @@ impl ProjectorState {
             self.activity_by_session.remove(&session.id);
             self.blocked_kind_by_session.remove(&session.id);
             self.record_backed_blocks.remove(&session.id);
+            self.record_approvals.remove(&session.id);
         }
         if session.state == SessionState::Stopped {
             self.handle_explicit_stop(attention, session);
@@ -694,7 +700,15 @@ impl ProjectorState {
         // detector seeing that edge first.
         if activity == AgentActivity::Working {
             self.blocked_replay_candidates.remove(session_id);
-            if previous != Some(AgentActivity::Working) {
+            let repaint = origin.source == Some(StateSource::Process)
+                && self.record_approvals.contains(session_id);
+            // A repaint ends no wait, however the terminal chunked it. The
+            // first working edge after it resolves even after the repaint's
+            // own `Working`.
+            if !repaint
+                && (self.record_approvals.remove(session_id)
+                    || previous != Some(AgentActivity::Working))
+            {
                 // The turn key resolves with the turn that starts, in order
                 // with the turns that ended.
                 attention.resolve(attention_dedupe_key(session_id));
@@ -714,13 +728,16 @@ impl ProjectorState {
             && record_backed
         {
             self.blocked_replay_candidates.remove(session_id);
+            self.record_approvals.remove(session_id);
             attention.resolve(attention_dedupe_key(session_id));
         }
         if activity == AgentActivity::Blocked {
             if origin.source == Some(StateSource::OscProgress) || origin.blocked_kind.is_some() {
                 self.record_backed_blocks.insert(session_id.clone());
+                self.record_approvals.insert(session_id.clone());
             } else if previous != Some(AgentActivity::Blocked) {
                 self.record_backed_blocks.remove(session_id);
+                self.record_approvals.remove(session_id);
             }
         } else {
             self.record_backed_blocks.remove(session_id);
@@ -797,6 +814,7 @@ impl ProjectorState {
             self.activity_by_session.remove(&session.id);
             self.blocked_kind_by_session.remove(&session.id);
             self.record_backed_blocks.remove(&session.id);
+            self.record_approvals.remove(&session.id);
             self.blocked_replay_candidates.remove(&session.id);
         }
     }
@@ -806,6 +824,7 @@ impl ProjectorState {
         self.lifecycle_by_session
             .insert(session.id.clone(), SessionState::Stopped);
         self.activity_by_session.remove(&session.id);
+        self.record_approvals.remove(&session.id);
         self.blocked_replay_candidates.remove(&session.id);
     }
 
