@@ -823,6 +823,104 @@ async fn a_restated_record_emits_no_agent_state() {
         .expect("stop the session");
 }
 
+/// A `session.list` seed carries the activity epoch and revision of the
+/// newest `agent_state` whose activity it shows, so a subscriber that
+/// buffered that event while it seeded knows it is not newer than the seed.
+#[tokio::test]
+async fn a_listed_session_carries_the_revision_of_its_newest_agent_state() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    let mut events = fixture.registry.subscribe();
+    command(&fixture, b'g');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
+        .await;
+    let seed = fixture
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .find(|info| info.id == created.id)
+        .expect("the session is listed");
+    assert_eq!(seed.activity, Some(AgentActivity::Working));
+    assert_eq!(
+        seed.activity_epoch.as_deref(),
+        Some(fixture.registry.daemon_instance_id()),
+        "the seed is scoped by this daemon epoch"
+    );
+    let seed_revision = seed.activity_revision.expect("activity was recorded");
+    let matched: protocol::AgentStateEvent =
+        wait_until("the agent_state of the seeded activity", || {
+            let mut collected = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if event.event() == protocol::event::AGENT_STATE {
+                    collected.push(event.payload().clone());
+                }
+            }
+            async move {
+                collected.into_iter().find_map(|payload| {
+                    let decoded: protocol::AgentStateEvent =
+                        serde_json::from_value(payload).expect("decode the agent_state event");
+                    (decoded.revision == Some(seed_revision)).then_some(decoded)
+                })
+            }
+        })
+        .await;
+    assert_eq!(matched.activity, AgentActivity::Working);
+    assert_eq!(matched.activity_epoch, seed.activity_epoch);
+    let seed_runtime = seed.runtime.as_ref().expect("the seed names a runtime");
+    let event_runtime = matched
+        .runtime
+        .as_ref()
+        .expect("agent_state names a runtime");
+    assert_eq!(
+        event_runtime.worker_instance_id(),
+        seed_runtime
+            .worker_instance_id
+            .as_deref()
+            .expect("seed instance"),
+        "the matched event is the seed runtime's own"
+    );
+    assert_eq!(
+        event_runtime.runtime_generation(),
+        seed_runtime.runtime_generation,
+        "the matched event is the seed runtime's own generation"
+    );
+    command(&fixture, b'd');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    let reseeded = fixture
+        .registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect the session");
+    assert_eq!(
+        reseeded.activity_epoch, seed.activity_epoch,
+        "the epoch still scopes the cursor"
+    );
+    assert!(
+        reseeded
+            .activity_revision
+            .is_some_and(|revision| revision > seed_revision),
+        "a later inspect moves past the seeded event: {reseeded:?}"
+    );
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
 /// The child records of a Claude background agent never change what the
 /// session reads: they do not turn a held root `done` working. A child record
 /// that dropped the held root record is not observed here, because the idle

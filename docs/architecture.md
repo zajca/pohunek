@@ -1536,7 +1536,10 @@ decimal-string activity revision. The registry retains the latest evidence for
 the full maximum wait window, subject to a hard per-session memory bound, so a
 later report of the same activity cannot erase valid pre-deadline evidence. The
 dedupe cursor is `(activity_epoch, runtime, revision)` because a replacement
-daemon adopts the same runtime but starts a fresh revision sequence. Runtime
+daemon adopts the same runtime but starts a fresh revision sequence. `session.list`
+and `session.inspect` read their activity cursor from the same registry lock
+that orders the revision, so the `(activity_epoch, activity_revision)` they
+carry belongs to the snapshot they return. Runtime
 exit returns `session_not_running`; replacement returns
 `session_runtime_changed`. Rust and TypeScript SDK wait helpers reject a success
 response unless it includes the matching activity, source, runtime identity,

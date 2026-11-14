@@ -1080,18 +1080,46 @@ fn session_info_json_shape_roundtrips_with_activity_cursor() {
 
 #[test]
 fn session_info_orders_buffered_agent_state_against_its_activity_cursor() {
-    let event = |epoch: Option<&str>, revision: Option<u64>| AgentStateEvent {
-        session_id: SessionId("s-42".to_owned()),
-        activity: AgentActivity::Working,
-        source: StateSource::Report,
-        blocked_kind: None,
-        runtime: None,
-        activity_epoch: epoch.map(str::to_owned),
-        revision: revision.map(ActivityRevision::new),
+    let seed_runtime = || protocol::SessionRuntime {
+        state: protocol::RuntimeState::Live,
+        runtime_generation: RuntimeGeneration::new(3),
+        worker_id: Some("w-1".to_owned()),
+        worker_instance_id: Some("runtime-42".to_owned()),
+        started_at: None,
+        last_connected_at: None,
+        loss_reason: None,
+        exit: None,
+        loss_cause: None,
+        generation_recorded: None,
+    };
+    let event =
+        |epoch: Option<&str>, revision: Option<u64>, runtime: Option<SessionRuntimeIdentity>| {
+            AgentStateEvent {
+                session_id: SessionId("s-42".to_owned()),
+                activity: AgentActivity::Working,
+                source: StateSource::Report,
+                blocked_kind: None,
+                runtime,
+                activity_epoch: epoch.map(str::to_owned),
+                revision: revision.map(ActivityRevision::new),
+            }
+        };
+    let seed_identity = || {
+        SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(3))
+            .expect("valid runtime identity")
+    };
+    let foreign_identity = || {
+        SessionRuntimeIdentity::new("runtime-77", RuntimeGeneration::new(3))
+            .expect("valid runtime identity")
+    };
+    let next_generation = || {
+        SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(4))
+            .expect("valid runtime identity")
     };
     let snapshotted = SessionInfo {
         activity_epoch: Some("d-epoch-1".to_owned()),
         activity_revision: Some(ActivityRevision::new(7)),
+        runtime: Some(seed_runtime()),
         ..running_shell_session(None)
     };
     assert_eq!(
@@ -1099,35 +1127,58 @@ fn session_info_orders_buffered_agent_state_against_its_activity_cursor() {
         Some(("d-epoch-1", ActivityRevision::new(7)))
     );
     assert_eq!(
-        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(7))),
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(7), Some(seed_identity()))),
         Some(true)
     );
     assert_eq!(
-        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(3))),
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(3), Some(seed_identity()))),
         Some(true)
     );
     assert_eq!(
-        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(8))),
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(8), Some(seed_identity()))),
         Some(false)
     );
     // Another epoch cannot be ordered against the snapshot.
     assert_eq!(
-        snapshotted.agent_state_is_stale(&event(Some("d-epoch-2"), Some(1))),
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-2"), Some(1), Some(seed_identity()))),
+        None
+    );
+    // A resume mints a new generation under the same epoch, so a buffered
+    // event from another runtime reads as unordered even at an old revision.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(
+            Some("d-epoch-1"),
+            Some(1),
+            Some(foreign_identity())
+        )),
+        None
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(
+            Some("d-epoch-1"),
+            Some(1),
+            Some(next_generation())
+        )),
+        None
+    );
+    // An event without a runtime identity cannot be tied to the seed.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(7), None)),
         None
     );
     // Without a cursor on either side there is nothing to order by.
     assert_eq!(
-        snapshotted.agent_state_is_stale(&event(None, Some(9))),
+        snapshotted.agent_state_is_stale(&event(None, Some(9), Some(seed_identity()))),
         None
     );
     assert_eq!(
-        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), None)),
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), None, Some(seed_identity()))),
         None
     );
     let bare = running_shell_session(None);
     assert_eq!(bare.activity_cursor(), None);
     assert_eq!(
-        bare.agent_state_is_stale(&event(Some("d-epoch-1"), Some(1))),
+        bare.agent_state_is_stale(&event(Some("d-epoch-1"), Some(1), Some(seed_identity()))),
         None
     );
 }

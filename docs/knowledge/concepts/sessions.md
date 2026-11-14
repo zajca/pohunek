@@ -174,8 +174,9 @@ been taken.
 `session.list` and `session.inspect` also report the activity cursor
 (`activity_epoch`, `activity_revision`) of the returned snapshot once activity
 was recorded, so an assistant that buffers `agent_state` events can tell which
-ones the snapshot already includes: a buffered event of the same epoch whose
-revision is not greater is older than the snapshot.
+ones the snapshot already includes: a buffered event naming the snapshot's
+runtime (`worker_instance_id` and `runtime_generation`) and the same epoch
+whose revision is not greater is older than the snapshot.
 A Claude session also reports each submitted prompt through the
 `UserPromptSubmit` hook. A caller that opts in with `allow_prompt_accepted`
 (the CLI always does for a waited input) gets that report as the answer to a

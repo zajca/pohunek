@@ -3447,16 +3447,26 @@ impl SessionInfo {
 
     /// Whether a buffered `agent_state` event is older than this snapshot.
     ///
-    /// Returns `Some(true)` when the event carries the cursor's epoch with a
-    /// revision at or below the cursor, `Some(false)` when it carries the
+    /// Returns `Some(true)` when the event names the snapshot's runtime and
+    /// carries the cursor's epoch with a revision at or below the cursor,
+    /// `Some(false)` when it names the snapshot's runtime and carries the
     /// cursor's epoch with a newer revision, and `None` when either side has
-    /// no cursor or the epochs differ and the two cannot be ordered.
+    /// no cursor, the epochs or runtimes differ, or an identity is missing,
+    /// so the two cannot be ordered.
     #[must_use]
     pub fn agent_state_is_stale(&self, event: &AgentStateEvent) -> Option<bool> {
         let (epoch, revision) = self.activity_cursor()?;
         let event_epoch = event.activity_epoch.as_deref()?;
         let event_revision = event.revision?;
         if event_epoch != epoch {
+            return None;
+        }
+        let seed = self.runtime.as_ref()?;
+        let (instance, generation) = (seed.worker_instance_id.as_deref()?, seed.runtime_generation);
+        let event_runtime = event.runtime.as_ref()?;
+        if event_runtime.worker_instance_id() != instance
+            || event_runtime.runtime_generation() != generation
+        {
             return None;
         }
         Some(event_revision <= revision)

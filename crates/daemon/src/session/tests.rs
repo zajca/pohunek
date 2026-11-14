@@ -12,16 +12,16 @@ use time::OffsetDateTime;
 
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use protocol::{
-    method, ActivityRevision, AgentActivity, CwdSource, DetectionRegionKind,
-    DetectionRegionPreview, ErrorClass, Event, OutputOffset, PackageId, PackageIdentity,
-    PackageVersion, ProcessStartIdentity, ProjectSource, ReportSequence, Request, Response,
-    RuntimeGeneration, RuntimeId, RuntimeRef, RuntimeState, SessionAttachParams,
-    SessionDetectionParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
-    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
-    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
-    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    method, AgentActivity, CwdSource, DetectionRegionKind, DetectionRegionPreview, ErrorClass,
+    Event, OutputOffset, PackageId, PackageIdentity, PackageVersion, ProcessStartIdentity,
+    ProjectSource, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId, RuntimeRef,
+    RuntimeState, SessionAttachParams, SessionDetectionParams, SessionId, SessionInfo,
+    SessionNativeRecoveredEvent, SessionNewParams, SessionOutputParams, SessionReadFormat,
+    SessionReadParams, SessionReadSource, SessionReleaseAgentParams, SessionReportAgentParams,
+    SessionReportNativeIdParams, SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity,
+    SessionState, SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo,
+    SubagentLifecycle, SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
+    MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::host::fixture::{
@@ -3227,23 +3227,17 @@ async fn a_turn_that_ends_blocked_leaves_the_input_to_the_next_working() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
-/// `session.list` and `session.inspect` report the activity cursor of the
-/// same snapshot they return: the daemon epoch plus the newest activity
-/// revision, so a client can tell buffered `agent_state` events older than
-/// the snapshot from newer ones.
 #[tokio::test]
-async fn listed_and_inspected_sessions_carry_their_activity_cursor() {
+async fn a_reported_activity_is_no_input_for_a_later_detector_turn() {
     let registry = turn_registry();
-    let mut events = registry.subscribe();
+    let mut edges = registry
+        .turn_events()
+        .take_edge_receiver()
+        .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
-    let before = registry
-        .inspect(&created.id)
-        .await
-        .expect("inspect the session");
-    assert_eq!(before.activity_epoch, None, "no activity recorded yet");
-    assert_eq!(before.activity_revision, None, "no activity recorded yet");
-
+    let mut events = registry.subscribe();
     hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
+    hook_report(&registry, &created.id, 2, Some(AgentActivity::Idle)).await;
     for event in std::iter::from_fn(|| events.try_recv().ok()) {
         if event.event() == protocol::event::SESSION_UPDATED {
             let updated: protocol::SessionEvent =
@@ -3258,56 +3252,6 @@ async fn listed_and_inspected_sessions_carry_their_activity_cursor() {
             );
         }
     }
-    let epoch = registry.daemon_instance_id().to_owned();
-    let inspected = registry
-        .inspect(&created.id)
-        .await
-        .expect("inspect the session");
-    assert_eq!(inspected.activity_epoch.as_deref(), Some(epoch.as_str()));
-    assert_eq!(
-        inspected.activity_revision.map(ActivityRevision::get),
-        Some(1),
-        "the first recorded activity"
-    );
-    let from_list = registry
-        .list()
-        .await
-        .into_iter()
-        .find(|info| info.id == created.id)
-        .expect("the session is listed");
-    assert_eq!(
-        (from_list.activity_epoch, from_list.activity_revision),
-        (
-            inspected.activity_epoch.clone(),
-            inspected.activity_revision
-        ),
-        "list and inspect agree on the cursor"
-    );
-
-    hook_report(&registry, &created.id, 2, Some(AgentActivity::Idle)).await;
-    let moved = registry
-        .inspect(&created.id)
-        .await
-        .expect("inspect the session");
-    assert_eq!(moved.activity_epoch.as_deref(), Some(epoch.as_str()));
-    assert_eq!(
-        moved.activity_revision.map(ActivityRevision::get),
-        Some(2),
-        "the cursor moves with newer activity"
-    );
-    registry.stop(&created.id).await.expect("stop the session");
-}
-
-#[tokio::test]
-async fn a_reported_activity_is_no_input_for_a_later_detector_turn() {
-    let registry = turn_registry();
-    let mut edges = registry
-        .turn_events()
-        .take_edge_receiver()
-        .expect("the first taker");
-    let created = registry.create(params()).await.expect("create session");
-    hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
-    hook_report(&registry, &created.id, 2, Some(AgentActivity::Idle)).await;
     hook_release(&registry, &created.id, 2).await;
     started_turns_and_ends(&mut edges);
 

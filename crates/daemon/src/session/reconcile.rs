@@ -20754,6 +20754,7 @@ generation "$1"
                 unbound.runtime.executable = None;
                 // A lost runtime that is not proven ended keeps its session
                 // state, so a stop is still refused with the runtime's code.
+                let mut events = fixture.registry.subscribe();
                 let committed = if state == RuntimeState::Lost {
                     fixture
                         .registry
@@ -20771,26 +20772,6 @@ generation "$1"
                         .await
                 };
                 assert!(committed);
-                let mut events = fixture.registry.subscribe();
-                // Resubscribing drops the classification event above, so
-                // reclassify to observe what a subscriber sees.
-                let again = if state == RuntimeState::Lost {
-                    fixture
-                        .registry
-                        .insert_lost_record(
-                            unbound,
-                            reason,
-                            crate::session::LossProof::Unproven,
-                            None,
-                        )
-                        .await
-                } else {
-                    fixture
-                        .registry
-                        .insert_unavailable_record(unbound, state, reason)
-                        .await
-                };
-                assert!(again);
                 if state == RuntimeState::Conflict {
                     let mut announced = false;
                     while let Ok(event) = events.try_recv() {

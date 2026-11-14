@@ -926,8 +926,8 @@ async fn a_conflict_without_a_generation_is_removed_only_with_consent_and_says_s
         listed.runtime.as_ref().map(|runtime| runtime.state),
         Some(RuntimeState::Conflict)
     );
-    // The published form says the daemon recorded no generation to prove,
-    // so a client no longer sees the actions; the daemon refuses them below.
+    // The listed runtime reports that no generation is recorded, so a
+    // client offers neither action; the daemon refuses both below.
     assert!(!listed.can_stop() && !listed.can_remove());
     assert_eq!(
         listed
