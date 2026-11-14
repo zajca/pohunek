@@ -1206,6 +1206,8 @@ impl Fixture {
         let now = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(session_id.to_owned()),
@@ -1230,6 +1232,7 @@ impl Fixture {
                 loss_reason: None,
                 exit: None,
                 loss_cause: None,
+                generation_recorded: None,
             }),
             cols: 80,
             rows: 24,

@@ -806,7 +806,7 @@ impl SessionRegistry {
                     self.reconcile_active_agent(entry, now, lineage.as_ref())
                 }
                 ForegroundDecision::Preserve => None,
-                ForegroundDecision::Updated => Some(entry.info.clone()),
+                ForegroundDecision::Updated => Some(entry.published_info()),
             }
             .or(retired);
             let focus = entry
@@ -960,7 +960,7 @@ impl SessionRegistry {
         ) {
             ForegroundDecision::Fallback => self.reconcile_active_agent(entry, now, None),
             ForegroundDecision::Preserve => None,
-            ForegroundDecision::Updated => Some(entry.info.clone()),
+            ForegroundDecision::Updated => Some(entry.published_info()),
         }
     }
 
@@ -1297,7 +1297,7 @@ impl SessionRegistry {
             }
             entry.info.active_agent_pid = Some(observed.pid);
             entry.info.updated_at = timestamp_now();
-            return Some(entry.info.clone());
+            return Some(entry.published_info());
         }
 
         if now.saturating_duration_since(active.reported_at)
@@ -1962,7 +1962,7 @@ pub(super) fn apply_observed_transition(
     let config = DetectorConfig::for_definition(&observed.definition.0);
     send_detector_config(entry, config);
     entry.info.updated_at = timestamp_now();
-    entry.info.clone()
+    entry.published_info()
 }
 
 fn first_observed_agent_for_base(

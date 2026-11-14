@@ -779,6 +779,8 @@ impl Installation {
         let live = runtime.state == RuntimeState::Live;
         let info = SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(session_id.to_owned()),
@@ -804,6 +806,7 @@ impl Installation {
                 loss_reason: runtime.reason.clone(),
                 exit: None,
                 loss_cause: None,
+                generation_recorded: None,
             }),
             cols: 80,
             rows: 24,

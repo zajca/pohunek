@@ -49,4 +49,12 @@ export type SessionRuntime = {
    * absent.
    */
   loss_cause?: string;
+  /**
+   * Whether the daemon's record of this `conflict` runtime names the worker
+   * generation (the supervised job) that `session.stop` and `session.remove`
+   * prove before they act. Set only while [`Self::state`] is `conflict`;
+   * stored records never carry it. `None` from a daemon that predates the
+   * field.
+   */
+  generation_recorded?: boolean;
 };

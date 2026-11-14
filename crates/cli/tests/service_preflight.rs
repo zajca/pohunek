@@ -283,6 +283,8 @@ impl Host {
 fn session_info() -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
         name: None,
@@ -334,6 +336,7 @@ fn session_info() -> SessionInfo {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         }),
     }
 }

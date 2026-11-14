@@ -171,6 +171,12 @@ SDK helpers validate the timeout locally and fail closed with
 runtime-scoped evidence. Its recovery guidance says to read the screen before resending or pressing
 Enter, because the text may still sit unsent in the prompt or may already have
 been taken.
+`session.list` and `session.inspect` also report the activity cursor
+(`activity_epoch`, `activity_revision`) of the returned snapshot once activity
+was recorded, so an assistant that buffers `agent_state` events can tell which
+ones the snapshot already includes: a buffered event naming the snapshot's
+runtime (`worker_instance_id` and `runtime_generation`) and the same epoch
+whose revision is not greater is older than the snapshot.
 A Claude session also reports each submitted prompt through the
 `UserPromptSubmit` hook. A caller that opts in with `allow_prompt_accepted`
 (the CLI always does for a waited input) gets that report as the answer to a
@@ -992,7 +998,12 @@ runtime's marker does not outlive the runtime.
 
 `lost` means the worker or host runtime is gone and the PTY cannot be
 reattached. `conflict` means discovery found ambiguous or mismatched live
-identity; Pohunek quarantines it and does not kill a worker automatically. A
+identity; Pohunek quarantines it and does not kill a worker automatically. List,
+inspect and event responses report `generation_recorded` on a `conflict`
+runtime: `true` when the record names the worker generation the stop and
+remove prove, `false` otherwise. The session helpers hide the actions a
+`false` conflict cannot take, and the daemon refuses them with
+`session_runtime_conflict`. A
 `conflict` whose record names a worker generation is re-checked in the
 background (after 1 s, doubling to at most 60 s) while a worker still answers
 or its job is supervised: a pass never kills, the session stays `conflict`

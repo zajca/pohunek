@@ -2824,13 +2824,25 @@ pub struct SessionRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub loss_cause: Option<String>,
+    /// Whether the daemon's record of this `conflict` runtime names the worker
+    /// generation (the supervised job) that `session.stop` and `session.remove`
+    /// prove before they act. Set only while [`Self::state`] is `conflict`;
+    /// stored records never carry it. `None` from a daemon that predates the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub generation_recorded: Option<bool>,
 }
 
 impl SessionRuntime {
-    /// Whether the runtime names both the worker and the worker instance the
-    /// daemon proves before it stops or removes a conflicted session.
-    fn names_recorded_worker(&self) -> bool {
-        self.worker_id.is_some() && self.worker_instance_id.is_some()
+    /// Whether a `conflict` runtime names what the daemon proves before it
+    /// stops or removes the session: the worker, the worker instance, and a
+    /// recorded generation. A peer that predates
+    /// [`Self::generation_recorded`] is taken to record one.
+    fn names_provable_conflict(&self) -> bool {
+        self.worker_id.is_some()
+            && self.worker_instance_id.is_some()
+            && self.generation_recorded != Some(false)
     }
 }
 
@@ -3170,6 +3182,20 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_kind: Option<BlockedKind>,
+    /// Daemon epoch that scopes [`Self::activity_revision`]. Set only on
+    /// `session.list` and `session.inspect` responses; events and stored
+    /// records never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_epoch: Option<String>,
+    /// Revision of the newest activity the daemon recorded for this session
+    /// within [`Self::activity_epoch`], taken with this snapshot. A buffered
+    /// `agent_state` of the same runtime and epoch whose `revision` is not
+    /// greater is older than the snapshot. Set only on `session.list` and
+    /// `session.inspect` responses, and only once activity was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_revision: Option<ActivityRevision>,
     /// Durable provider-managed subagents, including bounded recent history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentInfo>,
@@ -3351,11 +3377,12 @@ impl SessionInfo {
     /// An external observe-only entry has no PTY to stop, a terminal session has
     /// already stopped, and a runtime that is neither connected nor on its way
     /// back cannot be asked to shut one down; neither can a runtime in a state
-    /// this build does not know. A [`RuntimeState::Conflict`] runtime that names
-    /// its worker and worker instance is stoppable, because the daemon stops it
-    /// by that recorded identity once the worker journal and the service
-    /// manager's job prove it; the call can still be refused when the proof
-    /// fails. A session with no runtime at all predates worker-backed runtimes
+    /// this build does not know. A [`RuntimeState::Conflict`] runtime is
+    /// stoppable when it names its worker and worker instance and does not
+    /// report [`SessionRuntime::generation_recorded`] as `false`, because the
+    /// daemon stops it by that recorded identity once the worker journal and the
+    /// service manager's job prove it; the call can still be refused when the
+    /// proof fails. A session with no runtime at all predates worker-backed runtimes
     /// and is treated as stoppable.
     #[must_use]
     pub fn can_stop(&self) -> bool {
@@ -3366,7 +3393,7 @@ impl SessionInfo {
             .as_ref()
             .is_none_or(|runtime| match runtime.state {
                 RuntimeState::Live | RuntimeState::Starting | RuntimeState::Reconnecting => true,
-                RuntimeState::Conflict => runtime.names_recorded_worker(),
+                RuntimeState::Conflict => runtime.names_provable_conflict(),
                 _ => false,
             })
     }
@@ -3376,10 +3403,13 @@ impl SessionInfo {
     /// Removal is refused for an external entry the daemon does not own, for an
     /// [`RuntimeState::Incompatible`] or [`RuntimeState::Unknown`] runtime, and
     /// for a [`RuntimeState::Conflict`] runtime that does not name its worker and
-    /// worker instance: the identity backing such a session is unresolved and
+    /// worker instance, or that reports [`SessionRuntime::generation_recorded`]
+    /// as `false`: the identity backing such a session is unresolved and
     /// evicting the record could strand a live PTY. A conflict that does name
     /// them is removable, because the daemon proves the recorded identity before
     /// it retires anything; the call can still be refused when the proof fails.
+    /// A conflict without a recorded generation is removed only through
+    /// `session.remove_accepting_unconfirmed`, which this helper does not model.
     /// Everything else is removable once it is terminal, still stoppable, or
     /// lost. The daemon's retention sweep applies this rule and additionally
     /// never selects a conflict.
@@ -3392,7 +3422,7 @@ impl SessionInfo {
             matches!(
                 runtime.state,
                 RuntimeState::Incompatible | RuntimeState::Unknown
-            ) || (runtime.state == RuntimeState::Conflict && !runtime.names_recorded_worker())
+            ) || (runtime.state == RuntimeState::Conflict && !runtime.names_provable_conflict())
         }) {
             return false;
         }
@@ -3402,6 +3432,44 @@ impl SessionInfo {
                 .runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.state == RuntimeState::Lost)
+    }
+
+    /// The activity cursor of this snapshot, when `session.list` or
+    /// `session.inspect` reported one: the daemon epoch scoping the revision
+    /// plus the newest recorded activity revision.
+    #[must_use]
+    pub fn activity_cursor(&self) -> Option<(&str, ActivityRevision)> {
+        match (self.activity_epoch.as_deref(), self.activity_revision) {
+            (Some(epoch), Some(revision)) => Some((epoch, revision)),
+            _ => None,
+        }
+    }
+
+    /// Whether a buffered `agent_state` event is older than this snapshot.
+    ///
+    /// Returns `Some(true)` when the event names the snapshot's runtime and
+    /// carries the cursor's epoch with a revision at or below the cursor,
+    /// `Some(false)` when it names the snapshot's runtime and carries the
+    /// cursor's epoch with a newer revision, and `None` when either side has
+    /// no cursor, the epochs or runtimes differ, or an identity is missing,
+    /// so the two cannot be ordered.
+    #[must_use]
+    pub fn agent_state_is_stale(&self, event: &AgentStateEvent) -> Option<bool> {
+        let (epoch, revision) = self.activity_cursor()?;
+        let event_epoch = event.activity_epoch.as_deref()?;
+        let event_revision = event.revision?;
+        if event_epoch != epoch {
+            return None;
+        }
+        let seed = self.runtime.as_ref()?;
+        let (instance, generation) = (seed.worker_instance_id.as_deref()?, seed.runtime_generation);
+        let event_runtime = event.runtime.as_ref()?;
+        if event_runtime.worker_instance_id() != instance
+            || event_runtime.runtime_generation() != generation
+        {
+            return None;
+        }
+        Some(event_revision <= revision)
     }
 }
 
@@ -3998,6 +4066,8 @@ mod tests {
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(id.to_owned()),

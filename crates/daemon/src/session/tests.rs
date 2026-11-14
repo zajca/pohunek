@@ -3235,8 +3235,23 @@ async fn a_reported_activity_is_no_input_for_a_later_detector_turn() {
         .take_edge_receiver()
         .expect("the first taker");
     let created = registry.create(params()).await.expect("create session");
+    let mut events = registry.subscribe();
     hook_report(&registry, &created.id, 1, Some(AgentActivity::Working)).await;
     hook_report(&registry, &created.id, 2, Some(AgentActivity::Idle)).await;
+    for event in std::iter::from_fn(|| events.try_recv().ok()) {
+        if event.event() == protocol::event::SESSION_UPDATED {
+            let updated: protocol::SessionEvent =
+                serde_json::from_value(event.payload().clone()).expect("decode the event");
+            assert_eq!(
+                (
+                    updated.session.activity_epoch,
+                    updated.session.activity_revision
+                ),
+                (None, None),
+                "events never carry the list/inspect cursor"
+            );
+        }
+    }
     hook_release(&registry, &created.id, 2).await;
     started_turns_and_ends(&mut edges);
 
@@ -17075,11 +17090,15 @@ impl NativeIdExitRace {
         assert_eq!(record.info.state, SessionState::Failed);
         assert_eq!(record.info.exit_code, Some(3));
         assert_eq!(record.runtime.state, RuntimeState::Terminal);
-        let memory = self
+        let mut memory = self
             .registry
             .inspect(&self.id)
             .await
             .expect("inspect session");
+        // The activity cursor is a live read-time projection (like
+        // blocked_kind): the stored record never carries it.
+        memory.activity_epoch = None;
+        memory.activity_revision = None;
         assert_eq!(
             record.info, memory,
             "the store holds what the registry shows"
@@ -18140,10 +18159,14 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         durable.info.native_session_path.as_deref(),
         Some("/work/durable-native-newer")
     );
-    let registry_info = registry
+    let mut registry_info = registry
         .inspect(&created.id)
         .await
         .expect("inspect committed terminal session");
+    // The activity cursor is a live read-time projection (like blocked_kind):
+    // the stored record never carries it.
+    registry_info.activity_epoch = None;
+    registry_info.activity_revision = None;
     // Process observation may publish a live update (e.g. the procwatch cwd)
     // before the exit commit; the terminal update is the one under test.
     let event_info = loop {
@@ -19439,6 +19462,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
             ended_at: None,
         }),
         loss_cause: None,
+        generation_recorded: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -20123,6 +20147,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         });
         drop(sessions);
         let error = registry
@@ -24669,10 +24694,14 @@ async fn stop_intent_never_overwrites_an_exit_that_committed_first() {
     assert_eq!(record.info.state, SessionState::Stopped);
     assert_eq!(record.transaction, None, "no stop intent outlives the exit");
     assert_eq!(record.runtime.state, RuntimeState::Terminal);
-    let memory = registry
+    let mut memory = registry
         .inspect(&created.id)
         .await
         .expect("inspect session");
+    // The activity cursor is a live read-time projection (like blocked_kind):
+    // the stored record never carries it.
+    memory.activity_epoch = None;
+    memory.activity_revision = None;
     assert_eq!(
         record.info, memory,
         "the store holds what the registry shows"
@@ -28023,6 +28052,7 @@ async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
         loss_reason: Some("test_runtime_lost".to_owned()),
         exit: None,
         loss_cause: None,
+        generation_recorded: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -28137,6 +28167,7 @@ async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home()
         loss_reason: Some("test_runtime_lost".to_owned()),
         exit: None,
         loss_cause: None,
+        generation_recorded: None,
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");

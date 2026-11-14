@@ -632,6 +632,8 @@ mod tests {
     fn session(id: &str, state: SessionState, updated_at: String) -> SessionInfo {
         SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(id.to_owned()),
@@ -688,6 +690,7 @@ mod tests {
             loss_reason: (state == RuntimeState::Lost).then(|| "worker_unavailable".to_owned()),
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         }
     }
 

@@ -5,37 +5,37 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use proptest::prelude::*;
 use protocol::{
-    event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, ApprovalKeyReference,
-    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, BackgroundItem,
-    BackgroundKind, BackgroundRevision, BackgroundStatus, BlockedKind, ConceptDeprecation,
-    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
-    DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
-    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin, HostApprovalSignature,
-    HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
-    IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
-    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
-    IntegrationRecovery, IntegrationUninstallState, NotificationCreateParams,
-    NotificationCreateResult, NotificationCreatedEvent, NotificationDeletedEvent, NotificationId,
-    NotificationKind, NotificationListParams, NotificationRecord, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdatedEvent, ObservationParamsError,
-    OutputOffset, OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault,
-    PackageFindingKind, PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason,
-    PackageTrust, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
-    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
-    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult,
-    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
-    SessionDetectionParams, SessionDetectionResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
-    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
-    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, AgentStateEvent,
+    ApprovalKeyReference, AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader,
+    BackgroundItem, BackgroundKind, BackgroundRevision, BackgroundStatus, BlockedKind,
+    ConceptDeprecation, ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult,
+    DetectionRegionKind, DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus,
+    EnrollmentInfo, EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin,
+    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
+    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
+    IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
+    IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery,
+    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeletedEvent, NotificationId, NotificationKind,
+    NotificationListParams, NotificationRecord, NotificationSeverity, NotificationSource,
+    NotificationStatus, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault, PackageFindingKind,
+    PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PackageTrust, PrincipalId,
+    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
+    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
+    Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
+    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
+    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
+    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -104,6 +104,8 @@ fn output_result(
 fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
         name: None,
@@ -1029,6 +1031,156 @@ fn session_info_json_shape_roundtrips_with_activity() {
 
     let back = line_roundtrip(&info);
     assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_json_shape_roundtrips_with_activity_cursor() {
+    let info = SessionInfo {
+        activity_epoch: Some("d-epoch-1".to_owned()),
+        activity_revision: Some(ActivityRevision::new(7)),
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(
+        value,
+        json!({
+            "id": "s-42",
+            "external": false,
+            "agent": "shell",
+            "agent_base": "shell",
+            "capabilities": {"resume": false, "fork": false},
+            "cwd": "/workspace/project",
+            "cwd_source": "launch",
+            "pid": 4242,
+            "cols": 120,
+            "rows": 40,
+            "state": "running",
+            "state_source": "process",
+            "activity_epoch": "d-epoch-1",
+            "activity_revision": "7",
+            "created_at": "2026-06-17T10:00:00Z",
+            "updated_at": "2026-06-17T10:01:00Z"
+        })
+    );
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+
+    // A peer that predates the cursor decodes without it.
+    let mut bare = value;
+    for key in ["activity_epoch", "activity_revision"] {
+        bare.as_object_mut()
+            .expect("session info object")
+            .remove(key);
+    }
+    let decoded: SessionInfo = serde_json::from_value(bare).expect("decode session info");
+    assert_eq!(decoded.activity_epoch, None);
+    assert_eq!(decoded.activity_revision, None);
+}
+
+#[test]
+fn session_info_orders_buffered_agent_state_against_its_activity_cursor() {
+    let seed_runtime = || protocol::SessionRuntime {
+        state: protocol::RuntimeState::Live,
+        runtime_generation: RuntimeGeneration::new(3),
+        worker_id: Some("w-1".to_owned()),
+        worker_instance_id: Some("runtime-42".to_owned()),
+        started_at: None,
+        last_connected_at: None,
+        loss_reason: None,
+        exit: None,
+        loss_cause: None,
+        generation_recorded: None,
+    };
+    let event =
+        |epoch: Option<&str>, revision: Option<u64>, runtime: Option<SessionRuntimeIdentity>| {
+            AgentStateEvent {
+                session_id: SessionId("s-42".to_owned()),
+                activity: AgentActivity::Working,
+                source: StateSource::Report,
+                blocked_kind: None,
+                runtime,
+                activity_epoch: epoch.map(str::to_owned),
+                revision: revision.map(ActivityRevision::new),
+            }
+        };
+    let seed_identity = || {
+        SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(3))
+            .expect("valid runtime identity")
+    };
+    let foreign_identity = || {
+        SessionRuntimeIdentity::new("runtime-77", RuntimeGeneration::new(3))
+            .expect("valid runtime identity")
+    };
+    let next_generation = || {
+        SessionRuntimeIdentity::new("runtime-42", RuntimeGeneration::new(4))
+            .expect("valid runtime identity")
+    };
+    let snapshotted = SessionInfo {
+        activity_epoch: Some("d-epoch-1".to_owned()),
+        activity_revision: Some(ActivityRevision::new(7)),
+        runtime: Some(seed_runtime()),
+        ..running_shell_session(None)
+    };
+    assert_eq!(
+        snapshotted.activity_cursor(),
+        Some(("d-epoch-1", ActivityRevision::new(7)))
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(7), Some(seed_identity()))),
+        Some(true)
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(3), Some(seed_identity()))),
+        Some(true)
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(8), Some(seed_identity()))),
+        Some(false)
+    );
+    // Another epoch cannot be ordered against the snapshot.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-2"), Some(1), Some(seed_identity()))),
+        None
+    );
+    // A resume mints a new generation under the same epoch, so a buffered
+    // event from another runtime reads as unordered even at an old revision.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(
+            Some("d-epoch-1"),
+            Some(1),
+            Some(foreign_identity())
+        )),
+        None
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(
+            Some("d-epoch-1"),
+            Some(1),
+            Some(next_generation())
+        )),
+        None
+    );
+    // An event without a runtime identity cannot be tied to the seed.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), Some(7), None)),
+        None
+    );
+    // Without a cursor on either side there is nothing to order by.
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(None, Some(9), Some(seed_identity()))),
+        None
+    );
+    assert_eq!(
+        snapshotted.agent_state_is_stale(&event(Some("d-epoch-1"), None, Some(seed_identity()))),
+        None
+    );
+    let bare = running_shell_session(None);
+    assert_eq!(bare.activity_cursor(), None);
+    assert_eq!(
+        bare.agent_state_is_stale(&event(Some("d-epoch-1"), Some(1), Some(seed_identity()))),
+        None
+    );
 }
 
 #[test]
@@ -5777,8 +5929,9 @@ fn a_runtime_state_from_a_newer_daemon_is_possibly_live_and_never_stoppable_or_r
 
 /// A client reads `can_stop`/`can_remove` off the decoded wire form: a conflict
 /// that names its worker and worker instance is offered the actions the daemon
-/// accepts after its identity proof, any other conflict is not, and a result
-/// that skipped the proof says so on the wire.
+/// accepts after its identity proof, unless it reports `generation_recorded`
+/// as `false`; any other conflict is not, and a result that skipped the
+/// proof says so on the wire.
 #[test]
 fn a_conflict_naming_its_worker_is_stoppable_and_removable_to_a_client() {
     let decode = |runtime: serde_json::Value| -> SessionInfo {
@@ -5796,6 +5949,49 @@ fn a_conflict_naming_its_worker_is_stoppable_and_removable_to_a_client() {
     }));
     assert!(named.can_stop());
     assert!(named.can_remove());
+
+    let recorded_true = decode(json!({
+        "state": "conflict",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "resume_binding_shape_mismatch",
+        "generation_recorded": true
+    }));
+    assert!(recorded_true.can_stop());
+    assert!(recorded_true.can_remove());
+
+    let recorded_false = decode(json!({
+        "state": "conflict",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "resume_binding_shape_mismatch",
+        "generation_recorded": false
+    }));
+    assert!(!recorded_false.can_stop());
+    assert!(!recorded_false.can_remove());
+
+    // The flag only acts on a conflict.
+    let lost_with_flag = decode(json!({
+        "state": "lost",
+        "runtime_generation": "1",
+        "worker_id": "w-1",
+        "worker_instance_id": "r-1",
+        "loss_reason": "runtime_lost",
+        "generation_recorded": false
+    }));
+    assert_eq!(
+        lost_with_flag.can_stop(),
+        decode(json!({
+            "state": "lost",
+            "runtime_generation": "1",
+            "worker_id": "w-1",
+            "worker_instance_id": "r-1",
+            "loss_reason": "runtime_lost"
+        }))
+        .can_stop()
+    );
 
     for runtime in [
         json!({"state": "conflict", "runtime_generation": "1"}),

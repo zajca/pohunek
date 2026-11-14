@@ -1218,6 +1218,36 @@ fn next_entry_incarnation() -> u64 {
 }
 
 impl SessionEntry {
+    /// The entry's [`SessionInfo`] as the daemon publishes it: a `conflict`
+    /// runtime reports whether the record names the worker generation that
+    /// stop and removal prove. The value comes from [`Self::job`], which is
+    /// fixed when the entry is built, and is never written to `self.info`, so
+    /// no stored record carries it.
+    fn published_info(&self) -> SessionInfo {
+        let mut info = self.info.clone();
+        if let Some(runtime) = info
+            .runtime
+            .as_mut()
+            .filter(|runtime| runtime.state == RuntimeState::Conflict)
+        {
+            runtime.generation_recorded = Some(self.job.is_some());
+        }
+        info
+    }
+
+    /// The entry's [`SessionInfo`] as `session.list` and `session.inspect`
+    /// return it: [`Self::published_info`] plus the activity cursor of the
+    /// same snapshot, so a client can order buffered `agent_state` events
+    /// against it.
+    fn listed_info(&self, activity_epoch: &str) -> SessionInfo {
+        let mut info = self.published_info();
+        if self.activity_revision > 0 {
+            info.activity_epoch = Some(activity_epoch.to_owned());
+            info.activity_revision = Some(ActivityRevision::new(self.activity_revision));
+        }
+        info
+    }
+
     /// Who runs the session's turns now.
     fn turn_owner(&self) -> TurnOwner {
         TurnOwner {
@@ -5091,7 +5121,8 @@ impl SessionRegistry {
             .get(&session_id)
             .filter(|entry| !is_terminal(entry.info.state))
         {
-            self.emit(event::SESSION_UPDATED, &entry.info);
+            let info = entry.published_info();
+            self.emit(event::SESSION_UPDATED, &info);
         }
         drop(sessions);
         Ok(SessionReportNativeIdResult { recorded: true })
@@ -5571,7 +5602,7 @@ impl SessionRegistry {
             send_detector_config(entry, active_detector_config);
             entry.info.updated_at = timestamp_now();
             break (
-                entry.info.clone(),
+                entry.published_info(),
                 Arc::clone(&entry.procwatch_rescan),
                 evidence,
             );
@@ -5832,13 +5863,14 @@ impl SessionRegistry {
     }
 
     async fn list_raw(&self) -> Vec<SessionInfo> {
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let mut sessions = self
             .inner
             .sessions
             .lock()
             .await
             .values()
-            .map(|entry| entry.info.clone())
+            .map(|entry| entry.listed_info(&activity_epoch))
             .collect::<Vec<_>>();
         sessions.extend(self.inner.external.list().await);
         sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
@@ -5872,9 +5904,10 @@ impl SessionRegistry {
 
     /// Inspect a session by id.
     pub async fn inspect(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get(id) {
-            return Ok(entry.info.clone());
+            return Ok(entry.listed_info(&activity_epoch));
         }
         drop(sessions);
         self.inner
@@ -6209,7 +6242,7 @@ impl SessionRegistry {
             entry.info.updated_at = updated_at;
             let has_native =
                 entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
-            (entry.info.clone(), has_native)
+            (entry.published_info(), has_native)
         };
         drop(persist);
 
@@ -6247,7 +6280,7 @@ impl SessionRegistry {
             entry.info.updated_at = timestamp_now();
             let has_native =
                 entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
-            (entry.info.clone(), has_native)
+            (entry.published_info(), has_native)
         };
 
         // The name lives in the resume binding so it survives a daemon restart;
@@ -6341,7 +6374,7 @@ impl SessionRegistry {
             let has_native =
                 entry.info.native_session_id.is_some() || entry.info.native_session_path.is_some();
             (
-                entry.info.clone(),
+                entry.published_info(),
                 entry.detector_resize.clone(),
                 has_native,
             )
@@ -7029,7 +7062,8 @@ impl SessionRegistry {
             self.delete_session_journals(id).await;
         }
         if let Some(entry) = &evicted {
-            self.emit(event::SESSION_REMOVED, &entry.info);
+            let info = entry.published_info();
+            self.emit(event::SESSION_REMOVED, &info);
         }
         let accepted_unconfirmed = accepted_unconfirmed
             .into_iter()
@@ -7684,7 +7718,7 @@ impl SessionRegistry {
         if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
             candidate.cancel_runtime_watchers();
         }
-        let info = candidate.info.clone();
+        let info = candidate.published_info();
         self.set_unpersisted(&id.0, None);
         self.inner.turns.observe_state(id, info.state);
         sessions.insert(id.clone(), candidate);
@@ -8545,7 +8579,7 @@ fn apply_cwd_change(
         entry.info.worktree_path = association.worktree_path;
     }
     entry.info.updated_at = timestamp_now();
-    entry.info.clone()
+    entry.published_info()
 }
 
 fn external_session_info(
@@ -8564,6 +8598,8 @@ fn external_session_info(
     let association = association.unwrap_or_default();
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         id: external_session_id(fact.pid),
         external: Some(true),
         capabilities: protocol::SessionCapabilities::default(),
@@ -8785,6 +8821,8 @@ fn create_intent_record(
     let info = SessionInfo {
         blocked_kind: None,
         attention_isolated_by: None,
+        activity_epoch: None,
+        activity_revision: None,
         id: id.clone(),
         external: Some(false),
         capabilities: protocol::SessionCapabilities {
@@ -8807,6 +8845,7 @@ fn create_intent_record(
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         }),
         cols: params.cols,
         rows: params.rows,
@@ -9629,7 +9668,7 @@ fn clear_active_agent(
     let default_detector_config = entry.default_detector_config.clone();
     send_detector_config(entry, default_detector_config);
     entry.info.updated_at = timestamp_now();
-    entry.info.clone()
+    entry.published_info()
 }
 
 /// How the active agent `entry.info` names became known, when the report

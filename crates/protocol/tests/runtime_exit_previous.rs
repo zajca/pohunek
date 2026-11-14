@@ -60,6 +60,7 @@ fn lost_runtime(exit: Option<RuntimeExit>) -> SessionRuntime {
         loss_reason: Some("runtime_lost".to_owned()),
         exit,
         loss_cause: None,
+        generation_recorded: None,
     }
 }
 

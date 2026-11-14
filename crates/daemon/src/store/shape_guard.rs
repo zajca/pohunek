@@ -460,6 +460,8 @@ fn assert_every_field_is_reviewed(
         state_source,
         activity,
         blocked_kind: _,
+        activity_epoch: _,
+        activity_revision: _,
         subagents,
         background,
         active_agent: _,
@@ -509,6 +511,7 @@ fn assert_every_field_is_reviewed(
         loss_reason,
         exit,
         loss_cause,
+        generation_recorded: _,
     }) = session_runtime
     {
         let _: &RuntimeState = runtime_state;

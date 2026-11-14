@@ -881,10 +881,13 @@ impl SessionRegistry {
             loss_reason: None,
             exit: None,
             loss_cause: None,
+            generation_recorded: None,
         };
         let preparing_info = SessionInfo {
             blocked_kind: None,
             attention_isolated_by: None,
+            activity_epoch: None,
+            activity_revision: None,
             id: id.clone(),
             external: Some(false),
             capabilities: capabilities.clone(),
@@ -1074,6 +1077,8 @@ impl SessionRegistry {
         let mut info = SessionInfo {
             blocked_kind: None,
             attention_isolated_by: None,
+            activity_epoch: None,
+            activity_revision: None,
             id: id.clone(),
             external: Some(false),
             capabilities,
@@ -1502,6 +1507,7 @@ impl SessionRegistry {
                 loss_reason: None,
                 exit: None,
                 loss_cause: None,
+                generation_recorded: None,
             }),
         })
     }
