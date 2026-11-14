@@ -363,6 +363,7 @@ fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabili
         session_new_request_id_supported: request_id_supported,
         session_new_context_pin_supported: pin_supported,
         session_new_fetch_ref_supported: true,
+        session_attention_isolation_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,

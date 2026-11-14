@@ -47,6 +47,7 @@ export const ClientErrorCode = {
   SessionNewRequestIdUnsupported: "session_new_request_id_unsupported",
   SessionNewContextPinUnsupported: "session_new_context_pin_unsupported",
   SessionNewFetchRefUnsupported: "session_new_fetch_ref_unsupported",
+  SessionAttentionIsolationUnsupported: "session_attention_isolation_unsupported",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
 } as const;
@@ -73,6 +74,7 @@ export type ClientErrorKind =
   | "sessionNewRequestIdUnsupported"
   | "sessionNewContextPinUnsupported"
   | "sessionNewFetchRefUnsupported"
+  | "sessionAttentionIsolationUnsupported"
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
 
@@ -365,6 +367,25 @@ export class ClientError extends Error {
       protocolError(
         ClientErrorClass.Daemon,
         ClientErrorCode.SessionNewFetchRefUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_attention_isolation_supported`,
+   * so it would store the reserved flag without honoring it.
+   */
+  public static sessionAttentionIsolationUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates attention isolation and would store the flag without honoring it; nothing was sent`;
+    return new ClientError(
+      "sessionAttentionIsolationUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionAttentionIsolationUnsupported,
         msg,
         "upgrade the daemon, then retry",
       ),

@@ -105,6 +105,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
         spawned_by: None,
+        attention_isolated_by: None,
         name: None,
         id: SessionId("s-42".to_owned()),
         external: Some(false),
@@ -3322,6 +3323,7 @@ fn host_capabilities_json_shape_roundtrips() {
         session_new_request_id_supported: true,
         session_new_context_pin_supported: true,
         session_new_fetch_ref_supported: true,
+        session_attention_isolation_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,
@@ -3364,6 +3366,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "session_new_request_id_supported": true,
             "session_new_context_pin_supported": true,
             "session_new_fetch_ref_supported": true,
+            "session_attention_isolation_supported": true,
             "package_install_commands_supported": true,
             "package_bind_profile_expected_supported": true,
             "package_create_profile_supported": true,

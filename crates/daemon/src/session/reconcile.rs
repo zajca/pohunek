@@ -9559,6 +9559,7 @@ while os.getppid() == parent:
         let info = SessionInfo {
             blocked_kind: None,
             spawned_by: None,
+            attention_isolated_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             name: Some("restart continuity".to_owned()),
@@ -11134,6 +11135,7 @@ while os.getppid() == parent:
             info: SessionInfo {
                 blocked_kind: None,
                 spawned_by: None,
+                attention_isolated_by: None,
                 id: SessionId("s-identity".to_owned()),
                 external: Some(false),
                 name: None,

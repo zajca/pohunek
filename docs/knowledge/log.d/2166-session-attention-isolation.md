@@ -1,0 +1,3 @@
+## Unreleased (2026-11-14, per-session attention isolation, #2166)
+
+- `pohunek.attention.children=isolate` on a parent session withholds the attention of everything spawned under it: the attention coordinator suppresses the descendants' blocked and approval inbox records at both the defer and the post-debounce flush check (their turn signals are still recorded, `session.wait_turn` keeps working), and `session.list` annotates the affected rows with `attention_isolated_by` (nearest flagged ancestor wins; never on `session inspect`). See the protocol reference and [Sessions](concepts/sessions.md).

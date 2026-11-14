@@ -2207,7 +2207,13 @@ either the old replayable log or the complete new log, never a partially
 replaced store. Turn ends and turn errors never enter it: the attention
 coordinator records them as `TurnSignal`s in the in-memory turn journal behind
 `session.wait_turn`, and a terminal approval notice reaches the coordinator
-through a late-bound sink on the session registry.
+through a late-bound sink on the session registry. A parent carrying the
+reserved `pohunek.attention.children=isolate` session metadata isolates the
+attention of everything spawned under it: the attention coordinator withholds
+the descendants' blocked and approval records from the inbox (their turn
+signals are still recorded), at both the defer and the post-debounce flush
+check, and `session.list` annotates each affected row with
+`attention_isolated_by` (nearest flagged ancestor wins; list-only).
 
 Secrets are never written to the metadata stores, the event log, or session
 metadata. They

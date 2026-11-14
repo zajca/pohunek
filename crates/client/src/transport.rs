@@ -19,8 +19,9 @@ use protocol::{
     SessionReadResult, SessionRemoveResult, SessionResizeParams, SessionResizeResult,
     SessionResumeParams, SessionResumeResult, SessionScreenParams, SessionScreenResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, ENV_DAEMON_ID, ENV_SESSION_ID,
-    MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult,
+    ATTENTION_CHILDREN_METADATA_KEY, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -901,14 +902,16 @@ impl Client {
         // A daemon that predates `secret_env` drops the field and would start the
         // agent without its credential, one that predates `client_request_id`
         // would create a second session on a retry, one that predates
-        // `context_package_digest` would leave the context files unpinned, and
-        // one that predates `fetch_ref` would silently drop the extra fetch,
-        // so the flags are checked on the same connection before any of them
-        // leaves the process.
+        // `context_package_digest` would leave the context files unpinned, one
+        // that predates `fetch_ref` would silently drop the extra fetch, and
+        // one that predates attention isolation would store the reserved flag
+        // without honoring it, so the flags are checked on the same connection
+        // before any of them leaves the process.
         if !params.secret_env.is_empty()
             || params.client_request_id.is_some()
             || params.context_package_digest.is_some()
             || params.fetch_ref.is_some()
+            || new_params_set_attention_flag(&params)
         {
             let capabilities = client
                 .host_inspect_with(protocol::HostInspectParams {
@@ -936,6 +939,13 @@ impl Client {
             if params.fetch_ref.is_some() && !capabilities.session_new_fetch_ref_supported {
                 return Err(ClientError::Protocol(
                     ProtocolError::session_new_fetch_ref_unsupported(self.remote_host()),
+                ));
+            }
+            if new_params_set_attention_flag(&params)
+                && !capabilities.session_attention_isolation_supported
+            {
+                return Err(ClientError::Protocol(
+                    ProtocolError::session_attention_isolation_unsupported(self.remote_host()),
                 ));
             }
         }
@@ -1271,6 +1281,22 @@ impl Client {
         &mut self,
         params: SessionSetMetadataParams,
     ) -> Result<SessionSetMetadataResult, ClientError> {
+        // A daemon that predates attention isolation stores the reserved flag
+        // without honoring it; clearing the key is always sent.
+        if metadata_sets_attention_flag(&params.metadata) {
+            let capabilities = self
+                .connect_dedicated(self.options)
+                .await?
+                .host_inspect_with(protocol::HostInspectParams {
+                    skip_runtime_probes: Some(true),
+                })
+                .await?;
+            if !capabilities.session_attention_isolation_supported {
+                return Err(ClientError::Protocol(
+                    ProtocolError::session_attention_isolation_unsupported(self.remote_host()),
+                ));
+            }
+        }
         self.call::<protocol::method::SessionSetMetadata>(params)
             .await
     }
@@ -1518,6 +1544,27 @@ fn run_token() -> &'static str {
             .map_or(0, |duration| duration.as_nanos());
         format!("{:x}{:x}", std::process::id(), nanos)
     })
+}
+
+/// Whether `session.new` params set the reserved attention flag.
+///
+/// Only the reserved metadata value sets the flag; `session.new` carries
+/// plain `String` values with no clearing form.
+fn new_params_set_attention_flag(params: &SessionNewParams) -> bool {
+    params
+        .metadata
+        .contains_key(ATTENTION_CHILDREN_METADATA_KEY)
+}
+
+/// Whether a metadata patch sets the reserved attention flag to a value.
+///
+/// Clearing the key (`None`) always passes through; only `Some(_)` counts.
+fn metadata_sets_attention_flag(
+    metadata: &std::collections::BTreeMap<String, Option<String>>,
+) -> bool {
+    metadata
+        .get(ATTENTION_CHILDREN_METADATA_KEY)
+        .is_some_and(Option::is_some)
 }
 
 impl Subscription {

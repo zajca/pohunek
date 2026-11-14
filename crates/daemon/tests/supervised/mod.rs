@@ -780,6 +780,7 @@ impl Installation {
         let info = SessionInfo {
             blocked_kind: None,
             spawned_by: None,
+            attention_isolated_by: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities {

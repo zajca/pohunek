@@ -443,6 +443,9 @@ pub(crate) struct NewArgs {
     /// Parsed `--meta KEY=VALUE` pairs, one per repeated flag. Shape-validated
     /// per pair by [`parse_meta_pair`] (the clap value parser); duplicate-key
     /// rejection happens once the full set is known, in [`parse_meta_pairs`].
+    /// The reserved `pohunek.attention.children=isolate` pair isolates
+    /// descendants' attention; it needs a daemon that advertises
+    /// `session_attention_isolation_supported`.
     pub meta: Vec<(String, String)>,
 }
 
@@ -693,7 +696,14 @@ async fn check_new_capabilities(
     cwd_requested: bool,
     args: &NewArgs,
 ) -> Result<(), CliError> {
-    if !(cwd_requested || args.from_remote || args.input_ack_timeout_ms.is_some()) {
+    if !(cwd_requested
+        || args.from_remote
+        || args.input_ack_timeout_ms.is_some()
+        || args
+            .meta
+            .iter()
+            .any(|(key, _)| key == protocol::ATTENTION_CHILDREN_METADATA_KEY))
+    {
         return Ok(());
     }
     let capabilities = client
@@ -715,6 +725,17 @@ async fn check_new_capabilities(
     }
     if args.input_ack_timeout_ms.is_some() && !capabilities.session_new_input_ack_supported {
         return Err(CliError::SessionNewInputAckUnsupported {
+            host: host.to_owned(),
+            daemon_version: capabilities.daemon_version,
+        });
+    }
+    if args
+        .meta
+        .iter()
+        .any(|(key, _)| key == protocol::ATTENTION_CHILDREN_METADATA_KEY)
+        && !capabilities.session_attention_isolation_supported
+    {
+        return Err(CliError::SessionAttentionIsolationUnsupported {
             host: host.to_owned(),
             daemon_version: capabilities.daemon_version,
         });
@@ -2219,6 +2240,13 @@ fn render_list_footer(output: &mut String, sessions: &[SessionInfo]) {
                 capability_refusals_label(refusals)
             );
         }
+        if let Some(isolated_by) = &session.attention_isolated_by {
+            let _ = writeln!(
+                output,
+                "isolated {}: attention isolated by {}",
+                session.id.0, isolated_by.0
+            );
+        }
         if let Some(message) = session.loss_message() {
             let _ = writeln!(
                 output,
@@ -2954,6 +2982,7 @@ mod tests {
         SessionInfo {
             blocked_kind: None,
             spawned_by: None,
+            attention_isolated_by: None,
             name: None,
             id: protocol::SessionId(id.to_owned()),
             external: Some(false),

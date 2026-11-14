@@ -28,6 +28,10 @@ pub const SESSION_REQUEST_CONFLICT_CODE: &str = "session_request_conflict";
 pub const SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE: &str = "session_new_request_id_unsupported";
 /// Error code a client raises when the daemon cannot honor `fetch_ref`.
 pub const SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE: &str = "session_new_fetch_ref_unsupported";
+/// Error code a client raises when the daemon cannot isolate the attention of
+/// descendants of a session flagged with the reserved attention metadata key.
+pub const SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE: &str =
+    "session_attention_isolation_unsupported";
 /// Error code a client raises when the daemon cannot honor
 /// `context_package_digest`.
 pub const SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE: &str = "session_new_context_pin_unsupported";
@@ -1493,6 +1497,26 @@ impl ProtocolError {
             ErrorClass::Daemon,
             SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
             format!("{target} predates fetch_ref and would drop it silently; nothing was sent"),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_attention_isolation_unsupported` error a client
+    /// raises before it sends a `session.new` or `session.set_metadata` that
+    /// would set the reserved attention metadata key to a daemon that would
+    /// store the key and ignore it.
+    #[must_use]
+    pub fn session_attention_isolation_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE,
+            format!(
+                "{target} predates attention isolation and would store the flag without honoring it; nothing was sent"
+            ),
             Some("upgrade the daemon, then retry".to_owned()),
         )
     }

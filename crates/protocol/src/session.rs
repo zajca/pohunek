@@ -546,6 +546,20 @@ pub struct SessionNewParams {
 /// Most bytes a [`SessionNewParams::client_request_id`] may hold.
 pub const MAX_CLIENT_REQUEST_ID_BYTES: usize = 128;
 
+/// Reserved metadata key that isolates a session's descendants from attention.
+///
+/// Setting `pohunek.attention.children` to [`ATTENTION_CHILDREN_ISOLATE`] on a
+/// session stops the attention of its descendants (reachable through
+/// [`SessionInfo::spawned_by`] links) from reaching the flagged session or the
+/// owner: no inbox record, no parent roll-up, no `Needs you` entry, no tray
+/// count and no owner notification. The flagged session itself is unaffected.
+pub const ATTENTION_CHILDREN_METADATA_KEY: &str = "pohunek.attention.children";
+/// The only accepted value of [`ATTENTION_CHILDREN_METADATA_KEY`].
+///
+/// Any other value for the key is refused with `bad_request`; clearing the key
+/// unsets the flag.
+pub const ATTENTION_CHILDREN_ISOLATE: &str = "isolate";
+
 /// Whether `id` is a valid [`SessionNewParams::client_request_id`]:
 /// 1..=[`MAX_CLIENT_REQUEST_ID_BYTES`] bytes of `[A-Za-z0-9._:-]`.
 #[must_use]
@@ -3279,6 +3293,16 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub spawned_by: Option<SpawnedBy>,
+    /// Nearest flagged ancestor isolating this session's attention, set only
+    /// on `session.list` responses. `Some` names the ancestor carrying
+    /// [`ATTENTION_CHILDREN_METADATA_KEY`] set to [`ATTENTION_CHILDREN_ISOLATE`];
+    /// absent means not isolated or unknown. Clients skip roll-up, `Needs you`
+    /// and tray counting for a session that carries it. Like
+    /// [`Self::capability_refusals`], stored records, events and inspect
+    /// responses never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub attention_isolated_by: Option<SessionId>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.
@@ -3975,6 +3999,7 @@ mod tests {
         SessionInfo {
             blocked_kind: None,
             spawned_by: None,
+            attention_isolated_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities::default(),

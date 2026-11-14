@@ -318,6 +318,8 @@ predicates are all required to match, including contradictory values for the
 same key, which produce no sessions. These options affect selection only and do
 not add metadata to the human table or quiet output.
 
+A parent session can isolate the attention of everything spawned under it. Setting owner metadata `pohunek.attention.children` to `isolate` on the parent (through `session new --meta pohunek.attention.children=isolate`, or `session.set_metadata` later; the only accepted value, cleared by removing the key) withholds descendant attention from the chain above: a descendant gets no inbox record for its own blocked or approval attention, so no parent row, `Needs you` marker, tray count or owner notification names it, while its turn signals are still recorded and `session.wait_turn` keeps working. When parents nest, the nearest flagged ancestor above the session wins; without any flagged ancestor the attention rolls up. `session.list` reports the isolator on each affected row as `attention_isolated_by` (never on `session inspect`). The flag survives a daemon restart and a resume. The withhold applies to debounced attention only: an immediate `notification.create` naming the session without an attention or turn dedupe key is an explicit message and is still recorded, and records committed before the flag was set stay as they are.
+
 A session records which session created it. When `session.new` carries the request origin pair (`POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`;
 the CLI and the Rust client send the inherited pair unless the Rust client
 selects `OriginSource::Omitted`, and the TypeScript SDK sends it only when

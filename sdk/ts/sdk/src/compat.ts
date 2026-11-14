@@ -65,9 +65,39 @@ export function carriesContextPackageDigest(params: unknown): boolean {
   return isObject(params) && isSet(params["context_package_digest"]);
 }
 
+/** The reserved metadata key whose single accepted value isolates descendants. */
+export const ATTENTION_CHILDREN_METADATA_KEY = "pohunek.attention.children";
+
 /** Whether `params` carries a `fetch_ref` the daemon must fetch and pin. */
 export function carriesFetchRef(params: unknown): boolean {
   return isObject(params) && isSet(params["fetch_ref"]);
+}
+
+/**
+ * Whether `session.new` params set the reserved attention flag. Clearing is
+ * not a thing on `session.new`: its metadata holds plain string values.
+ */
+export function carriesAttentionIsolationFlag(params: unknown): boolean {
+  return (
+    isObject(params) &&
+    isObject(params["metadata"]) &&
+    params["metadata"] !== null &&
+    ATTENTION_CHILDREN_METADATA_KEY in params["metadata"]
+  );
+}
+
+/**
+ * Whether a `session.set_metadata` patch sets the reserved attention flag.
+ * Clearing the key (`null`) always passes through; only a value counts.
+ */
+export function setsAttentionIsolationFlag(params: unknown): boolean {
+  if (!isObject(params) || !isObject(params["metadata"])) {
+    return false;
+  }
+  const metadata = params["metadata"];
+  return (
+    ATTENTION_CHILDREN_METADATA_KEY in metadata && metadata[ATTENTION_CHILDREN_METADATA_KEY] !== null
+  );
 }
 
 function requireCurrent(version: number): void {

@@ -633,6 +633,7 @@ mod tests {
         SessionInfo {
             blocked_kind: None,
             spawned_by: None,
+            attention_isolated_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities::default(),

@@ -176,6 +176,18 @@ pub struct HostCapabilities {
     /// ref. `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_fetch_ref_supported: bool,
+    /// Whether the daemon isolates the attention of descendants of a session
+    /// carrying the reserved [`crate::session::ATTENTION_CHILDREN_METADATA_KEY`]
+    /// metadata key set to
+    /// [`crate::session::ATTENTION_CHILDREN_ISOLATE`].
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`;
+    /// it stores the key and ignores it, so a client checks the flag before
+    /// sending the key (a set or `session.new` metadata carrying it is refused
+    /// with `session_attention_isolation_unsupported` without being sent).
+    /// `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_attention_isolation_supported: bool,
     /// Whether `package.install` and `package.link` accept `accept_commands`
     /// and install packages that declare commands.
     ///

@@ -688,6 +688,7 @@ fn session_minimal() -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
         spawned_by: None,
+        attention_isolated_by: None,
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: None,
         capabilities: SessionCapabilities::default(),
@@ -839,6 +840,7 @@ fn session_full() -> SessionInfo {
             session_id: SessionId("s-spawner-fixture".to_owned()),
             daemon_id: "d-spawner-fixture".to_owned(),
         }),
+        attention_isolated_by: None,
         created_at: CREATED_AT.to_owned(),
         updated_at: UPDATED_AT.to_owned(),
         ended_at: Some(UPDATED_AT.to_owned()),

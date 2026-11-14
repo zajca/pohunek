@@ -15,6 +15,8 @@
 //! methods.
 
 mod assistant;
+#[cfg(test)]
+mod attention_isolation_tests;
 mod command;
 mod daemon;
 mod governance;
@@ -645,6 +647,7 @@ mod tests {
         SessionInfo {
             blocked_kind: None,
             spawned_by: None,
+            attention_isolated_by: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             name: None,

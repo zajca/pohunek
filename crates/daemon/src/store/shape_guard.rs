@@ -482,6 +482,7 @@ fn assert_every_field_is_reviewed(
         output_force_closed: _,
         metadata: _,
         spawned_by: _,
+        attention_isolated_by: _,
         created_at: _,
         updated_at: _,
         ended_at: _,
