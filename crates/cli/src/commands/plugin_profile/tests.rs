@@ -57,6 +57,8 @@ fn head(base: &str, pinned: Option<(&str, &str)>) -> ProfileHead {
         base: RuntimeId::parse(base).expect("base"),
         package: pinned.map(|(package, _)| PackageId::parse(package).expect("package")),
         digest: pinned.map(|(_, digest)| PackageDigest::parse(digest).expect("digest")),
+        display_name: None,
+        audience: None,
     }
 }
 
@@ -289,7 +291,7 @@ fn listing_reports_each_state_and_never_leaks_file_content() {
     fs::create_dir(agents.dir.join("manifests")).expect("manifests");
     let packages = vec![info("acme.pi", DIGEST_OLD, Some("acme-pi"))];
 
-    let listing = list_profiles(Some(&agents.open()), &packages).expect("listing");
+    let listing = list_profiles(Some(&agents.open()), &packages, true).expect("listing");
 
     let states: Vec<(&str, ProfileState)> = listing
         .profiles
@@ -327,7 +329,7 @@ fn listing_names_invalid_profile_files_by_a_sanitized_name() {
     agents.write("ok", "base = \"shell\"\n", 0o600);
     let odd = agents.dir.join("bad\u{1b}[31mname.toml");
     fs::write(&odd, "base = \"shell\"\n").expect("odd file");
-    let listing = list_profiles(Some(&agents.open()), &[]).expect("listing");
+    let listing = list_profiles(Some(&agents.open()), &[], true).expect("listing");
     assert_eq!(listing.profiles.len(), 2);
     let table = render_listing(&listing);
     assert!(!table.contains('\u{1b}'), "{table:?}");

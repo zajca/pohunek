@@ -75,6 +75,14 @@ struct RawProfile {
     /// under the same charset + containment guard as a profile file.
     #[serde(default)]
     manifest: Option<String>,
+    /// Human label shown in pickers, tables and session responses; absent ⇒
+    /// the profile shows by name. Presentation only: never in the revision.
+    #[serde(default)]
+    display_name: Option<presentation::ProfileDisplayName>,
+    /// Picker audience (`owner` | `agent` | `hidden`); absent ⇒ `owner`.
+    /// Presentation only: never in the revision.
+    #[serde(default)]
+    audience: Option<presentation::ProfileAudience>,
 }
 
 /// A profile env value. Deserializing a non-string fails with a fixed message
@@ -197,6 +205,10 @@ pub(crate) struct ResolvedProfile {
     pub manifest: Option<Manifest>,
     /// File stem of the detection-manifest override, as the profile names it.
     pub manifest_name: Option<String>,
+    /// Human label from the profile's `display_name` key; `None` ⇒ show the name.
+    pub display_name: Option<String>,
+    /// Picker audience from the profile's `audience` key; absent means owner.
+    pub audience: Option<protocol::ProfileAudience>,
     /// Digest of the profile's launch inputs; the source of its revision.
     pub inputs: ProfileInputs,
 }
@@ -651,8 +663,12 @@ impl ProfileRegistry {
         let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
         let binding_json = serde_json::to_vec(stored)
             .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+        // Labels are presentation only: the frozen check compares the launch
+        // inputs, so the label keys leave with the pin keys.
+        let revision_content =
+            revision_text(&stripped).map_err(|detail| invalid_profile(name, &detail))?;
         let inputs = ProfileInputs::of(
-            &stripped,
+            &revision_content,
             manifest.as_ref().map(|source| source.text.as_str()),
             &binding_json,
             launch.0,
@@ -702,8 +718,12 @@ impl ProfileRegistry {
         let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
         let binding_json = serde_json::to_vec(stored)
             .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+        // Labels are presentation only: the frozen check compares the launch
+        // inputs, so the label keys leave with the pin keys.
+        let revision_content =
+            revision_text(&at_launch).map_err(|detail| invalid_profile(name, &detail))?;
         let inputs = ProfileInputs::of(
-            &at_launch,
+            &revision_content,
             manifest.as_ref().map(|source| source.text.as_str()),
             &binding_json,
             launch.0,
@@ -1391,6 +1411,13 @@ fn resolve_profile_text(
     }
     let raw: RawProfile = toml::from_str(content)
         .map_err(|err| invalid_profile(name, &toml_diagnostic(content, &err)))?;
+    // Presentation labels validate with the raw fields, before launch inputs
+    // move them: an invalid label is a load error, not a launch default.
+    let display_name = raw
+        .display_name
+        .as_ref()
+        .map(|label| label.as_str().to_owned());
+    let audience = raw.audience.map(presentation::ProfileAudience::get);
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
     let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
@@ -1441,8 +1468,12 @@ fn resolve_profile_text(
     let manifest_source = resolve_manifest(name, dir, raw.manifest.as_deref())?;
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+    // Presentation labels never enter the revision: the digest sees the
+    // text with the label keys removed.
+    let revision_content =
+        revision_text(content).map_err(|detail| invalid_profile(name, &detail))?;
     let inputs = ProfileInputs::of(
-        content,
+        &revision_content,
         manifest_source.as_ref().map(|source| source.text.as_str()),
         &binding_json,
         &program,
@@ -1461,6 +1492,8 @@ fn resolve_profile_text(
             native,
             manifest: manifest_source.map(|source| source.manifest),
             manifest_name: raw.manifest,
+            display_name,
+            audience,
             inputs,
         }),
     })
@@ -1803,8 +1836,10 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
 
 mod bind;
 mod compose;
+pub(crate) mod presentation;
 pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
 pub(crate) use compose::{compose_profile, ProfileSpec};
+pub(crate) use presentation::{display_name_of, revision_text, LabelRead};
 
 #[cfg(test)]
 mod pin_tests;

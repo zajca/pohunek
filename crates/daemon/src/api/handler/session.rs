@@ -74,6 +74,9 @@ pub(super) async fn handle_session_list(request: &Request, sessions: &SessionReg
         list.retain(|session| params.filters.iter().all(|filter| filter.matches(session)));
     }
     sessions.enrich_native_activity(&mut list).await;
+    // Response-only presentation labels, after the activity snapshot: the
+    // label reflects the current profile file, not the stored record.
+    sessions.enrich_agent_labels(&mut list).await;
     ok_value(request, &list)
 }
 
@@ -89,6 +92,9 @@ pub(super) async fn handle_session_inspect(
         Ok(mut info) => {
             sessions
                 .enrich_native_activity(std::slice::from_mut(&mut info))
+                .await;
+            sessions
+                .enrich_agent_labels(std::slice::from_mut(&mut info))
                 .await;
             info.placement = sessions.live_placement(&id).await;
             ok_value(request, &info)

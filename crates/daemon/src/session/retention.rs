@@ -642,6 +642,7 @@ mod tests {
             name: None,
             agent: "shell".to_owned(),
             agent_base: RuntimeRef::shell(),
+            agent_display_name: None,
             cwd: PathBuf::from("/work"),
             cwd_source: None,
             pid: 1,

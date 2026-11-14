@@ -21,21 +21,22 @@ use protocol::{
     NotificationStatus, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
     OwnerRevision, PackageBindProfileParams, PackageBindStatus, PackageFault, PackageFindingKind,
     PackageInstallStatus, PackageOrigin, PackageSelectionBlockReason, PackageTrust, PrincipalId,
-    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
-    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
-    Request, Response, RuntimeGeneration, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryStatus,
-    RuntimeRef, RuntimeState, SessionAttachResult, SessionBackground, SessionCapabilities,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap, SessionOutputParams,
-    SessionOutputResult, SessionReadFormat, SessionReadParams, SessionReadResult,
-    SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionRetentionCandidate, SessionRetentionHold, SessionRetentionReason, SessionRuntime,
-    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSecretEnv,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
+    ProcessStartIdentity, ProfileAudience, ProjectSource, ProposalExpiry, ProposalId,
+    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
+    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
+    RuntimeInventoryEntry, RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionAttachResult,
+    SessionBackground, SessionCapabilities, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
+    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRetentionCandidate,
+    SessionRetentionHold, SessionRetentionReason, SessionRuntime, SessionRuntimeIdentity,
+    SessionScreenParams, SessionScreenResult, SessionSecretEnv, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWaitTurnReason, SessionWarning,
     SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource, SubagentInfo,
     SubagentLifecycle, SubagentRevision, TeamId, TerminalCursor, TerminalDimensions,
     TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate, TransferOutcomeId,
@@ -114,6 +115,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         capabilities: SessionCapabilities::default(),
         agent: "shell".to_owned(),
         agent_base: RuntimeRef::shell(),
+        agent_display_name: None,
         cwd: PathBuf::from("/workspace/project"),
         cwd_source: Some(CwdSource::Launch),
         pid: 4242,
@@ -3294,6 +3296,8 @@ fn agent_runtime_json_shape_roundtrips_with_path() {
         version: None,
         supported: None,
         config_home_id: None,
+        display_name: None,
+        audience: None,
     };
 
     let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
@@ -3321,6 +3325,8 @@ fn agent_runtime_omits_absent_path() {
         version: None,
         supported: None,
         config_home_id: None,
+        display_name: None,
+        audience: None,
     };
 
     let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
@@ -3354,6 +3360,8 @@ fn agent_runtime_roundtrips_optional_version_support() {
         version: Some("0.20.0".to_owned()),
         supported: Some(true),
         config_home_id: None,
+        display_name: None,
+        audience: None,
     };
 
     assert_eq!(
@@ -3391,6 +3399,8 @@ fn agent_runtime_config_home_id_is_additive_and_roundtrips() {
         version: None,
         supported: None,
         config_home_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+        display_name: None,
+        audience: None,
     };
 
     assert_eq!(
@@ -3414,6 +3424,52 @@ fn agent_runtime_config_home_id_is_additive_and_roundtrips() {
 }
 
 #[test]
+fn agent_runtime_labels_are_additive_and_roundtrip() {
+    let runtime = AgentRuntime {
+        agent: "night".to_owned(),
+        agent_base: Some(RuntimeRef::shell()),
+        available: true,
+        path: None,
+        version: None,
+        supported: None,
+        config_home_id: None,
+        display_name: Some("Night Shift".to_owned()),
+        audience: Some(ProfileAudience::Agent),
+    };
+
+    assert_eq!(
+        serde_json::to_value(&runtime).expect("serialize agent runtime"),
+        json!({
+            "agent": "night",
+            "agent_base": "shell",
+            "available": true,
+            "display_name": "Night Shift",
+            "audience": "agent"
+        })
+    );
+    assert_eq!(line_roundtrip(&runtime), runtime);
+
+    // An entry from a daemon without the keys reads as unlabelled with the
+    // owner audience, so an old daemon's inventory keeps its picker shape.
+    let older: AgentRuntime = serde_json::from_value(json!({
+        "agent": "night",
+        "available": true
+    }))
+    .expect("an entry without labels remains readable");
+    assert_eq!(older.display_name, None);
+    assert_eq!(older.audience, None);
+
+    // A tolerant client maps an audience from a newer daemon to Unknown.
+    let newer: AgentRuntime = protocol::tolerant::from_value(json!({
+        "agent": "night",
+        "available": true,
+        "audience": "a_value_from_a_newer_daemon"
+    }))
+    .expect("tolerant decode");
+    assert_eq!(newer.audience, Some(ProfileAudience::Unknown));
+}
+
+#[test]
 #[expect(
     clippy::too_many_lines,
     reason = "one test asserts the wire shape of every host capability flag"
@@ -3434,6 +3490,8 @@ fn host_capabilities_json_shape_roundtrips() {
                 version: None,
                 supported: None,
                 config_home_id: None,
+                display_name: None,
+                audience: None,
             },
             AgentRuntime {
                 agent: "codex".to_owned(),
@@ -3443,6 +3501,8 @@ fn host_capabilities_json_shape_roundtrips() {
                 version: None,
                 supported: None,
                 config_home_id: None,
+                display_name: None,
+                audience: None,
             },
             AgentRuntime {
                 agent: "claude".to_owned(),
@@ -3452,6 +3512,8 @@ fn host_capabilities_json_shape_roundtrips() {
                 version: None,
                 supported: None,
                 config_home_id: None,
+                display_name: None,
+                audience: None,
             },
             AgentRuntime {
                 agent: "hermes".to_owned(),
@@ -3461,6 +3523,8 @@ fn host_capabilities_json_shape_roundtrips() {
                 version: Some("0.20.0".to_owned()),
                 supported: Some(true),
                 config_home_id: None,
+                display_name: None,
+                audience: None,
             },
         ],
         git_available: true,
@@ -5230,6 +5294,16 @@ fn session_snapshot_display_enums_are_tolerant_only_on_the_client() {
         unknown_wire: "other",
     }
     .check("BackgroundKind");
+    TolerantEnum {
+        known: vec![
+            ("owner", ProfileAudience::Owner),
+            ("agent", ProfileAudience::Agent),
+            ("hidden", ProfileAudience::Hidden),
+        ],
+        unknown: ProfileAudience::Unknown,
+        unknown_wire: "unknown",
+    }
+    .check("ProfileAudience");
     TolerantEnum {
         known: vec![
             ("running", BackgroundStatus::Running),

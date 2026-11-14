@@ -308,6 +308,38 @@ use changes its revision, so a resume then needs `--accept-profile-change`.
 `--dry-run` prints the profile and its digest and writes nothing. The command is
 local only.
 
+## Presentation labels
+
+A profile may carry two optional top-level keys that only change how it is
+shown, never what it launches:
+
+```toml
+base = "claude"
+display_name = "Night Shift" # trimmed free text, at most 128 bytes
+audience = "owner" # "owner", "agent" or "hidden"; absent means "owner"
+```
+
+Both keys live at the top level, before any `[table]`: a key with the same
+name written under `[env]` is an environment variable, not a label. Only
+the file stem is the agent identity — `--agent` and `session.new` accept no
+lookup by display name.
+
+`display_name` is the human label pickers, `session list` and
+`session inspect` show instead of the agent name. It must be non-empty after
+trimming, fit in 128 bytes, and contain no hidden or separator characters; an
+invalid value is `invalid_profile` at launch, like any other bad key. `audience`
+marks who the profile is for: `owner` (the default) keeps it in owner pickers,
+`agent` marks a profile meant for agent-driven launches, and `hidden` hides it
+everywhere. Neither key enters the profile revision, so adding, editing or
+removing a label never triggers `agent_profile_changed`, never makes a
+relay approval stale, and never needs `--accept-profile-change`.
+
+`host.inspect` reports the labels on each resolvable profile's `runtimes`
+entry (`display_name` only when set, `audience` only when the file sets it —
+absent on the wire means `owner`; bare runtimes carry neither), and `session list`/`session inspect` report the session's current
+label live as `agent_display_name` (absent when the profile sets none, or no
+longer resolves). See the public API reference for the wire shape.
+
 ## Native recovery spec
 
 A native-session launch spec states how an agent CLI resumes one of its own

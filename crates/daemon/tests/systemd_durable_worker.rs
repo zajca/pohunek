@@ -1219,6 +1219,7 @@ impl Fixture {
             name: Some("systemd durability e2e".to_owned()),
             agent: "claude".to_owned(),
             agent_base: RuntimeRef::claude(),
+            agent_display_name: None,
             cwd: self.root.clone(),
             cwd_source: Some(CwdSource::Launch),
             pid: child_pid,

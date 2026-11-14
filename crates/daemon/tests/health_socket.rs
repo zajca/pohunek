@@ -19,6 +19,8 @@ mod native_attestation;
 mod native_recovery;
 #[path = "support/official_runtimes.rs"]
 mod official_runtimes;
+#[path = "health_socket/profile_labels.rs"]
+mod profile_labels;
 #[path = "health_socket/project_candidates.rs"]
 mod project_candidates;
 #[path = "health_socket/project_cwd.rs"]

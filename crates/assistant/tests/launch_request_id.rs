@@ -350,6 +350,8 @@ fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabili
             version: None,
             supported: None,
             config_home_id: None,
+            display_name: None,
+            audience: None,
         }],
         git_available: true,
         worktree_supported: true,

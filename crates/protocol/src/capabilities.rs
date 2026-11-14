@@ -16,6 +16,46 @@ use serde::{Deserialize, Serialize};
 
 use crate::{version::ProtocolVersion, RuntimeRef};
 
+/// Who an agent profile is shown to: the pickers a profile appears in.
+///
+/// The audience lives in the profile file; absent means `Owner`, so old
+/// profiles keep showing in owner pickers after the upgrade. `Agent` marks
+/// a profile meant for agent-driven launches, `Hidden` hides it everywhere.
+/// Presentation only: it never enters a profile revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", remote = "Self")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProfileAudience.ts"))]
+pub enum ProfileAudience {
+    /// The profile shows in owner pickers (the default when unset).
+    Owner,
+    /// The profile shows in agent-driven pickers.
+    Agent,
+    /// The profile is hidden from pickers.
+    Hidden,
+    /// A value a newer daemon sent that this build does not know. Only the
+    /// client's [`tolerant`](crate::tolerant) decode produces it; plain decoding
+    /// rejects the value and the daemon never holds or emits one.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(ProfileAudience);
+
+impl std::fmt::Display for ProfileAudience {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ProfileAudience::Owner => "owner",
+            ProfileAudience::Agent => "agent",
+            ProfileAudience::Hidden => "hidden",
+            ProfileAudience::Unknown => "unknown",
+        };
+        f.write_str(s)
+    }
+}
+
 /// One agent runtime's availability on a host.
 ///
 /// Reports whether a given agent profile's backing binary is present on the
@@ -61,6 +101,16 @@ pub struct AgentRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub config_home_id: Option<String>,
+    /// Human label from the profile file, when the profile sets one.
+    /// Reported only for profiles; bare runtimes never carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub display_name: Option<String>,
+    /// Picker audience from the profile file, when the profile sets one.
+    /// Absent on the wire means the owner audience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub audience: Option<ProfileAudience>,
 }
 
 /// Optional parameters for `host.inspect`.

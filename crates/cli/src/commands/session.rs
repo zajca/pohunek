@@ -30,6 +30,7 @@ use protocol::{
     MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_TURN_MS,
 };
 
+use super::plugin::sanitize;
 use crate::client::{Client, PinnedHost};
 #[cfg(test)]
 use crate::commands::request_with_params;
@@ -2534,6 +2535,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
         ),
     ];
     rows.extend(background_summary_rows(info, now_ms()));
+    insert_agent_display_name_row(&mut rows, info);
     insert_active_agent_rows(&mut rows, info);
     if has_worktree_drift(info) {
         rows.push(("worktree_drift", "yes".to_owned()));
@@ -2552,6 +2554,17 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     }
     append_inspect_details(&mut output, info, now_ms());
     output
+}
+
+/// Insert the live `agent_display_name` row after `agent` when the profile
+/// sets one. The agent name stays the lookup key; the label is presentation.
+fn insert_agent_display_name_row(rows: &mut Vec<(&'static str, String)>, info: &SessionInfo) {
+    let Some(label) = &info.agent_display_name else {
+        return;
+    };
+    if let Some(position) = rows.iter().position(|(field, _)| *field == "agent") {
+        rows.insert(position + 1, ("agent_display_name", sanitize(label)));
+    }
 }
 
 /// Inserts the active nested-agent rows after the launch identity rows, in
@@ -2874,11 +2887,17 @@ fn agent_label(agent: &str) -> &str {
 }
 
 fn session_agent_label(info: &SessionInfo) -> String {
+    // `<agent> (<display_name>)`: the agent name stays the lookup key;
+    // the label in parentheses is presentation only.
+    let base = match info.agent_display_name.as_deref() {
+        Some(label) => format!("{} ({})", agent_label(&info.agent), sanitize(label)),
+        None => agent_label(&info.agent).to_owned(),
+    };
     match info.active_agent.as_deref() {
         Some(active_agent) if active_agent != info.agent => {
-            format!("{}->{active_agent}", info.agent)
+            format!("{base}->{active_agent}")
         }
-        _ => agent_label(&info.agent).to_owned(),
+        _ => base,
     }
 }
 
@@ -2991,6 +3010,7 @@ mod tests {
             capabilities: protocol::SessionCapabilities::default(),
             agent: "shell".to_owned(),
             agent_base: protocol::RuntimeRef::shell(),
+            agent_display_name: None,
             cwd: PathBuf::from("/workspace/project"),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 4242,

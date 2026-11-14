@@ -140,6 +140,7 @@ export type { PackageVersion } from "./PackageVersion";
 export type { PrincipalId } from "./PrincipalId";
 export type { ProcessExit } from "./ProcessExit";
 export type { ProcessStartIdentity } from "./ProcessStartIdentity";
+export type { ProfileAudience } from "./ProfileAudience";
 export type { ProfileDigest } from "./ProfileDigest";
 export type { ProjectActionParams } from "./ProjectActionParams";
 export type { ProjectActionResult } from "./ProjectActionResult";

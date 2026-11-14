@@ -386,6 +386,54 @@ async fn a_newer_package_version_adopts_a_stopped_claude_session_whose_profile_m
     assert_resume_adopted("newer-adopts-claude", &CLAUDE).await;
 }
 
+/// A labelled profile adopts the same way: the `display_name` line is
+/// presentation only, so the preflight judges the session adoptable and the
+/// resume runs through the newer version without a profile change.
+#[tokio::test]
+async fn a_newer_package_version_adopts_a_labelled_stopped_session_whose_profile_moved_to_it() {
+    let kind = &CLAUDE;
+    let (session, _old, new) = moved_to_newer("newer-adopts-labelled", kind).await;
+    session.fixture.write_profile(
+        PROFILE,
+        &format!(
+            "display_name = \"Night Shift\"\nbase = \"{}\"\nprogram = \"{}\"\n\n[env]\n{} = \"{}\"\n",
+            kind.runtime,
+            session.agent.display(),
+            kind.home_env,
+            session.fixture.dir.join("agent-home").display(),
+        ),
+    );
+    pin_profile(&session.fixture.registry, &new.digest).await;
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        stopped_verdict(&restarted, &session.store_path, &session.id),
+        (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE_BY_NEWER_PACKAGE.to_owned()
+        ),
+        "the preflight names the adoption the resume performs"
+    );
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect("the newer version adopts the labelled session without a profile change");
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    assert_eq!(
+        pinned_digest(&session.store_path, &session.id),
+        new.digest,
+        "the relaunch records the adopting digest"
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
 #[tokio::test]
 async fn a_newer_package_version_adopts_a_stopped_codex_session_whose_profile_moved_to_it() {
     assert_resume_adopted("newer-adopts-codex", &CODEX).await;

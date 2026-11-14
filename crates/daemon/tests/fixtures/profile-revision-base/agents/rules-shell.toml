@@ -1,0 +1,10 @@
+# A shell profile carrying input-rules and resume overrides.
+base = "shell"
+args = ["-c", "exec sleep 30"]
+
+[input_rules]
+bracketed_paste = true
+submit_delay_ms = 0
+
+[resume]
+resumable = false

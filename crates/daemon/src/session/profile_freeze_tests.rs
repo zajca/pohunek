@@ -95,10 +95,18 @@ impl Frozen {
 
     /// Writes the profile `work` with `mark` as its environment variable.
     fn write_profile(&self, mark: &str) {
+        self.write_profile_with_labels(mark, "");
+    }
+
+    /// Writes the profile `work` with `mark` as its environment variable
+    /// and `labels` (complete `display_name`/`audience` lines) inserted
+    /// above `base`: TOML keys may come in any order, so a label first is
+    /// the same file the owner writes.
+    fn write_profile_with_labels(&self, mark: &str, labels: &str) {
         fs::write(
             self.agents.join(format!("{}.toml", self.name)),
             format!(
-                "base = \"pi\"\n{}program = \"{}\"\n[env]\n{MARK_VAR} = \"{mark}\"\n",
+                "{labels}base = \"pi\"\n{}program = \"{}\"\n[env]\n{MARK_VAR} = \"{mark}\"\n",
                 pi_shaped_profile_pin(),
                 self.script.display()
             ),
@@ -297,6 +305,40 @@ async fn resume_of_an_unchanged_profile_relaunches_under_it_after_a_restart() {
         [SECRET_MARK, SECRET_MARK]
     );
     assert_eq!(frozen.frozen_revision(&id), revision, "nothing re-froze");
+    restarted.stop(&id).await.expect("stop the session");
+}
+
+/// A label-only edit never needs the owner's accept flag: the session
+/// resumes under the labelled profile as if nothing changed, and the frozen
+/// revision is untouched. The launch runs under the current profile either
+/// way, so the second launch carries the same mark.
+#[tokio::test]
+async fn resume_after_a_label_only_edit_relaunches_without_accept() {
+    let frozen = Frozen::new("resume-label");
+    let registry = frozen.registry();
+    let id = frozen.created_and_settled(registry).await;
+    let before = frozen.frozen_revision(&id).expect("frozen at creation");
+
+    frozen.write_profile_with_labels(
+        SECRET_MARK,
+        "display_name = \"Night Shift\"\naudience = \"agent\"\n",
+    );
+    let restarted = frozen.restarted().await;
+    restarted
+        .resume(&id)
+        .await
+        .expect("a label-only edit resumes");
+
+    assert_eq!(
+        frozen.wait_for_launches(2).await,
+        [SECRET_MARK, SECRET_MARK],
+        "the relaunch runs under the current profile"
+    );
+    assert_eq!(
+        frozen.frozen_revision(&id),
+        Some(before),
+        "a label-only edit leaves the frozen revision alone"
+    );
     restarted.stop(&id).await.expect("stop the session");
 }
 

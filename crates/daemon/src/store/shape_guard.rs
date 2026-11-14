@@ -450,6 +450,7 @@ fn assert_every_field_is_reviewed(
         name: _,
         agent: _,
         agent_base: _,
+        agent_display_name: _,
         cwd: _,
         cwd_source,
         pid: _,

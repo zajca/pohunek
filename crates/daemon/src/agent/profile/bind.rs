@@ -122,7 +122,7 @@ fn escape_controls(text: &str) -> String {
 ///
 /// The error's own `Display` quotes the offending source line, which can be an
 /// `[env]` entry carrying a secret.
-fn edit_diagnostic(content: &str, error: &TomlError) -> String {
+pub(super) fn edit_diagnostic(content: &str, error: &TomlError) -> String {
     let message = escape_controls(error.message());
     match error.span() {
         Some(span) => {

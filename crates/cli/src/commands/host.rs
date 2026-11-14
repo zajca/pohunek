@@ -21,6 +21,7 @@ use protocol::{
     HostRecord, QuarantineReason,
 };
 
+use super::plugin::sanitize;
 use crate::client::Client;
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -274,9 +275,21 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
             .as_deref()
             .map(|home| format!(" config_home_id={home}"))
             .unwrap_or_default();
+        let label = rt
+            .display_name
+            .as_deref()
+            .map(|name| format!(" display_name={}", sanitize(name)))
+            .unwrap_or_default();
+        // The audience shows only when the file sets it: the wire omits an
+        // absent audience (which means `owner`), so an explicit `owner`
+        // stays visible exactly as the file declares it.
+        let audience = rt
+            .audience
+            .map(|audience| format!(" audience={audience}"))
+            .unwrap_or_default();
         let _ = writeln!(
             output,
-            "    {:<8} available={:<5} supported={supported:<5} version={version} path={path}{home}",
+            "    {:<8} available={:<5} supported={supported:<5} version={version} path={path}{home}{label}{audience}",
             rt.agent, rt.available,
         );
     }
@@ -384,6 +397,8 @@ mod tests {
                     version: None,
                     supported: None,
                     config_home_id: None,
+                    display_name: None,
+                    audience: None,
                 },
                 AgentRuntime {
                     agent: "claude".to_owned(),
@@ -393,6 +408,8 @@ mod tests {
                     version: None,
                     supported: None,
                     config_home_id: None,
+                    display_name: None,
+                    audience: None,
                 },
                 AgentRuntime {
                     agent: "hermes".to_owned(),
@@ -402,6 +419,8 @@ mod tests {
                     version: Some("0.20.0".to_owned()),
                     supported: Some(true),
                     config_home_id: None,
+                    display_name: None,
+                    audience: None,
                 },
             ],
             git_available: true,
@@ -438,6 +457,8 @@ mod tests {
                 version: None,
                 supported: None,
                 config_home_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+                display_name: None,
+                audience: None,
             }],
             git_available: true,
             worktree_supported: true,

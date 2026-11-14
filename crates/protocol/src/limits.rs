@@ -67,6 +67,13 @@ pub const MAX_SESSION_SECRET_ENV_ENTRIES: usize = 16;
 /// sixteen of them fit one control line.
 pub const MAX_SESSION_SECRET_ENV_VALUE_BYTES: usize = 16 * 1024;
 
+/// Maximum UTF-8 bytes in a profile `display_name`, after trimming.
+///
+/// A label is a short human name for pickers and tables; 128 bytes fit a
+/// long multi-word title while keeping table rows and inspect payloads
+/// bounded.
+pub const MAX_PROFILE_DISPLAY_NAME_BYTES: usize = 128;
+
 /// Maximum UTF-8 bytes in one `secret_env` variable name.
 ///
 /// Matches the portable environment-name bound used for launch environments.

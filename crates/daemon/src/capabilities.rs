@@ -23,7 +23,7 @@ use crate::agent::host::{
     LaunchProgram, RuntimeDefinition, RuntimeRegistry, Spawn, VersionProbePolicy, VersionRefusal,
     RESERVED_RUNTIME_IDS, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID, SEMVER_REVISION_LINE_PARSER_ID,
 };
-use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
+use crate::agent::{which_executable, ProfileRegistry, ResolvedAgent, ValidatedLaunchProgram};
 use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 use crate::integration::Home;
 use crate::runtime::environment::effective_variable;
@@ -240,6 +240,8 @@ fn host_capabilities_for(
                     version: None,
                     supported: None,
                     config_home_id: None,
+                    display_name: None,
+                    audience: None,
                 },
                 None,
             ),
@@ -279,6 +281,7 @@ fn host_capabilities_for(
             ),
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
+        enrich_agent_labels(entry, &agent);
         if launchable.is_ok() {
             if let Some(profile) = agent.profile.as_ref() {
                 entry.config_home_id =
@@ -339,6 +342,22 @@ fn place_runtime<'a>(
     runtimes
         .last_mut()
         .expect("the entry was pushed just above")
+}
+
+/// Copy the presentation labels of resolved profile `agent` onto its
+/// inventory `entry`: the `display_name` when the profile sets one (absent
+/// otherwise, so clients show the agent name) and the `audience` only when
+/// the profile sets one (absent on the wire means owner).
+///
+/// Only a resolvable profile carries labels — bare runtimes keep the absent
+/// form, and an unresolvable pinned profile has no validated labels to copy —
+/// so every labelled entry names a profile a launch would accept.
+fn enrich_agent_labels(entry: &mut AgentRuntime, agent: &ResolvedAgent) {
+    let Some(profile) = agent.profile.as_ref() else {
+        return;
+    };
+    entry.display_name.clone_from(&profile.display_name);
+    entry.audience = profile.audience;
 }
 
 /// The feature flags every snapshot carries around the inventory.
@@ -420,6 +439,8 @@ fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
         version: None,
         supported: None,
         config_home_id: None,
+        display_name: None,
+        audience: None,
     }
 }
 
@@ -465,6 +486,8 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
             version: None,
             supported: None,
             config_home_id: None,
+            display_name: None,
+            audience: None,
         },
         None => AgentRuntime {
             agent: agent.to_owned(),
@@ -474,6 +497,8 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
             version: None,
             supported: None,
             config_home_id: None,
+            display_name: None,
+            audience: None,
         },
     }
 }
@@ -502,6 +527,8 @@ fn plan_versioned_runtime(
                 version: None,
                 supported: None,
                 config_home_id: None,
+                display_name: None,
+                audience: None,
             },
             None,
         );
@@ -527,6 +554,8 @@ fn plan_versioned_runtime(
             version: None,
             supported: Some(false),
             config_home_id: None,
+            display_name: None,
+            audience: None,
         },
         probe,
     )

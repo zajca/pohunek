@@ -1,0 +1,8 @@
+# A shell profile with comments, blank lines, args and environment.
+base = "shell"
+
+# The program the shell runtime launches (the hermetic shell in tests).
+args = ["-c", "exec sleep 30"]
+
+[env]
+PROFILE_LABEL_ROLE = "base-guard"

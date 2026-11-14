@@ -3149,6 +3149,14 @@ pub struct SessionInfo {
     /// Runtime identity backing the session. A grammar-invalid historical label
     /// stays displayable but is never launchable.
     pub agent_base: RuntimeRef,
+    /// Human label of the session's agent profile, read live from the profile
+    /// file. Set only on `session.list` and `session.inspect` responses, when
+    /// the session runs on a labelled profile whose file still parses; absent
+    /// for a bare runtime, a missing profile file, or an unparsable one.
+    /// Stored records and events never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub agent_display_name: Option<String>,
     /// Current working directory for the session.
     pub cwd: PathBuf,
     /// Source that last set [`Self::cwd`].
@@ -4076,6 +4084,7 @@ mod tests {
             name: None,
             agent: "claude".to_owned(),
             agent_base: RuntimeRef::claude(),
+            agent_display_name: None,
             cwd: PathBuf::from("/workspace"),
             cwd_source: Some(CwdSource::Launch),
             pid: 4242,

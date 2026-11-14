@@ -450,6 +450,16 @@ would require an fd-based execution contract. An absent `agent_base` is compatib
 profile inventory, but a present historical label (a value outside the runtime-id
 grammar) is presentation-only and not launchable.
 
+Optional `display_name` on a `runtimes` entry is the profile's `display_name`
+key, shown by pickers instead of the agent name; it is absent for bare
+runtimes, unlabelled profiles and unresolvable pins. Optional `audience` on a
+`runtimes` entry is the profile's `audience` key (`owner`, `agent` or
+`hidden`); absent means `owner`, so profiles without the key keep showing in
+owner pickers, and a daemon that predates the field omits it. An audience
+value a client does not know decodes tolerantly to `unknown`. Neither field
+enters the profile revision (see below), and neither changes launchability:
+clients still derive that from `available` and `supported != false` alone.
+
 ### Runtime Package Methods
 
 The `package.*` methods manage the runtime packages installed on the host the
@@ -1791,6 +1801,10 @@ Important fields:
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
+- `agent_display_name`: optional display label from the session's profile
+  `display_name` key, read live on `session list` and `session inspect`; absent
+  means the session is shown by its agent name. A session whose profile is
+  missing, unresolvable or unlabelled carries no label.
 - `agent_base`: the `RuntimeRef` of the runtime backing the session, for
   example `shell`, `codex`, `claude`, or `hermes`; a historical label outside
   the runtime-id grammar remains presentation-only.
