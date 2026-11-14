@@ -96,6 +96,8 @@ mod plugin_profile_create_presets;
 mod plugin_profile_fold;
 #[path = "plugin_profile_list_audience.rs"]
 mod plugin_profile_list_audience;
+#[path = "plugin_profile_rm.rs"]
+mod plugin_profile_rm;
 #[path = "prompt_link.rs"]
 mod prompt_link;
 #[path = "prompt_render.rs"]

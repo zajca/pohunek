@@ -356,3 +356,50 @@ pub(super) fn resolve(
 pub(super) fn display_name(preset: &RawPreset) -> Option<&str> {
     preset.display_name.as_ref().map(ProfileDisplayName::as_str)
 }
+
+/// The `[preset] parent` that the profile text `text` names, read leniently:
+/// any TOML text whose `preset` table holds a string `parent` names it, even
+/// when another key of the preset is invalid, so a preset that a fix would
+/// make launchable still counts. Other text names no parent.
+fn named_parent(text: &str) -> Option<String> {
+    let root = toml::from_str::<toml::Table>(text).ok()?;
+    root.get(PRESET_KEY)?
+        .as_table()?
+        .get("parent")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
+impl ProfileRegistry {
+    /// The presets whose `[preset] parent` satisfies `is_parent`, sorted by
+    /// name.
+    ///
+    /// Reads the agents directory with the bounded scan of
+    /// [`Self::scanned_texts`]; a file that cannot be read names no parent.
+    /// The caller decides what a parent name stands for, so a parent that
+    /// reaches a profile through another spelling or an in-tree link can count
+    /// as naming it.
+    ///
+    /// # Errors
+    ///
+    /// The listing errors of [`Self::scanned_texts`], so a directory that
+    /// cannot be listed completely is never taken to hold no preset.
+    pub(crate) fn presets_of(
+        &self,
+        is_parent: impl Fn(&str) -> bool,
+    ) -> std::io::Result<Vec<String>> {
+        let mut presets: Vec<String> = self
+            .scanned_texts()?
+            .into_iter()
+            .filter(|(_name, text)| {
+                text.as_deref()
+                    .ok()
+                    .and_then(named_parent)
+                    .is_some_and(|named| is_parent(&named))
+            })
+            .map(|(name, _text)| name)
+            .collect();
+        presets.sort();
+        Ok(presets)
+    }
+}

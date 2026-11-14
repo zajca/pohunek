@@ -89,6 +89,10 @@ fn package_methods(digest: &PackageDigest) -> Vec<(&'static str, Value)> {
             method::PACKAGE_CREATE_PRESET,
             json!({ "profile": "review", "parent": "work", "dry_run": true }),
         ),
+        (
+            method::PACKAGE_REMOVE_PROFILE,
+            json!({ "profile": "work", "digest": format!("sha256:{}", "0".repeat(64)) }),
+        ),
     ]
 }
 

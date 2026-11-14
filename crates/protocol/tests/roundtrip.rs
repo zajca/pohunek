@@ -3768,6 +3768,7 @@ fn host_capabilities_json_shape_roundtrips() {
         package_create_profile_supported: true,
         package_create_profile_options_supported: true,
         package_create_preset_supported: true,
+        package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
     };
 
@@ -3813,6 +3814,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "package_create_profile_supported": true,
             "package_create_profile_options_supported": true,
             "package_create_preset_supported": true,
+            "package_remove_profile_supported": true,
             "integration_agent_skill_supported": true
         })
     );
@@ -3961,6 +3963,10 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     assert!(
         !caps.package_create_preset_supported,
         "a host that omits the create-preset flag answers package.create_preset with method_not_found"
+    );
+    assert!(
+        !caps.package_remove_profile_supported,
+        "a host that omits the remove-profile flag answers package.remove_profile with method_not_found"
     );
     assert!(
         !caps.integration_agent_skill_supported,

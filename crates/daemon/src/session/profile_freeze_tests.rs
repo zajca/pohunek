@@ -785,3 +785,102 @@ async fn a_session_that_reads_as_done_has_already_dropped_its_resume_binding() {
     );
     drop(late_writes);
 }
+
+/// The `package.remove_profile` params that name the current file of the
+/// fixture's profile, with the digest `plugin profile list` reports.
+fn remove_current(frozen: &Frozen) -> protocol::PackageRemoveProfileParams {
+    use sha2::Digest as _;
+    let bytes =
+        fs::read(frozen.agents.join(format!("{}.toml", frozen.name))).expect("read the profile");
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(&bytes));
+    protocol::PackageRemoveProfileParams {
+        profile: frozen.name.to_owned(),
+        digest: protocol::ProfileDigest::parse(&digest).expect("a profile digest"),
+    }
+}
+
+/// Arms `registry` to park its next create after its agent resolved, before
+/// it takes the package launch guard.
+fn hold_resolved_create(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
+    let gate = crate::runtime::lifecycle::tests::StartGate {
+        session_id: None,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *registry
+        .inner
+        .resolved_create_hold
+        .lock()
+        .expect("resolved create hold is never poisoned") = Some(gate.clone());
+    gate
+}
+
+/// Row 8 of #2346: a session that stopped keeps its frozen revision, the
+/// removal of its profile succeeds, and its resume follows the
+/// missing-profile rule until the same profile is restored.
+#[tokio::test]
+async fn a_removed_profile_leaves_a_stopped_session_to_the_missing_profile_rule() {
+    let frozen = Frozen::new("rm-stopped");
+    let registry = frozen.registry();
+    let id = frozen.created_and_exited(&registry).await;
+    let request = remove_current(&frozen);
+
+    let removed = registry
+        .packages()
+        .package_remove_profile(request.clone())
+        .await
+        .expect("no running session uses the profile");
+    assert_eq!(removed.file_digest, request.digest);
+    assert!(!frozen.agents.join("work.toml").exists());
+
+    let refused = registry
+        .resume(&id)
+        .await
+        .expect_err("a removed profile cannot be relaunched under");
+    assert_eq!(refused.code, "agent_profile_missing", "{refused:?}");
+    assert_eq!(launch_count(&frozen.marker), 1, "nothing launched");
+
+    frozen.write_profile(SECRET_MARK);
+    registry
+        .resume(&id)
+        .await
+        .expect("the restored profile has the frozen revision");
+    registry.stop(&id).await.expect("stop the session");
+}
+
+/// Row 14 of #2346: a create that resolved the profile before a removal
+/// takes the launch guard after it; it is refused and launches nothing, so
+/// no session runs a removed profile.
+#[tokio::test]
+async fn a_create_that_resolved_a_profile_removed_before_its_guard_is_refused() {
+    let frozen = Frozen::new("rm-create-race");
+    let registry = frozen.registry();
+    let gate = hold_resolved_create(&registry);
+    let create = tokio::spawn({
+        let registry = registry.clone();
+        let params = frozen.new_params();
+        async move { registry.create(params).await }
+    });
+    tokio::time::timeout(HANG_GUARD, gate.entered.notified())
+        .await
+        .expect("the create resolves its agent");
+
+    registry
+        .packages()
+        .package_remove_profile(remove_current(&frozen))
+        .await
+        .expect("no session runs the profile yet");
+    gate.release.notify_one();
+    let refused = tokio::time::timeout(HANG_GUARD, create)
+        .await
+        .expect("the create finishes")
+        .expect("the create task joins")
+        .expect_err("the profile was removed before the create took its guard");
+
+    assert_eq!(refused.code, "agent_profile_not_found", "{refused:?}");
+    assert_eq!(launch_count(&frozen.marker), 0, "nothing launched");
+    assert!(
+        registry.list().await.is_empty(),
+        "no session was registered"
+    );
+}

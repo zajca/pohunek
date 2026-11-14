@@ -897,6 +897,22 @@ fn daemon_creating_presets(method: &str, params: &Value) -> Value {
     }
 }
 
+/// A daemon that serves `package.remove_profile` and records what it receives.
+fn daemon_removing_profiles(method: &str, params: &Value) -> Value {
+    match method {
+        "host.inspect" => {
+            let mut value = capabilities(true);
+            value["package_remove_profile_supported"] = json!(true);
+            value
+        }
+        "package.remove_profile" => json!({
+            "profile": params["profile"],
+            "file_digest": params["digest"],
+        }),
+        _ => daemon_serving_pi(method, params),
+    }
+}
+
 /// A daemon that predates the previous-pin check of a profile bind.
 fn daemon_without_the_pin_check(method: &str, params: &Value) -> Value {
     match method {
@@ -1217,6 +1233,57 @@ fn profile_create_options_or_preset_against_an_older_daemon_sends_nothing() {
             "{code}: {recorded:?}"
         );
     }
+}
+
+/// Row 12 of #2346: a daemon that predates `package.remove_profile` is told
+/// apart before the removal: the CLI fails with its own code and sends
+/// nothing.
+#[test]
+fn profile_rm_against_a_daemon_without_the_method_sends_nothing() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_creating_presets);
+    let digest = format!("sha256:{}", "d".repeat(64));
+
+    let output = fixture.run(&[
+        "plugin", "profile", "rm", "work", "--digest", &digest, "--json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "profile_remove_unsupported"
+    );
+    let recorded = daemon.finish();
+    assert!(
+        recorded
+            .iter()
+            .all(|(method, _)| method != "package.remove_profile"),
+        "{recorded:?}"
+    );
+}
+
+/// `rm` sends the name and the digest exactly as given and prints the
+/// daemon's answer.
+#[test]
+fn profile_rm_sends_the_name_and_the_digest() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_removing_profiles);
+    let digest = format!("sha256:{}", "e".repeat(64));
+
+    let output = fixture.run(&["plugin", "profile", "rm", "work", "--digest", &digest]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("removed work digest {digest}\n")
+    );
+    let recorded = daemon.finish();
+    let sent: Vec<&Value> = recorded
+        .iter()
+        .filter(|(method, _)| method == "package.remove_profile")
+        .map(|(_, params)| params)
+        .collect();
+    assert_eq!(sent, [&json!({ "profile": "work", "digest": digest })]);
 }
 
 /// `--preset-of` sends `package.create_preset` with the parent, the

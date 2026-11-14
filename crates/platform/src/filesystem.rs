@@ -2409,7 +2409,7 @@ impl StagedEntry {
             &self.directory,
             &self.directory_path,
             &self.name,
-            ".pohunek-remove-",
+            REMOVE_QUARANTINE_PREFIX,
         )?;
         let Some(quarantine) = quarantine else {
             return Ok(RemoveOutcome::Missing);
@@ -3629,6 +3629,11 @@ fn restore_displaced_after(
 
 /// Quarantine name of an entry parked while [`StagedEntry::restore`] verifies it.
 const RESTORE_PREFIX: &str = ".pohunek-restore-";
+
+/// Quarantine name [`StagedEntry::remove`] gives an entry right before it
+/// unlinks it. An entry of this name outlives the removal only when the
+/// process stops between the rename and the unlink; its owner may sweep it.
+pub const REMOVE_QUARANTINE_PREFIX: &str = ".pohunek-remove-";
 
 /// Every name prefix the primitives in this module give to a quarantined,
 /// staged, or stale entry, so tools can recognize leftovers of an interrupted

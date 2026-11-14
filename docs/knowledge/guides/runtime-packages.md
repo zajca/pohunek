@@ -1510,6 +1510,12 @@ OPTION=CHOICE]... [--locked]` writes a preset of an existing profile through
 `package.create_preset` (behind `package_create_preset_supported`) instead; a
 preset carries no pin, so `plugin profile migrate` refuses it and its parent
 is migrated.
+`pohunek plugin profile rm <name> --digest <file digest>` removes a profile
+through `package.remove_profile` (behind `package_remove_profile_supported`)
+under the same exclusive authority, so removing a profile that pinned a
+package releases that pin; a package-served runtime name itself has no file
+and is refused with `package_profile_package_runtime` (use `plugin disable` or
+`plugin uninstall`).
 
 `pohunek plugin profile migrate <name> [--digest <d>] [--yes] [--json]` pins
 the profile through the daemon's `package.bind_profile` method; the command

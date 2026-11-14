@@ -140,9 +140,9 @@ pub use package::{
     PackageDoctorResult, PackageErrorKind, PackageFault, PackageFinding, PackageFindingKind,
     PackageInfo, PackageInspectParams, PackageInspectResult, PackageInstallParams,
     PackageInstallResult, PackageInstallStatus, PackageLinkParams, PackageListResult,
-    PackageOrigin, PackageRuntimeInfo, PackageSelectParams, PackageSelectionBlock,
-    PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
-    PackageUninstallResult,
+    PackageOrigin, PackageRemoveProfileParams, PackageRemoveProfileResult, PackageRuntimeInfo,
+    PackageSelectParams, PackageSelectionBlock, PackageSelectionBlockReason,
+    PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
 };
 #[doc(inline)]
 pub use project::{

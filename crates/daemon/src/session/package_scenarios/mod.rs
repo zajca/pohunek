@@ -19,6 +19,8 @@ mod newer_version_tests;
 #[cfg(test)]
 mod official_alias_tests;
 #[cfg(test)]
+mod remove_tests;
+#[cfg(test)]
 mod revocation_tests;
 #[cfg(test)]
 mod selection_tests;

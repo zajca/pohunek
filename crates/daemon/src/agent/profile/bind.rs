@@ -1,4 +1,5 @@
-//! Rewrites the package pin of a host agent profile.
+//! Rewrites the package pin of a host agent profile, and creates and removes
+//! profile files.
 //!
 //! The pin is the `package` and `digest` keys of `<agents>/<name>.toml`. The
 //! rewrite edits exactly those two keys and leaves every other byte alone, and
@@ -17,7 +18,8 @@ use std::path::PathBuf;
 
 use package::PackageDigest;
 use pohunek_platform::filesystem::{
-    AtomicReplaceError, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
+    AtomicReplaceError, EntryIdentity, EntryKind, FsError, MoveOutcome, RemoveOutcome,
+    StageOutcome, TrustedDir, REMOVE_QUARANTINE_PREFIX,
 };
 use protocol::{PackageId, RuntimeId};
 use toml_edit::{DocumentMut, Item, TomlError, Value};
@@ -252,6 +254,12 @@ impl ProfileFile {
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
+
+    /// The device and inode of the file that was read.
+    #[must_use]
+    pub(crate) fn file_id(&self) -> (u64, u64) {
+        (self.identity.device(), self.identity.inode())
+    }
 }
 
 /// The agents directory opened for a rewrite.
@@ -338,11 +346,13 @@ fn max_profile_bytes() -> usize {
 }
 
 impl BindDir {
-    /// Removes the temporary files an interrupted rewrite left behind.
+    /// Removes the temporary files an interrupted rewrite or removal left
+    /// behind: the staged rewrite temporaries, and the quarantine entries a
+    /// removal renames a profile to right before it unlinks it.
     ///
-    /// A temporary never has a profile name, so a stale one is inert; removal
-    /// only keeps secret `[env]` values from lingering in it. Failures are
-    /// logged and skipped.
+    /// Neither kind has a profile name, so a stale one is inert; removal only
+    /// keeps secret `[env]` values from lingering in it. Failures are logged
+    /// and skipped.
     pub(crate) fn remove_stale_temporaries(&self) {
         let names = match self.trusted.entry_names_limited(MAX_SCANNED_PROFILES) {
             Ok((names, _truncated)) => names,
@@ -352,7 +362,8 @@ impl BindDir {
             }
         };
         for name in names {
-            if !name.to_string_lossy().starts_with(TEMPORARY_PREFIX) {
+            let text = name.to_string_lossy();
+            if !text.starts_with(TEMPORARY_PREFIX) && !text.starts_with(REMOVE_QUARANTINE_PREFIX) {
                 continue;
             }
             let removed = self
@@ -421,6 +432,55 @@ impl BindDir {
             mode,
             identity,
         })
+    }
+
+    /// Whether `<name>.toml` is an entry of the directory under exactly that
+    /// name, byte for byte.
+    ///
+    /// A case-insensitive volume opens `Work.toml` for a stored `work.toml`;
+    /// the listing tells the stored name apart, so a request under another
+    /// spelling never stands for the stored profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::Failed`] when the directory cannot be listed
+    /// completely.
+    pub(crate) fn is_stored_name(&self, name: &str) -> Result<bool, BindError> {
+        let wanted = profile_file_name(name);
+        let (names, truncated) = self
+            .trusted
+            .entry_names_limited(MAX_SCANNED_PROFILES)
+            .map_err(|error| {
+                warn!(%error, "the agents directory could not be listed");
+                BindError::Failed("the agents directory could not be listed")
+            })?;
+        if names
+            .iter()
+            .any(|entry| entry.as_encoded_bytes() == wanted.as_bytes())
+        {
+            return Ok(true);
+        }
+        if truncated {
+            return Err(BindError::Failed(
+                "the agents directory holds too many entries to list",
+            ));
+        }
+        Ok(false)
+    }
+
+    /// The device and inode of the file a launch of `name` reads now, or
+    /// `None` when `name` names no regular file.
+    ///
+    /// A launch opens `<name>.toml` through the directory's lookup and follows
+    /// an in-tree symbolic link, so a link and every spelling the volume
+    /// folds onto the same entry lead to the same file.
+    #[must_use]
+    pub(crate) fn launch_file_id(&self, name: &str) -> Option<(u64, u64)> {
+        if validate_name("agent", name).is_err() {
+            return None;
+        }
+        let metadata = std::fs::metadata(self.root.join(profile_file_name(name))).ok()?;
+        metadata.is_file().then(|| (metadata.dev(), metadata.ino()))
     }
 
     /// Whether the profile file is still exactly `original`: the same inode,
@@ -557,6 +617,100 @@ impl BindDir {
                 self.discard(&temporary, identity);
                 Err(BindError::Failed(
                     "the new profile could not be moved into place",
+                ))
+            }
+        }
+    }
+
+    /// Removes the profile `name` when it is still exactly `original`.
+    ///
+    /// Immediately before the removal the file is compared with `original`
+    /// (inode, mode and content); then the inode is moved to a rewrite
+    /// temporary name bound to its identity, compared again there, renamed to
+    /// a removal quarantine name and unlinked, and the directory is
+    /// synchronized. The name therefore resolves to the complete file or to
+    /// nothing, and a file swapped in after the comparison is never removed.
+    /// A removal interrupted after the first move leaves the file under the
+    /// temporary or the quarantine name; [`Self::remove_stale_temporaries`]
+    /// sweeps both at the next create or removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::Changed`] when the profile changed after it was
+    /// read, and [`BindError::Failed`] when the move or the unlink failed or
+    /// its durability is uncertain; in the first case the file is untouched.
+    pub(crate) fn remove(&self, name: &str, original: &ProfileFile) -> Result<(), BindError> {
+        let file = profile_file_name(name);
+        match self.is_unchanged(name, original) {
+            Ok(()) => {}
+            Err(FsError::IdentityChanged { .. }) => return Err(BindError::Changed),
+            Err(error) => {
+                warn!(%error, "the profile could not be checked before its removal and is unchanged");
+                return Err(BindError::Failed(
+                    "the profile could not be removed; it is unchanged",
+                ));
+            }
+        }
+        let staged = match self
+            .trusted
+            .stage_random(&file, TEMPORARY_PREFIX, original.identity)
+        {
+            Ok(StageOutcome::Staged(staged)) => staged,
+            Ok(_moved_or_replaced) => return Err(BindError::Changed),
+            Err(error) => {
+                warn!(%error, "the profile could not be moved aside for its removal");
+                return Err(BindError::Failed(
+                    "the profile could not be removed; it is unchanged",
+                ));
+            }
+        };
+        // The move keeps the inode, so a write in place between the comparison
+        // and the move would still be removed: the content is compared again
+        // under the temporary name, and a changed file is moved back.
+        let staged_name = staged.path().file_name().map(ToOwned::to_owned);
+        let still_original = staged_name.is_some_and(|staged_name| {
+            self.trusted
+                .read_file(&staged_name, original.mode, max_profile_bytes())
+                .is_ok_and(|bytes| bytes == original.text.as_bytes())
+        });
+        if !still_original {
+            return match staged.restore(&file) {
+                Ok(MoveOutcome::Moved) => Err(BindError::Changed),
+                Ok(_occupied) => {
+                    warn!("a changed profile was moved aside and its name is taken again");
+                    Err(BindError::Failed(
+                        "the profile changed while it was being removed and its name is taken again; its previous file remains as a temporary in the agents directory",
+                    ))
+                }
+                Err(error) => {
+                    warn!(%error, "a changed profile could not be moved back");
+                    Err(BindError::Failed(
+                        "the profile changed while it was being removed and could not be moved back; it remains as a temporary in the agents directory",
+                    ))
+                }
+            };
+        }
+        match staged.remove() {
+            Ok(RemoveOutcome::Removed) => Ok(()),
+            Ok(outcome) => {
+                warn!(
+                    ?outcome,
+                    "the moved-aside profile changed before its removal"
+                );
+                Err(BindError::Failed(
+                    "the profile changed while it was being removed; check the agents directory",
+                ))
+            }
+            Err(FsError::CommittedDurabilityUncertain { source, .. }) => {
+                warn!(error = %source, "the profile was removed but the directory could not be synchronized");
+                Err(BindError::Failed(
+                    "the profile was removed but the directory could not be synchronized",
+                ))
+            }
+            Err(error) => {
+                warn!(%error, "the moved-aside profile could not be removed");
+                Err(BindError::Failed(
+                    "the profile could not be removed; a temporary copy may remain in the agents directory",
                 ))
             }
         }
