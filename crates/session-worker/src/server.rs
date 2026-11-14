@@ -485,7 +485,7 @@ impl Server {
             #[cfg(test)]
             starting_gate: Mutex::new(None),
             #[cfg(feature = "test-util")]
-            terminal_commit_hold: watch::channel(false).0,
+            terminal_commit_hold: watch::channel(CommitHold::Off).0,
         });
         Ok(Self {
             listener,
@@ -608,13 +608,63 @@ impl ServerHandle {
     /// Holds the runtime's terminal journal commit open (M-TEST-UTIL).
     ///
     /// The commit of an ended runtime waits until the hold is released. The
-    /// next stop that reaches its wait for that commit waits no time, so it is
-    /// refused with [`protocol::TERMINAL_COMMIT_PENDING`], and releases the
-    /// hold as it is refused; a later stop finds the commit landing.
+    /// next stop that reaches its wait for that commit parks there until
+    /// [`TerminalCommitHold::refuse`], then waits no time, so it is refused
+    /// with [`protocol::TERMINAL_COMMIT_PENDING`]. The stop after it releases
+    /// the commit and waits for it as usual.
     #[cfg(feature = "test-util")]
-    pub fn hold_terminal_commit(&self) {
-        self.shared.terminal_commit_hold.send_replace(true);
+    #[must_use]
+    pub fn hold_terminal_commit(&self) -> TerminalCommitHold {
+        self.shared
+            .terminal_commit_hold
+            .send_replace(CommitHold::Held);
+        TerminalCommitHold {
+            shared: Arc::clone(&self.shared),
+        }
     }
+}
+
+/// A held terminal journal commit; see [`ServerHandle::hold_terminal_commit`].
+#[cfg(feature = "test-util")]
+#[derive(Debug)]
+pub struct TerminalCommitHold {
+    shared: Arc<Shared>,
+}
+
+#[cfg(feature = "test-util")]
+impl TerminalCommitHold {
+    /// Waits until a stop is parked at its wait for the held commit.
+    pub async fn stop_parked(&self) {
+        let mut hold = self.shared.terminal_commit_hold.subscribe();
+        // `Shared` owns the sender, so the wait ends only on the state.
+        let _ = hold
+            .wait_for(|state| *state == CommitHold::StopParked)
+            .await;
+    }
+
+    /// Lets the parked stop be refused with the pending commit.
+    pub fn refuse(&self) {
+        self.shared
+            .terminal_commit_hold
+            .send_replace(CommitHold::Refusing);
+    }
+}
+
+/// Where a test-held terminal commit is; see
+/// [`ServerHandle::hold_terminal_commit`].
+#[cfg(feature = "test-util")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitHold {
+    /// No hold: the commit lands as soon as it can.
+    Off,
+    /// The commit is held and no stop has reached it yet.
+    Held,
+    /// A stop is parked at its wait for the held commit.
+    StopParked,
+    /// The parked stop may be refused.
+    Refusing,
+    /// A stop was refused; the next stop releases the commit.
+    Refused,
 }
 
 /// Binds and runs one worker server.
@@ -658,10 +708,10 @@ struct Shared {
     /// Pauses `initialize` between the `Starting` commit and the child spawn.
     #[cfg(test)]
     starting_gate: Mutex<Option<StartingGate>>,
-    /// Whether the terminal journal commit is held; see
+    /// Where a test-held terminal journal commit is; see
     /// [`ServerHandle::hold_terminal_commit`].
     #[cfg(feature = "test-util")]
-    terminal_commit_hold: watch::Sender<bool>,
+    terminal_commit_hold: watch::Sender<CommitHold>,
 }
 
 /// Test-only pause point that makes the transient `Starting` phase observable.
@@ -2002,13 +2052,17 @@ async fn stop_request(
     pty.stop(transaction_id.as_str(), grace, kill_reap)
         .await
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
-    let committed = tokio::time::timeout(
-        terminal_commit_wait(shared),
-        wait_for_terminal_commit(shared),
-    )
-    .await;
     #[cfg(feature = "test-util")]
-    shared.terminal_commit_hold.send_replace(false);
+    let refused = refused_by_hold(shared).await;
+    #[cfg(not(feature = "test-util"))]
+    let refused = false;
+    // The stop a test-held commit refuses waits no time; the commit is held.
+    let wait = if refused {
+        Duration::ZERO
+    } else {
+        shared.config.terminal_commit_wait_timeout
+    };
+    let committed = tokio::time::timeout(wait, wait_for_terminal_commit(shared)).await;
     let committed = committed.map_err(|_elapsed| {
         control_error_message(
             ControlCode::RuntimeFault,
@@ -2061,14 +2115,33 @@ fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
     })
 }
 
-/// How long a stop waits for the terminal journal commit: the configured
-/// wait, or no time while a test holds the commit.
-fn terminal_commit_wait(shared: &Shared) -> Duration {
-    #[cfg(feature = "test-util")]
-    if *shared.terminal_commit_hold.borrow() {
-        return Duration::ZERO;
+/// Moves a test-held commit on for one stop and tells whether that stop is
+/// the one the hold refuses.
+///
+/// A stop that finds the commit held parks until the test lets it be refused;
+/// the commit stays held, so its zero wait elapses. A stop after a refusal
+/// releases the commit.
+#[cfg(feature = "test-util")]
+async fn refused_by_hold(shared: &Shared) -> bool {
+    let hold = &shared.terminal_commit_hold;
+    let state = *hold.borrow();
+    match state {
+        CommitHold::Held => {
+            let mut parked = hold.subscribe();
+            hold.send_replace(CommitHold::StopParked);
+            // `Shared` owns the sender, so the wait ends only on the state.
+            let _ = parked
+                .wait_for(|state| *state == CommitHold::Refusing)
+                .await;
+            hold.send_replace(CommitHold::Refused);
+            true
+        }
+        CommitHold::Refused => {
+            hold.send_replace(CommitHold::Off);
+            false
+        }
+        CommitHold::Off | CommitHold::StopParked | CommitHold::Refusing => false,
     }
-    shared.config.terminal_commit_wait_timeout
 }
 
 async fn wait_for_terminal_commit(shared: &Shared) -> Result<ExitStatus, ControlError> {
@@ -3003,7 +3076,7 @@ async fn commit_runtime_completion(
     {
         let mut hold = shared.terminal_commit_hold.subscribe();
         // `Shared` owns the sender, so the wait ends only on a release.
-        let _ = hold.wait_for(|held| !*held).await;
+        let _ = hold.wait_for(|state| *state == CommitHold::Off).await;
     }
     let mut state = shared.state.lock().await;
     let mut journal = state.journal.clone();
@@ -3056,6 +3129,15 @@ async fn mark_runtime_faulted_at_offset(
     error: WorkerError,
     next_output_offset: Option<u64>,
 ) {
+    // A stop answered after the fault reports only that the runtime faulted;
+    // the worker log names the cause.
+    event!(
+        name: "worker.runtime.faulted",
+        Level::ERROR,
+        error.type = "runtime",
+        error.message = %error,
+        "runtime faulted before its terminal journal commit: {{error.message}}",
+    );
     let (commit, background_cleared) = {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Faulted;

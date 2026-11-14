@@ -1214,6 +1214,12 @@ impl Worker {
     /// the connection, the worker gets `waits.answer` to answer. The abandoned
     /// exchange is drained by the next caller.
     ///
+    /// A worker that refuses the stop with
+    /// [`pohunek_worker_protocol::TERMINAL_COMMIT_PENDING`] has already stopped
+    /// the process group, so the same stop is sent once more on the connection
+    /// this caller still holds: it only waits for the commit, gets another
+    /// `waits.answer`, and never waits for the connection again.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::StopUnanswered`] when a wait elapses, and
@@ -1268,31 +1274,57 @@ impl Worker {
             }
             Err(error) => return Err(error),
         }
+        let response = self
+            .stop_locked(&mut inner, &scope, &transaction_id, bound)
+            .await?;
+        let response = match response {
+            ResponseKind::Error { error } if is_terminal_commit_pending(&error) => {
+                tracing::info!(
+                    session_id = scope.session_id.as_str(),
+                    "worker stopped the runtime before its terminal commit; waiting for the commit"
+                );
+                self.stop_locked(&mut inner, &scope, &transaction_id, bound)
+                    .await?
+            }
+            other => other,
+        };
+        match response {
+            ResponseKind::Stopped { exit } => Ok(exit),
+            other => response_error(other),
+        }
+    }
+
+    /// Sends one stop on the connection `inner` holds and waits `bound` for
+    /// the worker's answer.
+    async fn stop_locked(
+        &self,
+        inner: &mut Inner,
+        scope: &RuntimeScope,
+        transaction_id: &TransactionId,
+        bound: Duration,
+    ) -> Result<ResponseKind, WorkerError> {
         let exchange = request_locked(
-            &mut inner,
+            inner,
             self.next_request_id("stop")?,
             RequestKind::Stop {
-                scope,
-                stop: StopRequest { transaction_id },
+                scope: scope.clone(),
+                stop: StopRequest {
+                    transaction_id: transaction_id.clone(),
+                },
             },
         );
-        let stopped = tokio::time::timeout(bound, exchange).await;
-        let response = match stopped {
-            Ok(response) => response?,
+        match tokio::time::timeout(bound, exchange).await {
+            Ok(response) => response,
             Err(_elapsed) => {
                 // The abandoned exchange would leave the next caller waiting
                 // for an answer that may never come; closing the connection
                 // lets the worker release its lease and the watcher reconnect.
                 inner.expire("stop", ExchangePhase::Answer, bound);
-                return Err(WorkerError::StopUnanswered {
+                Err(WorkerError::StopUnanswered {
                     bound,
                     stage: "after the request was sent",
-                });
+                })
             }
-        };
-        match response {
-            ResponseKind::Stopped { exit } => Ok(exit),
-            other => response_error(other),
         }
     }
 
@@ -2180,6 +2212,14 @@ fn forwarded_response_error<T>(response: ResponseKind) -> Result<T, WorkerError>
         Err(error @ WorkerError::ResponseMismatch) => Err(WorkerError::AnswerLost(Box::new(error))),
         other => other,
     }
+}
+
+/// Whether `error` is the worker's refusal of a stop whose process group is
+/// stopped but whose terminal journal commit is still pending.
+fn is_terminal_commit_pending(error: &pohunek_worker_protocol::ControlError) -> bool {
+    error.code == ControlCode::RuntimeFault
+        && error.retryable
+        && error.message == pohunek_worker_protocol::TERMINAL_COMMIT_PENDING
 }
 
 fn response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {

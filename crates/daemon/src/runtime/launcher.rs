@@ -738,7 +738,10 @@ mod test_support {
         /// # Panics
         ///
         /// Panics when no worker of the session is running.
-        pub async fn hold_terminal_commit(&self, session_id: &str) {
+        pub async fn hold_terminal_commit(
+            &self,
+            session_id: &str,
+        ) -> pohunek_session_worker::TerminalCommitHold {
             let tasks = self.tasks.lock().await;
             let (_, worker) = tasks
                 .iter()
@@ -748,7 +751,7 @@ mod test_support {
                             .is_ok_and(|key| key.session_id() == session_id)
                 })
                 .expect("a running worker of the session");
-            worker.server.hold_terminal_commit();
+            worker.server.hold_terminal_commit()
         }
     }
 
