@@ -1206,6 +1206,64 @@ async fn editing_an_unselected_choice_resumes_without_a_decision() {
     rig.finish().await;
 }
 
+/// An option the session never recorded: `extra`, default `low`, whose
+/// choices set only env.
+const EXTRA_OPTION: &str = r#"
+[options.extra]
+label = "Extra"
+default = "low"
+choices.low = { label = "Low", env = { PH_OPT_EXTRA = "low-env" } }
+choices.high = { label = "High", env = { PH_OPT_EXTRA = "high-env" } }
+"#;
+
+/// #2343: an accepted relaunch records the choices its resolution took,
+/// the default of an option added since included, so the record describes
+/// the running launch. A later change of that option's default then keeps
+/// the revision, and the session resumes without a decision with the
+/// recorded choice; the record survives a daemon restart.
+#[tokio::test]
+async fn an_accepted_relaunch_records_the_choices_it_resolved() {
+    let (mut rig, digest) = resumable_rig("agent-options-resume-added").await;
+    let (session, cwd) = stopped_bold_session(&mut rig).await;
+    let added = format!("{RESUMABLE_OPTIONS}{EXTRA_OPTION}");
+    rig.write_profile("work", &resumable_profile(&digest, &added));
+    let refused = err_payload(rig.resume(&session.id, false).await);
+    assert_eq!(refused.code, "agent_profile_changed", "{refused:?}");
+
+    let resolved = selection(&[("depth", "shallow"), ("extra", "low"), ("mode", "bold")]);
+    let resumed: protocol::SessionResumeResult =
+        serde_json::from_value(ok_payload(rig.resume(&session.id, true).await))
+            .expect("the resume result");
+    assert_eq!(
+        resumed.session.agent_options, resolved,
+        "the accepted relaunch reports the choices it resolved"
+    );
+    launches(&cwd, 2).await;
+    assert_eq!(rig.listed(&session.id).await.agent_options, resolved);
+
+    rig.stop(&session.id).await;
+    let new_default = added.replace("default = \"low\"", "default = \"high\"");
+    assert_ne!(new_default, added);
+    rig.write_profile("work", &resumable_profile(&digest, &new_default));
+    let resumed: protocol::SessionResumeResult =
+        serde_json::from_value(ok_payload(rig.resume(&session.id, false).await))
+            .expect("a changed default resumes without a decision");
+    assert_eq!(
+        resumed.session.agent_options, resolved,
+        "the recorded choice stands, not the new default"
+    );
+    launches(&cwd, 3).await;
+
+    rig.stop(&session.id).await;
+    let mut rig = rig.restarted().await;
+    assert_eq!(
+        rig.listed(&session.id).await.agent_options,
+        resolved,
+        "the recorded choices are persisted"
+    );
+    rig.finish().await;
+}
+
 /// Row 15: a recorded choice the profile no longer declares is refused with
 /// `agent_option_choice_missing`, also when the owner accepts the changed
 /// profile: no other choice stands in for it. The upgrade preflight judges

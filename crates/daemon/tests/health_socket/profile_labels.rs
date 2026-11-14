@@ -5,9 +5,14 @@
 //! base build froze: the `expected.json` fixture pins those revisions so a
 //! later change to the revision inputs fails loudly. The guard pins `SHELL`
 //! to `/bin/sh`, and the fixture carries the `/bin/sh` revisions, so the
-//! guard is host-independent. To regenerate after an intentional input
-//! change, run the guard once with `POHUNEK_PROFILE_REVISION_CAPTURE` set
-//! and commit the rewritten fixture alongside the change.
+//! guard is host-independent and only reads the fixture. After an
+//! intentional change to the revision inputs, rewrite the fixture with the
+//! ignored test and commit it alongside the change:
+//!
+//! ```text
+//! cargo nextest run -p pohunek-daemon --test health_socket --run-ignored only \
+//!     -E 'test(=profile_labels::regenerate_profile_revision_base_fixture)'
+//! ```
 
 // Rust guideline compliant 2026-11-13
 
@@ -93,12 +98,41 @@ async fn a_profile_without_new_keys_keeps_the_revision_the_base_build_froze() {
     }
     let mut shell = pohunek_test_support::process_env::ProcessEnv::lock();
     shell.set("SHELL", "/bin/sh");
-    let fixture = fixture_dir();
     let expected: BTreeMap<String, String> = serde_json::from_str(
-        &std::fs::read_to_string(fixture.join("expected.json")).expect("read expected revisions"),
+        &std::fs::read_to_string(fixture_dir().join("expected.json"))
+            .expect("read expected revisions"),
     )
     .expect("expected revisions are a name-to-hex map");
+    assert_eq!(
+        guard_revisions().await,
+        expected,
+        "a profile without the new keys keeps its base revision"
+    );
+}
 
+/// Rewrites the guard's `expected.json` with the revisions the current
+/// daemon freezes, for an intentional change to the revision inputs.
+#[tokio::test]
+#[ignore = "rewrites the committed guard fixture; run it after an intentional change to the revision inputs"]
+async fn regenerate_profile_revision_base_fixture() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let mut shell = pohunek_test_support::process_env::ProcessEnv::lock();
+    shell.set("SHELL", "/bin/sh");
+    let revisions = guard_revisions().await;
+    std::fs::write(
+        fixture_dir().join("expected.json"),
+        serde_json::to_string_pretty(&revisions).expect("encode revisions"),
+    )
+    .expect("write the expected revisions");
+}
+
+/// The revision each guard profile freezes in a daemon over the fixture's
+/// profiles and fixed revision key, by profile name. The caller pins
+/// `SHELL` to `/bin/sh`.
+async fn guard_revisions() -> BTreeMap<String, String> {
+    let fixture = fixture_dir();
     let socket = temp_socket("profile-revision-base");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -136,19 +170,7 @@ async fn a_profile_without_new_keys_keeps_the_revision_the_base_build_froze() {
     drop(control);
     let _ = shutdown.send(());
     let _ = handle.await;
-
-    if std::env::var_os("POHUNEK_PROFILE_REVISION_CAPTURE").is_some() {
-        std::fs::write(
-            fixture.join("expected.json"),
-            serde_json::to_string_pretty(&revisions).expect("encode revisions"),
-        )
-        .expect("capture expected revisions");
-        return;
-    }
-    assert_eq!(
-        revisions, expected,
-        "a profile without the new keys keeps its base revision"
-    );
+    revisions
 }
 
 // Rows 2-9: presentation-only labels (brief pi-2150-a, case table).

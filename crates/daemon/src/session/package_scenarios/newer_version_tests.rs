@@ -41,6 +41,51 @@ const PRESET: &str = "review";
 /// The conversation a hook-reporting session reports.
 const CONVERSATION: &str = "native-newer-version";
 
+/// The label and option table of a labelled profile with options: `mode`
+/// (default `calm`) whose choices set only env, which the revision covers.
+const LABELLED_OPTIONS: (&str, &str) = (
+    "display_name = \"Night Shift\"\n",
+    "\n[options.mode]\nlabel = \"Mode\"\ndefault = \"calm\"\n\
+     choices.calm = { label = \"Calm\", env = { PH_OPT_MODE = \"calm-env\" } }\n\
+     choices.bold = { label = \"Bold\", env = { PH_OPT_MODE = \"bold-env\" } }\n",
+);
+
+/// What the [`PROFILE`] host profile declares beside its launch keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// The launch keys only.
+    Plain,
+    /// A `display_name` and the [`LABELLED_OPTIONS`] option `mode`; the
+    /// session selects its choice `bold`, not the default.
+    LabelledWithOptions,
+}
+
+impl Shape {
+    /// The choices the session selects at create, and records.
+    fn selection(self) -> std::collections::BTreeMap<String, String> {
+        match self {
+            Self::Plain => std::collections::BTreeMap::new(),
+            Self::LabelledWithOptions => [("mode".to_owned(), "bold".to_owned())].into(),
+        }
+    }
+
+    /// The profile text of `kind` launching `agent` with its config home at
+    /// `home`.
+    fn profile_text(self, kind: &Kind, agent: &Path, home: &Path) -> String {
+        let (label, options) = match self {
+            Self::Plain => ("", ""),
+            Self::LabelledWithOptions => LABELLED_OPTIONS,
+        };
+        format!(
+            "{label}base = \"{}\"\nprogram = \"{}\"\n\n[env]\n{} = \"{}\"\n{options}",
+            kind.runtime,
+            agent.display(),
+            kind.home_env,
+            home.display()
+        )
+    }
+}
+
 /// One official runtime under test: its package versions and agent ranges, and
 /// how its agent answers the version probe and keeps its conversations.
 struct Kind {
@@ -223,17 +268,29 @@ async fn stopped_from(
     launched: &Package,
     version: Option<&str>,
 ) -> Stopped {
-    stopped_as(tag, kind, launched, version, None).await
+    stopped_as(tag, kind, launched, version, None, Shape::Plain).await
+}
+
+/// [`stopped_on`] of a session of a [`PROFILE`] of `shape`.
+async fn stopped_on_shaped(
+    tag: &str,
+    kind: &Kind,
+    launched: &Package,
+    version: &str,
+    shape: Shape,
+) -> Stopped {
+    stopped_as(tag, kind, launched, Some(version), None, shape).await
 }
 
 /// [`stopped_from`] for a session of the [`PRESET`] of the profile, written
-/// from `preset`, or of the profile itself without one.
+/// from `preset`, or of the profile itself of `shape` without one.
 async fn stopped_as(
     tag: &str,
     kind: &Kind,
     launched: &Package,
     version: Option<&str>,
     preset: Option<&str>,
+    shape: Shape,
 ) -> Stopped {
     let store_path = temp_store_path(tag);
     let fixture = Fixture::with_anchor_and_store(
@@ -245,16 +302,7 @@ async fn stopped_as(
     fs::create_dir_all(&home).expect("the agent home");
     let agent = fixture.dir.join(format!("{}-agent", kind.runtime));
     kind.write_agent(&agent, kind.in_both);
-    fixture.write_profile(
-        PROFILE,
-        &format!(
-            "base = \"{}\"\nprogram = \"{}\"\n\n[env]\n{} = \"{}\"\n",
-            kind.runtime,
-            agent.display(),
-            kind.home_env,
-            home.display()
-        ),
-    );
+    fixture.write_profile(PROFILE, &shape.profile_text(kind, &agent, &home));
     if let Some(text) = preset {
         fixture.write_profile(PRESET, text);
     }
@@ -275,10 +323,16 @@ async fn stopped_as(
         .create(protocol::SessionNewParams {
             agent: preset.map_or(PROFILE, |_text| PRESET).to_owned(),
             cwd: Some(temp_dir(tag)),
+            agent_options: shape.selection(),
             ..params()
         })
         .await
         .expect("a session of the older package");
+    assert_eq!(
+        created.agent_options,
+        shape.selection(),
+        "the session records the choice it selected"
+    );
     match kind.runtime {
         RuntimeId::CLAUDE => {
             let conversations = home.join("projects").join("work");
@@ -355,9 +409,18 @@ fn stopped_verdict(fixture: &Fixture, store_path: &Path, id: &SessionId) -> (Ver
 /// A stopped session of `kind` whose agent left the older package's range,
 /// with the newer version installed and the profile moved to it.
 async fn moved_to_newer(tag: &str, kind: &Kind) -> (Stopped, Package, Package) {
+    moved_to_newer_shaped(tag, kind, Shape::Plain).await
+}
+
+/// [`moved_to_newer`] for a session of a [`PROFILE`] of `shape`.
+async fn moved_to_newer_shaped(
+    tag: &str,
+    kind: &Kind,
+    shape: Shape,
+) -> (Stopped, Package, Package) {
     let old = kind.older();
     let new = kind.newer();
-    let session = stopped_on(tag, kind, &old, kind.old_version).await;
+    let session = stopped_on_shaped(tag, kind, &old, kind.old_version, shape).await;
     kind.write_agent(&session.agent, kind.only_new);
     install(&session.fixture, kind, &new, kind.new_version, 6).await;
     pin_profile(&session.fixture.registry, &new.digest).await;
@@ -439,6 +502,44 @@ async fn a_newer_package_version_adopts_a_labelled_stopped_session_whose_profile
     assert_eq!(
         resumed.runtime.as_ref().map(|runtime| runtime.state),
         Some(protocol::RuntimeState::Live)
+    );
+    assert_eq!(
+        pinned_digest(&session.store_path, &session.id),
+        new.digest,
+        "the relaunch records the adopting digest"
+    );
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+/// #2343: a labelled profile with an option adopts the same way. The
+/// adoption compares the revision the session froze with its recorded
+/// choice `bold`, not the option's default, so the preflight judges the
+/// session adoptable and the resume needs no decision and keeps the choice.
+#[tokio::test]
+async fn a_newer_package_version_adopts_a_labelled_session_with_a_selected_option() {
+    let (session, _old, new) =
+        moved_to_newer_shaped("newer-adopts-optioned", &CLAUDE, Shape::LabelledWithOptions).await;
+    let restarted = restart(&session.fixture).await;
+    assert_eq!(
+        stopped_verdict(&restarted, &session.store_path, &session.id),
+        (
+            Verdict::Adoptable,
+            CODE_ADOPTABLE_BY_NEWER_PACKAGE.to_owned()
+        ),
+        "the preflight judges the recorded choice as resume does"
+    );
+    let resumed = restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect("the newer version adopts the session with its recorded choice");
+    assert_eq!(
+        resumed.agent_options,
+        Shape::LabelledWithOptions.selection()
     );
     assert_eq!(
         pinned_digest(&session.store_path, &session.id),
@@ -959,6 +1060,39 @@ async fn the_release_step_repins_the_profile_of_a_session_its_package_does_not_a
     assert_release_step("newer-release-step-frozen", changed, false).await;
 }
 
+/// #2343: the release step adopts a session of a labelled profile with an
+/// option whose recorded choice is not the default; the adopted revision is
+/// compared with that choice.
+#[tokio::test]
+async fn the_release_step_adopts_a_labelled_session_with_a_selected_option() {
+    assert_release_step_of(
+        &CLAUDE,
+        "newer-release-step-optioned",
+        CLAUDE.newer(),
+        true,
+        Shape::LabelledWithOptions,
+    )
+    .await;
+}
+
+/// #2343: a session of a labelled profile with a selected option that the
+/// release package does not adopt resumes from its frozen digest; the
+/// repinned revision is compared with the recorded choice.
+#[tokio::test]
+async fn the_release_step_repins_a_labelled_session_with_a_selected_option_it_does_not_adopt() {
+    let changed = CLAUDE.package(CLAUDE.new_version, CLAUDE.new_below, |text| {
+        deeper_reference_search(&text)
+    });
+    assert_release_step_of(
+        &CLAUDE,
+        "newer-release-step-optioned-frozen",
+        changed,
+        false,
+        Shape::LabelledWithOptions,
+    )
+    .await;
+}
+
 /// The upgrade preflight of `session`'s host with the release step of
 /// `release`, judged over the host profiles and revision key the daemon uses.
 fn release_preflight(
@@ -1010,7 +1144,7 @@ fn apply_release_step(
 }
 
 async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
-    assert_release_step_of(&CLAUDE, tag, new, adopts).await;
+    assert_release_step_of(&CLAUDE, tag, new, adopts, Shape::Plain).await;
 }
 
 /// Pi is not a reserved runtime: the release step keeps its installed official
@@ -1019,16 +1153,18 @@ async fn assert_release_step(tag: &str, new: Package, adopts: bool) {
 /// preflight judges the adoption that enables.
 #[tokio::test]
 async fn a_stopped_pi_session_is_adopted_by_the_updated_package() {
-    assert_release_step_of(&PI, "newer-release-step-pi", PI.newer(), true).await;
+    assert_release_step_of(&PI, "newer-release-step-pi", PI.newer(), true, Shape::Plain).await;
 }
 
 /// The release step plans the release package `new` of `kind` for a stopped
 /// session launched from the older version, and its profile is repinned. When
 /// `adopts`, the preflight names the adoption and the resume runs through
 /// `new`; otherwise the preflight and the resume keep the frozen digest.
-async fn assert_release_step_of(kind: &Kind, tag: &str, new: Package, adopts: bool) {
+/// The profile is of `shape`, and the resumed session keeps the choices it
+/// recorded.
+async fn assert_release_step_of(kind: &Kind, tag: &str, new: Package, adopts: bool, shape: Shape) {
     let old = kind.older();
-    let session = stopped_on(tag, kind, &old, kind.old_version).await;
+    let session = stopped_on_shaped(tag, kind, &old, kind.old_version, shape).await;
     let agent = if adopts { kind.only_new } else { kind.in_both };
     kind.write_agent(&session.agent, agent);
     let release = session.fixture.dir.join("release").join("runtime");
@@ -1099,11 +1235,12 @@ async fn assert_release_step_of(kind: &Kind, tag: &str, new: Package, adopts: bo
     );
 
     let restarted = restart(&session.fixture).await;
-    restarted
+    let resumed = restarted
         .registry
         .resume_with(&session.id, ProfileChange::Refuse)
         .await
         .expect("the session resumes after the step");
+    assert_eq!(resumed.agent_options, shape.selection());
     let relaunched = if adopts { &new.digest } else { &old.digest };
     assert_eq!(&pinned_digest(&session.store_path, &session.id), relaunched);
     restarted
@@ -1139,7 +1276,15 @@ async fn assert_preset_release_step(tag: &str, new: Package, adopts: bool) {
     let kind = &CLAUDE;
     let old = kind.older();
     let preset_text = format!("display_name = \"Review\"\n[preset]\nparent = \"{PROFILE}\"\n");
-    let session = stopped_as(tag, kind, &old, Some(kind.old_version), Some(&preset_text)).await;
+    let session = stopped_as(
+        tag,
+        kind,
+        &old,
+        Some(kind.old_version),
+        Some(&preset_text),
+        Shape::Plain,
+    )
+    .await;
     let preset_path = session.fixture.agents.join(format!("{PRESET}.toml"));
     let preset_bytes = fs::read(&preset_path).expect("read the preset");
     let agent = if adopts { kind.only_new } else { kind.in_both };

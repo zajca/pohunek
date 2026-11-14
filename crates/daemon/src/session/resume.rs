@@ -60,7 +60,8 @@ pub(super) struct ResumeSnapshot {
     /// `None` for a session without a profile or a binding that never froze one.
     pub(super) profile_revision: Option<ProfileRevision>,
     /// The choice each option of the host profile launched with, defaults
-    /// included. Set once at create, carried unchanged by every resume.
+    /// included. Set at create; every relaunch records the choices its
+    /// profile resolution took, the ones [`Self::profile_revision`] covers.
     pub(super) agent_options: BTreeMap<String, String>,
     /// The directory and project the session was created with; the trusted
     /// checkout arguments are evaluated on this pair. Set once at create,
@@ -146,6 +147,11 @@ pub(super) struct RecoveryProfile {
     /// Current revision of the profile, frozen into the relaunched session;
     /// `None` for a session without a profile.
     pub(super) revision: Option<ProfileRevision>,
+    /// The choice each option took in the resolution `revision` covers: the
+    /// recorded choices, and the default of an option the record lacks.
+    /// Recorded as the relaunched session's choices, so the next resume
+    /// resolves the same selection; empty for a session without a profile.
+    pub(super) selected: BTreeMap<String, String>,
 }
 
 impl RecoveryProfile {
@@ -155,6 +161,7 @@ impl RecoveryProfile {
             env: LaunchEnv::default(),
             manifest: None,
             revision: None,
+            selected: BTreeMap::new(),
         }
     }
 }
@@ -1104,12 +1111,7 @@ impl SessionRegistry {
             session_ref,
             program,
             validated_program,
-            profile:
-                RecoveryProfile {
-                    env,
-                    manifest: manifest_override,
-                    revision,
-                },
+            profile,
             ..
         } = relaunch;
         let trusted_args = self
@@ -1117,7 +1119,7 @@ impl SessionRegistry {
             .await;
         let inputs = self.launch_inputs(
             &relaunch.definition,
-            &env,
+            &profile.env,
             binding.agent_base.clone(),
             &id,
             LaunchSubject {
@@ -1142,17 +1144,16 @@ impl SessionRegistry {
             &session_ref,
             &opts,
         )?;
-        // Re-freeze the structural snapshot for the resumed entry so a later resize
-        // re-persist keeps the same launch-time shape and the profile revision the
-        // relaunch ran under.
+        // Re-freeze the snapshot: a later resize re-persist keeps the launch-time
+        // shape, and the profile revision and option choices the relaunch ran under.
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
             native: Some(launch),
             launch_binding: relaunch_pin,
             reference_provenance: binding.native_reference_provenance,
-            profile_revision: revision,
-            agent_options: binding.agent_options.clone(),
+            profile_revision: profile.revision,
+            agent_options: profile.selected,
             launch_checkout: binding.launch_checkout.clone(),
             context_pin: binding.context_pin.clone(),
         };
@@ -1179,7 +1180,7 @@ impl SessionRegistry {
                 agent_base: binding.agent_base.clone(),
                 input_rules,
                 snapshot,
-                manifest_override,
+                manifest_override: profile.manifest,
                 cwd: binding.cwd,
                 cols: binding.cols,
                 rows: binding.rows,
@@ -1657,6 +1658,7 @@ pub(super) fn recovery_profile_memo(
         env: profile.env,
         manifest: profile.manifest,
         revision: Some(current),
+        selected: profile.selected,
     })
 }
 
