@@ -140,6 +140,26 @@ env:
   # job's `env`, not here, because the macOS and docs jobs do not install
   # mold. .github/actions/setup-mold puts mold on PATH without touching
   # /usr/bin/ld: only those RUSTFLAGS select mold.
+  # Pinned download cache (#2202): `.github/actions/pinned-cache` is the one
+  # mechanism that caches pinned third-party bytes, one `actions/cache` entry
+  # per item whose key holds the pins that select its bytes. Its restore
+  # phase computes the key and returns `key`, `path` and `hit`; its save
+  # phase takes them back after the caller's verified install, on a miss
+  # only. mold, zig and uv go through their setup actions, which stash only
+  # the release archive and check its sha256 on the hit path too. nextest
+  # and systemd-oomd are one step each (install, check and save inside the
+  # action); each locked npm tree is a restore step before and a save step
+  # after its release check. apt and npm miss installs run through
+  # `ci-retry`. A bumped pin misses and saves fresh. New pinned bytes go
+  # through this action, never through a per-site `actions/cache` step.
+  # Pinned cargo-install tools for taiki-e/install-action: the newest
+  # crates.io releases on 2026-11-13. NEXTEST_VERSION stays at or above the
+  # `nextest-version` minimum in .config/nextest.toml. Bump each version
+  # alone; the guard test rejects an unpinned `tool:` under
+  # taiki-e/install-action.
+  NEXTEST_VERSION: "0.9.151"
+  CARGO_HACK_VERSION: "0.6.46"
+  CARGO_UDEPS_VERSION: "0.1.61"
   # Pinned mold release for .github/actions/setup-mold. MOLD_SHA256 is the
   # sha256 GitHub publishes for the release asset
   # mold-2.42.1-x86_64-linux.tar.gz (`gh api repos/rui314/mold/releases/tags/v2.42.1`,
@@ -284,11 +304,12 @@ jobs:
           shared-key: platform-contracts
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
+      - name: Restore the pinned cargo-nextest
         id: infra-2
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Verify native APFS test volume
         run: diskutil info / | grep -q 'Type (Bundle):.*apfs'
@@ -464,10 +485,11 @@ jobs:
           shared-key: macos-tier
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       # xtask's dependency_policy test reads the registry sources of the locked
       # dependency graph, which an archive build does not fetch.
@@ -760,11 +782,12 @@ jobs:
           shared-key: clippy
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
+      - name: Restore the pinned cargo-nextest
         id: infra-2
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -1076,10 +1099,12 @@ jobs:
           shared-key: test-debug
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
         id: infra-2
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       # The archive holds the test binaries, the runnable bins the tests spawn,
       # and pohunek-sessiond (archive.include in .config/nextest.toml, an error
@@ -1141,10 +1166,17 @@ jobs:
       - name: Keep the fail-fast action
         run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      # The relocated checkout cannot resolve `./.github/actions/...` either:
+      # the pinned-cache action is copied out next to it, like cancel-run.
+      - name: Keep the pinned-cache action
+        run: cp -R .github/actions/pinned-cache "$GITHUB_WORKSPACE/pinned-cache-action"
+
+      - name: Restore the pinned cargo-nextest
         id: infra-2
+        uses: ./pinned-cache-action
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Download test archive
         id: infra-3
@@ -1300,6 +1332,7 @@ jobs:
               - 'crates/**/*.rs'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/pinned-cache/**'
             # macOS platform, path, private-protocol, session-worker, daemon,
             # CLI, launchd, and Hermes filesystem contracts run on the native
             # arm64 runner (issues #96-#100 and #125): gate on every crate
@@ -1346,6 +1379,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/pinned-cache/**'
             # Native macOS release packaging (issue #104): PRs gate the archive
             # scripts, install acceptance and launchd service code. Main and
             # nightly runs cover the complete packaged daemon dependency tree.
@@ -1402,6 +1436,7 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-uv/**'
+              - '.github/actions/pinned-cache/**'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
             # Covers both generators' inputs and outputs: the main protocol
@@ -1417,6 +1452,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/pinned-cache/**'
             # The release build catches a broken release profile before
             # tagging. That is caused by profile/manifest, lockfile, Cargo
             # configuration, toolchain, or packaging changes; ordinary source
@@ -1436,6 +1472,7 @@ jobs:
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-sccache/**'
               - '.github/actions/setup-mold/**'
+              - '.github/actions/pinned-cache/**'
             # Release rehearsal (issue #150): the release workflows, the
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, the scripts the rows
@@ -1510,6 +1547,7 @@ jobs:
               - '.github/actions/setup-sccache/**'
               - '.github/actions/setup-mold/**'
               - '.github/actions/setup-uv/**'
+              - '.github/actions/pinned-cache/**'
             # The release gate's test steps (gate-tests.yml) run on a pull
             # request that changes what they run or how: the two workflows,
             # the nextest profiles and shard filters, and the partition and
@@ -1524,6 +1562,8 @@ jobs:
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
               - '.github/actions/setup-mold/**'
+              - '.github/actions/setup-sccache/**'
+              - '.github/actions/pinned-cache/**'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
@@ -1550,6 +1590,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/pinned-cache/**'
             # The docs-only path of a pull request (#2210), decided by
             # counting: the `docs_only` output is true when every changed file
             # matches `docs_only_paths` and none matches `docs_only_mapped`.
@@ -1673,11 +1714,17 @@ jobs:
       - name: Keep the fail-fast action
         run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
-      - name: Install cargo-nextest
+      # The relocated checkout cannot resolve `./.github/actions/...` either:
+      # the pinned-cache action is copied out next to it, like cancel-run.
+      - name: Keep the pinned-cache action
+        run: cp -R .github/actions/pinned-cache "$GITHUB_WORKSPACE/pinned-cache-action"
+
+      - name: Restore the pinned cargo-nextest
         id: infra-2
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: ./pinned-cache-action
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       # xtask::dependency_policy reads `cargo metadata --offline`, so this job
       # needs the locked crates in the cargo registry. It compiles nothing
@@ -1850,19 +1897,17 @@ jobs:
       # The exit-evidence scenario for a worker that systemd-oomd kills needs
       # the daemon running on the host; the scenario fails with a stated
       # precondition when it is not.
-      - name: Install and start systemd-oomd
+      # Composite steps take no `timeout-minutes`; this bounds the retried
+      # apt download, the dpkg install and the cache save together.
+      - name: Install and start the pinned systemd-oomd
+        uses: ./.github/actions/pinned-cache
+        timeout-minutes: 10
+        with:
+          item: systemd-oomd
+
+      - name: Configure systemd-oomd logging
         timeout-minutes: 10
         run: |
-          # One retried unit: a DNS outage (#2192) must not fail the install
-          # when the next attempt would succeed. apt's own timeouts end a
-          # stalled connection inside each attempt; systemctl only runs after
-          # the install succeeds.
-          "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label apt-systemd-oomd \
-            --attempts "$CI_RETRY_ATTEMPTS" \
-            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS" \
-            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
-            sudo sh -c 'apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && apt-get -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y systemd-oomd'
-          sudo systemctl enable --now systemd-oomd
           # Debug without D-Bus: a drop-in sets the level, then restart.
           sudo install -d /etc/systemd/system/systemd-oomd.service.d
           printf '[Service]\nEnvironment=SYSTEMD_LOG_LEVEL=debug\n' | sudo tee /etc/systemd/system/systemd-oomd.service.d/10-log-level.conf >/dev/null
@@ -1971,10 +2016,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -2069,10 +2115,17 @@ jobs:
       - name: Keep the fail-fast action
         run: cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
 
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      # The relocated checkout cannot resolve `./.github/actions/...` either:
+      # the pinned-cache action is copied out next to it, like cancel-run.
+      - name: Keep the pinned-cache action
+        run: cp -R .github/actions/pinned-cache "$GITHUB_WORKSPACE/pinned-cache-action"
+
+      - name: Restore the pinned cargo-nextest
         id: infra-2
+        uses: ./pinned-cache-action
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Download test archive
         id: infra-3
@@ -2429,10 +2482,11 @@ jobs:
           shared-key: hermes-package
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Check fail-closed Hermes provisioning
         run: scripts/tests/provision-hermes-compat.sh
@@ -3006,28 +3060,32 @@ jobs:
         with:
           node-version: ${{ steps.lock.outputs.node }}
 
-      - name: Install the locked Pi release
+      - name: Restore the pinned Pi npm tree
+        id: npm-tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: npm:compat/pi/npm
+          npm-scripts: false
+
+      - name: Verify the pinned Pi release
         shell: bash
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/pi/npm"
-          # npm's own fetch retries run inside one install (npm defaults:
-          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
-          # and #fetch-retries); the helper bounds the total install time
-          # and retries the whole install after npm's retries are exhausted.
-          if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-pi \
-            --attempts "$CI_RETRY_ATTEMPTS" \
-            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
-            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
-            npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
-            echo "Failed to install the pinned Pi npm tree from $project/package-lock.json" >&2
-            exit 1
-          fi
           bin="$project/node_modules/.bin"
           echo "$bin" >> "$GITHUB_PATH"
           installed="$(env -i PATH="$bin:$PATH" HOME="$RUNNER_TEMP" pi --version)"
           test "$installed" = "${{ steps.lock.outputs.release }}" \
             || { echo "installed Pi $installed is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
+
+      # Runs only after the release check above passed; saves on a miss only.
+      - name: Save the pinned Pi npm tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          phase: save
+          key: ${{ steps.npm-tree.outputs.key }}
+          path: ${{ steps.npm-tree.outputs.path }}
+          hit: ${{ steps.npm-tree.outputs.hit }}
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -3045,10 +3103,11 @@ jobs:
           shared-key: pi-package
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Build the package deterministically
         shell: bash
@@ -3150,28 +3209,32 @@ jobs:
           lock=compat/codex/compatibility-lock.json
           echo "release=$(jq -er '.upstream.release' "$lock")" >> "$GITHUB_OUTPUT"
 
-      - name: Install the locked Codex release
+      - name: Restore the pinned Codex npm tree
+        id: npm-tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: npm:compat/codex/npm
+          npm-scripts: false
+
+      - name: Verify the pinned Codex release
         shell: bash
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/codex/npm"
-          # npm's own fetch retries run inside one install (npm defaults:
-          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
-          # and #fetch-retries); the helper bounds the total install time
-          # and retries the whole install after npm's retries are exhausted.
-          if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-codex \
-            --attempts "$CI_RETRY_ATTEMPTS" \
-            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
-            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
-            npm ci --prefix "$project" --ignore-scripts --no-audit --no-fund; then
-            echo "Failed to install the pinned Codex npm tree from $project/package-lock.json" >&2
-            exit 1
-          fi
           bin="$project/node_modules/.bin"
           echo "$bin" >> "$GITHUB_PATH"
           installed="$(env -i PATH="$bin:$PATH" HOME="$RUNNER_TEMP" CODEX_HOME="$RUNNER_TEMP/codex-version-home" codex --version)"
           test "$installed" = "codex-cli ${{ steps.lock.outputs.release }}" \
             || { echo "installed Codex '$installed' is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
+
+      # Runs only after the release check above passed; saves on a miss only.
+      - name: Save the pinned Codex npm tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          phase: save
+          key: ${{ steps.npm-tree.outputs.key }}
+          path: ${{ steps.npm-tree.outputs.path }}
+          hit: ${{ steps.npm-tree.outputs.hit }}
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -3189,10 +3252,11 @@ jobs:
           shared-key: codex-package
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Build the package deterministically
         shell: bash
@@ -3303,23 +3367,19 @@ jobs:
             echo "sha256=$(jq -er '.upstream.sha256["linux-x64"]' "$lock")"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install the locked Claude Code release
+      # The package's postinstall links the native binary, so scripts run.
+      - name: Restore the pinned Claude Code npm tree
+        id: npm-tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: npm:compat/claude/npm
+          npm-scripts: true
+
+      - name: Verify the pinned Claude Code release
         shell: bash
         run: |
           set -euo pipefail
           project="$GITHUB_WORKSPACE/compat/claude/npm"
-          # npm's own fetch retries run inside one install (npm defaults:
-          # https://docs.npmjs.com/cli/v11/using-npm/config#fetch-timeout
-          # and #fetch-retries); the helper bounds the total install time
-          # and retries the whole install after npm's retries are exhausted.
-          if ! "$GITHUB_WORKSPACE/.github/scripts/ci-retry" --label npm-ci-claude \
-            --attempts "$CI_RETRY_ATTEMPTS" \
-            --attempt-timeout "$CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS" \
-            --backoff "$CI_RETRY_BACKOFF_SECONDS" -- \
-            npm ci --prefix "$project" --ignore-scripts=false --no-audit --no-fund; then
-            echo "Failed to install the pinned Claude Code npm tree from $project/package-lock.json" >&2
-            exit 1
-          fi
           bin="$project/node_modules/.bin"
           echo "$bin" >> "$GITHUB_PATH"
           binary="$(readlink -f "$bin/claude")"
@@ -3329,6 +3389,15 @@ jobs:
           installed="$(env -i PATH="$bin:$PATH" HOME="$RUNNER_TEMP" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude-version-home" claude --version)"
           test "$installed" = "${{ steps.lock.outputs.release }} (Claude Code)" \
             || { echo "installed Claude Code '$installed' is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
+
+      # Runs only after the release check above passed; saves on a miss only.
+      - name: Save the pinned Claude Code npm tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          phase: save
+          key: ${{ steps.npm-tree.outputs.key }}
+          path: ${{ steps.npm-tree.outputs.path }}
+          hit: ${{ steps.npm-tree.outputs.hit }}
 
       - name: Install mold linker
         uses: ./.github/actions/setup-mold
@@ -3346,10 +3415,11 @@ jobs:
           shared-key: claude-package
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       - name: Build the package deterministically
         shell: bash
@@ -3501,11 +3571,12 @@ jobs:
           shared-key: hermes-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Install cargo-nextest
+      - name: Restore the pinned cargo-nextest
         id: infra-3
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       # Runs the shell tests with /bin/bash (3.2) first on PATH, so the
       # provisioner and the smoke run under the stock macOS shell.
@@ -4248,7 +4319,7 @@ jobs:
       - name: Install cargo-hack
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
-          tool: cargo-hack
+          tool: cargo-hack@${{ env.CARGO_HACK_VERSION }}
 
       # Validates every feature combination compiles. knowledge gates its
       # protocol bridge behind the `protocol` feature; --all-features only
@@ -4299,7 +4370,7 @@ jobs:
       - name: Install cargo-udeps
         uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
-          tool: cargo-udeps
+          tool: cargo-udeps@${{ env.CARGO_UDEPS_VERSION }}
 
       - name: Check for unused dependencies
         run: cargo udeps --workspace --all-targets --all-features
