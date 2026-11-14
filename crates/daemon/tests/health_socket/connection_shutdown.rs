@@ -304,10 +304,10 @@ async fn a_subscriber_that_stopped_reading_does_not_use_up_the_drivers_bound() {
 
 /// The lines a log subscriber captured.
 #[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl Captured {
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("log capture lock")).into_owned()
     }
 }
@@ -331,7 +331,7 @@ impl<'a> MakeWriter<'a> for Captured {
 }
 
 /// Routes the debug logs of this test's thread into `captured`.
-fn capture_logs(captured: &Captured) -> tracing::subscriber::DefaultGuard {
+pub(super) fn capture_logs(captured: &Captured) -> tracing::subscriber::DefaultGuard {
     tracing::subscriber::set_default(
         tracing_subscriber::fmt()
             .with_writer(captured.clone())
