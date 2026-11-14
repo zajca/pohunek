@@ -110,8 +110,8 @@ MACOS_BUCKETS = {
         )),
     ),
     # Measurement and maintenance tools that print or rewrite a checked-in file.
-    # Every xtask `survey_*` / `regenerate_*` test belongs here, as do the
-    # daemon's `regenerate_*` fixture tests and the worker output-path
+    # Every xtask `survey_*` / `regenerate_*` test and every daemon
+    # `regenerate_*` test belongs here, as does the worker output-path
     # measurement binary. A developer runs them by hand with
     # `--run-ignored only` (the Claude screen captures also need
     # POHUNEK_CLAUDE_CAPTURE_DIR and egress); no CI job does.
@@ -119,7 +119,7 @@ MACOS_BUCKETS = {
         ("xtask", "pohunek-cli", "pohunek-session-worker", "pohunek-daemon"),
         " or ".join((
             "(package(=xtask) and test(/(^|::)(survey|regenerate)_[a-z0-9_]+$/))",
-            "(package(=pohunek-daemon) and binary(=health_socket) and test(/(^|::)regenerate_[a-z0-9_]+$/))",
+            "(package(=pohunek-daemon) and test(/(^|::)regenerate_[a-z0-9_]+$/))",
             "(package(=pohunek-cli) and binary(=all) and test(/^claude_package::capture_the_real_claude_/))",
             "(package(=pohunek-session-worker) and binary(=output_path_cost))",
         )),
