@@ -832,9 +832,12 @@ a failed dependency diff, `.cargo/`, `.config/nextest.toml`, `rust-toolchain*`,
 lint/format configs, and any path no rule covers run everything.
 `cargo xtask affected guard` checks that every repository path the test code
 reads through `pohunek_test_support::workspace_root()` or `manifest_dir()`
-selects that test, and `cargo xtask affected ci --base REV --out DIR` writes the
+selects that test; a test that uses the repository root itself declares the
+paths it reads, per test in `TEST_SCANS` or per file in `SCANS`
+(`crates/xtask/src/affected/guard.rs`), and each declared path must select it
+too. `cargo xtask affected ci --base REV --out DIR` writes the
 selection for a pull request's CI jobs. Only a reviewed allowlist in `crates/xtask/src/affected/mod.rs` (other paths:
-`sdk/ts/`, the root Bun workspace files, `docs/`, `changelog.d/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
+`sdk/ts/`, the root Bun workspace files, `docs/`, `changelog.d/`, `.github/` (except `.github/scripts/`, which selects the xtask scenario that checks the CI test jobs' scripts exist), `.claude/`, `.agents/`, `assets/`, root `*.md`,
 `LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
 exits 0 without running nextest and names the follow-up checks (`cargo xtask
 docs check`, the `scripts/` unittests, the Bun gates). It narrows only which
