@@ -13,6 +13,13 @@ inputs:
     description: Expected sha256 of zig-x86_64-linux-<version>.tar.xz.
     required: true
 
+outputs:
+  hit:
+    description: >-
+      `true` when the pinned zig came from the cache, `false` when it
+      was downloaded. The offline proof requires `true`.
+    value: ${{ steps.restore.outputs.hit }}
+
 runs:
   using: composite
   steps:

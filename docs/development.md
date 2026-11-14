@@ -308,8 +308,9 @@ miss-path host (`OFFLINE_HOSTS` in the workflow, the host of every apt
 source of the image, and the npm registry of the locked trees) at loopback
 in `/etc/hosts` and fails unless each one then refuses a connection. It then
 installs every pinned item exactly like its `ci.yml` site, on the image and
-Node its key names, and requires each restore to hit; offline, a miss fails
-its install. The cache service and `api.github.com`/`codeload.github.com`,
+Node its key names, and its last step requires the `hit` output of every item
+(setup-mold, setup-zig and setup-uv forward the one of their pinned restore);
+offline, a miss fails its install anyway. The cache service and `api.github.com`/`codeload.github.com`,
 through which the runner fetches the actions nested in the composites, stay
 reachable. Run it with `gh workflow run pinned-cache-offline.yml` after a
 main run has saved the entries; on a pull request it runs only when the
@@ -318,7 +319,8 @@ workflow or the script changes, because a pin bump misses by design. A
 `gh cache list --key pinned-systemd-oomd` shows is an image rollover, not a
 regression: it hits after the next main run. The guard in
 `scripts/tests/test_pinned_cache.py` keeps the proof's items, inputs, pins,
-images and host list in step with `ci.yml` and the actions.
+images, Node source, host list and required hits in step with `ci.yml` and
+the actions.
 
 Green CI is half of the gate. The other half is the `opus-pr-review:v1` marker
 comment authored by `zajca` at the exact head (`high=0` and `medium=0`; the

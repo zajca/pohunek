@@ -12,6 +12,13 @@ inputs:
     description: Expected sha256 of mold-<version>-x86_64-linux.tar.gz.
     required: true
 
+outputs:
+  hit:
+    description: >-
+      `true` when the pinned mold came from the cache, `false` when it
+      was downloaded. The offline proof requires `true`.
+    value: ${{ steps.restore.outputs.hit }}
+
 runs:
   using: composite
   steps:

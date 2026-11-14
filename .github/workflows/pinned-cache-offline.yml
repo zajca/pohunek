@@ -7,7 +7,8 @@
 # their ci.yml sites do: same action, same inputs, same pins, and for the
 # items whose key names the runner image or the Node major, the same image
 # and the same Node. A miss can only install from those hosts, so it fails;
-# a green run means every item hit and installed from the cache alone.
+# a green run means every item hit and installed from the cache alone. The
+# last step of each job also requires the `hit` output of every item.
 # The cache service and the runner's own action downloads (api.github.com,
 # codeload.github.com) stay reachable: the restore needs the first, and the
 # runner fetches the actions nested in the composites through the second.
@@ -85,6 +86,7 @@ jobs:
             $OFFLINE_HOSTS
 
       - name: Install mold linker
+        id: mold
         uses: ./.github/actions/setup-mold
         timeout-minutes: 10
         with:
@@ -92,6 +94,7 @@ jobs:
           sha256: ${{ env.MOLD_SHA256 }}
 
       - name: Install zig
+        id: zig
         uses: ./.github/actions/setup-zig
         with:
           version: ${{ env.ZIG_VERSION }}
@@ -100,6 +103,7 @@ jobs:
       # The pinned uv entry does not depend on `enable-cache`; the uv
       # dependency cache stays off, so this job never saves one.
       - name: Install uv
+        id: uv
         uses: ./.github/actions/setup-uv
         with:
           enable-cache: false
@@ -141,11 +145,9 @@ jobs:
           path: ${{ steps.claude-tree.outputs.path }}
           hit: ${{ steps.claude-tree.outputs.hit }}
 
-      # setup-mold, setup-zig and setup-uv report their hit only in the
-      # step summary; offline, their miss path fails the step instead.
       - name: Require a hit for every restore
         env:
-          HITS: nextest=${{ steps.nextest.outputs.hit }} codex=${{ steps.codex-tree.outputs.hit }} claude=${{ steps.claude-tree.outputs.hit }}
+          HITS: mold=${{ steps.mold.outputs.hit }} zig=${{ steps.zig.outputs.hit }} uv=${{ steps.uv.outputs.hit }} nextest=${{ steps.nextest.outputs.hit }} codex=${{ steps.codex-tree.outputs.hit }} claude=${{ steps.claude-tree.outputs.hit }}
         run: |
           set -euo pipefail
           for hit in $HITS; do
@@ -168,9 +170,11 @@ jobs:
 
       - name: Read the Pi lock
         id: lock
+        shell: bash
         run: |
           set -euo pipefail
-          echo "node=$(jq -er '.upstream.node_min' compat/pi/compatibility-lock.json)" >> "$GITHUB_OUTPUT"
+          lock=compat/pi/compatibility-lock.json
+          echo "node=$(jq -er '.upstream.node_min' "$lock")" >> "$GITHUB_OUTPUT"
 
       - name: Install Node
         uses: actions/setup-node@v4

@@ -341,7 +341,7 @@ class ArchiveScenarioTests(Scenario):
                 self.cache = harness.FakeCache()
                 miss = self.runner()
                 sha = self.fixture(miss, item)
-                self.run_setup(miss, item, sha)
+                self.assertEqual(self.run_setup(miss, item, sha), {"hit": "false"})
                 self.assertEqual(len(miss.calls("curl")), 1)
                 self.assertEqual(len(self.cache.saves), 1)
                 key, path = self.cache.saves[0]
@@ -350,7 +350,7 @@ class ArchiveScenarioTests(Scenario):
                 self.assertIn(banner, miss.output())
                 hit = self.runner()
                 hit.offline()
-                self.run_setup(hit, item, sha)
+                self.assertEqual(self.run_setup(hit, item, sha), {"hit": "true"})
                 self.assertEqual(hit.calls("curl"), [])
                 self.assertEqual(self.cache.restores[-1], (key, path))
                 self.assertEqual(len(self.cache.saves), 1)
@@ -389,7 +389,7 @@ class UvScenarioTests(Scenario):
         body = self.body()
         miss = self.runner()
         self.prepare(miss, body)
-        miss.run_action(".github/actions/setup-uv", {"enable-cache": "false"})
+        self.assertEqual(miss.run_action(".github/actions/setup-uv", {"enable-cache": "false"}), {"hit": "false"})
         self.assertEqual(len(miss.calls("curl")), 1)
         self.assertEqual(len(self.cache.saves), 1)
         key, path = self.cache.saves[0]
@@ -398,7 +398,7 @@ class UvScenarioTests(Scenario):
         hit = self.runner()
         self.prepare(hit, body)
         hit.offline()
-        hit.run_action(".github/actions/setup-uv", {"enable-cache": "false"})
+        self.assertEqual(hit.run_action(".github/actions/setup-uv", {"enable-cache": "false"}), {"hit": "true"})
         self.assertEqual(hit.calls("curl"), [])
         self.assertEqual(self.cache.restores[-1], (key, path))
         self.assertEqual(len(self.cache.saves), 1)
@@ -653,10 +653,6 @@ class OfflineProofGuardTests(unittest.TestCase):
                     self.assertEqual(job_runner(self.proof, proof_job), job_runner(self.ci, ci_job))
                 else:
                     self.assertRegex(job_runner(self.proof, proof_job), r"^ubuntu-\d")
-                ci_node = any(step.get("uses", "").startswith("actions/setup-node@") for step in harness.job_steps(self.ci, ci_job))
-                proof_node = any(step.get("uses", "").startswith("actions/setup-node@") for step in harness.job_steps(self.proof, proof_job))
-                if item.startswith("npm:"):
-                    self.assertEqual(proof_node, ci_node, "the Node major is part of the npm key")
 
     def test_every_pin_and_retry_bound_equals_ci(self):
         proof_env = harness.workflow_env(self.proof)
@@ -679,9 +675,73 @@ class OfflineProofGuardTests(unittest.TestCase):
                 self.assertIsNotNone(offline, "exactly one offline step")
                 first = min(index for _, site_job, index, _ in sites if site_job == job)
                 self.assertLess(offline, first)
-                self.assertIn("--apt-dir /etc/apt", steps[offline]["run"])
+                run = steps[offline]["run"]
+                # Without these the sinkhole takes only the apt and npm hosts
+                # offline (or writes a file no resolver reads) and the
+                # positive control still passes on the hosts it was given.
+                self.assertRegex(run, r"\bsudo python3 -I \.github/scripts/pinned-cache-offline apply ")
+                self.assertIn("--hosts-file /etc/hosts ", run)
+                self.assertRegex(run, r"(?m)^\s*\$OFFLINE_HOSTS\s*$")
+                self.assertIn("--apt-dir /etc/apt", run)
                 for lock in sorted(ROOT.glob("compat/*/npm/package-lock.json")):
                     self.assertIn(f"--npm-lock {lock.relative_to(ROOT)}", steps[offline]["run"])
+
+    def test_every_job_ends_by_requiring_the_hit_of_each_of_its_items(self):
+        sites = item_sites(self.proof)
+        for job, steps in workflow_job_steps(self.proof).items():
+            with self.subTest(job=job):
+                last = steps[-1]
+                self.assertEqual(last.get("name"), "Require a hit for every restore")
+                self.assertNotIn("if", last)
+                self.assertIn('[ "${hit#*=}" = true ] ||', last["run"])
+                hits = (last.get("env") or {}).get("HITS", "")
+                entry = r"[a-z-]+=\$\{\{ steps\.([a-z-]+)\.outputs\.hit \}\}"
+                named = re.findall(entry, hits)
+                # Space-separated `name=<hit>` entries and nothing else.
+                self.assertEqual(re.sub(entry, "", hits).strip(" "), "", hits)
+                ids = [step.get("id") for item, site_job, _, step in sites if site_job == job]
+                self.assertNotIn(None, ids, "every item step carries an id")
+                self.assertEqual(sorted(named), sorted(ids))
+
+    def test_the_setup_actions_report_the_hit_of_their_pinned_restore(self):
+        for uses in SETUP_ITEMS:
+            text = (ROOT / uses[2:] / "action.yml").read_text()
+            definition = harness.parse_yaml(text, uses)
+            restores = [
+                step for step in definition["runs"]["steps"]
+                if step.get("uses") in PINNED_USES and "phase" not in (step.get("with") or {})
+            ]
+            with self.subTest(action=uses):
+                self.assertEqual(len(restores), 1)
+                self.assertEqual(
+                    definition["outputs"]["hit"]["value"], f"${{{{ steps.{restores[0]['id']}.outputs.hit }}}}"
+                )
+
+    def test_each_npm_tree_gets_the_node_of_its_site(self):
+        # The Node major is part of an npm key: the proof installs the same
+        # Node from the same lock field as the site job, or none at all.
+        ci_sites = {item: job for item, job, _, _ in item_sites(self.ci)}
+        for item, proof_job, _, _ in item_sites(self.proof):
+            if not item.startswith("npm:"):
+                continue
+            ci_job = ci_sites[item]
+            with self.subTest(item=item):
+                setups = []
+                for text, job in ((self.ci, ci_job), (self.proof, proof_job)):
+                    steps = harness.job_steps(text, job)
+                    node = [step.get("with") for step in steps if str(step.get("uses", "")).startswith("actions/setup-node@")]
+                    sources = []
+                    for value in node:
+                        for source in re.findall(r"\$\{\{ steps\.([a-z-]+)\.outputs\.node \}\}", str(value)):
+                            producer = next(step for step in steps if step.get("id") == source)
+                            run = producer["run"]
+                            sources.append((
+                                source,
+                                re.search(r'(?m)^\s*lock=(\S+)$', run).group(1),
+                                re.search(r'(?m)^\s*echo "node=\$\((.*)\)"', run).group(1),
+                            ))
+                    setups.append((node, sources))
+                self.assertEqual(setups[1], setups[0])
 
     def test_every_miss_path_download_host_is_offline(self):
         offline = set(harness.workflow_env(self.proof)["OFFLINE_HOSTS"].split())
