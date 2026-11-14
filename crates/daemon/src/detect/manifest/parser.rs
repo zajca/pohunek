@@ -418,6 +418,7 @@ pub(super) struct RawProgramStatus {
     pub(super) app: String,
     pub(super) answer_probe: Option<bool>,
     pub(super) authority_from: Option<String>,
+    pub(super) stale_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -6,9 +6,9 @@
 
 schema = 1
 id = "pohunek.runtime.claude"
-version = "2.1.0"
+version = "2.2.0"
 runtime_api = 1
-requires = ["naming-launch-args-v1", "placement-v1", "program-status-gate-v1", "agent-skill-v1"]
+requires = ["naming-launch-args-v1", "placement-v1", "program-status-gate-v1", "agent-skill-v1", "program-status-staleness-v1"]
 
 [runtime]
 id = "claude"

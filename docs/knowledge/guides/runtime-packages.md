@@ -117,6 +117,7 @@ The features this core implements:
 | `checkout-trust-args-v1` | 0.40.0 | `[runtime] trusted_checkout_args`, `trusted_checkout_paths` |
 | `integration-cline-hook-v1` | 0.40.0 | `integration.handler = "cline-hook-v1"` |
 | `program-status-gate-v1` | 0.41.0 | detection manifest `[program_status] authority_from` and rule `below_authority` (no descriptor key; the package lists it so an older core refuses it) |
+| `program-status-staleness-v1` | 0.43.0 | detection manifest `[program_status] stale_after_ms` (no descriptor key; the package lists it so an older core refuses it) |
 | `package-context-v1` | 0.41.0 | `[context]` |
 | `version-probe-open-range-v1` | 0.42.0 | `version_probe` with `min` and no `below` |
 | `detect-composer-absent-v1` | 0.42.0 | detection manifest rule matcher `composer_absent` (no descriptor key; enforced against the manifest the descriptor names) |
@@ -1208,6 +1209,7 @@ A detection manifest opts in to OSC 7501 program-status evidence with a table:
 app = "my-agent"      # 1-32 characters of [A-Za-z0-9_.+-]
 answer_probe = true   # optional, default false
 authority_from = "1.2.0"   # optional MAJOR.MINOR.PATCH
+stale_after_ms = 30000   # optional 1..=3600000, milliseconds
 ```
 
 `authority_from` makes the records authoritative only for a runtime release at
@@ -1215,6 +1217,18 @@ or above it, as probed by the launch's `version_probe`; below it, or with the
 release unknown, the worker answers no probe, records are ignored and the
 screen decides. Without the key the records are authoritative for every
 release.
+
+`stale_after_ms` bounds how long a held record may disagree with the screen
+before the screen decides: a `blocked` record over an idle or working screen
+with no dialog, a `working` record over a weak blocker, an `idle`/`done`/`error`
+record over a working spinner. While stale the detector arbitrates as if no
+record were held, until the next root record. Every transition and
+`agent_state` event published under the fallback carries the frozen fallback
+(`record_state`, `record_age_ms`, `rule_id`, `screen_state`), and
+`session.detection` reports it in its status; only their presence matters,
+program text never travels in them. Only the manifests that need it
+declare the key; the feature `program-status-staleness-v1` owns it, so a
+package that declares it must require the feature.
 
 A rule may set `below_authority = true` (only with `authority_from`): it serves
 releases below the gate and is skipped for activity while the gate is open and a record is held, so

@@ -163,6 +163,7 @@ async fn terminal_output_then_an_idle_record_does_not_acknowledge_an_idle_wait()
         activity,
         source,
         blocked_kind: None,
+        fallback: false,
     };
 
     // A program status `working` followed by idle is a turn.

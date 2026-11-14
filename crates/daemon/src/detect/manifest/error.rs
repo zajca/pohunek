@@ -41,6 +41,8 @@ pub enum ManifestError {
     InvalidProgramStatusApp { app: String },
     #[error("[program_status] authority_from {value:?} is not a MAJOR.MINOR.PATCH version")]
     InvalidProgramStatusAuthority { value: String },
+    #[error("[program_status] stale_after_ms {value} is outside 1..=3600000 (milliseconds)")]
+    InvalidProgramStatusStaleAfter { value: u64 },
     #[error("rule {rule_id:?} sets below_authority without [program_status] authority_from")]
     BelowAuthorityWithoutGate { rule_id: String },
     #[error("rule {rule_id:?} sets overrides_program_status without a [program_status] table")]

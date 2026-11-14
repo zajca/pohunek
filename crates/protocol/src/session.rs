@@ -1247,6 +1247,28 @@ pub struct DetectionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub last_evidence_age_ms: Option<u64>,
+    /// The stale-record fallback the detector arbitrates under, while it
+    /// lasts. Absent when the held record is authoritative (or none is held).
+    /// Added without a protocol bump: an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fallback: Option<ProgramStatusFallback>,
+}
+
+/// A held OSC 7501 record the screen replaced after it disagreed with it for
+/// the manifest's `stale_after_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "ProgramStatusFallback.ts"))]
+pub struct ProgramStatusFallback {
+    /// The held record's state, such as `blocked`.
+    pub record_state: String,
+    /// Age of the held record when the fallback began, in milliseconds.
+    pub record_age_ms: u64,
+    /// The screen rule whose reading replaced the record.
+    pub rule_id: String,
+    /// The activity that rule reads.
+    pub screen_state: AgentActivity,
 }
 
 /// The release gate of a runtime's OSC 7501 records.
@@ -3542,6 +3564,13 @@ pub struct AgentStateEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub revision: Option<ActivityRevision>,
+    /// The stale-record fallback the activity was arbitrated under, frozen
+    /// when the fallback began. Present on every `agent_state` event whose
+    /// activity comes from a fallback. Added without a protocol bump: an
+    /// older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fallback: Option<ProgramStatusFallback>,
 }
 
 /// Payload for a `subagent_state` event.
@@ -4301,6 +4330,7 @@ mod tests {
             ),
             activity_epoch: Some("d-epoch-1".to_owned()),
             revision: Some(ActivityRevision::new(3)),
+            fallback: None,
         })
         .expect("serialize typed agent-state event");
         let legacy = serde_json::json!({

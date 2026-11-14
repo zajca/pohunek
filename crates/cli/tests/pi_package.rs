@@ -707,6 +707,7 @@ fn every_captured_screen_is_classified_by_screen_evidence() {
         assert_eq!(
             detector.feed(started, &screen_bytes(&screen)),
             vec![pohunek_daemon::detect::ActivityTransition {
+                fallback: false,
                 activity: expected,
                 source: StateSource::Screen,
                 blocked_kind: None,

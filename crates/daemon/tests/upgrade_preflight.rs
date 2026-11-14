@@ -61,7 +61,7 @@ const WORKER_EXECUTABLE: &str = "/opt/pohunek/libexec/pohunek/1.0.0/pohunek-sess
 const GENERATION: &str = "abcd2345";
 
 /// A Claude package version one patch above the official package.
-const OFFICIAL_NEXT_PATCH: &str = "2.1.1";
+const OFFICIAL_NEXT_PATCH: &str = "2.2.1";
 
 /// Journal schema the daemon reads.
 const JOURNAL_SCHEMA: u64 = 4;

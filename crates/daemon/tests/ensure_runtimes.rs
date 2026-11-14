@@ -1959,7 +1959,7 @@ fn detect_without_dry_run_is_a_usage_error_and_changes_nothing() {
 
 /// A Claude package version one patch above the official package, for the
 /// scenarios that need a newer retained or pinned version.
-const OFFICIAL_NEXT_PATCH: &str = "2.1.1";
+const OFFICIAL_NEXT_PATCH: &str = "2.2.1";
 
 /// The older and the newer version the repin scenarios publish as the release
 /// package of `claude`.

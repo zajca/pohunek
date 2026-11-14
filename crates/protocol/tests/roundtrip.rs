@@ -1101,6 +1101,7 @@ fn session_info_orders_buffered_agent_state_against_its_activity_cursor() {
                 activity: AgentActivity::Working,
                 source: StateSource::Report,
                 blocked_kind: None,
+                fallback: None,
                 runtime,
                 activity_epoch: epoch.map(str::to_owned),
                 revision: revision.map(ActivityRevision::new),
@@ -2239,7 +2240,9 @@ fn observation_method_names_and_limits_are_stable() {
 
 #[test]
 fn session_detection_status_has_exact_wire_shape_and_an_older_result_decodes() {
-    use protocol::{AuthorityGate, AuthorityGateReason, DetectionStatus, StateSource};
+    use protocol::{
+        AuthorityGate, AuthorityGateReason, DetectionStatus, ProgramStatusFallback, StateSource,
+    };
 
     let status = DetectionStatus {
         state_source: Some(StateSource::OscProgress),
@@ -2254,6 +2257,12 @@ fn session_detection_status_has_exact_wire_shape_and_an_older_result_decodes() {
             authority_from: Some("2.1.309".to_owned()),
         },
         last_evidence_age_ms: Some(120),
+        fallback: Some(ProgramStatusFallback {
+            record_state: "blocked".to_owned(),
+            record_age_ms: 31_000,
+            rule_id: "live_prompt_box".to_owned(),
+            screen_state: AgentActivity::Idle,
+        }),
     };
     let result = SessionDetectionResult {
         session_id: SessionId("s-42".to_owned()),
@@ -2277,7 +2286,13 @@ fn session_detection_status_has_exact_wire_shape_and_an_older_result_decodes() {
                 "runtime_version": "2.1.309",
                 "authority_from": "2.1.309"
             },
-            "last_evidence_age_ms": 120
+            "last_evidence_age_ms": 120,
+            "fallback": {
+                "record_state": "blocked",
+                "record_age_ms": 31000,
+                "rule_id": "live_prompt_box",
+                "screen_state": "idle"
+            }
         }
     });
     assert_eq!(
@@ -2288,6 +2303,30 @@ fn session_detection_status_has_exact_wire_shape_and_an_older_result_decodes() {
         serde_json::from_value::<SessionDetectionResult>(expected).expect("parse"),
         result
     );
+    // A status without `fallback` decodes as absent.
+    let without = serde_json::json!({
+        "session_id": "s-42",
+        "supported_regions": [],
+        "previews": [],
+        "status": {
+            "probe_answered": false,
+            "record_present": false,
+            "gate": {
+                "declared": false,
+                "open": false,
+                "reason": "not_declared"
+            }
+        }
+    });
+    let decoded =
+        serde_json::from_value::<SessionDetectionResult>(without).expect("parse without fallback");
+    assert_eq!(
+        decoded
+            .status
+            .as_ref()
+            .and_then(|status| status.fallback.as_ref()),
+        None
+    );
     // A daemon that predates the field sends none.
     let older = serde_json::from_value::<SessionDetectionResult>(json!({
         "session_id": "s-42",
@@ -2296,6 +2335,42 @@ fn session_detection_status_has_exact_wire_shape_and_an_older_result_decodes() {
     }))
     .expect("an older result decodes");
     assert_eq!(older.status, None);
+}
+
+#[test]
+fn program_status_fallback_round_trips_on_detection_and_agent_state() {
+    use protocol::{AgentStateEvent, ProgramStatusFallback, SessionId};
+
+    let fallback = || ProgramStatusFallback {
+        record_state: "blocked".to_owned(),
+        record_age_ms: 31_000,
+        rule_id: "live_prompt_box".to_owned(),
+        screen_state: AgentActivity::Idle,
+    };
+    let with = AgentStateEvent {
+        session_id: SessionId("s-42".to_owned()),
+        activity: AgentActivity::Idle,
+        source: StateSource::Screen,
+        blocked_kind: None,
+        runtime: None,
+        activity_epoch: None,
+        revision: None,
+        fallback: Some(fallback()),
+    };
+    let value = serde_json::to_value(&with).expect("serialize agent-state event");
+    assert_eq!(value["fallback"]["rule_id"], "live_prompt_box");
+    assert_eq!(
+        serde_json::from_value::<AgentStateEvent>(value).expect("parse agent-state event"),
+        with
+    );
+    // An event from an older daemon (no fallback) decodes with none.
+    let older = serde_json::from_value::<AgentStateEvent>(serde_json::json!({
+        "session_id": "s-42",
+        "activity": "idle",
+        "source": "screen"
+    }))
+    .expect("parse older agent-state event");
+    assert_eq!(older.fallback, None);
 }
 
 #[test]

@@ -1085,6 +1085,78 @@ fn session_detection_names_a_closed_gate_and_the_unanswered_probe() {
 }
 
 #[test]
+fn session_detection_names_an_active_staleness_fallback() {
+    let detection = run_against_scripted_daemon(
+        &["session", "detection", "s-1"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_DETECTION,
+                json!({
+                    "session_id": "s-1",
+                    "supported_regions": ["program_status", "prompt_box_body"],
+                    "previews": [],
+                    "status": {
+                        "state_source": "screen",
+                        "probe_answered": true,
+                        "record_present": true,
+                        "record_state": "blocked:kind=permission",
+                        "gate": {
+                            "declared": true,
+                            "open": true,
+                            "reason": "at_or_above",
+                        },
+                        "last_evidence_age_ms": 400,
+                        "fallback": {
+                            "record_state": "blocked:kind=permission",
+                            "record_age_ms": 31_000,
+                            "rule_id": "live_prompt_box",
+                            "screen_state": "idle",
+                        },
+                    },
+                }),
+            ),
+        ]),
+    );
+    assert_eq!(detection.status.code(), Some(0), "{detection:?}");
+    let text = String::from_utf8_lossy(&detection.stdout);
+    for line in [
+        "state_source: screen",
+        "fallback: screen idle (rule live_prompt_box; record blocked:kind=permission, 31000 ms old)",
+    ] {
+        assert!(text.contains(line), "{line:?} missing from:\n{text}");
+    }
+    // A daemon that predates the fallback carries no marker; the line stays.
+    let detection = run_against_scripted_daemon(
+        &["session", "detection", "s-1"],
+        results_daemon(vec![
+            (protocol::method::SESSION_LIST, json!([plain_session()])),
+            (
+                protocol::method::SESSION_DETECTION,
+                json!({
+                    "session_id": "s-1",
+                    "supported_regions": ["osc_title"],
+                    "previews": [],
+                    "status": {
+                        "state_source": "screen",
+                        "probe_answered": false,
+                        "record_present": false,
+                        "gate": {
+                            "declared": false,
+                            "open": false,
+                            "reason": "not_declared",
+                        },
+                    },
+                }),
+            ),
+        ]),
+    );
+    assert_eq!(detection.status.code(), Some(0), "{detection:?}");
+    let text = String::from_utf8_lossy(&detection.stdout);
+    assert!(text.contains("fallback: none"), "{text}");
+}
+
+#[test]
 fn session_detection_does_not_claim_a_probe_state_for_an_unknown_release() {
     let detection = run_against_scripted_daemon(
         &["session", "detection", "s-1"],

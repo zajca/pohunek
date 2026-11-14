@@ -32,6 +32,13 @@ const VERSION_MARKER: &str = "-v";
 /// rows cannot see; [`manifest_covered`] enforces it.
 pub(super) const COMPOSER_ABSENT_FEATURE: &str = "detect-composer-absent-v1";
 
+/// The feature that owns the detection manifest key `[program_status]
+/// stale_after_ms`.
+///
+/// The key lives in the detection manifest, which the descriptor gate rows
+/// cannot see; [`manifest_covered`] enforces it.
+pub(super) const PROGRAM_STATUS_STALENESS_FEATURE: &str = "program-status-staleness-v1";
+
 /// One runtime feature this core implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RuntimeFeature {
@@ -172,6 +179,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
     RuntimeFeature {
         id: "agent-skill-v1",
         since: "0.42.0",
+    },
+    RuntimeFeature {
+        id: PROGRAM_STATUS_STALENESS_FEATURE,
+        since: "0.43.0",
     },
 ];
 
@@ -377,7 +388,9 @@ pub(super) fn check_gates(
 /// # Errors
 ///
 /// [`DefinitionError::FeatureNotRequired`] naming `detect_manifest` when the
-/// manifest uses `composer_absent` and `requires` lacks its feature.
+/// manifest uses `composer_absent` and `requires` lacks its feature, or when
+/// the manifest declares `[program_status] stale_after_ms` and `requires`
+/// lacks the staleness feature.
 pub(super) fn manifest_covered(
     descriptor: &Table,
     manifest: Arc<Manifest>,
@@ -387,6 +400,16 @@ pub(super) fn manifest_covered(
         return Err(DefinitionError::FeatureNotRequired {
             key: "detect_manifest",
             feature: COMPOSER_ABSENT_FEATURE,
+        });
+    }
+    if manifest
+        .program_status()
+        .is_some_and(|program_status| program_status.stale_after().is_some())
+        && !requires.contains(&PROGRAM_STATUS_STALENESS_FEATURE)
+    {
+        return Err(DefinitionError::FeatureNotRequired {
+            key: "detect_manifest",
+            feature: PROGRAM_STATUS_STALENESS_FEATURE,
         });
     }
     Ok(manifest)

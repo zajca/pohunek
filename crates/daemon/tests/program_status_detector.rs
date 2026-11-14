@@ -95,6 +95,44 @@ fn config(manifest: &str, readiness: InputReadiness) -> DetectorConfig {
     }
 }
 
+/// The one-shot variants make the order deterministic: with the refresh
+/// disabled the record's own publish is the only candidate, with a faster
+/// refresh the refresh wins before the record's own debounce completes.
+fn no_refresh_config(manifest: &str, readiness: InputReadiness) -> DetectorConfig {
+    let detection = DetectionConfig {
+        stable_visible_refresh: Duration::from_secs(3600),
+        ..DetectionConfig::default()
+    };
+    detection_config(manifest, readiness, detection)
+}
+
+fn fast_refresh_config(manifest: &str, readiness: InputReadiness) -> DetectorConfig {
+    let detection = DetectionConfig {
+        stable_visible_refresh: Duration::from_millis(200),
+        ..DetectionConfig::default()
+    };
+    detection_config(manifest, readiness, detection)
+}
+
+fn detection_config(
+    manifest: &str,
+    readiness: InputReadiness,
+    detection: DetectionConfig,
+) -> DetectorConfig {
+    let manifest = Manifest::parse_str(manifest).expect("the manifest parses");
+    let runtime_version = manifest
+        .program_status()
+        .and_then(ProgramStatusConfig::authority_from);
+    DetectorConfig {
+        launch_name: None,
+        runtime_version,
+        gate_waived: false,
+        detection,
+        manifest: Some(Arc::new(manifest)),
+        input_readiness: readiness,
+    }
+}
+
 /// A detector over a virtual clock, remembering the activity it published.
 struct Harness {
     detector: Detector,
@@ -114,6 +152,20 @@ impl Harness {
             published: None,
             transitions: Vec::new(),
         }
+    }
+
+    fn claude_no_refresh() -> Self {
+        Self::new(no_refresh_config(
+            &opted_in_source("claude", CLAUDE_APP, true),
+            InputReadiness::ScreenIdle,
+        ))
+    }
+
+    fn claude_fast_refresh() -> Self {
+        Self::new(fast_refresh_config(
+            &opted_in_source("claude", CLAUDE_APP, true),
+            InputReadiness::ScreenIdle,
+        ))
     }
 
     fn claude() -> Self {
@@ -169,6 +221,20 @@ impl Harness {
     fn advance(&mut self, by: Duration) -> &mut Self {
         self.now += by;
         self.settle()
+    }
+
+    /// Ticks of `by` without settling until one publishes (or `rounds` run
+    /// out): for scenarios where a publish follows the fallback end.
+    fn tick_until_published(&mut self, by: Duration, rounds: usize) -> Vec<ActivityTransition> {
+        for _ in 0..rounds {
+            self.now += by;
+            let transitions = self.detector.tick(self.now);
+            self.note(transitions.clone());
+            if !transitions.is_empty() {
+                return transitions;
+            }
+        }
+        Vec::new()
     }
 
     /// The activity and source of the latest published transition.
@@ -1295,4 +1361,468 @@ fn a_report_is_not_an_event_without_the_opt_in() {
     stripped.feed(&captured("codex", "idle"));
 
     assert_eq!(plain.transitions, stripped.transitions);
+}
+
+/// The staleness window the shipped Claude manifest declares, in milliseconds;
+/// the scenarios bound their virtual advances to fractions of it, never a
+/// second literal.
+fn stale_window() -> Duration {
+    let manifest = Manifest::parse_str(&read("runtime-packages/claude/detect.toml"))
+        .expect("the shipped Claude manifest parses");
+    manifest
+        .program_status()
+        .expect("Claude opts in to program-status")
+        .stale_after()
+        .expect("Claude declares stale_after_ms")
+}
+
+/// Records idle after `feed`, so the first feed that shows the disagreement
+/// starts the staleness clock.
+fn idle_record_first(harness: &mut Harness) {
+    harness.feed(&captured("claude", "idle"));
+}
+
+#[test]
+fn a_stale_blocked_record_gives_way_to_the_idle_screen() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("blocked:kind=permission"));
+
+    // The screen drops to the idle prompt box while the record stands.
+    harness.feed(&captured("claude", "idle"));
+    harness.advance(window / 2);
+    assert_eq!(
+        harness.activity(),
+        BLOCKED,
+        "a fresh held record is still authoritative"
+    );
+
+    harness.advance(window + Duration::from_secs(5));
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "a blocked record over an idle screen for the window gives way"
+    );
+}
+
+#[test]
+fn a_stale_idle_record_gives_way_to_the_working_screen() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("idle"));
+
+    // The spinner frame is working screen evidence without a dialog.
+    harness.feed(&captured("claude", "working_early"));
+    harness.advance(window / 2);
+    assert_eq!(harness.activity(), IDLE, "a fresh held record stands");
+
+    harness.advance(window + Duration::from_secs(5));
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Working, StateSource::Screen)),
+        "an idle record over a spinner for the window gives way"
+    );
+}
+
+#[test]
+fn a_stale_working_record_gives_way_to_a_weak_screen_blocker() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("working"));
+
+    // The weak blocker is blocked screen evidence with no visible blocker.
+    harness.feed(&frame(None, &["Waiting for permission"]));
+    harness.advance(window / 2);
+    assert_eq!(harness.activity(), WORKING, "a fresh held record stands");
+
+    harness.advance(window + Duration::from_secs(5));
+    let activity = harness.activity();
+    assert_eq!(
+        activity,
+        Some((AgentActivity::Blocked, StateSource::Screen)),
+        "a working record over a weak blocker for the window gives way"
+    );
+    assert!(
+        harness.detector.status(harness.now).record_state.is_some(),
+        "the record is still held; only the arbitration changed"
+    );
+}
+
+#[test]
+fn a_dialog_wins_over_a_non_blocked_record_without_waiting() {
+    for state in ["working", "idle", "done", "error"] {
+        let mut harness = Harness::claude();
+        idle_record_first(&mut harness);
+        harness.feed(&claude_record(state));
+
+        harness.feed(&captured("claude", "trust"));
+        assert_eq!(
+            harness.activity(),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{state}: a visible dialog wins at once"
+        );
+    }
+}
+
+#[test]
+fn a_restated_record_restarts_the_staleness_clock() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("blocked:kind=permission"));
+    harness.feed(&captured("claude", "idle"));
+
+    harness.advance(window.mul_f64(0.75));
+    // A finished prompt answers late: the same record arrives again.
+    harness.feed(&claude_record("blocked:kind=permission"));
+
+    harness.advance(window.mul_f64(0.75));
+    assert_eq!(
+        harness.activity(),
+        BLOCKED,
+        "the restated record restarted the clock: past the first window"
+    );
+
+    harness.advance(window / 2);
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "past the restated window the screen decides"
+    );
+}
+
+#[test]
+fn a_fresh_record_restores_record_authority_at_once() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("blocked:kind=permission"));
+    harness.feed(&captured("claude", "idle"));
+    harness.advance(window + Duration::from_secs(5));
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Idle, StateSource::Screen)),
+        "the setup reached the screen fallback"
+    );
+
+    harness.feed(&claude_record("working"));
+    assert_eq!(
+        harness.activity(),
+        WORKING,
+        "a fresh record decides at once"
+    );
+    assert!(
+        harness.detector.status(harness.now).record_state.is_some(),
+        "the fresh record is held"
+    );
+}
+
+#[test]
+fn agreement_with_the_screen_restores_record_authority() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("idle"));
+    harness.feed(&captured("claude", "working_early"));
+    harness.advance(window + Duration::from_secs(5));
+    assert_eq!(
+        harness.activity(),
+        Some((AgentActivity::Working, StateSource::Screen)),
+        "the setup reached the screen fallback"
+    );
+
+    harness.feed(&captured("claude", "idle"));
+    harness.settle();
+    assert_eq!(
+        harness.activity(),
+        IDLE,
+        "the record agrees with the screen again, so it decides"
+    );
+}
+
+#[test]
+fn every_captured_dialog_keeps_a_held_blocked_record() {
+    for name in ["approval", "askuser", "trust", "theme", "apikey", "login"] {
+        let window = stale_window();
+        let mut harness = Harness::claude();
+        idle_record_first(&mut harness);
+        harness.feed(&claude_record("blocked"));
+        harness.feed(&captured("claude", name));
+
+        harness.advance(2 * window);
+        assert_eq!(
+            harness.activity(),
+            Some((AgentActivity::Blocked, StateSource::Screen)),
+            "{name}: a dialog never leaves blocked to the fallback"
+        );
+    }
+}
+
+#[test]
+fn the_fallback_transition_and_status_carry_the_frozen_fallback() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("blocked:kind=permission"));
+    harness.feed(&captured("claude", "idle"));
+    let published = harness.published.expect("the blocked record publishes");
+    assert!(
+        !published.fallback,
+        "the record's own edge is not a fallback"
+    );
+    assert!(
+        harness
+            .detector
+            .status(harness.now)
+            .into_protocol(None)
+            .fallback
+            .is_none(),
+        "no disagreement yet means no fallback in session.detection"
+    );
+
+    harness.advance(window + Duration::from_secs(5));
+    let published = harness.published.expect("the fallback publishes");
+    assert_eq!(
+        (published.activity, published.source),
+        (AgentActivity::Idle, StateSource::Screen),
+        "the screen decides"
+    );
+    assert!(
+        published.fallback,
+        "the edge under a stale record is marked as a fallback"
+    );
+    let fallback = harness
+        .detector
+        .status(harness.now)
+        .into_protocol(None)
+        .fallback
+        .expect("the fallback stays visible in session.detection");
+    assert_eq!(fallback.record_state, "blocked");
+    assert_eq!(fallback.rule_id, "live_prompt_box");
+    assert_eq!(fallback.screen_state, AgentActivity::Idle);
+    assert!(
+        fallback.record_age_ms >= u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+        "the frozen record age passed the window: {}",
+        fallback.record_age_ms
+    );
+
+    // The restated screen keeps the source, so it publishes no edge, and the
+    // frozen fallback stays on the status.
+    harness.feed(&captured("claude", "idle"));
+    assert_eq!(
+        harness
+            .detector
+            .status(harness.now)
+            .into_protocol(None)
+            .fallback
+            .as_ref()
+            .map(|fallback| fallback.record_age_ms),
+        Some(fallback.record_age_ms),
+        "the frozen values stay the same on every restated event"
+    );
+
+    harness.feed(&claude_record("working"));
+    assert!(
+        harness
+            .detector
+            .status(harness.now)
+            .into_protocol(None)
+            .fallback
+            .is_none(),
+        "a fresh record ends the fallback"
+    );
+}
+
+/// Ending the fallback re-records the published transition without the mark
+/// (and with a fresh refresh timestamp): no later evaluation restates a
+/// fallback that is over, and no caller resolves a descriptor from no active
+/// fallback on the task path. The one-shot variant with the refresh disabled
+/// makes the record's own publish the only candidate; the faster-refresh
+/// variant below first lets the fresh record's own unmarked publish land,
+/// then waits for its refresh.
+fn fallback_end_setup(harness: &mut Harness) {
+    let window = stale_window();
+    idle_record_first(harness);
+    harness.feed(&claude_record("blocked:kind=permission"));
+    harness.feed(&captured("claude", "idle"));
+    harness.advance(window + Duration::from_secs(5));
+    let fallback = harness.published.expect("the fallback publishes");
+    assert_eq!(
+        (fallback.activity, fallback.source),
+        (AgentActivity::Idle, StateSource::Screen),
+        "the setup reached the screen fallback"
+    );
+    assert!(fallback.fallback, "the edge under a stale record is marked");
+
+    // A fresh `done` record ends the fallback (Record).
+    let ended = harness.feed_raw(&claude_record("done"));
+    assert!(ended.is_empty(), "the fresh record ends the fallback");
+    assert!(
+        harness.detector.status(harness.now).stale.is_none(),
+        "the record is authoritative again"
+    );
+}
+
+/// With the refresh disabled, the record's own idle publishes unmarked.
+#[test]
+fn a_record_publish_after_the_fallback_end_carries_no_fallback() {
+    let mut harness = Harness::claude_no_refresh();
+    fallback_end_setup(&mut harness);
+
+    let published = harness.tick_until_published(Duration::from_millis(100), 30);
+    assert_eq!(
+        published.len(),
+        1,
+        "the record's own state publishes after the fallback end"
+    );
+    assert_eq!(
+        (published[0].activity, published[0].source),
+        (AgentActivity::Idle, StateSource::OscProgress),
+        "the publish is the fresh record's idle"
+    );
+    assert!(
+        !published[0].fallback,
+        "the record's publish after the fallback end carries no fallback"
+    );
+    assert!(
+        harness
+            .detector
+            .status(harness.now)
+            .into_protocol(None)
+            .fallback
+            .is_none(),
+        "the ended fallback stays absent from session.detection"
+    );
+}
+
+/// A reconfigure during an active fallback ends the staleness before the
+/// state replacement drops the published transition: no panic, and the
+/// fallback is gone. The new manifest decides what the next evidence
+/// publishes.
+#[test]
+fn a_reconfigure_during_an_active_fallback_ends_the_staleness() {
+    let window = stale_window();
+    let mut harness = Harness::claude();
+    idle_record_first(&mut harness);
+    harness.feed(&claude_record("blocked:kind=permission"));
+    harness.feed(&captured("claude", "idle"));
+    harness.advance(window + Duration::from_secs(5));
+    assert!(
+        harness.detector.status(harness.now).stale.is_some(),
+        "the setup holds an active fallback"
+    );
+
+    let manifest = Manifest::parse_str(&opted_in_source("claude", CLAUDE_APP, true))
+        .expect("the manifest parses");
+    harness.now += STEP;
+    harness.detector.reconfigure(
+        harness.now,
+        DetectorConfig {
+            launch_name: None,
+            runtime_version: manifest
+                .program_status()
+                .and_then(ProgramStatusConfig::authority_from),
+            gate_waived: false,
+            detection: DetectionConfig::default(),
+            manifest: Some(Arc::new(manifest)),
+            input_readiness: InputReadiness::ScreenIdle,
+        },
+    );
+    assert!(
+        harness.detector.status(harness.now).stale.is_none(),
+        "the reconfigure ends the active fallback"
+    );
+    assert!(
+        harness
+            .detector
+            .status(harness.now)
+            .into_protocol(None)
+            .fallback
+            .is_none(),
+        "the ended fallback stays absent from session.detection"
+    );
+}
+
+/// With the faster refresh, the refresh after the interval restates the
+/// arbitrated state without the mark. The fresh `done` record's own idle
+/// publishes first (its source differs from the fallback screen edge), so
+/// the test lets that debounce complete and then waits for the refresh of
+/// the republished state: the 200 ms refresh must not restate a fallback
+/// that is over. Dropping the `record_published` re-record from
+/// `end_staleness` fails this deterministically: the stale fallback mark
+/// stays on the published transition, so the fresh record's own publish
+/// keeps it and the assertion below fires on the first publish.
+#[test]
+fn a_refresh_after_the_fallback_end_carries_no_fallback() {
+    let mut harness = Harness::claude_fast_refresh();
+    fallback_end_setup(&mut harness);
+
+    let published = harness.tick_until_published(Duration::from_millis(100), 30);
+    assert_eq!(published.len(), 1, "the fresh record publishes");
+    assert!(
+        !published[0].fallback,
+        "the fresh record publishes without the fallback mark"
+    );
+    let restated = harness.tick_until_published(Duration::from_millis(100), 30);
+    assert_eq!(restated.len(), 1, "a refresh follows the fresh publish");
+    assert_eq!(
+        (restated[0].activity, restated[0].source),
+        (published[0].activity, published[0].source),
+        "the refresh restates the republished state"
+    );
+    assert!(
+        !restated[0].fallback,
+        "a refresh after the fallback end carries no fallback"
+    );
+    assert!(
+        harness
+            .detector
+            .status(harness.now)
+            .into_protocol(None)
+            .fallback
+            .is_none(),
+        "the ended fallback stays absent from session.detection"
+    );
+}
+
+#[test]
+fn a_codex_record_has_no_staleness_window() {
+    let mut harness = Harness::codex();
+    harness.feed(&record(&format!("state=working:app={CODEX_APP}")));
+    harness.feed(&titled(
+        "cxw",
+        &["  Run it? [y/n]", "", "\u{203a} Ask Codex to do anything"],
+    ));
+    assert_eq!(harness.activity(), WORKING);
+
+    harness.advance(Duration::from_hours(48));
+    assert_eq!(
+        harness.activity(),
+        WORKING,
+        "without stale_after_ms a held record never expires"
+    );
+}
+
+#[test]
+fn stale_after_ms_rejects_zero_and_an_hour_plus_a_millisecond() {
+    for value in ["0", "3600001"] {
+        let manifest = format!("[program_status]\napp = \"synth\"\nstale_after_ms = {value}\n");
+        assert!(
+            matches!(
+                Manifest::parse_str(&manifest),
+                Err(ManifestError::InvalidProgramStatusStaleAfter { .. })
+            ),
+            "{value}: outside 1..=3600000"
+        );
+    }
+    let manifest = "[program_status]\napp = \"synth\"\nstale_after_ms = 30000\n";
+    let parsed = Manifest::parse_str(manifest).expect("the in-range window parses");
+    assert_eq!(
+        parsed.program_status().expect("opted in").stale_after(),
+        Some(Duration::from_secs(30)),
+        "the window is kept as a duration"
+    );
 }

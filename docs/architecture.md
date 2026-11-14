@@ -1233,7 +1233,8 @@ the screen rules stay the fallback.
   session's own (a Codex started below a shell) is not gated. Each gate
   evaluation is logged as `session.program_status.gate`.
 - **Evidence order.** From strongest to weakest: a visible dialog; the
-  authoritative 7501 root record; OSC 9;4 progress and titles; screen text;
+  authoritative 7501 root record; a stale record's screen fallback (see
+  Staleness below); OSC 9;4 progress and titles; screen text;
   process activity; unknown. A hook or `session report-agent` report that
   carries the activity sits above all detector evidence: while it is current
   no detector transition, record included, is applied.
@@ -1259,7 +1260,19 @@ the screen rules stay the fallback.
   restated or changed one among them is no transition (`error` folds into idle).
   Because a held record is structured evidence, the bytes-flowing fallback does
   not fire under it.
-- **Lifetime.** A record carries no expiry. It ends with a root `clear`, with any
+- **Staleness.** A manifest may declare `[program_status] stale_after_ms`. A
+  held record that disagrees with the screen winner for at least that long
+  (a `blocked` record over an idle or working screen with no dialog, a
+  `working` record over a weak blocker, an `idle`/`done`/`error` record over
+  a working spinner) arbitrates as absent: the screen decides, including the
+  `below_authority` rules. A known dialog still wins at once, and a screen
+  with no winner runs no clock. A new root record, a root `clear`, a
+  reconfigure, a lag resync or a screen back in agreement ends the fallback
+  at once. Each fallback start and end is logged at info level under
+  `session.program_status.gate` (the record state, the record age, the
+  winning rule, the screen state; never program text).
+- **Lifetime.** A record carries no expiry, except through the staleness
+  window above. It ends with a root `clear`, with any
   detector reconfigure (an agent switch, a nested agent's exit, a report, a
   package refresh), with a lag resync, and with the runtime generation (a new
   detector holds none). It is not persisted and not in `SessionInfo`. After an
@@ -1276,12 +1289,32 @@ the screen rules stay the fallback.
 - **Evidence.** A transition derived from a record takes the detector path of the
   input-evidence rules: `working` opens a turn only by taking an armed input
   token, and a record never arms one. A held record restated on later chunks
-  changes nothing.
+  changes nothing. An `agent_state` event published under the fallback names
+  the frozen fallback (record state and age, winning rule, screen state); a
+  session snapshot carries no marker. A fallback to idle right after a
+  record-backed `blocked` resolves the open attention record; an idle from
+  the screen or the title that is not a fallback (after a root `clear`, a
+  lag resync or a reconfigure) still does not, while an `osc_progress`
+  idle keeps resolving the dismissed-dialog case. After a root `clear`,
+  whether the approval is acknowledged depends on whether the redraw
+  passes the process edge: a single-chunk redraw carries structured
+  evidence and skips the edge, so the screen settles to idle with the
+  approval still open; a split redraw resolves it through `Working/Process`
+  first. The fallback guard itself never resolves a non-fallback idle.
+  The projector narrows the
+  idle resolve to program-channel idles and fallback idles
+  (`projector.rs`: the idle resolve needs `origin.source ==
+  OscProgress || origin.fallback`), and the boundary is pinned by the
+  projector unit test
+  `a_fallback_idle_resolves_while_a_plain_screen_idle_sends_nothing`.
 - **Wire.** The source is the existing `osc_progress` ("an OSC status report of
   the program"), so older SDKs that validate the closed `StateSource` set keep
   working. `session.detection` does not expose the record: the
   `DetectionRegionKind` enum is strict on the wire, so the `program_status`
-  preview waits for the tolerant decode of #1337.
+  preview waits for the tolerant decode of #1337. Both events and
+  `session.detection` expose the fallback, when active, as `fallback` with
+  `record_state`, `record_age_ms`, `rule_id` and `screen_state`; older SDKs
+  ignore the unknown key.
 - **Probe answer.** Programs such as Claude Code and Pi enable their reports only
   after the terminal echoes the probe. The session worker answers it when the
   launch's manifest sets `answer_probe = true` (see Durable Session Workers).

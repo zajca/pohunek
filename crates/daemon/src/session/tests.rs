@@ -2033,6 +2033,7 @@ fn transition(activity: AgentActivity) -> ActivityTransition {
         activity,
         source: protocol::StateSource::Process,
         blocked_kind: None,
+        fallback: false,
     }
 }
 
@@ -3522,6 +3523,7 @@ async fn working_seen_from_another_source_keeps_the_running_turn() {
                 activity: AgentActivity::Working,
                 source: protocol::StateSource::Screen,
                 blocked_kind: None,
+                fallback: false,
             },
         )
         .await;
@@ -3532,6 +3534,7 @@ async fn working_seen_from_another_source_keeps_the_running_turn() {
                 activity: AgentActivity::Idle,
                 source: protocol::StateSource::Screen,
                 blocked_kind: None,
+                fallback: false,
             },
         )
         .await;
@@ -7518,7 +7521,13 @@ async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     };
 
     registry
-        .record_detector_activity(&created.id, &expected, 0, transition(AgentActivity::Idle))
+        .record_detector_activity(
+            &created.id,
+            &expected,
+            0,
+            transition(AgentActivity::Idle),
+            None,
+        )
         .await;
 
     let mut sessions = registry.inner.sessions.lock().await;
@@ -7556,19 +7565,20 @@ async fn a_transition_computed_before_the_agent_left_is_dropped() {
         activity: AgentActivity::Working,
         source: protocol::StateSource::OscProgress,
         blocked_kind: None,
+        fallback: false,
     };
     observe_codex(&registry, &inspector, &created, None).await;
     let after_exit = generation(&registry).await;
     assert!(after_exit > under_agent, "the exit replaced the config");
 
     registry
-        .record_detector_activity(&created.id, &expected, under_agent, held)
+        .record_detector_activity(&created.id, &expected, under_agent, held, None)
         .await;
     let info = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(info.activity, None, "{info:?}");
 
     registry
-        .record_detector_activity(&created.id, &expected, after_exit, held)
+        .record_detector_activity(&created.id, &expected, after_exit, held, None)
         .await;
     let info = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(info.activity, Some(AgentActivity::Working), "{info:?}");
@@ -24755,6 +24765,7 @@ fn blocked_on_permission() -> ActivityTransition {
         activity: AgentActivity::Blocked,
         source: protocol::StateSource::OscProgress,
         blocked_kind: Some(protocol::BlockedKind::Permission),
+        fallback: false,
     }
 }
 

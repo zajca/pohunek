@@ -36,8 +36,9 @@ use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{worker_binary, workspace_root};
 use protocol::{
     method, AgentActivity, BlockedKind, NotificationKind, NotificationListParams,
-    NotificationRecord, NotificationStatus, SessionId, SessionInfo, SessionInputParams,
-    SessionInputWait, SessionNewParams, StateSource, ENV_DAEMON_ID, ENV_SESSION_ID,
+    NotificationRecord, NotificationStatus, ReportSequence, SessionId, SessionInfo,
+    SessionInputParams, SessionInputWait, SessionNewParams, SessionReportAgentParams, StateSource,
+    ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 /// `session.detection` as a client that predates the program-status region
@@ -103,11 +104,16 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// reports working, `d` done, `i` idle, `b`, `u` and `a` blocked for a
 /// permission, a question and an authentication, `n` blocked without a kind,
 /// `K` the same blocked record under a screen dialog, `Y` an idle record and
-/// then the end of that dialog, and `q` exits; `t` is a turn that
+/// then the end of that dialog, `C` a root record `clear`, and `q` exits;
+/// `t` is a turn that
 /// reports working until the FIFO yields a byte, then done. `c` and `x` report
 /// the child records a Claude background agent emits (a `working` record with
 /// an `id` and a `title`, then a bare `clear`); `L` reports a record with a
 /// `kind` the grammar does not know and then one with an unknown `state`;
+/// `W` clears the screen and prints the weak blocker text a transcript would
+/// leave behind (`Waiting for permission`, no prompt box); `S` clears and
+/// prints the status spinner above the prompt box; `M` reports a
+/// `blocked:kind=permission` record carrying a marker text as `msg=`;
 /// `m` draws a marker line. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
@@ -181,10 +187,15 @@ run() {{
     P) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit 'blocked:kind=permission' ;;
     K) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit blocked ;;
     y) printf '\033[2J\033[H'; box ;;
+    e) printf '\033[2J\033[H' ;;
     Y) emit idle; printf '\033[2J\033[H'; box ;;
     t) emit working; head -c 1 <&3 > /dev/null; emit done ;;
     c) printf '\033]7501;state=working:app={APP}:id=a460128b96cbca53d:title=U3R1YiBiYWNrZ3JvdW5kIGFnZW50\033\\' ;;
     x) printf '\033]7501;state=clear:id=a460128b96cbca53d\033\\' ;;
+    C) printf '\033]7501;state=clear:app={APP}\033\\' ;;
+    W) printf '\033[2J\033[HWaiting for permission\r\n' ;;
+    S) printf '\033[2J\033[H✻ Billowing… (1…\r\n'; box ;;
+    M) printf '\033]7501;state=blocked:kind=permission:app={APP}:msg=U0VDUkVULVBST01QVC1URVhU\033\\' ;;
     L) printf '\033]7501;state=blocked:app={APP}:kind=limit:msg=c2VjcmV0LWxpbWl0LXRleHQ=\033\\'
        printf '\033]7501;state=limit:app={APP}:msg=c2VjcmV0LXN0YXRlLXRleHQ=\033\\' ;;
     m) printf 'SYNC\r\n' ;;
@@ -204,10 +215,19 @@ done
     )
 }
 
-/// The shipped Claude manifest with its `[program_status]` table replaced by one
-/// that sets `answer_probe` and the given `authority_from`; without one the
-/// manifest has no gate and its `below_authority` rules are dropped.
-fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String {
+/// The staleness window the staleness scenarios give their manifest, in
+/// milliseconds; it only bounds how long the session waits for the fallback.
+const STALE_AFTER_MS: u64 = 500;
+
+/// The shipped Claude manifest with its `[program_status]` table replaced by
+/// one that sets `answer_probe`, the given `authority_from` and the given
+/// `stale_after_ms`; without an `authority_from` the manifest has no gate
+/// and its `below_authority` rules are dropped.
+fn opted_in_manifest_with_staleness(
+    answer_probe: bool,
+    authority_from: Option<&str>,
+    stale_after_ms: Option<u64>,
+) -> String {
     let mut in_table = false;
     let shipped =
         std::fs::read_to_string(workspace_root().join("runtime-packages/claude/detect.toml"))
@@ -234,19 +254,35 @@ fn opted_in_manifest(answer_probe: bool, authority_from: Option<&str>) -> String
     let gate = authority_from
         .map(|version| format!("authority_from = \"{version}\"\n"))
         .unwrap_or_default();
-    format!("{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n{gate}")
+    let stale = stale_after_ms
+        .map(|ms| format!("stale_after_ms = {ms}\n"))
+        .unwrap_or_default();
+    format!(
+        "{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n{gate}{stale}"
+    )
 }
 
 /// Writes the override manifest, the stand-in agent and its profiles below
 /// `env` and returns the scratch directory the agent reports into.
 fn prepare_agents(env: &TestEnv, answer_probe: bool, authority_from: Option<&str>) -> PathBuf {
+    prepare_agents_with_staleness(env, answer_probe, authority_from, None)
+}
+
+/// [`prepare_agents`], plus an optional `[program_status] stale_after_ms` in
+/// the manifest.
+fn prepare_agents_with_staleness(
+    env: &TestEnv,
+    answer_probe: bool,
+    authority_from: Option<&str>,
+    stale_after_ms: Option<u64>,
+) -> PathBuf {
     let scratch = env.cwd().join("scratch");
     std::fs::create_dir(&scratch).expect("create the scratch directory");
     let agents = env.root().join("agents");
     std::fs::create_dir_all(agents.join("manifests")).expect("create the agents directory");
     std::fs::write(
         agents.join("manifests/fake.toml"),
-        opted_in_manifest(answer_probe, authority_from),
+        opted_in_manifest_with_staleness(answer_probe, authority_from, stale_after_ms),
     )
     .expect("write the override manifest");
     let program = env.root().join("fake-agent");
@@ -349,9 +385,20 @@ impl Fixture {
 
     /// A fixture whose manifest declares `authority_from`.
     async fn gated(answer_probe: bool, authority_from: Option<&str>) -> Self {
-        Self::hosting(answer_probe, authority_from, |_env, _scratch| {
+        Self::hosting(answer_probe, authority_from, None, |_env, _scratch| {
             ShellCommand::new("/bin/sh", ["-c", "sleep 600"])
         })
+        .await
+    }
+
+    /// A fixture whose manifest declares a staleness window.
+    async fn staleness(answer_probe: bool) -> Self {
+        Self::hosting(
+            answer_probe,
+            None,
+            Some(STALE_AFTER_MS),
+            |_env: &TestEnv, _scratch: &Path| ShellCommand::new("/bin/sh", ["-c", "sleep 600"]),
+        )
         .await
     }
 
@@ -360,10 +407,12 @@ impl Fixture {
     async fn hosting(
         answer_probe: bool,
         authority_from: Option<&str>,
-        shell: impl FnOnce(&TestEnv, &Path) -> ShellCommand,
+        stale_after_ms: Option<u64>,
+        shell: impl FnOnce(&TestEnv, &Path) -> ShellCommand + Send,
     ) -> Self {
         let env = TestEnv::new().expect("create the test environment");
-        let scratch = prepare_agents(&env, answer_probe, authority_from);
+        let scratch =
+            prepare_agents_with_staleness(&env, answer_probe, authority_from, stale_after_ms);
         let shell_command = shell(&env, &scratch);
         let registry = registry_over(
             &env,
@@ -495,6 +544,91 @@ fn read_trimmed(path: &Path) -> Option<String> {
 /// Writes one command byte to the FIFO the stand-in agent reads.
 fn command(fixture: &Fixture, byte: u8) {
     std::fs::write(fixture.scratch_file("cmd"), [byte]).expect("write the command byte");
+}
+
+/// A hook report that reconfigures the detector through the session boundary
+/// during an active fallback must not panic the detector task: the report
+/// path (`report_agent` with an admitted hook identity) is the only
+/// session-boundary trigger that reaches `Detector::reconfigure` with a
+/// live stale record (a real standby exit tears the detector down instead
+/// of reconfiguring it), and a reconfigure there ends the staleness before
+/// it replaces the state.
+#[tokio::test]
+async fn a_report_during_an_active_fallback_reconfigures_without_panicking() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    // The nested profile the hook report claims: admitted through the
+    // identity hook (`pohunek:codex` is a hooked provider), so `report_agent`
+    // accepts it and reconfigures the detector mid-fallback.
+    std::fs::write(
+        fixture.env.root().join("agents/nested-codex.toml"),
+        format!(
+            "base = \"codex\"\n{}program = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+            official_runtimes::profile_pin("codex"),
+        ),
+    )
+    .expect("write the nested profile");
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    assert_fallback_visible(&fixture, &created.id).await;
+
+    let reported = fixture
+        .registry
+        .report_agent(SessionReportAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:codex".to_owned(),
+            agent: "nested-codex".to_owned(),
+            activity: Some(AgentActivity::Working),
+            seq: Some(ReportSequence::new(1)),
+            pid: None,
+            agent_session_id: None,
+            agent_session_path: None,
+            pid_start_identity: None,
+            monotonic_sequence: None,
+            retryable_admission: false,
+        })
+        .await;
+    assert!(
+        reported.recorded,
+        "the hook report reconfigures the detector"
+    );
+    // `detection` answers through the detector task only after it applied
+    // the report's config generation, so the reconfigure below already ran:
+    // the task cannot be stopped before it reaches `end_staleness`.
+    fixture
+        .registry
+        .detection(&created.id)
+        .await
+        .expect("the reconfigured detector answers");
+
+    // The detector task survived the reconfigure: the hook's own working
+    // claim lands (the detector stays quiet behind a reported activity),
+    // and a later screen state still publishes once the claim releases.
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Working, StateSource::Report))
+        .await;
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
 }
 
 #[tokio::test]
@@ -1146,7 +1280,7 @@ done
 
 /// A shell session that starts `program` below its root process.
 async fn nested_fixture(program: &'static str, first_bytes: usize) -> Fixture {
-    Fixture::hosting(true, None, move |env, scratch| {
+    Fixture::hosting(true, None, None, move |env, scratch| {
         let bin = env.root().join("nested-bin");
         std::fs::create_dir_all(&bin).expect("create the stand-in directory");
         let stand_in = bin.join(program);
@@ -1804,6 +1938,162 @@ async fn a_blocked_record_followed_by_an_idle_record_resolves_the_attention() {
     attention.end().await;
 }
 
+/// A stale blocked record over an idle prompt box resolves the attention:
+/// the fallback idle proves the screen showed no dialog for the whole
+/// staleness window, the way an idle record proves the dialog closed.
+#[tokio::test]
+async fn a_stale_blocked_fallback_idle_resolves_the_attention() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    // The weak blocker keeps the screen in agreement with the blocked record
+    // until the prompt box returns, so the staleness clock starts at `y`.
+    command(&fixture, b'W');
+    command(&fixture, b'b');
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.status, NotificationStatus::Unread);
+
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    wait_until("the attention record to resolve", || async {
+        attention
+            .records(&created.id)
+            .iter()
+            .all(|record| record.status != NotificationStatus::Unread)
+            .then_some(())
+    })
+    .await;
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// A root `clear` and the prompt-box redraw in the specified `C, y` shape:
+/// the approval the blocked record opened resolves only through a working
+/// edge, never through the non-fallback screen idle the redraw settles to.
+/// The redraw may pass the process edge (a split chunking) or land in one
+/// chunk as structured evidence that skips it, so the final status depends
+/// on what the session published between `C` and the idle: `Acknowledged`
+/// after a working edge, `Unread` without one. A second session's blocked
+/// record fences the projector and the coordinator, which handle the events
+/// and commands of all sessions in order.
+#[tokio::test]
+async fn a_cleared_record_resolves_only_through_the_working_edge() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    // The weak blocker keeps the screen in agreement with the blocked record
+    // until the prompt box returns, so no staleness clock runs before `y`.
+    command(&fixture, b'W');
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::ApprovalRequired);
+    assert_eq!(record.status, NotificationStatus::Unread);
+
+    let mut events = fixture.registry.subscribe();
+    command(&fixture, b'C');
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+
+    let fence = fixture.start("fake-reply-stdin").await;
+    fixture
+        .wait_activity(&fence.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    fixture
+        .input(&fence.id, "b", AgentActivity::Blocked)
+        .await
+        .expect("input until blocked");
+    attention.first_record(&fence.id).await;
+
+    let published = activities_until_screen_idle(&mut events, &created.id);
+    let working_edge = published.iter().any(|(activity, _)| activity == "working");
+    eprintln!("working edge between the clear and the idle: {working_edge}; {published:?}");
+    let records = attention.records(&created.id);
+    assert_eq!(records.len(), 1);
+    let expected = if working_edge {
+        NotificationStatus::Acknowledged
+    } else {
+        NotificationStatus::Unread
+    };
+    assert_eq!(
+        records[0].status, expected,
+        "only a working edge resolves the approval; published after the clear: {published:?}"
+    );
+
+    for id in [&created.id, &fence.id] {
+        fixture.registry.stop(id).await.expect("stop the session");
+    }
+    attention.end().await;
+}
+
+/// The activities `id` published up to and including its first screen idle.
+///
+/// Each is the `(activity, source)` pair of one `agent_state` event of `id`.
+///
+/// # Panics
+///
+/// Panics when the receiver lagged, since dropped events would hide a working
+/// edge, or when no screen idle of `id` is buffered.
+fn activities_until_screen_idle(
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
+    id: &SessionId,
+) -> Vec<(String, String)> {
+    let mut published = Vec::new();
+    loop {
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("the event receiver lagged by {skipped} events")
+            }
+            Err(error) => {
+                panic!("no screen idle of {id:?} among the events: {error}; {published:?}")
+            }
+        };
+        let payload = event.payload();
+        if event.event() != protocol::event::AGENT_STATE || payload["session_id"] != id.0.as_str() {
+            continue;
+        }
+        let field = |name: &str| {
+            payload[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("an agent_state names its {name}: {payload}"))
+                .to_owned()
+        };
+        let entry = (field("activity"), field("source"));
+        let screen_idle = entry.0 == "idle" && entry.1 == "screen";
+        published.push(entry);
+        if screen_idle {
+            return published;
+        }
+    }
+}
+
 /// A screen dialog that wins over a held `blocked` record carries the record's
 /// kind: a permission prompt the screen rules read is still an approval.
 #[tokio::test]
@@ -2208,4 +2498,470 @@ async fn a_client_reseeding_over_the_control_socket_reads_the_blocked_kind() {
         .stop(&created.id)
         .await
         .expect("stop the session");
+}
+
+/// Waits until `session.detection` reports the frozen fallback of the idle
+/// screen over the stale `blocked` record.
+async fn assert_fallback_visible(fixture: &Fixture, id: &SessionId) {
+    let fallback = wait_until("the fallback in session.detection", || async {
+        fixture
+            .registry
+            .detection(id)
+            .await
+            .ok()?
+            .status
+            .and_then(|status| status.fallback)
+    })
+    .await;
+    assert_eq!(fallback.record_state, "blocked");
+    assert_eq!(fallback.rule_id, "live_prompt_box");
+    assert_eq!(fallback.screen_state, AgentActivity::Idle);
+    assert!(
+        fallback.record_age_ms >= STALE_AFTER_MS,
+        "the frozen record age passed the window: {}",
+        fallback.record_age_ms
+    );
+}
+
+/// Waits for the `agent_state` event of the fallback idle.
+async fn fallback_event(
+    events: &mut tokio::sync::broadcast::Receiver<Arc<protocol::Event>>,
+) -> serde_json::Value {
+    wait_until("the fallback agent_state event", || {
+        let states = agent_states(events);
+        async move {
+            states.into_iter().find(|event| {
+                event.payload()["activity"] == "idle" && event.payload().get("fallback").is_some()
+            })
+        }
+    })
+    .await
+    .payload()
+    .clone()
+}
+
+/// Checks the frozen fallback of a fallback `agent_state` payload.
+fn assert_frozen_fallback(payload: &serde_json::Value) {
+    assert_eq!(payload["source"], "screen");
+    assert_eq!(payload["fallback"]["record_state"], "blocked");
+    assert_eq!(payload["fallback"]["rule_id"], "live_prompt_box");
+    assert_eq!(payload["fallback"]["screen_state"], "idle");
+    assert!(
+        payload["fallback"]["record_age_ms"].as_u64().unwrap_or(0) >= STALE_AFTER_MS,
+        "the frozen record age passed the window: {}",
+        payload["fallback"]["record_age_ms"]
+    );
+    // The marker names rule, states and age only: no program text travels in
+    // it. The `msg=` direction is covered by
+    // `a_msg_carrying_record_keeps_the_generic_notification_body`.
+    assert_eq!(
+        payload["fallback"].as_object().map(serde_json::Map::len),
+        Some(4),
+        "the fallback carries exactly its four fields: {payload}"
+    );
+}
+
+/// The lines the staleness fallback journaled on the gate target.
+fn staleness_journal_lines(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|line| line.contains("session.program_status.gate"))
+        .collect()
+}
+
+/// A stale blocked record over an idle prompt box resolves to the screen:
+/// the activity leaves blocked, and the fallback is journaled with the record
+/// state, its age, the winning rule and the screen state, never the record's
+/// text.
+#[tokio::test]
+async fn a_stale_blocked_record_falls_back_to_the_idle_screen() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let captured = CapturedLog::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    )
+    .expect("no other subscriber is installed in this test process");
+    let fixture = Fixture::staleness(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    // The weak blocker keeps the screen in agreement with the blocked record,
+    // so the staleness clock starts only when the prompt box returns. The
+    // subscription predates the record, so the single fallback event cannot
+    // be missed. The record carries a marker text, so the journal assertion
+    // below means something: the text must never reach the log.
+    let mut events = fixture.registry.subscribe();
+    command(&fixture, b'W');
+    command(&fixture, b'M');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+
+    // The `agent_state` event for the fallback idle carries the frozen
+    // fallback; an older client that ignores it still reads the activity.
+    // While the fallback is on the wire, an older client still decodes
+    // `session.detection`: the record is not on it.
+    assert_fallback_visible(&fixture, &created.id).await;
+    let during = fixture
+        .registry
+        .detection(&created.id)
+        .await
+        .expect("session.detection during the fallback");
+    let wire = serde_json::to_value(&during).expect("serialize session.detection");
+    serde_json::from_value::<LegacyDetection>(wire)
+        .expect("an older client decodes session.detection during the fallback");
+    let payload = fallback_event(&mut events).await;
+    assert_frozen_fallback(&payload);
+
+    let logged = wait_until("the staleness fallback journal", || async {
+        let logged = String::from_utf8_lossy(&captured.0.lock().expect("log buffer")).into_owned();
+        let began = |line: &str| {
+            line.contains("held program-status record is stale")
+                && line.contains("session.program_status.gate")
+        };
+        staleness_journal_lines(&logged)
+            .iter()
+            .any(|line| began(line))
+            .then_some(logged)
+    })
+    .await;
+    let lines = staleness_journal_lines(&logged);
+    let began = lines
+        .iter()
+        .find(|line| line.contains("held program-status record is stale"))
+        .expect("the fallback start is journaled");
+    for expected in [
+        "record_state=\"blocked\"",
+        "rule_id=\"live_prompt_box\"",
+        "screen_state=\"idle\"",
+        "record_age_ms=",
+    ] {
+        assert!(began.contains(expected), "{expected}: {began}");
+    }
+    assert!(
+        !began.contains("SECRET-PROMPT-TEXT"),
+        "no program text reaches the log: {began}"
+    );
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A stale working record over the weak blocker raises a generic blocked
+/// attention, the way any kind-less screen blocked does.
+#[tokio::test]
+async fn a_stale_working_record_falls_back_to_a_weak_screen_blocker() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'g');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
+        .await;
+    command(&fixture, b'W');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+
+    let record = attention.first_record(&created.id).await;
+    assert_eq!(record.kind, NotificationKind::AgentBlocked);
+    assert_eq!(
+        record.metadata.get("reason").map(String::as_str),
+        Some("blocked")
+    );
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
+}
+
+/// A stale idle record over the spinner follows the screen into working.
+#[tokio::test]
+async fn a_stale_idle_record_falls_back_to_the_working_screen() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'i');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+    command(&fixture, b'S');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Working, StateSource::Screen))
+        .await;
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A fresh record after the fallback takes over at once.
+#[tokio::test]
+async fn a_fresh_record_after_the_fallback_takes_over_at_once() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'W');
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+
+    let mut events = fixture.registry.subscribe();
+    command(&fixture, b'g');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
+        .await;
+
+    // The fresh record ends the fallback on the wire too: its `agent_state`
+    // event carries no marker, and neither does `session.detection`. An
+    // older client still decodes the detection: the record is not on it.
+    let payload = wait_until("the fresh agent_state event", || {
+        let states = agent_states(&mut events);
+        async move {
+            states
+                .into_iter()
+                .find(|event| {
+                    event.payload()["activity"] == "working"
+                        && event.payload()["source"] == "osc_progress"
+                })
+                .map(|event| event.payload().clone())
+        }
+    })
+    .await;
+    assert_eq!(payload.get("fallback"), None);
+    let detection = fixture
+        .registry
+        .detection(&created.id)
+        .await
+        .expect("session.detection")
+        .status
+        .expect("detection status");
+    assert_eq!(detection.fallback, None);
+    let detection = fixture
+        .registry
+        .detection(&created.id)
+        .await
+        .expect("session.detection");
+    let wire = serde_json::to_value(detection).expect("serialize session.detection");
+    serde_json::from_value::<LegacyDetection>(wire)
+        .expect("an older client decodes session.detection");
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// The session boundary propagates the fallback end: a root `clear` after the
+/// fallback keeps the session reachable, and the detector task publishes the
+/// next fresh record it sees instead of dying on its own refresh.
+#[tokio::test]
+async fn a_cleared_record_before_the_refresh_keeps_the_detector_task_alive() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::staleness(true).await;
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'W');
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    command(&fixture, b'y');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    assert_fallback_visible(&fixture, &created.id).await;
+
+    // The fallback is on the wire; the root `clear` and the fresh record
+    // below must not die on the detector task's own refresh. The `clear`
+    // ends the fallback but the re-recorded idle stays visible, so its
+    // 800ms refresh must fire between the `clear` and the fresh record. A
+    // restatement without a waiter is silent since #8b73d6920, so a
+    // background `input` wait holds one: while it waits, the refresh
+    // restatement arrives as an observable `agent_state` event (no sleep).
+    // The background wait itself can never succeed (idle needs a working
+    // first); it is only the waiter holder and is aborted afterwards.
+    // Without the `clear` ending the fallback, the restatement below still
+    // arrives but carries the marked record, so this pins the fallback end
+    // rather than a task panic.
+    let mut events = fixture.registry.subscribe();
+    command(&fixture, b'C');
+    let waiter = tokio::spawn({
+        let registry = fixture.registry.clone();
+        let id = created.id.clone();
+        async move {
+            registry
+                .input(SessionInputParams {
+                    session_id: id,
+                    text: String::new(),
+                    wait: Some(SessionInputWait {
+                        until: Some(vec![AgentActivity::Idle]),
+                        timeout_ms: Some(WAIT_MS),
+                        allow_prompt_accepted: None,
+                    }),
+                })
+                .await
+        }
+    });
+    // The first restatement after the `clear` is the 800ms refresh (the
+    // `clear` re-recorded the publish clock): it must carry no fallback.
+    let restated = wait_until("the visible refresh to restate the cleared idle", || {
+        let states = agent_states(&mut events);
+        async move {
+            states.into_iter().find(|event| {
+                let payload = event.payload();
+                payload["activity"] == "idle" && payload["source"] == "screen"
+            })
+        }
+    })
+    .await;
+    assert_eq!(
+        restated.payload().get("fallback"),
+        None,
+        "the refresh after the fallback end carries no fallback"
+    );
+    waiter.abort();
+    command(&fixture, b'g');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Working, StateSource::OscProgress),
+        )
+        .await;
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// The `msg=` of a held record never reaches the notification body: the
+/// attention carries the same generic permission body as a plain `b` record,
+/// and the marker text appears nowhere.
+#[tokio::test]
+async fn a_msg_carrying_record_keeps_the_generic_notification_body() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(true).await;
+    let attention = Attention::start(&fixture);
+    let created = fixture.start("fake-reply-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'M');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    fixture
+        .wait_blocked_kind(&created.id, Some(BlockedKind::Permission))
+        .await;
+    let marked = attention.first_record(&created.id).await;
+    assert_eq!(marked.kind, NotificationKind::ApprovalRequired);
+    assert_eq!(
+        marked.metadata.get("reason").map(String::as_str),
+        Some("permission")
+    );
+
+    command(&fixture, b'd');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::OscProgress))
+        .await;
+
+    command(&fixture, b'b');
+    fixture
+        .wait_activity(
+            &created.id,
+            (AgentActivity::Blocked, StateSource::OscProgress),
+        )
+        .await;
+    let plain = wait_until("the second attention record", || async {
+        let records = attention.records(&created.id);
+        (records.len() >= 2).then(|| records.into_iter().nth(1).expect("two records"))
+    })
+    .await;
+    assert_eq!(marked.body, plain.body, "the body ignores msg=");
+    assert_eq!(marked.title, plain.title);
+    for text in [&marked.body, &marked.title] {
+        assert!(
+            !text.contains("SECRET-PROMPT-TEXT"),
+            "no program text reaches the attention: {text}"
+        );
+    }
+
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+    attention.end().await;
 }
