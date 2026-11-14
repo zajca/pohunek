@@ -15,7 +15,7 @@ scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace -
 # (173 s) and flaked under load (#2267, #2268; #2269 at sixteen).
 cargo test --doc --workspace --all-features              # nextest excludes doctests
 cargo build --workspace --release                        # release profile must build (CI: see below)
-cargo xtask docs check                                   # schema/log fragments/drift/source-map/prompt contract shape/verifier/secrets/runbooks/doc commands/crate table/package lists/doc index
+cargo xtask docs check                                   # schema/log fragments/drift/source-map/prompt contract shape/verifier/secrets/runbooks/doc commands/crate table/package lists/doc index/onboarding floor
 scripts/build-hermes-package /abs/hermes.tar.zst        # Hermes runtime package for the gate
 cargo xtask hermes compatibility --bin-dir ABS --package /abs/hermes.tar.zst  # pinned, model-free Hermes CLI/golden gate
 ```

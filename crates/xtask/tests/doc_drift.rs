@@ -17,6 +17,9 @@ use clap::Command;
 /// and take no `--json`.
 const HIDDEN_PREFIX: &str = "__";
 
+/// The onboarding guide whose floor the deny table must cover.
+const ONBOARDING_GUIDE: &str = "docs/knowledge/guides/onboarding.md";
+
 /// A fixture checkout.
 struct Checkout {
     root: tempfile::TempDir,
@@ -101,6 +104,13 @@ fn reference_without_json_list() -> String {
     page[..cut].to_owned()
 }
 
+/// The committed onboarding guide, so the fixture scenarios hold for its
+/// current floor and deny table.
+fn committed_onboarding_guide() -> String {
+    fs::read_to_string(pohunek_test_support::workspace_root().join(ONBOARDING_GUIDE))
+        .expect("read the committed onboarding guide")
+}
+
 impl Checkout {
     /// A checkout in which every check passes.
     fn consistent() -> Self {
@@ -127,13 +137,14 @@ impl Checkout {
         );
         checkout.write(
             "docs/knowledge/index.md",
-            "# Index\n\n[map](assistant/source-map.md)\n",
+            "# Index\n\n[onboarding](guides/onboarding.md) [map](assistant/source-map.md)\n",
         );
         checkout.write(
             "docs/knowledge/assistant/source-map.md",
             "# Map\n\n- `crates/alpha/src/lib.rs`\n",
         );
         checkout.write("docs/cli.md", &reference(&[], &[]));
+        checkout.write(ONBOARDING_GUIDE, &committed_onboarding_guide());
         checkout
     }
 
@@ -156,7 +167,7 @@ impl Checkout {
         self.write("docs/knowledge/guides/page.md", body);
         self.write(
             "docs/knowledge/index.md",
-            "# Index\n\n[page](guides/page.md) [map](assistant/source-map.md)\n",
+            "# Index\n\n[page](guides/page.md) [onboarding](guides/onboarding.md) [map](assistant/source-map.md)\n",
         );
         self.failed_checks()
     }
@@ -275,7 +286,8 @@ fn retired_pages_and_the_history_log_are_not_held_to_the_current_tree() {
     );
     checkout.write(
         "docs/knowledge/index.md",
-        "# Index\n\n[old](guides/old.md) [log](log.md) [map](assistant/source-map.md)\n",
+        "# Index\n\n[old](guides/old.md) [log](log.md) [onboarding](guides/onboarding.md) \
+         [map](assistant/source-map.md)\n",
     );
     assert_eq!(checkout.failed_checks(), Vec::<&str>::new());
 }
@@ -500,4 +512,96 @@ fn a_symbolic_link_documentation_root_is_refused() {
     std::os::unix::fs::symlink(outside.path(), checkout.root.path().join(".agents"))
         .expect("link the agents root");
     xtask::check_doc_drift(checkout.root.path()).unwrap_err();
+}
+
+/// The onboarding guide with `from` replaced by `to`, exactly once.
+fn edited_guide(from: &str, to: &str) -> String {
+    let guide = committed_onboarding_guide();
+    assert_eq!(
+        guide.matches(from).count(),
+        1,
+        "the guide holds {from:?} once"
+    );
+    guide.replacen(from, to, 1)
+}
+
+/// A checkout whose onboarding guide has `from` replaced by `to`.
+fn with_guide_edit(from: &str, to: &str) -> Checkout {
+    let checkout = Checkout::consistent();
+    checkout.write(ONBOARDING_GUIDE, &edited_guide(from, to));
+    checkout
+}
+
+#[test]
+fn a_floor_command_without_a_deny_rule_fails_the_onboarding_floor_check() {
+    for row in [
+        "| `Bash(pohunek session retention sweep *--apply*)` | always | session removal by a retention sweep |\n",
+        "| `Bash(pohunek session stop *)` | always | session stop |\n",
+        "| `Bash(pohunek plugin profile rm *)` | always | profile removal |\n",
+    ] {
+        assert_eq!(
+            with_guide_edit(row, "").failed_checks(),
+            vec!["onboarding-floor"],
+            "without {row:?}"
+        );
+    }
+}
+
+#[test]
+fn a_floor_command_needs_an_always_on_deny_rule() {
+    let granted = with_guide_edit(
+        "| `Bash(pohunek session rm *)` | always |",
+        "| `Bash(pohunek session rm *)` | grant `projects` |",
+    );
+    assert_eq!(granted.failed_checks(), vec!["onboarding-floor"]);
+}
+
+#[test]
+fn each_alternative_of_a_floor_command_needs_its_deny_rule() {
+    let added = with_guide_edit(
+        "`pohunek session rm|stop`",
+        "`pohunek session rm|stop|resume`",
+    );
+    assert_eq!(added.failed_checks(), vec!["onboarding-floor"]);
+}
+
+#[test]
+fn a_deny_rule_without_a_floor_command_fails_the_onboarding_floor_check() {
+    let unpaired = with_guide_edit(
+        "- `pohunek project rm`, `pohunek session rm|stop`, and\n  `pohunek session retention sweep` with `--apply`.\n",
+        "- `pohunek project rm`, `pohunek session rm|stop`.\n",
+    );
+    assert_eq!(unpaired.failed_checks(), vec!["onboarding-floor"]);
+
+    let extra = with_guide_edit(
+        "| `Bash(pohunek session stop *)` | always | session stop |\n",
+        "| `Bash(pohunek session stop *)` | always | session stop |\n\
+         | `Bash(pohunek session resume *)` | always | session resume |\n",
+    );
+    assert_eq!(extra.failed_checks(), vec!["onboarding-floor"]);
+}
+
+#[test]
+fn a_rule_listed_beyond_the_floor_must_stay_in_the_deny_table() {
+    let dropped = with_guide_edit(
+        "| `Bash(pohunek session metadata *--clear*)` | always | metadata removal |\n",
+        "",
+    );
+    assert_eq!(dropped.failed_checks(), vec!["onboarding-floor"]);
+}
+
+#[test]
+fn a_guide_without_its_floor_or_deny_table_fails_the_onboarding_floor_check() {
+    assert_eq!(
+        with_guide_edit("### Floor\n", "### Limits\n").failed_checks(),
+        vec!["onboarding-floor"]
+    );
+    assert_eq!(
+        with_guide_edit(
+            "| Deny rule | Include when | Covers |",
+            "| Rule | Include when | Covers |"
+        )
+        .failed_checks(),
+        vec!["onboarding-floor"]
+    );
 }
