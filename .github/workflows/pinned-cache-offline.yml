@@ -1,0 +1,260 @@
+# Offline proof of the pinned download cache (issue #2202): on a cache hit,
+# every pinned item installs with the download hosts of every miss path
+# offline. Each job first runs `.github/scripts/pinned-cache-offline apply`,
+# which points those hosts (OFFLINE_HOSTS, every apt source of the image and
+# the registry of every locked npm tree) at loopback in /etc/hosts and fails
+# unless each one then refuses a connection. The items then run exactly as
+# their ci.yml sites do: same action, same inputs, same pins, and for the
+# items whose key names the runner image or the Node major, the same image
+# and the same Node. A miss can only install from those hosts, so it fails;
+# a green run means every item hit and installed from the cache alone. The
+# last step of each job also requires the `hit` output of every item.
+# The cache service and the runner's own action downloads (api.github.com,
+# codeload.github.com) stay reachable: the restore needs the first, and the
+# runner fetches the actions nested in the composites through the second.
+# The entries come from main (a pull request run reads its base branch's
+# entries), so the proof runs after a main run has saved them; an item
+# whose pins or image changed since then misses and fails, by design. That
+# is why only a change to the proof itself triggers it on a pull request.
+# Run it with `gh workflow run pinned-cache-offline.yml`.
+name: Pinned cache offline proof
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/pinned-cache-offline.yml
+      - .github/scripts/pinned-cache-offline
+
+permissions: {}
+
+concurrency:
+  group: pinned-cache-offline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A Python script never imports from its own directory or the working
+  # directory, so a file a pull request adds there cannot shadow a module.
+  PYTHONSAFEPATH: "1"
+  # The pins and retry bounds of the ci.yml sites (documented there); the
+  # guard in scripts/tests/test_pinned_cache.py keeps each value equal to
+  # ci.yml's, so a bump there fails the guard until it lands here too.
+  NEXTEST_VERSION: "0.9.151"
+  MOLD_VERSION: "2.42.1"
+  MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
+  ZIG_VERSION: "0.17.0"
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+  CI_RETRY_ATTEMPTS: "3"
+  CI_RETRY_BACKOFF_SECONDS: "10"
+  CI_RETRY_ATTEMPT_TIMEOUT_APT_SECONDS: "180"
+  CI_RETRY_ATTEMPT_TIMEOUT_NPM_SECONDS: "180"
+  # The download hosts of the miss paths that no apt source or npm lock
+  # names: the mold and uv releases and taiki-e/install-action's nextest
+  # (github.com and its asset hosts), zig, the cargo-binstall and rustup
+  # fallbacks. The guard requires every host a miss-path step of the
+  # pinned-cache, setup-mold, setup-zig and setup-uv actions downloads from.
+  OFFLINE_HOSTS: >-
+    github.com objects.githubusercontent.com release-assets.githubusercontent.com
+    raw.githubusercontent.com ziglang.org get.nexte.st crates.io index.crates.io
+    static.crates.io static.rust-lang.org
+  # A loopback connection is refused at once; this only bounds a hung one.
+  OFFLINE_CONNECT_TIMEOUT_SECONDS: "5"
+
+jobs:
+  # mold, zig, uv and nextest key on the OS and arch only; the Codex and
+  # Claude Code trees key on the Node of ubuntu-24.04, like their jobs.
+  ubuntu-24-04:
+    name: offline hit (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Take the miss-path download hosts offline
+        timeout-minutes: 5
+        run: |
+          sudo python3 -I .github/scripts/pinned-cache-offline apply \
+            --hosts-file /etc/hosts --connect-timeout "$OFFLINE_CONNECT_TIMEOUT_SECONDS" \
+            --apt-dir /etc/apt \
+            --npm-lock compat/pi/npm/package-lock.json \
+            --npm-lock compat/codex/npm/package-lock.json \
+            --npm-lock compat/claude/npm/package-lock.json \
+            $OFFLINE_HOSTS
+
+      - name: Install mold linker
+        id: mold
+        uses: ./.github/actions/setup-mold
+        timeout-minutes: 10
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+
+      # The pinned uv entry does not depend on `enable-cache`; the uv
+      # dependency cache stays off, so this job never saves one.
+      - name: Install uv
+        id: uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: false
+
+      - name: Install cargo-nextest
+        id: nextest
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
+
+      - name: Restore the pinned Codex npm tree
+        id: codex-tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: npm:compat/codex/npm
+          npm-scripts: false
+
+      - name: Save the pinned Codex npm tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          phase: save
+          key: ${{ steps.codex-tree.outputs.key }}
+          path: ${{ steps.codex-tree.outputs.path }}
+          hit: ${{ steps.codex-tree.outputs.hit }}
+
+      - name: Restore the pinned Claude Code npm tree
+        id: claude-tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: npm:compat/claude/npm
+          npm-scripts: true
+
+      - name: Save the pinned Claude Code npm tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          phase: save
+          key: ${{ steps.claude-tree.outputs.key }}
+          path: ${{ steps.claude-tree.outputs.path }}
+          hit: ${{ steps.claude-tree.outputs.hit }}
+
+      - name: Require a hit for every restore
+        env:
+          HITS: mold=${{ steps.mold.outputs.hit }} zig=${{ steps.zig.outputs.hit }} uv=${{ steps.uv.outputs.hit }} nextest=${{ steps.nextest.outputs.hit }} codex=${{ steps.codex-tree.outputs.hit }} claude=${{ steps.claude-tree.outputs.hit }}
+        run: |
+          set -euo pipefail
+          for hit in $HITS; do
+            [ "${hit#*=}" = true ] || { echo "::error::pinned-cache offline proof: ${hit%%=*} did not hit" >&2; exit 1; }
+          done
+          echo "every restore hit: $HITS"
+
+  # The Pi tree keys on the Node the Pi lock names, installed before the
+  # hosts go offline, as in the pi-package job.
+  pi:
+    name: offline hit (Pi npm tree)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Read the Pi lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=compat/pi/compatibility-lock.json
+          echo "node=$(jq -er '.upstream.node_min' "$lock")" >> "$GITHUB_OUTPUT"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.lock.outputs.node }}
+
+      - name: Take the miss-path download hosts offline
+        timeout-minutes: 5
+        run: |
+          sudo python3 -I .github/scripts/pinned-cache-offline apply \
+            --hosts-file /etc/hosts --connect-timeout "$OFFLINE_CONNECT_TIMEOUT_SECONDS" \
+            --apt-dir /etc/apt \
+            --npm-lock compat/pi/npm/package-lock.json \
+            --npm-lock compat/codex/npm/package-lock.json \
+            --npm-lock compat/claude/npm/package-lock.json \
+            $OFFLINE_HOSTS
+
+      - name: Restore the pinned Pi npm tree
+        id: pi-tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          item: npm:compat/pi/npm
+          npm-scripts: false
+
+      - name: Save the pinned Pi npm tree
+        uses: ./.github/actions/pinned-cache
+        with:
+          phase: save
+          key: ${{ steps.pi-tree.outputs.key }}
+          path: ${{ steps.pi-tree.outputs.path }}
+          hit: ${{ steps.pi-tree.outputs.hit }}
+
+      - name: Require a hit for every restore
+        env:
+          HITS: pi=${{ steps.pi-tree.outputs.hit }}
+        run: |
+          set -euo pipefail
+          for hit in $HITS; do
+            [ "${hit#*=}" = true ] || { echo "::error::pinned-cache offline proof: ${hit%%=*} did not hit" >&2; exit 1; }
+          done
+          echo "every restore hit: $HITS"
+
+  # The systemd-oomd set keys on the runner image of the systemd-supervision
+  # job; a newer image version than the saved entry misses until a main run
+  # saves it.
+  ubuntu-26-04:
+    name: offline hit (ubuntu-26.04, systemd-oomd)
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Take the miss-path download hosts offline
+        timeout-minutes: 5
+        run: |
+          sudo python3 -I .github/scripts/pinned-cache-offline apply \
+            --hosts-file /etc/hosts --connect-timeout "$OFFLINE_CONNECT_TIMEOUT_SECONDS" \
+            --apt-dir /etc/apt \
+            --npm-lock compat/pi/npm/package-lock.json \
+            --npm-lock compat/codex/npm/package-lock.json \
+            --npm-lock compat/claude/npm/package-lock.json \
+            $OFFLINE_HOSTS
+
+      - name: Install and start the pinned systemd-oomd
+        id: oomd
+        uses: ./.github/actions/pinned-cache
+        timeout-minutes: 10
+        with:
+          item: systemd-oomd
+
+      - name: Require a hit for every restore
+        env:
+          HITS: systemd-oomd=${{ steps.oomd.outputs.hit }}
+        run: |
+          set -euo pipefail
+          for hit in $HITS; do
+            [ "${hit#*=}" = true ] || { echo "::error::pinned-cache offline proof: ${hit%%=*} did not hit" >&2; exit 1; }
+          done
+          echo "every restore hit: $HITS"
