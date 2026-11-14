@@ -597,9 +597,9 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/native_launch.rs`
 - `crates/daemon/src/agent/native_reference.rs`
 - `crates/daemon/src/agent/profile.rs`
-- `crates/daemon/src/agent/credential.rs` — the credential-literal detector for profile inputs.
+- `crates/daemon/src/agent/credential.rs` — the daemon's path to the credential-literal detector of `crates/package/src/credential.rs`.
 - `crates/daemon/src/agent/profile/compose.rs` — composes the text of a new profile.
-- `crates/daemon/src/packages/create.rs` — `package.create_profile`.
+- `crates/daemon/src/packages/create.rs` — `package.create_profile` (with `options_toml`) and `package.create_preset`.
 - `crates/daemon/src/agent/host/`
 - `crates/daemon/src/integration/agent_skill.rs` — the opt-in agent skill install, status and removal.
 - `crates/xtask/tests/no_special_dispatch.rs`
@@ -642,7 +642,10 @@ Runtime package archive format:
 - `crates/daemon/src/agent/profile.rs` — profile `package`/`digest` pins and `pinned_digests`.
 - `crates/protocol/src/package.rs` — `package.*` payloads and stable error codes.
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
-- `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate|create|show`.
+- `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate|create|show`, including `create --options-file` and `create --preset-of`.
+- `crates/cli/src/commands/profile_fold.rs` — `pohunek plugin profile fold`: the proposal of a parent with options and one preset per input.
+- `crates/package/src/credential.rs` — the credential-literal detector the daemon's profile checks and `plugin profile fold` share.
+- `crates/daemon/src/agent/profile/preset.rs` — preset files: parsing, the parent read and the merged selection.
 - `docs/knowledge/guides/runtime-packages.md`
 - `docs/knowledge/guides/plugin-repositories.md` — the rule that new plugins live in their own repositories, naming, required CI, index admission and the release snapshot; the guard is `check_plugin_directories` in `crates/xtask/src/doc_drift.rs`.
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.

@@ -34,6 +34,13 @@ export type PackageCreateProfileParams = {
    */
   secret_env?: Array<string>;
   /**
+   * TOML text whose only root key is `options`: the `[options.<id>]`
+   * tables of the new profile, written after `secret_env` and validated
+   * with the load rules of a launch. Send it only when the daemon reports
+   * `package_create_profile_options_supported`.
+   */
+  options_toml?: string;
+  /**
    * The digest of the existing profile file this call replaces. Required
    * when the name exists; refused when it does not.
    */

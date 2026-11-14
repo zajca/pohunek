@@ -1,6 +1,5 @@
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
-use std::path::PathBuf;
 
 use protocol::{PackageIdentity, PackageVersion};
 

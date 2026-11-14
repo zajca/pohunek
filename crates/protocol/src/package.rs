@@ -14,6 +14,8 @@
 
 // Rust guideline compliant 2026-10-12
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -592,6 +594,43 @@ pub struct PackageCreateProfileParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>", optional))]
     pub secret_env: Vec<String>,
+    /// TOML text whose only root key is `options`: the `[options.<id>]`
+    /// tables of the new profile, written after `secret_env` and validated
+    /// with the load rules of a launch. Send it only when the daemon reports
+    /// `package_create_profile_options_supported`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub options_toml: Option<String>,
+    /// The digest of the existing profile file this call replaces. Required
+    /// when the name exists; refused when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub replace: Option<ProfileDigest>,
+    /// Validate and report without writing.
+    pub dry_run: bool,
+}
+
+/// Parameters for `package.create_preset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PackageCreatePresetParams.ts"))]
+pub struct PackageCreatePresetParams {
+    /// Name of the new preset: its file name under the agents directory
+    /// without `.toml`.
+    pub profile: String,
+    /// The host profile the preset launches; a full profile file, not a
+    /// preset or a bare runtime.
+    pub parent: String,
+    /// Choice id by option id; each must be declared by the parent. An option
+    /// it does not name takes the parent's default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<BTreeMap<String, String>>", optional))]
+    pub options: BTreeMap<String, String>,
+    /// Whether a launch of the preset refuses an option selection.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub locked: bool,
     /// The digest of the existing profile file this call replaces. Required
     /// when the name exists; refused when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -655,8 +694,12 @@ pub struct PackageCreateProfileResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub home_env: Option<String>,
-    /// The exact bytes of the profile file. The only values in it are the home
-    /// path, arguments that passed the credential check and secret names.
+    /// The exact bytes of the profile file. Its values are the home path,
+    /// arguments that passed the credential check, secret names and, with
+    /// `options_toml`, the `[options]` tables: labels, choice arguments and
+    /// choice `env` values that passed the load rules. A preset's text holds
+    /// its labels, its parent, its choices and `locked`. The choice `env`
+    /// values are profile values: like the file itself, never log them.
     pub text: String,
     /// Digest of `text`.
     pub file_digest: ProfileDigest,

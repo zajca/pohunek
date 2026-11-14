@@ -9,6 +9,8 @@
 
 #[path = "health_socket/agent_options.rs"]
 mod agent_options;
+#[path = "health_socket/agent_presets.rs"]
+mod agent_presets;
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
 #[path = "health_socket/branch_source.rs"]

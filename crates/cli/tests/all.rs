@@ -90,6 +90,10 @@ mod plugin_daemon;
 mod plugin_index_install;
 #[path = "plugin_profile_create.rs"]
 mod plugin_profile_create;
+#[path = "plugin_profile_create_presets.rs"]
+mod plugin_profile_create_presets;
+#[path = "plugin_profile_fold.rs"]
+mod plugin_profile_fold;
 #[path = "plugin_profile_list_audience.rs"]
 mod plugin_profile_list_audience;
 #[path = "prompt_link.rs"]

@@ -111,6 +111,7 @@ export type { PackageBindProfileParams } from "./PackageBindProfileParams";
 export type { PackageBindProfileResult } from "./PackageBindProfileResult";
 export type { PackageBindStatus } from "./PackageBindStatus";
 export type { PackageChangeResult } from "./PackageChangeResult";
+export type { PackageCreatePresetParams } from "./PackageCreatePresetParams";
 export type { PackageCreateProfileParams } from "./PackageCreateProfileParams";
 export type { PackageCreateProfileResult } from "./PackageCreateProfileResult";
 export type { PackageCreateProfileStatus } from "./PackageCreateProfileStatus";

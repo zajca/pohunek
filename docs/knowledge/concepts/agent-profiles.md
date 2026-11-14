@@ -308,6 +308,17 @@ use changes its revision, so a resume then needs `--accept-profile-change`.
 `--dry-run` prints the profile and its digest and writes nothing. The command is
 local only.
 
+`--options-file <path>` adds launch options: the path must name a regular
+file (not a symbolic link, FIFO or device), the file's only root key is
+`options`, and its `[options.<id>]` tables are written after `secret_env` and
+validated with the load rules of [Launch options](#launch-options); a refused
+table is `package_profile_unusable` and nothing is written.
+`pohunek plugin profile create <name> --preset-of <parent> [--opt
+OPTION=CHOICE]... [--locked]` (the wire method `package.create_preset`) writes
+a [preset](#presets) instead, validated as a launch resolves it, with the same
+`--replace` and `--dry-run` rules. `plugin profile list` shows a preset with
+the state `preset` and the detail `preset of <parent>`.
+
 ## Presentation labels
 
 A profile may carry two optional top-level keys that only change how it is
@@ -417,6 +428,68 @@ The profile bounds which choices exist, not who may pick them: any client
 allowed to start a session of the profile may select its most permissive
 choice (a permission mode included). Declare the least-privileged choice as
 the default, and leave out a choice you do not want any caller to have.
+
+## Presets
+
+A preset is a profile file that names a parent profile and a selection of its
+options, so an old profile name can keep working as a choice of one parent
+instead of a full copy of its launch keys:
+
+```toml
+display_name = "Claude Sonnet (review)"   # optional
+audience = "hidden"                        # optional
+[preset]
+parent = "claude"
+locked = true                              # optional, default false
+[preset.options]
+model = "sonnet"
+effort = "med"
+```
+
+A file whose root holds a `[preset]` table is a preset. It may hold only
+`[preset]`, `display_name` and `audience`; any launch key (`base`, `args`,
+`env`, `program`, `secret_env`, `options`, `package`, `digest`, `manifest`,
+`resume`, `input_rules`) is `invalid_profile`. `parent` must name a full host
+profile file: a bare runtime, a missing file or another preset is refused,
+and so is an option or choice the parent does not declare. Presets do not
+nest.
+
+A preset launches exactly as its parent with the merged selection: the
+parent's defaults, then the preset's choices, then what `session new --opt`
+selects. A `locked` preset refuses any selection (`agent_options_locked`) and
+shows no options in `host.inspect` or `plugin profile show`; an unlocked one
+shows the parent's options with its own choices as defaults. The session's
+agent is the preset's name, and `display_name` and `audience` are the preset's
+own. A preset carries no package pin: its sessions launch from the parent's,
+`plugin profile migrate` refuses a preset (migrate its parent), and a release
+step that repins the parent judges the preset's sessions too.
+
+A preset session records every option's choice like any other and resumes
+with them, so changing the preset's choices affects new sessions only.
+Editing the preset's labels or `locked` resumes without a decision; editing
+the parent's selected choice, or pointing the preset at another parent, is a
+profile change (`agent_profile_changed`).
+
+Turning an existing full profile into a preset of the same name also changes
+its sessions' revision: a preset's revision never equals one frozen from a
+full profile, so each session of that name needs one `session resume
+--accept-profile-change`. Keep an old profile file until its sessions are
+gone, and give a name that live sessions still use to a preset only when none
+holds it.
+
+### Folding a profile family
+
+`pohunek plugin profile fold <name> <name>... --into <parent> --dry-run`
+proposes such a family from existing profiles and writes nothing. The inputs
+must agree on every launch key but `args` and `[env]` and must not be presets
+or declare options. Each flag group of `args` that differs between them
+becomes an option named after the flag, with one choice per variant and
+`none` where an input lacks the flag; an `[env]` key whose value differs
+becomes an `env-<key>` option. The output is the parent profile text, one
+preset text per input that reproduces it, and a check per input (`args equal`,
+or `args reordered` when a varying flag stood before a shared one). Env values
+never appear: each is a `"<value of KEY from PROFILE>"` placeholder to fill in
+by hand, and an argument that looks like a credential refuses the fold.
 
 ## Native recovery spec
 

@@ -16,15 +16,15 @@
 
 use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use pohunek_platform::filesystem::{EntryKind, FsError, TrustedDir};
 use protocol::{
     method, official_package_install_only_step, PackageBindProfileParams, PackageBindProfileResult,
-    PackageBindStatus, PackageCreateProfileParams, PackageCreateProfileResult,
-    PackageCreateProfileStatus, PackageDigest, PackageId, PackageInfo, PackageOrigin,
-    ProfileDigest, RuntimeId,
+    PackageBindStatus, PackageCreatePresetParams, PackageCreateProfileParams,
+    PackageCreateProfileResult, PackageCreateProfileStatus, PackageDigest, PackageId, PackageInfo,
+    PackageOrigin, ProfileDigest, RuntimeId,
 };
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -36,6 +36,8 @@ use super::plugin::{
 };
 use crate::client::Client;
 use crate::commands::profile_bind::{self, PinCheck, UNCHECKED_PIN_NOTE};
+use crate::commands::profile_fold::{self, FoldArgs};
+use crate::commands::session::{agent_option_map, parse_agent_option};
 use crate::error::CliError;
 use crate::paths::Paths;
 use crate::target::LOCAL_HOST;
@@ -86,7 +88,7 @@ pub(crate) enum ProfileAction {
     /// serves the base, so the profile cannot launch), `package_unavailable`
     /// (an installed package that may serve the base cannot be loaded; run
     /// `pohunek plugin doctor`), `pin_not_installed` (the pinned digest is not
-    /// installed) and `unreadable`.
+    /// installed), `preset` (a preset of another profile) and `unreadable`.
     List {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
@@ -108,12 +110,16 @@ pub(crate) enum ProfileAction {
     /// update` or `plugin select`.
     Migrate(MigrateArgs),
 
-    /// Create a profile pinned to the selected package of its base runtime.
+    /// Create a profile pinned to the selected package of its base runtime,
+    /// or a preset of an existing profile.
     ///
     /// The daemon composes and validates the profile, then writes it
     /// atomically at mode 0600. `[env]` holds only the base runtime's config
     /// home variable, set from `--home`; secrets are passed by name with
-    /// `--secret-env` and never as values. An existing name is refused unless
+    /// `--secret-env` and never as values; `--options-file` adds the
+    /// `[options]` tables of a file. `--preset-of <PARENT>` writes a preset
+    /// instead, selecting choices with `--opt OPTION=CHOICE` and refusing
+    /// launch selections with `--locked`. An existing name is refused unless
     /// `--replace` names the digest `plugin profile list --json` reports for
     /// it. `--dry-run` prints the profile and its digest and writes nothing.
     Create(CreateArgs),
@@ -127,6 +133,20 @@ pub(crate) enum ProfileAction {
     /// unavailable when its `min_runtime` is above the runtime's version, or
     /// when the runtime reports no version.
     Show(ShowArgs),
+
+    /// Propose how two or more profiles that differ only in `args` and
+    /// `[env]` collapse into one parent with `[options]` and one preset per
+    /// input; prints the proposal and writes nothing.
+    ///
+    /// `--dry-run` is required. Each differing flag group of `args` becomes
+    /// an option whose choices are the inputs' variants (`none` where an
+    /// input lacks the flag), and each differing `[env]` key an `env-<key>`
+    /// option. Env values are never printed: the proposal holds a
+    /// `<value of KEY from PROFILE>` placeholder for each. An input that is
+    /// a preset, declares `[options]` or differs in another launch key is
+    /// refused (`fold_incompatible`), as is an argument that looks like a
+    /// credential (`fold_credential_literal`).
+    Fold(FoldArgs),
 }
 
 impl ProfileAction {
@@ -137,6 +157,7 @@ impl ProfileAction {
             Self::Migrate(args) => args.json,
             Self::Create(args) => args.json,
             Self::Show(args) => args.json,
+            Self::Fold(args) => args.json(),
         }
     }
 }
@@ -159,8 +180,14 @@ pub(crate) struct CreateArgs {
     #[arg(value_name = "NAME", value_parser = parse_profile_name)]
     name: String,
     /// Base runtime the profile extends: `shell` or a package-served runtime.
-    #[arg(long, value_name = "RUNTIME", value_parser = parse_base)]
-    base: RuntimeId,
+    /// Required unless `--preset-of` creates a preset.
+    #[arg(
+        long,
+        value_name = "RUNTIME",
+        value_parser = parse_base,
+        required_unless_present = "preset_of"
+    )]
+    base: Option<RuntimeId>,
     /// Absolute path of the agent's config home. The daemon writes it to the
     /// config home variable the base runtime declares, such as
     /// `CLAUDE_CONFIG_DIR` or `CODEX_HOME`.
@@ -174,6 +201,30 @@ pub(crate) struct CreateArgs {
     /// Names only, never values.
     #[arg(long = "secret-env", value_name = "NAME")]
     secret_env: Vec<String>,
+    /// TOML file whose only root key is `options`: the `[options.<id>]`
+    /// tables of the new profile, validated with the load rules of a launch.
+    #[arg(long, value_name = "PATH")]
+    options_file: Option<PathBuf>,
+    /// Create a preset of this existing profile instead of a full profile.
+    #[arg(
+        long,
+        value_name = "PARENT",
+        value_parser = parse_profile_name,
+        conflicts_with_all = ["base", "home", "args", "secret_env", "options_file"]
+    )]
+    preset_of: Option<String>,
+    /// A choice the preset selects, as `OPTION=CHOICE`; repeat for several
+    /// options, each at most once.
+    #[arg(
+        long = "opt",
+        value_name = "OPTION=CHOICE",
+        value_parser = parse_agent_option,
+        requires = "preset_of"
+    )]
+    opts: Vec<(String, String)>,
+    /// The preset refuses option selections at launch.
+    #[arg(long, requires = "preset_of")]
+    locked: bool,
     /// Replace the existing profile whose file digest this is.
     #[arg(long, value_name = "DIGEST", value_parser = parse_profile_digest)]
     replace: Option<ProfileDigest>,
@@ -230,7 +281,7 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn parse_profile_name(value: &str) -> Result<String, String> {
+pub(super) fn parse_profile_name(value: &str) -> Result<String, String> {
     if is_valid_profile_name(value) {
         Ok(value.to_owned())
     } else {
@@ -356,6 +407,56 @@ fn parse_head(text: &str) -> Result<ProfileHead, String> {
     })
 }
 
+/// The keys of a preset the listing reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PresetHead {
+    parent: String,
+    display_name: Option<String>,
+    audience: Option<String>,
+}
+
+/// Root keys a preset file may hold.
+const PRESET_ROOT_KEYS: [&str; 3] = ["preset", "display_name", "audience"];
+
+/// Read a preset's parent and presentation labels, or `None` when the text
+/// is no preset (its root holds no `preset` key).
+///
+/// Mirrors the daemon's shape rules for a preset; diagnostics name keys
+/// only.
+fn parse_preset_head(text: &str) -> Result<Option<PresetHead>, String> {
+    let document: DocumentMut = text
+        .parse()
+        .map_err(|error: TomlError| toml_diagnostic(text, &error))?;
+    let Some(preset) = document.get("preset") else {
+        return Ok(None);
+    };
+    if document
+        .iter()
+        .any(|(key, _)| !PRESET_ROOT_KEYS.contains(&key))
+    {
+        return Err("a preset holds only [preset], display_name and audience".to_owned());
+    }
+    let parent = preset
+        .as_table_like()
+        .and_then(|table| table.get("parent"))
+        .and_then(toml_edit::Item::as_str)
+        .ok_or_else(|| "`preset.parent` is missing".to_owned())?;
+    if !is_valid_profile_name(parent) {
+        return Err("`preset.parent` is not a valid profile name".to_owned());
+    }
+    let display_name = string_key(&document, "display_name")?
+        .map(validate_display_name)
+        .transpose()?;
+    let audience = string_key(&document, "audience")?
+        .map(validate_audience)
+        .transpose()?;
+    Ok(Some(PresetHead {
+        parent: parent.to_owned(),
+        display_name,
+        audience,
+    }))
+}
+
 fn string_key<'a>(document: &'a DocumentMut, key: &str) -> Result<Option<&'a str>, String> {
     match document.get(key) {
         None => Ok(None),
@@ -390,6 +491,8 @@ enum ProfileState {
     PackageUnavailable,
     /// The pinned digest is not installed.
     PinNotInstalled,
+    /// A preset of another profile, from which it launches.
+    Preset,
     /// The file cannot be read or parsed.
     Unreadable,
 }
@@ -403,6 +506,7 @@ impl ProfileState {
             Self::PackageNotInstalled => "package_not_installed",
             Self::PackageUnavailable => "package_unavailable",
             Self::PinNotInstalled => "pin_not_installed",
+            Self::Preset => "preset",
             Self::Unreadable => "unreadable",
         }
     }
@@ -550,6 +654,9 @@ struct ProfileEntry {
     /// The profile's `audience` key (`owner`, `agent` or `hidden`).
     #[serde(skip_serializing_if = "Option::is_none")]
     audience: Option<String>,
+    /// The parent profile of a preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preset_of: Option<String>,
     state: ProfileState,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -594,7 +701,7 @@ fn apply_audience_filter(entries: Vec<ProfileEntry>, all: bool) -> (Vec<ProfileE
 
 /// Why a profile file could not be loaded.
 #[derive(Debug, PartialEq, Eq)]
-enum LoadFault {
+pub(super) enum LoadFault {
     /// No such file.
     Missing,
     /// The file fails the ownership, type or permission policy.
@@ -604,7 +711,7 @@ enum LoadFault {
 }
 
 impl LoadFault {
-    fn detail(&self) -> &'static str {
+    pub(super) fn detail(&self) -> &'static str {
         match self {
             Self::Missing => "the file does not exist",
             Self::Unsafe(reason) | Self::Unreadable(reason) => reason,
@@ -644,8 +751,8 @@ fn check_file_policy(
 }
 
 /// A profile file read through the trusted directory descriptor.
-struct LoadedProfile {
-    text: String,
+pub(super) struct LoadedProfile {
+    pub(super) text: String,
 }
 
 /// The digest of profile file text, as `create --replace` compares it.
@@ -673,7 +780,7 @@ fn profile_file_name(name: &str) -> String {
 ///
 /// The directory must be owned by the current user and not group- or
 /// world-writable, the daemon's own gate for host configuration.
-fn open_agents_dir(path: &Path) -> Result<Option<TrustedDir>, FsError> {
+pub(super) fn open_agents_dir(path: &Path) -> Result<Option<TrustedDir>, FsError> {
     match TrustedDir::open_absolute_owner_safe(path, OTHERS_WRITE_BITS) {
         Ok(dir) => Ok(Some(dir)),
         Err(error) if error.io_kind() == Some(std::io::ErrorKind::NotFound) => Ok(None),
@@ -681,7 +788,7 @@ fn open_agents_dir(path: &Path) -> Result<Option<TrustedDir>, FsError> {
     }
 }
 
-fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault> {
+pub(super) fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault> {
     let file = profile_file_name(name);
     let metadata = match std::fs::symlink_metadata(dir.path().join(&file)) {
         Ok(metadata) => metadata,
@@ -722,7 +829,7 @@ fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault
     Ok(LoadedProfile { text })
 }
 
-fn directory_error(error: &FsError) -> Error {
+pub(super) fn directory_error(error: &FsError) -> Error {
     Error::ProfileDirectory {
         detail: sanitize(&error.to_string()),
     }
@@ -771,6 +878,7 @@ fn unreadable_entry(name: &str, detail: String) -> ProfileEntry {
         file_digest: None,
         display_name: None,
         audience: None,
+        preset_of: None,
         state: ProfileState::Unreadable,
         detail: Some(detail),
     }
@@ -784,6 +892,24 @@ fn profile_entry(dir: &TrustedDir, name: &str, packages: &[PackageInfo]) -> Prof
         Ok(loaded) => loaded,
         Err(fault) => return unreadable_entry(name, fault.detail().to_owned()),
     };
+    match parse_preset_head(&loaded.text) {
+        Err(detail) => return unreadable_entry(name, detail),
+        Ok(Some(preset)) => {
+            return ProfileEntry {
+                name: name.to_owned(),
+                base: None,
+                package: None,
+                digest: None,
+                file_digest: Some(text_digest(&loaded.text)),
+                display_name: preset.display_name,
+                audience: preset.audience,
+                state: ProfileState::Preset,
+                detail: Some(format!("preset of {}", preset.parent)),
+                preset_of: Some(preset.parent),
+            }
+        }
+        Ok(None) => {}
+    }
     match parse_head(&loaded.text) {
         Err(detail) => unreadable_entry(name, detail),
         Ok(head) => {
@@ -796,6 +922,7 @@ fn profile_entry(dir: &TrustedDir, name: &str, packages: &[PackageInfo]) -> Prof
                 file_digest: Some(text_digest(&loaded.text)),
                 display_name: head.display_name,
                 audience: head.audience,
+                preset_of: None,
                 state,
                 detail,
             }
@@ -943,6 +1070,7 @@ pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
         ProfileAction::Migrate(args) => run_migrate(&args).await,
         ProfileAction::Create(args) => run_create(&args).await,
         ProfileAction::Show(args) => run_show(&args).await,
+        ProfileAction::Fold(args) => profile_fold::run(&args),
     }
 }
 
@@ -1032,11 +1160,18 @@ fn render_profile(entry: &protocol::AgentRuntime) -> String {
     output
 }
 
-/// Create the profile through the daemon.
+/// Create the profile or preset through the daemon.
 ///
-/// The capability is read first, so a daemon that predates the method is told
-/// apart from a refusal and receives nothing.
+/// The capabilities are read first, so a daemon that predates the method or
+/// the options field is told apart from a refusal and receives nothing.
 async fn run_create(args: &CreateArgs) -> Result<(), CliError> {
+    // The options file is read before the daemon is asked anything, so a
+    // missing or oversized file fails without a connection.
+    let options_toml = args
+        .options_file
+        .as_deref()
+        .map(read_options_file)
+        .transpose()?;
     let paths = Paths::resolve()?;
     let mut client = Client::connect(LOCAL_HOST, &paths).await?;
     let capabilities = client
@@ -1044,21 +1179,88 @@ async fn run_create(args: &CreateArgs) -> Result<(), CliError> {
             skip_runtime_probes: Some(true),
         })
         .await?;
+    if let Some(parent) = &args.preset_of {
+        if !capabilities.package_create_preset_supported {
+            return Err(Error::ProfileCreatePresetUnsupported.into());
+        }
+        let result = client
+            .call::<method::PackageCreatePreset>(PackageCreatePresetParams {
+                profile: args.name.clone(),
+                parent: parent.clone(),
+                options: agent_option_map(args.opts.clone())?,
+                locked: args.locked,
+                replace: args.replace.clone(),
+                dry_run: args.dry_run,
+            })
+            .await?;
+        return print_output(args.json, &result, || render_created(&result));
+    }
     if !capabilities.package_create_profile_supported {
         return Err(Error::ProfileCreateUnsupported.into());
     }
+    if options_toml.is_some() && !capabilities.package_create_profile_options_supported {
+        return Err(Error::ProfileCreateOptionsUnsupported.into());
+    }
+    let Some(base) = args.base.clone() else {
+        unreachable!("clap requires --base unless --preset-of is given")
+    };
     let result = client
         .call::<method::PackageCreateProfile>(PackageCreateProfileParams {
             profile: args.name.clone(),
-            base: args.base.clone(),
+            base,
             home: args.home.clone(),
             args: args.args.clone(),
             secret_env: args.secret_env.clone(),
+            options_toml,
             replace: args.replace.clone(),
             dry_run: args.dry_run,
         })
         .await?;
     print_output(args.json, &result, || render_created(&result))
+}
+
+/// The text of the `--options-file` at `path`: a regular file, not a symbolic link, of at most
+/// [`MAX_PROFILE_BYTES`] bytes of UTF-8. Diagnostics never quote the file.
+fn read_options_file(path: &Path) -> Result<String, Error> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let refused = |detail: &str| Error::OptionsFile {
+        detail: detail.to_owned(),
+    };
+    // Opening a FIFO for reading blocks until a writer appears, and a device
+    // may never end: the type is checked before the open, with the
+    // `load_profile` rule that a symbolic link is refused, and again on the
+    // handle, which is opened without following a link and without
+    // blocking, so a swap after the inspection fails closed.
+    let inspected =
+        std::fs::symlink_metadata(path).map_err(|_error| refused("the file cannot be opened"))?;
+    if !inspected.file_type().is_file() {
+        return Err(refused("the path is not a regular file"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_error| refused("the file cannot be opened"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_error| refused("the file cannot be inspected"))?;
+    if !metadata.is_file() {
+        return Err(refused("the path is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(
+        u64::try_from(MAX_PROFILE_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    )
+    .read_to_end(&mut bytes)
+    .map_err(|_error| refused("the file cannot be read"))?;
+    if bytes.len() > MAX_PROFILE_BYTES {
+        return Err(refused("the file is too large"));
+    }
+    String::from_utf8(bytes).map_err(|_error| refused("the file is not valid UTF-8"))
 }
 
 fn render_created(result: &PackageCreateProfileResult) -> String {

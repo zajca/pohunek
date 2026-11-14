@@ -38,12 +38,11 @@ pub use native_reference::{
     MAX_EXISTENCE_DEPTH, MAX_EXISTENCE_ENTRIES, MAX_EXISTENCE_PATH_COMPONENTS,
     MAX_EXISTENCE_TEXT_BYTES, MAX_RELOCATING_ENTRIES,
 };
-#[cfg(test)]
 pub(crate) use profile::MAX_PROFILE_BYTES;
 pub(crate) use profile::{
-    agent_profile_not_found, apply_pin, compose_profile, parse_head, BindDir, BindError,
-    DoctorManifestError, DoctorProfileError, Pin, ProfileEnv, ProfileFile, ProfilePin,
-    ProfileRegistry, ProfileSpec, ResolvedAgent,
+    agent_profile_not_found, apply_pin, compose_preset, compose_profile, is_preset, parse_head,
+    BindDir, BindError, DoctorManifestError, DoctorProfileError, Pin, PresetSpec, ProfileEnv,
+    ProfileFile, ProfilePin, ProfileRegistry, ProfileSpec, ResolvedAgent,
 };
 
 /// Shell launched when the host reports no usable login shell.

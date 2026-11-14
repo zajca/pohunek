@@ -1487,6 +1487,7 @@ one state:
   repair, because it already names the digest; an unpinned one is then
   migrated.
 - `pin_not_installed`: the pinned digest is not installed.
+- `preset`: a preset of another profile, which carries no pin of its own.
 - `unreadable`: the file is a symlink or special file, is not owned by you, is
   group- or world-writable, is not valid TOML, or has an invalid `base`,
   `package`, or `digest`.
@@ -1503,6 +1504,12 @@ the package descriptor declares, so a base without that table takes no home
 refusals are `package_profile_exists`, `package_profile_digest_mismatch`,
 `package_profile_credential_literal` and `package_profile_dir_unsafe`. A daemon
 without the method (`package_create_profile_supported`) is sent nothing.
+`--options-file <path>` adds `[options]` tables (sent as `options_toml`, behind
+`package_create_profile_options_supported`), and `--preset-of <parent> [--opt
+OPTION=CHOICE]... [--locked]` writes a preset of an existing profile through
+`package.create_preset` (behind `package_create_preset_supported`) instead; a
+preset carries no pin, so `plugin profile migrate` refuses it and its parent
+is migrated.
 
 `pohunek plugin profile migrate <name> [--digest <d>] [--yes] [--json]` pins
 the profile through the daemon's `package.bind_profile` method; the command

@@ -135,13 +135,14 @@ pub use notification::{
 #[doc(inline)]
 pub use package::{
     CommandExposure, CommandInfo, ExpectedPin, PackageBindProfileParams, PackageBindProfileResult,
-    PackageBindStatus, PackageChangeResult, PackageCreateProfileParams, PackageCreateProfileResult,
-    PackageCreateProfileStatus, PackageDoctorParams, PackageDoctorResult, PackageErrorKind,
-    PackageFault, PackageFinding, PackageFindingKind, PackageInfo, PackageInspectParams,
-    PackageInspectResult, PackageInstallParams, PackageInstallResult, PackageInstallStatus,
-    PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
-    PackageSelectionBlock, PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust,
-    PackageUninstallParams, PackageUninstallResult,
+    PackageBindStatus, PackageChangeResult, PackageCreatePresetParams, PackageCreateProfileParams,
+    PackageCreateProfileResult, PackageCreateProfileStatus, PackageDoctorParams,
+    PackageDoctorResult, PackageErrorKind, PackageFault, PackageFinding, PackageFindingKind,
+    PackageInfo, PackageInspectParams, PackageInspectResult, PackageInstallParams,
+    PackageInstallResult, PackageInstallStatus, PackageLinkParams, PackageListResult,
+    PackageOrigin, PackageRuntimeInfo, PackageSelectParams, PackageSelectionBlock,
+    PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
+    PackageUninstallResult,
 };
 #[doc(inline)]
 pub use project::{

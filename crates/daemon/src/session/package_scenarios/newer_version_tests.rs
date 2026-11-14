@@ -35,6 +35,9 @@ use crate::session::{ProfileChange, SessionRegistry};
 /// The host profile the sessions launch from.
 const PROFILE: &str = "work";
 
+/// A preset of [`PROFILE`] some sessions launch from.
+const PRESET: &str = "review";
+
 /// The conversation a hook-reporting session reports.
 const CONVERSATION: &str = "native-newer-version";
 
@@ -220,6 +223,18 @@ async fn stopped_from(
     launched: &Package,
     version: Option<&str>,
 ) -> Stopped {
+    stopped_as(tag, kind, launched, version, None).await
+}
+
+/// [`stopped_from`] for a session of the [`PRESET`] of the profile, written
+/// from `preset`, or of the profile itself without one.
+async fn stopped_as(
+    tag: &str,
+    kind: &Kind,
+    launched: &Package,
+    version: Option<&str>,
+    preset: Option<&str>,
+) -> Stopped {
     let store_path = temp_store_path(tag);
     let fixture = Fixture::with_anchor_and_store(
         &format!("{tag}-plugins"),
@@ -240,6 +255,9 @@ async fn stopped_from(
             home.display()
         ),
     );
+    if let Some(text) = preset {
+        fixture.write_profile(PRESET, text);
+    }
     if let Some(version) = version {
         install(&fixture, kind, launched, version, 5).await;
     } else {
@@ -255,7 +273,7 @@ async fn stopped_from(
     let created = fixture
         .registry
         .create(protocol::SessionNewParams {
-            agent: PROFILE.to_owned(),
+            agent: preset.map_or(PROFILE, |_text| PRESET).to_owned(),
             cwd: Some(temp_dir(tag)),
             ..params()
         })
@@ -1086,6 +1104,103 @@ async fn assert_release_step_of(kind: &Kind, tag: &str, new: Package, adopts: bo
         .resume_with(&session.id, ProfileChange::Refuse)
         .await
         .expect("the session resumes after the step");
+    let relaunched = if adopts { &new.digest } else { &old.digest };
+    assert_eq!(&pinned_digest(&session.store_path, &session.id), relaunched);
+    restarted
+        .registry
+        .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+/// Row 10 of #2148: the release step repins the parent of a preset whose
+/// session the newer package adopts. The plan neither refuses nor rewrites
+/// the preset, the preflight judges the session as resume does, and the
+/// session resumes through the new version without a profile change.
+#[tokio::test]
+async fn the_release_step_repins_the_parent_of_a_preset_session() {
+    assert_preset_release_step("newer-release-step-preset", CLAUDE.newer(), true).await;
+}
+
+/// The release package does not adopt the preset session, which resumes
+/// from its frozen digest: the preset carries no pin, so the repinned
+/// parent's pin is the one judged.
+#[tokio::test]
+async fn the_release_step_repins_the_parent_of_a_preset_session_it_does_not_adopt() {
+    let changed = CLAUDE.package(CLAUDE.new_version, CLAUDE.new_below, |text| {
+        deeper_reference_search(&text)
+    });
+    assert_preset_release_step("newer-release-step-preset-frozen", changed, false).await;
+}
+
+/// [`assert_release_step_of`] for a Claude session of a preset of the
+/// profile the step repins.
+async fn assert_preset_release_step(tag: &str, new: Package, adopts: bool) {
+    let kind = &CLAUDE;
+    let old = kind.older();
+    let preset_text = format!("display_name = \"Review\"\n[preset]\nparent = \"{PROFILE}\"\n");
+    let session = stopped_as(tag, kind, &old, Some(kind.old_version), Some(&preset_text)).await;
+    let preset_path = session.fixture.agents.join(format!("{PRESET}.toml"));
+    let preset_bytes = fs::read(&preset_path).expect("read the preset");
+    let agent = if adopts { kind.only_new } else { kind.in_both };
+    kind.write_agent(&session.agent, agent);
+    let release = session.fixture.dir.join("release").join("runtime");
+    write_release(&release, kind, &new, kind.new_version, 6);
+    let trust =
+        crate::catalog_anchor::CatalogTrust::Loaded(anchor(&[&signing_key("root")], Vec::new()));
+
+    let report = release_preflight(&session, &release, &trust);
+    let plan = report.runtimes.as_ref().expect("the release plan");
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert_eq!(
+        plan.profiles
+            .iter()
+            .map(|profile| (profile.name.as_str(), profile.status))
+            .collect::<Vec<_>>(),
+        [(PROFILE, ProfileStatus::Repin)],
+        "the plan repins the parent only"
+    );
+    let verdict = report
+        .stopped_sessions
+        .iter()
+        .find(|verdict| verdict.session_id == session.id.0)
+        .expect("the preset session is judged");
+    assert_eq!(
+        (verdict.verdict, verdict.code.as_str()),
+        (
+            Verdict::Adoptable,
+            if adopts {
+                CODE_ADOPTABLE_BY_NEWER_PACKAGE
+            } else {
+                CODE_ADOPTABLE
+            }
+        ),
+        "{}",
+        verdict.detail
+    );
+
+    let applied = apply_release_step(&session, release, trust);
+    assert!(applied.refusals.is_empty(), "{:?}", applied.refusals);
+    assert_eq!(
+        applied
+            .profiles
+            .iter()
+            .map(|profile| (profile.name.as_str(), profile.status))
+            .collect::<Vec<_>>(),
+        [(PROFILE, ProfileStatus::Repinned)]
+    );
+    assert_eq!(
+        fs::read(&preset_path).expect("read the preset"),
+        preset_bytes,
+        "the step leaves the preset as it was"
+    );
+
+    let restarted = restart(&session.fixture).await;
+    restarted
+        .registry
+        .resume_with(&session.id, ProfileChange::Refuse)
+        .await
+        .expect("the preset session resumes after the step without a profile change");
     let relaunched = if adopts { &new.digest } else { &old.digest };
     assert_eq!(&pinned_digest(&session.store_path, &session.id), relaunched);
     restarted

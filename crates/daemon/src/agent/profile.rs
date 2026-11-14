@@ -223,6 +223,8 @@ pub(crate) struct ResolvedProfile {
     /// Digest of the profile's launch inputs, selected choices included; the
     /// source of its revision.
     pub inputs: ProfileInputs,
+    /// The parent of a preset; `None` for a full profile.
+    pub preset: Option<PresetOf>,
 }
 
 /// The resolution of an agent NAME on this host: its base kind plus optional
@@ -669,7 +671,9 @@ impl ProfileRegistry {
     /// launch of the base runtime. The option choices are the session's
     /// recorded `selected` ids, every other option taking its default. A pin
     /// the profile carries must name the package `served` that now serves the
-    /// runtime, or the revision does not match.
+    /// runtime, or the revision does not match. For a preset the parent's
+    /// text is read, and the preset's part joins the revision as a launch
+    /// adds it.
     ///
     /// # Errors
     ///
@@ -690,10 +694,8 @@ impl ProfileRegistry {
             .dir
             .as_deref()
             .ok_or_else(|| agent_profile_not_found(name))?;
-        let path = dir.join(format!("{name}.toml"));
-        let content = self.profile_text(dir, name, &path)?;
-        let raw: RawProfile = toml::from_str(&content)
-            .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+        let source = preset::launch_source(self, dir, name)?;
+        let (name, raw) = (source.name.as_str(), &source.raw);
         let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
         if let Some(pin) = pin {
             if pin.package != *served.0 || pin.digest != *served.1 {
@@ -701,15 +703,19 @@ impl ProfileRegistry {
             }
         }
         let stripped =
-            bind::without_pin(&content).map_err(|detail| invalid_profile(name, &detail))?;
+            bind::without_pin(&source.content).map_err(|detail| invalid_profile(name, &detail))?;
         let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
         let binding_json = serde_json::to_vec(stored)
             .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
         let selection = options::select(name, &raw.options, OptionRequest::Recorded(selected))?;
         // Labels are presentation only: the frozen check compares the launch
         // inputs, so the label keys leave with the pin keys.
-        let revision_content = revision_text(&stripped, &selection.revision())
-            .map_err(|detail| invalid_profile(name, &detail))?;
+        let revision_content = launch_revision_text(
+            name,
+            &stripped,
+            &selection.revision(),
+            source.preset.as_ref(),
+        )?;
         let inputs = ProfileInputs::of(
             &revision_content,
             manifest.as_ref().map(|source| source.text.as_str()),
@@ -730,7 +736,8 @@ impl ProfileRegistry {
     /// to the frozen revision exactly when nothing else changed. The option
     /// choices are the session's recorded `selected` ids, every other option
     /// taking its default. The profile must pin `served`, the package that
-    /// now serves the session.
+    /// now serves the session. For a preset the parent's text and pin are
+    /// read, and the preset's part joins the revision as a launch adds it.
     ///
     /// # Errors
     ///
@@ -752,24 +759,26 @@ impl ProfileRegistry {
             .dir
             .as_deref()
             .ok_or_else(|| agent_profile_not_found(name))?;
-        let path = dir.join(format!("{name}.toml"));
-        let content = self.profile_text(dir, name, &path)?;
-        let raw: RawProfile = toml::from_str(&content)
-            .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+        let source = preset::launch_source(self, dir, name)?;
+        let (name, raw) = (source.name.as_str(), &source.raw);
         let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
         if !pin.is_some_and(|pin| pin.package == served.package && pin.digest == served.digest) {
             return Ok(false);
         }
-        let at_launch =
-            apply_pin(&content, launched).map_err(|detail| invalid_profile(name, &detail))?;
+        let at_launch = apply_pin(&source.content, launched)
+            .map_err(|detail| invalid_profile(name, &detail))?;
         let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
         let binding_json = serde_json::to_vec(stored)
             .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
         let selection = options::select(name, &raw.options, OptionRequest::Recorded(selected))?;
         // Labels are presentation only: the frozen check compares the launch
         // inputs, so the label keys leave with the pin keys.
-        let revision_content = revision_text(&at_launch, &selection.revision())
-            .map_err(|detail| invalid_profile(name, &detail))?;
+        let revision_content = launch_revision_text(
+            name,
+            &at_launch,
+            &selection.revision(),
+            source.preset.as_ref(),
+        )?;
         let inputs = ProfileInputs::of(
             &revision_content,
             manifest.as_ref().map(|source| source.text.as_str()),
@@ -780,11 +789,13 @@ impl ProfileRegistry {
         self.revision_keys().matches(&inputs, frozen)
     }
 
-    /// The package pin of the host profile `name`.
+    /// The package pin of the host profile `name`; for a preset, the pin of
+    /// its parent, from which its sessions launch.
     ///
     /// # Errors
     ///
-    /// Returns the profile read and parse errors.
+    /// Returns the profile read and parse errors, and for a preset those of
+    /// its parent.
     pub(crate) fn profile_pin(&self, name: &str) -> Result<ProfilePin, ProtocolError> {
         let Some(dir) = self.dir.as_deref() else {
             return Ok(ProfilePin::Absent);
@@ -793,10 +804,10 @@ impl ProfileRegistry {
         if !self.planned.contains_key(name) && !path.is_file() {
             return Ok(ProfilePin::Absent);
         }
-        let content = self.profile_text(dir, name, &path)?;
-        let raw: RawProfile = toml::from_str(&content)
-            .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
-        let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+        // A preset carries no pin: its sessions launch from its parent's.
+        let source = preset::launch_source(self, dir, name)?;
+        let raw = &source.raw;
+        let pin = parse_package_pin(&source.name, raw.package.as_deref(), raw.digest.as_deref())?;
         Ok(pin.map_or(ProfilePin::Unpinned, |pin| {
             ProfilePin::Pinned(Pin {
                 package: pin.package,
@@ -867,11 +878,9 @@ impl ProfileRegistry {
         validate_name("agent", name)?;
         if let Some(dir) = &self.dir {
             let path = dir.join(format!("{name}.toml"));
-            if let Some(text) = self.planned.get(name) {
-                return resolve_profile_text(name, text, dir, &self.runtimes, pinned, request);
-            }
-            if path.is_file() {
-                return load_profile(name, &path, dir, &self.runtimes, pinned, request);
+            if self.planned.contains_key(name) || path.is_file() {
+                let content = self.profile_text(dir, name, &path)?;
+                return self.resolve_text(dir, name, &content, pinned, request);
             }
         }
         if let Some(definition) = RuntimeId::parse(name)
@@ -925,19 +934,25 @@ impl ProfileRegistry {
     }
 
     /// The profiles that bind a package version the host cannot serve now:
-    /// the digest is not installed, or its root fails verification. They are
-    /// listed so `host.inspect` reports them unavailable instead of hiding
-    /// them. Sorted by name.
+    /// the digest is not installed, or its root fails verification, and the
+    /// presets of such a profile. They are listed so `host.inspect` reports
+    /// them unavailable instead of hiding them. Sorted by name.
     pub(crate) fn unavailable_pinned(&self) -> Vec<UnavailableProfile> {
         let Some(dir) = &self.dir else {
             return Vec::new();
         };
         let mut unavailable = Vec::new();
         for (stem, path) in profile_files(dir) {
-            let Ok(Some(binding)) = read_binding(dir, &stem, &path) else {
-                continue;
+            let base = match read_binding(dir, &stem, &path) {
+                Ok(Some(binding)) => binding.base,
+                // A preset launches from its parent's pin.
+                Ok(None) => preset::launch_source(self, dir, &stem)
+                    .ok()
+                    .filter(|source| source.preset.is_some() && source.raw.digest.is_some())
+                    .and_then(|source| RuntimeId::parse(&source.raw.base).ok()),
+                Err(_error) => None,
             };
-            let Some(base) = binding.base else {
+            let Some(base) = base else {
                 continue;
             };
             let refused = matches!(
@@ -986,15 +1001,36 @@ impl ProfileRegistry {
             .dir
             .as_deref()
             .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
-        resolve_profile_text(
-            name,
-            content,
-            dir,
-            &self.runtimes,
-            None,
-            OptionRequest::Defaults,
-        )
-        .map(|_agent| ())
+        self.resolve_text(dir, name, content, None, OptionRequest::Defaults)
+            .map(|_agent| ())
+    }
+
+    /// Resolves the candidate preset `name` with file text `content` through
+    /// the resolution a launch applies, and returns the agent its launch
+    /// would use: the parent with the preset's choices.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `invalid_profile` (or runtime) error a launch would return
+    /// for that text, and `invalid_profile` for a text that is no preset.
+    pub(crate) fn resolve_preset_candidate(
+        &self,
+        name: &str,
+        content: &str,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
+        let agent = self.resolve_text(dir, name, content, None, OptionRequest::Defaults)?;
+        if agent
+            .profile
+            .as_ref()
+            .is_none_or(|profile| profile.preset.is_none())
+        {
+            return Err(invalid_profile(name, "the text is not a preset"));
+        }
+        Ok(agent)
     }
 
     /// Resolves the profile `name` with file text `content` over `definition`,
@@ -1010,11 +1046,10 @@ impl ProfileRegistry {
             .dir
             .as_deref()
             .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
-        resolve_profile_text(
+        self.resolve_text(
+            dir,
             name,
             content,
-            dir,
-            &self.runtimes,
             Some(definition),
             OptionRequest::Defaults,
         )
@@ -1137,7 +1172,7 @@ impl ProfileRegistry {
         if !path.is_file() {
             return Ok(None);
         }
-        read_base_env(dir, name, &path).map(Some)
+        read_base_env(self, dir, name).map(Some)
     }
 
     /// [`Self::unresolved_base_env`] of every host profile whose `base` is
@@ -1153,8 +1188,8 @@ impl ProfileRegistry {
             return Vec::new();
         };
         let mut found = Vec::new();
-        for (stem, path) in profile_files(dir) {
-            match validate_name("agent", &stem).and_then(|()| read_base_env(dir, &stem, &path)) {
+        for (stem, _path) in profile_files(dir) {
+            match validate_name("agent", &stem).and_then(|()| read_base_env(self, dir, &stem)) {
                 Ok((base, env)) if base == *runtime_id => found.push((stem, env)),
                 Ok(_) => {}
                 Err(err) => {
@@ -1171,8 +1206,9 @@ impl ProfileRegistry {
 /// Secret-bearing: never logged or stored.
 pub(crate) type ProfileEnv = Vec<(String, String)>;
 
-/// Read the base and environment of the profile `name` at `path`, under the
-/// containment and owner-security checks of a profile load.
+/// Read the base and environment of the profile `name` in `dir`, under the
+/// containment and owner-security checks of a profile load; a preset reads
+/// its parent's, which its launches use.
 ///
 /// The file is parsed as a load parses it (unknown keys refused) and its
 /// `package`/`digest` pair and manifest override are validated as a load
@@ -1181,13 +1217,12 @@ pub(crate) type ProfileEnv = Vec<(String, String)>;
 /// the base runtime's definition (`[resume]`) are not applied: no definition
 /// exists for a base nothing serves.
 fn read_base_env(
+    registry: &ProfileRegistry,
     dir: &Path,
     name: &str,
-    path: &Path,
 ) -> Result<(RuntimeId, ProfileEnv), ProtocolError> {
-    let content = read_profile_text(dir, name, path)?;
-    let raw: RawProfile = toml::from_str(&content)
-        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+    let source = preset::launch_source(registry, dir, name)?;
+    let (name, raw) = (source.name.as_str(), *source.raw);
     let base = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
     parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
@@ -1479,38 +1514,70 @@ fn assert_contained(base_dir: &Path, candidate: &Path, name: &str) -> Result<(),
     Ok(())
 }
 
-fn load_profile(
-    name: &str,
-    path: &Path,
-    dir: &Path,
-    runtimes: &RuntimeHost,
-    pinned: Option<&Arc<RuntimeDefinition>>,
-    request: OptionRequest<'_>,
-) -> Result<ResolvedAgent, ProtocolError> {
-    let content = read_profile_text(dir, name, path)?;
-    resolve_profile_text(name, &content, dir, runtimes, pinned, request)
+/// A parsed full profile file: its name, text and keys.
+struct ParsedProfile<'a> {
+    /// The profile name.
+    name: &'a str,
+    /// The file text (the planned text when a release step rewrites it).
+    content: &'a str,
+    /// The parsed keys.
+    raw: RawProfile,
 }
 
-/// Resolves the profile `name` whose file text is `content`.
+impl ProfileRegistry {
+    /// Resolves the profile or preset `name` whose file text is `content`.
+    ///
+    /// This is everything a launch does with a profile after reading its
+    /// file, so a candidate text validated through it (a rewrite about to be
+    /// published) is accepted exactly when a launch would accept it.
+    /// `pinned` supplies the definition of the base runtime when the caller
+    /// already holds it, and `request` the option choices the resolution
+    /// takes.
+    fn resolve_text(
+        &self,
+        dir: &Path,
+        name: &str,
+        content: &str,
+        pinned: Option<&Arc<RuntimeDefinition>>,
+        request: OptionRequest<'_>,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        if u64::try_from(content.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
+            return Err(invalid_profile(name, "profile file is too large"));
+        }
+        match preset::parse(name, content)? {
+            preset::RawFile::Profile(raw) => resolve_raw(
+                ParsedProfile {
+                    name,
+                    content,
+                    raw: *raw,
+                },
+                dir,
+                &self.runtimes,
+                pinned,
+                request,
+                None,
+            ),
+            preset::RawFile::Preset(raw) => preset::resolve(self, dir, name, &raw, pinned, request),
+        }
+    }
+}
+
+/// Resolves the full profile `parsed`, read from the agents directory
+/// `dir`, over the base runtimes of `runtimes`.
 ///
-/// This is everything a launch does with a profile after reading its file, so
-/// a candidate text validated through it (a rewrite about to be published) is
-/// accepted exactly when a launch would accept it. `pinned` supplies the
-/// definition of the base runtime when the caller already holds it, and
-/// `request` the option choices the resolution takes.
-fn resolve_profile_text(
-    name: &str,
-    content: &str,
+/// `pinned` supplies the definition of the base runtime when the caller
+/// already holds it, `request` the option choices the resolution takes, and
+/// `preset` the preset the resolution launches the profile for, whose part
+/// joins the revision.
+fn resolve_raw(
+    parsed: ParsedProfile<'_>,
     dir: &Path,
     runtimes: &RuntimeHost,
     pinned: Option<&Arc<RuntimeDefinition>>,
     request: OptionRequest<'_>,
+    preset: Option<&PresetOf>,
 ) -> Result<ResolvedAgent, ProtocolError> {
-    if u64::try_from(content.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
-        return Err(invalid_profile(name, "profile file is too large"));
-    }
-    let raw: RawProfile = toml::from_str(content)
-        .map_err(|err| invalid_profile(name, &toml_diagnostic(content, &err)))?;
+    let ParsedProfile { name, content, raw } = parsed;
     // Presentation labels validate with the raw fields, before launch inputs
     // move them: an invalid label is a load error, not a launch default.
     let display_name = raw
@@ -1585,8 +1652,7 @@ fn resolve_profile_text(
     // Presentation labels never enter the revision: the digest sees the
     // text with the label keys removed, and the selected option choices
     // in place of the `[options]` table.
-    let revision_content = revision_text(content, &selection.revision())
-        .map_err(|detail| invalid_profile(name, &detail))?;
+    let revision_content = launch_revision_text(name, content, &selection.revision(), preset)?;
     let inputs = ProfileInputs::of(
         &revision_content,
         manifest_source.as_ref().map(|source| source.text.as_str()),
@@ -1612,8 +1678,32 @@ fn resolve_profile_text(
             options: declared_options,
             selected: selection.ids(),
             inputs,
+            preset: preset.cloned(),
         }),
     })
+}
+
+/// The revision text of profile `name` whose launch text is `text` (the
+/// file text, or its text with a pin transform applied): [`revision_text`]
+/// of it with the `selected` choices, then the part of the `preset` the
+/// launch is for. Every revision site builds it in this one order.
+fn launch_revision_text<'a>(
+    name: &str,
+    text: &'a str,
+    selected: &options::SelectedChoices,
+    preset: Option<&PresetOf>,
+) -> Result<std::borrow::Cow<'a, str>, ProtocolError> {
+    let revision =
+        revision_text(text, selected).map_err(|detail| invalid_profile(name, &detail))?;
+    let Some(preset) = preset else {
+        return Ok(revision);
+    };
+    let suffix = preset
+        .revision_suffix()
+        .map_err(|detail| invalid_profile(name, &detail))?;
+    let mut text = revision.into_owned();
+    text.push_str(&suffix);
+    Ok(std::borrow::Cow::Owned(text))
 }
 
 /// Variables the launch composes itself; a profile slot on one of them would
@@ -1955,10 +2045,12 @@ mod bind;
 mod compose;
 pub(crate) mod options;
 pub(crate) mod presentation;
+mod preset;
 pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
-pub(crate) use compose::{compose_profile, ProfileSpec};
+pub(crate) use compose::{compose_preset, compose_profile, PresetSpec, ProfileSpec};
 pub(crate) use options::OptionRequest;
 pub(crate) use presentation::{display_name_of, revision_text, LabelRead};
+pub(crate) use preset::{is_preset, PresetOf};
 
 #[cfg(test)]
 mod pin_tests;

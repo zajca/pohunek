@@ -10,9 +10,10 @@
 // Rust guideline compliant 2026-10-04
 
 use protocol::{
-    PackageBindProfileParams, PackageCreateProfileParams, PackageDoctorParams, PackageErrorKind,
-    PackageInspectParams, PackageInstallParams, PackageLinkParams, PackageSelectParams,
-    PackageSetEnabledParams, PackageUninstallParams, ProtocolError, Request, Response,
+    PackageBindProfileParams, PackageCreatePresetParams, PackageCreateProfileParams,
+    PackageDoctorParams, PackageErrorKind, PackageInspectParams, PackageInstallParams,
+    PackageLinkParams, PackageSelectParams, PackageSetEnabledParams, PackageUninstallParams,
+    ProtocolError, Request, Response,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
@@ -157,6 +158,26 @@ pub(super) async fn handle_package_bind_profile(
         Ok(params) => respond(
             request,
             state.sessions.packages().package_bind_profile(params).await,
+        ),
+        Err(error) => error_value(request, error),
+    }
+}
+
+pub(super) async fn handle_package_create_preset(
+    request: &Request,
+    state: &DaemonState,
+) -> Response {
+    if let Err(response) = require_local(request, state) {
+        return response;
+    }
+    match parse_params::<PackageCreatePresetParams>(request) {
+        Ok(params) => respond(
+            request,
+            state
+                .sessions
+                .packages()
+                .package_create_preset(params)
+                .await,
         ),
         Err(error) => error_value(request, error),
     }
