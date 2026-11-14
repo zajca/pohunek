@@ -731,6 +731,25 @@ mod test_support {
                 tasks: Arc::new(Mutex::new(HashMap::new())),
             }
         }
+
+        /// Holds the terminal journal commit of the running worker of
+        /// `session_id`; see [`ServerHandle::hold_terminal_commit`].
+        ///
+        /// # Panics
+        ///
+        /// Panics when no worker of the session is running.
+        pub async fn hold_terminal_commit(&self, session_id: &str) {
+            let tasks = self.tasks.lock().await;
+            let (_, worker) = tasks
+                .iter()
+                .find(|(id, worker)| {
+                    !worker.serve.is_finished()
+                        && WorkerKey::from_service_id(id)
+                            .is_ok_and(|key| key.session_id() == session_id)
+                })
+                .expect("a running worker of the session");
+            worker.server.hold_terminal_commit();
+        }
     }
 
     /// Whether any generation of `session_id` still has a running task.

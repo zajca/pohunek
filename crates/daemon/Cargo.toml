@@ -69,6 +69,8 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 # debounce coordinator tests advance time deterministically instead of sleeping.
 tokio = { workspace = true, features = ["test-util"] }
 pohunek-test-support = { workspace = true, features = ["catalog"] }
+# The in-process worker's terminal-commit hold (`InProcessWorkerLauncher`).
+pohunek-session-worker = { workspace = true, features = ["test-util"] }
 # Persisted-shape guard helpers; a dev-dependency only, never linked into the daemon.
 pohunek-shape-guard = { workspace = true }
 wait-timeout = "0.2"

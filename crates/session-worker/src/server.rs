@@ -484,6 +484,8 @@ impl Server {
             terminate: CancellationToken::new(),
             #[cfg(test)]
             starting_gate: Mutex::new(None),
+            #[cfg(feature = "test-util")]
+            terminal_commit_hold: watch::channel(false).0,
         });
         Ok(Self {
             listener,
@@ -602,6 +604,17 @@ impl ServerHandle {
         self.shared.tasks.wait().await;
         self.shared.journal.wait_for_writes().await;
     }
+
+    /// Holds the runtime's terminal journal commit open (M-TEST-UTIL).
+    ///
+    /// The commit of an ended runtime waits until the hold is released. The
+    /// next stop that reaches its wait for that commit waits no time, so it is
+    /// refused with [`protocol::TERMINAL_COMMIT_PENDING`], and releases the
+    /// hold as it is refused; a later stop finds the commit landing.
+    #[cfg(feature = "test-util")]
+    pub fn hold_terminal_commit(&self) {
+        self.shared.terminal_commit_hold.send_replace(true);
+    }
 }
 
 /// Binds and runs one worker server.
@@ -645,6 +658,10 @@ struct Shared {
     /// Pauses `initialize` between the `Starting` commit and the child spawn.
     #[cfg(test)]
     starting_gate: Mutex<Option<StartingGate>>,
+    /// Whether the terminal journal commit is held; see
+    /// [`ServerHandle::hold_terminal_commit`].
+    #[cfg(feature = "test-util")]
+    terminal_commit_hold: watch::Sender<bool>,
 }
 
 /// Test-only pause point that makes the transient `Starting` phase observable.
@@ -1986,14 +2003,16 @@ async fn stop_request(
         .await
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     let committed = tokio::time::timeout(
-        shared.config.terminal_commit_wait_timeout,
+        terminal_commit_wait(shared),
         wait_for_terminal_commit(shared),
     )
-    .await
-    .map_err(|_elapsed| {
+    .await;
+    #[cfg(feature = "test-util")]
+    shared.terminal_commit_hold.send_replace(false);
+    let committed = committed.map_err(|_elapsed| {
         control_error_message(
             ControlCode::RuntimeFault,
-            "terminal journal commit is still pending; retry stop",
+            protocol::TERMINAL_COMMIT_PENDING,
             true,
         )
     })??;
@@ -2040,6 +2059,16 @@ fn prepare_stop(state: &mut State) -> Result<StopPreparation, ControlError> {
         grace: state.stop_grace,
         kill_reap: state.kill_reap_deadline,
     })
+}
+
+/// How long a stop waits for the terminal journal commit: the configured
+/// wait, or no time while a test holds the commit.
+fn terminal_commit_wait(shared: &Shared) -> Duration {
+    #[cfg(feature = "test-util")]
+    if *shared.terminal_commit_hold.borrow() {
+        return Duration::ZERO;
+    }
+    shared.config.terminal_commit_wait_timeout
 }
 
 async fn wait_for_terminal_commit(shared: &Shared) -> Result<ExitStatus, ControlError> {
@@ -2970,6 +2999,12 @@ async fn commit_runtime_completion(
     exited_at: &str,
     next_output_offset: u64,
 ) -> Result<Duration, WorkerError> {
+    #[cfg(feature = "test-util")]
+    {
+        let mut hold = shared.terminal_commit_hold.subscribe();
+        // `Shared` owns the sender, so the wait ends only on a release.
+        let _ = hold.wait_for(|held| !*held).await;
+    }
     let mut state = shared.state.lock().await;
     let mut journal = state.journal.clone();
     journal.phase = JournalPhase::Terminal;

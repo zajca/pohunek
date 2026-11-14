@@ -67,6 +67,7 @@ mod lifecycle_queue;
 mod muse_hook;
 mod native_recovery;
 mod native_supersede;
+mod pending_terminal_commit;
 mod process_evidence;
 mod prompt_accepted;
 mod session_tree;
