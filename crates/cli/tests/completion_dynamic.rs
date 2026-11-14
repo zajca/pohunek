@@ -228,6 +228,17 @@ fn profile_completion_reads_private_agent_profiles_through_the_cli() {
         ["pohunek", "integration", "update", "--profile", "wo"].as_slice(),
         ["pohunek", "integration", "uninstall", "--profile", "wo"].as_slice(),
         ["pohunek", "plugin", "profile", "migrate", "wo"].as_slice(),
+        ["pohunek", "plugin", "profile", "fold", "wo"].as_slice(),
+        [
+            "pohunek",
+            "plugin",
+            "profile",
+            "create",
+            "review",
+            "--preset-of",
+            "wo",
+        ]
+        .as_slice(),
     ] {
         let output = complete_bash(&env, words);
         assert!(output.status.success(), "{words:?}: {output:?}");

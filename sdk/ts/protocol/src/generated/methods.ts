@@ -30,6 +30,7 @@ import type {
   PackageBindProfileParams,
   PackageBindProfileResult,
   PackageChangeResult,
+  PackageCreatePresetParams,
   PackageCreateProfileParams,
   PackageCreateProfileResult,
   PackageDoctorParams,
@@ -125,6 +126,7 @@ export interface Methods {
   "notification.create": { params: NotificationCreateParams; output: NotificationCreateResult };
   "notification.list": { params: NotificationListParams; output: NotificationListResult };
   "package.bind_profile": { params: PackageBindProfileParams; output: PackageBindProfileResult };
+  "package.create_preset": { params: PackageCreatePresetParams; output: PackageCreateProfileResult };
   "package.create_profile": { params: PackageCreateProfileParams; output: PackageCreateProfileResult };
   "package.doctor": { params: PackageDoctorParams; output: PackageDoctorResult };
   "package.inspect": { params: PackageInspectParams; output: PackageInspectResult };
@@ -189,6 +191,7 @@ export const METHOD_NAMES = [
   "notification.create",
   "notification.list",
   "package.bind_profile",
+  "package.create_preset",
   "package.create_profile",
   "package.doctor",
   "package.inspect",

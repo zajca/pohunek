@@ -1,5 +1,6 @@
-//! `package.create_profile`: writes a new host agent profile pinned to the
-//! selected package of its base runtime.
+//! `package.create_profile` and `package.create_preset`: write a new host
+//! agent profile pinned to the selected package of its base runtime, or a
+//! preset of an existing profile.
 //!
 //! The daemon composes the text, validates it through the resolution a launch
 //! uses, and publishes it under the exclusive package lifecycle authority that
@@ -9,28 +10,35 @@
 //!
 //! The only `[env]` entry a composed profile can hold is the base runtime's
 //! config home variable, taken from its descriptor. Arguments and the home path
-//! pass the credential check before anything is written, and no diagnostic
-//! carries a request value.
+//! pass the credential check before anything is written, the `[options]`
+//! tables pass the load rules of a launch, and no diagnostic carries a request
+//! value. A preset holds only its parent and choices and is validated through
+//! the preset resolution of a launch.
 
-// Rust guideline compliant 2026-11-11
+// Rust guideline compliant 2026-11-14
 
 use std::sync::Arc;
 
 use protocol::{
-    PackageCreateProfileParams, PackageCreateProfileResult, PackageCreateProfileStatus,
-    PackageErrorKind, ProfileDigest,
+    PackageCreatePresetParams, PackageCreateProfileParams, PackageCreateProfileResult,
+    PackageCreateProfileStatus, PackageErrorKind, ProfileDigest, MAX_PROFILE_OPTIONS,
 };
 use sha2::{Digest as _, Sha256};
+use toml_edit::{DocumentMut, Table};
 use tracing::warn;
 
 use super::bind::{bind_kind, ensure_coexists, resolve_target, unusable, Target};
 use super::{read_state, Context, PackageService, RetainedPins};
 use crate::agent::host::{ConfigHome, RuntimeDefinition};
 use crate::agent::{
-    compose_profile, credential_arg_problem, credential_literal_problem, env_name_problem, BindDir,
-    BindError, Pin, ProfileFile, ProfileRegistry, ProfileSpec,
+    compose_preset, compose_profile, credential_arg_problem, credential_literal_problem,
+    env_name_problem, BindDir, BindError, Pin, PresetSpec, ProfileFile, ProfileRegistry,
+    ProfileSpec, MAX_PROFILE_BYTES,
 };
 use crate::project::config::validate_name;
+
+/// Root key of the options text `package.create_profile` accepts.
+const OPTIONS_KEY: &str = "options";
 
 /// Longest accepted home path in bytes; the usual `PATH_MAX`.
 const HOME_MAX_BYTES: usize = 4096;
@@ -57,6 +65,29 @@ impl PackageService {
         let replaced = params.replace.is_some().then(|| params.profile.clone());
         self.package_transaction_excluding(replaced, move |context, retained| {
             create_profile(context, &profiles, retained, &params)
+        })
+        .await
+    }
+
+    /// Creates the host agent preset `params.profile` of `params.parent`.
+    ///
+    /// The preset text holds only the parent, the choices and `locked`, and
+    /// is validated through the preset resolution of a launch. An existing
+    /// name is replaced only when `params.replace` is the digest of its
+    /// current file. A dry run reports the text and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageErrorKind`] naming the first failed check; on every
+    /// error no profile file was written or changed.
+    pub async fn package_create_preset(
+        &self,
+        params: PackageCreatePresetParams,
+    ) -> Result<PackageCreateProfileResult, PackageErrorKind> {
+        let profiles = self.sessions.profiles().clone();
+        let replaced = params.replace.is_some().then(|| params.profile.clone());
+        self.package_transaction_excluding(replaced, move |_context, _retained| {
+            create_preset(&profiles, &params)
         })
         .await
     }
@@ -129,6 +160,11 @@ fn create_profile(
         None => None,
     };
     let home = checked_home(params, definition.as_deref(), name)?;
+    let options = params
+        .options_toml
+        .as_deref()
+        .map(|text| options_table(name, text))
+        .transpose()?;
     let pin = target.as_ref().map(pin_of);
     let spec = ProfileSpec {
         base: params.base.clone(),
@@ -136,6 +172,7 @@ fn create_profile(
         home,
         args: params.args.clone(),
         secret_env: params.secret_env.clone(),
+        options,
     };
     let text = compose_profile(&spec);
     if let Some(pin) = &pin {
@@ -146,24 +183,13 @@ fn create_profile(
         None => profiles.validate_builtin_candidate(name, &text),
     };
     validated.map_err(|error| unusable(name, &error.msg))?;
-    let existing = match &dir {
-        Some(dir) => dir
-            .read_existing(name)
-            .map_err(|error| bind_kind(name, error))?,
-        None => None,
-    };
-    let previous = previous_digest(existing.as_ref(), params.replace.as_ref())?;
-    let status = if params.dry_run {
-        PackageCreateProfileStatus::Preview
-    } else if existing.is_some() {
-        PackageCreateProfileStatus::Replaced
-    } else {
-        PackageCreateProfileStatus::Created
-    };
-    if !params.dry_run {
-        let dir = dir.as_ref().ok_or(PackageErrorKind::RegistryFailed)?;
-        publish(dir, name, existing.as_ref(), &text)?;
-    }
+    let (status, previous) = write_file(
+        dir.as_ref(),
+        name,
+        params.replace.as_ref(),
+        params.dry_run,
+        &text,
+    )?;
     let home_env = spec.home.map(|(env, _path)| env);
     let (package, runtime) = match target {
         Some(Target { inspected, runtime }) => {
@@ -186,6 +212,112 @@ fn create_profile(
         text,
         previous,
     })
+}
+
+/// Validates, composes and publishes the preset under the lifecycle
+/// authority the caller holds.
+fn create_preset(
+    profiles: &ProfileRegistry,
+    params: &PackageCreatePresetParams,
+) -> Result<PackageCreateProfileResult, PackageErrorKind> {
+    let name = params.profile.as_str();
+    if let Err(error) = validate_name("agent", name) {
+        return Err(unusable(name, &error.msg));
+    }
+    // The file the preset would replace is the parent it names.
+    if params.parent == params.profile {
+        return Err(unusable(name, "a preset cannot be its own parent"));
+    }
+    if params.options.len() > MAX_PROFILE_OPTIONS {
+        return Err(unusable(
+            name,
+            "the preset selects more options than a profile declares",
+        ));
+    }
+    let dir = profiles
+        .open_for_create(!params.dry_run)
+        .map_err(|error| bind_kind(name, error))?;
+    let text = compose_preset(&PresetSpec {
+        parent: &params.parent,
+        options: &params.options,
+        locked: params.locked,
+    });
+    let agent = profiles
+        .resolve_preset_candidate(name, &text)
+        .map_err(|error| unusable(name, &error.msg))?;
+    let (status, previous) = write_file(
+        dir.as_ref(),
+        name,
+        params.replace.as_ref(),
+        params.dry_run,
+        &text,
+    )?;
+    Ok(PackageCreateProfileResult {
+        status,
+        profile: name.to_owned(),
+        base: agent.base,
+        package: None,
+        runtime: None,
+        home_env: None,
+        file_digest: file_digest(text.as_bytes()),
+        text,
+        previous,
+    })
+}
+
+/// The `[options]` table of the options text `text` for profile `name`.
+///
+/// The text must be TOML whose only root key is `options`, a table; its
+/// tables are validated later with the load rules of the composed profile.
+/// Diagnostics never quote the text.
+fn options_table(name: &str, text: &str) -> Result<Table, PackageErrorKind> {
+    if u64::try_from(text.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
+        return Err(unusable(name, "the options text is too large"));
+    }
+    let mut document: DocumentMut = text
+        .parse()
+        .map_err(|_error| unusable(name, "the options text is not valid TOML"))?;
+    let root = document.as_table_mut();
+    let only_options = root.len() == 1 && root.contains_key(OPTIONS_KEY);
+    match root.remove(OPTIONS_KEY) {
+        Some(toml_edit::Item::Table(options)) if only_options => Ok(options),
+        _ => Err(unusable(
+            name,
+            "the options file holds only [options] tables",
+        )),
+    }
+}
+
+/// Writes `text` as the profile `name` in `dir`, or replaces the existing
+/// file whose digest is `replace`, and reports what the call did and the
+/// replaced digest. A dry run applies the existence rules and writes
+/// nothing.
+fn write_file(
+    dir: Option<&BindDir>,
+    name: &str,
+    replace: Option<&ProfileDigest>,
+    dry_run: bool,
+    text: &str,
+) -> Result<(PackageCreateProfileStatus, Option<ProfileDigest>), PackageErrorKind> {
+    let existing = match dir {
+        Some(dir) => dir
+            .read_existing(name)
+            .map_err(|error| bind_kind(name, error))?,
+        None => None,
+    };
+    let previous = previous_digest(existing.as_ref(), replace)?;
+    let status = if dry_run {
+        PackageCreateProfileStatus::Preview
+    } else if existing.is_some() {
+        PackageCreateProfileStatus::Replaced
+    } else {
+        PackageCreateProfileStatus::Created
+    };
+    if !dry_run {
+        let dir = dir.ok_or(PackageErrorKind::RegistryFailed)?;
+        publish(dir, name, existing.as_ref(), text)?;
+    }
+    Ok((status, previous))
 }
 
 fn pin_of(target: &Target) -> Pin {

@@ -1005,6 +1005,34 @@ impl ProfileRegistry {
             .map(|_agent| ())
     }
 
+    /// Resolves the candidate preset `name` with file text `content` through
+    /// the resolution a launch applies, and returns the agent its launch
+    /// would use: the parent with the preset's choices.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `invalid_profile` (or runtime) error a launch would return
+    /// for that text, and `invalid_profile` for a text that is no preset.
+    pub(crate) fn resolve_preset_candidate(
+        &self,
+        name: &str,
+        content: &str,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
+        let agent = self.resolve_text(dir, name, content, None, OptionRequest::Defaults)?;
+        if agent
+            .profile
+            .as_ref()
+            .is_none_or(|profile| profile.preset.is_none())
+        {
+            return Err(invalid_profile(name, "the text is not a preset"));
+        }
+        Ok(agent)
+    }
+
     /// Resolves the profile `name` with file text `content` over `definition`,
     /// the way [`Self::validate_candidate`] does, and returns the agent a launch
     /// of that text would use.
@@ -2019,7 +2047,7 @@ pub(crate) mod options;
 pub(crate) mod presentation;
 mod preset;
 pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
-pub(crate) use compose::{compose_profile, ProfileSpec};
+pub(crate) use compose::{compose_preset, compose_profile, PresetSpec, ProfileSpec};
 pub(crate) use options::OptionRequest;
 pub(crate) use presentation::{display_name_of, revision_text, LabelRead};
 pub(crate) use preset::{is_preset, PresetOf};

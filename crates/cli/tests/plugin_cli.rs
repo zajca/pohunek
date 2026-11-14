@@ -877,6 +877,26 @@ fn daemon_creating_profiles(method: &str, params: &Value) -> Value {
     }
 }
 
+/// A daemon that serves `package.create_preset` and records what it receives.
+fn daemon_creating_presets(method: &str, params: &Value) -> Value {
+    match method {
+        "host.inspect" => {
+            let mut value = capabilities(true);
+            value["package_create_profile_supported"] = json!(true);
+            value["package_create_preset_supported"] = json!(true);
+            value
+        }
+        "package.create_preset" => json!({
+            "status": "preview",
+            "profile": params["profile"],
+            "base": "pi",
+            "text": "[preset]\nparent = \"work\"\n",
+            "file_digest": format!("sha256:{}", "d".repeat(64)),
+        }),
+        _ => daemon_serving_pi(method, params),
+    }
+}
+
 /// A daemon that predates the previous-pin check of a profile bind.
 fn daemon_without_the_pin_check(method: &str, params: &Value) -> Value {
     match method {
@@ -1150,6 +1170,94 @@ fn profile_create_against_a_daemon_without_the_method_sends_nothing() {
         "profile_create_unsupported"
     );
     let recorded = daemon.finish();
+    assert!(
+        recorded
+            .iter()
+            .all(|(method, _)| method != "package.create_profile"),
+        "{recorded:?}"
+    );
+}
+
+/// Row 21 of #2149: a daemon that serves `package.create_profile` but
+/// predates `options_toml` or `package.create_preset` is told apart before
+/// the create: the CLI fails with its own code and sends neither call.
+#[test]
+fn profile_create_options_or_preset_against_an_older_daemon_sends_nothing() {
+    let options_text =
+        "[options.mode]\nlabel = \"Mode\"\ndefault = \"a\"\nchoices.a = { label = \"A\" }\n";
+    for (preset, code, unsent) in [
+        (
+            false,
+            "profile_create_options_unsupported",
+            "package.create_profile",
+        ),
+        (
+            true,
+            "profile_create_preset_unsupported",
+            "package.create_preset",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let options = fixture.root.join("options.toml");
+        std::fs::write(&options, options_text).expect("write the options file");
+        let options = options.to_str().expect("a UTF-8 path").to_owned();
+        let daemon = fixture.serve(daemon_creating_profiles);
+        let mut arguments = vec!["plugin", "profile", "create", "fresh", "--json"];
+        if preset {
+            arguments.extend(["--preset-of", "work", "--opt", "mode=a"]);
+        } else {
+            arguments.extend(["--base", "pi", "--options-file", &options]);
+        }
+        let output = fixture.run(&arguments);
+        assert_eq!(output.status.code(), Some(1), "{code}");
+        assert_eq!(stdout_json(&output)["err"]["code"], code);
+        let recorded = daemon.finish();
+        assert!(
+            recorded.iter().all(|(method, _)| method != unsent),
+            "{code}: {recorded:?}"
+        );
+    }
+}
+
+/// `--preset-of` sends `package.create_preset` with the parent, the
+/// selection and `locked`, and nothing of a full profile.
+#[test]
+fn profile_create_preset_sends_the_parent_and_the_selection() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_creating_presets);
+
+    let output = fixture.run(&[
+        "plugin",
+        "profile",
+        "create",
+        "review",
+        "--preset-of",
+        "work",
+        "--opt",
+        "model=sonnet",
+        "--opt",
+        "effort=med",
+        "--locked",
+        "--dry-run",
+        "--json",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let recorded = daemon.finish();
+    let create = recorded
+        .iter()
+        .find(|(method, _)| method == "package.create_preset")
+        .expect("the create call");
+    assert_eq!(
+        create.1,
+        json!({
+            "profile": "review",
+            "parent": "work",
+            "options": { "effort": "med", "model": "sonnet" },
+            "locked": true,
+            "dry_run": true
+        })
+    );
     assert!(
         recorded
             .iter()

@@ -37,8 +37,12 @@ export type PackageCreateProfileResult = {
    */
   home_env?: string;
   /**
-   * The exact bytes of the profile file. The only values in it are the home
-   * path, arguments that passed the credential check and secret names.
+   * The exact bytes of the profile file. Its values are the home path,
+   * arguments that passed the credential check, secret names and, with
+   * `options_toml`, the `[options]` tables: labels, choice arguments and
+   * choice `env` values that passed the load rules. A preset's text holds
+   * its labels, its parent, its choices and `locked`. The choice `env`
+   * values are profile values: like the file itself, never log them.
    */
   text: string;
   /**

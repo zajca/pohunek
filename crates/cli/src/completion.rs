@@ -273,7 +273,8 @@ const INTEGRATION_PROFILE_ARG: &str = "home_profile";
 /// Id of the `--spawned-by` argument of `session list`.
 const SPAWNED_BY_ARG: &str = "spawned_by";
 
-/// Completes the `<NAME>` argument of `pohunek plugin profile migrate` and the
+/// Completes the `<NAME>` arguments of the `pohunek plugin profile`
+/// commands, the `--preset-of` parent of `plugin profile create` and the
 /// `--profile` value of the `integration` commands with the profile files in
 /// the agents directory.
 ///
@@ -472,7 +473,7 @@ fn with_plugin_completers(command: Command, context: &CompletionContext) -> Comm
             "digest" => arg.add(ArgValueCompleter::new(DigestCompleter {
                 package: context.plugin_package.clone(),
             })),
-            "name" => arg.add(ArgValueCompleter::new(ProfileNameCompleter)),
+            "name" | "preset_of" => arg.add(ArgValueCompleter::new(ProfileNameCompleter)),
             _ => arg,
         })
         .mut_subcommands(|subcommand| with_plugin_completers(subcommand, context))

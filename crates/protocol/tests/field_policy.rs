@@ -458,6 +458,7 @@ const ROWS: &[Row] = &[
     row!(PackageUninstallParams, Strict, PARAMS_STRICT),
     row!(PackageBindProfileParams, Strict, PARAMS_STRICT),
     row!(PackageCreateProfileParams, Strict, PARAMS_STRICT),
+    row!(PackageCreatePresetParams, Strict, PARAMS_STRICT),
     row!(PackageInspectParams, Strict, PARAMS_STRICT),
     row!(PackageDoctorParams, Strict, PARAMS_STRICT),
     row!(SessionScreenParams, Strict, PARAMS_STRICT),

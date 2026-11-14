@@ -321,6 +321,22 @@ pub struct HostCapabilities {
     /// only when this is `true`. `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub package_create_profile_supported: bool,
+    /// Whether `package.create_profile` accepts `options_toml`, the
+    /// `[options]` tables of the new profile.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`;
+    /// its params are strict and would reject `options_toml`, so a client
+    /// sends the field only when this is `true`. `false` is likewise omitted
+    /// on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub package_create_profile_options_supported: bool,
+    /// Whether the daemon serves `package.create_preset`.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; it
+    /// answers the method with `method_not_found`, so a client sends the call
+    /// only when this is `true`. `false` is likewise omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub package_create_preset_supported: bool,
     /// Whether the daemon implements the agent skill install:
     /// `integration.install` accepts `skill`, `integration.uninstall` accepts
     /// `skill_only`, and `integration.status` reports a `skill` per home.

@@ -635,6 +635,21 @@ pub(crate) enum Error {
     #[error("the local daemon is too old for `plugin profile create`")]
     ProfileCreateUnsupported,
 
+    /// The daemon predates `options_toml` on `package.create_profile`.
+    #[error("the local daemon is too old for `plugin profile create --options-file`")]
+    ProfileCreateOptionsUnsupported,
+
+    /// The daemon predates `package.create_preset`.
+    #[error("the local daemon is too old for `plugin profile create --preset-of`")]
+    ProfileCreatePresetUnsupported,
+
+    /// The `--options-file` cannot be used.
+    #[error("the options file cannot be used: {detail}")]
+    OptionsFile {
+        /// What is wrong, never the file content.
+        detail: String,
+    },
+
     /// A `plugin profile fold` input cannot be read or is not a full
     /// profile file.
     #[error("cannot fold profile {name}: {detail}")]
@@ -717,6 +732,9 @@ impl Error {
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
             Self::ProfileTarget { .. } => "profile_target_invalid",
             Self::ProfileCreateUnsupported => "profile_create_unsupported",
+            Self::ProfileCreateOptionsUnsupported => "profile_create_options_unsupported",
+            Self::ProfileCreatePresetUnsupported => "profile_create_preset_unsupported",
+            Self::OptionsFile { .. } => "profile_options_file_invalid",
             Self::FoldInput { .. } => "fold_input_invalid",
             Self::FoldIncompatible { .. } => "fold_incompatible",
             Self::FoldAmbiguousArgs { .. } => "fold_ambiguous_args",
@@ -807,7 +825,14 @@ impl Error {
             Self::ProfileDirectory { .. } => {
                 "the agents directory must be owned by you and not group- or world-writable"
             }
-            Self::ProfileCreateUnsupported => "run `pohunek service upgrade`, then repeat the command",
+            Self::ProfileCreateUnsupported
+            | Self::ProfileCreateOptionsUnsupported
+            | Self::ProfileCreatePresetUnsupported => {
+                "run `pohunek service upgrade`, then repeat the command"
+            }
+            Self::OptionsFile { .. } => {
+                "pass a regular TOML file of at most 1 MiB whose only root key is `options`"
+            }
             Self::ProfileTarget { .. } => {
                 "list installed packages with `pohunek plugin list` and pass --digest"
             }

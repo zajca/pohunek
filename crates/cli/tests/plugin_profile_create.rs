@@ -211,6 +211,49 @@ async fn create_writes_a_pinned_private_profile_with_the_descriptor_home_variabl
     harness.stop().await;
 }
 
+/// `--options-file` on a package-served base: the options join the pinned
+/// profile after `secret_env` and before the `[env]` table that holds the
+/// config home, in the bytes the daemon writes.
+#[tokio::test]
+async fn create_writes_options_before_the_config_home() {
+    let harness = Harness::start().await;
+    install(&harness).await;
+    let home = harness.home("work-home");
+    let options = harness.env.root().join("options.toml");
+    fs::write(
+        &options,
+        "[options.mode]\nlabel = \"Mode\"\ndefault = \"a\"\n\
+         choices.a = { label = \"A\", args = [\"--mode=a\"] }\n",
+    )
+    .expect("write the options file");
+    let (code, created) = harness
+        .json(&[
+            "plugin",
+            "profile",
+            "create",
+            "work",
+            "--base",
+            RUNTIME,
+            "--home",
+            &home,
+            "--secret-env",
+            "WORK_KEY",
+            "--options-file",
+            path_str(&options),
+        ])
+        .await;
+    assert_eq!(code, 0, "{created}");
+    let text = fs::read_to_string(harness.agents.join("work.toml")).expect("read the profile");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} in {text}"))
+    };
+    assert!(at("secret_env") < at("[options.mode]"), "{text}");
+    assert!(at("[options.mode]") < at("[env]"), "{text}");
+    assert!(text.contains(&format!("{HOME_ENV} = ")), "{text}");
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn create_makes_a_missing_agents_directory_private() {
     let harness = Harness::start().await;

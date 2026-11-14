@@ -308,6 +308,17 @@ use changes its revision, so a resume then needs `--accept-profile-change`.
 `--dry-run` prints the profile and its digest and writes nothing. The command is
 local only.
 
+`--options-file <path>` adds launch options: the path must name a regular
+file (not a symbolic link, FIFO or device), the file's only root key is
+`options`, and its `[options.<id>]` tables are written after `secret_env` and
+validated with the load rules of [Launch options](#launch-options); a refused
+table is `package_profile_unusable` and nothing is written.
+`pohunek plugin profile create <name> --preset-of <parent> [--opt
+OPTION=CHOICE]... [--locked]` (the wire method `package.create_preset`) writes
+a [preset](#presets) instead, validated as a launch resolves it, with the same
+`--replace` and `--dry-run` rules. `plugin profile list` shows a preset with
+the state `preset` and the detail `preset of <parent>`.
+
 ## Presentation labels
 
 A profile may carry two optional top-level keys that only change how it is

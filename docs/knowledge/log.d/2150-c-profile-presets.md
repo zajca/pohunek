@@ -15,3 +15,9 @@
 - `pohunek plugin profile fold <name>... --into <parent> --dry-run [--json]`
   proposes a parent with `[options]` and one preset per input, with env
   values replaced by placeholders and credential-looking arguments refused.
+- `pohunek plugin profile create` takes `--options-file <path>` (`options_toml`
+  on `package.create_profile`, behind `package_create_profile_options_supported`)
+  and `--preset-of <parent> [--opt OPTION=CHOICE]... [--locked]`, which writes a
+  preset through the new local-only `package.create_preset` method (behind
+  `package_create_preset_supported`). `plugin profile list` shows a preset with
+  the state `preset` and `preset_of` in `--json`.

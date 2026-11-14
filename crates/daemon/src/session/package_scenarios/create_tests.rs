@@ -25,6 +25,7 @@ fn create(base: &str) -> PackageCreateProfileParams {
         home: None,
         args: Vec::new(),
         secret_env: Vec::new(),
+        options_toml: None,
         replace: None,
         dry_run: false,
     }

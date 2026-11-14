@@ -85,6 +85,10 @@ fn package_methods(digest: &PackageDigest) -> Vec<(&'static str, Value)> {
             method::PACKAGE_CREATE_PROFILE,
             json!({ "profile": "work", "base": "shell", "dry_run": true }),
         ),
+        (
+            method::PACKAGE_CREATE_PRESET,
+            json!({ "profile": "review", "parent": "work", "dry_run": true }),
+        ),
     ]
 }
 
