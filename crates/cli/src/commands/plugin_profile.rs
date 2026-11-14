@@ -91,6 +91,12 @@ pub(crate) enum ProfileAction {
         /// Emit machine-readable JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Show every profile, including `agent` and `hidden` audiences.
+        /// By default only `owner` profiles (absent or `owner` audience)
+        /// show; an `unreadable` file always shows because its audience
+        /// cannot be known.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Pin a profile to an installed package; the daemon rewrites only its
@@ -117,7 +123,7 @@ impl ProfileAction {
     /// Whether the subcommand requested `--json` output.
     pub(crate) fn wants_json(&self) -> bool {
         match self {
-            Self::List { json } => *json,
+            Self::List { json, .. } => *json,
             Self::Migrate(args) => args.json,
             Self::Create(args) => args.json,
         }
@@ -239,8 +245,42 @@ struct ProfileHead {
     base: RuntimeId,
     package: Option<PackageId>,
     digest: Option<PackageDigest>,
+    display_name: Option<String>,
+    audience: Option<String>,
 }
 
+/// Validate a profile `display_name` value with the daemon's rule: trimmed
+/// free text within the byte bound, with no hidden or separator character.
+/// Diagnostics are fixed and never echo the value.
+fn validate_display_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("display_name must not be empty".to_owned());
+    }
+    if trimmed.len() > protocol::MAX_PROFILE_DISPLAY_NAME_BYTES {
+        return Err(format!(
+            "display_name exceeds {} bytes",
+            protocol::MAX_PROFILE_DISPLAY_NAME_BYTES
+        ));
+    }
+    if trimmed
+        .chars()
+        .any(pohunek_worker_protocol::is_hidden_or_separator)
+    {
+        return Err(
+            "display_name must not contain control, separator or format characters".to_owned(),
+        );
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Validate a profile `audience` value with the daemon's fixed message.
+fn validate_audience(value: &str) -> Result<String, String> {
+    match value {
+        "owner" | "agent" | "hidden" => Ok(value.to_owned()),
+        _ => Err("audience must be one of owner, agent, hidden".to_owned()),
+    }
+}
 /// Describe a TOML parse failure by message and line only.
 ///
 /// The error's own `Display` quotes the offending source line, which can be an
@@ -258,7 +298,8 @@ fn toml_diagnostic(content: &str, error: &TomlError) -> String {
     }
 }
 
-/// Read `base`, `package` and `digest` from profile text.
+/// Read `base`, `package`, `digest` and the presentation labels from profile
+/// text.
 ///
 /// Diagnostics name keys and lines, never values.
 fn parse_head(text: &str) -> Result<ProfileHead, String> {
@@ -275,20 +316,34 @@ fn parse_head(text: &str) -> Result<ProfileHead, String> {
         .map(PackageDigest::parse)
         .transpose()
         .map_err(|_invalid| "`digest` is not a valid package digest")?;
+    // Presentation labels validate with the daemon's fixed messages; an
+    // invalid value makes the entry `unreadable` instead of hiding a broken
+    // file behind a silently dropped label.
+    let display_name = string_key(&document, "display_name")?
+        .map(validate_display_name)
+        .transpose()?;
+    let audience = string_key(&document, "audience")?
+        .map(validate_audience)
+        .transpose()?;
     Ok(ProfileHead {
         base,
         package,
         digest,
+        display_name,
+        audience,
     })
 }
 
 fn string_key<'a>(document: &'a DocumentMut, key: &str) -> Result<Option<&'a str>, String> {
     match document.get(key) {
         None => Ok(None),
-        Some(item) => item
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| format!("`{key}` must be a string")),
+        // The fixed daemon texts name the key only, never the value (serde
+        // would quote the offending value: `invalid type: integer 5`).
+        Some(item) => item.as_str().map(Some).ok_or_else(|| match key {
+            "display_name" => "display_name must be a string".to_owned(),
+            "audience" => "audience must be one of owner, agent, hidden".to_owned(),
+            _ => format!("`{key}` must be a string"),
+        }),
     }
 }
 
@@ -467,6 +522,12 @@ struct ProfileEntry {
     /// Digest of the profile file, the value `create --replace` expects.
     #[serde(skip_serializing_if = "Option::is_none")]
     file_digest: Option<ProfileDigest>,
+    /// The profile's `display_name` key, as written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    /// The profile's `audience` key (`owner`, `agent` or `hidden`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audience: Option<String>,
     state: ProfileState,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -476,8 +537,37 @@ struct ProfileEntry {
 #[derive(Debug, Serialize)]
 struct ProfileListing {
     profiles: Vec<ProfileEntry>,
+    /// Profiles held back by the default `owner`-only filter.
+    hidden: usize,
     /// Whether the directory held more entries than were read.
     truncated: bool,
+}
+
+/// Whether the entry's audience shows in the default `owner`-only list.
+/// An `unreadable` entry always shows: its audience cannot be known, and
+/// hiding a broken file is worse than showing it.
+fn shows_by_default(entry: &ProfileEntry) -> bool {
+    if entry.state == ProfileState::Unreadable {
+        return true;
+    }
+    matches!(entry.audience.as_deref(), None | Some("owner"))
+}
+
+/// Split the full listing into the rows to show and the held-back count.
+fn apply_audience_filter(entries: Vec<ProfileEntry>, all: bool) -> (Vec<ProfileEntry>, usize) {
+    if all {
+        return (entries, 0);
+    }
+    let mut shown = Vec::new();
+    let mut hidden = 0;
+    for entry in entries {
+        if shows_by_default(&entry) {
+            shown.push(entry);
+        } else {
+            hidden += 1;
+        }
+    }
+    (shown, hidden)
 }
 
 /// Why a profile file could not be loaded.
@@ -616,14 +706,17 @@ fn directory_error(error: &FsError) -> Error {
     }
 }
 
-/// Build the listing of every profile file in `dir`.
+/// Build the listing of every profile file in `dir`, filtered to the rows
+/// `--all` selects: by default only `owner` profiles show.
 fn list_profiles(
     dir: Option<&TrustedDir>,
     packages: &[PackageInfo],
+    all: bool,
 ) -> Result<ProfileListing, Error> {
     let Some(dir) = dir else {
         return Ok(ProfileListing {
             profiles: Vec::new(),
+            hidden: 0,
             truncated: false,
         });
     };
@@ -639,8 +732,10 @@ fn list_profiles(
         profiles.push(profile_entry(dir, stem, packages));
     }
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    let (profiles, hidden) = apply_audience_filter(profiles, all);
     Ok(ProfileListing {
         profiles,
+        hidden,
         truncated,
     })
 }
@@ -652,6 +747,8 @@ fn unreadable_entry(name: &str, detail: String) -> ProfileEntry {
         package: None,
         digest: None,
         file_digest: None,
+        display_name: None,
+        audience: None,
         state: ProfileState::Unreadable,
         detail: Some(detail),
     }
@@ -675,6 +772,8 @@ fn profile_entry(dir: &TrustedDir, name: &str, packages: &[PackageInfo]) -> Prof
                 package: head.package,
                 digest: head.digest,
                 file_digest: Some(text_digest(&loaded.text)),
+                display_name: head.display_name,
+                audience: head.audience,
                 state,
                 detail,
             }
@@ -683,10 +782,14 @@ fn profile_entry(dir: &TrustedDir, name: &str, packages: &[PackageInfo]) -> Prof
 }
 
 fn render_listing(listing: &ProfileListing) -> String {
-    if listing.profiles.is_empty() {
+    // An empty table with no hidden profiles means no files at all. When
+    // every profile is held back (all `agent`/`hidden`), the rows stay
+    // empty but the footer below still names the hidden count: the owner
+    // must see that the profiles exist instead of "no profiles".
+    if listing.profiles.is_empty() && listing.hidden == 0 {
         return "No host agent profiles.\n".to_owned();
     }
-    let rows: Vec<[String; 6]> = listing
+    let rows: Vec<[String; 8]> = listing
         .profiles
         .iter()
         .map(|entry| {
@@ -696,6 +799,11 @@ fn render_listing(listing: &ProfileListing) -> String {
             );
             [
                 entry.name.clone(),
+                entry
+                    .display_name
+                    .as_deref()
+                    .map_or_else(|| "-".to_owned(), sanitize),
+                entry.audience.clone().unwrap_or_else(|| "-".to_owned()),
                 entry
                     .base
                     .as_ref()
@@ -717,9 +825,25 @@ fn render_listing(listing: &ProfileListing) -> String {
         })
         .collect();
     let mut output = render_table(
-        ["NAME", "BASE", "PACKAGE", "DIGEST", "FILE", "STATE"],
+        [
+            "NAME",
+            "DISPLAY NAME",
+            "AUDIENCE",
+            "BASE",
+            "PACKAGE",
+            "DIGEST",
+            "FILE",
+            "STATE",
+        ],
         &rows,
     );
+    if listing.hidden > 0 {
+        let _ = writeln!(
+            output,
+            "{} profiles hidden (agent/hidden audience); use --all",
+            listing.hidden
+        );
+    }
     if listing.truncated {
         let _ = writeln!(
             output,
@@ -785,13 +909,13 @@ fn render_migration(result: &PackageBindProfileResult) -> String {
 /// daemon refuses or fails the request.
 pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
     match action {
-        ProfileAction::List { json } => {
+        ProfileAction::List { json, all } => {
             let paths = Paths::resolve()?;
             let mut client = Client::connect(LOCAL_HOST, &paths).await?;
             let packages = list(&mut client).await?.packages;
             let dir = open_agents_dir(&paths.config_dir.join(AGENTS_DIR))
                 .map_err(|error| directory_error(&error))?;
-            let listing = list_profiles(dir.as_ref(), &packages)?;
+            let listing = list_profiles(dir.as_ref(), &packages, all)?;
             print_output(json, &listing, || render_listing(&listing))
         }
         ProfileAction::Migrate(args) => run_migrate(&args).await,

@@ -136,6 +136,7 @@ use crate::worktree::{
 use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
 
+mod agent_label;
 mod attach;
 pub(crate) mod attention_isolation;
 mod background;
@@ -5854,6 +5855,9 @@ impl SessionRegistry {
     /// the project store (so the switcher and `session list` show the project by
     /// name, and `--filter project=<label>` resolves). Enrichment is best-effort:
     /// a missing store or read error simply leaves labels unset.
+    ///
+    /// Agent labels arrive in the handler, not here: `list` feeds persisted
+    /// records to every caller, and `agent_display_name` is response-only.
     pub async fn list(&self) -> Vec<SessionInfo> {
         let mut sessions = self.list_raw().await;
         self.enrich_project_labels(&mut sessions).await;
@@ -8606,6 +8610,7 @@ fn external_session_info(
         name: None,
         agent,
         agent_base,
+        agent_display_name: None,
         cwd,
         cwd_source: Some(CwdSource::Procwatch),
         pid: fact.pid,
@@ -8832,6 +8837,7 @@ fn create_intent_record(
         name: validate_session_name(params.name.as_deref())?,
         agent: resolved.name.clone(),
         agent_base: RuntimeRef::from(resolved.base.clone()),
+        agent_display_name: None,
         cwd: cwd.to_path_buf(),
         cwd_source: Some(CwdSource::Launch),
         pid: 0,

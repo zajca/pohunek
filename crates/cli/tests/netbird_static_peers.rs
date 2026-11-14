@@ -156,6 +156,7 @@ fn serve_session_and_track(
                                 name: Some("s-1".to_owned()),
                                 agent: "test".to_owned(),
                                 agent_base: protocol::RuntimeRef::shell(),
+                                agent_display_name: None,
                                 cwd: "/work".into(),
                                 cwd_source: None,
                                 pid: 1,

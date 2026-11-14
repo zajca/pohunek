@@ -655,6 +655,7 @@ mod tests {
             name: None,
             agent: "shell".to_owned(),
             agent_base: RuntimeRef::shell(),
+            agent_display_name: None,
             cwd: path.clone(),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 0,

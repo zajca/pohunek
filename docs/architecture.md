@@ -1112,7 +1112,9 @@ binding, so it needs the key; a launch of a bare runtime never does.
 `session.resume` resolves the profile once, compare its
 current revision with the frozen one and refuse an edited, legacy or missing
 profile with `agent_profile_changed` or `agent_profile_missing` unless the
-local owner accepts the change. The one exception is the migration pin: for an
+local owner accepts the change. The revision text excludes the
+presentation-only `display_name` and `audience` keys, and a profile without
+them is digested byte for byte, so label edits never need `--accept-profile-change`. The one exception is the migration pin: for an
 adopted built-in session the comparison also accepts a profile whose revision,
 computed without its `package` and `digest` keys, equals the frozen one, with
 the stored built-in binding, the frozen program and arguments, and the profile's

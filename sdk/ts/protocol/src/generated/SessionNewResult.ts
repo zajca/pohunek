@@ -114,6 +114,14 @@ export type SessionNewResult = {
    */
   agent_base: RuntimeRef;
   /**
+   * Human label of the session's agent profile, read live from the profile
+   * file. Set only on `session.list` and `session.inspect` responses, when
+   * the session runs on a labelled profile whose file still parses; absent
+   * for a bare runtime, a missing profile file, or an unparsable one.
+   * Stored records and events never carry it.
+   */
+  agent_display_name?: string;
+  /**
    * Current working directory for the session.
    */
   cwd: string;

@@ -51,6 +51,8 @@ fn runtime(
         version: None,
         supported,
         config_home_id: None,
+        display_name: None,
+        audience: None,
     }
 }
 

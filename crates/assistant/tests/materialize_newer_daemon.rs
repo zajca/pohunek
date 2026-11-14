@@ -33,6 +33,8 @@ fn capabilities() -> Value {
             version: None,
             supported: None,
             config_home_id: None,
+            display_name: None,
+            audience: None,
         }],
         git_available: true,
         worktree_supported: true,

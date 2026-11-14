@@ -793,6 +793,7 @@ impl Installation {
             name: Some(format!("seeded {session_id}")),
             agent: "claude".to_owned(),
             agent_base: RuntimeRef::claude(),
+            agent_display_name: None,
             cwd: self.home(),
             cwd_source: Some(CwdSource::Launch),
             pid: 0,

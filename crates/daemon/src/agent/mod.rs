@@ -19,7 +19,7 @@ pub mod host;
 mod launch_env;
 mod native_launch;
 mod native_reference;
-mod profile;
+pub(crate) mod profile;
 
 pub(crate) use credential::{credential_arg_problem, credential_literal_problem};
 pub use launch_env::LaunchEnv;

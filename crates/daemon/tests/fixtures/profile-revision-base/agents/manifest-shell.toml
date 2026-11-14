@@ -1,0 +1,4 @@
+# A shell profile with a detection-manifest override.
+base = "shell"
+manifest = "guard-shell"
+args = ["-c", "exec sleep 30"]

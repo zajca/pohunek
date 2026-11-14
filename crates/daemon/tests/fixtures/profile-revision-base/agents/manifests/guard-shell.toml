@@ -1,0 +1,6 @@
+[[rules]]
+id = "guard-ready"
+state = "idle"
+priority = 10
+region = "whole_recent"
+contains = "ready"
