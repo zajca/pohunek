@@ -231,6 +231,16 @@ export type SessionInfo = {
    */
   spawned_by?: SpawnedBy;
   /**
+   * Nearest flagged ancestor isolating this session's attention, set only
+   * on `session.list` responses. `Some` names the ancestor carrying
+   * [`ATTENTION_CHILDREN_METADATA_KEY`] set to [`ATTENTION_CHILDREN_ISOLATE`];
+   * absent means not isolated or unknown. Clients skip roll-up, `Needs you`
+   * and tray counting for a session that carries it. Like
+   * [`Self::capability_refusals`], stored records, events and inspect
+   * responses never carry it.
+   */
+  attention_isolated_by?: SessionId;
+  /**
    * Creation timestamp in the daemon's wire timestamp format.
    */
   created_at: string;

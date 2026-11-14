@@ -86,7 +86,8 @@ use protocol::{
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
     SessionReportNativeIdResult, SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult,
     SessionState, SessionStopResult, SessionWarning, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SubagentRevision, UnconfirmedProcess, WorktreeRemoveResult, ATTENTION_CHILDREN_ISOLATE,
+    ATTENTION_CHILDREN_METADATA_KEY, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 #[cfg(test)]
@@ -136,6 +137,7 @@ use native_attestation::{attest_report_caller, unattested, NativeReportRefusal};
 use reconcile::LossClassification;
 
 mod attach;
+pub(crate) mod attention_isolation;
 mod background;
 mod claim;
 mod conflict_stop;
@@ -2434,6 +2436,7 @@ impl SessionRegistry {
             transaction,
             info: SessionInfo {
                 blocked_kind: None,
+                attention_isolated_by: None,
                 ..entry.info.clone()
             },
             recovery: Some(Self::resume_binding_from_entry(id, entry)),
@@ -5824,6 +5827,7 @@ impl SessionRegistry {
         let mut sessions = self.list_raw().await;
         self.enrich_project_labels(&mut sessions).await;
         self.flag_revoked_packages(&mut sessions).await;
+        attention_isolation::annotate_list(&mut sessions);
         sessions
     }
 
@@ -6197,6 +6201,7 @@ impl SessionRegistry {
                 }
             }
             validate_session_metadata(&candidate)?;
+            validate_reserved_metadata(&candidate)?;
             let updated_at = timestamp_now();
             self.commit_session_metadata(id, &candidate, &updated_at)
                 .await?;
@@ -8596,6 +8601,7 @@ fn external_session_info(
         output_force_closed: false,
         metadata: BTreeMap::new(),
         spawned_by: None,
+        attention_isolated_by: None,
         created_at: now.clone(),
         updated_at: now,
         ended_at: None,
@@ -8748,6 +8754,7 @@ fn validate_new_params(params: &SessionNewParams) -> Result<(), ProtocolError> {
         crate::worktree::check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
     }
     validate_session_metadata(&params.metadata)?;
+    validate_reserved_metadata(&params.metadata)?;
     validate_session_name(params.name.as_deref())?;
     Ok(())
 }
@@ -8777,6 +8784,7 @@ fn create_intent_record(
     let created_at = timestamp_now();
     let info = SessionInfo {
         blocked_kind: None,
+        attention_isolated_by: None,
         id: id.clone(),
         external: Some(false),
         capabilities: protocol::SessionCapabilities {
@@ -8974,6 +8982,24 @@ fn validate_session_metadata(metadata: &BTreeMap<String, String>) -> Result<(), 
         return Err(ProtocolError::bad_request(format!(
             "session metadata serialized size exceeds {MAX_SESSION_METADATA_SERIALIZED_BYTES} bytes"
         )));
+    }
+    Ok(())
+}
+
+/// Refuse a reserved metadata value other than the documented one.
+///
+/// The reserved `pohunek.attention.children` key accepts only `isolate`; a
+/// typo would otherwise look like success while the daemon ignores the key.
+/// Clearing the key is always allowed. List filters stay free: this runs at
+/// the two mutation sites only (`session.new` validation and
+/// `session.set_metadata`), never from `validate_session_list_filters`.
+fn validate_reserved_metadata(metadata: &BTreeMap<String, String>) -> Result<(), ProtocolError> {
+    if let Some(value) = metadata.get(ATTENTION_CHILDREN_METADATA_KEY) {
+        if value != ATTENTION_CHILDREN_ISOLATE {
+            return Err(ProtocolError::bad_request(format!(
+                "session metadata key {ATTENTION_CHILDREN_METADATA_KEY:?} accepts only {ATTENTION_CHILDREN_ISOLATE:?}; got {value:?}"
+            )));
+        }
     }
     Ok(())
 }

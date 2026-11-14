@@ -1736,3 +1736,275 @@ async fn pi_package_relocated_store_is_judged_would_lose_as_resume_refuses_it() 
     assert_eq!(judged.code, "agent_native_store_relocated", "{judged:?}");
     assert_eq!(judged.code, refusal.code, "{refusal:?}");
 }
+
+/// A hook-admitted `approval_required` attention record for `session`, shaped
+/// like the handler harness `attention_for`: provider `claude` with the
+/// session's `attention:<id>` dedupe key, so the create takes the coordinator
+/// debounce path.
+fn attention_params(session: &SessionId, seq: u32) -> NotificationCreateParams {
+    NotificationCreateParams {
+        source: NotificationSource {
+            provider: "claude".to_owned(),
+            provider_event: "Notification.permission_prompt".to_owned(),
+            host_local_source_id: format!("claude-approval-{session}-{seq}", session = session.0),
+        },
+        kind: NotificationKind::ApprovalRequired,
+        severity: NotificationSeverity::ActionRequired,
+        title: "Approval required".to_owned(),
+        body: "Claude is waiting for approval.".to_owned(),
+        metadata: BTreeMap::from([
+            ("provider".to_owned(), "claude".to_owned()),
+            (
+                "provider_event".to_owned(),
+                "Notification.permission_prompt".to_owned(),
+            ),
+        ]),
+        session_id: Some(session.clone()),
+        agent_kind: None,
+        source_id: Some(format!(
+            "claude:{session}:approval:{seq}",
+            session = session.0
+        )),
+        dedupe_key: Some(format!("attention:{session}", session = session.0)),
+        project_id: None,
+        retryable_admission: false,
+    }
+}
+
+/// Take a `session.wait_turn` cursor at the current end of the journal: a 1 ms
+/// wait always times out and returns its cursor, so a later wait with `after`
+/// set to it observes events recorded after this point even when the flush
+/// ran before the later wait was registered.
+async fn flush_cursor(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    session: &SessionId,
+    tag: &str,
+) -> String {
+    let request = Request::make(
+        tag,
+        method::SESSION_WAIT_TURN,
+        serde_json::json!({
+            "session_ids": [session],
+            "until": ["turn_completed"],
+            "timeout_ms": 1,
+        }),
+    );
+    let timed_out: Value = serde_json::from_value(ok_payload(
+        pohunek_test_support::wait::guard("take a wait_turn cursor", exchange(control, &request))
+            .await,
+    ))
+    .expect("the 1 ms wait times out with a cursor");
+    assert_eq!(timed_out["reason"], "timeout");
+    timed_out["cursor"]
+        .as_str()
+        .expect("the timeout carries a cursor")
+        .to_owned()
+}
+
+/// Wait until the coordinator flushes `session`'s debounced attention: the
+/// turn signal the flush journals fires a `session.wait_turn` on the
+/// attention kind, with no inbox record when the session is isolated. A
+/// sibling without a flagged ancestor commits a record instead, with the
+/// same event. `until` selects which side this wait observes. `after` is a
+/// cursor taken before the matching create, so the wait returns the flush
+/// event even when the flush recorded it before this wait was registered.
+async fn wait_for_attention_flush(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    session: &SessionId,
+    until: &str,
+    seq: u32,
+    isolated: bool,
+    after: &str,
+) {
+    let request = Request::make(
+        &format!("isolation-flush-{seq}"),
+        method::SESSION_WAIT_TURN,
+        serde_json::json!({
+            "session_ids": [session],
+            "until": [until],
+            "after": after,
+        }),
+    );
+    let done: Value = serde_json::from_value(ok_payload(
+        pohunek_test_support::wait::guard(
+            "the attention flush to journal the child's turn",
+            exchange(control, &request),
+        )
+        .await,
+    ))
+    .expect("the flush journals a turn for the attention");
+    assert_eq!(done["reason"], "event");
+    assert_eq!(done["event"]["kind"], until);
+    if isolated {
+        assert!(
+            done["event"].get("notification_id").is_none(),
+            "the withheld record names no inbox record: {:?}",
+            done["event"]
+        );
+    } else {
+        assert!(
+            done["event"].get("notification_id").is_some(),
+            "the control record names its inbox record: {:?}",
+            done["event"]
+        );
+    }
+}
+
+/// An unflagged session's attention commits an inbox record: the positive
+/// control that proves the coordinator still commits non-isolated attention
+/// (run after resume only). The sibling's own `wait_turn` event proves its
+/// flush; like the child's, the wait carries a cursor taken before the
+/// create so a flush that ran early still resolves it.
+async fn assert_control_attention_surfaced(
+    control: &mut Framed<UnixStream, LinesCodec>,
+    sibling: &SessionId,
+) {
+    let cursor = flush_cursor(control, sibling, "isolation-cursor-sibling-1").await;
+    create_notification(control, attention_params(sibling, 1)).await;
+    wait_for_attention_flush(control, sibling, "approval_required", 1, false, &cursor).await;
+    let inbox = list_notifications(control, NotificationListParams::default()).await;
+    assert_eq!(
+        inbox.notifications.len(),
+        1,
+        "the unflagged sibling's attention reaches the inbox: {:?}",
+        inbox.notifications
+    );
+    assert_eq!(inbox.notifications[0].session_id.as_ref(), Some(sibling));
+}
+
+/// A flagged parent still isolates its child after a real `session.resume`
+/// (#2166 I6): the flag survives stop and resume, the child's attention stays
+/// withheld, and `session.list` still reports the child as isolated by the
+/// parent. Each flush is observed through that session's own `session.wait_turn`
+/// event, never sleeps: the cursor is taken before each create, so a flush
+/// that ran before the wait was registered still resolves it. The unflagged
+/// sibling below runs after resume only and shows the coordinator still
+/// commits non-isolated attention.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The resume scenario keeps create, flag-survival, control and re-check assertions in one auditable flow."
+)]
+async fn a_flagged_parent_still_isolates_its_child_after_session_resume() {
+    let mut rig = ClaudeRig::new("claude-isolation-resume").await;
+    let mut params = session_params_in(rig.cwd.to_path_buf());
+    "claude-fixture".clone_into(&mut params.agent);
+    params.metadata = BTreeMap::from([(
+        protocol::ATTENTION_CHILDREN_METADATA_KEY.to_owned(),
+        protocol::ATTENTION_CHILDREN_ISOLATE.to_owned(),
+    )]);
+    let parent: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut rig.control, params).await,
+    ))
+    .expect("create the flagged parent");
+    rig.additional_sessions.push(parent.id.clone());
+    rig.transcript(LAUNCH);
+    rig.report_for(&parent.id, "startup", LAUNCH).await;
+
+    let mut child_params = session_params_in(rig.cwd.to_path_buf());
+    "claude-fixture".clone_into(&mut child_params.agent);
+    let child_request = Request::make(
+        "claude-isolation-child-new",
+        method::SESSION_NEW,
+        serde_json::to_value(child_params).expect("serialize child params"),
+    )
+    .with_origin(
+        Some(parent.id.clone()),
+        Some(SOURCE_SPAWNER_DAEMON.to_owned()),
+    )
+    .expect("valid child origin pair");
+    let child: SessionInfo =
+        serde_json::from_value(ok_payload(exchange(&mut rig.control, &child_request).await))
+            .expect("create the child of the flagged parent");
+    rig.additional_sessions.push(child.id.clone());
+
+    // A sibling under no flagged ancestor: its attention commits after
+    // resume, the positive control showing the coordinator still commits
+    // non-isolated attention.
+    let mut sibling_params = session_params_in(rig.cwd.to_path_buf());
+    "claude-fixture".clone_into(&mut sibling_params.agent);
+    let sibling: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut rig.control, sibling_params).await,
+    ))
+    .expect("create the unflagged control sibling");
+    rig.additional_sessions.push(sibling.id.clone());
+
+    // The child's own wait_turn event proves its flush; the cursor is taken
+    // before the create so an early flush still resolves the wait.
+    let cursor = flush_cursor(&mut rig.control, &child.id, "isolation-cursor-child-1").await;
+    create_notification(&mut rig.control, attention_params(&child.id, 1)).await;
+    wait_for_attention_flush(
+        &mut rig.control,
+        &child.id,
+        "approval_required",
+        1,
+        true,
+        &cursor,
+    )
+    .await;
+    let inbox = list_notifications(&mut rig.control, NotificationListParams::default()).await;
+    assert!(
+        inbox.notifications.is_empty(),
+        "the isolated child's attention is withheld: {:?}",
+        inbox.notifications
+    );
+    let listed = listed_sessions(&mut rig.control).await;
+    let row = listed
+        .iter()
+        .find(|session| session.id == child.id)
+        .expect("the isolated child is listed");
+    assert_eq!(
+        row.attention_isolated_by.as_ref(),
+        Some(&parent.id),
+        "the child is isolated by its flagged parent"
+    );
+
+    rig.stop(&parent.id).await;
+    ok_payload(rig.resume_session(&parent.id).await);
+    let resumed = inspect_session(&mut rig.control, &parent.id).await;
+    assert_eq!(
+        resumed
+            .metadata
+            .get(protocol::ATTENTION_CHILDREN_METADATA_KEY),
+        Some(&protocol::ATTENTION_CHILDREN_ISOLATE.to_owned()),
+        "the flag survives stop and resume"
+    );
+
+    // The sibling commits its own record after resume; then the child's own
+    // wait_turn event proves the second flush, so the child's empty inbox
+    // means withheld, not slow.
+    assert_control_attention_surfaced(&mut rig.control, &sibling.id).await;
+    let cursor = flush_cursor(&mut rig.control, &child.id, "isolation-cursor-child-2").await;
+    create_notification(&mut rig.control, attention_params(&child.id, 2)).await;
+    wait_for_attention_flush(
+        &mut rig.control,
+        &child.id,
+        "approval_required",
+        2,
+        true,
+        &cursor,
+    )
+    .await;
+    let inbox = list_notifications(&mut rig.control, NotificationListParams::default()).await;
+    assert_eq!(
+        inbox.notifications.len(),
+        1,
+        "only the control sibling's attention is listed: {:?}",
+        inbox.notifications
+    );
+    assert_eq!(
+        inbox.notifications[0].session_id.as_ref(),
+        Some(&sibling.id)
+    );
+    let listed = listed_sessions(&mut rig.control).await;
+    let row = listed
+        .iter()
+        .find(|session| session.id == child.id)
+        .expect("the isolated child is still listed");
+    assert_eq!(
+        row.attention_isolated_by.as_ref(),
+        Some(&parent.id),
+        "the child is still isolated by its resumed parent"
+    );
+    rig.finish(None).await;
+}

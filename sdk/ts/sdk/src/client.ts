@@ -25,7 +25,7 @@ import {
   type SessionWaitTurnParams,
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
-import { CompatError, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
+import { CompatError, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
 import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -407,6 +407,20 @@ export class Client {
       await this.requireCapability(connection, {
         flag: "session_new_fetch_ref_supported",
         unsupported: (host) => ClientError.sessionNewFetchRefUnsupported(host),
+      });
+    }
+    // A daemon that predates attention isolation stores the reserved flag
+    // without honoring it; clearing the key is always sent.
+    if (request.method === "session.new" && carriesAttentionIsolationFlag(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_attention_isolation_supported",
+        unsupported: (host) => ClientError.sessionAttentionIsolationUnsupported(host),
+      });
+    }
+    if (request.method === "session.set_metadata" && setsAttentionIsolationFlag(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_attention_isolation_supported",
+        unsupported: (host) => ClientError.sessionAttentionIsolationUnsupported(host),
       });
     }
     if (isPackageCommandsRequest(request)) {

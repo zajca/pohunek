@@ -229,6 +229,26 @@ impl Fixture {
         handle_request(&request, &self.state).await.into_result()
     }
 
+    /// Calls `method` with `params` carrying `parent` as the request origin,
+    /// so a `session.new` made through it records `parent` in `spawned_by`.
+    pub(super) async fn call_with_origin(
+        &self,
+        method: &str,
+        params: Value,
+        parent: &str,
+    ) -> Result<Value, ProtocolError> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = format!("child-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        let request = Request::new(id, method, params)
+            .expect("valid request")
+            .with_origin(
+                Some(protocol::SessionId(parent.to_owned())),
+                Some(self.sessions.daemon_instance_id().to_owned()),
+            )
+            .expect("valid origin pair");
+        handle_request(&request, &self.state).await.into_result()
+    }
+
     /// Starts `session.wait_turn` on its own task, as a dedicated connection does.
     pub(super) fn spawn_wait(&self, params: Value) -> JoinHandle<Result<Value, ProtocolError>> {
         let state = self.state.clone();
@@ -286,6 +306,15 @@ impl Fixture {
             params["dedupe_key"] = json!(format!("turn:{session}"));
         }
         self.call(method::NOTIFICATION_CREATE, params).await
+    }
+
+    /// Reads the session's latest activity through `session.inspect`.
+    pub(super) async fn latest_activity(&self, session: &str) -> String {
+        let inspected = ok(self.call(method::SESSION_INSPECT, json!(session)).await);
+        inspected["activity"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
     }
 
     /// Reports the active agent's activity, as the managed identity hook does.

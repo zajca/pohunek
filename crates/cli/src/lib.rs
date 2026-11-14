@@ -1163,7 +1163,10 @@ enum SessionAction {
         request_id: Option<String>,
         /// Session metadata in key=value form (repeatable). Split on the first
         /// `=` only, so a value may itself contain `=`. Each key may be set at
-        /// most once; the daemon enforces size limits on the values.
+        /// most once; the daemon enforces size limits on the values. The
+        /// reserved `pohunek.attention.children=isolate` pair isolates
+        /// descendants' attention from the owner; it needs a daemon that
+        /// advertises `session_attention_isolation_supported`.
         #[arg(long = "meta", value_name = "key=value", value_parser = commands::session::parse_meta_pair)]
         meta: Vec<(String, String)>,
         /// Skip the confirmation prompt when starting a session on a remote

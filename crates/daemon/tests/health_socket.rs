@@ -755,6 +755,15 @@ async fn serve_registry(
     let worker_home = worker_home_dir.path().to_path_buf();
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
+    // The production daemon always runs the debounce coordinator next to the
+    // inbox; without it every debounced attention create is refused with
+    // `notifications_not_configured`, so no socket scenario could exercise
+    // the coordinator path.
+    let (attention, _coordinator) = pohunek_daemon::notifications::AttentionCoordinator::spawn(
+        &pohunek_daemon::shutdown::DaemonShutdown::default(),
+        notifications.clone(),
+        &registry,
+    );
     if let Some((event_log_dir, retention)) = event_log_dir {
         let log = Arc::new(EventLog::open(&event_log_dir, retention).expect("event log opens"));
         let _session_log = spawn_drain(
@@ -775,7 +784,8 @@ async fn serve_registry(
         support::overlay_registry(),
         pohunek_daemon::api::OverlaySource::Default,
     )
-    .with_notifications(notifications);
+    .with_notifications(notifications)
+    .with_attention_coordinator(attention);
     let server = ControlServer::bind_with_state(socket, state)
         .await
         .expect("server binds");

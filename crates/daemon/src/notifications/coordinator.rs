@@ -39,9 +39,10 @@ use protocol::{
 };
 use tokio::sync::mpsc;
 use tokio_util::time::DelayQueue;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{source_priority, DeferredNotification, NotificationService, SourcePriority};
+use crate::session::attention_isolation;
 use crate::session::{SessionRegistry, TurnEvents, TurnId, TurnVerdict};
 use crate::shutdown::{DaemonShutdown, DriverHandle, Stage};
 use protocol::AgentActivity;
@@ -296,12 +297,34 @@ async fn run(
             biased;
             command = commands.recv() => match command {
                 Some(Command::Defer(deferred)) => {
+                    // Isolation is checked on defer: a descendant of a flagged
+                    // session keeps only its turn signal, never an inbox
+                    // record. `defer` then keeps the signal candidate while the
+                    // inbox candidate stays empty.
+                    let mut deferred = *deferred;
+                    // A record without an inbox candidate (a pure turn
+                    // signal) needs no isolation check: only the inbox
+                    // record is withheld, never the signal.
+                    if deferred.inbox {
+                        if let Some(session_id) = deferred.record.session_id.clone() {
+                            if let Some(isolated_by) = attention_isolation::attention_isolated_by(&sessions, &session_id).await {
+                                info!(
+                                    target: "notifications.attention.isolated",
+                                    session = %session_id.0,
+                                    isolated_by = %isolated_by.0,
+                                    kind = deferred.record.kind.as_str(),
+                                    "withheld an isolated descendant's attention record on defer"
+                                );
+                                deferred.inbox = false;
+                            }
+                        }
+                    }
                     defer(
                         &mut pending,
                         &mut queue,
                         &mut generation,
                         &notifications,
-                        *deferred,
+                        deferred,
                     );
                 }
                 Some(Command::Resolve(dedupe_key, as_of)) => {
@@ -351,7 +374,10 @@ fn defer(
         // Debounced creates always carry a dedupe key; without one the record
         // cannot be cancelled by session activity, so surface it immediately
         // rather than dropping it. Such a create is never a turn signal: the
-        // projector and hook claims always carry a session key.
+        // projector and hook claims always carry a session key. The defer
+        // path in `run` already withheld the inbox record of an isolated
+        // descendant, so reaching `commit` here means the session is not
+        // isolated.
         if inbox {
             commit(notifications, record, minted);
         }
@@ -508,9 +534,31 @@ async fn flush(
         return;
     }
     let Some(turn) = token.key.1 else {
-        let Some(entry) = pending.remove(&token.key) else {
+        let Some(mut entry) = pending.remove(&token.key) else {
             return;
         };
+        // The flag may have been set during the debounce window, so the
+        // non-turn branch re-checks before committing: an isolated
+        // descendant's inbox record is withheld while its turn signal is
+        // still journaled with `committed = None`.
+        if let Some(session_id) = entry
+            .inbox
+            .as_ref()
+            .and_then(|record| record.session_id.clone())
+        {
+            if let Some(isolated_by) =
+                attention_isolation::attention_isolated_by(sessions, &session_id).await
+            {
+                info!(
+                    target: "notifications.attention.isolated",
+                    session = %session_id.0,
+                    isolated_by = %isolated_by.0,
+                    kind = entry.inbox.as_ref().map_or("unknown", |record| record.kind.as_str()),
+                    "withheld an isolated descendant's attention record on flush"
+                );
+                entry.inbox = None;
+            }
+        }
         let minted = entry.newest_foreign.unwrap_or_else(StdInstant::now);
         let committed = entry
             .inbox

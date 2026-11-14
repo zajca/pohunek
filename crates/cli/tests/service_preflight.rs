@@ -284,6 +284,7 @@ fn session_info() -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
         spawned_by: None,
+        attention_isolated_by: None,
         name: None,
         id: SessionId(SESSION.to_owned()),
         external: Some(false),

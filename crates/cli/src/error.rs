@@ -207,6 +207,22 @@ pub(crate) enum CliError {
         daemon_version: String,
     },
 
+    /// The host's daemon predates per-session attention isolation and would
+    /// store the flag as plain metadata without isolating anything, so the
+    /// owner would keep seeing the descendants' attention.
+    #[error(
+        "host '{host}' runs daemon {daemon_version}, which does not advertise \
+         `session_attention_isolation_supported`: isolating descendants \
+         (`--meta pohunek.attention.children=isolate`) needs a daemon that \
+         advertises it (upgrade the daemon on that host); no session was created"
+    )]
+    SessionAttentionIsolationUnsupported {
+        /// The host as the user typed it.
+        host: String,
+        /// Version the host's daemon reported.
+        daemon_version: String,
+    },
+
     /// The daemon advertised `session_new_fetch_ref_supported` but omitted
     /// `fetched_ref` from a first (non-replayed) response: a contract break.
     /// The session was created; only the outcome report is unusable.
@@ -550,6 +566,18 @@ impl CliError {
                 Some(
                     "update and restart the pohunek daemon on that host to a release that advertises \
                      `session_new_branch_source_supported`, or start the session without --from-remote"
+                        .to_owned(),
+                ),
+            ),
+            // The CLI refusal mirrors the client's daemon-class refusal.
+            CliError::SessionAttentionIsolationUnsupported { .. } => ProtocolError::new(
+                ErrorClass::Daemon,
+                "session_attention_isolation_unsupported",
+                self.to_string(),
+                Some(
+                    "update and restart the pohunek daemon on that host to a release that advertises \
+                     `session_attention_isolation_supported`, or start the session without \
+                     `--meta pohunek.attention.children=isolate`"
                         .to_owned(),
                 ),
             ),

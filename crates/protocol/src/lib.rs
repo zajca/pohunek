@@ -72,9 +72,9 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
-    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
-    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REQUEST_CONFLICT_CODE,
-    SESSION_REQUEST_IN_PROGRESS_CODE,
+    SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE, SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE,
+    SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
+    SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
 };
 #[doc(inline)]
 pub use governance::{
@@ -180,7 +180,8 @@ pub use session::{
     SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
     SessionWarningKind, SpawnedBy, SubagentInfo, SubagentLifecycle, SubagentStateEvent,
     TerminalCursor, TerminalDimensions, TerminalDimensionsError, UnconfirmedProcess,
-    WorktreeSource, MAX_CLIENT_REQUEST_ID_BYTES,
+    WorktreeSource, ATTENTION_CHILDREN_ISOLATE, ATTENTION_CHILDREN_METADATA_KEY,
+    MAX_CLIENT_REQUEST_ID_BYTES,
 };
 #[doc(inline)]
 pub use store::{StoreRejectedLine, STORE_REJECTED_TEXT_MAX_BYTES};

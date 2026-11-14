@@ -1,0 +1,4 @@
+---
+kind: added
+---
+`session.new` and `session.set_metadata` accept the reserved `pohunek.attention.children=isolate` pair (a single accepted value; clearing restores roll-up). A flagged parent withholds descendant attention from the chain above it: a descendant gets no inbox record for its own blocked or approval attention, so no parent row, `Needs you` marker, tray count or owner notification names it, while its turn signals are still recorded and `session.wait_turn` keeps working (nearest flagged ancestor wins, default rolls up). `session.list` rows carry the isolator as `attention_isolated_by` (never on `session inspect`). Clients gate the metadata on the `session_attention_isolation_supported` capability and refuse with `session_attention_isolation_unsupported` against older daemons. ([#2166](https://github.com/zajca/pohunek/issues/2166))
