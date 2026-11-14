@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Take the download hosts of the pinned-cache miss paths offline (#2202).
+
+Usage:
+  pinned-cache-offline entries [--apt-dir DIR] [--npm-lock FILE]... HOST...
+  pinned-cache-offline apply --hosts-file FILE --connect-timeout SECONDS
+                             [--apt-dir DIR] [--npm-lock FILE]... HOST...
+
+The host set is the HOST arguments, the host of every apt source under
+`--apt-dir` (one-line `.list` files, deb822 `.sources` files, and the
+mirror lists a `mirror+file:` source names) and the host of every
+`resolved` URL in each `--npm-lock`. `entries` prints a hosts-file line
+sending each host to 127.0.0.1 and one sending it to ::1. `apply` appends
+those lines to `--hosts-file` and is the positive control: it fails unless
+every host now resolves through the system resolver to loopback only and a
+TCP connection to it on port 443 fails. A source this script cannot map to
+a host fails the run instead of leaving that host online.
+
+Only the named hosts go offline: the cache service and the runner's own
+action downloads use other hosts, so a restore still reaches its entry.
+"""
+
+import argparse
+import json
+import re
+import socket
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+LOOPBACK = ("127.0.0.1", "::1")
+# The port every miss-path download uses (https).
+PROBE_PORT = 443
+HOST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*")
+ONE_LINE_SOURCE = re.compile(r"(?:deb|deb-src)\s+(?:\[[^\]]*\]\s+)?(\S+)")
+# Local apt schemes: they fetch nothing over the network.
+LOCAL_SCHEMES = ("file", "cdrom", "copy")
+
+
+class OfflineError(Exception):
+    pass
+
+
+def host_of(url, origin):
+    host = urlsplit(url).hostname
+    if not host or not HOST_NAME.fullmatch(host):
+        raise OfflineError(f"{origin}: no host name in {url!r}")
+    return host.lower()
+
+
+def mirror_list_hosts(path, origin):
+    hosts = set()
+    try:
+        text = Path(path).read_text()
+    except OSError as error:
+        raise OfflineError(f"{origin}: cannot read the mirror list {path}: {error}") from error
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            hosts |= uri_hosts(line.split()[0], f"{origin} -> {path}")
+    return hosts
+
+
+def uri_hosts(uri, origin):
+    scheme = uri.split(":", 1)[0].lower()
+    if scheme in ("http", "https"):
+        return {host_of(uri, origin)}
+    if scheme == "mirror+file":
+        path = uri.split(":", 1)[1]
+        if path.startswith("//"):
+            path = path[2:]
+        return mirror_list_hosts(path, origin)
+    if scheme in LOCAL_SCHEMES:
+        return set()
+    raise OfflineError(f"{origin}: cannot map the apt source {uri!r} to the hosts it fetches from")
+
+
+def apt_hosts(apt_dir):
+    hosts = set()
+    parts = apt_dir / "sources.list.d"
+    one_line = [apt_dir / "sources.list", *sorted(parts.glob("*.list"))]
+    for path in one_line:
+        if not path.is_file():
+            continue
+        for line in path.read_text().splitlines():
+            match = ONE_LINE_SOURCE.match(line.split("#", 1)[0].strip())
+            if match:
+                hosts |= uri_hosts(match.group(1), str(path))
+    for path in sorted(parts.glob("*.sources")):
+        in_uris = False
+        for line in path.read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            if line[:1] in (" ", "\t") and in_uris:
+                values = line.split()
+            else:
+                field, _, value = line.partition(":")
+                in_uris = field.strip().lower() == "uris"
+                values = value.split() if in_uris else []
+            for uri in values:
+                hosts |= uri_hosts(uri, str(path))
+    return hosts
+
+
+def resolved_urls(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "resolved" and isinstance(value, str):
+                yield value
+            else:
+                yield from resolved_urls(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from resolved_urls(value)
+
+
+def npm_hosts(lock):
+    try:
+        data = json.loads(Path(lock).read_text())
+    except (OSError, ValueError) as error:
+        raise OfflineError(f"cannot read the npm lock {lock}: {error}") from error
+    hosts = {host_of(url, str(lock)) for url in resolved_urls(data) if url.startswith(("http://", "https://"))}
+    if not hosts:
+        raise OfflineError(f"{lock}: no resolved registry URL")
+    return hosts
+
+
+def offline_hosts(args):
+    hosts = set()
+    for name in args.hosts:
+        if not HOST_NAME.fullmatch(name):
+            raise OfflineError(f"not a host name: {name!r}")
+        hosts.add(name.lower())
+    if args.apt_dir is not None:
+        hosts |= apt_hosts(Path(args.apt_dir))
+    for lock in args.npm_lock:
+        hosts |= npm_hosts(lock)
+    return sorted(hosts)
+
+
+def entries(hosts):
+    return [f"{address} {host}" for host in hosts for address in LOOPBACK]
+
+
+def control(host, timeout):
+    """The reason `host` is still online, or None when it is offline."""
+    try:
+        infos = socket.getaddrinfo(host, PROBE_PORT, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        return f"does not resolve through the hosts file ({error})"
+    addresses = sorted({info[4][0] for info in infos})
+    if not set(addresses) <= set(LOOPBACK):
+        return f"resolves to {', '.join(addresses)}"
+    try:
+        with socket.create_connection((host, PROBE_PORT), timeout=timeout):
+            return f"accepts a connection on port {PROBE_PORT}"
+    except OSError:
+        return None
+
+
+def apply(args, hosts):
+    lines = entries(hosts)
+    with open(args.hosts_file, "a", encoding="ascii") as hosts_file:
+        hosts_file.write("# pinned-cache offline proof (#2202)\n" + "\n".join(lines) + "\n")
+    online = []
+    for host in hosts:
+        reason = control(host, args.connect_timeout)
+        print(f"pinned-cache-offline: {host}: {'offline' if reason is None else reason}")
+        if reason is not None:
+            online.append(f"{host} {reason}")
+    if online:
+        raise OfflineError("still online: " + "; ".join(online))
+    print(f"pinned-cache-offline: {len(hosts)} hosts offline")
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(prog="pinned-cache-offline")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("entries", "apply"):
+        command = commands.add_parser(name)
+        command.add_argument("--apt-dir")
+        command.add_argument("--npm-lock", action="append", default=[])
+        command.add_argument("hosts", nargs="*")
+        if name == "apply":
+            command.add_argument("--hosts-file", required=True)
+            command.add_argument("--connect-timeout", type=float, required=True)
+    return parser.parse_args(argv)
+
+
+def main(argv):
+    args = parse(argv)
+    try:
+        hosts = offline_hosts(args)
+        if not hosts:
+            raise OfflineError("no host to take offline")
+        if args.command == "entries":
+            print("\n".join(entries(hosts)))
+        else:
+            apply(args, hosts)
+    except OfflineError as error:
+        print(f"::error::pinned-cache-offline: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -360,7 +360,13 @@ alone, and its sha256 is checked on a hit too. To bump a pin, change its
 `MOLD_*`, `ZIG_*`) or the action's pin; the next run misses and saves the new
 entry. Keep the total of the `pinned-*` entries under 1 GB: the repository
 cache quota is shared with rust-cache. `scripts/tests/test_pinned_cache.py`
-runs every item's miss and hit.
+runs every item's miss and hit. `.github/workflows/pinned-cache-offline.yml`
+proves the hits need no download host: it takes every miss-path host offline,
+installs each item like its `ci.yml` site and requires each item's `hit`.
+A new pinned item or a changed site goes into that workflow too (its guard in
+`test_pinned_cache.py` fails otherwise). Dispatch it with
+`gh workflow run pinned-cache-offline.yml` only after a main run has saved
+the entries: before that, a bumped pin misses and the proof fails by design.
 
 **Fork heads.** This applies to every dispatch, rerun and `head_ref` rule in
 this repository's agent instructions. A fork head is never dispatched, never run

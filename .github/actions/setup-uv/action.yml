@@ -12,6 +12,13 @@ inputs:
     description: Whether setup-uv saves and restores the uv cache ("true" or "false").
     required: true
 
+outputs:
+  hit:
+    description: >-
+      `true` when the pinned uv came from the cache, `false` when it
+      was downloaded. The offline proof requires `true`.
+    value: ${{ steps.pinned.outputs.hit }}
+
 runs:
   using: composite
   steps:
