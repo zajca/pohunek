@@ -772,17 +772,6 @@ def main():
         parser.error("--skip-owned-by applies to run-macos and run-macos-tier only")
     if args.action != "audit-sparse" and (args.selector is not None or args.report_dir is not None):
         parser.error("--selector and --report-dir apply to audit-sparse only")
-    if args.action == "plan":
-        if args.selection is None or args.shard is not None or args.archive_file is not None:
-            parser.error("plan takes --selection and nothing else")
-        try:
-            _selection, plan = load_selection(args.selection)
-        except ValueError as error:
-            sys.exit(f"test-partitions plan: {error}")
-        print(f"fast_shards={json.dumps(plan['fast_shards'])}")
-        print(f"heavy={str(plan['heavy']).lower()}")
-        print(f"lane={str(plan['lane']).lower()}")
-        return
     part = None
     if args.part is not None:
         if args.action != "run" or args.shard != "heavy":
@@ -796,6 +785,17 @@ def main():
             parser.error("--parts applies to check only")
         if args.parts < 1:
             parser.error(f"--parts is not a positive number of parts: {args.parts}")
+    if args.action == "plan":
+        if args.selection is None or args.shard is not None or args.archive_file is not None:
+            parser.error("plan takes --selection and nothing else")
+        try:
+            _selection, plan = load_selection(args.selection)
+        except ValueError as error:
+            sys.exit(f"test-partitions plan: {error}")
+        print(f"fast_shards={json.dumps(plan['fast_shards'])}")
+        print(f"heavy={str(plan['heavy']).lower()}")
+        print(f"lane={str(plan['lane']).lower()}")
+        return
     selection = plan = None
     if args.selection is not None:
         if args.action not in ("run", "check", "run-macos"):

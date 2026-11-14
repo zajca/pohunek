@@ -728,7 +728,17 @@ class PartActionTests(ScriptScenario):
 
     def test_part_and_parts_reject_anything_but_their_action(self):
         archive = ["--archive-file", str(self.archive)]
+        selection = self.root / "selection.json"
+        selection.write_text(json.dumps({
+            "schema_version": 1, "mode": "full", "script_tests": True,
+            "filterset": None, "packages": [],
+        }))
+        # The same plan without the flag passes, so a refusal below is the flag's.
+        self.assertEqual(
+            self.run_script("plan", "--selection", str(selection)).returncode, 0)
         for arguments in (
+            ("plan", "--selection", str(selection), "--parts", "3"),
+            ("plan", "--selection", str(selection), "--part", "1/3"),
             ("run", "core", "--part", "1/3", *archive),
             ("run", "heavy", *archive, "--part", "bogus"),
             ("run", "heavy", *archive, "--part", "0/3"),
