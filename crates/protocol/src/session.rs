@@ -3182,6 +3182,20 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_kind: Option<BlockedKind>,
+    /// Daemon epoch that scopes [`Self::activity_revision`]. Set only on
+    /// `session.list` and `session.inspect` responses; events and stored
+    /// records never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_epoch: Option<String>,
+    /// Revision of the newest activity the daemon recorded for this session
+    /// within [`Self::activity_epoch`], taken with this snapshot. A buffered
+    /// `agent_state` of the same runtime and epoch whose `revision` is not
+    /// greater is older than the snapshot. Set only on `session.list` and
+    /// `session.inspect` responses, and only once activity was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub activity_revision: Option<ActivityRevision>,
     /// Durable provider-managed subagents, including bounded recent history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<SubagentInfo>,
@@ -4014,6 +4028,8 @@ mod tests {
     fn session(id: &str) -> SessionInfo {
         SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(id.to_owned()),

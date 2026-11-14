@@ -844,6 +844,8 @@ fn worker_id(session: &str) -> ServiceId {
 fn session(id: &str, name: Option<&str>) -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
         name: name.map(str::to_owned),

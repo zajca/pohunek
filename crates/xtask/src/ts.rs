@@ -687,6 +687,8 @@ where
 fn session_minimal() -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
@@ -743,6 +745,8 @@ fn session_full() -> SessionInfo {
 
     SessionInfo {
         blocked_kind: Some(BlockedKind::Permission),
+        activity_epoch: None,
+        activity_revision: None,
         id: SessionId(SESSION_FIXTURE_ID.to_owned()),
         external: Some(false),
         capabilities: SessionCapabilities {

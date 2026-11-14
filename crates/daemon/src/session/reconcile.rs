@@ -9563,6 +9563,8 @@ while os.getppid() == parent:
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         let info = SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(session_id.to_owned()),
@@ -11141,6 +11143,8 @@ while os.getppid() == parent:
             native_identity_ordering: None,
             info: SessionInfo {
                 blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
                 spawned_by: None,
                 attention_isolated_by: None,
                 id: SessionId("s-identity".to_owned()),

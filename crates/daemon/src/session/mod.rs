@@ -1235,6 +1235,19 @@ impl SessionEntry {
         info
     }
 
+    /// The entry's [`SessionInfo`] as `session.list` and `session.inspect`
+    /// return it: [`Self::published_info`] plus the activity cursor of the
+    /// same snapshot, so a client can order buffered `agent_state` events
+    /// against it.
+    fn listed_info(&self, activity_epoch: &str) -> SessionInfo {
+        let mut info = self.published_info();
+        if self.activity_revision > 0 {
+            info.activity_epoch = Some(activity_epoch.to_owned());
+            info.activity_revision = Some(ActivityRevision::new(self.activity_revision));
+        }
+        info
+    }
+
     /// Who runs the session's turns now.
     fn turn_owner(&self) -> TurnOwner {
         TurnOwner {
@@ -5850,13 +5863,14 @@ impl SessionRegistry {
     }
 
     async fn list_raw(&self) -> Vec<SessionInfo> {
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let mut sessions = self
             .inner
             .sessions
             .lock()
             .await
             .values()
-            .map(|entry| entry.published_info())
+            .map(|entry| entry.listed_info(&activity_epoch))
             .collect::<Vec<_>>();
         sessions.extend(self.inner.external.list().await);
         sessions.sort_by(|left, right| left.id.0.cmp(&right.id.0));
@@ -5890,9 +5904,10 @@ impl SessionRegistry {
 
     /// Inspect a session by id.
     pub async fn inspect(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
+        let activity_epoch = self.daemon_instance_id().to_owned();
         let sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get(id) {
-            return Ok(entry.published_info());
+            return Ok(entry.listed_info(&activity_epoch));
         }
         drop(sessions);
         self.inner
@@ -8583,6 +8598,8 @@ fn external_session_info(
     let association = association.unwrap_or_default();
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         id: external_session_id(fact.pid),
         external: Some(true),
         capabilities: protocol::SessionCapabilities::default(),
@@ -8804,6 +8821,8 @@ fn create_intent_record(
     let info = SessionInfo {
         blocked_kind: None,
         attention_isolated_by: None,
+        activity_epoch: None,
+        activity_revision: None,
         id: id.clone(),
         external: Some(false),
         capabilities: protocol::SessionCapabilities {

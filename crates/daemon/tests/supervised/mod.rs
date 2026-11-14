@@ -779,6 +779,8 @@ impl Installation {
         let live = runtime.state == RuntimeState::Live;
         let info = SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(session_id.to_owned()),

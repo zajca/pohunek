@@ -166,6 +166,8 @@ fn serve_session_and_track(
                                 state_source: protocol::StateSource::Process,
                                 activity: Some(protocol::AgentActivity::Idle),
                                 blocked_kind: None,
+                                activity_epoch: None,
+                                activity_revision: None,
                                 subagents: Vec::new(),
                                 background: None,
                                 active_agent: None,

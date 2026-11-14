@@ -886,6 +886,8 @@ impl SessionRegistry {
         let preparing_info = SessionInfo {
             blocked_kind: None,
             attention_isolated_by: None,
+            activity_epoch: None,
+            activity_revision: None,
             id: id.clone(),
             external: Some(false),
             capabilities: capabilities.clone(),
@@ -1075,6 +1077,8 @@ impl SessionRegistry {
         let mut info = SessionInfo {
             blocked_kind: None,
             attention_isolated_by: None,
+            activity_epoch: None,
+            activity_revision: None,
             id: id.clone(),
             external: Some(false),
             capabilities,

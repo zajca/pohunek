@@ -104,6 +104,8 @@ fn output_result(
 fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
     SessionInfo {
         blocked_kind: None,
+        activity_epoch: None,
+        activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
         name: None,
@@ -1029,6 +1031,51 @@ fn session_info_json_shape_roundtrips_with_activity() {
 
     let back = line_roundtrip(&info);
     assert_eq!(back, info);
+}
+
+#[test]
+fn session_info_json_shape_roundtrips_with_activity_cursor() {
+    let info = SessionInfo {
+        activity_epoch: Some("d-epoch-1".to_owned()),
+        activity_revision: Some(ActivityRevision::new(7)),
+        ..running_shell_session(None)
+    };
+
+    let value = serde_json::to_value(&info).expect("serialize session info");
+    assert_eq!(
+        value,
+        json!({
+            "id": "s-42",
+            "external": false,
+            "agent": "shell",
+            "agent_base": "shell",
+            "capabilities": {"resume": false, "fork": false},
+            "cwd": "/workspace/project",
+            "cwd_source": "launch",
+            "pid": 4242,
+            "cols": 120,
+            "rows": 40,
+            "state": "running",
+            "state_source": "process",
+            "activity_epoch": "d-epoch-1",
+            "activity_revision": "7",
+            "created_at": "2026-06-17T10:00:00Z",
+            "updated_at": "2026-06-17T10:01:00Z"
+        })
+    );
+    let back = line_roundtrip(&info);
+    assert_eq!(back, info);
+
+    // A peer that predates the cursor decodes without it.
+    let mut bare = value;
+    for key in ["activity_epoch", "activity_revision"] {
+        bare.as_object_mut()
+            .expect("session info object")
+            .remove(key);
+    }
+    let decoded: SessionInfo = serde_json::from_value(bare).expect("decode session info");
+    assert_eq!(decoded.activity_epoch, None);
+    assert_eq!(decoded.activity_revision, None);
 }
 
 #[test]

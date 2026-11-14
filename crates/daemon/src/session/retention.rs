@@ -632,6 +632,8 @@ mod tests {
     fn session(id: &str, state: SessionState, updated_at: String) -> SessionInfo {
         SessionInfo {
             blocked_kind: None,
+            activity_epoch: None,
+            activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
             id: SessionId(id.to_owned()),
