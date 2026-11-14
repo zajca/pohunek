@@ -1332,6 +1332,7 @@ jobs:
               - 'crates/**/*.rs'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-mold/**'
               - '.github/actions/pinned-cache/**'
             # macOS platform, path, private-protocol, session-worker, daemon,
             # CLI, launchd, and Hermes filesystem contracts run on the native
@@ -1452,6 +1453,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-mold/**'
               - '.github/actions/pinned-cache/**'
             # The release build catches a broken release profile before
             # tagging. That is caused by profile/manifest, lockfile, Cargo
@@ -1590,6 +1592,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/setup-mold/**'
               - '.github/actions/pinned-cache/**'
             # The docs-only path of a pull request (#2210), decided by
             # counting: the `docs_only` output is true when every changed file

@@ -1236,6 +1236,28 @@ def rehearsal_xtask_inputs(commands: set[tuple[str, str]], source: Path = XTASK_
     return inputs
 
 
+def composite_nested_uses(relative: str) -> set[str]:
+    """Every local action a composite nests, transitively.
+
+    Setup actions reach their pinned downloads through
+    `.github/actions/pinned-cache`, so the cache is an input of every job
+    that uses them: the rehearsal inputs and the uses-closure guard below
+    both expand through here instead of listing nesting by hand."""
+    seen: set[str] = set()
+    queue = [relative]
+    while queue:
+        current = queue.pop()
+        try:
+            text = (ROOT / current / "action.yml").read_text()
+        except FileNotFoundError:
+            continue
+        for nested in re.findall(r"(?m)^\s*uses:\s*(\./\.github/actions/[a-z0-9-]+)\s*$", text):
+            if nested not in seen:
+                seen.add(nested)
+                queue.append(nested[2:])
+    return seen
+
+
 def rehearsal_inputs() -> dict[str, str]:
     """Every repository path the rehearsal reads, mapped to where it is read.
 
@@ -1269,6 +1291,9 @@ def rehearsal_inputs() -> dict[str, str]:
                 xtask_runs |= rehearsal_xtask_runs(lines, f"{workflow} job {job_name}")
                 for path in path_references(lines):
                     inputs.setdefault(path, f"{workflow} job {job_name}")
+                for use in REHEARSAL_LOCAL_ACTION.finditer(step):
+                    for nested in composite_nested_uses(f".github/actions/{use.group(1).split('/')[-1]}"):
+                        inputs.setdefault(f"{nested[2:]}/**", f"{workflow} nests {nested} via {use.group(1)}")
                 for line in lines:
                     if "cargo " in line:
                         for package in REHEARSAL_CARGO_PACKAGE.findall(line):
@@ -1441,6 +1466,76 @@ class ReleaseRehearsalFilterTests(unittest.TestCase):
                 continue
             with self.subTest(input=path, origin=origin):
                 self.assertTrue((ROOT / path).is_file(), f"{path} ({origin}) does not exist")
+
+    def test_the_nested_composite_is_a_rehearsal_input(self):
+        # setup-mold and setup-uv reach their downloads through
+        # `.github/actions/pinned-cache`, so the cache is a rehearsal input
+        # even though no rehearsal step uses it directly: drop one of the
+        # nesting `uses:` and this fails on the pull request that does it.
+        self.assertIn(
+            ".github/actions/pinned-cache/**", rehearsal_inputs(),
+            "the nested pinned-cache is not a rehearsal input: "
+            "composite_nested_uses follows no uses: of the setup actions",
+        )
+
+
+def filtered_job_uses_closure(job: str) -> dict[str, set[str]]:
+    """Local action paths a paths-filtered job runs, by called file.
+
+    The job's own local `uses:` plus, for each called reusable workflow,
+    the workflow's local `uses:` expanded through the nested composites
+    (setup-mold, setup-uv and setup-zig nest pinned-cache). The review asked
+    for exactly this derivation: a filter entry removed from `ci.yml`
+    without the action going away must fail the guard below, not the
+    nightly tier."""
+    direct = {use for use in re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job) if not use.endswith(".yml")}
+    called = {use for use in re.findall(r"(?m)^\s*uses:\s*(\./\S+)\s*$", job) if use.endswith(".yml")}
+    closure: dict[str, set[str]] = {}
+    if direct:
+        nested: set[str] = set()
+        for use in direct:
+            nested |= composite_nested_uses(use[2:])
+        closure["job"] = direct | nested
+    for workflow in sorted(called):
+        text = (ROOT / workflow[2:]).read_text()
+        body = text.split("jobs:\n", 1)[1] if "jobs:\n" in text else text
+        declared = set(re.findall(r"(?m)^\s*uses:\s*(\./\.github/actions/\S+)\s*$", body))
+        nested = set()
+        for use in declared:
+            nested |= composite_nested_uses(use[2:])
+        closure[workflow] = declared | nested
+    return closure
+
+
+class FilteredJobUsesClosureTests(unittest.TestCase):
+    def test_every_filtered_job_covers_its_uses_closure(self):
+        # Every local action a filtered job runs — its own `uses:`, the
+        # called reusable workflow's, and the composites they nest — must be
+        # in the job's paths filter: a pull request changing that action
+        # must start the job. `docs_only` jobs run on every pull request by
+        # construction (the filter is inverted), so they are exempt.
+        # `cancel-run` is exempt with a reason: every filtered job that
+        # carries the fail-fast step cancels through the verdict path, and
+        # the action changes with the verdict's own inputs (the cancelling
+        # set and `test_ci_tiers.py` own it), so no paths filter lists it.
+        CANCEL_RUN = "./.github/actions/cancel-run"
+        for name, job in sorted(workflow_jobs().items()):
+            match = re.search(r"needs\.changes\.outputs\.([a-z_]+)", job)
+            if match is None or match.group(1) == "docs_only":
+                continue
+            filt = match.group(1)
+            patterns = filter_paths(filt)
+            for origin, uses in sorted(filtered_job_uses_closure(job).items()):
+                for use in sorted(uses):
+                    if use == CANCEL_RUN:
+                        continue
+                    with self.subTest(job=name, origin=origin, uses=use):
+                        covered = any(glob_covers(pattern, f"{use[2:]}/**") for pattern in patterns)
+                        self.assertTrue(
+                            covered,
+                            f"{name}: {use} ({origin}) runs outside the {filt} filter: "
+                            "add it to the filter",
+                        )
 
 
 def load_test_partitions():
