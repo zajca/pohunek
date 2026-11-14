@@ -12,6 +12,7 @@
 // Rust guideline compliant 2026-10-12
 
 use pohunek_service_config::preflight::PROBE_BUDGET;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -1996,6 +1997,17 @@ async fn stopped_built_in_claudes(
     tag: &str,
     count: usize,
 ) -> (Fixture, PathBuf, Vec<protocol::SessionId>) {
+    stopped_built_in_claudes_as(tag, count, &claude_profile_text, &BTreeMap::new()).await
+}
+
+/// [`stopped_built_in_claudes`] from the profile `text` gives for the config
+/// home, each session selecting `options`.
+async fn stopped_built_in_claudes_as(
+    tag: &str,
+    count: usize,
+    text: &dyn Fn(&Path) -> String,
+    options: &BTreeMap<String, String>,
+) -> (Fixture, PathBuf, Vec<protocol::SessionId>) {
     let key = signing_key("root");
     let dir = temp_dir(tag);
     let store_path = temp_store_path(tag);
@@ -2009,7 +2021,7 @@ async fn stopped_built_in_claudes(
     let config_home = fixture.dir.join("claude-home");
     let conversations = config_home.join("projects").join("work");
     fs::create_dir_all(&conversations).expect("the conversation directory");
-    fixture.write_profile(PROFILE, &claude_profile_text(&config_home));
+    fixture.write_profile(PROFILE, &text(&config_home));
     let previous = compiled_in_daemon(&fixture, &store_path);
     let mut ids = Vec::with_capacity(count);
     for index in 0..count {
@@ -2024,10 +2036,12 @@ async fn stopped_built_in_claudes(
             .create(protocol::SessionNewParams {
                 agent: PROFILE.to_owned(),
                 cwd: Some(dir.clone()),
+                agent_options: options.clone(),
                 ..params()
             })
             .await
             .expect("a session of the built-in Claude runtime");
+        assert_eq!(&created.agent_options, options);
         let report = native_report_params(
             &previous,
             created.id.clone(),
@@ -4135,6 +4149,54 @@ async fn a_profile_bound_to_the_adopting_package_resumes_without_accepting_a_cha
     restarted
         .registry
         .remove(&session.id)
+        .await
+        .expect("remove the resumed session");
+}
+
+/// A labelled Claude profile over the built-in runtime with the option
+/// `mode` (default `calm`) whose choices set only env.
+fn labelled_claude_profile_text(config_home: &Path) -> String {
+    format!(
+        "display_name = \"Night Shift\"\n{}\n[options.mode]\nlabel = \"Mode\"\ndefault = \"calm\"\n\
+         choices.calm = {{ label = \"Calm\", env = {{ PH_OPT_MODE = \"calm-env\" }} }}\n\
+         choices.bold = {{ label = \"Bold\", env = {{ PH_OPT_MODE = \"bold-env\" }} }}\n",
+        claude_profile_text(config_home)
+    )
+}
+
+/// #2343: a session of a labelled built-in profile that selected the
+/// non-default choice `bold` resumes through the adopting package without a
+/// decision once its profile is bound to it: the adoption compares the
+/// revision the session froze with the recorded choice, and the resumed
+/// session keeps it.
+#[tokio::test]
+async fn a_bound_labelled_profile_with_a_selected_option_resumes_without_a_decision() {
+    let selection = BTreeMap::from([("mode".to_owned(), "bold".to_owned())]);
+    let (fixture, _store_path, ids) = stopped_built_in_claudes_as(
+        "claude-bound-optioned",
+        1,
+        &labelled_claude_profile_text,
+        &selection,
+    )
+    .await;
+    let package = real_official(RuntimeId::CLAUDE);
+    install_real_official(&fixture, &fixture.registry, RuntimeId::CLAUDE, &package, 5).await;
+    bind_claude_profile(&fixture).await;
+    let restarted = restart(&fixture).await;
+
+    let resumed = restarted
+        .registry
+        .resume_with(&ids[0], crate::session::ProfileChange::Refuse)
+        .await
+        .expect("the bound profile keeps the revision the session froze with its choice");
+    assert_eq!(
+        resumed.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+    assert_eq!(resumed.agent_options, selection);
+    restarted
+        .registry
+        .remove(&ids[0])
         .await
         .expect("remove the resumed session");
 }

@@ -1838,9 +1838,12 @@ Important fields:
 - `agent_options`: optional map of option id to choice id: the choice each
   option of the session's profile launched with, defaults included. Absent for
   a bare runtime and a profile without options. It is persisted on the session
-  record and the resume binding (store schema 20) and carried unchanged by
-  every resume, so `session.new`, `session.list`, `session.inspect` and events
-  report the same map.
+  record and the resume binding (store schema 20), so `session.new`,
+  `session.list`, `session.inspect` and events report the same map. A resume
+  records the choices its profile resolution took: the recorded ones, and the
+  default of an option the record lacks (an option added to the profile since,
+  which a relaunch the owner accepted with `accept_profile_change` resolves).
+  The map therefore always matches the frozen profile revision.
 - `agent_base`: the `RuntimeRef` of the runtime backing the session, for
   example `shell`, `codex`, `claude`, or `hermes`; a historical label outside
   the runtime-id grammar remains presentation-only.
@@ -2227,7 +2230,10 @@ relabelled option or choice, a changed default, an added choice and an edit to
 a choice the session did not select therefore keep the revision; an edit to a
 selected choice changes it (`agent_profile_changed`). Under the decision the
 relaunch keeps the frozen arguments and takes the env of the choice as the
-profile now declares it. A recorded choice the profile no longer declares is
+profile now declares it. An option added since the session launched changes the
+revision too; under the decision the relaunch takes the env of its default and
+records that choice in `agent_options`, so a later change of that default
+resumes without a decision. A recorded choice the profile no longer declares is
 refused with `agent_option_choice_missing`, also with the decision: no other
 choice stands in for it, and the owner starts a new session instead. The
 `[options]` text is re-rendered before it is digested, so a layout or comment
