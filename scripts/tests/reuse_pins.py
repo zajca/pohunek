@@ -31,26 +31,26 @@ def pinned_callee():
 # Populated by the pin-update procedure; see docs/development.md (Delta dispatch).
 PINNED_BODY_HASHES = {
   "build-bins": "fe2f2655ee5dd89c177f8bd4bf72a4cb7b766ca5c133304d2a5611ff7bf3d983",
-  "build-tests": "e184799016c58f03a64f9f3e2cf99d5d1af46d2905215225605a6658c0928c7c",
+  "build-tests": "0c4b15a4ab9a7e5ad82bf21c6489e68f8e5cba2b51b8f15fa218b1e412c318fd",
   "darwin-check": "4a82af03b6684e8d7c970cd338a799007bbca51e5dfd7681c1e4ccdbfb62612b",
   "docs": "06499e3f4e9ade20bfd77c7c4f55b0d1c8cdead3de485bcbb2be2b69528544b2",
   "doctests": "7978d844ac8b29ecbbf12db1808456dbb830fb70431c85d7afa3eb8a1ba24326",
-  "fast-tests": "7247e665a0e7d87c90a78e4ecd351651c4157fdfbb699c27011d5e43244973ea",
-  "feature-matrix": "aa5ee100347f8e163a3d12d241c1782636ac5d5ecc52a929c0ff1a855bde7c5a",
-  "hermes-compatibility-macos": "31230f71891dba9c8ddd9d7ef8e758da1d2559f6419d47662ed35063db1ee325",
-  "integration": "898974abc1a703c126b05c0b7f5f3c7f4796372f6a71030d6ca86db4c032113f",
+  "fast-tests": "bb8a335dd5ec94c10c91f9889eaaa5196254987b611ecea329858ac6e6289a8a",
+  "feature-matrix": "7f1ff717444cbe6383a275855562cbdd49a1bd8836355baf6259063527b618aa",
+  "hermes-compatibility-macos": "54ee470400f5a861170bfba8698de84003b6f867ac1878ce32585804ee6a1fa5",
+  "integration": "f34976c20d4d8e6daecfcaa6134b52bf856b1f1e4269a4750a8fd3b93fda03e7",
   "macos-package": "065adb21e50a67d097a7ab569ba1f08ee52991a397fa06bd966604174ea75ef0",
   "macos-release-build": "3606ddebf6821c5b43a453417aa4f5077c8843fb5de0a35e0560094fc3746a38",
-  "macos-tier": "b6d5867fa5aeccaf431276e6f6cd1a3e697c5f8cbc7a60f0595a986224c7cc83",
-  "platform-contracts": "e8c96045f47a59e50ec5e6c95c1fac53d744a4888248add118ac939761cb8473",
+  "macos-tier": "5c1c709f20f1ed7f77248e9fe66d28174d0174c2f0571fc185eb79367e44c5d1",
+  "platform-contracts": "2478c75e6149df6dc0c3f1968b7a69be8918f0d69ea0e1a88a2e7b6b3a0910aa",
   "release-build": "116a9eff04cddbdb4f4fc419f6292be0f7221fd28f153907b0ea115d726d17f1",
   "script-tests": "6bf890865bcac4488c6f72d4b4f6ee15010be064f17b2b2221398be1f62b1996",
   "sdk-macos": "30206a63cca0537df6e38025a794bb5fee4c1baba4c12075ed476a74ddbeccbe",
   "shear": "8e9684845342c677bb4155e024c73fd205e8d1be7582a73a81b75bdff4046c62",
-  "systemd-supervision": "4d67597b01aba3f4abe135be42474c79ae44ee9fbc2e097415c16d1dee46c887",
-  "test": "1023fc9dbabe6f12b693140cd47eb1d7e67f76085a119cf1069f724ff771ba99",
+  "systemd-supervision": "d3be62ecc43a3f2ede8030443abd06581d31bc381f74d49c1898c68586266e94",
+  "test": "e1e15e7f9c00a4271e353dca87028c3aff6e95d80b89130fef6299c0e9c1f92c",
   "ts-drift": "d18b132a9b0a47f66735ed031448f0503a5af9840521fb481c69db78d6dc4cc1",
-  "udeps": "71da2c358e8873c1d9075d2410840afa7d476d50e01a8909716a25f51dbef38f",
+  "udeps": "4b1c16df0545f348bd7142416d7c2eaa4b84707f004694f346d8538b97020ad3",
   "upgrade-test": "5085c4d9086eb08446a2834e80a94fb0538d52e03fab110d3206f9ff17145053",
 }
 
@@ -59,7 +59,7 @@ PINNED_CALLEE = {".github/workflows/upgrade.yml": "266534e2e341054912f4220623af7
 # sha256 of the workflow text before `jobs:` (the header comment, `on:`,
 # `run-name`, `concurrency`, `permissions`, the workflow `env:`), taken from
 # ci.yml at pin time.
-PINNED_PREAMBLE = "eb1736bd450b8dc17bbf8c0f7045d767195e556965aa76cbdc6f62a185e0ed27"
+PINNED_PREAMBLE = "48f811fd45d188832f6119928fa1c058591a3331dc273a74442e1741c3c07bf1"
 
 
 def pinned_preamble():

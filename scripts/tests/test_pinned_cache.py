@@ -1,0 +1,566 @@
+"""The pinned cache (issue #2202): guards and behaviour scenarios.
+
+Every scenario runs the real action and job step bodies through
+`composite_harness`: a miss on an empty cache, then a hit on a fresh runner
+that shares only the cache, with the network shims offline. A hit can only
+succeed from the entry the miss saved, so each pair proves that the save
+received exactly the key and the path the restore computed.
+"""
+
+import hashlib
+import io
+import json
+import re
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+
+import composite_harness as harness
+
+ROOT = harness.ROOT
+ACTIONS = ROOT / ".github" / "actions"
+WORKFLOWS = ROOT / ".github" / "workflows"
+PINNED_CACHE = ACTIONS / "pinned-cache" / "action.yml"
+PINNED_USES = ("./.github/actions/pinned-cache", "./pinned-cache-action")
+# Inputs a restore call may pass: the item and the pins that select its bytes.
+RESTORE_INPUTS = {"item", "version", "sha256", "npm-scripts"}
+SAVE_INPUTS = {"phase", "key", "path", "hit"}
+# Items whose install and check run in the caller, which saves afterwards.
+CALLER_SAVED = ("mold", "zig", "uv", "npm:")
+UV_TARGETS = ("X86_64_LINUX", "AARCH64_LINUX", "AARCH64_DARWIN", "X86_64_DARWIN")
+CI_RETRY_FAST = {"CI_RETRY_BACKOFF_SECONDS": "1"}
+
+
+def ci_text():
+    return (WORKFLOWS / "ci.yml").read_text()
+
+
+def tarball(mode, members):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode=mode) as archive:
+        for name, body in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            info.mode = 0o755
+            archive.addfile(info, io.BytesIO(body))
+    return buffer.getvalue()
+
+
+def pinned_cache_violations(files):
+    """Steps outside the composite that cache a pinned item themselves.
+
+    `files` maps a path to its text. Every `actions/cache` step's `with:`
+    block is read whole, so a key or path on any line of the step counts.
+    """
+    found = []
+    for path, text in files.items():
+        if path == PINNED_CACHE:
+            continue
+        for step in harness.iter_steps(text, str(path)):
+            if not str(step.get("uses", "")).startswith("actions/cache"):
+                continue
+            values = " ".join(str(value) for value in (step.get("with") or {}).values())
+            if re.search(r"pinned-|pinned-cache", values):
+                found.append(f"{path}: {step.get('name') or step['uses']}")
+    return found
+
+
+def repository_files():
+    return {path: path.read_text() for path in [*sorted(WORKFLOWS.glob("*.yml")), *sorted(ACTIONS.glob("*/action.yml"))]}
+
+
+def pinned_steps(text, name):
+    return [step for step in harness.iter_steps(text, name) if step.get("uses") in PINNED_USES]
+
+
+def pinned_sites(text, workflow):
+    """Every nextest pinned-cache step with its job: the job is needed to
+    resolve a relocated `./pinned-cache-action` the way the runner does."""
+    jobs = {}
+    for name in re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\n", text.split("jobs:\n", 1)[1]):
+        jobs[name] = [step for step in pinned_steps(text, name) if (step.get("with") or {}).get("item") == "nextest"]
+    return [(name, step) for name, steps in jobs.items() for step in steps]
+
+
+def pinned_step_lists(text, name):
+    """The pinned-cache steps of each job (or action), in order."""
+    for steps in harness.iter_step_lists(text, name):
+        yield [step for step in steps if step.get("uses") in PINNED_USES]
+
+
+class PinnedCacheGuardTests(unittest.TestCase):
+    def test_only_the_composite_touches_actions_cache_for_the_pinned_items(self):
+        self.assertEqual(pinned_cache_violations(repository_files()), [])
+        steps = list(harness.iter_steps(PINNED_CACHE.read_text(), "pinned-cache"))
+        uses = [str(step.get("uses", "")).split("@")[0] for step in steps if "uses" in step]
+        self.assertEqual(uses.count("actions/cache/restore"), 1)
+        self.assertEqual(uses.count("actions/cache/save"), 1)
+
+    def test_the_guard_catches_a_setup_action_with_its_own_save_step(self):
+        path = ACTIONS / "setup-zig" / "action.yml"
+        mutated = path.read_text() + (
+            "\n    - name: Save the pinned zig\n"
+            "      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n"
+            "      with:\n"
+            "        path: ${{ runner.temp }}/pinned-cache/zig\n"
+            "        key: >-\n"
+            "          pinned-zig-${{ runner.os }}-${{ runner.arch }}-\n"
+            "          ${{ inputs.version }}-${{ inputs.sha256 }}-\n"
+        )
+        files = repository_files()
+        files[path] = mutated
+        self.assertEqual(pinned_cache_violations(files), [f"{path}: Save the pinned zig"])
+
+    def test_every_call_is_a_restore_with_pins_or_a_save_of_that_restore(self):
+        restores = {}
+        for path, text in repository_files().items():
+            if path == PINNED_CACHE:
+                continue
+            for steps in pinned_step_lists(text, str(path)):
+                self.check_calls(path, steps, restores)
+        self.assertEqual(set(restores), {"mold", "zig", "uv", "nextest", "systemd-oomd", "npm:compat/pi/npm", "npm:compat/codex/npm", "npm:compat/claude/npm"})
+
+    def check_calls(self, path, steps, restores):
+        ids = {step.get("id"): step for step in steps if step.get("id")}
+        for step in steps:
+            inputs = step.get("with") or {}
+            with self.subTest(file=path.name, step=step.get("name")):
+                if inputs.get("phase", "restore") == "restore":
+                    self.assertNotIn("phase", inputs)
+                    self.assertLessEqual(set(inputs), RESTORE_INPUTS)
+                    self.assertIn("item", inputs)
+                    restores.setdefault(inputs["item"], []).append((path, step))
+                    continue
+                # A save takes back exactly the restore's three outputs
+                # and never decides itself whether the cache hit.
+                self.assertEqual(set(inputs), SAVE_INPUTS)
+                self.assertNotIn("if", step)
+                source = re.fullmatch(r"\$\{\{ steps\.([a-z-]+)\.outputs\.key \}\}", inputs["key"])
+                self.assertIsNotNone(source, inputs["key"])
+                restore_id = source.group(1)
+                for name in ("path", "hit"):
+                    self.assertEqual(inputs[name], f"${{{{ steps.{restore_id}.outputs.{name} }}}}")
+                self.assertIn(restore_id, ids)
+                self.assertTrue(ids[restore_id]["with"]["item"].startswith(CALLER_SAVED))
+
+    def test_caller_saved_items_save_once_and_inside_saved_items_never(self):
+        for path, text in repository_files().items():
+            if path == PINNED_CACHE:
+                continue
+            for steps in pinned_step_lists(text, str(path)):
+                self.check_saves(path, steps)
+
+    def check_saves(self, path, steps):
+        for step in steps:
+            inputs = step.get("with") or {}
+            if "item" not in inputs:
+                continue
+            saves = [
+                other for other in steps
+                if (other.get("with") or {}).get("key") == f"${{{{ steps.{step.get('id')}.outputs.key }}}}"
+            ]
+            with self.subTest(file=path.name, item=inputs["item"]):
+                if inputs["item"].startswith(CALLER_SAVED):
+                    self.assertEqual(len(saves), 1)
+                    self.assertGreater(steps.index(saves[0]), steps.index(step))
+                else:
+                    self.assertEqual(saves, [])
+
+    def test_each_npm_tree_saves_after_its_release_check(self):
+        for job, title in (("pi-package", "Pi"), ("codex-package", "Codex"), ("claude-package", "Claude Code")):
+            with self.subTest(job=job):
+                names = [step.get("name") for step in harness.job_steps(ci_text(), job)]
+                self.assertLess(names.index(f"Restore the pinned {title} npm tree"), names.index(f"Verify the pinned {title} release"))
+                self.assertEqual(
+                    names.index(f"Save the pinned {title} npm tree"), names.index(f"Verify the pinned {title} release") + 1
+                )
+
+    def test_every_key_sha_prefix_matches_its_pin(self):
+        # A key prefix that is not the head of its pinned sha would bind the
+        # key to other bytes. The joined prefixes follow the seed table's
+        # target order, so a rotated or truncated list fails.
+        uv = (ACTIONS / "setup-uv" / "action.yml").read_text()
+        prefixes = re.search(r"(?m)^        sha256: ([0-9a-f]{12}(?:-[0-9a-f]{12}){3})$", uv)
+        self.assertIsNotNone(prefixes, uv)
+        table = dict(re.findall(r"UV_SHA256_(\w+): ([0-9a-f]{64})", uv))
+        self.assertEqual(prefixes.group(1).split("-"), [table[name][:12] for name in UV_TARGETS])
+        self.assertEqual(re.findall(r'(?m)^        version: (\S+)$', uv), [re.search(r'UV_VERSION: "([^"]+)"', uv).group(1)])
+        for name in ("setup-mold", "setup-zig"):
+            with self.subTest(action=name):
+                text = (ACTIONS / name / "action.yml").read_text()
+                self.assertRegex(text, r"(?m)^        sha256: \$\{\{ inputs\.sha256 \}\}$")
+                self.assertRegex(text, r"(?m)^        version: \$\{\{ inputs\.version \}\}$")
+
+
+class Scenario(unittest.TestCase):
+    """A miss runner and a later hit runner sharing one fake cache."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = harness.FakeCache()
+        self.env = {**harness.workflow_env(ci_text()), **CI_RETRY_FAST}
+        self.runners = 0
+
+    def runner(self, **extra_env):
+        self.runners += 1
+        return harness.Harness(self.tmp.name, self.cache, {**self.env, **extra_env})
+
+    def assert_fails(self, run, step_fragment):
+        with self.assertRaises(harness.StepFailed) as raised:
+            run()
+        self.assertIn(step_fragment, raised.exception.output)
+        return raised.exception
+
+
+class NextestScenarioTests(Scenario):
+    VERSION = "0.9.151"
+
+    def restore(self, runner, version=None):
+        return runner.run_action(".github/actions/pinned-cache", {"item": "nextest", "version": version or self.VERSION})
+
+    def test_a_miss_installs_checks_and_saves_and_a_later_hit_needs_no_install(self):
+        miss = self.runner()
+        outputs = self.restore(miss)
+        self.assertEqual(outputs["hit"], "false")
+        self.assertEqual(miss.tools, [f"cargo-nextest@{self.VERSION}"])
+        self.assertEqual(self.cache.saves, [(outputs["key"], outputs["path"])])
+        self.assertEqual(outputs["key"], f"pinned-nextest-Linux-X64-{self.VERSION}")
+        self.assertEqual(self.cache.names(outputs["key"], outputs["path"]), ["cargo-nextest"])
+        hit = self.runner()
+        hit.offline()
+        again = self.restore(hit)
+        self.assertEqual((again["hit"], again["key"], again["path"]), ("true", outputs["key"], outputs["path"]))
+        self.assertEqual(hit.tools, [])
+        self.assertEqual(len(self.cache.saves), 1)
+        self.assertTrue((hit.home / ".cargo" / "bin" / "cargo-nextest").exists())
+
+    def test_a_cached_binary_of_another_version_fails_the_check(self):
+        miss = self.runner()
+        outputs = self.restore(miss)
+        other = Path(self.tmp.name) / "other"
+        harness.write_nextest(other, "0.9.150")
+        self.cache.replace(outputs["key"], outputs["path"], {"cargo-nextest": other.read_bytes()})
+        self.assert_fails(lambda: self.restore(self.runner()), "is not the pinned 0.9.151")
+
+    def test_a_rustup_shim_on_path_does_not_shadow_the_checked_binary(self):
+        # The check calls the binary directly (`"$CARGO_HOME/bin/cargo-nextest"
+        # nextest -V`), never through `cargo`: a rustup `cargo` proxy earlier
+        # on PATH that resolves the checkout's toolchain file (and downloads
+        # the pinned toolchain inside this step, issue #2202) must not change
+        # what the step executes. An extra PATH entry shadows the harness
+        # `cargo` shim the same way a rustup proxy shadows a plain `cargo`.
+        proxy = Path(self.tmp.name) / "proxy"
+        proxy.mkdir()
+        (proxy / "cargo").write_text(
+            '#!/bin/sh\necho "rustup proxy must not run" >&2\nexit 42\n'
+        )
+        (proxy / "cargo").chmod(0o755)
+        miss = self.runner()
+        miss.extra_path.append(str(proxy))
+        outputs = self.restore(miss)
+        self.assertEqual(miss.tools, [f"cargo-nextest@{self.VERSION}"])
+        hit = self.runner()
+        hit.offline()
+        hit.extra_path.append(str(proxy))
+        again = self.restore(hit)
+        self.assertEqual((again["hit"], again["key"]), ("true", outputs["key"]))
+
+    def test_every_nextest_site_restores_the_same_entry(self):
+        first = None
+        for workflow in ("ci.yml", "gate-tests.yml"):
+            text = (WORKFLOWS / workflow).read_text()
+            env = {**harness.workflow_env(text), **CI_RETRY_FAST}
+            sites = pinned_sites(text, workflow)
+            self.assertTrue(sites, workflow)
+            for job, step in sites:
+                with self.subTest(workflow=workflow, job=job, site=step.get("name"), uses=step.get("uses")):
+                    runner = harness.Harness(self.tmp.name, self.cache, env)
+                    if first is not None:
+                        runner.offline()
+                    # Each site runs through its own `uses:` string: a
+                    # relocated `./pinned-cache-action` resolves through the
+                    # copy the containing job makes before the step.
+                    if step.get("uses") == "./pinned-cache-action":
+                        for copy in harness.iter_steps(text, job):
+                            if "cp -R .github/actions/pinned-cache" in (copy.get("run") or ""):
+                                runner.run_steps([copy], {})
+                                break
+                    runner.run_steps([dict(step)], {})
+                    first = first or self.cache.saves[0]
+        self.assertEqual(len(self.cache.saves), 1)
+
+
+class ArchiveScenarioTests(Scenario):
+    """mold and zig: the setup action installs, the composite stores the archive."""
+
+    CASES = {
+        "mold": (
+            "setup-mold",
+            "mold-9.9.9-x86_64-linux.tar.gz",
+            "w:gz",
+            {"mold-9.9.9-x86_64-linux/bin/mold": b"#!/bin/sh\necho mold-test-banner\n"},
+            "mold-test-banner",
+        ),
+        "zig": (
+            "setup-zig",
+            "zig-x86_64-linux-9.9.9.tar.xz",
+            "w:xz",
+            {"zig-x86_64-linux-9.9.9/zig": b"#!/bin/sh\necho 9.9.9\n"},
+            "9.9.9",
+        ),
+    }
+
+    def run_setup(self, runner, item, sha256):
+        action, archive, mode, members, banner = self.CASES[item]
+        return runner.run_action(f".github/actions/{action}", {"version": "9.9.9", "sha256": sha256})
+
+    def fixture(self, runner, item):
+        _, archive, mode, members, _ = self.CASES[item]
+        body = tarball(mode, members)
+        (runner.state / "downloads" / archive).write_bytes(body)
+        return hashlib.sha256(body).hexdigest()
+
+    def test_a_miss_saves_only_the_archive_and_a_later_hit_installs_offline(self):
+        for item, (action, archive, _, _, banner) in self.CASES.items():
+            with self.subTest(item=item):
+                self.cache = harness.FakeCache()
+                miss = self.runner()
+                sha = self.fixture(miss, item)
+                self.run_setup(miss, item, sha)
+                self.assertEqual(len(miss.calls("curl")), 1)
+                self.assertEqual(len(self.cache.saves), 1)
+                key, path = self.cache.saves[0]
+                self.assertEqual(key, f"pinned-{item}-Linux-X64-9.9.9-{sha}")
+                self.assertEqual(self.cache.names(key, path), [archive])
+                self.assertIn(banner, miss.output())
+                hit = self.runner()
+                hit.offline()
+                self.run_setup(hit, item, sha)
+                self.assertEqual(hit.calls("curl"), [])
+                self.assertEqual(self.cache.restores[-1], (key, path))
+                self.assertEqual(len(self.cache.saves), 1)
+                self.assertIn(banner, hit.output())
+
+    def test_a_hit_with_a_corrupted_archive_fails_the_sha256_check(self):
+        for item, (action, archive, _, _, _) in self.CASES.items():
+            with self.subTest(item=item):
+                self.cache = harness.FakeCache()
+                miss = self.runner()
+                sha = self.fixture(miss, item)
+                self.run_setup(miss, item, sha)
+                key, path = self.cache.saves[0]
+                self.cache.replace(key, path, {archive: b"not the pinned release"})
+                hit = self.runner()
+                hit.offline()
+                self.assert_fails(lambda: self.run_setup(hit, item, sha), "sha256 verification of the restored")
+                self.assertFalse((hit.temp / item).exists() and any((hit.temp / item).iterdir()))
+
+
+class UvScenarioTests(Scenario):
+    ARCHIVE = "uv-x86_64-unknown-linux-gnu.tar.gz"
+
+    def prepare(self, runner, body):
+        # The seed table carries the published shas; the fixture's sha
+        # replaces this platform's row in the runner's copy of the action.
+        action = runner.workspace / ".github" / "actions" / "setup-uv" / "action.yml"
+        sha = hashlib.sha256(body).hexdigest()
+        action.write_text(re.sub(r"(UV_SHA256_X86_64_LINUX: )[0-9a-f]{64}", rf"\g<1>{sha}", action.read_text()))
+        (runner.state / "downloads" / self.ARCHIVE).write_bytes(body)
+
+    def body(self):
+        return tarball("w:gz", {"uv-x86_64-unknown-linux-gnu/uv": b"#!/bin/sh\necho 'uv 0.9.28 (0123abcd 2026-01-01)'\n"})
+
+    def test_a_miss_seeds_and_saves_the_archive_and_a_later_hit_seeds_offline(self):
+        body = self.body()
+        miss = self.runner()
+        self.prepare(miss, body)
+        miss.run_action(".github/actions/setup-uv", {"enable-cache": "false"})
+        self.assertEqual(len(miss.calls("curl")), 1)
+        self.assertEqual(len(self.cache.saves), 1)
+        key, path = self.cache.saves[0]
+        self.assertEqual(key, "pinned-uv-Linux-X64-0.9.28-66ad1822dd9c-382c342735ff-12163fe09eb2-3a8030881d13")
+        self.assertEqual(self.cache.names(key, path), [self.ARCHIVE])
+        hit = self.runner()
+        self.prepare(hit, body)
+        hit.offline()
+        hit.run_action(".github/actions/setup-uv", {"enable-cache": "false"})
+        self.assertEqual(hit.calls("curl"), [])
+        self.assertEqual(self.cache.restores[-1], (key, path))
+        self.assertEqual(len(self.cache.saves), 1)
+        self.assertTrue((hit.tool_cache / "uv" / "0.9.28" / "x86_64" / "uv").exists())
+
+    def test_a_hit_with_a_corrupted_archive_fails_the_sha256_check(self):
+        body = self.body()
+        miss = self.runner()
+        self.prepare(miss, body)
+        miss.run_action(".github/actions/setup-uv", {"enable-cache": "false"})
+        key, path = self.cache.saves[0]
+        self.cache.replace(key, path, {self.ARCHIVE: b"not the pinned uv"})
+        hit = self.runner()
+        self.prepare(hit, body)
+        hit.offline()
+        self.assert_fails(
+            lambda: hit.run_action(".github/actions/setup-uv", {"enable-cache": "false"}), "sha256 verification of"
+        )
+        self.assertFalse((hit.tool_cache / "uv" / "0.9.28" / "x86_64" / "uv").exists())
+
+
+class NpmScenarioTests(Scenario):
+    """The three package jobs, from their first step through the save."""
+
+    RUNTIMES = {
+        # job, step title, bin, version line from the release, native binary
+        "pi": ("pi-package", "Pi", "pi", "{release}", False),
+        "codex": ("codex-package", "Codex", "codex", "codex-cli {release}", False),
+        "claude": ("claude-package", "Claude Code", "claude", "{release} (Claude Code)", True),
+    }
+    RELEASE = "1.2.3"
+
+    def prepare(self, runner, runtime, node="v20.19.1"):
+        job, title, bin_name, version, native = self.RUNTIMES[runtime]
+        native_body = harness.npm_tree_spec(runner.state, bin_name, version.format(release=self.RELEASE), native)
+        project = runner.workspace / "compat" / runtime
+        (project / "npm").mkdir(parents=True, exist_ok=True)
+        (project / "npm" / "package-lock.json").write_text(json.dumps({"name": runtime, "lockfileVersion": 3}))
+        lock = {"upstream": {"release": self.RELEASE, "node_min": "20", "sha256": {"linux-x64": hashlib.sha256(native_body.encode()).hexdigest()}}}
+        (project / "compatibility-lock.json").write_text(json.dumps(lock))
+        (runner.state / "node-version").write_text(f"{node}\n")
+        return job, title
+
+    def run_job(self, runner, runtime, steps=None):
+        job, title, *_ = self.RUNTIMES[runtime]
+        steps = steps or harness.job_steps(ci_text(), job)
+        runner.run_steps(steps, {}, until=f"Save the pinned {title} npm tree")
+
+    def test_a_miss_installs_through_the_retry_helper_and_a_later_hit_installs_nothing(self):
+        for runtime in self.RUNTIMES:
+            with self.subTest(runtime=runtime):
+                self.cache = harness.FakeCache()
+                miss = self.runner()
+                self.prepare(miss, runtime)
+                (miss.state / "npm-flaky").write_text("")
+                self.run_job(miss, runtime)
+                npm = miss.calls("npm ci")
+                # The first attempt fails, the helper runs the second.
+                self.assertEqual(len(npm), 2, npm)
+                self.assertIn(f"ci-retry: npm-ci-{runtime} attempt 2/", miss.output())
+                scripts = "--ignore-scripts=false" if runtime == "claude" else "--ignore-scripts"
+                self.assertEqual(npm[-1].split()[4], scripts, npm[-1])
+                lock_hash = hashlib.sha256((miss.workspace / "compat" / runtime / "npm" / "package-lock.json").read_bytes()).hexdigest()
+                key, path = self.cache.saves[0]
+                self.assertEqual(
+                    key,
+                    f"pinned-npm-compat-{runtime}-npm-Linux-X64-{lock_hash}-node20-scripts{'true' if runtime == 'claude' else 'false'}",
+                )
+                self.assertEqual(path, str(miss.workspace / "compat" / runtime / "npm" / "node_modules"))
+                hit = self.runner()
+                self.prepare(hit, runtime)
+                hit.offline()
+                self.run_job(hit, runtime)
+                self.assertEqual(hit.calls("npm"), [])
+                self.assertEqual(self.cache.restores[-1], (key, str(hit.workspace / "compat" / runtime / "npm" / "node_modules")))
+                self.assertEqual(len(self.cache.saves), 1)
+
+    def test_claude_without_install_scripts_fails_the_release_check_and_saves_nothing(self):
+        miss = self.runner()
+        self.prepare(miss, "claude")
+        steps = harness.job_steps(ci_text(), "claude-package")
+        for step in steps:
+            if (step.get("with") or {}).get("item") == "npm:compat/claude/npm":
+                step["with"]["npm-scripts"] = "false"
+        self.assert_fails(lambda: self.run_job(miss, "claude", steps), "is not the locked")
+        self.assertEqual(self.cache.saves, [])
+        self.assertEqual(self.cache.entries, {})
+
+    def test_another_node_major_misses(self):
+        miss = self.runner()
+        self.prepare(miss, "codex")
+        self.run_job(miss, "codex")
+        other = self.runner()
+        self.prepare(other, "codex", node="v22.11.0")
+        self.run_job(other, "codex")
+        self.assertEqual(len(other.calls("npm ci")), 1)
+        self.assertEqual([key.rsplit("-", 2)[1] for key, _ in self.cache.saves], ["node20", "node22"])
+
+
+class SystemdOomdScenarioTests(Scenario):
+    STEP = "Install and start the pinned systemd-oomd"
+    SET = ("systemd-oomd_255.4-1ubuntu8.11_amd64.deb", "libsystemd-shared_255.4-1ubuntu8.11_amd64.deb", "systemd_255.4-1ubuntu8.11_amd64.deb")
+    IMAGE = {"ImageOS": "ubuntu26", "ImageVersion": "20261109.1"}
+
+    def step(self):
+        steps = [step for step in harness.job_steps(ci_text(), "systemd-supervision") if step.get("name") == self.STEP]
+        self.assertEqual(len(steps), 1)
+        return steps
+
+    def runner(self, **extra_env):
+        runner = super().runner(**{**self.IMAGE, **extra_env})
+        (runner.state / "apt-set").write_text("\n".join(self.SET) + "\n")
+        return runner
+
+    def test_a_miss_downloads_the_set_through_the_retry_helper_and_a_later_hit_installs_it_offline(self):
+        miss = self.runner()
+        (miss.state / "apt-flaky").write_text("")
+        miss.run_steps(self.step(), {})
+        self.assertIn("ci-retry: apt-systemd-oomd attempt 2/", miss.output())
+        install = [call for call in miss.calls("apt-get") if " install " in call]
+        self.assertEqual(len(install), 1)
+        self.assertIn("--download-only", install[0])
+        self.assertEqual(sorted((miss.state / "dpkg-installed").read_text().split()), sorted(self.SET))
+        self.assertIn("systemctl enable --now systemd-oomd", miss.calls("systemctl"))
+        key, path = self.cache.saves[0]
+        self.assertEqual(key, "pinned-systemd-oomd-Linux-X64-ubuntu26-20261109.1")
+        # Only the .debs: apt's partial/ and its root-only lock never enter the entry.
+        self.assertEqual(self.cache.names(key, path), sorted(self.SET))
+        hit = self.runner()
+        hit.offline()
+        hit.run_steps(self.step(), {})
+        self.assertEqual(hit.calls("apt-get"), [])
+        self.assertEqual(sorted((hit.state / "dpkg-installed").read_text().split()), sorted(self.SET))
+        self.assertIn("systemctl enable --now systemd-oomd", hit.calls("systemctl"))
+        self.assertEqual(len(self.cache.saves), 1)
+
+    def test_a_new_runner_image_misses(self):
+        self.runner().run_steps(self.step(), {})
+        newer = self.runner(ImageVersion="20261116.1")
+        newer.run_steps(self.step(), {})
+        self.assertEqual([key for key, _ in self.cache.saves], [
+            "pinned-systemd-oomd-Linux-X64-ubuntu26-20261109.1",
+            "pinned-systemd-oomd-Linux-X64-ubuntu26-20261116.1",
+        ])
+
+    def test_an_unknown_runner_image_fails_before_any_cache_access(self):
+        runner = self.runner(ImageOS="", ImageVersion="")
+        self.assert_fails(lambda: runner.run_steps(self.step(), {}), "needs the runner image")
+        self.assertEqual(self.cache.restores, [])
+
+
+class PinnedCachePhaseTests(Scenario):
+    def test_a_save_without_the_restore_outputs_fails(self):
+        runner = self.runner()
+        for inputs in ({"phase": "save"}, {"phase": "save", "key": "pinned-x", "path": str(runner.temp)}, {"phase": "nope", "item": "nextest"}):
+            with self.subTest(inputs=inputs):
+                self.assert_fails(lambda: runner.run_action(".github/actions/pinned-cache", inputs), "pinned-cache")
+
+    def test_a_save_of_a_missing_path_fails_instead_of_warning(self):
+        runner = self.runner()
+        missing = str(runner.temp / "pinned-cache" / "mold")
+        self.assert_fails(
+            lambda: runner.run_action(".github/actions/pinned-cache", {"phase": "save", "key": "pinned-mold-x", "path": missing, "hit": "false"}),
+            "nothing to save",
+        )
+        self.assertEqual(self.cache.warnings, [])
+
+    def test_a_save_after_a_hit_writes_nothing(self):
+        runner = self.runner()
+        stash = runner.temp / "pinned-cache" / "mold"
+        stash.mkdir(parents=True)
+        (stash / "a").write_text("a")
+        runner.run_action(".github/actions/pinned-cache", {"phase": "save", "key": "pinned-mold-x", "path": str(stash), "hit": "true"})
+        self.assertEqual(self.cache.saves, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -16,11 +16,21 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Restore the pinned zig
+      id: restore
+      uses: ./.github/actions/pinned-cache
+      with:
+        item: zig
+        version: ${{ inputs.version }}
+        sha256: ${{ inputs.sha256 }}
+
     - name: Install zig
+      if: steps.restore.outputs.hit != 'true'
       shell: bash
       env:
         ZIG_VERSION: ${{ inputs.version }}
         ZIG_SHA256: ${{ inputs.sha256 }}
+        PINNED_PATH: ${{ steps.restore.outputs.path }}
         # `--retry-all-errors` retries every failure, including a connection
         # reset (curl exit 35 or 56) that plain `--retry` treats as permanent.
         # A permanent error such as 404 is retried too and fails after the last
@@ -68,6 +78,51 @@ runs:
         # Fails closed: extraction only runs after the hash matches.
         (cd "$dest" && printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum -c -)
         tar -xJf "$dest/$archive" -C "$dest" --strip-components=1
-        rm -f "$dest/$archive"
+        # Only the sha256-checked archive enters the stash the save step
+        # writes; the hit step checks its sha256 again before extracting.
+        rm -rf "${PINNED_PATH:?}"
+        mkdir -p "$PINNED_PATH"
+        mv "$dest/$archive" "$PINNED_PATH/"
         echo "$dest" >> "$GITHUB_PATH"
         "$dest/zig" version
+
+    - name: Verify the pinned zig on a hit
+      if: steps.restore.outputs.hit == 'true'
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        ZIG_SHA256: ${{ inputs.sha256 }}
+        PINNED_PATH: ${{ steps.restore.outputs.path }}
+      run: |
+        set -eu
+        # GitHub does not enforce `required: true` on composite inputs.
+        if [ -z "$ZIG_VERSION" ] || [ -z "$ZIG_SHA256" ]; then
+          echo "::error::setup-zig: inputs 'version' and 'sha256' are required" >&2
+          exit 1
+        fi
+        stage="${PINNED_PATH:?}"
+        archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        if [ ! -f "$stage/$archive" ]; then
+          echo "::error::setup-zig: the cache hit holds no $archive" >&2
+          exit 1
+        fi
+        # Fails closed like the miss path: extraction only runs after the
+        # hash of the restored archive matches.
+        (cd "$stage" && printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum -c -) || {
+          echo "::error::setup-zig: sha256 verification of the restored $archive failed" >&2
+          exit 1
+        }
+        dest="${RUNNER_TEMP:?}/zig"
+        rm -rf "$dest"
+        mkdir -p "$dest"
+        tar -xJf "$stage/$archive" -C "$dest" --strip-components=1
+        echo "$dest" >> "$GITHUB_PATH"
+        "$dest/zig" version
+
+    - name: Save the pinned zig
+      uses: ./.github/actions/pinned-cache
+      with:
+        phase: save
+        key: ${{ steps.restore.outputs.key }}
+        path: ${{ steps.restore.outputs.path }}
+        hit: ${{ steps.restore.outputs.hit }}

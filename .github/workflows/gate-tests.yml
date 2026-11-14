@@ -33,6 +33,12 @@ env:
   # gate-tests.yml, release.yml and release-build.yml.
   MOLD_VERSION: "2.42.1"
   MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
+  # Pinned cargo-nextest for taiki-e/install-action, the newest crates.io
+  # release on 2026-11-13, at or above the `nextest-version` minimum in
+  # .config/nextest.toml; equal to NEXTEST_VERSION in ci.yml. Bump both
+  # together; the guard test rejects an unpinned `tool:` under
+  # taiki-e/install-action.
+  NEXTEST_VERSION: "0.9.151"
   # Retry bounds for `.github/scripts/ci-retry` (issue #2201; the values and
   # their calibration are documented in ci.yml). This workflow only needs the
   # cargo class.
@@ -150,10 +156,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+      - name: Restore the pinned cargo-nextest
+        uses: ./.github/actions/pinned-cache
         with:
-          tool: cargo-nextest
+          item: nextest
+          version: ${{ env.NEXTEST_VERSION }}
 
       # The gate runs the tests the way CI does: one archive of the workspace
       # test binaries, shards proven exhaustive and disjoint, one nextest

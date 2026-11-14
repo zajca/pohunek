@@ -258,6 +258,11 @@ cargo +nightly-YYYY-MM-DD udeps --workspace --all-targets --all-features  # opti
 The udeps date is the pinned nightly: the `toolchain: nightly-YYYY-MM-DD`
 input of the `cargo-udeps` job in `.github/workflows/ci.yml`.
 
+Install the versions CI pins (`CARGO_HACK_VERSION` and `CARGO_UDEPS_VERSION`
+in the `.github/workflows/ci.yml` env; a bump changes both places, and
+`PinnedInstallToolTests` compares them): `cargo install --locked
+cargo-hack@0.6.46` and `cargo install --locked cargo-udeps@0.1.61`.
+
 Note: `knowledge` gates its protocol bridge behind a `protocol` feature, so
 `--all-features` only covers the everything-on case — the feature-powerset job
 is what catches a broken feature combination.
