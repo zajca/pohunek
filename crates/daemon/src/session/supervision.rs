@@ -2142,9 +2142,11 @@ mod tests {
     /// The SDK's lifecycle budgets are built from the daemon's validation
     /// maximum of one lifecycle step and from the sweep's pass limit; the
     /// budgets follow when either daemon bound changes. Worker connection and
-    /// initialization are validated up to the same maximum, and the daemon's
-    /// waits on a worker's stop, the stop it sends again on a pending terminal
-    /// commit included, fit the two steps the budgets can give a worker stop.
+    /// initialization are validated up to the same maximum. A worker's stop
+    /// waits for the control connection once and for the worker's answer at
+    /// most twice (the stop it sends again on a pending terminal commit goes
+    /// out on the connection it already holds, `Worker::stop_within`), which
+    /// fits the two steps the budgets can give a worker stop.
     #[test]
     fn the_sdk_lifecycle_budgets_follow_the_daemon_bounds() {
         assert_eq!(

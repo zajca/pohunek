@@ -6578,7 +6578,7 @@ impl SessionRegistry {
                     input: self.inner.config.worker_input_stop_wait,
                     answer: bound,
                 };
-                match Box::pin(stop_through_pending_commit(&worker, id, transaction, waits)).await {
+                match Box::pin(worker.stop_within(transaction, waits)).await {
                     Ok(Some(status)) => ObservedExit::from_status(&status),
                     Ok(None) => {
                         self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
@@ -9976,36 +9976,6 @@ fn worker_error_to_protocol(err: WorkerError) -> ProtocolError {
             ),
         ),
         other => runtime_error("worker_operation_failed", other.to_string()),
-    }
-}
-
-/// Stops `worker`, sending the same stop once more when the worker refuses it
-/// because the stopped runtime's terminal journal commit is still pending.
-///
-/// The worker refuses that way only after its process group was stopped, and a
-/// repeated stop returns that outcome at once, so the second stop only waits
-/// another `terminal_commit_wait` for the commit; it gets the same answer bound
-/// as the first. Any other answer, and the second stop's own refusal, is
-/// returned as it came.
-async fn stop_through_pending_commit(
-    worker: &Worker,
-    id: &SessionId,
-    transaction: pohunek_worker_protocol::TransactionId,
-    waits: StopWaits,
-) -> Result<Option<pohunek_worker_protocol::ExitStatus>, WorkerError> {
-    match Box::pin(worker.stop_within(transaction.clone(), waits)).await {
-        Err(WorkerError::Rejected {
-            code: pohunek_worker_protocol::ControlCode::RuntimeFault,
-            message,
-            retryable: true,
-        }) if message == pohunek_worker_protocol::TERMINAL_COMMIT_PENDING => {
-            info!(
-                session_id = %id.0,
-                "worker stopped the runtime before its terminal commit; waiting for the commit"
-            );
-            Box::pin(worker.stop_within(transaction, waits)).await
-        }
-        other => other,
     }
 }
 
