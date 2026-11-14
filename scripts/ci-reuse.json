@@ -87,11 +87,13 @@
     },
     "integration": {
       "names": [
-        "tests (heavy, PTY + Hermes)"
+        "tests (heavy 1/3, PTY + Hermes)",
+        "tests (heavy 2/3, PTY + Hermes)",
+        "tests (heavy 3/3, PTY + Hermes)"
       ],
       "selection_dependent": true,
       "consumers": [],
-      "reason": "heavy suite runs from the archive with the full selection only"
+      "reason": "heavy parts run from the archive with the full selection only; part 1 also proves the partition"
     },
     "macos-package": {
       "names": [
@@ -135,6 +137,14 @@
       "selection_dependent": false,
       "consumers": [],
       "reason": "release build of the same tree"
+    },
+    "script-tests": {
+      "names": [
+        "script regressions"
+      ],
+      "selection_dependent": true,
+      "consumers": [],
+      "reason": "script regressions of the same tree; a narrowed source never reuses them"
     },
     "sdk-macos": {
       "names": [

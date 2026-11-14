@@ -426,13 +426,13 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertEqual(self.outputs()["source_run"], "")
 
     def test_a_red_heavy_leg_drops_build_tests_by_closure(self):
-        # Row 12: the red `tests (heavy, PTY + Hermes)` leg drops
+        # Row 12: a red `tests (heavy 1/3, PTY + Hermes)` leg drops
         # `integration`, and the closure to a fixed point must take
         # `build-tests` (its producer) out of `skip` too, while jobs that
         # do not depend on it stay reused.
         jobs = green_jobs()
         for entry in jobs:
-            if entry["name"] == "tests (heavy, PTY + Hermes)":
+            if entry["name"] == "tests (heavy 1/3, PTY + Hermes)":
                 entry["conclusion"] = "failure"
         self.write_fixture(
             runs=[run_doc()],

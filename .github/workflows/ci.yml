@@ -12,6 +12,10 @@ name: CI
 # and publishes nothing; it is part of the nightly tier, not of the main tier.
 # The rehearsal's synthetic-archive smoke scenarios (#1259) are their own job
 # that needs only this checkout, so they start in parallel with the build.
+# A pull request whose every change is on the selector's docs-only path skips
+# `build-tests` and `systemd-supervision` through the `changes` job's
+# `docs_only` output (#2210); the test selection verdict fails the run unless
+# the selection takes that path too.
 # Runner images are pinned (#1731), never ubuntu-latest. The nextest archive producer (build-tests) and every job
 # that consumes its archive run on ubuntu-26.04, together, so they share one glibc. Jobs that build or run the
 # shipped binaries stay on ubuntu-24.04: the acceptance guests carry glibc 2.41 and `glibc-check` rejects binaries
@@ -103,9 +107,10 @@ env:
   PYTHONSAFEPATH: "1"
   # Test binaries (issue #170): job `build-tests` compiles the workspace test
   # binaries once (`cargo nextest archive --workspace --all-features`) and
-  # uploads the archive. The test jobs (fast shards, heavy) download
+  # uploads the archive. The test jobs (fast shards, heavy parts, the script
+  # regressions job needs no archive) download
   # it and run from it via scripts/test-partitions --archive-file; they install
-  # only cargo-nextest, no rust-cache (the heavy job also needs the fetched
+  # only cargo-nextest, no rust-cache (each heavy part also needs the fetched
   # crate sources for xtask::dependency_policy). Tests
   # resolve binaries and sources at run time (`CARGO_BIN_EXE_*`,
   # `CARGO_MANIFEST_DIR`, the worker beside the test binaries), so the archive
@@ -1033,13 +1038,17 @@ jobs:
           overwrite: true
           if-no-files-found: error
 
-  # Compiles every workspace test binary exactly once for the fast shards, the
-  # and heavy job (issue #170). Designated `test-debug`
+  # Compiles every workspace test binary exactly once for the fast shards
+  # and the heavy parts (issue #170). Designated `test-debug`
   # saver; the same `--workspace --all-features` build also warms doctests.
   build-tests:
     name: build tests (nextest archive)
-    needs: reuse
-    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') }}
+    # A pull request whose every change is on the docs-only path skips the
+    # build (#2210). The `changes` paths filter decides that in seconds, so
+    # the build never waits for `test-selection`; the verdict fails the run
+    # unless the selection also takes the docs-only path.
+    needs: [reuse, changes]
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') && !(github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1158,9 +1167,7 @@ jobs:
       - name: Install Rust toolchain
         uses: ./relocated/.github/actions/setup-rust
 
-      - name: Check script regressions
-        if: matrix.shard == 'core' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false')
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+      # `script-tests` runs `scripts/tests`; the `core` shard holds Rust tests only.
 
       # Every workflow installs Rust from rust-toolchain.toml or a dated nightly.
       - name: Check the Rust toolchain pin
@@ -1242,6 +1249,9 @@ jobs:
       release_rehearsal: ${{ steps.filter.outputs.release_rehearsal }}
       release_gate: ${{ steps.filter.outputs.release_gate }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
+      # Every changed file is on a docs-only path of the selector and none on
+      # a path it maps (the `docs_only_*` filters below).
+      docs_only: ${{ steps.filter.outputs.docs_only_paths_count == steps.filter.outputs.docs_only_all_count && steps.filter.outputs.docs_only_mapped_count == '0' }}
     steps:
       # Push events (after merge to main) resolve the filter with git commands
       # against the previous commit, which needs more than a depth-1 checkout.
@@ -1430,9 +1440,14 @@ jobs:
             # packaging and assembly tools, the compatibility matrix and locks,
             # the official packages, the consumer suite, the scripts the rows
             # and the archive smoke run, the SDK pack inputs, and the crates the
-            # assembler and the signed catalog live in. The product crates,
+            # assembler and the signed catalog live in. Of crates/xtask it lists
+            # the files the rehearsal's xtask runs can execute (#2211): the
+            # manifest, main.rs, lib.rs and the module closure of each
+            # `cargo xtask` / `"$XTASK"` command; the guard in
+            # scripts/tests/test_ci_tiers.py computes that closure and requires
+            # exactly these xtask entries. The product crates,
             # docs and SDK sources it also reads are left out on purpose; the
-            # guard in scripts/tests/test_ci_tiers.py names them. The rehearsal
+            # guard names them. The rehearsal
             # builds the Linux release artifacts from this commit, runs every
             # matrix row, assembles and signs a bundle with a throwaway key and
             # runs the network-isolated archive smoke on it.
@@ -1446,7 +1461,36 @@ jobs:
               - 'scripts/release-workflow/**'
               - 'scripts/tests/test_release_workflow.py'
               - 'scripts/tests/test_release_workflow_scripts.py'
-              - 'crates/xtask/**'
+              - 'crates/xtask/Cargo.toml'
+              - 'crates/xtask/src/main.rs'
+              - 'crates/xtask/src/lib.rs'
+              - 'crates/xtask/src/affected/**'
+              - 'crates/xtask/src/attestation.rs'
+              - 'crates/xtask/src/catalog.rs'
+              - 'crates/xtask/src/catalog_key.rs'
+              - 'crates/xtask/src/generators.rs'
+              - 'crates/xtask/src/generators/**'
+              - 'crates/xtask/src/knowledge_log.rs'
+              - 'crates/xtask/src/package_evidence.rs'
+              - 'crates/xtask/src/plugin.rs'
+              - 'crates/xtask/src/plugin/build.rs'
+              - 'crates/xtask/src/plugin/host.rs'
+              - 'crates/xtask/src/plugin/prove.rs'
+              - 'crates/xtask/src/plugin_index.rs'
+              - 'crates/xtask/src/plugin_index/admit.rs'
+              - 'crates/xtask/src/plugin_index/build.rs'
+              - 'crates/xtask/src/plugin_index/sign.rs'
+              - 'crates/xtask/src/plugin_index/throwaway.rs'
+              - 'crates/xtask/src/release.rs'
+              - 'crates/xtask/src/release_inventory.rs'
+              - 'crates/xtask/src/release_policy.rs'
+              - 'crates/xtask/src/release_tree.rs'
+              - 'crates/xtask/src/runtime_package.rs'
+              - 'crates/xtask/src/site.rs'
+              - 'crates/xtask/src/test_code.rs'
+              - 'crates/xtask/src/test_runtime.rs'
+              - 'crates/xtask/src/throwaway_trust.rs'
+              - 'crates/xtask/src/upstream_stage.rs'
               - 'crates/package/**'
               - 'compat/**'
               - 'runtime-packages/**'
@@ -1506,6 +1550,35 @@ jobs:
               - '.github/workflows/ci.yml'
               - 'rust-toolchain.toml'
               - '.github/actions/setup-rust/**'
+            # The docs-only path of a pull request (#2210), decided by
+            # counting: the `docs_only` output is true when every changed file
+            # matches `docs_only_paths` and none matches `docs_only_mapped`.
+            # The pinned paths-filter has only a per-step `predicate-quantifier`,
+            # and `every` there means "a file matches all patterns", so the rule
+            # is expressed with the per-filter `_count` outputs instead.
+            # `docs_only_paths` are the selector's `NoRustTests` rules whose only
+            # reminder is `docs check` (or none), and `docs_only_mapped` the rules
+            # that select tests or other gates inside them (crates/xtask/src/
+            # affected/mod.rs); scripts/tests/test_ci_tiers.py derives both lists
+            # from the selector and requires these exact lists. A toolchain
+            # change is never on the docs-only path, so these filters omit
+            # the toolchain inputs the other filters list.
+            docs_only_all:
+              - '**'
+            docs_only_paths:
+              - 'docs/**'
+              - 'changelog.d/**'
+              - '.claude/**'
+              - '.agents/**'
+              - 'assets/**'
+              - '*.md'
+              - 'LICENSE'
+              - 'bacon.toml'
+            docs_only_mapped:
+              - 'docs/knowledge/**'
+              - 'docs/public-api.md'
+              - 'rust-toolchain*'
+              - 'tsconfig*'
       - name: Cancel the run (fail fast)
         if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && steps.infra-2.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: ./.github/actions/cancel-run
@@ -1516,14 +1589,74 @@ jobs:
           set -euo pipefail
           echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
 
+  # Issue #2208: the script regressions have their own job. The job runs
+  # the same `unittest discover` the `core` fast shard used to carry, on
+  # every run except a narrowed selection whose `script_tests` output is
+  # false. Cancels the run on a deterministic
+  # failure like every other verdict-needs job; its checkout is the only
+  # network step, so its infra id is `infra-1`.
+  script-tests:
+    name: script regressions
+    needs: [test-selection, reuse]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.script_tests != 'false') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'script-tests') }}
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write
+    defaults:
+      run:
+        working-directory: relocated
+    steps:
+      - uses: actions/checkout@v4
+        id: infra-1
+        with:
+          path: relocated
+          persist-credentials: false
+
+      - name: Run script regressions
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Keep the fail-fast action
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -R .github/actions/cancel-run "$GITHUB_WORKSPACE/cancel-run-action"
+
+      - name: Cancel the run (fail fast)
+        if: failure() && env.CI_INFRA_FAILURE == '' && steps.infra-1.outcome != 'failure' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+        uses: ./cancel-run-action
+      - name: Note the infrastructure failure (no cancel)
+        if: failure() && (env.CI_INFRA_FAILURE != '' || steps.infra-1.outcome == 'failure')
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::notice title=Infrastructure failure::${CI_INFRA_FAILURE:-a network step}: tagged as infrastructure (an exhausted retry or a failed network step); check the step log: a deterministic failure of a retried command is tagged too; not cancelling, rerun this job alone"
+
+  # Issue #774: the heavy shard runs as three parts (matrix `part`), so no
+  # single job waits for the whole heavy list. Part 1 proves the partition
+  # (`run heavy --part 1/N --check` checks, proves the parts' union, then
+  # runs); parts 2 and 3 run their tests alone. Each part extracts the
+  # archive exactly once, in its own process.
   integration:
-    name: tests (heavy, PTY + Hermes)
+    name: tests (heavy ${{ matrix.part }}/3, PTY + Hermes)
     needs: [build-tests, test-selection, reuse]
     if: ${{ !cancelled() && needs.build-tests.result == 'success' && (github.event_name != 'pull_request' || needs.test-selection.result != 'success' || needs.test-selection.outputs.narrowed != 'true' || needs.test-selection.outputs.heavy != 'false') && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
       actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        # The heavy parts; part 1 also runs the inventory check. The count
+        # stays in `HEAVY_PARTS` below: the run step builds `--part K/N`
+        # from the leg and that value.
+        part: [1, 2, 3]
+    env:
+      # The number of heavy parts (issue #774). `scripts/test-partitions`
+      # reads N from the `--part K/N` argument, never from a literal.
+      HEAVY_PARTS: "3"
     defaults:
       run:
         working-directory: relocated
@@ -1570,11 +1703,9 @@ jobs:
           name: nextest-archive
           path: ${{ runner.temp }}/nextest-archive
 
-      # The daemon socket tests spawn the real durable worker by path
-      # (`target/debug/pohunek-sessiond`); it comes out of the archive, which
-      # cannot be built without it.
-      - name: Verify exhaustive disjoint test partitions
-        run: python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" check
+      # The heavy parts run the extracted archive's test binaries; the
+      # part-1 run step also proves the partition (`--check`) before it
+      # runs. Parts 2 and 3 run their tests alone.
 
       - name: Download test selection
         if: github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true'
@@ -1602,6 +1733,7 @@ jobs:
         shell: bash
         env:
           SHARD: heavy
+          PART: ${{ matrix.part }}
           NARROWED: ${{ github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' }}
         run: |
           set -euo pipefail
@@ -1609,11 +1741,15 @@ jobs:
           if [ "$NARROWED" = true ]; then
             selection=(--selection "$RUNNER_TEMP/test-selection/selection.json")
           fi
-          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" "${selection[@]}"
+          check=()
+          if [ "$PART" = 1 ]; then
+            check=(--check)
+          fi
+          python3 scripts/test-partitions --archive-file "$RUNNER_TEMP/nextest-archive/nextest-archive.tar.zst" run "$SHARD" --part "$PART/$HEAVY_PARTS" "${check[@]}" "${selection[@]}"
 
       - name: Summarize flaky tests
         if: always()
-        run: python3 scripts/junit-flaky-summary --label heavy target/nextest/heavy/junit.xml
+        run: python3 scripts/junit-flaky-summary --label "heavy ${{ matrix.part }}/3" target/nextest/heavy/junit.xml
 
       # Per-test timing evidence for the test-performance work (JUnit `time`
       # attributes). Nextest writes the report under its own storage directory.
@@ -1622,7 +1758,7 @@ jobs:
         id: infra-5
         uses: actions/upload-artifact@v4
         with:
-          name: nextest-junit-heavy
+          name: nextest-junit-heavy-${{ matrix.part }}
           path: relocated/target/nextest/heavy/junit.xml
           if-no-files-found: warn
       - name: Cancel the run (fail fast)
@@ -1642,8 +1778,11 @@ jobs:
   # not carry one.
   systemd-supervision:
     name: real systemd supervision
-    needs: reuse
-    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'systemd-supervision') }}
+    # Skipped on the docs-only path of a pull request by the same `changes`
+    # clause as `build-tests` (#2210); the verdict's check of that skip
+    # against the selection covers this job too.
+    needs: [reuse, changes]
+    if: ${{ !cancelled() && !contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'systemd-supervision') && !(github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true') }}
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -1966,9 +2105,13 @@ jobs:
   # a pull request that plans nothing for it. The gate
   # jobs of the docs-only path must succeed or be skipped by that path, and the
   # macOS lane by its paths filter or a narrowed selection without lane tests.
+  # `build tests` (and with it `test selection check`) may be skipped by the
+  # `changes` docs-only clause only when the selection takes the docs-only
+  # path too; `real systemd supervision` shares that clause, so a docs-only
+  # skip the selection does not confirm always fails this job.
   test-selection-verdict:
     name: test selection verdict
-    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos, reuse]
+    needs: [changes, test-selection, build-tests, test-selection-check, fast-tests, integration, script-tests, test, darwin-check, doctests, build-bins, sdk, audit, shear, platform-contracts, macos-release-build, hermes-compatibility-macos, reuse]
     if: ${{ always() }}
     runs-on: ubuntu-24.04 # not yet run on ubuntu-26.04 (#1731)
     steps:
@@ -1979,10 +2122,10 @@ jobs:
           echo "::error::the reuse job failed, so no skip is trusted"
           exit 1
       - name: Fail a test job that failed or was skipped without a narrowed selection or a reuse skip
-        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests')) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')))) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')))) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success') }}
+        if: ${{ needs.build-tests.result != 'success' && !(needs.build-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'build-tests') || (github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true'))) || (needs.fast-tests.result != 'success' && !(needs.fast-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'fast-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.fast_shards == '[]')))) || (needs.integration.result != 'success' && !(needs.integration.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'integration') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.heavy == 'false')))) || (needs.script-tests.result != 'success' && !(needs.script-tests.result == 'skipped' && (contains(fromJSON(needs.reuse.outputs.skip || '[]'), 'script-tests') || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection.outputs.script_tests == 'false')))) || needs.test-selection-check.result == 'failure' || needs.test-selection-check.result == 'cancelled' || (github.event_name == 'pull_request' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode != 'full' && needs.test-selection-check.result != 'success' && !(needs.test-selection-check.result == 'skipped' && github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'true' && needs.test-selection.result == 'success' && needs.test-selection.outputs.narrowed == 'true' && needs.test-selection.outputs.mode == 'none' && needs.test-selection.outputs.docs_only == 'true')) }}
         shell: bash
         env:
-          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }}"
+          RESULTS: "selection=${{ needs.test-selection.result }} narrowed=${{ needs.test-selection.outputs.narrowed }} mode=${{ needs.test-selection.outputs.mode }} docs_only=${{ needs.test-selection.outputs.docs_only }} changes=${{ needs.changes.result }} changes_docs_only=${{ needs.changes.outputs.docs_only }} build=${{ needs.build-tests.result }} check=${{ needs.test-selection-check.result }} fast=${{ needs.fast-tests.result }} heavy=${{ needs.integration.result }} script=${{ needs.script-tests.result }}"
         run: |
           echo "::error::test jobs did not run as the selection requires: $RESULTS"
           exit 1

@@ -42,7 +42,7 @@ JOB_JUNIT: dict[str, tuple[str, ...]] = {
         "nextest-junit-daemon",
         "nextest-junit-cli",
     ),
-    "integration": ("nextest-junit-heavy",),
+    "integration": ("nextest-junit-heavy-1", "nextest-junit-heavy-2", "nextest-junit-heavy-3"),
 }
 
 MAX_ATTEMPTS = 3

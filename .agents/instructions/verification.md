@@ -251,7 +251,7 @@ design; it changes the pipeline, so it runs every test, and the review of
 workflow changes protects it. A test job narrows or skips only on a narrowed
 selection, and the `test selection verdict` job fails a run whose test job or
 selection check failed, was cancelled, or was skipped without one. The script
-regressions run in the core shard unless a narrowed selection needs none.
+regressions run in the `script-tests` job unless a narrowed selection needs none.
 
 A narrowed selection whose every changed file has no Rust tests and no gate
 but `docs check` (`docs_only`, mode `none`; for example `docs/` outside the
@@ -263,9 +263,14 @@ by the changelog guard's `scripts/changelog check`, root `*.md`, `.agents/`,
 reaches a build: the `every_escaping_include_is_covered` test of `xtask`
 requires every `include_str!` or `include_bytes!` path outside its package
 to select that package. `build tests` and `real systemd supervision` do not
-wait for the selection, so they also run on the docs-only path, and the
-verdict fails a run where one of the skipped jobs failed, was cancelled, or
-was skipped by anything but that path.
+wait for the selection: the `changes` paths filter decides the same path in
+seconds (its `docs_only` output, from the `docs_only_*` filters that
+`scripts/tests/test_ci_tiers.py` derives from the selector's rules), and a
+pull request on it skips both, and with `build tests` also `test selection
+check`. The verdict fails a run where one of the skipped jobs failed, was
+cancelled, or was skipped by anything but that path, and a run where the
+paths filter skipped `build tests` but the selection does not take the
+docs-only path.
 
 G2, running the tests from a sparse checkout that holds only the files whose
 change selects a selected package (`cargo xtask affected sparse`), is wired
@@ -495,8 +500,9 @@ the measurement path behind
 The loop cost boundary (nextest >= 0.9.131; profiles in `.config/nextest.toml`,
 shard helper requires Python >= 3.11). CI compiles the workspace test binaries
 once in `build-tests` (`cargo nextest archive --workspace --all-features`) and
-runs three fast matrix shards and the heavy job from that
-archive, independently of lint/release jobs. The cost boundary is
+runs three fast matrix shards, three heavy matrix parts and the
+script-regressions job from that archive (the script job needs no archive
+itself), independently of lint/release jobs. The cost boundary is
 `profile.fast.default-filter`; update it when adding a PTY, DB, Hermes, or other
 costly fixture. The helper takes its exact complement for heavy and verifies
 all discovered tests, including ignored ones, are assigned exactly once.
@@ -523,7 +529,12 @@ post-merge main tier, so narrowing a filter cannot silently drop coverage.
 Because only the nightly tier runs the release rehearsal after merge, the same
 file guards the `release_rehearsal` filter: every path the rehearsal workflows
 and the scripts they run read must match the filter or be named, with its
-reason, in `REHEARSAL_FILTER_EXCEPTIONS`.
+reason, in `REHEARSAL_FILTER_EXCEPTIONS`. Of `crates/xtask` the inputs are the
+files the rehearsal's xtask runs can execute: the guard reads each
+`cargo xtask <command> <action>` and `"$XTASK" <command> <action>`, follows its
+dispatch arm in `lib.rs` and the module references from there, and requires
+the filter to list exactly that closure (no other xtask file, so a change to
+an xtask test or an unrelated module does not start the rehearsal).
 Manual runs use `workflow_dispatch` input `tier=main|nightly`; the daily
 schedule selects nightly. Pushes to `main` drain: each started main run
 completes, and a newer push replaces only the pending one. PR runs are
@@ -765,8 +776,9 @@ cargo t -p pohunek-daemon                     # fast tests in one crate (alias t
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/cli/heavy
+python3 scripts/test-partitions run heavy --part 1/3  # one heavy part: the only K/N form CI runs
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
-python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
+python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy --part 1/3  # CI mode: no compile, one leg
 python3 scripts/test-partitions --archive-file A check-macos   # 14-package macOS set: exact lane/tier/bucket partition
 python3 scripts/test-partitions --archive-file A check-macos --scope lane  # PR lane archive: its 9 packages only
 python3 scripts/test-partitions --archive-file A run-macos     # PR macOS lane: 9 packages, profile macos
