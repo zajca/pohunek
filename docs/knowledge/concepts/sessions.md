@@ -396,7 +396,11 @@ acknowledges any `unread` `agent_blocked` and `approval_required` records for
 that session's `attention:<session_id>` key and drops the pending turn signal
 for `turn:<session_id>`. An `idle` observation alone does not resolve attention
 because an approval prompt can be technically idle while still requiring owner
-input. A session whose runtime is lost also resolves its attention records,
+input. An approval that a `blocked` record of the program (OSC 7501, or a
+`blocked` reading that names a kind) raised is the exception to the `working`
+rule: a `working` edge with source `process` (output no detection rule names,
+such as a redraw after the record was dropped) does not resolve it; only the
+program's next `working` record or a working screen rule does. A session whose runtime is lost also resolves its attention records,
 because no terminal is left to answer them. The projector derives no record for
 the loss or for any other state of the session (`session list` shows a failed,
 done or lost session). Resolved records are removed after `record_ttl_secs`

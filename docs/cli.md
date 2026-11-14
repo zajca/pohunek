@@ -596,7 +596,9 @@ pohunek notifications watch --session s-01J00000000000000000000000 --kind agent_
 ```
 
 The inbox holds attention only: `agent_blocked` and `approval_required`. A
-record resolves (`acknowledged`) when the session works again or ends, and a
+record resolves (`acknowledged`) when the session works again or ends (for an
+approval the agent's own status report raised, a repaint of its screen is no
+work: only its next reported or visible turn resolves it), and a
 resolved record is removed after `record_ttl_secs` (14 days; the `[notifications]`
 table of `service.toml` also sets `attention_debounce_secs`,
 `attention_dedupe_window_secs` and `record_sweep_interval_secs`). There is no

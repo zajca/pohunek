@@ -3849,7 +3849,12 @@ an automatic denial). A `blocked` reading that names a different kind than the
 one already derived replaces the attention record. A `blocked` record that names no kind is reported with the kind
 `unspecified`, also under a dialog the screen rules read, so an `idle` record
 after it resolves the attention record; a dialog only the screen saw carries no
-kind and stays open.
+kind and stays open. After a `blocked` record or a `blocked` reading with a
+kind, the program reports its own turns: `working` with `state_source`
+`process` (output no detection rule names, such as the program redrawing its
+screen after its status record was dropped) does not resolve that attention
+record, however the terminal split the output; the next `working` from the
+program's status channel or from a screen rule does.
 
 #### Session notification debounce
 
