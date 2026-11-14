@@ -15,6 +15,8 @@ mod hermes_mock;
 mod hermes_skill;
 mod knowledge_log;
 pub use knowledge_log::{fold as fold_log, migrate as migrate_log, FoldSummary, MigrateSummary};
+mod canary_capture;
+mod isolated_host;
 mod package_affected;
 mod package_baseline;
 mod package_bump;

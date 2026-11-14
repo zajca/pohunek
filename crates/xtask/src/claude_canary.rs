@@ -16,12 +16,13 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use serde_json::Value;
 
+use crate::canary_capture::{self, CaptureOutcome};
 use crate::XtaskError;
 
 /// Schema of `capture.json` and of the expected table.
 ///
 /// The runbook `docs/runbooks/claude-canary.md` documents the schema.
-const CANARY_SCHEMA: u32 = 1;
+pub(crate) const CANARY_SCHEMA: u32 = 1;
 
 /// The runtime the canary compares.
 const CANARY_RUNTIME: &str = "claude";
@@ -61,6 +62,50 @@ pub(crate) enum CanaryAction {
         /// The capture file with the schema documented in the runbook.
         #[arg(long, value_name = "FILE")]
         capture: PathBuf,
+    },
+    /// Capture the status records of one `claude` executable per scenario.
+    ///
+    /// Exit codes: 0 the run completed and `capture.json` was written, 2 a
+    /// usage or setup error, 4 a driver step timed out or the workdir is not
+    /// trusted for the account (the partial capture is still written and
+    /// stderr names the step).
+    Capture {
+        /// Head daemon binaries plus the official Claude runtime package: the
+        /// shape `cargo xtask release test-runtime --output <dir> --runtime
+        /// claude` produces with the binaries copied in.
+        #[arg(long, value_name = "DIR")]
+        release_dir: PathBuf,
+        /// The `claude` executable to drive; a relative path is refused.
+        #[arg(long, value_name = "PATH")]
+        claude: PathBuf,
+        /// The `CLAUDE_CONFIG_DIR` of the account the account scenarios run
+        /// as; without it only `login_screen` may be selected.
+        #[arg(long, value_name = "DIR")]
+        claude_config_dir: Option<PathBuf>,
+        /// An existing git directory the sessions run in; the account of
+        /// `--claude-config-dir` must already trust it.
+        #[arg(long, value_name = "DIR")]
+        workdir: PathBuf,
+        /// The directory receiving `capture.json` and `daemon.log`; it must
+        /// not exist or must be empty.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// A scenario to capture; repeat per scenario, default all in table
+        /// order.
+        #[arg(long, value_name = "NAME")]
+        scenario: Vec<String>,
+        /// The directory the isolation root (daemon, sockets, profiles, MCP
+        /// scratch files) is created in and removed from; `TMPDIR` by
+        /// default. The session worker sockets below it must fit the
+        /// platform's socket path limit, so it must be short; a parent that
+        /// is too long is refused before anything starts.
+        #[arg(long, value_name = "DIR")]
+        scratch_parent: Option<PathBuf>,
+        /// Bound of every wait the driver polls: the first screen, a record
+        /// and the first notification. The CLI's own wait for the agent to
+        /// take a prompt is bounded by the protocol's 8 s maximum instead.
+        #[arg(long, value_name = "SECONDS", default_value_t = 120)]
+        step_timeout_secs: u64,
     },
 }
 
@@ -129,16 +174,53 @@ struct CompareReport {
 }
 
 /// Dispatch of the `claude canary` command.
-pub(crate) fn run(action: ClaudeAction) -> Result<CompareOutcome, XtaskError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CanaryOutcome {
+    Compare(CompareOutcome),
+    Capture(CaptureOutcome),
+}
+
+impl CanaryOutcome {
+    /// The process exit code.
+    #[must_use]
+    pub(crate) const fn exit_code(self) -> i32 {
+        match self {
+            Self::Compare(outcome) => outcome.exit_code(),
+            Self::Capture(outcome) => outcome.exit_code(),
+        }
+    }
+}
+
+pub(crate) fn run(action: ClaudeAction) -> Result<CanaryOutcome, XtaskError> {
     match action {
         ClaudeAction::Canary { action } => match action {
             CanaryAction::Compare { expected, capture } => match compare(&expected, &capture) {
                 Ok(report) => {
                     print_report(&report);
-                    Ok(report.outcome)
+                    Ok(CanaryOutcome::Compare(report.outcome))
                 }
                 Err(error) => Err(error),
             },
+            CanaryAction::Capture {
+                release_dir,
+                claude,
+                claude_config_dir,
+                workdir,
+                out,
+                scenario,
+                scratch_parent,
+                step_timeout_secs,
+            } => canary_capture::run(&canary_capture::CaptureArgs {
+                release_dir,
+                claude,
+                claude_config_dir,
+                workdir,
+                out,
+                scenarios: scenario,
+                scratch_parent,
+                step_timeout: std::time::Duration::from_secs(step_timeout_secs),
+            })
+            .map(CanaryOutcome::Capture),
         },
     }
 }

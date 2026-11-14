@@ -297,6 +297,11 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "upstream staging scenarios over the locks, npm projects, the Hermes provisioner and the package list",
     ),
     (
+        "crates/xtask/tests/claude_canary_capture.rs",
+        &["runtime-packages/claude", "crates"],
+        "the Claude package sources and workspace crates the `release test-runtime` tree is built from, run with the checkout as its working directory",
+    ),
+    (
         "crates/xtask/tests/dependency_policy.rs",
         &["Cargo.toml", "Cargo.lock", ".clippy.toml", ".cargo", "crates"],
         "workspace resolution and member manifests",

@@ -9,7 +9,6 @@
 // Rust guideline compliant 2026-11-06
 
 mod build;
-mod host;
 mod prove;
 
 pub(crate) use build::{build, BuildArgs};

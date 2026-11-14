@@ -22,10 +22,115 @@ changes an expectation.
 
 ## Producing a capture
 
-The capture command is tracked in issue #2137.
+`cargo xtask claude canary capture` starts an isolated daemon from the
+release binaries, installs the official Claude runtime package, writes one
+host profile per launch shape and drives each scenario through the daemon's
+CLI. It writes `capture.json` and `daemon.log` into `--out` for `compare` to
+diff. Whatever the records say, a completed run exits 0; comparing is
+`compare`'s job.
 
-The capture schema, the schema the planned capture command (#2137) will
-write and `compare` reads:
+Prerequisites:
+
+- A release tree: `cargo xtask release test-runtime --output <dir> --runtime
+  claude`, then copy the head `pohunek`, `pohunekd` and `pohunek-sessiond`
+  binaries into `<dir>` (the shape `scripts/upgrade-test` builds).
+- The `claude` executable to test. The sessions start it with the isolated
+  `PATH` (`/usr/bin:/bin`), so it must not need another interpreter on
+  `PATH`.
+- The config directory (`CLAUDE_CONFIG_DIR`) of a logged-in account, for
+  every scenario but `login_screen`.
+- A git work directory that account already trusts. The capture never
+  answers Claude's folder-trust dialog: trust the directory once by starting
+  `claude` there with `CLAUDE_CONFIG_DIR` set to that config and accepting
+  the dialog.
+- `python3` on `PATH` for `mcp_elicitation`, which runs the canary MCP
+  server (`compat/claude/canary/elicit_server.py`).
+
+```text
+cargo xtask claude canary capture \
+  --release-dir <dir> \
+  --claude /absolute/path/to/claude \
+  --claude-config-dir /absolute/path/to/claude-config \
+  --workdir /absolute/path/to/git-workdir \
+  --out <empty-or-new-dir> \
+  [--scratch-parent /short/absolute/dir] \
+  [--step-timeout-secs <seconds>] \
+  [--scenario idle_after_turn|permission_prompt|mcp_elicitation|login_screen|running_turn]...
+```
+
+- `--release-dir`, `--claude`, `--workdir`, `--out`: required. Every path
+  flag must be absolute. `--out` must not exist or must be empty, so a
+  capture never mixes with an older one.
+- `--claude-config-dir`: the account the scenarios run as. Without it only
+  `login_screen` may be selected; an account scenario without it exits 2
+  naming the flag.
+- `--scenario`: repeatable; default is all five in table order.
+- `--scratch-parent`: the directory the isolation root is created in and
+  removed from at the end; `TMPDIR` by default. The deepest socket below it
+  is a session worker's staged bind, 84 bytes below the parent with the
+  longest session ID, and every socket path must fit the platform limit (107
+  bytes on Linux, 103 on macOS). The parent may therefore be at most 23 bytes
+  long on Linux and 19 on macOS (`/private/tmp` fits; the default macOS
+  `TMPDIR` does not). The capture checks this the way the daemon does before
+  it starts anything; a parent that is too long exits 2 naming the path
+  length.
+- `--step-timeout-secs`: the bound of every wait the driver polls (the
+  first screen, a record and the first notification); 120 by default. The
+  CLI's own wait for the agent to take a prompt (`--until working` of the
+  turn scenarios) is bounded by the protocol's 8 s maximum instead.
+
+Before every account scenario the command prints one warning line to
+stderr: the scenario runs as the account of `--claude-config-dir` and may
+spend its quota.
+
+The scenarios:
+
+| scenario | profile arguments | prompt | read point |
+| --- | --- | --- | --- |
+| `idle_after_turn` | none | `Reply with the single word OK.` | a `working` record and then `done` or `idle` |
+| `permission_prompt` | `--permission-mode=default` | `Run the shell command true with the Bash tool.` | the first `blocked` record, then the first notification |
+| `mcp_elicitation` | `--mcp-config=<scratch>/mcp.json --allowedTools=mcp__canary__ask --strict-mcp-config` | `Call the ask tool of the canary MCP server.` | the first `blocked` record, then the first notification |
+| `login_screen` | none; an empty config home | none | the first record, or 10 s after the login method list is on screen (`final_record` is then `null`) |
+| `running_turn` | none | `Write a 400 word story about a lighthouse.` | the first `working` record, before the turn ends |
+
+Each session starts in `--workdir`. Before the prompt the capture waits for
+the first screen: the prompt, the login method list (the package's
+`login_method_list` rule) or the folder-trust dialog (its
+`folder_trust_dialog` rule). The trust dialog stops the run with exit 4 and
+the message to trust the workdir in Claude for that config first; no prompt
+is sent while the dialog is on screen. The login method list in an account
+scenario exits 2: log in to that account first.
+
+The records of a row are those read up to its read point, and the reads
+that depend on the held record (the activity and the stale-record check)
+finish within 10 s of the record's first arrival: the 30 s staleness window
+of #2138 then cannot replace the record with the screen. A later read stops
+the run (exit 4), and a row the detector already replaced exits 2 so the
+capture can be retried. `attention` is read with them; a blocked row with no
+notification yet waits for the first one up to `--step-timeout-secs`. After each scenario, and on
+every failure, the session is stopped before the daemon stops.
+
+Side effects: every account scenario runs Claude as that account and may
+spend its quota. The scenarios approve no tool call, so nothing is written
+to `--workdir`. The isolation root holds the daemon, its sockets, the
+profiles, an empty login config home, and the scratch `mcp.json` and MCP
+server; it is removed at the end of the run. `daemon.log` holds the
+isolated daemon's own log.
+
+The `mcp_elicitation` and `login_screen` rows, and the Claude flag
+spellings of the profile arguments (from the Claude Code CLI reference),
+are verified at the first real run (#2101 tracks the login result).
+
+Exit codes:
+
+| code | meaning |
+| --- | --- |
+| 0 | every selected scenario was captured and `capture.json` was written |
+| 2 | usage or setup error; stderr names its cause |
+| 4 | a driver step timed out, a row's activity was not read within 10 s of its record, or the workdir is not trusted for the account; the partial `capture.json` holds the scenarios captured before and stderr names the step |
+
+The capture schema, the schema the capture command writes and `compare`
+reads:
 
 ```json
 {

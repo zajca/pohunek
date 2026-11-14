@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use super::host::{Host, Root};
 use crate::catalog::{archive_identity, hex, io_error, read_input};
+use crate::isolated_host::{Host, Root};
 use crate::plugin_index::{document_bytes, entry_of, throwaway, write_new_document, ThrowawayArgs};
 use crate::XtaskError;
 
@@ -321,7 +321,7 @@ fn write_archive(archive: &[u8], root: &Root) -> Result<PathBuf, String> {
 }
 
 /// The `ok` member of a `--json` document, or the failure the document names.
-fn json_result(output: &super::host::Output, what: &str) -> Result<Value, String> {
+fn json_result(output: &crate::isolated_host::Output, what: &str) -> Result<Value, String> {
     let document: Value = serde_json::from_slice(&output.stdout)
         .map_err(|_error| format!("{what}: stdout is not one JSON document"))?;
     if output.code == Some(0) {
