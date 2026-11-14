@@ -642,7 +642,7 @@ Runtime package archive format:
 - `crates/daemon/src/agent/profile.rs` — profile `package`/`digest` pins and `pinned_digests`.
 - `crates/protocol/src/package.rs` — `package.*` payloads and stable error codes.
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
-- `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate|create`.
+- `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate|create|show`.
 - `docs/knowledge/guides/runtime-packages.md`
 - `docs/knowledge/guides/plugin-repositories.md` — the rule that new plugins live in their own repositories, naming, required CI, index admission and the release snapshot; the guard is `check_plugin_directories` in `crates/xtask/src/doc_drift.rs`.
 - `docs/knowledge/runbooks/runtime-package-recovery.md` — recovery from failed package verification, refused official installs, and disabled, removed or damaged pinned packages.

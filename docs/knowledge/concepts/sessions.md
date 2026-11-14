@@ -295,6 +295,14 @@ the session is kept either way, and a delivery that fails before the submit is
 written rolls the create back as above. A host whose daemon does not advertise
 `session_new_input_ack_supported` is refused before the session is created.
 
+A session launched from a profile that declares options records the choice of
+every option it launched with, defaults included: `agent_options` on
+`session list` and `session inspect`, selected with repeatable
+`pohunek session new --opt OPTION=CHOICE` (or `agent_options` on
+`session.new`). The record survives a daemon restart and every resume
+relaunches with the same choices
+([Agent profiles](agent-profiles.md#launch-options)).
+
 A session can also carry owner metadata, set atomically at creation with
 repeatable `pohunek session new --meta key=value` flags (split on the first
 `=`, so a value may itself contain `=`; a missing `=`, an empty key, or a key
@@ -1218,8 +1226,9 @@ key lives and dies with the session.
 - The same key with the same request returns the existing session with
   `replayed: true`. No hook runs and no input is injected; `worktree_source` and
   `prompt_delivered` belong to the first response and are absent.
-- The same key with another request (another `agent`, `input` or `metadata`)
-  fails with `session_request_conflict` and creates nothing. Only `cols`, `rows`
+- The same key with another request (another `agent`, `input`, `metadata` or
+  `agent_options` selection) fails with `session_request_conflict` and creates
+  nothing. Only `cols`, `rows`
   and `secret_env` values may differ: the fingerprint covers none of them, so a
   retry with another secret value replays the session with its original
   credentials.

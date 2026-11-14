@@ -25,7 +25,7 @@ import {
   type SessionWaitTurnParams,
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
-import { CompatError, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
+import { CompatError, carriesAgentOptions, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesSecretEnv, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
 import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -407,6 +407,14 @@ export class Client {
       await this.requireCapability(connection, {
         flag: "session_new_fetch_ref_supported",
         unsupported: (host) => ClientError.sessionNewFetchRefUnsupported(host),
+      });
+    }
+    // A daemon that predates agent options drops the selection and launches
+    // every option with its default.
+    if (request.method === "session.new" && carriesAgentOptions(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_new_agent_options_supported",
+        unsupported: (host) => ClientError.sessionNewAgentOptionsUnsupported(host),
       });
     }
     // A daemon that predates attention isolation stores the reserved flag

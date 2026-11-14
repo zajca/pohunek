@@ -47,6 +47,7 @@ export const ClientErrorCode = {
   SessionNewRequestIdUnsupported: "session_new_request_id_unsupported",
   SessionNewContextPinUnsupported: "session_new_context_pin_unsupported",
   SessionNewFetchRefUnsupported: "session_new_fetch_ref_unsupported",
+  SessionNewAgentOptionsUnsupported: "session_new_agent_options_unsupported",
   SessionAttentionIsolationUnsupported: "session_attention_isolation_unsupported",
   CommandUnsupported: "command_unsupported",
   PackageInstallCommandsUnsupported: "package_install_commands_unsupported",
@@ -74,6 +75,7 @@ export type ClientErrorKind =
   | "sessionNewRequestIdUnsupported"
   | "sessionNewContextPinUnsupported"
   | "sessionNewFetchRefUnsupported"
+  | "sessionNewAgentOptionsUnsupported"
   | "sessionAttentionIsolationUnsupported"
   | "commandUnsupported"
   | "packageInstallCommandsUnsupported";
@@ -367,6 +369,26 @@ export class ClientError extends Error {
       protocolError(
         ClientErrorClass.Daemon,
         ClientErrorCode.SessionNewFetchRefUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_new_agent_options_supported`, so it
+   * would drop `agent_options` silently and launch every option with its
+   * default.
+   */
+  public static sessionNewAgentOptionsUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates agent_options and would launch every option with its default; nothing was sent`;
+    return new ClientError(
+      "sessionNewAgentOptionsUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionNewAgentOptionsUnsupported,
         msg,
         "upgrade the daemon, then retry",
       ),

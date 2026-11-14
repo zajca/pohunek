@@ -495,6 +495,13 @@ pub(crate) enum Error {
     #[error("the plugin index has expired")]
     IndexExpired,
 
+    /// `plugin profile show` named no agent the host inventories.
+    #[error("no agent profile named {name} on this host")]
+    ProfileNotFound {
+        /// The requested profile name.
+        name: String,
+    },
+
     /// No entry of the index fits the id on this host and core version.
     #[error("the plugin index has no {package} for this platform and core version")]
     IndexPackageNotFound {
@@ -653,6 +660,7 @@ impl Error {
             Self::IndexContextUnsupported => "plugin_index_context_unsupported",
             Self::IndexInvalid { .. } => "plugin_index_invalid",
             Self::IndexExpired => "plugin_index_expired",
+            Self::ProfileNotFound { .. } => "plugin_profile_not_found",
             Self::IndexPackageNotFound { .. } => "plugin_index_package_not_found",
             Self::IndexVersionNotFound { .. } => "plugin_index_version_not_found",
             Self::ArchiveDigestMismatch { .. } => "plugin_archive_digest_mismatch",
@@ -713,6 +721,9 @@ impl Error {
             }
             Self::IndexExpired => {
                 "the index is out of date; retry later or report it to the index maintainers"
+            }
+            Self::ProfileNotFound { .. } => {
+                "list the host's profiles with `pohunek plugin profile list --all`"
             }
             Self::IndexPackageNotFound { .. } => {
                 "check the package id; the index may not list it for this platform and core version"

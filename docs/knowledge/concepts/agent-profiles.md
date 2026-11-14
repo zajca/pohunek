@@ -340,6 +340,84 @@ absent on the wire means `owner`; bare runtimes carry neither), and `session lis
 label live as `agent_display_name` (absent when the profile sets none, or no
 longer resolves). See the public API reference for the wire shape.
 
+## Launch options
+
+A profile may offer a few closed choices a launch picks from, for example the
+model, the effort level or a permission mode. Each `[options.<id>]` table has a
+label, a default and its choices; a choice adds launch arguments, environment
+entries and an optional `min_runtime` floor:
+
+```toml
+base = "claude"
+args = ["--shared"]
+
+[options.model]
+label = "Model"
+default = "opus"
+choices.opus   = { label = "Opus",   args = ["--model", "opus"] }
+choices.sonnet = { label = "Sonnet", args = ["--model", "sonnet"] }
+choices.next   = { label = "Next",   args = ["--model", "next"], min_runtime = "2.2.0" }
+
+[options.subagents]
+label = "Subagent model"
+default = "haiku"
+choices.haiku   = { label = "Haiku", env = { CLAUDE_CODE_SUBAGENT_MODEL = "haiku" } }
+choices.inherit = { label = "Same as main" }
+```
+
+A launch selects one choice per option: `pohunek session new --opt
+model=sonnet` (or `agent_options` on `session.new`) names the choices, and
+every option it does not name takes its default. The selected choices' args
+follow the profile `args` in option-id order (here `subagents` after `model`),
+and their env joins the profile `[env]`, so every rule a launch applies to
+profile args and env applies to them too (the trusted-checkout arguments, the
+integration launch-argument checks, the secret-slot collision check).
+`pohunek plugin profile show <name>` lists the options and which choices are
+available.
+
+The load rules (`invalid_profile` names the option, choice, env key or argument
+index, never a value or label text):
+
+- option and choice ids use the agent-name characters (letters, digits, `.`,
+  `_`, `-`, no leading `.` or `-`, no `..`), at most 64 bytes;
+- at most 16 options, and 1 to 32 choices per option;
+- labels are 1 to 64 bytes after trimming, without hidden or separator
+  characters, and `default` names one of the option's choices;
+- a choice env key is an upper-case variable name that is not `POHUNEK_*`
+  (refused, never stripped), a service-manager variable, a dynamic-loader
+  variable (`LD_*`, `DYLD_*`), a variable the launch sets itself (`PATH`,
+  `HOME`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`, `SHELL`, `LANG`), the runtime's
+  config home variable, a `[launch_env]` name of the runtime, one of the
+  profile's `secret_env` slots, a key of its `[env]`, or a credential-style name
+  (`*_TOKEN`, `*_KEY`, `*_SECRET`, ...). Two choices of one option may set the
+  same key (they are alternatives); choices of different options may not;
+- a choice env value and a choice argument must not look like a credential
+  literal (vendor token, JWT, PEM block, authorization header, URL password);
+- `min_runtime` is a version the runtime's version probe can report.
+
+A choice with `min_runtime` is available only when the runtime's probed version
+is at least that floor. A runtime without a version (no version probe, the
+host shell, a probe that gave none) makes every floored choice unavailable:
+the check fails closed. `session.new` refuses an unavailable choice with
+`agent_option_choice_unavailable`; floors are checked when a session is
+created, not when it resumes.
+
+A session records the choice of every option it launched with, defaults
+included (`agent_options` on `session list` and `session inspect`), and
+resumes with exactly those choices. The profile revision covers the selected
+choices, not the whole `[options]` table: relabelling, changing a default,
+adding a choice or editing a choice the session did not select resumes
+without a decision, while editing a selected choice is `agent_profile_changed`
+(with `--accept-profile-change` the relaunch keeps the frozen arguments and
+takes the choice's current env). A recorded choice the profile no longer
+declares fails with `agent_option_choice_missing`, also with the flag: start a
+new session instead.
+
+The profile bounds which choices exist, not who may pick them: any client
+allowed to start a session of the profile may select its most permissive
+choice (a permission mode included). Declare the least-privileged choice as
+the default, and leave out a choice you do not want any caller to have.
+
 ## Native recovery spec
 
 A native-session launch spec states how an agent CLI resumes one of its own
