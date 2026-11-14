@@ -17146,11 +17146,15 @@ impl NativeIdExitRace {
         assert_eq!(record.info.state, SessionState::Failed);
         assert_eq!(record.info.exit_code, Some(3));
         assert_eq!(record.runtime.state, RuntimeState::Terminal);
-        let memory = self
+        let mut memory = self
             .registry
             .inspect(&self.id)
             .await
             .expect("inspect session");
+        // The activity cursor is a live read-time projection (like
+        // blocked_kind): the stored record never carries it.
+        memory.activity_epoch = None;
+        memory.activity_revision = None;
         assert_eq!(
             record.info, memory,
             "the store holds what the registry shows"
@@ -18211,10 +18215,14 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         durable.info.native_session_path.as_deref(),
         Some("/work/durable-native-newer")
     );
-    let registry_info = registry
+    let mut registry_info = registry
         .inspect(&created.id)
         .await
         .expect("inspect committed terminal session");
+    // The activity cursor is a live read-time projection (like blocked_kind):
+    // the stored record never carries it.
+    registry_info.activity_epoch = None;
+    registry_info.activity_revision = None;
     // Process observation may publish a live update (e.g. the procwatch cwd)
     // before the exit commit; the terminal update is the one under test.
     let event_info = loop {
@@ -24742,10 +24750,14 @@ async fn stop_intent_never_overwrites_an_exit_that_committed_first() {
     assert_eq!(record.info.state, SessionState::Stopped);
     assert_eq!(record.transaction, None, "no stop intent outlives the exit");
     assert_eq!(record.runtime.state, RuntimeState::Terminal);
-    let memory = registry
+    let mut memory = registry
         .inspect(&created.id)
         .await
         .expect("inspect session");
+    // The activity cursor is a live read-time projection (like blocked_kind):
+    // the stored record never carries it.
+    memory.activity_epoch = None;
+    memory.activity_revision = None;
     assert_eq!(
         record.info, memory,
         "the store holds what the registry shows"
