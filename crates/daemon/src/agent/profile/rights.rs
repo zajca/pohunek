@@ -67,6 +67,35 @@ impl ProfileRights {
         }
     }
 
+    /// The rights a session holds when its launch rights are `self` and its
+    /// profile file now reads `live`: nothing the file grew since the launch
+    /// counts, and everything it took away does.
+    pub(crate) fn narrowed_by(&self, live: &Self) -> Self {
+        let spawn_profiles = match (&self.spawn_profiles, &live.spawn_profiles) {
+            (Some(launch), Some(now)) => Some(
+                launch
+                    .iter()
+                    .filter(|name| now.contains(name))
+                    .cloned()
+                    .collect(),
+            ),
+            (Some(list), None) | (None, Some(list)) => Some(list.clone()),
+            (None, None) => None,
+        };
+        Self {
+            owner_equivalent: self.owner_equivalent && live.owner_equivalent,
+            spawn_profiles,
+        }
+    }
+
+    /// Whether an owner-equivalent session with these rights may launch the
+    /// profile `name`: any profile unless a spawn list names the allowed ones.
+    pub(crate) fn allows_spawn_as_owner(&self, name: &str) -> bool {
+        self.spawn_profiles
+            .as_ref()
+            .map_or(true, |allowed| allowed.iter().any(|entry| entry == name))
+    }
+
     /// Whether a session with these rights may launch the profile `name`,
     /// whose own rights are `target`.
     ///

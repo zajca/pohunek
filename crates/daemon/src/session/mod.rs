@@ -883,6 +883,10 @@ struct SessionRegistryInner {
     /// `session.adopt` of a session inside one of those trees is refused, so
     /// a cascade never removes a session the owner just moved elsewhere.
     removing_roots: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// The `[rights]` each live session's profile held when the session was
+    /// launched or resumed. A session's rights are these narrowed by the
+    /// profile file as it reads now, so an edit never widens a running session.
+    launch_rights: std::sync::Mutex<HashMap<SessionId, crate::agent::profile::rights::ProfileRights>>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
     #[cfg(test)]
@@ -2798,6 +2802,7 @@ impl SessionRegistry {
                 store,
                 persist_lock: Mutex::new(()),
                 removing_roots: std::sync::Mutex::new(HashMap::new()),
+                launch_rights: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 resume_writes_blocked: AtomicBool::new(false),
                 #[cfg(test)]

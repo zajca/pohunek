@@ -457,7 +457,7 @@ async fn handle_negotiated(
         }
     }
 
-    if request.method() == method::SESSION_ADOPT {
+    if owner_only_method(request.method()) {
         let class = caller_class(state).await;
         let reason = match class {
             CallerClass::Owner | CallerClass::OwnerShell(_) => None,
@@ -465,6 +465,8 @@ async fn handle_negotiated(
             CallerClass::Unknown => Some("unknown_caller"),
         };
         if let Some(reason) = reason {
+            // Only a session id is read into the audit line; profile names
+            // stay out of it.
             let target = request
                 .params()
                 .get("session_id")
@@ -477,6 +479,13 @@ async fn handle_negotiated(
                 ProtocolError::session_right_denied(reason),
             )
             .expect("deserialized request ids satisfy response validation");
+        }
+    }
+
+    if request.method() == method::SESSION_RESUME {
+        if let Err(error) = resume_profile_allowed(request, state).await {
+            return Response::err(selected_version, request.id(), error)
+                .expect("deserialized request ids satisfy response validation");
         }
     }
 
@@ -654,7 +663,26 @@ async fn attested_spawn_origin(
 ) -> Result<Option<protocol::SpawnedBy>, ProtocolError> {
     let class = caller_class(state).await;
     let caller = match &class {
-        CallerClass::Owner | CallerClass::OwnerShell(_) => {
+        CallerClass::Owner => return Ok(session::request_spawned_by(request)),
+        CallerClass::OwnerShell(shell) => {
+            // Owner rights that come from a profile keep that profile's spawn
+            // list; a `shell` session without a profile table has none.
+            let agent = request
+                .params()
+                .get("agent")
+                .and_then(serde_json::Value::as_str);
+            if let (Some(agent), Some(rights)) =
+                (agent, state.sessions.session_profile_rights(shell).await)
+            {
+                if rights.owner_equivalent && !rights.allows_spawn_as_owner(agent) {
+                    return Err(refuse_spawn(
+                        request,
+                        state,
+                        &class,
+                        "spawn_profile_not_allowed",
+                    ));
+                }
+            }
             return Ok(session::request_spawned_by(request));
         }
         CallerClass::Unknown => return Err(refuse_spawn(request, state, &class, "unknown_caller")),
@@ -694,6 +722,52 @@ async fn attested_spawn_origin(
     }))
 }
 
+/// Applies the spawn list of a session's process tree to `session.resume`: a
+/// resume launches the target's profile, so the list must name it.
+async fn resume_profile_allowed(
+    request: &Request,
+    state: &DaemonState,
+) -> Result<(), ProtocolError> {
+    let class = caller_class(state).await;
+    let CallerClass::Session(caller) = &class else {
+        return Ok(());
+    };
+    let target = mutation_target(request).unwrap_or_default();
+    let Some(agent) = state
+        .sessions
+        .session_agent(&protocol::SessionId(target.to_owned()))
+        .await
+    else {
+        return Ok(());
+    };
+    let Some(rights) = state.sessions.session_profile_rights(caller).await else {
+        return Err(refuse_resume(request, state, &class, target, "unknown_caller"));
+    };
+    let target_rights = state.sessions.profile_rights(&agent).await;
+    if rights.allows_spawn(&agent, &target_rights) {
+        Ok(())
+    } else {
+        Err(refuse_resume(
+            request,
+            state,
+            &class,
+            target,
+            "spawn_profile_not_allowed",
+        ))
+    }
+}
+
+fn refuse_resume(
+    request: &Request,
+    state: &DaemonState,
+    class: &CallerClass,
+    target: &str,
+    reason: &'static str,
+) -> ProtocolError {
+    audit::record_rights_refusal(request, state, class, target, reason);
+    ProtocolError::session_right_denied(reason)
+}
+
 /// Audits a refused `session.new` and returns the error that answers it.
 fn refuse_spawn(
     request: &Request,
@@ -703,6 +777,19 @@ fn refuse_spawn(
 ) -> ProtocolError {
     audit::record_rights_refusal(request, state, class, "", reason);
     ProtocolError::session_right_denied(reason)
+}
+
+/// The methods only the owner may call: they change the parent link a
+/// session's rights follow, or the profile files its rights are read from.
+fn owner_only_method(name: &str) -> bool {
+    matches!(
+        name,
+        method::SESSION_ADOPT
+            | method::PACKAGE_BIND_PROFILE
+            | method::PACKAGE_CREATE_PROFILE
+            | method::PACKAGE_CREATE_PRESET
+            | method::PACKAGE_REMOVE_PROFILE
+    )
 }
 
 /// The session a request addresses for the rights check: every self-target
@@ -721,7 +808,8 @@ fn rights_target(request: &Request) -> Option<&str> {
 ///
 /// A remote overlay connection and a state without a kernel peer carry owner
 /// rights. A local peer is classified once and the class is kept, while the
-/// peer's attestation is read again before every use.
+/// peer's attestation is read again before every use. An `Owner` placement
+/// made while a live session has no known root is not kept.
 async fn caller_class(state: &DaemonState) -> CallerClass {
     if state.transport == ControlTransport::Remote {
         return CallerClass::Owner;
@@ -733,12 +821,20 @@ async fn caller_class(state: &DaemonState) -> CallerClass {
             CallerClass::Owner
         };
     };
-    let class = state
-        .rights_class
-        .get_or_init(|| state.sessions.classify_caller(peer))
-        .await;
+    let class = match state.rights_class.get() {
+        Some(class) => class.clone(),
+        None => {
+            let (class, keep) = state.sessions.classify_caller(peer).await;
+            if keep {
+                // A concurrent request may have set the class first; both
+                // placed the same peer.
+                let _ = state.rights_class.set(class.clone());
+            }
+            class
+        }
+    };
     match peer.standing() {
-        PeerStanding::Process(_) => class.clone(),
+        PeerStanding::Process(_) => class,
         PeerStanding::ForeignUser | PeerStanding::Unattested => CallerClass::Unknown,
     }
 }

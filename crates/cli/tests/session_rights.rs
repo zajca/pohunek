@@ -126,6 +126,30 @@ impl Scenario {
             .expect("keep the profile private");
     }
 
+    /// The `file_digest` `plugin profile list` reports for the profile `name`.
+    fn digest_of(&self, name: &str) -> String {
+        let (code, listed) = self.host.json(&["plugin", "profile", "list", "--all"]);
+        assert_eq!(code, 0, "{listed}");
+        listed["ok"]["profiles"]
+            .as_array()
+            .expect("profiles")
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .and_then(|entry| entry["file_digest"].as_str())
+            .unwrap_or_else(|| panic!("{name} is listed with a digest: {listed}"))
+            .to_owned()
+    }
+
+    /// The path of the profile file `name`.
+    fn profile_path(&self, name: &str) -> PathBuf {
+        self.host
+            .env
+            .config_home()
+            .join("pohunek")
+            .join("agents")
+            .join(format!("{name}.toml"))
+    }
+
     /// The session `id` records as its parent, if any.
     fn parent_of(&self, id: &str) -> Option<String> {
         self.state(id)["spawned_by"]["session_id"]
@@ -662,5 +686,140 @@ fn an_owner_equivalent_profile_acts_like_the_owner() {
     let adopt = scenario.inside(&manager, &format!("session adopt {w1} {manager} --json"));
     assert_eq!(adopt.0, 0, "{}", adopt.1);
     assert_eq!(scenario.parent_of(&w1).as_deref(), Some(manager.as_str()));
+    scenario.finish();
+}
+
+/// A session cannot rewrite the profile files its rights are read from, and
+/// the rights it was launched with only narrow while it runs.
+#[test]
+fn a_session_cannot_rewrite_the_profiles_its_rights_come_from() {
+    let scenario = Scenario::start();
+    scenario.add_profile("rights-manager", "owner_equivalent = true");
+    let plain = scenario.spawn(AGENT_PROFILE, "plain", None);
+    let sibling = scenario.spawn(AGENT_PROFILE, "sibling", None);
+    let before = scenario.digest_of(AGENT_PROFILE);
+
+    // Re-pointing its own profile at the manager profile would give the
+    // session owner rights on its next connection.
+    let replace = scenario.inside(
+        &plain,
+        &format!(
+            "plugin profile create {AGENT_PROFILE} --preset-of rights-manager --replace {before} --json"
+        ),
+    );
+    assert_denied(&replace, "owner_only");
+    let create = scenario.inside(
+        &plain,
+        "plugin profile create rights-evil --preset-of rights-manager --json",
+    );
+    assert_denied(&create, "owner_only");
+    let remove = scenario.inside(
+        &plain,
+        &format!("plugin profile rm {AGENT_PROFILE} --digest {before} --json"),
+    );
+    assert_denied(&remove, "owner_only");
+    assert_eq!(scenario.digest_of(AGENT_PROFILE), before);
+    let still = scenario.inside(&plain, &format!("session stop {sibling} --json"));
+    assert_denied(&still, "not_descendant");
+    assert!(scenario.is_live(&sibling));
+
+    // The owner widening a profile does not widen a session that runs it.
+    let narrow = scenario.spawn(AGENT_PROFILE, "narrow", None);
+    let base = fs::read_to_string(scenario.profile_path(AGENT_PROFILE)).expect("read the profile");
+    fs::write(
+        scenario.profile_path(AGENT_PROFILE),
+        format!("{base}\n[rights]\nowner_equivalent = true\n"),
+    )
+    .expect("widen the profile");
+    let widened = scenario.inside(&narrow, &format!("session stop {sibling} --json"));
+    assert_denied(&widened, "not_descendant");
+    fs::write(scenario.profile_path(AGENT_PROFILE), base).expect("restore the profile");
+
+    // Narrowing it takes effect: a manager whose profile file stops granting
+    // owner rights loses them, and so does one whose file cannot be read.
+    let manager = scenario.spawn("rights-manager", "manager", None);
+    let reach = scenario.inside(&manager, &format!("session stop {sibling} --json"));
+    assert_eq!(reach.0, 0, "{}", reach.1);
+    poll_until("the sibling to stop", || {
+        (!scenario.is_live(&sibling)).then_some(())
+    });
+    let victim = scenario.spawn(AGENT_PROFILE, "victim", None);
+    let path = scenario.profile_path("rights-manager");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("hide the profile");
+    let lost = scenario.inside(&manager, &format!("session stop {victim} --json"));
+    assert_denied(&lost, "not_descendant");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("restore the mode");
+    scenario.finish();
+}
+
+/// `--replace` keeps the `[rights]` table of the profile it replaces, and a
+/// preset cannot replace a profile that has one.
+#[test]
+fn a_replaced_profile_keeps_its_rights_table() {
+    let scenario = Scenario::start();
+    let path = scenario.profile_path("rights-kept");
+    fs::write(
+        &path,
+        "base = \"shell\"\n\n[rights]\nowner_equivalent = true\nspawn_profiles = []\n",
+    )
+    .expect("write the profile");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("keep it private");
+    let digest = scenario.digest_of("rights-kept");
+
+    let (code, replaced) = scenario.host.json(&[
+        "plugin", "profile", "create", "rights-kept", "--base", "shell", "--replace", &digest,
+    ]);
+    assert_eq!(code, 0, "{replaced}");
+    let text = fs::read_to_string(&path).expect("read the profile");
+    assert!(text.contains("owner_equivalent = true"), "{text}");
+    assert!(text.contains("spawn_profiles = []"), "{text}");
+
+    let digest = scenario.digest_of("rights-kept");
+    let (code, refused) = scenario.host.json(&[
+        "plugin",
+        "profile",
+        "create",
+        "rights-kept",
+        "--preset-of",
+        AGENT_PROFILE,
+        "--replace",
+        &digest,
+    ]);
+    assert_ne!(code, 0, "{refused}");
+    assert_eq!(refused["err"]["code"], "package_profile_unusable", "{refused}");
+    assert_eq!(fs::read_to_string(&path).expect("read the profile"), text);
+    scenario.finish();
+}
+
+/// An owner-equivalent profile keeps its spawn list, and a resume launches a
+/// profile only when the list names it.
+#[test]
+fn an_owner_equivalent_manager_still_honours_its_spawn_list() {
+    let scenario = Scenario::start();
+    scenario.add_profile(
+        "rights-listed-manager",
+        &format!("owner_equivalent = true\nspawn_profiles = [\"{AGENT_PROFILE}\"]"),
+    );
+    scenario.add_profile(
+        "rights-lead",
+        &format!("spawn_profiles = [\"{AGENT_PROFILE}\"]"),
+    );
+    let manager = scenario.spawn("rights-listed-manager", "manager", None);
+    let lead = scenario.spawn("rights-lead", "lead", None);
+    let other = scenario.spawn(AGENT_PROFILE, "other", None);
+
+    spawn_inside(&scenario, &manager, AGENT_PROFILE, "").expect("a listed profile is launched");
+    let refused = spawn_inside(&scenario, &manager, SHELL_PROFILE, "")
+        .expect_err("a profile off the list is refused");
+    assert_denied(&refused, "spawn_profile_not_allowed");
+    // The owner rights stay: the manager reaches a session it did not spawn.
+    let stop = scenario.inside(&manager, &format!("session stop {other} --json"));
+    assert_eq!(stop.0, 0, "{}", stop.1);
+
+    // A resume relaunches the stopped session's profile, so it needs the list.
+    let shell = scenario.spawn(SHELL_PROFILE, "shell", Some(&lead));
+    scenario.host.stop_session(&shell);
+    let resume = scenario.inside(&lead, &format!("session resume {shell} --json"));
+    assert_denied(&resume, "spawn_profile_not_allowed");
     scenario.finish();
 }

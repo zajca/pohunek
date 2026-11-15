@@ -134,6 +134,9 @@ struct Roots {
     live: HashSet<SessionId>,
     /// The live sessions of the `shell` runtime.
     shell: HashSet<SessionId>,
+    /// Whether a live session has no known PTY root, so a process in its tree
+    /// would not be placed.
+    rootless: bool,
 }
 
 impl Roots {
@@ -148,31 +151,41 @@ impl Roots {
 
 impl SessionRegistry {
     /// Places the peer of a local control connection in a rights class.
-    pub(crate) async fn classify_caller(&self, peer: &ControlPeer) -> CallerClass {
+    ///
+    /// The second value says whether the class may be kept for the life of the
+    /// connection. An `Owner` placement made while a live session has no known
+    /// root is not: the caller may belong to that session, and the next
+    /// request places it again.
+    pub(crate) async fn classify_caller(&self, peer: &ControlPeer) -> (CallerClass, bool) {
         let process = match peer.standing() {
             PeerStanding::Process(process) => process,
-            PeerStanding::ForeignUser | PeerStanding::Unattested => return CallerClass::Unknown,
+            PeerStanding::ForeignUser | PeerStanding::Unattested => {
+                return (CallerClass::Unknown, true)
+            }
         };
         let roots = self.live_roots().await;
         let inspector = self.inner.inspector.as_ref();
         let Some(id) = ancestry_session(inspector, process, &roots)
             .or_else(|| worker_unit_session(inspector, process, &roots))
         else {
-            return CallerClass::Owner;
+            return (CallerClass::Owner, !roots.rootless);
         };
         if self
             .session_profile_rights(&id)
             .await
             .is_some_and(|rights| rights.owner_equivalent)
         {
-            return CallerClass::OwnerShell(id);
+            return (CallerClass::OwnerShell(id), true);
         }
-        roots.class_of(id)
+        (roots.class_of(id), true)
     }
 
-    /// The `[rights]` of the profile the live session `id` was launched from.
+    /// The rights of the live session `id`: those its profile held at launch,
+    /// narrowed by the profile file as it reads now.
     ///
-    /// `None` for a session the registry does not hold.
+    /// `None` for a session the registry does not hold. A session whose launch
+    /// rights were not recorded, such as one restored after a daemon restart,
+    /// takes the file as it reads at its first use.
     pub(crate) async fn session_profile_rights(&self, id: &SessionId) -> Option<ProfileRights> {
         let agent = self
             .inner
@@ -181,7 +194,45 @@ impl SessionRegistry {
             .await
             .get(id)
             .map(|entry| entry.info.agent.clone())?;
-        Some(self.profile_rights(&agent).await)
+        let live = self.profile_rights(&agent).await;
+        let mut launch = self
+            .inner
+            .launch_rights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = launch.entry(id.clone()).or_insert_with(|| live.clone());
+        Some(held.narrowed_by(&live))
+    }
+
+    /// The profile name the session `id` runs, if the registry holds it.
+    pub(crate) async fn session_agent(&self, id: &SessionId) -> Option<String> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| entry.info.agent.clone())
+    }
+
+    /// Records the rights the profile of the session `id` holds now as the
+    /// rights the session was launched with.
+    pub(crate) async fn record_launch_rights(&self, id: &SessionId) {
+        let Some(agent) = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| entry.info.agent.clone())
+        else {
+            return;
+        };
+        let live = self.profile_rights(&agent).await;
+        self.inner
+            .launch_rights
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), live);
     }
 
     /// The `[rights]` of the profile `agent`, read from its file.
@@ -203,6 +254,7 @@ impl SessionRegistry {
             by_pid: HashMap::new(),
             live: HashSet::new(),
             shell: HashSet::new(),
+            rootless: false,
         };
         for (id, entry) in sessions.iter() {
             if is_terminal(entry.info.state) {
@@ -215,8 +267,11 @@ impl SessionRegistry {
             if entry.info.agent_base == RuntimeRef::shell() && entry.info.spawned_by.is_none() {
                 roots.shell.insert(id.clone());
             }
-            if let Some(root) = entry.root_process {
-                roots.by_pid.insert(root.pid, (id.clone(), root));
+            match entry.root_process {
+                Some(root) => {
+                    roots.by_pid.insert(root.pid, (id.clone(), root));
+                }
+                None => roots.rootless = true,
             }
         }
         roots
