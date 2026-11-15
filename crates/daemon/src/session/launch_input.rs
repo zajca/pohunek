@@ -553,14 +553,14 @@ impl EvaluationRun {
     }
 }
 
-/// Turns git's own hooks off for the agent of a session that skips its
-/// checkout's hooks: the agent runs git in that checkout as the daemon user,
-/// and a relative `core.hooksPath` would resolve to a hook the checkout
-/// carries.
+/// Turns git's own hooks and the fsmonitor hook off for the agent of a
+/// session that skips its checkout's hooks: the agent runs git in that
+/// checkout as the daemon user, and a relative `core.hooksPath` or
+/// `core.fsmonitor` would resolve to a program the checkout carries.
 ///
 /// `env` is the launch environment the worker lays over `base`, so a name in
-/// `env` wins. One `GIT_CONFIG_COUNT` pair is appended behind the pairs the
-/// agent would otherwise get, keeping them.
+/// `env` wins. The pinned `GIT_CONFIG_COUNT` pairs are appended behind the
+/// pairs the agent would otherwise get, keeping them.
 ///
 /// # Errors
 ///
@@ -569,13 +569,13 @@ pub(super) fn pin_agent_git_hooks_off(
     base: &BaseEnv,
     env: &mut LaunchEnv,
 ) -> Result<(), ProtocolError> {
-    let pair = git_hooks_off_env(|name| {
+    let pairs = git_hooks_off_env(|name| {
         env.iter()
             .rev()
             .find(|(set, _)| set == name)
             .map(|(_, value)| value.as_str())
             .or_else(|| base.get(name))
     })?;
-    env.append(LaunchEnv::new(pair.into()));
+    env.append(LaunchEnv::new(pairs));
     Ok(())
 }

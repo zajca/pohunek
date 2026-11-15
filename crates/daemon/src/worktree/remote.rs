@@ -311,7 +311,7 @@ pub(super) fn verify_start(
     source: &WorktreeSource,
 ) -> Result<(), ProtocolError> {
     let expected = source.commit.as_str();
-    let err = match git_capture(path,layer, &["rev-parse", "--verify", "HEAD"]) {
+    let err = match git_capture(path, layer, &["rev-parse", "--verify", "HEAD"]) {
         Ok(head) if head == expected => return Ok(()),
         Ok(head) => error(
             ErrorClass::Runtime,

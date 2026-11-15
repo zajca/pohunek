@@ -30,18 +30,17 @@ pub(crate) enum RepoHookLayer {
     Skip,
 }
 
-/// The `git -c` setting of a skipped layer.
-const GIT_NO_HOOKS_OPTION: &str = "core.hooksPath=/dev/null";
-/// The git setting a skipped layer pins.
-const GIT_HOOKS_PATH_KEY: &str = "core.hooksPath";
-/// The `core.hooksPath` of a skipped layer: git looks a hook up below it and
-/// finds none.
-const GIT_NO_HOOKS_PATH: &str = "/dev/null";
+/// The git settings a skipped layer pins, as key and value: no hook directory
+/// (git looks a hook up below `/dev/null` and finds none) and no fsmonitor
+/// hook. A repository configuration can name either as a path relative to the
+/// checkout, which would run a program the checkout carries.
+const GIT_PINNED_SETTINGS: [(&str, &str); 2] =
+    [("core.hooksPath", "/dev/null"), ("core.fsmonitor", "false")];
 /// Number of `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` pairs git reads (git
 /// 2.31 or newer, which project detection already needs).
 const GIT_CONFIG_COUNT: &str = "GIT_CONFIG_COUNT";
 /// Command-scoped settings of `git -c`, which git reads after the
-/// `GIT_CONFIG_COUNT` pairs, so one of them would win over the pinned path.
+/// `GIT_CONFIG_COUNT` pairs, so one of them would win over the pinned settings.
 const GIT_CONFIG_PARAMETERS: &str = "GIT_CONFIG_PARAMETERS";
 
 impl RepoHookLayer {
@@ -57,36 +56,54 @@ impl RepoHookLayer {
     /// The options a daemon `git` command of a session with this layer takes
     /// before its subcommand.
     ///
-    /// A skipped layer runs none of git's own hooks either: a relative
-    /// `core.hooksPath` (husky style) resolves inside the checkout a command
-    /// runs in, so a hook the checkout carries would run as the daemon user.
+    /// A skipped layer runs none of git's own hooks and no fsmonitor hook
+    /// either ([`GIT_PINNED_SETTINGS`]): a relative `core.hooksPath` (husky
+    /// style) or `core.fsmonitor` resolves inside the checkout a command runs
+    /// in, so a program the checkout carries would run as the daemon user.
     /// `-c` outranks every configuration file and `GIT_CONFIG_COUNT`.
     pub(crate) fn git_options(self) -> &'static [&'static str] {
         match self {
             Self::Run => &[],
-            Self::Skip => &["-c", GIT_NO_HOOKS_OPTION],
+            Self::Skip => &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+            ],
+        }
+    }
+
+    /// The options a daemon `git diff` of a session with this layer takes: a
+    /// skipped layer converts no file through a textconv driver, which the
+    /// checkout's `.gitattributes` selects and a repository configuration may
+    /// name by a path inside the checkout. External diff drivers are off for
+    /// every session diff (`--no-ext-diff`).
+    pub(crate) fn diff_options(self) -> &'static [&'static str] {
+        match self {
+            Self::Run => &[],
+            Self::Skip => &["--no-textconv"],
         }
     }
 }
 
-/// The environment entries that turn git's own hooks off for the agent of a
-/// session that skips its checkout's hooks; the agent runs git in that
-/// checkout as the daemon user.
+/// The environment entries that turn git's own hooks and the fsmonitor hook
+/// off for the agent of a session that skips its checkout's hooks; the agent
+/// runs git in that checkout as the daemon user.
 ///
-/// `lookup` reads the environment the entries are appended to. The
-/// entries add one `GIT_CONFIG_COUNT` pair behind the pairs already set, so a
-/// user's own pairs keep their values and the pinned `core.hooksPath` is the
-/// last one git reads. An unset or empty count is zero.
+/// `lookup` reads the environment the entries are appended to. The entries
+/// add one `GIT_CONFIG_COUNT` pair per pinned setting behind the pairs already
+/// set, so a user's own pairs keep their values and the pinned settings are
+/// the last ones git reads. An unset or empty count is zero.
 ///
 /// # Errors
 ///
 /// `configuration/git_hooks_env_conflict` when the environment sets
 /// `GIT_CONFIG_PARAMETERS` (git reads it after the pairs, so it could set the
-/// path back) or a `GIT_CONFIG_COUNT` that is not a decimal number. The error
+/// settings back) or a `GIT_CONFIG_COUNT` that is not a decimal number. The error
 /// names the variable, never its value.
 pub(crate) fn git_hooks_off_env<V: AsRef<std::ffi::OsStr>>(
     lookup: impl Fn(&str) -> Option<V>,
-) -> Result<[(String, String); 3], ProtocolError> {
+) -> Result<Vec<(String, String)>, ProtocolError> {
     let conflict = |detail: &str| {
         error(
             ErrorClass::Configuration,
@@ -119,29 +136,28 @@ pub(crate) fn git_hooks_off_env<V: AsRef<std::ffi::OsStr>>(
                 ))
             })?,
     };
-    if count == usize::MAX {
+    if count > usize::MAX - GIT_PINNED_SETTINGS.len() {
         return Err(conflict(&format!(
             "the agent environment sets {GIT_CONFIG_COUNT} to a value too large to extend"
         )));
     }
-    Ok(git_hooks_off_pair(count))
+    Ok(git_hooks_off_pairs(count))
 }
 
-/// The `GIT_CONFIG_COUNT` entries that set `core.hooksPath` to the null device
-/// as pair `index`, the last of `index + 1` pairs. A process that starts from
-/// an environment without git configuration takes pair 0.
-pub(crate) fn git_hooks_off_pair(index: usize) -> [(String, String); 3] {
-    [
-        (GIT_CONFIG_COUNT.to_owned(), (index + 1).to_string()),
-        (
-            format!("GIT_CONFIG_KEY_{index}"),
-            GIT_HOOKS_PATH_KEY.to_owned(),
-        ),
-        (
-            format!("GIT_CONFIG_VALUE_{index}"),
-            GIT_NO_HOOKS_PATH.to_owned(),
-        ),
-    ]
+/// The `GIT_CONFIG_COUNT` entries that set each of [`GIT_PINNED_SETTINGS`] as
+/// pairs `first`, `first + 1`, ..., the last pairs git reads. A process that
+/// starts from an environment without git configuration takes `first` 0.
+pub(crate) fn git_hooks_off_pairs(first: usize) -> Vec<(String, String)> {
+    let mut entries = vec![(
+        GIT_CONFIG_COUNT.to_owned(),
+        (first + GIT_PINNED_SETTINGS.len()).to_string(),
+    )];
+    for (offset, (key, value)) in GIT_PINNED_SETTINGS.iter().enumerate() {
+        let index = first + offset;
+        entries.push((format!("GIT_CONFIG_KEY_{index}"), (*key).to_owned()));
+        entries.push((format!("GIT_CONFIG_VALUE_{index}"), (*value).to_owned()));
+    }
+    entries
 }
 
 /// The host-global script of `event`, when the layer is enabled and the script

@@ -176,9 +176,11 @@ export type SessionNewParams = {
    * `.pohunek/setup`) for every lifecycle hook of the session, for its
    * whole life: create, session, agent-state and remove events. The
    * host-global layer still runs. The session also runs none of git's own
-   * hooks: the daemon's git commands for it take `core.hooksPath=/dev/null`,
-   * and the agent and the host-global hook scripts get it as one more
-   * `GIT_CONFIG_COUNT` pair; an agent environment that sets
+   * hooks and no fsmonitor hook: the daemon's git commands for it take
+   * `core.hooksPath=/dev/null` and `core.fsmonitor=false` (its session diff
+   * also `--no-textconv`), and the agent and the host-global hook scripts
+   * get both as two more `GIT_CONFIG_COUNT` pairs; filter drivers stay
+   * outside the switch. An agent environment that sets
    * `GIT_CONFIG_PARAMETERS` or a non-numeric `GIT_CONFIG_COUNT` fails the
    * start with `git_hooks_env_conflict`. When `hooks.required` names an
    * event the host-global layer has no script for, the create fails with

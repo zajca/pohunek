@@ -659,29 +659,67 @@ GIT_CONFIG_VALUE_0 = "Seeded"
 /// `post-index-change` when its hooks are on.
 const TRACKED_FILE: &str = "README.md";
 
+/// The tracked file whose diff goes through the fixture's textconv driver.
+const CONVERTED_FILE: &str = "notes.txt";
+
 impl Scene {
     /// A fixture repository whose base branch carries a git hook for each of
     /// [`GIT_HOOKS`] below `.githooks`, and whose configuration names that
     /// directory with a relative `core.hooksPath` (husky style), so a git
     /// command run inside a checkout resolves the hooks of that checkout.
     ///
-    /// Each hook appends `git:<hook>:<GIT_CONFIG_COUNT>` to `git.log`; the
-    /// daemon's own git commands carry no count and log `daemon`.
+    /// The configuration also names two more programs by a path inside the
+    /// checkout: `core.fsmonitor=tools/fsmonitor`, which `git status` and
+    /// `git diff` run, and the textconv driver `tools/textconv` that the
+    /// committed `.gitattributes` selects for `*.txt`.
+    ///
+    /// Each program appends `<name>:<GIT_CONFIG_COUNT>` to `git.log` (a hook
+    /// `git:<hook>:...`); the daemon's own git commands carry no count and log
+    /// `daemon`.
     fn init_git_hook_repo(&self) {
-        let hooks: Vec<_> = GIT_HOOKS
+        let marker = |name: &str| format!("{name}:${{GIT_CONFIG_COUNT:-daemon}}");
+        let mut files: Vec<_> = GIT_HOOKS
             .iter()
             .map(|hook| {
                 (
                     format!(".githooks/{hook}"),
-                    self.appending(
-                        "git.log",
-                        &format!("git:{hook}:${{GIT_CONFIG_COUNT:-daemon}}"),
-                    ),
+                    self.appending("git.log", &marker(&format!("git:{hook}"))),
                 )
             })
             .collect();
-        self.init_repo(&hooks);
+        // A failing fsmonitor hook makes git fall back to a full scan.
+        files.push((
+            "tools/fsmonitor".to_owned(),
+            format!(
+                "{}exit 1\n",
+                self.appending("git.log", &marker("fsmonitor"))
+            ),
+        ));
+        files.push((
+            "tools/textconv".to_owned(),
+            format!(
+                "{}cat \"$1\"\n",
+                self.appending("git.log", &marker("textconv"))
+            ),
+        ));
+        files.push((".gitattributes".to_owned(), "*.txt diff=conv\n".to_owned()));
+        files.push((CONVERTED_FILE.to_owned(), "reviewed\n".to_owned()));
+        self.init_repo(&files);
         self.git(&["config", "core.hooksPath", ".githooks"]);
+        self.git(&["config", "core.fsmonitor", "tools/fsmonitor"]);
+        self.git(&["config", "diff.conv.textconv", "tools/textconv"]);
+    }
+
+    /// Changes the converted file and moves the tracked file's mtime in
+    /// `checkout`, so the next `session diff` diffs it through the textconv
+    /// driver and its `git status` rewrites the index.
+    fn edit_checkout(checkout: &Path, seconds_ahead: u64) {
+        fs::write(
+            checkout.join(CONVERTED_FILE),
+            "changed by the pull request\n",
+        )
+        .expect("change the converted file");
+        Scene::stale_index(checkout, seconds_ahead);
     }
 
     /// A host-global `session-start` script that records the
@@ -758,21 +796,14 @@ impl Scene {
         let (code, removed) = self.harness.json(&["session", "rm", id]).await;
         assert_eq!(code, 0, "{removed}");
     }
-
-    fn git_entries(&self, marker: &str) -> usize {
-        self.entries("git.log")
-            .iter()
-            .filter(|entry| entry.ends_with(&format!(":{marker}")))
-            .count()
-    }
 }
 
-/// Git's own hooks, rows 19 to 21: with a relative `core.hooksPath` naming
-/// hooks the checkout carries, a switched session runs none of them: not
-/// through the daemon's git commands (create, `session diff`, removal), not
-/// through the agent's git and not through a host-global script's git. The
-/// agent still sees its own `GIT_CONFIG_COUNT` setting: the pinned path is
-/// appended behind it.
+/// Git's own hooks, rows 19 to 21 and 23: with a relative `core.hooksPath`,
+/// `core.fsmonitor` and textconv driver naming programs the checkout carries,
+/// a switched session runs none of them: not through the daemon's git
+/// commands (create, `session diff`, removal), not through the agent's git
+/// and not through a host-global script's git. The agent still sees its own
+/// `GIT_CONFIG_COUNT` setting: the pinned settings are appended behind it.
 #[tokio::test]
 async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     let scene = Scene::start(Vec::new(), &[]).await;
@@ -786,30 +817,30 @@ async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     scene.wait_for_entry("agent.log", "agent:done").await;
     assert_eq!(
         scene.entries("agent.log").first().map(String::as_str),
-        Some("agent:/dev/null:Seeded:2"),
+        Some("agent:/dev/null:Seeded:3"),
         "the agent's git sees no hook path and keeps its own setting"
     );
     scene.wait_for_entry("host.log", "host-git:/dev/null").await;
 
     let inspected = scene.inspected(&id).await;
     let checkout = PathBuf::from(inspected["worktree_path"].as_str().expect("worktree path"));
-    Scene::stale_index(&checkout, 1);
+    Scene::edit_checkout(&checkout, 1);
     scene.diffed(&id).await;
     scene.stopped_and_removed(&id).await;
 
     assert_eq!(
         scene.entries("git.log"),
         Vec::<String>::new(),
-        "no git hook of the checkout ran"
+        "no git hook, fsmonitor or textconv program of the checkout ran"
     );
     scene.harness.stop().await;
 }
 
-/// Control of rows 19 to 21: the same fixture without the switch runs the
-/// checkout's git hooks through the agent's `git status` and through the
-/// daemon's `git status` of `session diff`, and a host-global script's git
-/// resolves the checkout's hook directory, so the empty log above is
-/// evidence.
+/// Control of rows 19 to 21 and 23: the same fixture without the switch runs
+/// the checkout's git hook and fsmonitor through the agent's `git status`,
+/// all three through the daemon's git of `session diff`, and a host-global
+/// script's git resolves the checkout's hook directory, so the empty log
+/// above is evidence.
 #[tokio::test]
 async fn without_the_switch_the_checkout_git_hooks_run() {
     let scene = Scene::start(Vec::new(), &[]).await;
@@ -826,20 +857,35 @@ async fn without_the_switch_the_checkout_git_hooks_run() {
         Some("agent:.githooks:Seeded:1"),
     );
     scene.wait_for_entry("host.log", "host-git:.githooks").await;
-    scene
-        .wait_for_entry("git.log", "git:post-index-change:1")
-        .await;
+    for entry in ["git:post-index-change:1", "fsmonitor:1"] {
+        scene.wait_for_entry("git.log", entry).await;
+    }
 
     let inspected = scene.inspected(&id).await;
     let checkout = PathBuf::from(inspected["worktree_path"].as_str().expect("worktree path"));
-    let before = scene.git_entries("daemon");
-    Scene::stale_index(&checkout, 2);
+    let count = |entry: &str| {
+        scene
+            .entries("git.log")
+            .iter()
+            .filter(|seen| seen.as_str() == entry)
+            .count()
+    };
+    let before: Vec<_> = [
+        "git:post-index-change:daemon",
+        "fsmonitor:daemon",
+        "textconv:daemon",
+    ]
+    .map(|entry| (entry, count(entry)))
+    .into();
+    Scene::edit_checkout(&checkout, 2);
     scene.diffed(&id).await;
-    assert!(
-        scene.git_entries("daemon") > before,
-        "the diff's git status ran the checkout's hook: {:?}",
-        scene.entries("git.log")
-    );
+    for (entry, earlier) in before {
+        assert!(
+            count(entry) > earlier,
+            "the diff's git ran {entry}: {:?}",
+            scene.entries("git.log")
+        );
+    }
     scene.stopped_and_removed(&id).await;
     scene.harness.stop().await;
 }

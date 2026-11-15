@@ -16,15 +16,18 @@
   backup.
 - With the switch, a `hooks.required` event the host has no script for fails
   the create with `hook_required_skipped` before anything runs.
-- With the switch, the session runs none of git's own hooks: a relative
-  `core.hooksPath` would otherwise resolve to hooks the checkout carries for a
-  git command run inside it (the daemon's `git status` of `session diff` and
-  of the retention pre-removal check ran them, and so did the agent's git).
-  Every daemon git command of the session takes `-c core.hooksPath=/dev/null`
-  (the hook layer is a required argument of the daemon's git command
-  constructor); the agent, on create and on every relaunch, and the host hook
-  scripts get the setting as one more `GIT_CONFIG_COUNT` pair behind the
-  existing ones. `GIT_CONFIG_PARAMETERS` or a non-numeric `GIT_CONFIG_COUNT` in
+- With the switch, the session runs none of git's own hooks and no fsmonitor
+  hook: a relative `core.hooksPath` or `core.fsmonitor` would otherwise
+  resolve to a program the checkout carries for a git command run inside it
+  (the daemon's `git status` of `session diff` and of the retention
+  pre-removal check ran them, and so did the agent's git), and `session diff`
+  ran the textconv driver the checkout's `.gitattributes` selected. Every
+  daemon git command of the session takes `-c core.hooksPath=/dev/null -c
+  core.fsmonitor=false` (the hook layer is a required argument of the
+  daemon's git command constructor) and its `session diff` `--no-textconv`;
+  the agent, on create and on every relaunch, and the host hook scripts get
+  both settings as two more `GIT_CONFIG_COUNT` pairs behind the existing ones.
+  Filter drivers stay outside the switch. `GIT_CONFIG_PARAMETERS` or a non-numeric `GIT_CONFIG_COUNT` in
   the agent environment fails the start with `git_hooks_env_conflict`.
 - The switch is per session; a child or a later in-place session in the same
   checkout does not inherit it.

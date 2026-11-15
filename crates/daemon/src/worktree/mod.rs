@@ -65,7 +65,7 @@ pub(crate) use fetch_ref::check_session_fetch_request;
 use fetch_ref::delete_session_fetched_ref;
 pub(crate) use remote::note_backup;
 use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
-use repo_hooks::{check_required_layer, git_hooks_off_pair, host_hook_script};
+use repo_hooks::{check_required_layer, git_hooks_off_pairs, host_hook_script};
 pub(crate) use repo_hooks::{git_hooks_off_env, host_hook_scripts, RepoHookLayer};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
@@ -1572,7 +1572,7 @@ fn is_valid_worktree(path: &Path) -> bool {
 /// on a bare repo precisely because it has no working tree to run in).
 fn is_git_repo(repo: &Path, layer: RepoHookLayer) -> bool {
     let answers_true =
-        |args: &[&str]| matches!(git_capture(repo,layer, args), Ok(out) if out.trim() == "true");
+        |args: &[&str]| matches!(git_capture(repo, layer, args), Ok(out) if out.trim() == "true");
     answers_true(&["rev-parse", "--is-inside-work-tree"])
         || answers_true(&["rev-parse", "--is-bare-repository"])
 }
@@ -2095,7 +2095,7 @@ fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
     // A host-global script of a session that skips its checkout's hooks runs
     // git in that checkout too; the cleared environment holds no other pair.
     if ctx.repo_layer == RepoHookLayer::Skip {
-        env.extend(git_hooks_off_pair(0));
+        env.extend(git_hooks_off_pairs(0));
     }
     env
 }

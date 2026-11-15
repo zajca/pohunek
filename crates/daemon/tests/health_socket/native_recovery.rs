@@ -38,7 +38,7 @@ struct ClaudeRig {
     session: SessionInfo,
     argv_log: PathBuf,
     /// One line per agent launch: the session id and the agent's
-    /// `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`.
+    /// `GIT_CONFIG_COUNT` and its pairs 0 and 1.
     git_env_log: PathBuf,
     ack_log: PathBuf,
     config_home: PathBuf,
@@ -116,7 +116,7 @@ impl ClaudeRig {
             &format!(
                 "#!/bin/bash\n\
                  printf '%s\\n' \"$*\" >> {argv:?}\n\
-                 printf '%s %s %s %s\\n' \"$POHUNEK_SESSION_ID\" \"${{GIT_CONFIG_COUNT:-}}\" \"${{GIT_CONFIG_KEY_0:-}}\" \"${{GIT_CONFIG_VALUE_0:-}}\" >> {git_env:?}\n\
+                 printf '%s %s %s %s %s %s\\n' \"$POHUNEK_SESSION_ID\" \"${{GIT_CONFIG_COUNT:-}}\" \"${{GIT_CONFIG_KEY_0:-}}\" \"${{GIT_CONFIG_VALUE_0:-}}\" \"${{GIT_CONFIG_KEY_1:-}}\" \"${{GIT_CONFIG_VALUE_1:-}}\" >> {git_env:?}\n\
                  printf '\\033[?2004h'\n\
                  while read -r action source reference; do\n\
                    case \"$action\" in\n\
@@ -539,10 +539,10 @@ async fn a_resumed_session_keeps_skipping_the_repository_hooks() {
     };
     assert_eq!(
         of(&id),
-        vec!["1 core.hooksPath /dev/null"; 2],
+        vec!["2 core.hooksPath /dev/null core.fsmonitor false"; 2],
         "create and relaunch: {launches}"
     );
-    assert_eq!(of(&rig.session.id), vec!["  "], "{launches}");
+    assert_eq!(of(&rig.session.id), vec!["    "], "{launches}");
 
     rig.stop(&id).await;
     let mut rig = rig.restarted().await;

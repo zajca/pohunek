@@ -192,6 +192,7 @@ fn tracked_diff(
 ) -> Result<String, ProtocolError> {
     let mut args = vec!["diff"];
     args.extend(DIFF_OUTPUT_FLAGS);
+    args.extend(layer.diff_options());
     args.extend(["--find-renames", "--end-of-options", merge_base_sha]);
     let output = git_output(worktree, layer, &args)?;
     if output.status.success() {
@@ -265,6 +266,7 @@ fn untracked_diff(
 ) -> Result<String, ProtocolError> {
     let mut args = vec!["diff"];
     args.extend(DIFF_OUTPUT_FLAGS);
+    args.extend(layer.diff_options());
     args.extend(["--no-index", "--", "/dev/null", relative_path]);
     let output = git_output(worktree, layer, &args)?;
     match output.status.code() {

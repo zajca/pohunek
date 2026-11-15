@@ -200,30 +200,43 @@ create at its `post-create` step with the same code, and the create is rolled
 back. Without the switch the rule is unchanged: a required event with no script
 anywhere passes.
 
-The switch also runs none of git's own hooks for the session. A relative
-`core.hooksPath` (husky style) resolves inside the checkout a git command runs
-in, so without the switch a git command there runs hooks the checkout carries.
-With it:
+The switch also turns off the programs git itself runs that a repository
+configuration can name by a path relative to the checkout a git command runs
+in: its hooks (`core.hooksPath`, husky style), its fsmonitor hook
+(`core.fsmonitor`) and, for `session diff`, textconv drivers (which the
+checkout's `.gitattributes` selects). Without the switch a git command there
+runs the copies the checkout carries. With it:
 
 - Every git command the daemon runs for the session (create, fetch, `git
   worktree add` and `remove`, `session diff`, the pre-removal check of a
-  retention sweep, the rollback) runs with `-c core.hooksPath=/dev/null`.
-  Project detection runs its read-only git queries that way for every session.
-- The agent's environment gets `core.hooksPath=/dev/null` as one more
-  `GIT_CONFIG_COUNT` pair (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`), on the
-  first launch and on every relaunch, so the agent's own git in the checkout
-  runs no hook either, including the repository's own `.git/hooks`. The pairs
-  the agent environment already sets (from the profile `[env]` or the
-  environment allowlist) keep their values: the new pair is appended behind
-  them. An agent environment that sets `GIT_CONFIG_PARAMETERS` (git reads it
-  after the pairs, so it could turn the hooks back on) or a `GIT_CONFIG_COUNT`
-  that is not a decimal number fails the start with `git_hooks_env_conflict`
-  (the create is rolled back) and fails a relaunch with the same code; the
-  error names the variable, not its value.
-  `GIT_CONFIG_COUNT` needs git 2.31 or newer, which project detection already
-  requires.
-- Each host-global hook script of the session gets the same pair, so its git in
-  the checkout runs no hook of it.
+  retention sweep, the rollback) runs with `-c core.hooksPath=/dev/null -c
+  core.fsmonitor=false`, and `session diff` also passes `--no-textconv`
+  (external diff drivers are off for every session diff). Project detection
+  runs its read-only git queries with the same settings for every session.
+- The agent's environment gets `core.hooksPath=/dev/null` and
+  `core.fsmonitor=false` as two more `GIT_CONFIG_COUNT` pairs
+  (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`), on the first launch and on
+  every relaunch, so the agent's own git in the checkout runs no hook and no
+  fsmonitor hook either, including the repository's own `.git/hooks`, as long
+  as the process keeps its environment. The pairs the agent environment
+  already sets (from the profile `[env]` or the environment allowlist) keep
+  their values: the new pairs are appended behind them. An agent environment
+  that sets `GIT_CONFIG_PARAMETERS` (git reads it after the pairs, so it could
+  turn them back on) or a `GIT_CONFIG_COUNT` that is not a decimal number
+  fails the start with `git_hooks_env_conflict` (the create is rolled back)
+  and fails a relaunch with the same code; the error names the variable, not
+  its value. `GIT_CONFIG_COUNT` needs git 2.31 or newer, which project
+  detection already requires.
+- Each host-global hook script of the session gets the same pairs, so its git
+  in the checkout runs no hook and no fsmonitor hook of it.
+
+Outside the switch: filter drivers (`filter.<driver>.clean`, `smudge`,
+`process`) that the repository configuration names and the checkout's
+`.gitattributes` selects. A git command that reads such a file (the daemon's
+`git status`, the agent's git) runs them, so a host that reviews untrusted
+checkouts names no filter command by a path relative to the checkout. The
+agent's own `git diff` also applies the configured textconv and external diff
+drivers.
 
 The switch belongs to the session started with it. A session started later in
 the same checkout, an agent's child or an in-place `--cwd` session, does not

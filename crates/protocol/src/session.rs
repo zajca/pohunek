@@ -556,9 +556,11 @@ pub struct SessionNewParams {
     /// `.pohunek/setup`) for every lifecycle hook of the session, for its
     /// whole life: create, session, agent-state and remove events. The
     /// host-global layer still runs. The session also runs none of git's own
-    /// hooks: the daemon's git commands for it take `core.hooksPath=/dev/null`,
-    /// and the agent and the host-global hook scripts get it as one more
-    /// `GIT_CONFIG_COUNT` pair; an agent environment that sets
+    /// hooks and no fsmonitor hook: the daemon's git commands for it take
+    /// `core.hooksPath=/dev/null` and `core.fsmonitor=false` (its session diff
+    /// also `--no-textconv`), and the agent and the host-global hook scripts
+    /// get both as two more `GIT_CONFIG_COUNT` pairs; filter drivers stay
+    /// outside the switch. An agent environment that sets
     /// `GIT_CONFIG_PARAMETERS` or a non-numeric `GIT_CONFIG_COUNT` fails the
     /// start with `git_hooks_env_conflict`. When `hooks.required` names an
     /// event the host-global layer has no script for, the create fails with
@@ -3427,7 +3429,7 @@ pub struct SessionInfo {
     pub spawned_by: Option<SpawnedBy>,
     /// Whether the session runs none of the in-repo hook layer
     /// (`.pohunek/hooks/<event>`, `.pohunek/setup`) for any of its lifecycle
-    /// hooks and none of git's own hooks, as
+    /// hooks and none of git's own hooks or fsmonitor hook, as
     /// [`SessionNewParams::skip_repo_hooks`] requested. Set at
     /// creation and never changed; persisted, so a resume and a daemon
     /// restart keep it. Omitted from the wire form when false.

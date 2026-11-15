@@ -2723,10 +2723,11 @@ fn unsaved_work_clears_a_binding_whose_checkout_is_already_gone() {
     );
 }
 
-/// Row 20: the pre-removal check of a binding started with the switch
-/// (`git status` inside its checkout) runs no git hook the checkout carries,
-/// although a relative `core.hooksPath` resolves to one there; the same check
-/// of a binding without the switch runs it.
+/// Rows 20 and 23: the pre-removal check of a binding started with the switch
+/// (`git status` inside its checkout) runs no git hook and no fsmonitor hook
+/// the checkout carries, although a relative `core.hooksPath` and
+/// `core.fsmonitor` resolve to them there; the same check of a binding
+/// without the switch runs them.
 #[cfg(unix)]
 #[test]
 fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout() {
@@ -2734,7 +2735,9 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
 
     let mgr = manager("unsaved-git-hooks");
     let repo = init_repo("unsaved-git-hooks-repo");
-    let marker = unique_dir("unsaved-git-hooks-marker").join("ran");
+    let markers = unique_dir("unsaved-git-hooks-marker");
+    let marker = markers.join("ran");
+    let fsmonitor_marker = markers.join("fsmonitor");
     let hook = repo.join(".githooks/post-index-change");
     fs::create_dir_all(hook.parent().expect("hook directory")).expect("create .githooks");
     fs::write(
@@ -2746,9 +2749,22 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
     )
     .expect("write the hook");
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
+    let fsmonitor = repo.join("tools/fsmonitor");
+    fs::create_dir_all(fsmonitor.parent().expect("tools directory")).expect("create tools");
+    // A failing fsmonitor hook makes git fall back to a full scan.
+    fs::write(
+        &fsmonitor,
+        format!(
+            "#!/bin/sh\nprintf 'fsmonitor\\n' >> '{}'\nexit 1\n",
+            fsmonitor_marker.display()
+        ),
+    )
+    .expect("write the fsmonitor hook");
+    fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o755)).expect("hook mode");
     git_in(&repo, &["add", "."]);
     git_in(&repo, &["commit", "-q", "-m", "a checkout with a git hook"]);
     git_in(&repo, &["config", "core.hooksPath", ".githooks"]);
+    git_in(&repo, &["config", "core.fsmonitor", "tools/fsmonitor"]);
     let mut switched = request("s-skip", &repo, "review/skip");
     switched.skip_repo_hooks = true;
     let skipped = mgr.bind(&switched).expect("bind the switched session");
@@ -2756,6 +2772,7 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         .bind(&request("s-run", &repo, "review/run"))
         .expect("bind the control session");
     let _ = fs::remove_file(&marker);
+    let _ = fs::remove_file(&fsmonitor_marker);
     let stale_index = |checkout: &Path| {
         fs::File::options()
             .write(true)
@@ -2768,12 +2785,20 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
     stale_index(&skipped.path);
     assert_eq!(mgr.unsaved_work("s-skip"), WorktreeWork::Saved);
     assert!(!marker.exists(), "the switched check ran no hook");
+    assert!(
+        !fsmonitor_marker.exists(),
+        "the switched check ran no fsmonitor hook"
+    );
 
     stale_index(&running.path);
     assert_eq!(mgr.unsaved_work("s-run"), WorktreeWork::Saved);
     assert!(
         marker.exists(),
         "without the switch the check runs the checkout's hook"
+    );
+    assert!(
+        fsmonitor_marker.exists(),
+        "without the switch the check runs the checkout's fsmonitor hook"
     );
 }
 
