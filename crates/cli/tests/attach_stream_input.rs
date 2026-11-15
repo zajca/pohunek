@@ -459,9 +459,14 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
         let _killed = cli.0.kill();
         let _reaped = cli.0.wait();
         let errors = errors_rx.recv_timeout(HANG_GUARD);
+        // Whether the client had shown the answer tells a client that never saw
+        // the stream close from one that hung after it.
+        let shown = shown_rx
+            .recv_timeout(HANG_GUARD)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         panic!(
             "the client ends once the stream closed; stream input end: \
-             {stream_saw_input_end:?}, client stderr: {errors:?}"
+             {stream_saw_input_end:?}, client stdout: {shown:?}, client stderr: {errors:?}"
         );
     };
     let status = cli.0.wait().expect("wait for pohunek attach");
