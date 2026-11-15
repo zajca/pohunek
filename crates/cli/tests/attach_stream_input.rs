@@ -69,9 +69,6 @@ const PIPE_GROWTH_PROBE_BYTES: usize = 256 * 1024;
 /// client and the stream hold, less than the client's input queue limit.
 const UNREAD_PASTE_BYTES: usize = 768 * 1024;
 
-/// Size of one read of the fixture's input.
-const INPUT_CHUNK_BYTES: usize = 1024;
-
 /// Output the stream writes after it read the client's input to its end.
 const ANSWER: &[u8] = b"answer-after-the-input-was-delivered\n";
 
@@ -624,26 +621,33 @@ fn serve_input_holding_attach_stream(
 }
 
 /// Reads the client's input to its end, answers and closes the stream.
+///
+/// The input end is awaited through the tokio reactor, the way the daemon's
+/// attach bridge and the CLI's attach loop read their streams.
 fn serve_answering_attach_stream(
     reader: BufReader<UnixStream>,
     events: &mpsc::Sender<StreamEvent>,
 ) {
     let mut input = reader.buffer().to_vec();
-    let mut stream = reader.into_inner();
+    let stream = reader.into_inner();
     let _sent = events.send(StreamEvent::StreamOpened);
-    // A chunked `read` loop: `read_to_end` on this stream stayed blocked after
-    // the client had written its input and shut its write half down (macOS).
-    let mut chunk = [0_u8; INPUT_CHUNK_BYTES];
-    loop {
-        let count = stream.read(&mut chunk).expect("read the client's input");
-        if count == 0 {
-            break;
-        }
-        input.extend_from_slice(&chunk[..count]);
-    }
-    // Reported before the answer so a scenario that times out can tell whether
-    // the client ever ended its input.
-    let _sent = events.send(StreamEvent::InputReceived(input.len()));
-    // A client the scenario already killed no longer reads the answer.
-    let _written = stream.write_all(ANSWER);
+    stream
+        .set_nonblocking(true)
+        .expect("make the fixture stream non-blocking");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .expect("build the fixture runtime");
+    runtime.block_on(async {
+        let mut stream =
+            tokio::net::UnixStream::from_std(stream).expect("register the fixture stream");
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut input)
+            .await
+            .expect("read the client's input");
+        // Reported before the answer so a scenario that times out can tell
+        // whether the client ever ended its input.
+        let _sent = events.send(StreamEvent::InputReceived(input.len()));
+        // A client the scenario already killed no longer reads the answer.
+        let _written = tokio::io::AsyncWriteExt::write_all(&mut stream, ANSWER).await;
+    });
 }
