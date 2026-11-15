@@ -37,6 +37,9 @@ struct ClaudeRig {
     server: tokio::task::JoinHandle<()>,
     session: SessionInfo,
     argv_log: PathBuf,
+    /// One line per agent launch: the session id and the agent's
+    /// `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`.
+    git_env_log: PathBuf,
     ack_log: PathBuf,
     config_home: PathBuf,
     worker_state_root: PathBuf,
@@ -105,6 +108,7 @@ impl ClaudeRig {
             .expect("install managed Claude hook");
         let hook = config_home.join("hooks/pohunek-agent-state.sh");
         let argv_log = state.join("argv.log");
+        let git_env_log = state.join("git-env.log");
         let ack_log = state.join("hook-ack.log");
         let script = bin.join("fixture-agent.sh");
         write_executable(
@@ -112,6 +116,7 @@ impl ClaudeRig {
             &format!(
                 "#!/bin/bash\n\
                  printf '%s\\n' \"$*\" >> {argv:?}\n\
+                 printf '%s %s %s %s\\n' \"$POHUNEK_SESSION_ID\" \"${{GIT_CONFIG_COUNT:-}}\" \"${{GIT_CONFIG_KEY_0:-}}\" \"${{GIT_CONFIG_VALUE_0:-}}\" >> {git_env:?}\n\
                  printf '\\033[?2004h'\n\
                  while read -r action source reference; do\n\
                    case \"$action\" in\n\
@@ -120,6 +125,7 @@ impl ClaudeRig {
                    esac\n\
                  done\n",
                 argv = argv_log.display().to_string(),
+                git_env = git_env_log.display().to_string(),
                 hook = hook.display().to_string(),
                 ack = ack_log.display().to_string(),
             ),
@@ -193,6 +199,7 @@ impl ClaudeRig {
             server,
             session,
             argv_log,
+            git_env_log,
             ack_log,
             config_home,
             worker_state_root,
@@ -520,6 +527,22 @@ async fn a_resumed_session_keeps_skipping_the_repository_hooks() {
 
     let resumed = inspect_session(&mut rig.control, &id).await;
     assert!(resumed.skip_repo_hooks, "the relaunch keeps the switch");
+    // Both launches of the switched agent get git's hooks turned off; the
+    // rig's own session, started without the switch, does not.
+    let launches = std::fs::read_to_string(&rig.git_env_log).expect("read the git env log");
+    let of = |session: &SessionId| {
+        launches
+            .lines()
+            .filter(|line| line.split(' ').next() == Some(session.0.as_str()))
+            .map(|line| line.split_once(' ').map_or("", |(_, rest)| rest).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        of(&id),
+        vec!["1 core.hooksPath /dev/null"; 2],
+        "create and relaunch: {launches}"
+    );
+    assert_eq!(of(&rig.session.id), vec!["  "], "{launches}");
 
     rig.stop(&id).await;
     let mut rig = rig.restarted().await;

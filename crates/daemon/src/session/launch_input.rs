@@ -23,6 +23,8 @@ use crate::integration::launch_input::{
 use crate::project::ProjectManager;
 use crate::runtime::environment::effective_variable;
 use crate::store::ResumeBinding;
+use crate::worktree::git_hooks_off_env;
+use pohunek_worker_protocol::BaseEnv;
 
 /// What a launch of one session runs: its kind, the arguments it would
 /// otherwise run with and the session name it uses.
@@ -549,4 +551,31 @@ impl EvaluationRun {
         *state = RunState::Finished { trusted };
         abandoned
     }
+}
+
+/// Turns git's own hooks off for the agent of a session that skips its
+/// checkout's hooks: the agent runs git in that checkout as the daemon user,
+/// and a relative `core.hooksPath` would resolve to a hook the checkout
+/// carries.
+///
+/// `env` is the launch environment the worker lays over `base`, so a name in
+/// `env` wins. One `GIT_CONFIG_COUNT` pair is appended behind the pairs the
+/// agent would otherwise get, keeping them.
+///
+/// # Errors
+///
+/// The `configuration/git_hooks_env_conflict` of [`git_hooks_off_env`].
+pub(super) fn pin_agent_git_hooks_off(
+    base: &BaseEnv,
+    env: &mut LaunchEnv,
+) -> Result<(), ProtocolError> {
+    let pair = git_hooks_off_env(|name| {
+        env.iter()
+            .rev()
+            .find(|(set, _)| set == name)
+            .map(|(_, value)| value.as_str())
+            .or_else(|| base.get(name))
+    })?;
+    env.append(LaunchEnv::new(pair.into()));
+    Ok(())
 }

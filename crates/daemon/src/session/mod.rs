@@ -4704,6 +4704,10 @@ impl SessionRegistry {
         }
         let mut env_extra = inputs.env;
         env_extra.append(secret_env);
+        if params.skip_repo_hooks {
+            let base = self.launch_base_environment()?;
+            launch_input::pin_agent_git_hooks_off(&base, &mut env_extra)?;
+        }
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),
             cols: params.cols,

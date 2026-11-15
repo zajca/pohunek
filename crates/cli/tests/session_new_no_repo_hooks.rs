@@ -174,9 +174,15 @@ impl Scene {
     /// `session new --agent toggler` on `branch` of the fixture repository,
     /// with the switch when `skip` is set.
     async fn new_on_branch(&self, branch: &str, skip: bool) -> (i32, Value) {
+        self.new_with_agent("toggler", branch, skip).await
+    }
+
+    /// `session new --agent <agent>` on `branch` of the fixture repository,
+    /// with the switch when `skip` is set.
+    async fn new_with_agent(&self, agent: &str, branch: &str, skip: bool) -> (i32, Value) {
         let repo = path_str(&self.repo).to_owned();
         let mut args = vec![
-            "session", "new", "--agent", "toggler", "--repo", &repo, "--branch", branch,
+            "session", "new", "--agent", agent, "--repo", &repo, "--branch", branch,
         ];
         if skip {
             args.push("--no-repo-hooks");
@@ -185,7 +191,11 @@ impl Scene {
     }
 
     async fn created_on_branch(&self, branch: &str, skip: bool) -> String {
-        let (code, created) = self.new_on_branch(branch, skip).await;
+        self.created_with_agent("toggler", branch, skip).await
+    }
+
+    async fn created_with_agent(&self, agent: &str, branch: &str, skip: bool) -> String {
+        let (code, created) = self.new_with_agent(agent, branch, skip).await;
         assert_eq!(code, 0, "{created}");
         assert_eq!(
             created["ok"]["skip_repo_hooks"].as_bool().unwrap_or(false),
@@ -627,5 +637,254 @@ async fn host_inspect_advertises_the_switch_and_the_host_hook_scripts() {
         text.contains("host_hooks:         post-create, session-stop"),
         "{text}"
     );
+    scene.harness.stop().await;
+}
+
+/// The git hooks the fixture repository of the git-hook scenarios commits.
+const GIT_HOOKS: [&str; 3] = [
+    "post-index-change",
+    "post-checkout",
+    "reference-transaction",
+];
+
+/// A profile `[env]` that sets one git setting of its own through a
+/// `GIT_CONFIG_COUNT` pair, which a switched launch keeps.
+const SEEDED_GIT_ENV: &str = r#"GIT_CONFIG_COUNT = "1"
+GIT_CONFIG_KEY_0 = "user.name"
+GIT_CONFIG_VALUE_0 = "Seeded"
+"#;
+
+/// The tracked file the git-hook scenarios move the mtime of, so that the
+/// next `git status` in the checkout rewrites the index and git runs
+/// `post-index-change` when its hooks are on.
+const TRACKED_FILE: &str = "README.md";
+
+impl Scene {
+    /// A fixture repository whose base branch carries a git hook for each of
+    /// [`GIT_HOOKS`] below `.githooks`, and whose configuration names that
+    /// directory with a relative `core.hooksPath` (husky style), so a git
+    /// command run inside a checkout resolves the hooks of that checkout.
+    ///
+    /// Each hook appends `git:<hook>:<GIT_CONFIG_COUNT>` to `git.log`; the
+    /// daemon's own git commands carry no count and log `daemon`.
+    fn init_git_hook_repo(&self) {
+        let hooks: Vec<_> = GIT_HOOKS
+            .iter()
+            .map(|hook| {
+                (
+                    format!(".githooks/{hook}"),
+                    self.appending(
+                        "git.log",
+                        &format!("git:{hook}:${{GIT_CONFIG_COUNT:-daemon}}"),
+                    ),
+                )
+            })
+            .collect();
+        self.init_repo(&hooks);
+        self.git(&["config", "core.hooksPath", ".githooks"]);
+    }
+
+    /// A host-global `session-start` script that records the
+    /// `core.hooksPath` git resolves in the session's directory.
+    fn host_git_probe(&self) {
+        self.host_hook(
+            "session-start",
+            &format!(
+                "#!/bin/sh\nprintf 'host-git:%s\\n' \"$(git config --get core.hooksPath)\" >> '{}'\n",
+                self.logs.join("host.log").display()
+            ),
+        );
+    }
+
+    /// The `git-agent` profile: an agent that records the `core.hooksPath`,
+    /// `user.name` and `GIT_CONFIG_COUNT` it sees in its checkout, moves the
+    /// tracked file's mtime and runs `git status` there, then waits.
+    fn git_agent_profile(&self, env: &str) {
+        let script = self.logs.join("git-agent.sh");
+        write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 printf 'agent:%s:%s:%s\\n' \"$(git config --get core.hooksPath)\" \
+                 \"$(git config --get user.name)\" \"$GIT_CONFIG_COUNT\" >> '{log}'\n\
+                 touch -m -t 203001010000 {TRACKED_FILE}\n\
+                 git status --porcelain > /dev/null\n\
+                 printf 'agent:done\\n' >> '{log}'\n\
+                 exec sleep 600\n",
+                log = self.logs.join("agent.log").display()
+            ),
+        );
+        self.harness.profile(
+            "git-agent",
+            &format!(
+                "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"{}\"]\n[env]\n{env}",
+                script.display()
+            ),
+        );
+    }
+
+    async fn wait_for_entry(&self, log: &str, entry: &str) {
+        wait_until(&format!("{entry} in {log}"), || async {
+            self.entries(log)
+                .iter()
+                .any(|seen| seen == entry)
+                .then_some(())
+        })
+        .await;
+    }
+
+    /// Moves the tracked file's mtime in `checkout`, so the next `git status`
+    /// there rewrites the index.
+    fn stale_index(checkout: &Path, seconds_ahead: u64) {
+        let modified = std::time::SystemTime::now()
+            + std::time::Duration::from_secs(86_400 * 365 * 10 + seconds_ahead);
+        fs::File::options()
+            .write(true)
+            .open(checkout.join(TRACKED_FILE))
+            .expect("open the tracked file")
+            .set_modified(modified)
+            .expect("move the tracked file's mtime");
+    }
+
+    /// `session diff <id>`, which must succeed.
+    async fn diffed(&self, id: &str) {
+        let (code, diff) = self.harness.json(&["session", "diff", id]).await;
+        assert_eq!(code, 0, "{diff}");
+    }
+
+    async fn stopped_and_removed(&self, id: &str) {
+        let (code, stopped) = self.harness.json(&["session", "stop", id]).await;
+        assert_eq!(code, 0, "{stopped}");
+        let (code, removed) = self.harness.json(&["session", "rm", id]).await;
+        assert_eq!(code, 0, "{removed}");
+    }
+
+    fn git_entries(&self, marker: &str) -> usize {
+        self.entries("git.log")
+            .iter()
+            .filter(|entry| entry.ends_with(&format!(":{marker}")))
+            .count()
+    }
+}
+
+/// Git's own hooks, rows 19 to 21: with a relative `core.hooksPath` naming
+/// hooks the checkout carries, a switched session runs none of them: not
+/// through the daemon's git commands (create, `session diff`, removal), not
+/// through the agent's git and not through a host-global script's git. The
+/// agent still sees its own `GIT_CONFIG_COUNT` setting: the pinned path is
+/// appended behind it.
+#[tokio::test]
+async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
+    let scene = Scene::start(Vec::new(), &[]).await;
+    scene.init_git_hook_repo();
+    scene.host_git_probe();
+    scene.git_agent_profile(SEEDED_GIT_ENV);
+
+    let id = scene
+        .created_with_agent("git-agent", "review/git-hooks", true)
+        .await;
+    scene.wait_for_entry("agent.log", "agent:done").await;
+    assert_eq!(
+        scene.entries("agent.log").first().map(String::as_str),
+        Some("agent:/dev/null:Seeded:2"),
+        "the agent's git sees no hook path and keeps its own setting"
+    );
+    scene.wait_for_entry("host.log", "host-git:/dev/null").await;
+
+    let inspected = scene.inspected(&id).await;
+    let checkout = PathBuf::from(inspected["worktree_path"].as_str().expect("worktree path"));
+    Scene::stale_index(&checkout, 1);
+    scene.diffed(&id).await;
+    scene.stopped_and_removed(&id).await;
+
+    assert_eq!(
+        scene.entries("git.log"),
+        Vec::<String>::new(),
+        "no git hook of the checkout ran"
+    );
+    scene.harness.stop().await;
+}
+
+/// Control of rows 19 to 21: the same fixture without the switch runs the
+/// checkout's git hooks through the agent's `git status` and through the
+/// daemon's `git status` of `session diff`, and a host-global script's git
+/// resolves the checkout's hook directory, so the empty log above is
+/// evidence.
+#[tokio::test]
+async fn without_the_switch_the_checkout_git_hooks_run() {
+    let scene = Scene::start(Vec::new(), &[]).await;
+    scene.init_git_hook_repo();
+    scene.host_git_probe();
+    scene.git_agent_profile(SEEDED_GIT_ENV);
+
+    let id = scene
+        .created_with_agent("git-agent", "review/git-hooks-run", false)
+        .await;
+    scene.wait_for_entry("agent.log", "agent:done").await;
+    assert_eq!(
+        scene.entries("agent.log").first().map(String::as_str),
+        Some("agent:.githooks:Seeded:1"),
+    );
+    scene.wait_for_entry("host.log", "host-git:.githooks").await;
+    scene
+        .wait_for_entry("git.log", "git:post-index-change:1")
+        .await;
+
+    let inspected = scene.inspected(&id).await;
+    let checkout = PathBuf::from(inspected["worktree_path"].as_str().expect("worktree path"));
+    let before = scene.git_entries("daemon");
+    Scene::stale_index(&checkout, 2);
+    scene.diffed(&id).await;
+    assert!(
+        scene.git_entries("daemon") > before,
+        "the diff's git status ran the checkout's hook: {:?}",
+        scene.entries("git.log")
+    );
+    scene.stopped_and_removed(&id).await;
+    scene.harness.stop().await;
+}
+
+/// Row 22: an agent environment that could set `core.hooksPath` back
+/// (`GIT_CONFIG_PARAMETERS`) or whose `GIT_CONFIG_COUNT` cannot be extended
+/// refuses the switched create with `git_hooks_env_conflict`, naming no
+/// value, and leaves no session or checkout; without the switch the same
+/// profiles start.
+#[tokio::test]
+async fn an_agent_environment_that_could_turn_git_hooks_back_on_refuses_the_switch() {
+    let scene = Scene::start(Vec::new(), &[]).await;
+    scene.init_repo(&[]);
+    for (name, env, value) in [
+        (
+            "git-params",
+            "GIT_CONFIG_PARAMETERS = \"'core.hookspath'='.githooks'\"\n",
+            ".githooks",
+        ),
+        ("git-count", "GIT_CONFIG_COUNT = \"two\"\n", "two"),
+    ] {
+        scene
+            .harness
+            .profile(name, &format!("{TOGGLING_PROFILE}[env]\n{env}"));
+        let (code, refused) = scene
+            .new_with_agent(name, &format!("review/{name}"), true)
+            .await;
+        assert_ne!(code, 0, "{refused}");
+        assert_eq!(
+            refused["err"]["code"], "git_hooks_env_conflict",
+            "{refused}"
+        );
+        assert_eq!(refused["err"]["class"], "configuration", "{refused}");
+        assert!(
+            !refused.to_string().contains(value),
+            "the error names no value: {refused}"
+        );
+        assert_eq!(scene.session_count().await, 0, "no session");
+        assert_eq!(scene.worktrees(), 1, "the checkout is rolled back");
+
+        let control = scene
+            .created_with_agent(name, &format!("review/{name}-run"), false)
+            .await;
+        let (code, removed) = scene.harness.json(&["session", "rm", &control]).await;
+        assert_eq!(code, 0, "{removed}");
+    }
     scene.harness.stop().await;
 }

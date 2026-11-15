@@ -21,7 +21,7 @@ use super::fetch::{fetch_into_ref, fetch_ref_name, FetchedBase};
 use super::{
     admin_lock, branch_exists, branch_in_use_error, error, git_capture, git_command, git_output,
     has_origin, lock_within, output_failure_message, run_output_bounded, worktree_add_error,
-    worktree_add_existing, worktree_add_new, GIT_COMMAND_TIMEOUT,
+    worktree_add_existing, worktree_add_new, RepoHookLayer, GIT_COMMAND_TIMEOUT,
 };
 
 /// Name of the only remote a remote-mode branch is taken from.
@@ -110,20 +110,21 @@ impl RemotePlan {
 /// worktree has it checked out.
 pub(super) fn plan_remote_branch(
     repository: &Path,
+    layer: RepoHookLayer,
     branch: &str,
     on_diverged: Option<OnDiverged>,
 ) -> Result<RemotePlan, ProtocolError> {
-    check_branch_name(repository, branch)?;
-    if !has_origin(repository) {
+    check_branch_name(repository, layer, branch)?;
+    if !has_origin(repository, layer) {
         return Err(not_found(branch, "the repository has no origin remote"));
     }
-    let fetched = fetch_remote_branch(repository, branch)?;
+    let fetched = fetch_remote_branch(repository, layer, branch)?;
     let remote = fetched.commit.clone();
     let local_ref = format!("refs/heads/{branch}");
-    let action = match branch_exists(repository, branch) {
+    let action = match branch_exists(repository, layer, branch) {
         Ok(false) => Action::Create,
         Ok(true) => {
-            let local = rev_parse_commit(repository, &local_ref).map_err(|message| {
+            let local = rev_parse_commit(repository, layer, &local_ref).map_err(|message| {
                 error(
                     ErrorClass::Runtime,
                     "worktree_add_failed",
@@ -131,7 +132,7 @@ pub(super) fn plan_remote_branch(
                     None,
                 )
             })?;
-            relate(repository, branch, local, &remote, on_diverged)?
+            relate(repository, layer, branch, local, &remote, on_diverged)?
         }
         Err(message) => {
             return Err(error(
@@ -147,7 +148,7 @@ pub(super) fn plan_remote_branch(
     // which excludes the daemon's own concurrent `git worktree add` (the lock is
     // in-process, so a `git worktree add` run in a terminal is not excluded).
     if matches!(action, Action::FastForward { .. } | Action::Reset { .. }) {
-        refuse_held_branch(repository, branch)?;
+        refuse_held_branch(repository, layer, branch)?;
     }
     Ok(RemotePlan { fetched, action })
 }
@@ -155,6 +156,7 @@ pub(super) fn plan_remote_branch(
 /// How the local head `local` relates to the fetched `remote`.
 fn relate(
     repository: &Path,
+    layer: RepoHookLayer,
     branch: &str,
     local: String,
     remote: &str,
@@ -163,15 +165,15 @@ fn relate(
     if local == remote {
         return Ok(Action::UseLocal);
     }
-    if is_ancestor(repository, &local, remote)? {
+    if is_ancestor(repository, layer, &local, remote)? {
         return Ok(Action::FastForward { from: local });
     }
-    if is_ancestor(repository, remote, &local)? {
+    if is_ancestor(repository, layer, remote, &local)? {
         return Ok(Action::Ahead { local });
     }
     let short = &local[..BACKUP_SHA_LEN.min(local.len())];
     let backup = format!("{BACKUP_NAMESPACE}/{branch}-{short}");
-    let merge_base = merge_base(repository, &local, remote)?;
+    let merge_base = merge_base(repository, layer, &local, remote)?;
     match on_diverged {
         None => Err(error(
             ErrorClass::Runtime,
@@ -186,9 +188,9 @@ fn relate(
         Some(OnDiverged::BackupReset) => {
             // A backup that already holds the local head is reused by the update.
             let holds_local =
-                ref_head(repository, &format!("refs/heads/{backup}"))?.as_deref() == Some(&local);
+                ref_head(repository, layer, &format!("refs/heads/{backup}"))?.as_deref() == Some(&local);
             if !holds_local {
-                if let Some(why) = backup_obstruction(repository, &backup)? {
+                if let Some(why) = backup_obstruction(repository, layer, &backup)? {
                     return Err(backup_exists(&backup, &why));
                 }
             }
@@ -202,15 +204,19 @@ fn relate(
 /// A failed fetch is `remote_branch_not_found` only when `git ls-remote`
 /// proves the branch absent; any other failure, including an unreachable
 /// remote, is `branch_fetch_failed`.
-fn fetch_remote_branch(repository: &Path, branch: &str) -> Result<FetchedBase, ProtocolError> {
+fn fetch_remote_branch(
+    repository: &Path,
+    layer: RepoHookLayer,
+    branch: &str,
+) -> Result<FetchedBase, ProtocolError> {
     let fetch_ref = fetch_ref_name().map_err(|message| fetch_failed(branch, &message))?;
     let source = format!("refs/heads/{branch}");
-    match fetch_into_ref(repository, &source, &fetch_ref) {
+    match fetch_into_ref(repository, layer, &source, &fetch_ref) {
         Ok(fetched) => Ok(fetched),
         // A fetch that ran out of time already spent its budget: asking the
         // same remote again would only double the wait.
         Err(message) if message.contains("timed out") => Err(fetch_failed(branch, &message)),
-        Err(message) => match remote_has_branch(repository, &source) {
+        Err(message) => match remote_has_branch(repository, layer, &source) {
             Ok(false) => Err(not_found(
                 branch,
                 &format!("{REMOTE} has no branch {branch:?}"),
@@ -221,8 +227,12 @@ fn fetch_remote_branch(repository: &Path, branch: &str) -> Result<FetchedBase, P
 }
 
 /// Whether `origin` advertises exactly `source` (a full `refs/heads/...` name).
-fn remote_has_branch(repository: &Path, source: &str) -> Result<bool, String> {
-    let mut cmd = git_command(repository)?;
+fn remote_has_branch(
+    repository: &Path,
+    layer: RepoHookLayer,
+    source: &str,
+) -> Result<bool, String> {
+    let mut cmd = git_command(repository, layer)?;
     cmd.args(["ls-remote", "--exit-code", "--heads", REMOTE])
         .arg("--end-of-options")
         .arg(source);
@@ -248,24 +258,27 @@ fn remote_has_branch(repository: &Path, source: &str) -> Result<bool, String> {
 /// `backup_ref_exists`.
 pub(super) fn create_remote_worktree(
     repository: &Path,
+    layer: RepoHookLayer,
     path: &Path,
     branch: &str,
     plan: &RemotePlan,
 ) -> Result<(), ProtocolError> {
     let remote = &plan.fetched.commit;
     match &plan.action {
-        Action::Create => worktree_add_new(repository, path, branch, remote)
+        Action::Create => worktree_add_new(repository, layer, path, branch, remote)
             .map_err(|message| worktree_add_error(branch, &message)),
-        Action::UseLocal | Action::Ahead { .. } => worktree_add_existing(repository, path, branch)
-            .map_err(|message| worktree_add_error(branch, &message)),
+        Action::UseLocal | Action::Ahead { .. } => {
+            worktree_add_existing(repository, layer, path, branch)
+                .map_err(|message| worktree_add_error(branch, &message))
+        }
         Action::FastForward { from } => {
-            move_branch(repository, branch, from, remote, None)?;
-            worktree_add_existing(repository, path, branch)
+            move_branch(repository, layer, branch, from, remote, None)?;
+            worktree_add_existing(repository, layer, path, branch)
                 .map_err(|message| worktree_add_error(branch, &message))
         }
         Action::Reset { local, backup } => {
-            move_branch(repository, branch, local, remote, Some(backup))?;
-            worktree_add_existing(repository, path, branch).map_err(|message| {
+            move_branch(repository, layer, branch, local, remote, Some(backup))?;
+            worktree_add_existing(repository, layer, path, branch).map_err(|message| {
                 note_backup(worktree_add_error(branch, &message), branch, backup)
             })
         }
@@ -293,11 +306,12 @@ pub(crate) fn note_backup(mut err: ProtocolError, branch: &str, backup: &str) ->
 /// `worktree_add_failed` naming the commit the worktree is at.
 pub(super) fn verify_start(
     path: &Path,
+    layer: RepoHookLayer,
     branch: &str,
     source: &WorktreeSource,
 ) -> Result<(), ProtocolError> {
     let expected = source.commit.as_str();
-    let err = match git_capture(path, &["rev-parse", "--verify", "HEAD"]) {
+    let err = match git_capture(path,layer, &["rev-parse", "--verify", "HEAD"]) {
         Ok(head) if head == expected => return Ok(()),
         Ok(head) => error(
             ErrorClass::Runtime,
@@ -326,15 +340,16 @@ pub(super) fn verify_start(
 /// applied first, counts as applied.
 fn move_branch(
     repository: &Path,
+    layer: RepoHookLayer,
     branch: &str,
     old: &str,
     new: &str,
     backup: Option<&String>,
 ) -> Result<(), ProtocolError> {
-    let lock = admin_lock(repository).map_err(|message| inspect_error(&message))?;
+    let lock = admin_lock(repository, layer).map_err(|message| inspect_error(&message))?;
     let _guard =
         lock_within(&lock, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
-    refuse_held_branch(repository, branch)?;
+    refuse_held_branch(repository, layer, branch)?;
     let moves = Move {
         branch_ref: format!("refs/heads/{branch}"),
         backup_ref: backup.map(|name| format!("refs/heads/{name}")),
@@ -344,18 +359,18 @@ fn move_branch(
     };
     // One transaction: the backup (which must not exist yet) and the compare-and-
     // swap reset both apply or neither does.
-    let Err(message) = update_refs(repository, &moves.script(true)) else {
+    let Err(message) = update_refs(repository, layer, &moves.script(true)) else {
         return Ok(());
     };
-    match settle(repository, &moves, false)? {
+    match settle(repository, layer, &moves, false)? {
         Settled::Applied => Ok(()),
         Settled::BackupHoldsOld => {
             // A concurrent request already made the backup of this very head;
             // the reset only has to verify it.
-            let Err(message) = update_refs(repository, &moves.script(false)) else {
+            let Err(message) = update_refs(repository, layer, &moves.script(false)) else {
                 return Ok(());
             };
-            match settle(repository, &moves, true)? {
+            match settle(repository, layer, &moves, true)? {
                 Settled::Applied => Ok(()),
                 Settled::BackupHoldsOld | Settled::Failed => Err(moves.update_failed(&message)),
             }
@@ -420,7 +435,12 @@ enum Settled {
 /// `backup_ref_exists` for a backup name that is taken by something else while
 /// the branch is still at `old`, and `worktree_add_failed` naming a concurrent
 /// move (and the backup holding `old`, if any) for any other position.
-fn settle(repository: &Path, moves: &Move<'_>, retried: bool) -> Result<Settled, ProtocolError> {
+fn settle(
+    repository: &Path,
+    layer: RepoHookLayer,
+    moves: &Move<'_>,
+    retried: bool,
+) -> Result<Settled, ProtocolError> {
     // A ref that cannot be read is an error, not an absent ref: the update may
     // have committed, so the old head is named for recovery.
     let unreadable = |mut err: ProtocolError| {
@@ -439,10 +459,13 @@ fn settle(repository: &Path, moves: &Move<'_>, retried: bool) -> Result<Settled,
         );
         err
     };
-    let head = ref_head(repository, &moves.branch_ref).map_err(unreadable)?;
+    let head = ref_head(repository, layer, &moves.branch_ref).map_err(unreadable)?;
     let backup_holds_old = match &moves.backup_ref {
         Some(backup) => {
-            ref_head(repository, backup).map_err(unreadable)?.as_deref() == Some(moves.old)
+            ref_head(repository, layer, backup)
+                .map_err(unreadable)?
+                .as_deref()
+                == Some(moves.old)
         }
         None => false,
     };
@@ -456,7 +479,7 @@ fn settle(repository: &Path, moves: &Move<'_>, retried: bool) -> Result<Settled,
         if let Some(backup) = &moves.backup_ref {
             let name = backup.trim_start_matches("refs/heads/");
             if !backup_holds_old {
-                if let Some(why) = backup_obstruction(repository, name)? {
+                if let Some(why) = backup_obstruction(repository, layer, name)? {
                     return Err(backup_exists(name, &why));
                 }
             }
@@ -484,8 +507,8 @@ fn settle(repository: &Path, moves: &Move<'_>, retried: bool) -> Result<Settled,
 }
 
 /// Apply a `git update-ref --stdin` script, bounded by [`GIT_COMMAND_TIMEOUT`].
-fn update_refs(repository: &Path, script: &str) -> Result<(), String> {
-    let mut cmd = git_command(repository)?;
+fn update_refs(repository: &Path, layer: RepoHookLayer, script: &str) -> Result<(), String> {
+    let mut cmd = git_command(repository, layer)?;
     cmd.args(["update-ref", "-m", REFLOG_MESSAGE, "--stdin"]);
     let captured =
         git_output::capture_with_input(cmd, GIT_COMMAND_TIMEOUT, || {}, Some(script.as_bytes()))?;
@@ -497,8 +520,12 @@ fn update_refs(repository: &Path, script: &str) -> Result<(), String> {
 }
 
 /// Refuse with `worktree_branch_in_use` when another worktree holds `branch`.
-fn refuse_held_branch(repository: &Path, branch: &str) -> Result<(), ProtocolError> {
-    match branch_holder(repository, branch).map_err(|message| inspect_error(&message))? {
+fn refuse_held_branch(
+    repository: &Path,
+    layer: RepoHookLayer,
+    branch: &str,
+) -> Result<(), ProtocolError> {
+    match branch_holder(repository, layer, branch).map_err(|message| inspect_error(&message))? {
         None => Ok(()),
         Some(Holder::CheckedOut) => Err(branch_in_use_error(branch)),
         Some(Holder::Operation(operation)) => Err(error(
@@ -556,8 +583,12 @@ impl Operation {
 /// `git worktree list` reports a worktree in the middle of a rebase or bisect
 /// as detached, so the per-worktree state files are read as well, the way git's
 /// own branch-in-use check does. `git update-ref` has no such check.
-fn branch_holder(repository: &Path, branch: &str) -> Result<Option<Holder>, String> {
-    let listing = git_capture(repository, &["worktree", "list", "--porcelain"])?;
+fn branch_holder(
+    repository: &Path,
+    layer: RepoHookLayer,
+    branch: &str,
+) -> Result<Option<Holder>, String> {
+    let listing = git_capture(repository, layer, &["worktree", "list", "--porcelain"])?;
     let wanted = format!("refs/heads/{branch}");
     if listing.lines().any(|line| {
         line.strip_prefix("branch ")
@@ -567,6 +598,7 @@ fn branch_holder(repository: &Path, branch: &str) -> Result<Option<Holder>, Stri
     }
     let common = PathBuf::from(git_capture(
         repository,
+        layer,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?);
     let mut git_dirs = vec![common.clone()];
@@ -639,8 +671,12 @@ fn read_state(path: &Path) -> Result<Option<String>, String> {
 }
 
 /// Reject a name git does not accept as a branch before any remote work.
-fn check_branch_name(repository: &Path, branch: &str) -> Result<(), ProtocolError> {
-    let mut cmd = git_command(repository).map_err(|message| inspect_error(&message))?;
+fn check_branch_name(
+    repository: &Path,
+    layer: RepoHookLayer,
+    branch: &str,
+) -> Result<(), ProtocolError> {
+    let mut cmd = git_command(repository, layer).map_err(|message| inspect_error(&message))?;
     cmd.args(["check-ref-format", "--branch", branch]);
     let output =
         run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
@@ -659,8 +695,13 @@ fn check_branch_name(repository: &Path, branch: &str) -> Result<(), ProtocolErro
 
 /// The best common ancestor of `local` and `remote`, or `none` for unrelated
 /// histories.
-fn merge_base(repository: &Path, local: &str, remote: &str) -> Result<String, ProtocolError> {
-    let mut cmd = git_command(repository).map_err(|message| inspect_error(&message))?;
+fn merge_base(
+    repository: &Path,
+    layer: RepoHookLayer,
+    local: &str,
+    remote: &str,
+) -> Result<String, ProtocolError> {
+    let mut cmd = git_command(repository, layer).map_err(|message| inspect_error(&message))?;
     cmd.args(["merge-base", local, remote]);
     let output =
         run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
@@ -673,8 +714,13 @@ fn merge_base(repository: &Path, local: &str, remote: &str) -> Result<String, Pr
 }
 
 /// Whether `ancestor` is an ancestor of (or equal to) `descendant`.
-fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, ProtocolError> {
-    let mut cmd = git_command(repository).map_err(|message| inspect_error(&message))?;
+fn is_ancestor(
+    repository: &Path,
+    layer: RepoHookLayer,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, ProtocolError> {
+    let mut cmd = git_command(repository, layer).map_err(|message| inspect_error(&message))?;
     cmd.args(["merge-base", "--is-ancestor", ancestor, descendant]);
     let output =
         run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
@@ -688,12 +734,17 @@ fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bo
 /// Why `refs/heads/<backup>` cannot be created, if it cannot: the ref exists, or
 /// a branch named like one of its parent directories does (git cannot hold
 /// `backup` and `backup/<name>` at once).
-fn backup_obstruction(repository: &Path, backup: &str) -> Result<Option<String>, ProtocolError> {
-    if ref_exists(repository, &format!("refs/heads/{backup}"))? {
+fn backup_obstruction(
+    repository: &Path,
+    layer: RepoHookLayer,
+    backup: &str,
+) -> Result<Option<String>, ProtocolError> {
+    if ref_exists(repository, layer, &format!("refs/heads/{backup}"))? {
         return Ok(Some("the ref already exists".to_owned()));
     }
     let below = git_capture(
         repository,
+        layer,
         &[
             "for-each-ref",
             "--count=1",
@@ -715,15 +766,15 @@ fn backup_obstruction(repository: &Path, backup: &str) -> Result<Option<String>,
             prefix.push('/');
         }
         prefix.push_str(part);
-        if ref_exists(repository, &format!("refs/heads/{prefix}"))? {
+        if ref_exists(repository, layer, &format!("refs/heads/{prefix}"))? {
             return Ok(Some(format!("the branch {prefix:?} blocks that name")));
         }
     }
     Ok(None)
 }
 
-fn ref_exists(repository: &Path, name: &str) -> Result<bool, ProtocolError> {
-    let mut cmd = git_command(repository).map_err(|message| inspect_error(&message))?;
+fn ref_exists(repository: &Path, layer: RepoHookLayer, name: &str) -> Result<bool, ProtocolError> {
+    let mut cmd = git_command(repository, layer).map_err(|message| inspect_error(&message))?;
     cmd.args(["rev-parse", "--verify", "--quiet", name]);
     let output =
         run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(|message| inspect_error(&message))?;
@@ -735,8 +786,12 @@ fn ref_exists(repository: &Path, name: &str) -> Result<bool, ProtocolError> {
 }
 
 /// The commit `name` points to, or `None` when the ref does not exist.
-fn ref_head(repository: &Path, name: &str) -> Result<Option<String>, ProtocolError> {
-    let mut cmd = git_command(repository).map_err(|message| inspect_error(&message))?;
+fn ref_head(
+    repository: &Path,
+    layer: RepoHookLayer,
+    name: &str,
+) -> Result<Option<String>, ProtocolError> {
+    let mut cmd = git_command(repository, layer).map_err(|message| inspect_error(&message))?;
     cmd.args([
         "rev-parse",
         "--verify",
@@ -754,9 +809,10 @@ fn ref_head(repository: &Path, name: &str) -> Result<Option<String>, ProtocolErr
     }
 }
 
-fn rev_parse_commit(repository: &Path, name: &str) -> Result<String, String> {
+fn rev_parse_commit(repository: &Path, layer: RepoHookLayer, name: &str) -> Result<String, String> {
     git_capture(
         repository,
+        layer,
         &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
     )
 }
@@ -802,7 +858,7 @@ fn backup_exists(backup: &str, why: &str) -> ProtocolError {
 mod tests {
     use std::fs;
 
-    use super::{operation_on_branch, Operation};
+    use super::{operation_on_branch, Operation, RepoHookLayer};
 
     /// A git directory holding the given files (relative path, content).
     fn git_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -920,10 +976,13 @@ mod tests {
             "stops on the conflict"
         );
 
-        let holder = branch_holder(repo.path(), "feat").expect("inspect");
+        let holder = branch_holder(repo.path(), RepoHookLayer::Run, "feat").expect("inspect");
 
         assert_eq!(holder, Some(Holder::Operation(Operation::Rebase)));
-        assert_eq!(branch_holder(repo.path(), "main").expect("inspect"), None);
+        assert_eq!(
+            branch_holder(repo.path(), RepoHookLayer::Run, "main").expect("inspect"),
+            None
+        );
     }
 
     #[cfg(unix)]

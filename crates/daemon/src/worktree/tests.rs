@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
+use super::RepoHookLayer;
 use super::{
     admin_lock, git_command, lock_within, run_admin_command_within, share_within, worktree_add_new,
     worktree_prune,
@@ -683,7 +684,7 @@ fn a_base_fetch_waits_for_a_worktree_add_that_has_not_finished_its_admin_entry()
     .expect("write gitdir");
     fs::write(entry.join("commondir"), "../..\n").expect("write commondir");
     fs::write(entry.join("HEAD"), format!("{}\n", "0".repeat(40))).expect("write the placeholder");
-    let lock = admin_lock(&downstream).expect("repository lock");
+    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
 
     let mgr = manager("fetch-vs-add");
     let mut req = request("s-1", &downstream, "feat/1");
@@ -732,7 +733,7 @@ fn a_base_fetch_waits_for_a_worktree_add_that_has_not_finished_its_admin_entry()
 fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
     let (upstream, tip) = upstream_with_stacked_base("fetch-vs-fetch-upstream");
     let downstream = clone_of(&upstream, "fetch-vs-fetch-downstream");
-    let lock = admin_lock(&downstream).expect("repository lock");
+    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
 
     let fetched = std::thread::scope(|scope| {
         // Dropped on unwind too, before the scope waits for the fetch.
@@ -743,7 +744,7 @@ fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
         let fetch = scope.spawn(|| {
             super::fetch::FETCH_LOCK_WAIT_OVERRIDE
                 .with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
-            super::fetch::fetch_origin(&downstream, "stacked/base")
+            super::fetch::fetch_origin(&downstream, RepoHookLayer::Run, "stacked/base")
         });
         pohunek_test_support::wait::poll_until(
             "the fetch to finish beside the other fetch",
@@ -759,7 +760,7 @@ fn a_base_fetch_runs_while_another_fetch_holds_the_repository_lock() {
 #[test]
 fn a_waiting_add_holds_back_new_fetches_of_the_repository() {
     let repo = init_repo("writer-preference");
-    let lock = admin_lock(&repo).expect("repository lock");
+    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("repository lock");
 
     std::thread::scope(|scope| {
         let fetch = share_within(&lock, TEST_LOCK_WAIT).expect("the fetch shares the lock");
@@ -789,13 +790,13 @@ fn a_waiting_add_holds_back_new_fetches_of_the_repository() {
 fn a_fetch_that_cannot_get_the_repository_lock_falls_back_to_the_local_base_with_a_warning() {
     let (upstream, _) = upstream_with_stacked_base("fetch-lock-warning-upstream");
     let downstream = clone_of(&upstream, "fetch-lock-warning-downstream");
-    let lock = admin_lock(&downstream).expect("repository lock");
+    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
     let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
 
     super::fetch::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
     let mut warnings = Vec::new();
     let (start_point, fetched) =
-        WorktreeManager::fetch_start_point(&downstream, "main", &mut warnings);
+        WorktreeManager::fetch_start_point(&downstream, RepoHookLayer::Run, "main", &mut warnings);
 
     assert_eq!(start_point, "main", "the local base is used");
     assert!(fetched.is_none());
@@ -812,7 +813,7 @@ fn a_fetch_that_cannot_get_the_repository_lock_falls_back_to_the_local_base_with
 fn a_bind_whose_origin_only_base_cannot_get_the_repository_lock_reports_the_fetch_failure() {
     let (upstream, _) = upstream_with_stacked_base("fetch-lock-error-upstream");
     let downstream = clone_of(&upstream, "fetch-lock-error-downstream");
-    let lock = admin_lock(&downstream).expect("repository lock");
+    let lock = admin_lock(&downstream, RepoHookLayer::Run).expect("repository lock");
     let _held = lock_within(&lock, TEST_LOCK_WAIT).expect("take the admin lock");
 
     super::fetch::FETCH_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(SHORT_FETCH_LOCK_WAIT)));
@@ -844,7 +845,7 @@ fn concurrent_worktree_adds_and_prunes_in_one_repository_all_succeed() {
         let (adds, prune) = std::thread::scope(|scope| {
             let prune = scope.spawn(|| {
                 barrier.wait();
-                worktree_prune(&repo)
+                worktree_prune(&repo, RepoHookLayer::Run)
             });
             let handles: Vec<_> = (0..RAW_ADDS_PER_ROUND)
                 .map(|index| {
@@ -852,8 +853,14 @@ fn concurrent_worktree_adds_and_prunes_in_one_repository_all_succeed() {
                     let path = checkouts.join(format!("wt-{round}-{index}"));
                     scope.spawn(move || {
                         barrier.wait();
-                        worktree_add_new(repo, &path, &format!("b/{round}-{index}"), "main")
-                            .map(|()| path)
+                        worktree_add_new(
+                            repo,
+                            RepoHookLayer::Run,
+                            &path,
+                            &format!("b/{round}-{index}"),
+                            "main",
+                        )
+                        .map(|()| path)
                     })
                 })
                 .collect();
@@ -887,11 +894,13 @@ fn admin_lock_is_shared_per_repository_and_independent_across_repositories() {
     let first = init_repo("lock-first");
     let second = init_repo("lock-second");
     let linked = unique_dir("lock-linked").join("wt");
-    worktree_add_new(&first, &linked, "feat/linked", "main").expect("add a linked worktree");
+    worktree_add_new(&first, RepoHookLayer::Run, &linked, "feat/linked", "main")
+        .expect("add a linked worktree");
 
-    let first_lock = admin_lock(&first).expect("lock for the first repository");
-    let via_linked = admin_lock(&linked).expect("lock via a linked worktree");
-    let second_lock = admin_lock(&second).expect("lock for the second repository");
+    let first_lock = admin_lock(&first, RepoHookLayer::Run).expect("lock for the first repository");
+    let via_linked = admin_lock(&linked, RepoHookLayer::Run).expect("lock via a linked worktree");
+    let second_lock =
+        admin_lock(&second, RepoHookLayer::Run).expect("lock for the second repository");
     assert!(
         Arc::ptr_eq(&first_lock, &via_linked),
         "the main checkout and its linked worktree share one lock"
@@ -921,7 +930,7 @@ fn admin_lock_is_shared_per_repository_and_independent_across_repositories() {
 #[test]
 fn admin_lock_wait_reports_a_timeout_instead_of_blocking_forever() {
     let repo = init_repo("lock-timeout");
-    let lock = admin_lock(&repo).expect("lock");
+    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("lock");
     let _held = lock_within(&lock, Duration::ZERO).expect("take the lock");
 
     let message = lock_within(&lock, Duration::ZERO).expect_err("lock is held");
@@ -936,14 +945,14 @@ fn admin_lock_wait_reports_a_timeout_instead_of_blocking_forever() {
 fn admin_commands_wait_for_the_repository_lock_before_running_git() {
     let repo = init_repo("lock-wiring");
     let checkout = unique_dir("lock-wiring-checkout").join("wt");
-    let lock = admin_lock(&repo).expect("lock");
+    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("lock");
     let held = lock_within(&lock, Duration::ZERO).expect("take the lock");
 
-    let mut cmd = git_command(&repo).expect("git command");
+    let mut cmd = git_command(&repo, RepoHookLayer::Run).expect("git command");
     cmd.args(["worktree", "add", "-b", "feat/locked", "--end-of-options"])
         .arg(&checkout)
         .arg("main");
-    let message = run_admin_command_within(&repo, cmd, Duration::ZERO)
+    let message = run_admin_command_within(&repo, RepoHookLayer::Run, cmd, Duration::ZERO)
         .expect_err("the held lock keeps the command from running");
 
     assert!(
@@ -1001,11 +1010,11 @@ fn repository_lock_is_released_when_git_exits_even_if_a_hook_descendant_holds_th
     let first_path = unique_dir("lock-exit-first").join("wt");
     let second_path = unique_dir("lock-exit-second").join("wt");
     let add = |path: &Path, branch: &str, lock_wait: Duration| {
-        let mut cmd = git_command(&repo).expect("git command");
+        let mut cmd = git_command(&repo, RepoHookLayer::Run).expect("git command");
         cmd.args(["worktree", "add", "-b", branch, "--end-of-options"])
             .arg(path)
             .arg("main");
-        run_admin_command_within(&repo, cmd, lock_wait)
+        run_admin_command_within(&repo, RepoHookLayer::Run, cmd, lock_wait)
     };
 
     std::thread::scope(|scope| {
@@ -1091,7 +1100,7 @@ fn bind_with_pipe_holding_grandchild(detached: bool, fails: bool) {
         pohunek_test_support::wait::poll_until("native hook grandchild ready", || {
             started.exists().then_some(())
         });
-        let lock = admin_lock(&repo).expect("repository lock");
+        let lock = admin_lock(&repo, RepoHookLayer::Run).expect("repository lock");
         drop(lock_within(&lock, TEST_LOCK_WAIT).expect("git exit releases lock before drain"));
         manager
             .bind(&request("second", &repo, "feat/second"))
@@ -1159,7 +1168,7 @@ fn an_oversized_failing_native_hook_keeps_bounded_partial_diagnostics() {
 #[test]
 fn admin_lock_survives_a_panicking_holder() {
     let repo = init_repo("lock-poison");
-    let lock = admin_lock(&repo).expect("lock");
+    let lock = admin_lock(&repo, RepoHookLayer::Run).expect("lock");
     let poisoner = Arc::clone(&lock);
     let panicked = std::thread::spawn(move || {
         let _guard = poisoner.rw.write().expect("take the lock");
@@ -1223,7 +1232,7 @@ fn base_ref_with_refspec_syntax_is_not_fetched() {
 
     for hostile in ["main:refs/heads/injected", "+main", "ma*in"] {
         assert!(
-            super::fetch::fetch_origin(&downstream, hostile).is_err(),
+            super::fetch::fetch_origin(&downstream, RepoHookLayer::Run, hostile).is_err(),
             "{hostile:?} must be rejected before any fetch"
         );
     }
@@ -1274,7 +1283,8 @@ fn annotated_tag_base_is_pinned_by_its_commit_and_its_ref_is_deleted() {
     let downstream = clone_of(&upstream, "tag-downstream");
     git_in(&downstream, &["tag", "-d", "v1.0.0"]);
 
-    let fetched = super::fetch::fetch_origin(&downstream, "v1.0.0").expect("fetch the tag");
+    let fetched = super::fetch::fetch_origin(&downstream, RepoHookLayer::Run, "v1.0.0")
+        .expect("fetch the tag");
     assert_eq!(fetched.commit, commit);
     drop(fetched);
     assert_eq!(leftover_fetch_refs(&downstream), "");
@@ -1304,7 +1314,7 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
         ("refs/pohunek/fetch/taken-same", &main_tip),
     ] {
         git_in(&downstream, &["update-ref", dest, oid]);
-        super::fetch::fetch_into_ref(&downstream, "main", dest)
+        super::fetch::fetch_into_ref(&downstream, RepoHookLayer::Run, "main", dest)
             .expect_err("an existing destination must fail the fetch");
         assert_eq!(&git_stdout(&downstream, &["rev-parse", dest]), oid);
     }
@@ -1317,8 +1327,14 @@ fn fetch_disables_automatic_maintenance() {
         super::fetch::FetchScope::Tracked,
         super::fetch::FetchScope::Untrusted,
     ] {
-        let cmd = super::fetch::fetch_command(&repo, "main", "refs/pohunek/fetch/x", scope)
-            .expect("command");
+        let cmd = super::fetch::fetch_command(
+            &repo,
+            RepoHookLayer::Run,
+            "main",
+            "refs/pohunek/fetch/x",
+            scope,
+        )
+        .expect("command");
         let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
         let fetch = args
             .iter()
@@ -2707,6 +2723,60 @@ fn unsaved_work_clears_a_binding_whose_checkout_is_already_gone() {
     );
 }
 
+/// Row 20: the pre-removal check of a binding started with the switch
+/// (`git status` inside its checkout) runs no git hook the checkout carries,
+/// although a relative `core.hooksPath` resolves to one there; the same check
+/// of a binding without the switch runs it.
+#[cfg(unix)]
+#[test]
+fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mgr = manager("unsaved-git-hooks");
+    let repo = init_repo("unsaved-git-hooks-repo");
+    let marker = unique_dir("unsaved-git-hooks-marker").join("ran");
+    let hook = repo.join(".githooks/post-index-change");
+    fs::create_dir_all(hook.parent().expect("hook directory")).expect("create .githooks");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> '{}'\n",
+            marker.display()
+        ),
+    )
+    .expect("write the hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-q", "-m", "a checkout with a git hook"]);
+    git_in(&repo, &["config", "core.hooksPath", ".githooks"]);
+    let mut switched = request("s-skip", &repo, "review/skip");
+    switched.skip_repo_hooks = true;
+    let skipped = mgr.bind(&switched).expect("bind the switched session");
+    let running = mgr
+        .bind(&request("s-run", &repo, "review/run"))
+        .expect("bind the control session");
+    let _ = fs::remove_file(&marker);
+    let stale_index = |checkout: &Path| {
+        fs::File::options()
+            .write(true)
+            .open(checkout.join("README.md"))
+            .expect("open the tracked file")
+            .set_modified(std::time::SystemTime::now() + Duration::from_hours(24))
+            .expect("move the tracked file's mtime");
+    };
+
+    stale_index(&skipped.path);
+    assert_eq!(mgr.unsaved_work("s-skip"), WorktreeWork::Saved);
+    assert!(!marker.exists(), "the switched check ran no hook");
+
+    stale_index(&running.path);
+    assert_eq!(mgr.unsaved_work("s-run"), WorktreeWork::Saved);
+    assert!(
+        marker.exists(),
+        "without the switch the check runs the checkout's hook"
+    );
+}
+
 #[test]
 fn status_hold_ranks_an_uncommitted_change_above_an_untracked_file() {
     let hold = super::status_hold("?? notes.md\n M README.md\n").expect("a hold");
@@ -2845,7 +2915,7 @@ fn a_remote_branch_fetch_that_times_out_is_a_fetch_failure_and_skips_ls_remote()
     super::fetch::FETCH_COMMAND_TIMEOUT_OVERRIDE
         .with(|timeout| timeout.set(Some(SHORT_FETCH_COMMAND_TIMEOUT)));
 
-    let error = super::remote::plan_remote_branch(&downstream, "main", None)
+    let error = super::remote::plan_remote_branch(&downstream, RepoHookLayer::Run, "main", None)
         .expect_err("the fetch times out");
 
     assert_eq!(error.code, "branch_fetch_failed", "{error:?}");

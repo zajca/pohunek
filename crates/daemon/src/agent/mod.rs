@@ -554,6 +554,7 @@ fn invalid_session_ref(message: &'static str) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use crate::worktree::RepoHookLayer;
     use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -821,7 +822,7 @@ mod tests {
             let repo = temp_dir("git-repo");
             let (detected, output, resolved) = with_path(Path::new(&path), || {
                 let detected = crate::project::detect::git(&repo, &[]);
-                let output = crate::worktree::git_command(&repo)
+                let output = crate::worktree::git_command(&repo, RepoHookLayer::Run)
                     .expect("a trusted git exists")
                     .output()
                     .expect("spawn git");
