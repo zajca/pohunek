@@ -677,13 +677,16 @@ async fn attested_spawn_origin(
         .params()
         .get("agent")
         .and_then(serde_json::Value::as_str);
-    if agent.is_some_and(|agent| !rights.allows_spawn(agent)) {
-        return Err(refuse_spawn(
-            request,
-            state,
-            &class,
-            "spawn_profile_not_allowed",
-        ));
+    if let Some(agent) = agent {
+        let target = state.sessions.profile_rights(agent).await;
+        if !rights.allows_spawn(agent, &target) {
+            return Err(refuse_spawn(
+                request,
+                state,
+                &class,
+                "spawn_profile_not_allowed",
+            ));
+        }
     }
     Ok(Some(protocol::SpawnedBy {
         session_id: caller.clone(),

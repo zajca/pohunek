@@ -599,6 +599,34 @@ fn spawn_profiles_limit_what_a_session_launches() {
         .expect_err("an empty list forbids spawning");
     assert_denied(&none, "spawn_profile_not_allowed");
 
+    // A preset has the rights of its parent, and a profile that grants owner
+    // rights is launched only by a session whose list names it.
+    let agents_dir = scenario
+        .host
+        .env
+        .config_home()
+        .join("pohunek")
+        .join("agents");
+    let preset = agents_dir.join("rights-closed-preset.toml");
+    fs::write(&preset, "[preset]\nparent = \"rights-closed\"\n").expect("write the preset");
+    fs::set_permissions(&preset, fs::Permissions::from_mode(0o600)).expect("keep it private");
+    let from_preset = scenario.spawn("rights-closed-preset", "closed-preset", None);
+    let refused = spawn_inside(&scenario, &from_preset, AGENT_PROFILE, "")
+        .expect_err("a preset of a closed profile cannot spawn");
+    assert_denied(&refused, "spawn_profile_not_allowed");
+    scenario.add_profile("rights-manager", "owner_equivalent = true");
+    let plain = scenario.spawn(AGENT_PROFILE, "plain", None);
+    let escalate = spawn_inside(&scenario, &plain, "rights-manager", "")
+        .expect_err("a session without a list cannot launch an owner-equivalent profile");
+    assert_denied(&escalate, "spawn_profile_not_allowed");
+    scenario.add_profile(
+        "rights-lead-manager",
+        &format!("spawn_profiles = [\"rights-manager\", \"{AGENT_PROFILE}\"]"),
+    );
+    let lead_manager = scenario.spawn("rights-lead-manager", "lead-manager", None);
+    spawn_inside(&scenario, &lead_manager, "rights-manager", "")
+        .expect("a list that names the profile launches it");
+
     // A table the daemon cannot read grants nothing and does not load.
     scenario.add_profile("rights-bad", "owner_equivalent = \"yes\"");
     let (code, bad) = scenario

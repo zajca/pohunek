@@ -878,10 +878,11 @@ struct SessionRegistryInner {
     /// [`SessionRegistry::set_metadata`], so a metadata edit is never overwritten
     /// by a record built from an earlier snapshot.
     persist_lock: Mutex<()>,
-    /// The roots of the `session.remove_tree` cascades in progress. A
+    /// The roots of the `session.remove_tree` cascades in progress, with how
+    /// many run on each. A
     /// `session.adopt` of a session inside one of those trees is refused, so
     /// a cascade never removes a session the owner just moved elsewhere.
-    removing_roots: std::sync::Mutex<HashSet<SessionId>>,
+    removing_roots: std::sync::Mutex<HashMap<SessionId, usize>>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
     #[cfg(test)]
@@ -2796,7 +2797,7 @@ impl SessionRegistry {
                 produced_events,
                 store,
                 persist_lock: Mutex::new(()),
-                removing_roots: std::sync::Mutex::new(HashSet::new()),
+                removing_roots: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 resume_writes_blocked: AtomicBool::new(false),
                 #[cfg(test)]

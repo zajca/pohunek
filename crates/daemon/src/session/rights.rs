@@ -181,12 +181,20 @@ impl SessionRegistry {
             .await
             .get(id)
             .map(|entry| entry.info.agent.clone())?;
+        Some(self.profile_rights(&agent).await)
+    }
+
+    /// The `[rights]` of the profile `agent`, read from its file.
+    ///
+    /// A profile the daemon cannot read grants nothing.
+    pub(crate) async fn profile_rights(&self, agent: &str) -> ProfileRights {
         let profiles = self.inner.profiles.clone();
+        let agent = agent.to_owned();
         self.inner
             .background
             .spawn_blocking("profile_rights", move || rights_of(&profiles, &agent))
             .await
-            .ok()
+            .unwrap_or_else(|_join_error| ProfileRights::closed())
     }
 
     async fn live_roots(&self) -> Roots {

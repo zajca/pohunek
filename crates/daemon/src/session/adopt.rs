@@ -20,24 +20,31 @@ pub(super) struct RemovingRoot<'a> {
 impl<'a> RemovingRoot<'a> {
     /// Registers `root` as the root of a cascade in progress.
     pub(super) fn new(registry: &'a SessionRegistry, root: SessionId) -> Self {
-        registry
+        *registry
             .inner
             .removing_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.clone());
+            .entry(root.clone())
+            .or_default() += 1;
         Self { registry, root }
     }
 }
 
 impl Drop for RemovingRoot<'_> {
     fn drop(&mut self) {
-        self.registry
+        let mut roots = self
+            .registry
             .inner
             .removing_roots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.root);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = roots.get_mut(&self.root) {
+            *count -= 1;
+            if *count == 0 {
+                roots.remove(&self.root);
+            }
+        }
     }
 }
 
@@ -124,7 +131,7 @@ impl SessionRegistry {
             .removing_roots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        roots.iter().any(|root| {
+        roots.keys().any(|root| {
             [child, parent]
                 .into_iter()
                 .any(|id| id == root || descends_from(lookup, id, root))

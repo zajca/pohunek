@@ -383,13 +383,23 @@ spawn_profiles = ["worker", "review"] # the profiles it may launch
 `owner_equivalent` is meant for manager profiles: the sessions run with the
 owner's rights, so a manager session reaches sessions it did not spawn.
 `spawn_profiles` lists exact profile names; an empty list forbids spawning and
-an absent key leaves it unrestricted. A request that names a profile outside
-the list is refused with `session_right_denied` (`reason=spawn_profile_not_allowed`).
+an absent key leaves it unrestricted, except that a profile with
+`owner_equivalent = true` is launched from a session only when the list names
+it. A request that names a profile outside the list is refused with
+`session_right_denied` (`reason=spawn_profile_not_allowed`). A preset has the
+rights of its parent profile.
+
 The table is read from the profile file, never from a request, and an unknown
-key or an entry that is not a profile name is `invalid_profile`. Unlike a
-presentation label it is part of the profile revision, so a change asks for
-`--accept-profile-change` on the next resume. A profile without the table has
-neither key.
+key or an entry that is not a profile name is `invalid_profile`. The daemon
+reads the file when it places a caller (once per connection) and when it checks
+a spawn, so an edit applies to the running sessions of the profile from their
+next connection; a file it cannot read, including one with unsafe permissions,
+grants nothing and forbids spawning. The table is part of the profile revision,
+so a change also asks for `--accept-profile-change` on the next resume. The
+profile files are the owner's lever and, like every file of the same user,
+within reach of a same-user process: `package.create_profile --replace`
+rewrites the file without the table. A profile without the table has neither
+key.
 
 ## Launch options
 

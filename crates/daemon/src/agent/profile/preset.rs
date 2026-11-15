@@ -74,6 +74,13 @@ pub(super) enum RawFile {
     Preset(RawPreset),
 }
 
+impl RawPreset {
+    /// The name of the profile the preset launches.
+    pub(super) fn parent(&self) -> &str {
+        &self.preset.parent
+    }
+}
+
 /// The parent of a resolved preset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PresetOf {
