@@ -719,6 +719,26 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/session_right_denied` error.
+    ///
+    /// The caller runs inside a session's process tree and the request targets
+    /// a session its rights do not cover. `reason` is a stable machine-readable
+    /// code (`not_descendant`, `parent_blocked`, `owner_only`,
+    /// `spawn_profile_not_allowed`, `origin_mismatch` or `unknown_caller`); the
+    /// message carries nothing else of the request.
+    #[must_use]
+    pub fn session_right_denied(reason: &'static str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_right_denied",
+            format!("the caller's session rights do not cover this request (reason={reason})"),
+            Some(
+                "ask the owner to run the request, or act on a session this session spawned"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `daemon/method_not_found` error for an unknown method.
     #[must_use]
     pub fn method_not_found(method: &str) -> Self {

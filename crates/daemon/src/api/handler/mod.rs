@@ -48,7 +48,8 @@ use crate::discovery::DiscoveryCache;
 use crate::governance::HostGovernanceService;
 use crate::notifications::{AttentionCoordinator, NotificationService};
 use crate::package_command::PackageCommandService;
-use crate::session::{ControlPeer, SessionRegistry};
+use crate::session::rights::CallerClass;
+use crate::session::{ControlPeer, PeerStanding, SessionRegistry};
 
 /// Static facts the daemon reports from `daemon.health`.
 ///
@@ -101,6 +102,9 @@ pub struct DaemonState {
     ///
     /// Set per accepted remote connection; `None` on every other state.
     pub remote_peer: Option<SocketAddr>,
+    /// The rights class of this connection's caller, computed on the first
+    /// rights-checked request and kept for the connection.
+    pub(crate) rights_class: Arc<tokio::sync::OnceCell<CallerClass>>,
     /// Runs package commands. States that serve one daemon share one service,
     /// so its limits hold across transports.
     pub package_commands: PackageCommandService,
@@ -175,6 +179,7 @@ impl DaemonState {
             transport: ControlTransport::default(),
             control_peer: None,
             remote_peer: None,
+            rights_class: Arc::default(),
             package_commands,
         }
     }
@@ -196,6 +201,7 @@ impl DaemonState {
         self.transport = transport;
         self.control_peer = None;
         self.remote_peer = None;
+        self.rights_class = Arc::default();
         self
     }
 
@@ -210,6 +216,7 @@ impl DaemonState {
     #[must_use]
     pub fn with_control_peer(mut self, peer: Option<Arc<ControlPeer>>) -> Self {
         self.control_peer = peer;
+        self.rights_class = Arc::default();
         self
     }
 
@@ -431,6 +438,23 @@ async fn handle_negotiated(
         }
     }
 
+    if let Some(target) = rights_target(request) {
+        let class = caller_class(state).await;
+        if let Err(denial) = state
+            .sessions
+            .check_session_right(&class, request.method(), target)
+            .await
+        {
+            audit::record_rights_refusal(request, state, &class, target, denial.code());
+            return Response::err(
+                selected_version,
+                request.id(),
+                ProtocolError::session_right_denied(denial.code()),
+            )
+            .expect("deserialized request ids satisfy response validation");
+        }
+    }
+
     // Stop and remove release what a session owns and need no resolvable
     // runtime; the registry refuses an external session itself.
     let releases_only = matches!(
@@ -582,6 +606,40 @@ async fn handle_negotiated(
             ProtocolError::method_not_found(other),
         )
         .expect("deserialized request ids satisfy response validation"),
+    }
+}
+
+/// The session a request addresses for the rights check: every self-target
+/// guarded method, and `session.attach`, which opens an input stream.
+fn rights_target(request: &Request) -> Option<&str> {
+    if request.method() == method::SESSION_ATTACH {
+        return request
+            .params()
+            .get("session_id")
+            .and_then(serde_json::Value::as_str);
+    }
+    mutation_target(request)
+}
+
+/// The rights class of the caller of the connection `state` serves.
+///
+/// A remote overlay connection and a state without a kernel peer carry owner
+/// rights. A local peer is classified once and the class is kept, while the
+/// peer's attestation is read again before every use.
+async fn caller_class(state: &DaemonState) -> CallerClass {
+    if state.transport == ControlTransport::Remote {
+        return CallerClass::Owner;
+    }
+    let Some(peer) = state.control_peer.as_deref() else {
+        return CallerClass::Owner;
+    };
+    let class = state
+        .rights_class
+        .get_or_init(|| state.sessions.classify_caller(peer))
+        .await;
+    match peer.standing() {
+        PeerStanding::Process(_) => class.clone(),
+        PeerStanding::ForeignUser | PeerStanding::Unattested => CallerClass::Unknown,
     }
 }
 

@@ -1189,6 +1189,7 @@ impl SessionRegistry {
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
             create_request,
+            root_process: Some(started.root_process),
         };
         #[cfg(test)]
         self.hold_launch_commit().await;

@@ -177,11 +177,13 @@ mod rejected_lines;
 use claim::{ClaimKey, ClaimOrigin, PendingActivity, PendingRelease};
 use forward::Forwarded;
 pub use native_attestation::ControlPeer;
+pub(crate) use native_attestation::PeerStanding;
 pub use reconcile::upgrade_preflight;
 pub(crate) use rejected_lines::RejectedLinesState;
 pub(crate) mod remove_tree;
 mod resume;
 mod retention;
+pub(crate) mod rights;
 mod settle;
 mod supervision;
 mod target;
@@ -1211,6 +1213,10 @@ struct SessionEntry {
     /// The idempotency key and fingerprint of the creating `session.new`,
     /// written to every record of the session and never reported to clients.
     create_request: Option<Box<CreateRequest>>,
+    /// The process the runtime's PTY launched, with its start identity. The
+    /// rights classifier matches a caller's ancestry against it; `None` while
+    /// the runtime has no live root the daemon observed.
+    root_process: Option<ProcessIdentity>,
 }
 
 /// Discovery inventory as the session tests read it.

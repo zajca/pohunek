@@ -28,6 +28,9 @@ const PLACEMENT_ESCAPE_CHECK: &str = "placement_escape";
 /// Most sessions the placement check names in its detail.
 const MAX_PLACEMENT_SESSIONS_LISTED: usize = 8;
 
+/// Name of the check that states the session rights guardrail and its limit.
+const SESSION_RIGHTS_CHECK: &str = "session_rights";
+
 /// Name of the check that reports the metadata-store lines no loader accepts.
 const METADATA_STORE_REJECTED_LINES_CHECK: &str = "metadata_store_rejected_lines";
 
@@ -114,6 +117,7 @@ pub(crate) async fn report(
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
+    checks.push(session_rights_check());
     Ok(bounded_report(checks))
 }
 
@@ -906,6 +910,19 @@ fn placement_check(
         &format!(
             "{} live session(s) with a placement check report no escaped process.",
             placements.len()
+        ),
+    )
+}
+
+/// The check that names the limit of the session rights guardrail and the
+/// platform mode that places a caller in a session tree.
+fn session_rights_check() -> DoctorCheck {
+    check(
+        SESSION_RIGHTS_CHECK,
+        DoctorStatus::Ok,
+        &format!(
+            "guardrail: processes that leave a session tree keep owner rights (see security model); placement: {}",
+            crate::session::rights::platform_mode()
         ),
     )
 }

@@ -4384,6 +4384,10 @@ impl SessionRegistry {
             reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
+            root_process: Some(crate::procwatch::ProcessIdentity {
+                pid: child.pid,
+                start_identity: crate::procwatch::StartIdentity::new(child.start_identity),
+            }),
         };
         let listed = record.clone();
         match self.write_record_and_install(&id, record, entry).await {
@@ -4732,6 +4736,7 @@ impl SessionRegistry {
             reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
+            root_process: None,
         };
         (record, entry)
     }

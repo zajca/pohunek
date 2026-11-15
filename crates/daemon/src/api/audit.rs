@@ -12,6 +12,7 @@ use protocol::{method, Request, Response};
 use tracing::info;
 
 use super::handler::{ControlTransport, DaemonState};
+use crate::session::rights::CallerClass;
 
 /// Tracing target of every audit entry, so a log filter can select them.
 pub(crate) const AUDIT_TARGET: &str = "audit.session_change";
@@ -112,6 +113,40 @@ pub(crate) fn record_request(
             request.origin_session_id().map(|id| id.0.as_str()),
             request.origin_daemon_id(),
         ),
+    );
+}
+
+/// Writes the audit entry of a request the session rights refused.
+///
+/// The entry names the caller's class and session, the kernel peer, the method,
+/// the target session id, the reason and the request id. Params text, input
+/// bytes, names and metadata values are never read into it.
+pub(crate) fn record_rights_refusal(
+    request: &Request,
+    state: &DaemonState,
+    class: &CallerClass,
+    target: &str,
+    reason: &str,
+) {
+    let peer = match Caller::of(state) {
+        Caller::Local { pid, uid } => format!("pid={pid} uid={uid}"),
+        Caller::Remote(addr) => addr.to_string(),
+        Caller::LocalUnattested => "unattested".to_owned(),
+    };
+    let caller_session = class.session().map(|id| bounded(&id.0));
+    let target = bounded(target);
+    let request_id = bounded(request.id());
+    info!(
+        target: AUDIT_TARGET,
+        caller_class = %class.label(),
+        caller_session = caller_session.as_deref(),
+        peer = %peer,
+        kind = %request.method(),
+        session = %target,
+        outcome = "refused",
+        reason = %reason,
+        request_id = %request_id,
+        "session right refused"
     );
 }
 

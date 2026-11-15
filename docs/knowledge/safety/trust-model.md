@@ -120,6 +120,14 @@ The assistant must:
   route for a Hermes hook's native reference: the public native-id report
   accepts only the PTY root and refuses `identity-v1` sessions altogether, and
   the Hermes reporter never sends it.
+- A process inside a session's tree is also placed by its kernel peer, not by
+  markers: it may mutate only that session's `spawned_by` descendants, plus type
+  into its parent while the parent is not blocked, and every other target is
+  `session_right_denied`. Owner terminals, services outside every session tree
+  and `shell` sessions keep owner rights, and so does a process that leaves the
+  tree (a double fork, `systemd-run --user --scope`). It is a guardrail against
+  a confused worker, not isolation from a hostile one; run untrusted agents in
+  the isolation track (#88). `pohunek doctor` shows the `session_rights` check.
 - The Rust SDK inherits that origin from the calling process by default
   (`OriginSource::Environment`, which reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID`). `OriginSource::Omitted` makes a connection attach no
