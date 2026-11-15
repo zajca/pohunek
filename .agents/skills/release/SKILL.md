@@ -2,9 +2,10 @@
 name: release
 description: >-
   Cut a pohunek release with scripts/release — bump the workspace version, tag
-  vX.Y.Z, push, and verify the GitHub Actions Release workflow builds and
-  publishes the glibc + MUSL x86_64 binaries. Use when the user asks to cut
-  or publish a new version.
+  vX.Y.Z, push, verify the GitHub Actions Release workflow builds and
+  publishes the glibc + MUSL x86_64 binaries, publish the reviewed release
+  post, and drive the downstream updates. Use when the user asks to cut or
+  publish a new version.
 ---
 
 # release — cut and publish a release
@@ -82,9 +83,9 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    explicit `X.Y.Z`; the workspace is already bumped, so do not request another
    relative bump such as `patch`.
 
-5. **Publish the notes.** When a notes file was needed, attach it to the GitHub
-   Release once the workflow has created it (`gh release edit "vX.Y.Z"
-   --notes-file FILE`) and confirm with `gh release view "vX.Y.Z"`.
+5. **Publish the notes.** The compatibility notes of step 1 are published with
+   the release post: step 8 puts them after the end marker and sets the whole
+   body in one edit. Do not edit the body with the notes file alone.
 
 6. **Record the release.** Via the `github-workflow` skill, comment the
    version/tag and release URL on any issue whose delivery this release
@@ -112,7 +113,112 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    gh release view "vX.Y.Z"   # confirm the tarballs + .sha256 (incl. the three pohunek-ts-*.tgz) are attached
    ```
 
-8. **Release `pohunekd/plugin-assistant` from the new core tag.** The assistant
+8. **Release post (required).** pohunek.dev shows only the part of the release
+   body between `<!-- pohunek-changelog:start -->` and
+   `<!-- pohunek-changelog:end -->` (ecosystem changelog contract, #1588), so
+   that block is a post written for people, with the folded changelog section
+   under it. Every release gets one, a patch release included.
+
+   - **Draft.** As soon as step 4 has made the `Release vX.Y.Z` commit (the
+     script then waits for CI evidence, which leaves time to write and review),
+     print the skeleton from the release tree; before that, write from the
+     section the step 3 dry run prints:
+
+     ```bash
+     POST=$(mktemp -t pohunek-vX.Y.Z-post.XXXXXX)   # outside the checkout; keep the path
+     scripts/changelog notes X.Y.Z --post > "$POST"
+     ```
+
+     The file stays outside the release checkout: an untracked file there makes
+     a rerun of `scripts/release` (step 4) refuse the dirty tree.
+
+     It holds the markers, the parts to write (each carries
+     `TODO(release-post)`) and `### Full changelog` with the folded section, its
+     kind headings moved one level down. Do not edit the full changelog; a wrong
+     entry is fixed in `CHANGELOG.md` of a later release.
+   - **Write** to this shape (the prose is an example of the tone, not text to
+     reuse):
+
+     ```markdown
+     <!-- pohunek-changelog:start -->
+     Two or three sentences: what this release is about and who notices it.
+
+     ### What's new
+
+     **Sessions keep their profile when you resume them.** You can stop a
+     session and pick it up later with the same agent and options, so long work
+     survives a reboot without setting it up again.
+
+     ### Upgrading
+
+     Restart the daemon after installing; existing sessions are kept. Nothing
+     else to do.
+
+     ### Full changelog
+
+     #### Added
+     ...
+     <!-- pohunek-changelog:end -->
+
+     ## Compatibility notes
+
+     One line per changed compatibility constant (the step 1 notes file);
+     no section when none changed.
+     ```
+
+     Style: each highlight says what a user can now do and why it matters, in
+     plain words, naming only the commands, flags and settings a user types.
+     No internal jargon: no crate, module, constant, job or test names, no
+     agent or CI process terms, no issue numbers in the prose (the full
+     changelog links them). Two to five highlights for a minor release, one or
+     two for a patch. Every breaking entry and every action an operator must
+     take (restart, re-pair, package upgrade, changed compatibility constant)
+     appears under `Upgrading`; write "Nothing to do" when that is true.
+   - **After the end marker** goes only what the website must not show: the
+     compatibility notes of step 1 (this body replaces the step 5 one, so keep
+     them here) and the assistant digest of step 9.
+   - **Review.** Send the full body to the release coordinator or the owner and
+     publish only after their explicit approval of that text. Before
+     publishing, each check prints the value after it:
+
+     ```bash
+     grep -c 'TODO(release-post)' "$POST"                      # 0
+     grep -cx '<!-- pohunek-changelog:start -->' "$POST"        # 1
+     grep -cx '<!-- pohunek-changelog:end -->' "$POST"          # 1
+     ```
+
+   - **Publish** right after step 7 shows the release published. The Release
+     workflow publishes the release without the markers, so the body has none
+     from publication until this edit, and a site run inside that window
+     records the release without the post (the website check below catches
+     it). This edit sets the whole body, compatibility notes included (step 5).
+     Confirm:
+
+     ```bash
+     gh release edit "vX.Y.Z" --notes-file "$POST"
+     gh release view "vX.Y.Z" --json body --jq .body | grep -c 'TODO(release-post)'   # 0
+     ```
+
+   - **Website.** pohunek.dev `follow-release` (every 3 hours, or a manual
+     dispatch; the core Release workflow does not notify it) records a
+     release's body the first time it sees the release and keeps that record
+     when the body changes later: the marked block as `source:
+     "release-notes"`, or, for a body without markers, a list of pull request
+     titles as `source: "generated"`. Check the recorded entry after the site
+     has followed the release:
+
+     ```bash
+     gh api -H 'Accept: application/vnd.github.raw' \
+       repos/pohunekd/pohunek.dev/contents/src/data/changelog/pohunek.json \
+       | jq -r '.releases[] | select(.tag == "vX.Y.Z") | .source, .markdown' | head -4
+     ```
+
+     It prints `release-notes` and the post's intro. When the site recorded an
+     earlier body, open a pohunek.dev pull request that sets that entry's
+     `source` to `"release-notes"` and its `markdown` to the text between the
+     markers of the published body, trimmed.
+
+9. **Release `pohunekd/plugin-assistant` from the new core tag.** The assistant
    knowledge bundle ships as the context package `pohunek.context.assistant`, and
    the plugin release workflow builds it with the `xtask` of a published core tag,
    so this step runs after the core release is verified. In a clone of
@@ -134,24 +240,47 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    pohunekd/plugin-assistant`), then append the archive's sha256 to the core release
    notes of `zajca/pohunek` (these commands run in the plugin clone, so each names
    the repository): fetch the body first (`gh release view "vX.Y.Z" --repo
-   zajca/pohunek --json body --jq .body > FILE`), add the digest line, and
+   zajca/pohunek --json body --jq .body > FILE`), add the digest line after the
+   end marker, and
    `gh release edit "vX.Y.Z" --repo zajca/pohunek --notes-file FILE`, so the
-   folded changelog stays. The notes are where
+   release post stays. The notes are where
    `docs/install.md` ("Install the assistant package") sends operators for the
    digest. Without this release, `pohunek assistant` answers
    `assistant_package_missing` on every host.
 
-9. **Report.** State the published version/tag, the workflow conclusion
+10. **Downstream updates (required).** Other repositories build on, pin or
+    show the core release. For each consumer the release coordinator tells its
+    owner (the repository's maintainer or agent session) the version, the
+    changed compatibility constants of step 1 and which waiting work this
+    release unblocks; each change goes through that repository's own pull
+    requests and release process, and the coordinator tracks it to the done
+    check.
+
+    | Consumer | After a core tag | Done when |
+    | --- | --- | --- |
+    | `pohunekd/pohunek-companion` | A pull request moving `tag = "vX.Y.Z"` of `pohunek-client` and `pohunek-assistant` in `Cargo.toml` (with `Cargo.lock`), then the feature pull requests that waited for this release, then a companion release. | The companion release names core vX.Y.Z. |
+    | `pohunekd/pohunek-companion-android` | The pin (`pohunek_protocol_tag` in `app/src/main/res/values/config.xml`, `POHUNEK_VERSION` and the sha256 args in `container/Containerfile`, the tag in `docs/architecture.md`) moves when the release changes `PROTOCOL_VERSION` or `MIN_PROTOCOL_VERSION`, or when the app needs a feature of it; then an app release. | The app release names core vX.Y.Z, or the coordinator records why the pin stays. |
+    | `pohunekd/omarchy` | No pin: `tools/verified-download.bash` installs the newest core release. Check that what the widget reads (`pohunek session list --json`) stays compatible; change and release only when it does not. | The check result is recorded; a needed change is released. |
+    | `pohunekd/plugin-assistant` | Step 9. | Its release vX.Y.Z is published and the digest is in the core notes. |
+    | Hosts that run pohunek for other services (the `pohunekd/autoreview` review hosts) | Their operator gets the version and whether the protocol window requires an upgrade; upgrade on their schedule. | The operator acknowledged. |
+    | pohunek.dev | `follow-release` moves the `pohunek` pin in `releases.config.json` and records the post (step 8); a manual run is `gh workflow run follow-release.yml --repo pohunekd/pohunek.dev -f product=pohunek`. | The site shows vX.Y.Z with the post, and each downstream release above once it is out. |
+
+11. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
    the workflow failed, report why with output — a failed gate means no binary
-   was published. Include the plugin-assistant release and its digest.
+   was published. Include the release post URL and who approved it, the
+   plugin-assistant release and its digest, and the state of each downstream
+   consumer of step 10.
 
 ## Constraints
 
 - Never publish from a red commit; the workflow will block it, so catch it
   locally.
 - Do not hand-edit versions or push a tag of this repository outside
-  `scripts/release`. Step 8 is the one exception: it edits and tags
-  `pohunekd/plugin-assistant`, a separate repository.
+  `scripts/release`. Step 9 edits and tags `pohunekd/plugin-assistant`, a
+  separate repository; step 10 changes other repositories only through their
+  own pull requests and releases.
+- Never publish a release post that still holds `TODO(release-post)` or that
+  the coordinator or owner has not approved.
 - Verify the release actually published; never report "released" from the tag
   push alone without checking the workflow and the GitHub Release.

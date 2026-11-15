@@ -11,7 +11,7 @@ and this tool never creates it.
 Usage:
   scripts/changelog check
   scripts/changelog fold VERSION [--surface SURFACE] [--date YYYY-MM-DD]
-  scripts/changelog notes VERSION [--surface SURFACE]
+  scripts/changelog notes VERSION [--surface SURFACE] [--post]
   scripts/changelog guard --base REV [--head REV] [--labels-json JSON]
 
 `--root` names another repository tree and defaults to the one holding this script.
@@ -45,6 +45,23 @@ SURFACE_SEPARATOR = ", "
 NO_CHANGES = "No user-facing changes."
 NOTES_START = "<!-- pohunek-changelog:start -->"
 NOTES_END = "<!-- pohunek-changelog:end -->"
+# Every part of the release-post skeleton a person still has to write carries this token;
+# the release skill's review gate checks that none is left before publishing.
+POST_PLACEHOLDER = "TODO(release-post)"
+POST_HEAD = (
+    f"{POST_PLACEHOLDER}: two or three sentences on what this release is about.",
+    "",
+    "### What's new",
+    "",
+    f"**{POST_PLACEHOLDER}: highlight.** What a user can now do and why it matters, in plain words.",
+    "",
+    "### Upgrading",
+    "",
+    f"{POST_PLACEHOLDER}: what an operator does when upgrading, or that nothing is needed.",
+    "",
+    "### Full changelog",
+    "",
+)
 
 
 class ChangelogError(Exception):
@@ -318,7 +335,12 @@ def rewrite_surfaces(raw: str, remaining: list[str]) -> str:
     return "\n".join(lines)
 
 
-def notes(root: Path, layout: Layout, version: str, surface: str | None) -> int:
+def post_changelog(content: list[str]) -> list[str]:
+    """Moves the kind headings one level down so they sit under `### Full changelog`."""
+    return ["#" + line if line.startswith("### ") else line for line in content]
+
+
+def notes(root: Path, layout: Layout, version: str, surface: str | None, post: bool) -> int:
     fragments, problems = scan_fragments(root, layout)
     if problems:
         return fail(problems)
@@ -339,6 +361,9 @@ def notes(root: Path, layout: Layout, version: str, surface: str | None) -> int:
     while content and not content[-1].strip():
         content.pop()
     print(NOTES_START)
+    if post:
+        print("\n".join(POST_HEAD))
+        content = post_changelog(content)
     if content:
         print("\n".join(content))
     print(NOTES_END)
@@ -450,6 +475,11 @@ def build_parser() -> argparse.ArgumentParser:
     notes_parser = commands.add_parser("notes", help="print the release notes block of a version")
     notes_parser.add_argument("version")
     notes_parser.add_argument("--surface")
+    notes_parser.add_argument(
+        "--post",
+        action="store_true",
+        help="print a release-post skeleton (intro, what's new, upgrading) above the section, for a person to write",
+    )
     guard_parser = commands.add_parser("guard", help="require a fragment or the exemption label for a documented behavior change")
     guard_parser.add_argument("--base", required=True, help="the pull request's base revision")
     guard_parser.add_argument("--head", default="HEAD", help="the pull request's head revision")
@@ -479,7 +509,7 @@ def main(argv: list[str]) -> int:
             except ValueError as error:
                 raise ChangelogError(f"not a calendar date: {date!r}") from error
             return fold(root, layout, version, surface, date)
-        return notes(root, layout, version, surface)
+        return notes(root, layout, version, surface, args.post)
     except ChangelogError as error:
         return fail([str(error)])
 

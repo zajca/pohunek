@@ -212,5 +212,58 @@ class ReleaseRules(ChangelogScenarios):
         self.assertEqual(run(root, "fold", "0.37.0", "--date", "2026-10-24T00:00").returncode, 1)
 
 
+class ReleasePost(ChangelogScenarios):
+    """`notes --post`: the skeleton a person turns into the release post.
+
+    The website keeps only what sits between the markers, so the skeleton must
+    hold exactly one marker pair around the whole post and the full section.
+    """
+
+    def folded(self, fixture: str, *fold_args: str) -> Path:
+        root = self.copy_input(fixture)
+        fold = run(root, "fold", *fold_args)
+        self.assertEqual(fold.returncode, 0, fold.stderr)
+        return root
+
+    def assert_one_marked_block(self, output: bytes) -> list[bytes]:
+        lines = output.split(b"\n")
+        self.assertEqual(lines.count(b"<!-- pohunek-changelog:start -->"), 1)
+        self.assertEqual(lines.count(b"<!-- pohunek-changelog:end -->"), 1)
+        self.assertEqual(lines[0], b"<!-- pohunek-changelog:start -->")
+        self.assertEqual(lines[-2:], [b"<!-- pohunek-changelog:end -->", b""])
+        return lines[1:-2]
+
+    def test_post_matches_the_contract_fixture(self):
+        root = self.folded("single", "0.37.0", "--date", "2026-10-24")
+        post = run(root, "notes", "0.37.0", "--post")
+        self.assertEqual(post.returncode, 0, post.stderr)
+        self.assertEqual(post.stdout, (FIXTURES / "single" / "expected-0.37.0" / "post.md").read_bytes())
+        self.assert_one_marked_block(post.stdout)
+
+    def test_post_of_a_release_without_user_facing_changes(self):
+        root = self.folded("single", "0.37.0", "--date", "2026-10-24")
+        fold = run(root, "fold", "0.37.1", "--date", "2026-10-25")
+        self.assertEqual(fold.returncode, 0, fold.stderr)
+        post = run(root, "notes", "0.37.1", "--post")
+        self.assertEqual(post.returncode, 0, post.stderr)
+        block = self.assert_one_marked_block(post.stdout)
+        self.assertEqual(block[-3:], [b"### Full changelog", b"", b"No user-facing changes."])
+
+    def test_post_follows_the_surface_of_a_multi_surface_repository(self):
+        root = self.folded("multi", "0.8.0", "--surface", "plugin", "--date", "2026-10-24")
+        post = run(root, "notes", "0.8.0", "--surface", "plugin", "--post")
+        self.assertEqual(post.returncode, 0, post.stderr)
+        block = b"\n".join(self.assert_one_marked_block(post.stdout))
+        self.assertIn(b"\n#### Changed\n\n- Both read the host list from `hosts.toml`.", block)
+        self.assertIn(b"\n#### Fixed\n\n- `pohunek-work setup` keeps", block)
+
+    def test_post_keeps_the_release_rules(self):
+        root = self.copy_input("single")
+        result = run(root, "notes", "0.36.0", "--post")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"unfolded fragments remain", result.stderr)
+        self.assertEqual(result.stdout, b"")
+
+
 if __name__ == "__main__":
     unittest.main()
