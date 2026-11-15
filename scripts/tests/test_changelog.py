@@ -219,8 +219,6 @@ class ReleasePost(ChangelogScenarios):
     hold exactly one marker pair around the whole post and the full section.
     """
 
-    PLACEHOLDER = b"TODO(release-post)"
-
     def folded(self, fixture: str, *fold_args: str) -> Path:
         root = self.copy_input(fixture)
         fold = run(root, "fold", *fold_args)
@@ -235,28 +233,12 @@ class ReleasePost(ChangelogScenarios):
         self.assertEqual(lines[-2:], [b"<!-- pohunek-changelog:end -->", b""])
         return lines[1:-2]
 
-    def test_post_puts_the_skeleton_above_the_full_changelog(self):
+    def test_post_matches_the_contract_fixture(self):
         root = self.folded("single", "0.37.0", "--date", "2026-10-24")
         post = run(root, "notes", "0.37.0", "--post")
         self.assertEqual(post.returncode, 0, post.stderr)
-
-        block = b"\n".join(self.assert_one_marked_block(post.stdout))
-        head, _, full = block.partition(b"\n### Full changelog\n\n")
-        self.assertTrue(full, block)
-        for heading in (b"### What's new", b"### Upgrading"):
-            self.assertIn(b"\n" + heading + b"\n", head)
-        self.assertEqual(head.count(self.PLACEHOLDER), 3)
-        self.assertTrue(head.startswith(self.PLACEHOLDER))
-        notes = run(root, "notes", "0.37.0")
-        section = b"\n".join(self.assert_one_marked_block(notes.stdout))
-        self.assertEqual(full, section.replace(b"### ", b"#### "))
-        self.assertNotIn(self.PLACEHOLDER, full)
-
-    def test_post_leaves_the_default_notes_untouched(self):
-        root = self.folded("single", "0.37.0", "--date", "2026-10-24")
-        notes = run(root, "notes", "0.37.0")
-        self.assertEqual(notes.stdout, (FIXTURES / "single" / "expected-0.37.0" / "notes.md").read_bytes())
-        self.assertNotIn(self.PLACEHOLDER, notes.stdout)
+        self.assertEqual(post.stdout, (FIXTURES / "single" / "expected-0.37.0" / "post.md").read_bytes())
+        self.assert_one_marked_block(post.stdout)
 
     def test_post_of_a_release_without_user_facing_changes(self):
         root = self.folded("single", "0.37.0", "--date", "2026-10-24")

@@ -83,9 +83,9 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    explicit `X.Y.Z`; the workspace is already bumped, so do not request another
    relative bump such as `patch`.
 
-5. **Publish the notes.** When a notes file was needed, attach it to the GitHub
-   Release once the workflow has created it (`gh release edit "vX.Y.Z"
-   --notes-file FILE`) and confirm with `gh release view "vX.Y.Z"`.
+5. **Publish the notes.** The compatibility notes of step 1 are published with
+   the release post: step 8 puts them after the end marker and sets the whole
+   body in one edit. Do not edit the body with the notes file alone.
 
 6. **Record the release.** Via the `github-workflow` skill, comment the
    version/tag and release URL on any issue whose delivery this release
@@ -125,8 +125,12 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
      section the step 3 dry run prints:
 
      ```bash
-     scripts/changelog notes X.Y.Z --post > POST
+     POST=$(mktemp -t pohunek-vX.Y.Z-post.XXXXXX)   # outside the checkout; keep the path
+     scripts/changelog notes X.Y.Z --post > "$POST"
      ```
+
+     The file stays outside the release checkout: an untracked file there makes
+     a rerun of `scripts/release` (step 4) refuse the dirty tree.
 
      It holds the markers, the parts to write (each carries
      `TODO(release-post)`) and `### Full changelog` with the folded section, its
@@ -178,18 +182,20 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
      publishing, each check prints the value after it:
 
      ```bash
-     grep -c 'TODO(release-post)' POST                        # 0
-     grep -cx '<!-- pohunek-changelog:start -->' POST          # 1
-     grep -cx '<!-- pohunek-changelog:end -->' POST            # 1
+     grep -c 'TODO(release-post)' "$POST"                      # 0
+     grep -cx '<!-- pohunek-changelog:start -->' "$POST"        # 1
+     grep -cx '<!-- pohunek-changelog:end -->' "$POST"          # 1
      ```
 
-   - **Publish** right after step 7 shows the release published. When the post
-     is ready by then, this one edit is also the step 5 edit (the post carries
-     the compatibility notes), so the body never sits without the markers.
+   - **Publish** right after step 7 shows the release published. The Release
+     workflow publishes the release without the markers, so the body has none
+     from publication until this edit, and a site run inside that window
+     records the release without the post (the website check below catches
+     it). This edit sets the whole body, compatibility notes included (step 5).
      Confirm:
 
      ```bash
-     gh release edit "vX.Y.Z" --notes-file POST
+     gh release edit "vX.Y.Z" --notes-file "$POST"
      gh release view "vX.Y.Z" --json body --jq .body | grep -c 'TODO(release-post)'   # 0
      ```
 

@@ -46,7 +46,7 @@ NO_CHANGES = "No user-facing changes."
 NOTES_START = "<!-- pohunek-changelog:start -->"
 NOTES_END = "<!-- pohunek-changelog:end -->"
 # Every part of the release-post skeleton a person still has to write carries this token;
-# the release skill refuses to publish a body that contains it.
+# the release skill's review gate checks that none is left before publishing.
 POST_PLACEHOLDER = "TODO(release-post)"
 POST_HEAD = (
     f"{POST_PLACEHOLDER}: two or three sentences on what this release is about.",
