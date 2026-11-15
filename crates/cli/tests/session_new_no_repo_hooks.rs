@@ -647,12 +647,23 @@ const GIT_HOOKS: [&str; 3] = [
     "reference-transaction",
 ];
 
-/// A profile `[env]` that sets one git setting of its own through a
-/// `GIT_CONFIG_COUNT` pair, which a switched launch keeps.
-const SEEDED_GIT_ENV: &str = r#"GIT_CONFIG_COUNT = "1"
+/// A profile `[env]` that sets git settings of its own through
+/// `GIT_CONFIG_COUNT` pairs, which a switched launch keeps: `user.name`, and
+/// the configured hook `agent-lint` (`tools/config-hook`, on
+/// `post-index-change`), which only the agent's git sees.
+const SEEDED_GIT_ENV: &str = r#"GIT_CONFIG_COUNT = "3"
 GIT_CONFIG_KEY_0 = "user.name"
 GIT_CONFIG_VALUE_0 = "Seeded"
+GIT_CONFIG_KEY_1 = "hook.agent-lint.command"
+GIT_CONFIG_VALUE_1 = "tools/config-hook agent-lint"
+GIT_CONFIG_KEY_2 = "hook.agent-lint.event"
+GIT_CONFIG_VALUE_2 = "post-index-change"
 "#;
+
+/// The `GIT_CONFIG_COUNT` the switched agent sees: the three pairs of
+/// [`SEEDED_GIT_ENV`], the hook path and fsmonitor pins, and two pins for
+/// each configured hook it sees (`review-lint`, `agent-lint`).
+const SWITCHED_AGENT_COUNT: &str = "9";
 
 /// The tracked file the git-hook scenarios move the mtime of, so that the
 /// next `git status` in the checkout rewrites the index and git runs
@@ -682,12 +693,14 @@ impl Scene {
     /// The configuration also names more programs by a path inside the
     /// checkout: `core.fsmonitor=tools/fsmonitor`, which `git status` and
     /// `git diff` run, the textconv driver `tools/textconv` that the committed
-    /// `.gitattributes` selects for `*.txt`, and the filter drivers `plain`
+    /// `.gitattributes` selects for `*.txt`, the filter drivers `plain`
     /// (`*.dat`, clean and smudge) and `a=b.c` (`*.eq`, clean) whose program is
-    /// `tools/filter`.
+    /// `tools/filter`, and the configured hook `review-lint`
+    /// (`tools/config-hook`, on `post-checkout` and `post-index-change`).
     ///
     /// Each program appends `<name>:<GIT_CONFIG_COUNT>` to `git.log` (a hook
-    /// `git:<hook>:...`, a filter `filter:<clean|smudge|clean-eq>:...`); the
+    /// `git:<hook>:...`, a filter `filter:<clean|smudge|clean-eq>:...`, a
+    /// configured hook `config-hook:<review-lint|agent-lint>:...`); the
     /// daemon's own git commands of a session without the switch carry no
     /// count and log `daemon`.
     fn init_git_hook_repo(&self) {
@@ -721,6 +734,10 @@ impl Scene {
             format!("{}cat\n", self.appending("git.log", &marker("filter:$1"))),
         ));
         files.push((
+            "tools/config-hook".to_owned(),
+            self.appending("git.log", &marker("config-hook:$1")),
+        ));
+        files.push((
             ".gitattributes".to_owned(),
             "*.txt diff=conv\n*.dat filter=plain\n*.eq filter=a=b.c\n".to_owned(),
         ));
@@ -736,6 +753,14 @@ impl Scene {
         self.git(&["config", "filter.plain.smudge", "tools/filter smudge"]);
         self.git(&["config", "filter.plain.required", "true"]);
         self.git(&["config", "filter.a=b.c.clean", "tools/filter clean-eq"]);
+        self.git(&[
+            "config",
+            "hook.review-lint.command",
+            "tools/config-hook review-lint",
+        ]);
+        for event in ["post-checkout", "post-index-change"] {
+            self.git(&["config", "--add", "hook.review-lint.event", event]);
+        }
     }
 
     /// Changes the converted file and the filtered files and adds an
@@ -760,12 +785,14 @@ impl Scene {
     }
 
     /// A host-global `session-start` script that records the
-    /// `core.hooksPath` git resolves in the session's directory.
+    /// `core.hooksPath` and the `hook.review-lint.enabled` git resolves in the
+    /// session's directory.
     fn host_git_probe(&self) {
         self.host_hook(
             "session-start",
             &format!(
-                "#!/bin/sh\nprintf 'host-git:%s\\n' \"$(git config --get core.hooksPath)\" >> '{}'\n",
+                "#!/bin/sh\nprintf 'host-git:%s:%s\\n' \"$(git config --get core.hooksPath)\" \
+                 \"$(git config --get hook.review-lint.enabled)\" >> '{}'\n",
                 self.logs.join("host.log").display()
             ),
         );
@@ -840,11 +867,13 @@ impl Scene {
 /// naming programs the checkout carries, a switched session runs no hook,
 /// fsmonitor or textconv program: not through the daemon's git commands
 /// (create, `session diff`, removal), not through the agent's git and not
-/// through a host-global script's git. The daemon's git runs no filter
-/// program either; the agent's own git applies the configured filters, so
-/// its filter runs (count 3) are the only entries the log may hold. The agent
-/// still sees its own `GIT_CONFIG_COUNT` setting: the pinned settings are
-/// appended behind it.
+/// through a host-global script's git. That includes the configured hooks
+/// (`hook.<name>.command`, run by git 2.54 or newer), among them one only the
+/// agent's own `GIT_CONFIG_COUNT` pairs define. The daemon's git runs no
+/// filter program either; the agent's own git applies the configured filters,
+/// so its filter runs (count [`SWITCHED_AGENT_COUNT`]) are the only entries
+/// the log may hold. The agent still sees its own settings: the pinned
+/// settings are appended behind them.
 #[tokio::test]
 async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     let scene = Scene::start(Vec::new(), &[]).await;
@@ -858,10 +887,12 @@ async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     scene.wait_for_entry("agent.log", "agent:done").await;
     assert_eq!(
         scene.entries("agent.log").first().map(String::as_str),
-        Some("agent:/dev/null:Seeded:3"),
+        Some(format!("agent:/dev/null:Seeded:{SWITCHED_AGENT_COUNT}").as_str()),
         "the agent's git sees no hook path and keeps its own setting"
     );
-    scene.wait_for_entry("host.log", "host-git:/dev/null").await;
+    scene
+        .wait_for_entry("host.log", "host-git:/dev/null:false")
+        .await;
 
     let inspected = scene.inspected(&id).await;
     let checkout = PathBuf::from(inspected["worktree_path"].as_str().expect("worktree path"));
@@ -869,7 +900,9 @@ async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     scene.diffed(&id).await;
     scene.stopped_and_removed(&id).await;
 
-    let agent_filter_run = |entry: &String| entry.starts_with("filter:") && entry.ends_with(":3");
+    let agent_filter_run = |entry: &String| {
+        entry.starts_with("filter:") && entry.ends_with(&format!(":{SWITCHED_AGENT_COUNT}"))
+    };
     assert_eq!(
         scene
             .entries("git.log")
@@ -877,17 +910,21 @@ async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
             .filter(|entry| !agent_filter_run(entry))
             .collect::<Vec<_>>(),
         Vec::<String>::new(),
-        "no git hook, fsmonitor, textconv or daemon-side filter program of the checkout ran"
+        "no git hook, configured hook, fsmonitor, textconv or daemon-side filter program of the \
+         checkout ran"
     );
     scene.harness.stop().await;
 }
 
-/// Control of rows 19 to 21, 23 and 24: the same fixture without the switch
+/// Control of rows 19 to 21 and 23 to 25: the same fixture without the switch
 /// runs the checkout's git hook and fsmonitor through the agent's
 /// `git status`, the smudge filter through the daemon's checkout, the hook,
 /// fsmonitor, textconv and both clean filters through the daemon's git of
 /// `session diff`, and a host-global script's git resolves the checkout's hook
-/// directory, so the log above is evidence.
+/// directory, so the log above is evidence. With git 2.54 or newer it also
+/// runs both configured hooks through the agent's git and `review-lint`
+/// through the daemon's checkout and diff; with older git, which ignores
+/// `hook.*` settings, those checks are skipped and say so.
 #[tokio::test]
 async fn without_the_switch_the_checkout_git_hooks_run() {
     let scene = Scene::start(Vec::new(), &[]).await;
@@ -901,11 +938,30 @@ async fn without_the_switch_the_checkout_git_hooks_run() {
     scene.wait_for_entry("agent.log", "agent:done").await;
     assert_eq!(
         scene.entries("agent.log").first().map(String::as_str),
-        Some("agent:.githooks:Seeded:1"),
+        Some("agent:.githooks:Seeded:3"),
     );
-    scene.wait_for_entry("host.log", "host-git:.githooks").await;
-    for entry in ["git:post-index-change:1", "fsmonitor:1"] {
+    scene
+        .wait_for_entry("host.log", "host-git:.githooks:")
+        .await;
+    for entry in ["git:post-index-change:3", "fsmonitor:3"] {
         scene.wait_for_entry("git.log", entry).await;
+    }
+    let config_hooks = pohunek_test_support::git::runs_config_hooks();
+    if config_hooks {
+        for entry in [
+            "config-hook:review-lint:3",
+            "config-hook:agent-lint:3",
+            "config-hook:review-lint:daemon",
+        ] {
+            scene.wait_for_entry("git.log", entry).await;
+        }
+    } else {
+        eprintln!(
+            "skipping the configured-hook checks: the host git predates {}.{}, which ignores \
+             hook.<name>.command",
+            pohunek_test_support::git::CONFIG_HOOKS_SINCE.0,
+            pohunek_test_support::git::CONFIG_HOOKS_SINCE.1
+        );
     }
 
     assert!(
@@ -926,15 +982,20 @@ async fn without_the_switch_the_checkout_git_hooks_run() {
             .filter(|seen| seen.as_str() == entry)
             .count()
     };
-    let before: Vec<_> = [
+    let mut ran_by_diff = vec![
         "git:post-index-change:daemon",
         "fsmonitor:daemon",
         "textconv:daemon",
         "filter:clean:daemon",
         "filter:clean-eq:daemon",
-    ]
-    .map(|entry| (entry, count(entry)))
-    .into();
+    ];
+    if config_hooks {
+        ran_by_diff.push("config-hook:review-lint:daemon");
+    }
+    let before: Vec<_> = ran_by_diff
+        .into_iter()
+        .map(|entry| (entry, count(entry)))
+        .collect();
     Scene::edit_checkout(&checkout, 2);
     scene.diffed(&id).await;
     for (entry, earlier) in before {
@@ -949,7 +1010,8 @@ async fn without_the_switch_the_checkout_git_hooks_run() {
 }
 
 /// Row 22: an agent environment that could set `core.hooksPath` back
-/// (`GIT_CONFIG_PARAMETERS`) or whose `GIT_CONFIG_COUNT` cannot be extended
+/// (`GIT_CONFIG_PARAMETERS`), whose `GIT_CONFIG_COUNT` cannot be extended,
+/// or in which git cannot list the configured hooks (a pair without its key)
 /// refuses the switched create with `git_hooks_env_conflict`, naming no
 /// value, and leaves no session or checkout; without the switch the same
 /// profiles start.
@@ -964,6 +1026,11 @@ async fn an_agent_environment_that_could_turn_git_hooks_back_on_refuses_the_swit
             ".githooks",
         ),
         ("git-count", "GIT_CONFIG_COUNT = \"two\"\n", "two"),
+        (
+            "git-unlisted",
+            "GIT_CONFIG_COUNT = \"1\"\nGIT_CONFIG_VALUE_0 = \"keyless-value\"\n",
+            "keyless-value",
+        ),
     ] {
         scene
             .harness

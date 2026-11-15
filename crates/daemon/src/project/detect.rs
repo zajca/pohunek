@@ -320,8 +320,10 @@ fn warn_git_too_old() {
 /// by the same hot-path discipline as detection.
 ///
 /// Detection reads any directory a caller names, including a checkout whose
-/// content the session distrusts, so it runs with git's own hooks off
-/// ([`RepoHookLayer::Skip`]). Its read-only queries run none anyway.
+/// content the session distrusts, so it runs with the hook directory and the
+/// fsmonitor hook off ([`RepoHookLayer::Skip`]). Its read-only queries fire no
+/// hook event and apply no filter, so a configured hook or filter driver
+/// cannot run either.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let mut command = crate::git::command().ok()?;
     command

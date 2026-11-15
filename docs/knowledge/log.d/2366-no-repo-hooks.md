@@ -17,23 +17,28 @@
 - With the switch, a `hooks.required` event the host has no script for fails
   the create with `hook_required_skipped` before anything runs.
 - With the switch, the session runs none of git's own hooks and no fsmonitor
-  hook: a relative `core.hooksPath` or `core.fsmonitor` would otherwise
-  resolve to a program the checkout carries for a git command run inside it
-  (the daemon's `git status` of `session diff` and of the retention
+  hook: a relative `core.hooksPath`, a configured hook
+  (`hook.<name>.command`, git 2.54 or newer, which runs whatever
+  `core.hooksPath` says) or `core.fsmonitor` would otherwise resolve to a
+  program the checkout carries for a git command run inside it (the daemon's
+  `worktree add`, and `git status` of `session diff` and of the retention
   pre-removal check ran them, and so did the agent's git), and `session diff`
   ran the textconv driver the checkout's `.gitattributes` selected, and the
   daemon's checkout, `git status` and `git diff` ran the filter drivers it
   selected. Every daemon git command of the session takes `-c
   core.hooksPath=/dev/null -c core.fsmonitor=false` (the hook layer is a
   required argument of the daemon's git command constructor) and turns off
-  every filter driver its configuration defines, listed just before it runs
-  and passed as `GIT_CONFIG_COUNT` pairs (a driver name may hold the `=` that
-  `git -c` splits at); its `session diff` adds `--no-textconv`. The agent, on
-  create and on every relaunch, and the host hook scripts get the hook and
-  fsmonitor settings as two more `GIT_CONFIG_COUNT` pairs behind the existing
-  ones; their own git still applies filter drivers. `GIT_CONFIG_PARAMETERS`
-  or a non-numeric `GIT_CONFIG_COUNT` in the agent environment fails the
-  start with `git_hooks_env_conflict`.
+  every configured hook (`event` empty, `enabled=false`) and filter driver its
+  configuration defines, listed just before it runs and passed as
+  `GIT_CONFIG_COUNT` pairs (a name may hold the `=` that `git -c` splits at);
+  its `session diff` adds `--no-textconv`. The agent, on create and on every
+  relaunch, and the host hook scripts get the hook path and fsmonitor
+  settings and the off settings of the configured hooks their own git sees,
+  listed with their own environment when they start, as more
+  `GIT_CONFIG_COUNT` pairs behind the existing ones; their own git still
+  applies filter drivers. `GIT_CONFIG_PARAMETERS` or a non-numeric
+  `GIT_CONFIG_COUNT` in the agent environment, or a listing that fails, fails
+  the start with `git_hooks_env_conflict`.
 - The switch is per session; a child or a later in-place session in the same
   checkout does not inherit it.
 - `host.inspect` reports `host_hooks`, one boolean per event for the presence of

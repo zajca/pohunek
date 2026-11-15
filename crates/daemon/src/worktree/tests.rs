@@ -2729,15 +2729,18 @@ struct GitProgramMarkers {
     hook: PathBuf,
     fsmonitor: PathBuf,
     filter: PathBuf,
+    config_hook: PathBuf,
 }
 
 /// Commits to `repo` a git hook (`.githooks/post-index-change`), an
 /// fsmonitor hook and a filter program (`tools/`), and names each in the
 /// repository configuration by a path relative to the checkout: a relative
 /// `core.hooksPath` and `core.fsmonitor`, and the filter drivers `plain`
-/// (clean, smudge, `required`, for `zz.dat`) and `a=b.c` (clean, for `zz.eq`).
-/// Each program appends to its marker below `markers`; the filter program
-/// appends its first argument (`clean`, `smudge` or `clean-eq`).
+/// (clean, smudge, `required`, for `zz.dat`) and `a=b.c` (clean, for `zz.eq`),
+/// and the configured hook `review-lint` (`tools/config-hook`, on
+/// `post-checkout` and `post-index-change`, run by git 2.54 or newer). Each
+/// program appends to its marker below `markers`; the filter program appends
+/// its first argument (`clean`, `smudge` or `clean-eq`).
 #[cfg(unix)]
 fn checkout_with_git_programs(repo: &Path, markers: &Path) -> GitProgramMarkers {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2746,6 +2749,7 @@ fn checkout_with_git_programs(repo: &Path, markers: &Path) -> GitProgramMarkers 
         hook: markers.join("ran"),
         fsmonitor: markers.join("fsmonitor"),
         filter: markers.join("filter"),
+        config_hook: markers.join("config-hook"),
     };
     // A failing fsmonitor hook makes git fall back to a full scan.
     let programs = [
@@ -2757,6 +2761,7 @@ fn checkout_with_git_programs(repo: &Path, markers: &Path) -> GitProgramMarkers 
             "exit 1\n",
         ),
         ("tools/filter", "\"$1\"", &marked.filter, "cat\n"),
+        ("tools/config-hook", "\"$1\"", &marked.config_hook, ""),
     ];
     for (relative, logged, marker, tail) in programs {
         let program = repo.join(relative);
@@ -2793,18 +2798,25 @@ fn checkout_with_git_programs(repo: &Path, markers: &Path) -> GitProgramMarkers 
         ("filter.plain.smudge", "tools/filter smudge"),
         ("filter.plain.required", "true"),
         ("filter.a=b.c.clean", "tools/filter clean-eq"),
+        ("hook.review-lint.command", "tools/config-hook review-lint"),
     ] {
         git_in(repo, &["config", key, value]);
+    }
+    for event in ["post-checkout", "post-index-change"] {
+        git_in(repo, &["config", "--add", "hook.review-lint.event", event]);
     }
     marked
 }
 
-/// Rows 20, 23 and 24: the pre-removal check of a binding started with the
-/// switch (`git status` inside its checkout) runs no git hook, no fsmonitor
-/// hook and no filter driver program the checkout carries, although a relative
-/// `core.hooksPath`, `core.fsmonitor` and filter command resolve to them there,
-/// and its checkout (`git worktree add`) runs no smudge filter either; the same
-/// binding and check without the switch run them. One filter driver's name
+/// Rows 20 and 23 to 25: the pre-removal check of a binding started with the
+/// switch (`git status` inside its checkout) runs no git hook, no configured
+/// hook, no fsmonitor hook and no filter driver program the checkout carries,
+/// although a relative `core.hooksPath`, `hook.<name>.command`,
+/// `core.fsmonitor` and filter command resolve to them there, and its checkout
+/// (`git worktree add`) runs no smudge filter and no `post-checkout` either;
+/// the same binding and check without the switch run them (the configured
+/// hook with git 2.54 or newer only; older git ignores it, and the check says
+/// it skips that part). One filter driver's name
 /// holds a `=`, which `git -c` cannot express; the other is `required`, so
 /// emptying its commands without turning that off fails the check.
 #[cfg(unix)]
@@ -2816,8 +2828,14 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         hook: marker,
         fsmonitor: fsmonitor_marker,
         filter: filter_marker,
+        config_hook: config_hook_marker,
     } = checkout_with_git_programs(&repo, &unique_dir("unsaved-git-hooks-marker"));
     let filter_runs = || fs::read_to_string(&filter_marker).unwrap_or_default();
+    let config_hook_runs = || fs::read_to_string(&config_hook_marker).unwrap_or_default();
+    let config_hooks = pohunek_test_support::git::runs_config_hooks();
+    if !config_hooks {
+        eprintln!("skipping the configured-hook controls: the test git predates 2.54");
+    }
     let mut switched = request("s-skip", &repo, "review/skip");
     switched.skip_repo_hooks = true;
     let skipped = mgr.bind(&switched).expect("bind the switched session");
@@ -2826,6 +2844,7 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         "",
         "the switched checkout ran no smudge filter"
     );
+    assert_eq!(config_hook_runs(), "", "the switched checkout ran no hook");
     let running = mgr
         .bind(&request("s-run", &repo, "review/run"))
         .expect("bind the control session");
@@ -2834,6 +2853,11 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         "without the switch the checkout runs the smudge filter: {:?}",
         filter_runs()
     );
+    assert!(
+        !config_hooks || !config_hook_runs().is_empty(),
+        "without the switch the checkout runs the configured hook"
+    );
+    let _ = fs::remove_file(&config_hook_marker);
     let _ = fs::remove_file(&marker);
     let _ = fs::remove_file(&fsmonitor_marker);
     let _ = fs::remove_file(&filter_marker);
@@ -2856,6 +2880,7 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         "the switched check ran no fsmonitor hook"
     );
     assert_eq!(filter_runs(), "", "the switched check ran no filter");
+    assert_eq!(config_hook_runs(), "", "the switched check ran no hook");
 
     stale_index(&running.path);
     assert_eq!(mgr.unsaved_work("s-run"), WorktreeWork::Saved);
@@ -2874,6 +2899,10 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
             filter_runs()
         );
     }
+    assert!(
+        !config_hooks || !config_hook_runs().is_empty(),
+        "without the switch the check runs the configured hook"
+    );
 }
 
 #[test]

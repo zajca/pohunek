@@ -4189,6 +4189,7 @@ impl SessionRegistry {
                         create_request,
                         &trusted_args,
                     )
+                    .await
                 }
             }
             Err(error) => Err(error),
@@ -4608,7 +4609,7 @@ impl SessionRegistry {
         clippy::too_many_arguments,
         reason = "the registration takes the resolved agent, its frozen revision, the validated program and the launch-only secrets as separate values"
     )]
-    fn create_spec(
+    async fn create_spec(
         &self,
         id: &SessionId,
         params: &SessionNewParams,
@@ -4706,7 +4707,7 @@ impl SessionRegistry {
         env_extra.append(secret_env);
         if params.skip_repo_hooks {
             let base = self.launch_base_environment()?;
-            launch_input::pin_agent_git_hooks_off(&base, &mut env_extra)?;
+            launch_input::pin_git_hooks_off(&base, &mut env_extra, &launch_cwd).await?;
         }
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),

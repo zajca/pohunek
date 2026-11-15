@@ -65,8 +65,10 @@ pub(crate) use fetch_ref::check_session_fetch_request;
 use fetch_ref::delete_session_fetched_ref;
 pub(crate) use remote::note_backup;
 use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
-use repo_hooks::{check_required_layer, git_hooks_off_pairs, host_hook_script};
-pub(crate) use repo_hooks::{git_hooks_off_env, host_hook_scripts, RepoHookLayer};
+use repo_hooks::{check_required_layer, host_hook_script};
+pub(crate) use repo_hooks::{
+    git_config_count, git_hooks_env_conflict, git_hooks_off_pairs, host_hook_scripts, RepoHookLayer,
+};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
 /// Relative path of the optional per-repository setup script, run inside a
@@ -2092,12 +2094,28 @@ fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
     if let Some(activity) = ctx.activity {
         env.push(("POHUNEK_ACTIVITY".to_owned(), activity.to_owned()));
     }
-    // A host-global script of a session that skips its checkout's hooks runs
-    // git in that checkout too; the cleared environment holds no other pair.
-    if ctx.repo_layer == RepoHookLayer::Skip {
-        env.extend(git_hooks_off_pairs(0));
-    }
     env
+}
+
+/// The environment entries that turn git's own hooks off for a host-global
+/// script of a session that skips its checkout's hooks: the script runs git in
+/// that checkout too. Its cleared environment `env` holds no other pair, so
+/// the pairs start at 0, and the configured hooks are those git sees in `cwd`
+/// with `env`. A session that runs its checkout's hooks gets none.
+///
+/// # Errors
+///
+/// The listing's message: the script does not run with a hook left on.
+fn host_git_hooks_off(
+    layer: RepoHookLayer,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    if layer == RepoHookLayer::Run {
+        return Ok(Vec::new());
+    }
+    let hooks = list_config_hooks(cwd, env)?;
+    git_hooks_off_pairs(0, &hooks).map_err(|error| error.msg)
 }
 
 /// Resolve a hook's in-repo script path: `<in_repo_dir>/.pohunek/hooks/<event>`,
@@ -2190,19 +2208,25 @@ fn run_hook_layers(
     let cwd = &ctx.cwd_or(in_repo_dir);
     // Host-global layer first (composed, not overridden).
     if let Some(host_script) = host_hook_script(config_dir, event) {
-        let outcome = run_timed_hook(
-            &HookRun {
-                event,
-                layer: HookLayer::Host,
-                session_id: &ctx.session_id,
-                script: &host_script,
-                cwd,
-                env: &env,
-                timeout,
-            },
-            warnings,
-            stderr_tails.as_mut(),
-        );
+        let outcome = match host_git_hooks_off(ctx.repo_layer, cwd, &env) {
+            Ok(pairs) => {
+                let host_env: Vec<_> = env.iter().cloned().chain(pairs).collect();
+                run_timed_hook(
+                    &HookRun {
+                        event,
+                        layer: HookLayer::Host,
+                        session_id: &ctx.session_id,
+                        script: &host_script,
+                        cwd,
+                        env: &host_env,
+                        timeout,
+                    },
+                    warnings,
+                    stderr_tails.as_mut(),
+                )
+            }
+            Err(err) => hook_not_spawned(event, &host_script, &err, warnings),
+        };
         if required && outcome != HookRunOutcome::Succeeded {
             return Some(RequiredHookFailure {
                 layer: HookLayer::Host,
@@ -2658,9 +2682,9 @@ fn terminate_process_group(child: &mut Child) {
 /// A `git` command scoped to `repo` via `-C` (passed as an `OsStr` so non-UTF-8
 /// repo paths survive), with the options of the session's hook `layer`
 /// ([`RepoHookLayer::git_options`]). A skipped layer also turns off every
-/// filter driver the configuration seen from `repo` defines
-/// ([`repo_hooks::filter_drivers_off_env`]); the listing runs once per command,
-/// so a driver configured since the last command is off too.
+/// filter driver and every configured hook the configuration seen from `repo`
+/// defines ([`repo_hooks::git_programs_off_env`]); the listing runs once per
+/// command, so one configured since the last command is off too.
 ///
 /// The program is the trusted absolute path
 /// [`trusted_program`](crate::agent::trusted_program) resolves once, so no
@@ -2669,9 +2693,9 @@ fn terminate_process_group(child: &mut Child) {
 /// # Errors
 ///
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
-/// like a failed spawn. Under a skipped layer, a filter driver listing that
-/// fails, times out or overflows returns its message: the command does not
-/// run with drivers left on.
+/// like a failed spawn. Under a skipped layer, a listing that fails, times out
+/// or overflows returns its message: the command does not run with a driver
+/// or hook left on.
 pub(crate) fn git_command(repo: &Path, layer: RepoHookLayer) -> Result<Command, String> {
     let scoped = || -> Result<Command, String> {
         let mut cmd = crate::git::command()?;
@@ -2682,21 +2706,52 @@ pub(crate) fn git_command(repo: &Path, layer: RepoHookLayer) -> Result<Command, 
     let mut cmd = scoped()?;
     if layer == RepoHookLayer::Skip {
         let mut listing = scoped()?;
-        listing.args(repo_hooks::FILTER_DRIVER_LISTING);
+        listing.args(repo_hooks::GIT_PROGRAM_LISTING);
         let output = run_output_bounded(listing, GIT_COMMAND_TIMEOUT)?;
-        let listed = match output.status.code() {
-            Some(0) => output.stdout.as_slice(),
-            Some(1) if output.stdout.is_empty() => &[],
-            _ => {
-                return Err(format!(
-                    "listing the configured filter drivers failed: {}",
-                    output_failure_message(&output)
-                ))
-            }
-        };
-        cmd.envs(repo_hooks::filter_drivers_off_env(listed));
+        let listed = listed_keys(&output, "filter drivers and hooks")?;
+        cmd.envs(repo_hooks::git_programs_off_env(listed));
     }
     Ok(cmd)
+}
+
+/// The keys a `git config --get-regexp` listing printed: exit 0 with keys, or
+/// exit 1 with none.
+///
+/// # Errors
+///
+/// Any other exit, naming `what` was listed.
+fn listed_keys<'a>(output: &'a Output, what: &str) -> Result<&'a [u8], String> {
+    match output.status.code() {
+        Some(0) => Ok(output.stdout.as_slice()),
+        Some(1) if output.stdout.is_empty() => Ok(&[]),
+        _ => Err(format!(
+            "listing the configured {what} failed: {}",
+            output_failure_message(output)
+        )),
+    }
+}
+
+/// The configured hooks (`hook.<name>.*`) git sees in `dir` when it runs with
+/// exactly the environment `env` (later entries win), for a process the
+/// daemon starts in a session's checkout without wrapping its git: the agent
+/// and the host hook scripts.
+///
+/// # Errors
+///
+/// A listing that cannot run, fails, times out or overflows, or a hook name
+/// that is not UTF-8.
+pub(crate) fn list_config_hooks(
+    dir: &Path,
+    env: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let mut cmd = Command::new(crate::git::executable()?);
+    cmd.env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .arg("-C")
+        .arg(dir)
+        .args(repo_hooks::CONFIG_HOOK_LISTING);
+    let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
+    repo_hooks::config_hook_names(listed_keys(&output, "hooks")?)
 }
 
 /// Run a `git` invocation built with [`git_command`], discarding stdout but

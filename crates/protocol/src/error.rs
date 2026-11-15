@@ -43,7 +43,9 @@ pub const SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE: &str =
 pub const HOOK_REQUIRED_SKIPPED_CODE: &str = "hook_required_skipped";
 /// Error code of a launch with `skip_repo_hooks` whose agent environment
 /// carries `GIT_CONFIG_PARAMETERS` or a `GIT_CONFIG_COUNT` that is not a
-/// number, so the daemon cannot turn git's own hooks off for the agent.
+/// number, or in which git cannot list the configured hooks (or names one
+/// that is not UTF-8), so the daemon cannot turn git's own hooks off for the
+/// agent.
 pub const GIT_HOOKS_ENV_CONFLICT_CODE: &str = "git_hooks_env_conflict";
 /// Error code a client raises when the daemon cannot isolate the attention of
 /// descendants of a session flagged with the reserved attention metadata key.

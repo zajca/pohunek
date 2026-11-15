@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
-use super::launch_input::{pin_agent_git_hooks_off, LaunchSubject};
+use super::launch_input::{pin_git_hooks_off, LaunchSubject};
 use crate::agent::host::{
     CheckoutTrust, LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost,
 };
@@ -1132,7 +1132,7 @@ impl SessionRegistry {
         )?;
         let mut env_extra = inputs.env;
         if binding.skip_repo_hooks {
-            pin_agent_git_hooks_off(&relaunch.base_environment, &mut env_extra)?;
+            pin_git_hooks_off(&relaunch.base_environment, &mut env_extra, &binding.cwd).await?;
         }
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),

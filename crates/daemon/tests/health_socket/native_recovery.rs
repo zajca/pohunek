@@ -38,7 +38,7 @@ struct ClaudeRig {
     session: SessionInfo,
     argv_log: PathBuf,
     /// One line per agent launch: the session id and the agent's
-    /// `GIT_CONFIG_COUNT` and its pairs 0 and 1.
+    /// `GIT_CONFIG_COUNT` and its pairs 0 to 3.
     git_env_log: PathBuf,
     ack_log: PathBuf,
     config_home: PathBuf,
@@ -116,7 +116,7 @@ impl ClaudeRig {
             &format!(
                 "#!/bin/bash\n\
                  printf '%s\\n' \"$*\" >> {argv:?}\n\
-                 printf '%s %s %s %s %s %s\\n' \"$POHUNEK_SESSION_ID\" \"${{GIT_CONFIG_COUNT:-}}\" \"${{GIT_CONFIG_KEY_0:-}}\" \"${{GIT_CONFIG_VALUE_0:-}}\" \"${{GIT_CONFIG_KEY_1:-}}\" \"${{GIT_CONFIG_VALUE_1:-}}\" >> {git_env:?}\n\
+                 printf '%s %s %s %s %s %s %s %s %s %s\\n' \"$POHUNEK_SESSION_ID\" \"${{GIT_CONFIG_COUNT:-}}\" \"${{GIT_CONFIG_KEY_0:-}}\" \"${{GIT_CONFIG_VALUE_0:-}}\" \"${{GIT_CONFIG_KEY_1:-}}\" \"${{GIT_CONFIG_VALUE_1:-}}\" \"${{GIT_CONFIG_KEY_2:-}}\" \"${{GIT_CONFIG_VALUE_2:-}}\" \"${{GIT_CONFIG_KEY_3:-}}\" \"${{GIT_CONFIG_VALUE_3:-}}\" >> {git_env:?}\n\
                  printf '\\033[?2004h'\n\
                  while read -r action source reference; do\n\
                    case \"$action\" in\n\
@@ -505,10 +505,24 @@ async fn a_recovered_session_keeps_the_key_of_its_creating_request() {
 
 /// A session started with `skip_repo_hooks` keeps the switch through a resume,
 /// which rebuilds the session from its resume binding, and through a daemon
-/// restart after it (#2366).
+/// restart after it (#2366). Its directory is a repository that configures a
+/// hook (`hook.resume-lint.command`); both launches turn it off by name.
 #[tokio::test]
 async fn a_resumed_session_keeps_skipping_the_repository_hooks() {
     let mut rig = ClaudeRig::new("claude-skip-resume").await;
+    for args in [
+        &["init", "-q"][..],
+        &["config", "hook.resume-lint.command", "true"],
+        &["config", "hook.resume-lint.event", "post-index-change"],
+    ] {
+        let status = pohunek_test_support::git::command()
+            .arg("-C")
+            .arg(rig.cwd.to_path_buf())
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
     let mut params =
         serde_json::to_value(session_params_in(rig.cwd.to_path_buf())).expect("serialize params");
     params["agent"] = serde_json::json!("claude-fixture");
@@ -539,10 +553,14 @@ async fn a_resumed_session_keeps_skipping_the_repository_hooks() {
     };
     assert_eq!(
         of(&id),
-        vec!["2 core.hooksPath /dev/null core.fsmonitor false"; 2],
+        vec![
+            "4 core.hooksPath /dev/null core.fsmonitor false hook.resume-lint.event  \
+             hook.resume-lint.enabled false";
+            2
+        ],
         "create and relaunch: {launches}"
     );
-    assert_eq!(of(&rig.session.id), vec!["    "], "{launches}");
+    assert_eq!(of(&rig.session.id), vec![" ".repeat(8)], "{launches}");
 
     rig.stop(&id).await;
     let mut rig = rig.restarted().await;

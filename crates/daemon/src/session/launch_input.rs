@@ -23,7 +23,9 @@ use crate::integration::launch_input::{
 use crate::project::ProjectManager;
 use crate::runtime::environment::effective_variable;
 use crate::store::ResumeBinding;
-use crate::worktree::git_hooks_off_env;
+use crate::worktree::{
+    git_config_count, git_hooks_env_conflict, git_hooks_off_pairs, list_config_hooks,
+};
 use pohunek_worker_protocol::BaseEnv;
 
 /// What a launch of one session runs: its kind, the arguments it would
@@ -555,27 +557,50 @@ impl EvaluationRun {
 
 /// Turns git's own hooks and the fsmonitor hook off for the agent of a
 /// session that skips its checkout's hooks: the agent runs git in that
-/// checkout as the daemon user, and a relative `core.hooksPath` or
-/// `core.fsmonitor` would resolve to a program the checkout carries.
+/// checkout as the daemon user, and a relative `core.hooksPath`,
+/// `core.fsmonitor` or configured hook command would resolve to a program the
+/// checkout carries.
 ///
 /// `env` is the launch environment the worker lays over `base`, so a name in
-/// `env` wins. The pinned `GIT_CONFIG_COUNT` pairs are appended behind the
-/// pairs the agent would otherwise get, keeping them.
+/// `env` wins. The configured hooks are those git sees in `cwd` with that
+/// layered environment, listed once here: a hook configured after the launch
+/// is not covered. The listing runs on the blocking pool, like the daemon's
+/// other git subprocesses. The pinned `GIT_CONFIG_COUNT` pairs are appended
+/// behind the pairs the agent would otherwise get, keeping them.
 ///
 /// # Errors
 ///
-/// The `configuration/git_hooks_env_conflict` of [`git_hooks_off_env`].
-pub(super) fn pin_agent_git_hooks_off(
+/// `configuration/git_hooks_env_conflict` when the environment sets
+/// `GIT_CONFIG_PARAMETERS` or a non-numeric `GIT_CONFIG_COUNT`
+/// ([`git_config_count`]), or when the hooks cannot be listed or one has a
+/// name that is not UTF-8.
+pub(super) async fn pin_git_hooks_off(
     base: &BaseEnv,
     env: &mut LaunchEnv,
+    cwd: &Path,
 ) -> Result<(), ProtocolError> {
-    let pairs = git_hooks_off_env(|name| {
+    let first = git_config_count(|name| {
         env.iter()
             .rev()
             .find(|(set, _)| set == name)
             .map(|(_, value)| value.as_str())
             .or_else(|| base.get(name))
     })?;
-    env.append(LaunchEnv::new(pairs));
+    let layered: Vec<(String, String)> = base
+        .iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .chain(env.iter().cloned())
+        .collect();
+    let dir = cwd.to_path_buf();
+    let hooks = tokio::task::spawn_blocking(move || list_config_hooks(&dir, &layered))
+        .await
+        .map_err(|join| join.to_string())
+        .and_then(|listed| listed)
+        .map_err(|detail| {
+            git_hooks_env_conflict(&format!(
+                "the configured git hooks of the agent could not be listed: {detail}"
+            ))
+        })?;
+    env.append(LaunchEnv::new(git_hooks_off_pairs(first, &hooks)?));
     Ok(())
 }

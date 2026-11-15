@@ -318,8 +318,9 @@ export type SessionNewResult = {
   /**
    * Whether the session runs none of the in-repo hook layer
    * (`.pohunek/hooks/<event>`, `.pohunek/setup`) for any of its lifecycle
-   * hooks and none of git's own hooks or fsmonitor hook, and whose daemon
-   * git applies no filter driver, as
+   * hooks and none of git's own hooks (hooks directory and configured
+   * hooks) or fsmonitor hook, and whose daemon git applies no filter
+   * driver, as
    * [`SessionNewParams::skip_repo_hooks`] requested. Set at
    * creation and never changed; persisted, so a resume and a daemon
    * restart keep it. Omitted from the wire form when false.

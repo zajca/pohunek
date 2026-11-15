@@ -202,41 +202,56 @@ anywhere passes.
 
 The switch also turns off the programs git itself runs that a repository
 configuration can name by a path relative to the checkout a git command runs
-in: its hooks (`core.hooksPath`, husky style), its fsmonitor hook
-(`core.fsmonitor`) and, for the daemon's git, filter drivers and textconv
-drivers (which the checkout's `.gitattributes` selects). Without the switch a
-git command there runs the copies the checkout carries. With it:
+in: its hooks, both those of the hooks directory (`core.hooksPath`, husky
+style) and those the configuration names (`hook.<name>.command` with
+`hook.<name>.event`, git 2.54 or newer, which run from the checkout's top and
+do not depend on `core.hooksPath`), its fsmonitor hook (`core.fsmonitor`) and,
+for the daemon's git, filter drivers and textconv drivers (which the
+checkout's `.gitattributes` selects). Without the switch a git command there
+runs the copies the checkout carries. With it:
 
 - Every git command the daemon runs for the session (create, fetch, `git
   worktree add` and `remove`, `session diff`, the pre-removal check of a
   retention sweep, the rollback) runs with `-c core.hooksPath=/dev/null -c
   core.fsmonitor=false`, and `session diff` also passes `--no-textconv`
   (external diff drivers are off for every session diff). Each of those
-  commands also turns off every filter driver the configuration it sees
-  defines (`filter.<driver>.clean`, `smudge` and `process` empty, `required`
-  false), listed with `git config` just before the command runs. They go in
-  as `GIT_CONFIG_COUNT` pairs, because `git -c` splits at the first `=` and a
-  driver name may hold one; a listing that fails fails the command. So the
-  checkout is written without smudge filters (a Git LFS file stays a pointer
-  file) and `session diff` and the pre-removal check compare the files as
-  they are on disk. Project detection runs its read-only git queries, which
-  apply no filter, with the hook and fsmonitor settings for every session.
-- The agent's environment gets `core.hooksPath=/dev/null` and
-  `core.fsmonitor=false` as two more `GIT_CONFIG_COUNT` pairs
-  (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`), on the first launch and on
-  every relaunch, so the agent's own git in the checkout runs no hook and no
-  fsmonitor hook either, including the repository's own `.git/hooks`, as long
-  as the process keeps its environment. The pairs the agent environment
-  already sets (from the profile `[env]` or the environment allowlist) keep
-  their values: the new pairs are appended behind them. An agent environment
-  that sets `GIT_CONFIG_PARAMETERS` (git reads it after the pairs, so it could
-  turn them back on) or a `GIT_CONFIG_COUNT` that is not a decimal number
-  fails the start with `git_hooks_env_conflict` (the create is rolled back)
-  and fails a relaunch with the same code; the error names the variable, not
-  its value. `GIT_CONFIG_COUNT` needs git 2.31 or newer, which project
-  detection already requires.
-- Each host-global hook script of the session gets the same pairs, so its git
-  in the checkout runs no hook and no fsmonitor hook of it.
+  commands also turns off every configured hook (`hook.<name>.event` empty,
+  `hook.<name>.enabled` false) and every filter driver
+  (`filter.<driver>.clean`, `smudge` and `process` empty, `required` false)
+  the configuration it sees defines, listed with `git config` just before the
+  command runs. They go in as `GIT_CONFIG_COUNT` pairs, because `git -c`
+  splits at the first `=` and a name may hold one; a listing that fails fails
+  the command. So the checkout is written without smudge filters (a Git LFS
+  file stays a pointer file) and `session diff` and the pre-removal check
+  compare the files as they are on disk. Git older than 2.54 reads no
+  `hook.*` setting, so the hook pairs change nothing there. Project detection
+  runs its read-only git queries, which fire no hook event and apply no
+  filter, with the hook path and fsmonitor settings for every session.
+- The agent's environment gets `core.hooksPath=/dev/null`,
+  `core.fsmonitor=false` and the off settings of every configured hook as
+  more `GIT_CONFIG_COUNT` pairs (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`),
+  on the first launch and on every relaunch, so the agent's own git in the
+  checkout runs no hook and no fsmonitor hook either, including the
+  repository's own `.git/hooks`, as long as the process keeps its
+  environment. The configured hooks are those git sees in the session's
+  directory with the agent's own environment (its `GIT_CONFIG_COUNT` pairs,
+  `HOME` and the like included), listed once at the launch: a hook configured
+  after it is not covered. The pairs the agent environment already sets (from
+  the profile `[env]` or the environment allowlist) keep their values: the new
+  pairs are appended behind them. An agent environment that sets
+  `GIT_CONFIG_PARAMETERS` (git reads it after the pairs, so it could turn them
+  back on) or a `GIT_CONFIG_COUNT` that is not a decimal number, in which git
+  cannot list the configured hooks, or that names a hook whose name is not
+  UTF-8 (no environment entry can carry it) fails the start with
+  `git_hooks_env_conflict` (the create is rolled back) and fails a relaunch
+  with the same code; the error names the variable or hook, not a value.
+  `GIT_CONFIG_COUNT` needs git 2.31 or newer, which project detection already
+  requires.
+- Each host-global hook script of the session gets the same settings, with
+  the configured hooks its git sees in its directory with its own environment,
+  listed before it starts, so its git in the checkout runs no hook and no
+  fsmonitor hook of it. A script whose configured hooks cannot be listed does
+  not run and is reported like a script that could not be spawned.
 
 Outside the switch: the git of the agent and of the host hook scripts still
 applies the filter, textconv and external diff drivers the configuration
