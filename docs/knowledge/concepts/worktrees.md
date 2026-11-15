@@ -199,7 +199,12 @@ before anything is created; a host script removed after that check fails the
 create at its `post-create` step with the same code, and the create is rolled
 back. Without the switch the rule is unchanged: a required event with no script
 anywhere passes. Git's own hooks are outside this switch: `git worktree add`
-runs the repository's `post-checkout` hook.
+runs the repository's `post-checkout` hook, and a git command run inside the
+checkout (the daemon's `git status` for `session diff` and before a removal, or
+the agent's own git) runs that repository's hooks. A relative `core.hooksPath`
+(husky style) resolves inside the checkout for such a command, so a host that
+reviews untrusted trees keeps `core.hooksPath` unset or absolute for that
+repository.
 
 A host or repository `pre-remove` hook runs inside the worktree before
 `pohunek session rm` deletes it, and `post-remove` runs in the repository
