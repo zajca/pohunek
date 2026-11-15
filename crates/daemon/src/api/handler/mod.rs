@@ -827,17 +827,16 @@ async fn caller_class(state: &DaemonState) -> CallerClass {
             CallerClass::Owner
         };
     };
-    let class = match state.rights_class.get() {
-        Some(class) => class.clone(),
-        None => {
-            let (class, keep) = state.sessions.classify_caller(peer).await;
-            if keep {
-                // A concurrent request may have set the class first; both
-                // placed the same peer.
-                let _ = state.rights_class.set(class.clone());
-            }
-            class
+    let class = if let Some(class) = state.rights_class.get() {
+        class.clone()
+    } else {
+        let (class, keep) = state.sessions.classify_caller(peer).await;
+        if keep {
+            // A concurrent request may have set the class first; both placed
+            // the same peer.
+            let _ = state.rights_class.set(class.clone());
         }
+        class
     };
     match peer.standing() {
         PeerStanding::Process(_) => class,

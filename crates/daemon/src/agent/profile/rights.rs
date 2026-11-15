@@ -93,7 +93,7 @@ impl ProfileRights {
     pub(crate) fn allows_spawn_as_owner(&self, name: &str) -> bool {
         self.spawn_profiles
             .as_ref()
-            .map_or(true, |allowed| allowed.iter().any(|entry| entry == name))
+            .is_none_or(|allowed| allowed.iter().any(|entry| entry == name))
     }
 
     /// Whether a session with these rights may launch the profile `name`,
