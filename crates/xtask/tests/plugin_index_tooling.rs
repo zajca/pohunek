@@ -1435,6 +1435,99 @@ fn context_entry_text(name: &str, digit: char) -> String {
 }
 
 #[test]
+fn the_throwaway_signs_a_schema_2_index_for_a_context_tree() {
+    let tooling = Tooling::new();
+    let tree = tooling.tree("context-throwaway-tree");
+    let file = tree.join("official/pohunek.context.assistant/0.42.0.toml");
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&file, context_entry_text("assistant", '4')).expect("context entry");
+
+    let output = tooling.path("context-throwaway");
+    std::fs::create_dir(&output).expect("mkdir");
+    let stdout = tooling.xtask_ok(&[
+        "index",
+        "throwaway",
+        "--entries",
+        s(&tree),
+        "--output",
+        s(&output),
+        "--schema-version",
+        "2",
+    ]);
+    assert!(
+        stdout.starts_with("index throwaway ok: entries=3 "),
+        "{stdout}"
+    );
+
+    let index = output.join("official-index-v2.json");
+    assert!(index.is_file(), "the schema 2 document is written");
+    assert!(
+        !output.join("official-index-v1.json").exists(),
+        "no schema 1 document is written"
+    );
+    let envelope = read_envelope(&index);
+    assert_eq!(envelope.schema_version, 2);
+    assert_eq!(envelope.index.schema_version, 2);
+    assert_eq!(envelope.index.entries.len(), 3);
+    assert_eq!(
+        envelope
+            .index
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == Some(package::IndexEntryKind::Context))
+            .count(),
+        1,
+        "the schema 2 document carries the context entry"
+    );
+
+    let verified = tooling.xtask_ok(&[
+        "index",
+        "verify",
+        "--index",
+        s(&index),
+        "--anchor",
+        s(&output.join("runtime-catalog-anchor.json")),
+        "--channel",
+        s(&output.join("plugin-index-channel.json")),
+    ]);
+    assert!(verified.ends_with("entries=3\n"), "{verified}");
+}
+
+#[test]
+fn the_throwaway_with_schema_1_leaves_a_context_entry_out() {
+    let tooling = Tooling::new();
+    let tree = tooling.tree("context-throwaway-v1-tree");
+    let file = tree.join("official/pohunek.context.assistant/0.42.0.toml");
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&file, context_entry_text("assistant", '4')).expect("context entry");
+
+    let output = tooling.path("context-throwaway-v1");
+    std::fs::create_dir(&output).expect("mkdir");
+    let stdout = tooling.xtask_ok(&[
+        "index",
+        "throwaway",
+        "--entries",
+        s(&tree),
+        "--output",
+        s(&output),
+    ]);
+    assert!(
+        stdout.starts_with("index throwaway ok: entries=2 "),
+        "{stdout}"
+    );
+    let envelope = read_envelope(&output.join("official-index-v1.json"));
+    assert_eq!(envelope.index.entries.len(), 2);
+    assert!(
+        envelope
+            .index
+            .entries
+            .iter()
+            .all(|entry| entry.kind.is_none()),
+        "a schema 1 throwaway lists runtime entries only"
+    );
+}
+
+#[test]
 fn a_tree_with_context_entries_builds_in_both_schemas_and_admits_more_than_one() {
     let tooling = Tooling::new();
     let tree = tooling.tree("context-tree");

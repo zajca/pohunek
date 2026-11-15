@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use package::{
     host_platform, read_archive, Limits, ANCHOR_FILE_NAME, INDEX_CHANNEL_FILE_NAME,
-    OFFICIAL_INDEX_FILE_NAME,
+    OFFICIAL_INDEX_FILE_NAME, OFFICIAL_INDEX_FILE_NAME_V2,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -110,6 +110,8 @@ struct Evidence<'a> {
     package_id: &'a str,
     version: &'a str,
     digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
     platform: &'a str,
     result: &'static str,
     failed_step: Option<&'static str>,
@@ -127,13 +129,16 @@ struct Outcome {
 /// Returns `Ok` with the one-line report for a pass and `Err` for a failed
 /// proof or a refused input. An invocation that cannot name its entry or
 /// platform, or whose evidence path exists, writes no evidence.
+///
+/// A runtime entry proves a runtime package: the install must report the
+/// runtime enabled and selected, and the inspect must see the runtime
+/// without a fault. A context entry proves a context package: the install
+/// must report the package enabled and selected, and an entry for
+/// `pohunek.context.assistant` must let `assistant help --print-prompt`
+/// print a prompt.
 pub(crate) fn prove(args: &ProveArgs) -> Result<String, XtaskError> {
     let entry = entry_of(&args.entry)?;
-    if entry.kind() == package::IndexEntryKind::Context {
-        return Err(XtaskError::Usage(
-            "plugin prove proves runtime entries; a context entry is proved by installing it through the index with `pohunek plugin install`".to_owned(),
-        ));
-    }
+    let is_context = entry.kind() == package::IndexEntryKind::Context;
     let platform = host_platform().ok_or_else(|| {
         XtaskError::Usage("this platform has no plugin index platform name".to_owned())
     })?;
@@ -149,12 +154,14 @@ pub(crate) fn prove(args: &ProveArgs) -> Result<String, XtaskError> {
     }
 
     let digest = entry.digest.as_str();
+    let kind = is_context.then_some("context");
     let evidence = Evidence {
         schema: EVIDENCE_SCHEMA,
         core_version: outcome.core_version.as_deref(),
         package_id: entry.package_id.as_str(),
         version: entry.version.as_str(),
         digest,
+        kind,
         platform: &platform,
         result: if outcome.failure.is_some() {
             "fail"
@@ -229,8 +236,8 @@ fn run_steps(
 /// Step 1: the archive is the one the entry lists.
 ///
 /// The SHA-256 of the file bytes equals the entry's digest, the archive reads
-/// under the strict reader, and its descriptor names the entry's package id,
-/// runtime id and version.
+/// under the strict reader, and its descriptor names the entry's package id
+/// and version, plus the runtime id for a runtime entry.
 fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), String> {
     let actual = format!("sha256:{}", hex(&Sha256::digest(archive)));
     if actual != entry.digest.as_str() {
@@ -238,6 +245,18 @@ fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), Stri
     }
     let verified = read_archive(archive, &Limits::DEFAULT)
         .map_err(|error| format!("the archive is not a valid package: {error}"))?;
+    if entry.kind() == package::IndexEntryKind::Context {
+        if entry.runtime_id.is_some() {
+            return Err("a context entry names no runtime".to_owned());
+        }
+        let (package_id, version) =
+            crate::catalog::archive_package(&verified, Path::new("archive"))
+                .map_err(|error| error.to_string())?;
+        if package_id != entry.package_id || version != entry.version {
+            return Err("the archive descriptor differs from the entry's identity".to_owned());
+        }
+        return Ok(());
+    }
     let identity =
         archive_identity(&verified, Path::new("archive")).map_err(|error| error.to_string())?;
     if identity.package_id != entry.package_id
@@ -266,7 +285,7 @@ fn prove_in(
     )
     .map_err(fail(Step::Host))?;
     outcome.core_version = Some(host.core_version().map_err(fail(Step::Host))?);
-    host.launch(root).map_err(fail(Step::Host))?;
+    host.launch_local_only(root).map_err(fail(Step::Host))?;
 
     let archive_path = write_archive(archive, root).map_err(fail(Step::Install))?;
     install(&mut host, entry, &archive_path, &trust).map_err(fail(Step::Install))?;
@@ -292,9 +311,15 @@ fn write_trust(
     .map_err(|error| format!("cannot copy the entry file: {error}"))?;
     let trust = root.path().join(TRUST_DIRECTORY);
     create_directory(&trust)?;
+    let schema_version = if entry.kind() == package::IndexEntryKind::Context {
+        package::INDEX_SCHEMA_VERSION_2
+    } else {
+        package::INDEX_SCHEMA_VERSION
+    };
     throwaway(&ThrowawayArgs {
         entries: tree,
         output: trust.clone(),
+        schema_version,
     })
     .map_err(|error| error.to_string())?;
     Ok(trust)
@@ -340,7 +365,12 @@ fn install(
     trust: &Path,
 ) -> Result<(), String> {
     let archive = archive.to_string_lossy();
-    let index = trust.join(OFFICIAL_INDEX_FILE_NAME);
+    let index_name = if entry.kind() == package::IndexEntryKind::Context {
+        OFFICIAL_INDEX_FILE_NAME_V2
+    } else {
+        OFFICIAL_INDEX_FILE_NAME
+    };
+    let index = trust.join(index_name);
     let index = index.to_string_lossy();
     let output = host.cli(&[
         "plugin", "install", &archive, "--index", &index, "--yes", "--json",
@@ -358,20 +388,58 @@ fn install(
     Ok(())
 }
 
-/// Step 5: the daemon reports the entry's runtime without a fault, and the
-/// package doctor finds nothing.
+/// Step 5: the daemon reports the entry's package without a fault, and the
+/// package doctor finds nothing. A context entry has no runtime, so the
+/// runtime invocation is replaced by reading the package back: inspect must
+/// report it enabled and selected without a fault, and the assistant entry
+/// must render its prompt (a proof rig holds no agents, so the readiness
+/// probe fails closed: `no_capable_agent` passes, while a missing or damaged
+/// assistant package fails).
 fn inspect(host: &mut Host, entry: &package::IndexEntry) -> Result<(), String> {
     let output = host.cli(&["plugin", "inspect", entry.package_id.as_str(), "--json"])?;
     let inspected = json_result(&output, "`pohunek plugin inspect`")?;
     let package = &inspected["package"];
-    let runtime = entry.runtime_id.as_ref().map(protocol::RuntimeId::as_str);
-    if package["runtime_id"].as_str() != runtime
-        || !package["fault"].is_null()
-        || package["digest"] != entry.digest.as_str()
-    {
-        return Err(
-            "the inspected package is not the entry's runtime, or reports a fault".to_owned(),
-        );
+    if entry.kind() == package::IndexEntryKind::Context {
+        if !package["runtime_id"].is_null()
+            || !package["fault"].is_null()
+            || package["digest"] != entry.digest.as_str()
+            || package["enabled"] != true
+            || package["selected"] != true
+        {
+            return Err(
+                "the inspected package is not the entry's enabled, selected context, or reports a fault"
+                    .to_owned(),
+            );
+        }
+        if entry.package_id.as_str() == protocol::ASSISTANT_CONTEXT_PACKAGE_ID {
+            let output = host.cli(&["assistant", "help", "--print-prompt", "--json"])?;
+            if output.code == Some(0) {
+                let printed = json_result(&output, "`pohunek assistant help --print-prompt`")?;
+                if printed["prompt"].as_str().is_none_or(str::is_empty) {
+                    return Err("the assistant package printed no prompt".to_owned());
+                }
+            } else {
+                let document: Value = serde_json::from_slice(&output.stdout).map_err(|_error| {
+                    "`pohunek assistant help --print-prompt` printed no JSON document".to_owned()
+                })?;
+                if document["err"]["code"] != "no_capable_agent" {
+                    return Err(format!(
+                        "the assistant package does not render: {}",
+                        document["err"]["code"].as_str().unwrap_or("no error code")
+                    ));
+                }
+            }
+        }
+    } else {
+        let runtime = entry.runtime_id.as_ref().map(protocol::RuntimeId::as_str);
+        if package["runtime_id"].as_str() != runtime
+            || !package["fault"].is_null()
+            || package["digest"] != entry.digest.as_str()
+        {
+            return Err(
+                "the inspected package is not the entry's runtime, or reports a fault".to_owned(),
+            );
+        }
     }
     let doctor = host.cli(&["plugin", "doctor", entry.package_id.as_str()])?;
     if doctor.code != Some(0) {

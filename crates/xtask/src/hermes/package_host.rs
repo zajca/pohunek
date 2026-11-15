@@ -32,6 +32,7 @@ use super::{
     EXPECTED_RUNTIME_ID, PROCESS_POLL_INTERVAL,
 };
 use crate::catalog::{archive_identity, read_input};
+use crate::isolated_host::{LOCAL_ONLY_FLAG, LOCAL_ONLY_LOG_LINE};
 use crate::throwaway_trust::{self, write_public, CoreRelease, Trust};
 use crate::XtaskError;
 
@@ -249,6 +250,7 @@ impl Host {
             .map_err(|error| fail(format!("cannot duplicate the daemon log: {error}")))?;
         let mut command = Command::new(prefix.join("pohunekd"));
         command
+            .arg(LOCAL_ONLY_FLAG)
             .current_dir(cwd)
             .env_clear()
             .envs(env.iter().cloned())
@@ -269,6 +271,13 @@ impl Host {
             daemon: Some(daemon),
         };
         host.wait_ready(socket)?;
+        let log = fs::read_to_string(root.join(DAEMON_LOG_FILE))
+            .map_err(|error| fail(format!("cannot read the daemon log: {error}")))?;
+        if !log.contains(LOCAL_ONLY_LOG_LINE) {
+            return Err(fail(format!(
+                "the daemon log does not confirm `{LOCAL_ONLY_FLAG}` (`{LOCAL_ONLY_LOG_LINE}`)"
+            )));
+        }
         Ok(host)
     }
 

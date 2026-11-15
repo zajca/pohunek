@@ -17,7 +17,9 @@ use package::{
     index_document_signing_message, index_key_record_signing_message, revocation_signing_message,
     verify_index, AnchorFile, CatalogSignature, IndexBody, IndexChannel, IndexEnvelope,
     IndexKeyRecord, IndexVerifierState, KeyId, RevocationBody, RootKey, SignedRevocations,
-    INDEX_CHANNEL_FILE_NAME, INDEX_SCHEMA_VERSION, OFFICIAL_INDEX_FILE_NAME, OFFICIAL_SCOPE,
+    INDEX_CHANNEL_FILE_NAME, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
+    OFFICIAL_INDEX_FILE_NAME, OFFICIAL_INDEX_FILE_NAME_V2, OFFICIAL_SCOPE,
+    SUPPORTED_INDEX_SCHEMA_VERSIONS,
 };
 use zeroize::Zeroizing;
 
@@ -46,6 +48,7 @@ const REVOCATION_SEQUENCE: u64 = 1;
 pub(crate) struct ThrowawayArgs {
     pub(crate) entries: PathBuf,
     pub(crate) output: PathBuf,
+    pub(crate) schema_version: u64,
 }
 
 /// What `index throwaway` reports.
@@ -98,7 +101,12 @@ struct Documents {
 }
 
 fn assemble(args: &ThrowawayArgs, now: u64) -> Result<Documents, XtaskError> {
-    let entries = entries_of(&args.entries, INDEX_SCHEMA_VERSION)?;
+    if !SUPPORTED_INDEX_SCHEMA_VERSIONS.contains(&args.schema_version) {
+        return Err(XtaskError::Usage(format!(
+            "--schema-version must be {INDEX_SCHEMA_VERSION} or {INDEX_SCHEMA_VERSION_2}"
+        )));
+    }
+    let entries = entries_of(&args.entries, args.schema_version)?;
     let entry_count = entries.len();
     let not_before = now.saturating_sub(VALID_BEFORE_SECONDS);
     let not_after = now.saturating_add(VALID_AFTER_SECONDS);
@@ -131,7 +139,7 @@ fn assemble(args: &ThrowawayArgs, now: u64) -> Result<Documents, XtaskError> {
         .to_bytes());
 
     let body = RevocationBody {
-        schema_version: INDEX_SCHEMA_VERSION,
+        schema_version: args.schema_version,
         sequence: REVOCATION_SEQUENCE,
         revoked_key_ids: Vec::new(),
     };
@@ -148,9 +156,9 @@ fn assemble(args: &ThrowawayArgs, now: u64) -> Result<Documents, XtaskError> {
 
     let signer = record.key_id.clone();
     let mut envelope = IndexEnvelope {
-        schema_version: INDEX_SCHEMA_VERSION,
+        schema_version: args.schema_version,
         index: IndexBody {
-            schema_version: INDEX_SCHEMA_VERSION,
+            schema_version: args.schema_version,
             scope: OFFICIAL_SCOPE.to_owned(),
             sequence: now,
             expires_at: not_after,
@@ -199,10 +207,15 @@ fn assemble(args: &ThrowawayArgs, now: u64) -> Result<Documents, XtaskError> {
 pub(crate) fn write(args: &ThrowawayArgs) -> Result<Written, XtaskError> {
     check_output(&args.output)?;
     let documents = assemble(args, unix_now()?)?;
+    let index_name = if args.schema_version == INDEX_SCHEMA_VERSION_2 {
+        OFFICIAL_INDEX_FILE_NAME_V2
+    } else {
+        OFFICIAL_INDEX_FILE_NAME
+    };
     let files = [
         (ANCHOR_FILE, &documents.anchor),
         (INDEX_CHANNEL_FILE_NAME, &documents.channel),
-        (OFFICIAL_INDEX_FILE_NAME, &documents.index),
+        (index_name, &documents.index),
     ];
     let mut created: Vec<PathBuf> = Vec::with_capacity(files.len());
     for (name, bytes) in files {

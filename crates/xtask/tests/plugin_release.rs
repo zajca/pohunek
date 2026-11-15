@@ -135,6 +135,12 @@ impl Plugin {
     /// Builds `package` into a new directory and returns the archive path and
     /// its digest.
     fn build(&self, package: &Path, out: &str) -> (PathBuf, String) {
+        self.build_as(package, out, ARCHIVE_NAME)
+    }
+
+    /// Builds `package` into a new directory and returns the archive of
+    /// `archive_name` and its digest.
+    fn build_as(&self, package: &Path, out: &str, archive_name: &str) -> (PathBuf, String) {
         let out = self.dir(out);
         let output = self.xtask(&[
             "plugin",
@@ -152,7 +158,52 @@ impl Plugin {
         let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
         let fields: Vec<&str> = stdout.trim_end().split(' ').collect();
         assert_eq!(fields.len(), 7, "one line of seven fields: {stdout:?}");
-        (out.join(ARCHIVE_NAME), fields[5].to_owned())
+        (out.join(archive_name), fields[5].to_owned())
+    }
+
+    /// A context package directory: a descriptor with no runtime plus the
+    /// assistant prompt contract, so even the assistant step can run.
+    fn context_package(&self, name: &str, package_id: &str, version: &str) -> PathBuf {
+        let dir = self.dir(name);
+        fs::write(
+            dir.join("runtime.toml"),
+            format!(
+                "schema = 1\nid = \"{package_id}\"\nversion = \"{version}\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n"
+            ),
+        )
+        .expect("write the descriptor");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(bundle.join("assistant")).expect("bundle directories");
+        fs::write(bundle.join("index.md"), "# Index\n").expect("write the index");
+        fs::write(
+            bundle.join("assistant/system.md"),
+            "---\ntype: PromptTemplate\nid: assistant/system\ntitle: Contract\ndescription: Fixture contract.\nsource_kind: manual\nintents: [help]\n---\n\n## Safety\n\n- Never print secrets.\n\n## Navigation\n\n1. Start at the index.\n",
+        )
+        .expect("write the prompt contract");
+        dir
+    }
+
+    /// A context entry file for `archive` with the given identity.
+    fn context_entry(&self, name: &str, package_id: &str, digest: &str, version: &str) -> PathBuf {
+        let text = format!(
+            "package_id = \"{package_id}\"\n\
+             kind = \"context\"\n\
+             version = \"{version}\"\n\
+             digest = \"{digest}\"\n\
+             url = \"https://github.com/pohunekd/plugin-kitfixture/releases/download/v{version}/{package_id}-{version}.tar.zst\"\n\
+             platforms = [\"{}\"]\n\
+             core = \">=0.42.0\"\n\n\
+             [source]\n\
+             repo = \"pohunekd/plugin-kitfixture\"\n\
+             repo_id = 1001\n\
+             tag = \"v{version}\"\n\
+             commit = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+             built_with = \"v0.42.0\"\n",
+            host_platform().expect("this platform has an index platform name")
+        );
+        let path = self.path(name);
+        fs::write(&path, text).expect("write the entry");
+        path
     }
 
     /// An entry file for `archive` with the given identity.
@@ -443,6 +494,88 @@ fn the_fixture_proves_in_isolation_and_leaves_nothing() {
         matches!(decoy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "the proof connected to the caller's control socket"
     );
+}
+
+#[test]
+fn a_context_entry_proves_by_reading_the_package_back() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("context-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let evidence = plugin.path("context-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("plugin prove ok: pohunek.context.fixture 0.2.0 {digest}\n")
+    );
+
+    let document = evidence_of(&evidence);
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["result"], "pass");
+    assert!(document["failed_step"].is_null());
+    assert_eq!(document["package_id"], "pohunek.context.fixture");
+    assert_eq!(document["version"], "0.2.0");
+    assert_eq!(document["digest"], digest);
+    assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn the_assistant_context_entry_proves_by_printing_its_prompt() {
+    let plugin = Plugin::new();
+    let package =
+        plugin.context_package("assistant-package", "pohunek.context.assistant", "0.42.0");
+    let (archive, digest) = plugin.build_as(
+        &package,
+        "built",
+        "pohunek.context.assistant-0.42.0.tar.zst",
+    );
+    let entry = plugin.context_entry(
+        "assistant-entry.toml",
+        "pohunek.context.assistant",
+        &digest,
+        "0.42.0",
+    );
+    let evidence = plugin.path("assistant-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "pass");
+    assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn a_context_archive_mismatch_fails_at_digest_before_any_prefix_exists() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("context-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, _digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "context-entry.toml",
+        "pohunek.context.fixture",
+        ABSENT_DIGEST,
+        "0.2.0",
+    );
+    let evidence = plugin.path("context-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "digest");
+    assert_eq!(document["kind"], "context");
+    assert_eq!(document["core_version"], Value::Null);
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 
 #[test]

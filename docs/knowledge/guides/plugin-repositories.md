@@ -112,7 +112,12 @@ The same two commands run locally:
   <dir> --evidence <file>` installs the archive through the index path on an
   isolated daemon started from the `pohunek`, `pohunekd` and `pohunek-sessiond`
   in `--release-dir`, and writes the verdict as evidence JSON. It never launches
-  the runtime program and never talks to your own daemon. The
+  the runtime program and never talks to your own daemon. A context entry
+  (`kind = "context"`) proves a context package with no runtime: the install
+  must report it enabled and selected, and the inspect reads the package back
+  (for `pohunek.context.assistant` it also renders the assistant prompt; a rig
+  with no agents passes that readback when it fails with `no_capable_agent`).
+  The evidence of a context proof carries `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
   lists the steps, the evidence fields and the exit statuses.
 
