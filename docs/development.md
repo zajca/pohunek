@@ -821,7 +821,11 @@ a multi-surface repository. `scripts/changelog check` validates the fragments,
 `fold VERSION [--surface S] [--date YYYY-MM-DD]` writes the version section into
 the committed `CHANGELOG.md` and deletes the released fragments, and
 `notes VERSION [--surface S]` prints the marked release-notes block for a folded
-version. A fragment alone does not widen test or package selection: it selects no Rust
+version. `notes VERSION --post` prints the same block with a release-post skeleton
+above the section (intro, `What's new`, `Upgrading`, then `Full changelog` with
+the kind headings one level down); every part still to be written carries
+`TODO(release-post)`, and the `release` skill ("Release post") turns it into the
+published post. A fragment alone does not widen test or package selection: it selects no Rust
 test and no runtime package. The repository layout is declared in `.github/changelog.json`; the
 contract fixtures in `scripts/tests/fixtures/changelog` pin the byte-exact output.
 
