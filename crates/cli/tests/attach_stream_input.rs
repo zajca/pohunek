@@ -433,6 +433,13 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
     let mut cli = CliProcess(command.spawn().expect("spawn pohunek attach"));
     let mut stdin = cli.0.stdin.take().expect("piped stdin");
     let mut stdout = cli.0.stdout.take().expect("piped stdout");
+    let mut stderr = cli.0.stderr.take().expect("piped stderr");
+    let (errors_tx, errors_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut errors = String::new();
+        let _count = stderr.read_to_string(&mut errors);
+        let _sent = errors_tx.send(errors);
+    });
 
     // The input ends the client's stdin; the stream answers once it read the
     // input to its end, and closes. The client keeps the connection open for
@@ -445,9 +452,18 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
         let _count = stdout.read_to_end(&mut shown);
         let _sent = output.send(shown);
     });
-    let shown = shown_rx
-        .recv_timeout(HANG_GUARD)
-        .expect("the client ends once the stream closed");
+    let Ok(shown) = shown_rx.recv_timeout(HANG_GUARD) else {
+        // Names the side that stalled: the stream either saw the end of the
+        // client's input or never did.
+        let stream_saw_input_end = observed.try_recv();
+        let _killed = cli.0.kill();
+        let _reaped = cli.0.wait();
+        let errors = errors_rx.recv_timeout(HANG_GUARD);
+        panic!(
+            "the client ends once the stream closed; stream input end: \
+             {stream_saw_input_end:?}, client stderr: {errors:?}"
+        );
+    };
     let status = cli.0.wait().expect("wait for pohunek attach");
 
     assert!(status.success(), "{status}");
@@ -603,6 +619,9 @@ fn serve_answering_attach_stream(
     stream
         .read_to_end(&mut input)
         .expect("read the client's input");
-    stream.write_all(ANSWER).expect("write the answer");
+    // Reported before the answer so a scenario that times out can tell whether
+    // the client ever ended its input.
     let _sent = events.send(StreamEvent::InputReceived(input.len()));
+    // A client the scenario already killed no longer reads the answer.
+    let _written = stream.write_all(ANSWER);
 }
