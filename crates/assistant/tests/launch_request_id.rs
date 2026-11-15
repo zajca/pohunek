@@ -381,6 +381,8 @@ fn capabilities(request_id_supported: bool, pin_supported: bool) -> HostCapabili
         integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
         session_new_agent_options_supported: true,
+        host_hooks: None,
+        session_new_skip_repo_hooks_supported: false,
     }
 }
 

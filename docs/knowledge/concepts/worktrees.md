@@ -179,6 +179,94 @@ not apply to it. A required hook that outlasts the client's request timeout
 ends the call with the outcome-unknown error while the daemon rolls back: check
 `session list` before retrying.
 
+A checkout carries its own hook layer, so a pull-request head started with
+`--base-branch refs/pull/<n>/head` would run scripts its author wrote. `pohunek
+session new --no-repo-hooks` (`skip_repo_hooks` on `session.new`) runs none of
+the repository layer, neither `.pohunek/hooks/<event>` nor the legacy
+`.pohunek/setup`, for any event of that session and for its whole life:
+`pre-create`, `post-create`, `session-start`, `agent-state`, `session-stop`,
+`pre-remove` and `post-remove`, also after a resume, a daemon restart, and in
+the rollback of a failed create. The daemon never looks the layer up for such a
+session, so a link or any other path shape in the checkout cannot bring it back.
+The host's scripts in `~/.config/pohunek/hooks/` still run, in the checkout; a
+host that must not run code there either has no such script or refuses the start
+first (`host inspect --json` reports `host_hooks`, one boolean per event). The
+session reports `skip_repo_hooks: true` in `session new --json`, `session
+inspect` and `session list`. When `[hooks] required` lists an event that only
+the skipped layer could run (the host has no script for it), the start fails
+with `hook_required_skipped` before any hook, fetch or git command runs and
+before anything is created; a host script removed after that check fails the
+create at its `post-create` step with the same code, and the create is rolled
+back. Without the switch the rule is unchanged: a required event with no script
+anywhere passes.
+
+The switch also turns off the programs git itself runs that a repository
+configuration can name by a path relative to the checkout a git command runs
+in: its hooks, both those of the hooks directory (`core.hooksPath`, husky
+style) and those the configuration names (`hook.<name>.command` with
+`hook.<name>.event`, git 2.54 or newer, which run from the checkout's top and
+do not depend on `core.hooksPath`), its fsmonitor hook (`core.fsmonitor`) and,
+for the daemon's git, filter drivers and textconv drivers (which the
+checkout's `.gitattributes` selects). Without the switch a git command there
+runs the copies the checkout carries. With it:
+
+- Every git command the daemon runs for the session (create, fetch, `git
+  worktree add` and `remove`, `session diff`, the pre-removal check of a
+  retention sweep, the rollback) runs with `-c core.hooksPath=/dev/null -c
+  core.fsmonitor=false`, and `session diff` also passes `--no-textconv`
+  (external diff drivers are off for every session diff). Each of those
+  commands also turns off every configured hook (`hook.<name>.event` empty,
+  `hook.<name>.enabled` false) and every filter driver
+  (`filter.<driver>.clean`, `smudge` and `process` empty, `required` false)
+  the configuration it sees defines, listed with `git config` just before the
+  command runs. They go in as `GIT_CONFIG_COUNT` pairs, because `git -c`
+  splits at the first `=` and a name may hold one; a listing that fails fails
+  the command. So the checkout is written without smudge filters (a Git LFS
+  file stays a pointer file) and `session diff` and the pre-removal check
+  compare the files as they are on disk. Git older than 2.54 reads no
+  `hook.*` setting, so the hook pairs change nothing there. Project detection
+  runs its read-only git queries, which fire no hook event and apply no
+  filter, with the hook path and fsmonitor settings for every session.
+- The agent's environment gets `core.hooksPath=/dev/null`,
+  `core.fsmonitor=false` and the off settings of every configured hook as
+  more `GIT_CONFIG_COUNT` pairs (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`),
+  on the first launch and on every relaunch, so the agent's own git in the
+  checkout runs no hook and no fsmonitor hook either, including the
+  repository's own `.git/hooks`, as long as the process keeps its
+  environment. The configured hooks are those git sees in the session's
+  directory with the agent's own environment (its `GIT_CONFIG_COUNT` pairs,
+  `HOME` and the like included), listed once at the launch: a hook configured
+  after it is not covered. The pairs the agent environment already sets (from
+  the profile `[env]` or the environment allowlist) keep their values: the new
+  pairs are appended behind them. An agent environment that sets
+  `GIT_CONFIG_PARAMETERS` (git reads it after the pairs, so it could turn them
+  back on) or a `GIT_CONFIG_COUNT` that is not a decimal number, in which git
+  cannot list the configured hooks, or that names a hook whose name is not
+  UTF-8 (no environment entry can carry it) fails the start with
+  `git_hooks_env_conflict` (the create is rolled back) and fails a relaunch
+  with the same code; the error names the variable or hook, not a value.
+  `GIT_CONFIG_COUNT` needs git 2.31 or newer, which project detection already
+  requires.
+- Each host-global hook script of the session gets the same settings, with
+  the configured hooks its git sees in its directory with its own environment,
+  listed before it starts, so its git in the checkout runs no hook and no
+  fsmonitor hook of it. A script whose configured hooks cannot be listed does
+  not run and is reported like a script that could not be spawned.
+
+Outside the switch: the git of the agent and of the host hook scripts still
+applies the filter, textconv and external diff drivers the configuration
+defines. Turning filters off there would change what the agent's own
+`git add` and `git commit` write (a Git LFS file would be committed whole, not
+as a pointer), and a list taken at launch would miss a driver configured
+later. A host that reviews untrusted checkouts names no filter, textconv or
+diff command by a path relative to the checkout.
+
+The switch belongs to the session started with it. A session started later in
+the same checkout, an agent's child or an in-place `--cwd` session, does not
+inherit it: `spawned_by` is an origin the caller states, not one the daemon
+proves. A client that reviews an untrusted checkout passes `--no-repo-hooks`
+(or `skip_repo_hooks`) to every session it starts there.
+
 A host or repository `pre-remove` hook runs inside the worktree before
 `pohunek session rm` deletes it, and `post-remove` runs in the repository
 afterwards, so a project can release what its `post-create` hook provisioned

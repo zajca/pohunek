@@ -643,6 +643,7 @@ mod tests {
                 project_id: Some(added.id.clone()),
                 created_at: "2026-06-23T00:00:00Z".to_owned(),
                 updated_at: "2026-06-23T00:00:00Z".to_owned(),
+                skip_repo_hooks: false,
             })
             .expect("record worktree binding");
 

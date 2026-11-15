@@ -414,6 +414,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create shell session")
@@ -507,6 +508,7 @@ async fn assert_foreground_agent_unattributed_without_the_official_package(agent
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create shell session")
@@ -620,6 +622,7 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
                                 context_package_digest: None,
                                 fetch_ref: None,
                                 agent_options: std::collections::BTreeMap::new(),
+                                skip_repo_hooks: false,
                             })
                             .await
                             .expect("create shell session")
@@ -785,6 +788,7 @@ async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create shell session")
@@ -877,6 +881,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             context_package_digest: None,
             fetch_ref: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         })
         .await
         .expect("create shell session");

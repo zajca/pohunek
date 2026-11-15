@@ -122,8 +122,11 @@ can be required in this release; another known event, an unknown name or a
 repeated entry makes the configuration load fail with the named key, and
 `pohunek service check` reports it. The installer omits the key while it is
 empty, so a previous release still reads the file. A previous release that reads
-a file with the key reports it as an unknown key and does not enforce it. See
-the hooks guide in [worktrees](../concepts/worktrees.md).
+a file with the key reports it as an unknown key and does not enforce it. A
+session started with `session new --no-repo-hooks` runs only the host's hook
+scripts, so a required event needs a host script under `hooks/` in the config
+directory: without one that start fails with `hook_required_skipped` before
+anything runs. See the hooks guide in [worktrees](../concepts/worktrees.md).
 The optional `[checkout_trust] trusted_repositories = ["owner/repo"]` key lists the
 GitHub repositories whose checkouts a runtime may launch with its
 `trusted_checkout_args` (see [runtime packages](runtime-packages.md#trusted-checkout-arguments)).

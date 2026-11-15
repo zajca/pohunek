@@ -11,8 +11,8 @@ use protocol::{
     ConceptDeprecation, ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult,
     DetectionRegionKind, DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus,
     EnrollmentInfo, EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ExpectedPin,
-    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
-    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
+    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostHookScripts, HostId,
+    HostOwner, IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
     IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery,
     IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
@@ -152,6 +152,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         ended_at: None,
         exit_code,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 
@@ -685,6 +686,7 @@ fn session_new_params_json_shape_roundtrips() {
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -725,6 +727,7 @@ fn session_new_params_roundtrips_with_metadata() {
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -769,6 +772,7 @@ fn session_new_params_roundtrips_with_worktree_fields() {
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -811,6 +815,7 @@ fn session_new_params_roundtrips_with_initial_input() {
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -855,6 +860,7 @@ fn session_new_params_roundtrips_with_fetch_ref() {
             commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
         }),
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize params");
@@ -3681,6 +3687,156 @@ fn session_new_params_carry_agent_options_only_when_set() {
     assert_eq!(line_roundtrip(&params), params);
 }
 
+/// `skip_repo_hooks` is on the wire only when true, both on the request and
+/// on the recorded session.
+#[test]
+fn skip_repo_hooks_is_on_the_wire_only_when_true() {
+    let mut params: SessionNewParams = serde_json::from_value(json!({
+        "agent": "work",
+        "cols": 80,
+        "rows": 24
+    }))
+    .expect("params without skip_repo_hooks decode");
+    assert!(!params.skip_repo_hooks);
+    assert!(
+        serde_json::to_value(&params)
+            .expect("serialize params")
+            .get("skip_repo_hooks")
+            .is_none(),
+        "an unset switch is absent on the wire"
+    );
+    let explicit_false: SessionNewParams = serde_json::from_value(json!({
+        "agent": "work",
+        "cols": 80,
+        "rows": 24,
+        "skip_repo_hooks": false
+    }))
+    .expect("an explicit false decodes");
+    assert!(!explicit_false.skip_repo_hooks);
+    assert!(
+        serde_json::to_value(&explicit_false)
+            .expect("serialize params")
+            .get("skip_repo_hooks")
+            .is_none(),
+        "an explicit false is absent on the wire"
+    );
+
+    params.skip_repo_hooks = true;
+    assert_eq!(
+        serde_json::to_value(&params).expect("serialize params"),
+        json!({
+            "agent": "work",
+            "cols": 80,
+            "rows": 24,
+            "skip_repo_hooks": true
+        })
+    );
+    assert_eq!(line_roundtrip(&params), params);
+
+    let mut info = running_shell_session(None);
+    assert!(
+        serde_json::to_value(&info)
+            .expect("serialize session")
+            .get("skip_repo_hooks")
+            .is_none(),
+        "a session that runs its repository hooks omits the switch"
+    );
+    info.skip_repo_hooks = true;
+    assert_eq!(
+        serde_json::to_value(&info).expect("serialize session")["skip_repo_hooks"],
+        json!(true)
+    );
+    assert_eq!(line_roundtrip(&info), info);
+}
+
+/// A host that predates `session_new_skip_repo_hooks_supported` and
+/// `host_hooks` decodes both as absent; present values round-trip with each
+/// of the seven host hook presence flags kept in its own place.
+#[test]
+fn host_capabilities_decode_skip_repo_hooks_and_host_hooks() {
+    let base = json!({
+        "daemon_version": "0.1.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_agents": [],
+        "runtimes": [],
+        "git_available": false,
+        "worktree_supported": false,
+        "terminal_read_supported": false,
+        "output_read_supported": false,
+        "session_wait_supported": false
+    });
+    let predating: HostCapabilities =
+        serde_json::from_value(base.clone()).expect("a host that predates both fields decodes");
+    assert!(!predating.session_new_skip_repo_hooks_supported);
+    assert_eq!(predating.host_hooks, None);
+    let value = serde_json::to_value(&predating).expect("serialize host capabilities");
+    assert!(value.get("session_new_skip_repo_hooks_supported").is_none());
+    assert!(value.get("host_hooks").is_none());
+
+    let mut advertised = base;
+    advertised["session_new_skip_repo_hooks_supported"] = json!(true);
+    advertised["host_hooks"] = json!({
+        "pre_create": true,
+        "post_create": false,
+        "pre_remove": false,
+        "post_remove": true,
+        "session_start": true,
+        "session_stop": false,
+        "agent_state": true
+    });
+    let present: HostCapabilities =
+        serde_json::from_value(advertised).expect("a host that advertises both fields decodes");
+    assert!(present.session_new_skip_repo_hooks_supported);
+    assert_eq!(
+        present.host_hooks,
+        Some(HostHookScripts {
+            pre_create: true,
+            post_create: false,
+            pre_remove: false,
+            post_remove: true,
+            session_start: true,
+            session_stop: false,
+            agent_state: true,
+        })
+    );
+    let value = serde_json::to_value(&present).expect("serialize host capabilities");
+    assert_eq!(value["session_new_skip_repo_hooks_supported"], json!(true));
+    assert_eq!(
+        value["host_hooks"],
+        json!({
+            "pre_create": true,
+            "post_create": false,
+            "pre_remove": false,
+            "post_remove": true,
+            "session_start": true,
+            "session_stop": false,
+            "agent_state": true
+        })
+    );
+    assert_eq!(line_roundtrip(&present), present);
+}
+
+/// The refusal for `skip_repo_hooks` is a daemon-class error with its wire
+/// code, names the host route when there is one, and suggests an upgrade.
+#[test]
+fn session_new_skip_repo_hooks_refusal_is_a_daemon_error() {
+    let local = ProtocolError::session_new_skip_repo_hooks_unsupported(None);
+    assert_eq!(local.class, ErrorClass::Daemon);
+    assert_eq!(local.code, "session_new_skip_repo_hooks_unsupported");
+    assert!(local.msg.contains("the local daemon"), "{}", local.msg);
+    assert!(
+        local
+            .recover
+            .as_deref()
+            .is_some_and(|recover| recover.contains("upgrade the daemon")),
+        "{local:?}"
+    );
+
+    let routed = ProtocolError::session_new_skip_repo_hooks_unsupported(Some("host-a"));
+    assert_eq!(routed.class, ErrorClass::Daemon);
+    assert!(routed.msg.contains("host 'host-a'"), "{}", routed.msg);
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -3770,6 +3926,8 @@ fn host_capabilities_json_shape_roundtrips() {
         package_create_preset_supported: true,
         package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
+        host_hooks: None,
+        session_new_skip_repo_hooks_supported: false,
     };
 
     let value = serde_json::to_value(&caps).expect("serialize host capabilities");

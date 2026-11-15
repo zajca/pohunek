@@ -704,6 +704,7 @@ mod tests {
             exit_code: None,
             capabilities: protocol::SessionCapabilities::default(),
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 
@@ -897,6 +898,7 @@ mod tests {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create session");
@@ -993,6 +995,7 @@ mod tests {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create session");
@@ -1060,6 +1063,7 @@ mod tests {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create shell session");
@@ -1289,6 +1293,7 @@ mod tests {
                         context_package_digest: None,
                         fetch_ref: None,
                         agent_options: std::collections::BTreeMap::new(),
+                        skip_repo_hooks: false,
                     })
                     .await
             }

@@ -82,6 +82,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (18, include_str!("fixtures/shape/schema-18.txt")),
     (19, include_str!("fixtures/shape/schema-19.txt")),
     (20, include_str!("fixtures/shape/schema-20.txt")),
+    (21, include_str!("fixtures/shape/schema-21.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -106,6 +107,7 @@ fn resume_builtin_json() -> Value {
         "is_linked_worktree": true,
         "metadata": {"key": "value"},
         "spawned_by": {"session_id": "s-0", "daemon_id": "d-0"},
+        "skip_repo_hooks": true,
         "program": "claude",
         "args": ["--flag"],
         "input_rules": {"bracketed_paste": true, "submit_delay_ms": 5, "restricted": true, "refuse_while_blocked": true},
@@ -170,6 +172,7 @@ fn worktree_json() -> Value {
         "agent": "claude",
         "status": "active",
         "project_id": "p-1",
+        "skip_repo_hooks": true,
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-01T00:00:01Z"
     })
@@ -320,6 +323,7 @@ fn session_json_with(recovery: &Value) -> Value {
     record["info"]["output_force_closed"] = json!(true);
     record["info"]["ended_at"] = json!("2026-01-01T00:00:01Z");
     record["info"]["agent_options"] = json!({"model": "sonnet"});
+    record["info"]["skip_repo_hooks"] = json!(true);
     record
 }
 
@@ -350,6 +354,7 @@ fn assert_every_field_is_reviewed(
             is_linked_worktree: _,
             metadata: _,
             spawned_by: _,
+            skip_repo_hooks: _,
             program: _,
             args: _,
             input_rules,
@@ -380,6 +385,7 @@ fn assert_every_field_is_reviewed(
         agent: _,
         status,
         project_id: _,
+        skip_repo_hooks: _,
         created_at: _,
         updated_at: _,
     } = worktree;
@@ -491,6 +497,7 @@ fn assert_every_field_is_reviewed(
         output_force_closed: _,
         metadata: _,
         spawned_by: _,
+        skip_repo_hooks: _,
         attention_isolated_by: _,
         created_at: _,
         updated_at: _,

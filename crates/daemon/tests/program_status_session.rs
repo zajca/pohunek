@@ -458,6 +458,7 @@ impl Fixture {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create the stand-in agent session")

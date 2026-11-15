@@ -941,6 +941,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 
@@ -966,6 +967,7 @@ fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParam
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 
@@ -996,6 +998,7 @@ fn session_params_for_worktree(
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 

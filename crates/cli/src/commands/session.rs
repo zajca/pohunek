@@ -434,6 +434,8 @@ pub(crate) struct NewArgs {
     pub fetch_ref: Option<protocol::FetchRefRequest>,
     /// The `--opt OPTION=CHOICE` selection, one choice per option.
     pub agent_options: BTreeMap<String, String>,
+    /// `--no-repo-hooks`: skip the in-repo hook layer for the session.
+    pub skip_repo_hooks: bool,
     /// Initial text to inject into the spawned PTY.
     pub input: Option<String>,
     /// Acknowledgement window for the initial input; the result then reports
@@ -2018,6 +2020,7 @@ fn new_params(args: &NewArgs) -> Result<SessionNewParams, CliError> {
         context_package_digest: None,
         fetch_ref: args.fetch_ref.clone(),
         agent_options: args.agent_options.clone(),
+        skip_repo_hooks: args.skip_repo_hooks,
     })
 }
 
@@ -2296,6 +2299,9 @@ fn render_new_human(
             .map(|(option, choice)| format!("{option}={choice}"))
             .collect();
         let _ = writeln!(output, "  options: {}", options.join(", "));
+    }
+    if info.skip_repo_hooks {
+        let _ = writeln!(output, "  repo hooks: skipped");
     }
     if let Some(delivered) = prompt_delivered {
         let _ = writeln!(
@@ -2768,9 +2774,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     rows.extend(background_summary_rows(info, now_ms()));
     insert_agent_display_name_row(&mut rows, info);
     insert_active_agent_rows(&mut rows, info);
-    if has_worktree_drift(info) {
-        rows.push(("worktree_drift", "yes".to_owned()));
-    }
+    insert_marker_rows(&mut rows, info);
     let width = rows
         .iter()
         .map(|(field, _)| field.len())
@@ -2785,6 +2789,17 @@ fn render_inspect_human(info: &SessionInfo) -> String {
     }
     append_inspect_details(&mut output, info, now_ms());
     output
+}
+
+/// Append the rows shown only when they hold: `worktree_drift` and
+/// `repo_hooks` (a session that skips the in-repo hook layer).
+fn insert_marker_rows(rows: &mut Vec<(&'static str, String)>, info: &SessionInfo) {
+    if has_worktree_drift(info) {
+        rows.push(("worktree_drift", "yes".to_owned()));
+    }
+    if info.skip_repo_hooks {
+        rows.push(("repo_hooks", "skipped".to_owned()));
+    }
 }
 
 /// Insert the live `agent_display_name` row after `agent` when the profile
@@ -3278,6 +3293,7 @@ mod tests {
             exit_code: None,
             runtime: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 
@@ -3296,6 +3312,7 @@ mod tests {
             reset_diverged: false,
             fetch_ref: None,
             agent_options: BTreeMap::new(),
+            skip_repo_hooks: false,
             input: None,
             input_ack_timeout_ms: None,
             request_timeout_ms: None,
@@ -3395,6 +3412,7 @@ mod tests {
             reset_diverged: false,
             fetch_ref: None,
             agent_options: BTreeMap::new(),
+            skip_repo_hooks: false,
             input: Some("Fix #1234".to_owned()),
             input_ack_timeout_ms: None,
             request_timeout_ms: None,

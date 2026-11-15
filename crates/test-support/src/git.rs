@@ -120,6 +120,31 @@ pub fn pin_hooks(repository: &std::path::Path) {
     );
 }
 
+/// The first git release that runs hooks named in its configuration
+/// (`hook.<name>.command` with `hook.<name>.event`); older git ignores every
+/// `hook.*` setting.
+pub const CONFIG_HOOKS_SINCE: (u32, u32) = (2, 54);
+
+/// Whether the `git` a test runs is [`CONFIG_HOOKS_SINCE`] or newer, so a
+/// scenario's control can expect a configured hook to run. A version that
+/// cannot be read counts as older.
+#[must_use]
+pub fn runs_config_hooks() -> bool {
+    let Ok(output) = command().arg("--version").output() else {
+        return false;
+    };
+    let version = String::from_utf8_lossy(&output.stdout);
+    let mut numbers = version
+        .trim()
+        .trim_start_matches("git version ")
+        .split('.')
+        .map(|part| part.parse::<u32>().ok());
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= CONFIG_HOOKS_SINCE,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

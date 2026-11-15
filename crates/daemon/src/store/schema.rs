@@ -35,7 +35,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 20;
+pub const STORE_SCHEMA_VERSION: u32 = 21;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -129,6 +129,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 19,
         apply: migrate_v19_to_v20,
+    },
+    Migration {
+        from: 20,
+        apply: migrate_v20_to_v21,
     },
 ];
 
@@ -315,6 +319,13 @@ fn migrate_v18_to_v19(record: &mut Map<String, Value>) {
 /// and env, so it recorded no choices; an absent map reads as empty. The step
 /// changes nothing.
 fn migrate_v19_to_v20(_record: &mut Map<String, Value>) {}
+
+/// Schema 20 to 21: session records, resume bindings and worktree bindings
+/// gain the optional `skip_repo_hooks`.
+///
+/// No session of schema 20 could skip the in-repo hook layer; an absent flag
+/// reads as false. The step changes nothing.
+fn migrate_v20_to_v21(_record: &mut Map<String, Value>) {}
 
 /// Removes the fork keys from one native launch spec.
 #[expect(

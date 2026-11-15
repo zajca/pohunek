@@ -34,6 +34,7 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_daemon::shutdown::{DaemonShutdown, DriverHandle};
+use pohunek_service_config::RequiredHook;
 use pohunek_test_support::env::{check_socket_path, TestEnv};
 use pohunek_test_support::wait::guard;
 use pohunek_test_support::worker_binary;
@@ -130,6 +131,17 @@ pub(crate) struct Harness {
     pub(crate) sessions: SessionRegistry,
     /// The launcher of this daemon's workers.
     launcher: Arc<dyn WorkerLauncher>,
+    /// The host-global hook layer this daemon runs, when it runs one.
+    hooks: Option<HostHooks>,
+}
+
+/// The host-global hook layer of a daemon: its scripts live in
+/// [`Harness::host_hooks_dir`], and the daemon runs the agent-state hook
+/// dispatcher, as the daemon binary does.
+#[derive(Debug, Clone)]
+pub(crate) struct HostHooks {
+    /// The host's `hooks.required`.
+    pub(crate) required: Vec<RequiredHook>,
 }
 
 /// What a daemon thread hands back once it serves.
@@ -146,6 +158,7 @@ struct Started {
 pub(crate) struct Surviving {
     env: TestEnv,
     launcher: Arc<dyn WorkerLauncher>,
+    hooks: Option<HostHooks>,
 }
 
 /// Which notification components the daemon is built with.
@@ -216,6 +229,7 @@ impl Harness {
                 inbox,
                 durable: false,
                 reconcile: false,
+                hooks: None,
             },
         )
         .await
@@ -240,9 +254,37 @@ impl Harness {
                 inbox: Inbox::Absent,
                 durable: true,
                 reconcile: false,
+                hooks: None,
             },
         )
         .await
+    }
+
+    /// Starts a durable daemon that runs the host-global hook layer from
+    /// [`Self::host_hooks_dir`] with `required` as its `hooks.required`, and the
+    /// agent-state hook dispatcher. A restart keeps both.
+    pub(crate) async fn start_durable_with_host_hooks(required: Vec<RequiredHook>) -> Self {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let hooks_dir = env.config_home().join("pohunek/hooks");
+        fs::create_dir_all(&hooks_dir).expect("create the host hook directory");
+        Self::serve(
+            env,
+            Arc::new(SubprocessWorkerLauncher::new()),
+            DaemonSpec {
+                catalog_trust: CatalogTrust::Absent,
+                worker_executable: worker_binary(),
+                inbox: Inbox::Absent,
+                durable: true,
+                reconcile: false,
+                hooks: Some(HostHooks { required }),
+            },
+        )
+        .await
+    }
+
+    /// The host-global hook directory of a daemon started with host hooks.
+    pub(crate) fn host_hooks_dir(&self) -> PathBuf {
+        self.env.config_home().join("pohunek/hooks")
     }
 
     /// Restarts the daemon like [`Self::restart`], with the notification inbox
@@ -265,6 +307,7 @@ impl Harness {
                 inbox: Inbox::Debounced,
                 durable: true,
                 reconcile: false,
+                hooks: None,
             },
         )
         .await
@@ -302,6 +345,7 @@ impl Harness {
                 inbox,
                 durable: true,
                 reconcile: true,
+                hooks: surviving.hooks,
             },
         )
         .await
@@ -314,6 +358,7 @@ impl Harness {
             shutdown,
             task,
             launcher,
+            hooks,
             ..
         } = self;
         let _ = shutdown.send(());
@@ -321,13 +366,18 @@ impl Harness {
             .await
             .expect("join the daemon thread")
             .expect("the server thread stops without a panic");
-        Surviving { env, launcher }
+        Surviving {
+            env,
+            launcher,
+            hooks,
+        }
     }
 
     /// Serves the daemon of `env` on a thread of its own. A durable daemon keeps
     /// its session records in the root's metadata store; a reconciling one adopts
     /// the surviving workers before its socket accepts a connection.
     async fn serve(env: TestEnv, launcher: Arc<dyn WorkerLauncher>, spec: DaemonSpec) -> Self {
+        let hooks = spec.hooks.clone();
         let (ready, started) = oneshot::channel::<Started>();
         let (shutdown, stop) = oneshot::channel::<()>();
         let task = std::thread::Builder::new()
@@ -355,6 +405,7 @@ impl Harness {
             task,
             sessions,
             launcher,
+            hooks,
         }
     }
 
@@ -373,10 +424,11 @@ impl Harness {
             inbox,
             durable,
             reconcile,
+            hooks,
         } = spec;
         let dirs = prepare_directories(&env);
         let environment = worker_environment(&env, &dirs.socket);
-        let config = registry_config(
+        let mut config = registry_config(
             &env,
             &dirs,
             &environment,
@@ -384,12 +436,19 @@ impl Harness {
             worker_executable,
             durable,
         );
+        if let Some(hooks) = &hooks {
+            config.config_dir = Some(env.config_home().join("pohunek"));
+            config.hook_required.clone_from(&hooks.required);
+        }
         let registry = SessionRegistry::new_production_with_inspector(
             config,
             Arc::clone(&launcher),
             Arc::new(readable_host::ReadableHost::new()),
         )
         .expect("the production registry opens the plugin root");
+        if hooks.is_some() {
+            registry.spawn_agent_state_hooks();
+        }
         // The event log starts before any session is created or adopted, so
         // every lifecycle event of a durable daemon is recorded.
         if durable {
@@ -519,6 +578,7 @@ struct DaemonSpec {
     inbox: Inbox,
     durable: bool,
     reconcile: bool,
+    hooks: Option<HostHooks>,
 }
 
 /// The directories a daemon of the harness uses, all under its environment.

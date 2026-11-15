@@ -25,7 +25,7 @@ import {
   type SessionWaitTurnParams,
   type SessionWaitTurnResult,
 } from "@pohunek/protocol";
-import { CompatError, carriesAgentOptions, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesRetentionSelector, carriesSecretEnv, carriesTreeListFilter, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
+import { CompatError, carriesAgentOptions, carriesAttentionIsolationFlag, carriesClientRequestId, carriesContextPackageDigest, carriesFetchRef, carriesRetentionSelector, carriesSecretEnv, carriesSkipRepoHooks, carriesTreeListFilter, downgradeRequestParams, requestIsVersionIndependent, setsAttentionIsolationFlag, upgradeResult } from "./compat";
 import { ClientError, type LifecycleOperation, type ObservedProtocolError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -423,6 +423,14 @@ export class Client {
       await this.requireCapability(connection, {
         flag: "session_new_agent_options_supported",
         unsupported: (host) => ClientError.sessionNewAgentOptionsUnsupported(host),
+      });
+    }
+    // A daemon that predates the switch drops it and runs the repository's
+    // hooks.
+    if (request.method === "session.new" && carriesSkipRepoHooks(request.params)) {
+      await this.requireCapability(connection, {
+        flag: "session_new_skip_repo_hooks_supported",
+        unsupported: (host) => ClientError.sessionNewSkipRepoHooksUnsupported(host),
       });
     }
     // A daemon that predates attention isolation stores the reserved flag

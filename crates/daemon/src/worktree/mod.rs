@@ -56,6 +56,7 @@ mod fetch;
 mod fetch_ref;
 mod git_output;
 mod remote;
+mod repo_hooks;
 mod stderr_drain;
 mod stderr_tail;
 
@@ -64,6 +65,10 @@ pub(crate) use fetch_ref::check_session_fetch_request;
 use fetch_ref::delete_session_fetched_ref;
 pub(crate) use remote::note_backup;
 use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
+use repo_hooks::{check_required_layer, host_hook_script};
+pub(crate) use repo_hooks::{
+    git_config_count, git_hooks_env_conflict, git_hooks_off_pairs, host_hook_scripts, RepoHookLayer,
+};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
 /// Relative path of the optional per-repository setup script, run inside a
@@ -138,6 +143,9 @@ pub struct WorktreeRequest {
     /// under `refs/pohunek/sessions/<session_id>/fetched`. Applied exactly
     /// once per session: a reused worktree reports it without refetching.
     pub fetch_ref: Option<FetchRefRequest>,
+    /// Whether the session skips the in-repo hook layer; recorded on the
+    /// binding so every remove hook of the worktree skips it too.
+    pub skip_repo_hooks: bool,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -363,6 +371,7 @@ impl WorktreeManager {
     /// a locally present base, setup script) never abort; they are returned in
     /// [`WorktreeBound::warnings`].
     pub fn bind(&self, req: &WorktreeRequest) -> Result<WorktreeBound, ProtocolError> {
+        let layer = RepoHookLayer::of_session(req.skip_repo_hooks);
         let slug = require_branch_slug(&req.branch)?;
         // The branch and base branch arrive from the socket and are passed
         // positionally to `git`; reject a leading dash (argv flag injection) or
@@ -376,8 +385,16 @@ impl WorktreeManager {
         if let Some(fetch) = req.fetch_ref.as_ref() {
             check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
         }
+        // A required hook the skipped in-repo layer alone could run refuses
+        // the create before any git command, fetch or hook runs.
+        check_required_layer(
+            HookEvent::PostCreate,
+            &self.required_hooks,
+            layer,
+            self.config_dir.as_deref(),
+        )?;
         let repository = canonical_or_original(&req.repo);
-        if !is_git_repo(&repository) {
+        if !is_git_repo(&repository, layer) {
             return Err(error(
                 ErrorClass::Runtime,
                 "not_a_git_repo",
@@ -417,6 +434,7 @@ impl WorktreeManager {
         path: &Path,
         slug: &str,
     ) -> Result<Option<WorktreeBound>, ProtocolError> {
+        let layer = RepoHookLayer::of_session(req.skip_repo_hooks);
         let owned = self
             .store
             .find_worktree(&req.session_id, repository, slug)
@@ -439,6 +457,7 @@ impl WorktreeManager {
                         .map(|fetch| {
                             fetch_ref::require_session_fetched_ref(
                                 repository,
+                                layer,
                                 &req.session_id,
                                 fetch,
                             )
@@ -465,7 +484,7 @@ impl WorktreeManager {
                         path = %path.display(),
                         "recreating owned worktree with an invalid directory"
                     );
-                    Self::reset_stale_worktree(repository, path)?;
+                    Self::reset_stale_worktree(repository, layer, path)?;
                     Ok(None)
                 }
                 None => {
@@ -485,7 +504,7 @@ impl WorktreeManager {
         } else if owned.is_some() {
             // Owned binding but the directory vanished entirely: prune the stale
             // git admin entry before re-adding at the same path.
-            Self::reset_stale_worktree(repository, path)?;
+            Self::reset_stale_worktree(repository, layer, path)?;
             Ok(None)
         } else {
             Ok(None)
@@ -512,6 +531,7 @@ impl WorktreeManager {
         path: PathBuf,
         slug: String,
     ) -> Result<WorktreeBound, ProtocolError> {
+        let layer = RepoHookLayer::of_session(req.skip_repo_hooks);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| store_error("create the worktrees root directory", &err))?;
@@ -538,7 +558,7 @@ impl WorktreeManager {
         // session ref behind. The temp guard below pins the commit until it is
         // promoted to the session ref once the checkout stands.
         let session_temp = match req.fetch_ref.as_ref() {
-            Some(fetch) => Some(fetch_ref::fetch_session_temp(&repository, fetch)?),
+            Some(fetch) => Some(fetch_ref::fetch_session_temp(&repository, layer, fetch)?),
             None => None,
         };
         // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
@@ -567,6 +587,7 @@ impl WorktreeManager {
             agent: req.agent.clone(),
             status: WorktreeStatus::Active,
             project_id: req.project_id.clone(),
+            skip_repo_hooks: req.skip_repo_hooks,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -576,14 +597,15 @@ impl WorktreeManager {
             .map_err(|err| store_error("persist worktree binding", &err))?;
         let added = match &remote {
             Some(plan) => {
-                create_remote_worktree(&repository, &path, &req.branch, plan).map(|()| false)
+                create_remote_worktree(&repository, layer, &path, &req.branch, plan).map(|()| false)
             }
-            None => Self::create_worktree(&repository, &path, &req.branch, &start_point),
+            None => Self::create_worktree(&repository, layer, &path, &req.branch, &start_point),
         };
         let source = remote.as_ref().map(|plan| plan.source(&req.branch));
         if let Ok(true) = added {
             Self::warn_ignored_base_branch(
                 &repository,
+                layer,
                 &path,
                 req,
                 &base_branch,
@@ -611,7 +633,7 @@ impl WorktreeManager {
         if let Some(source) = &source {
             // The checkout exists and its binding stays, so the session's
             // compensation removes it.
-            verify_start(&path, &req.branch, source)?;
+            verify_start(&path, layer, &req.branch, source)?;
         }
         // The checkout stands: promote the fetched commit to the session ref
         // before the post-create hook, so the agent and the hooks see the
@@ -623,6 +645,7 @@ impl WorktreeManager {
             .map(|(temp, fetch)| {
                 fetch_ref::promote_session_fetched_ref(
                     &repository,
+                    layer,
                     &req.session_id,
                     &req.branch,
                     fetch,
@@ -630,6 +653,23 @@ impl WorktreeManager {
                 )
             })
             .transpose()?;
+        // The host script the preflight found may be gone by now; the
+        // checkout and its binding stay for the session's compensation.
+        check_required_layer(
+            HookEvent::PostCreate,
+            &self.required_hooks,
+            layer,
+            self.config_dir.as_deref(),
+        )
+        .map_err(|err| {
+            match source
+                .as_ref()
+                .and_then(|source| source.backup_ref.as_deref())
+            {
+                Some(backup) => note_backup(err, &req.branch, backup),
+                None => err,
+            }
+        })?;
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.
         if let Some(failure) = self.run_worktree_hook(
@@ -697,6 +737,7 @@ impl WorktreeManager {
             base_branch: Some(base_branch.to_owned()),
             stop_reason: None,
             activity: None,
+            repo_layer: RepoHookLayer::of_session(req.skip_repo_hooks),
         };
         run_hook_layers(
             event,
@@ -734,6 +775,7 @@ impl WorktreeManager {
             base_branch: Some(binding.base_branch.clone()),
             stop_reason: None,
             activity: None,
+            repo_layer: RepoHookLayer::of_session(binding.skip_repo_hooks),
         };
         // Remove-hook warnings are only logged, so their stderr is never kept.
         run_hook(
@@ -890,7 +932,10 @@ impl WorktreeManager {
             .into_iter()
             .filter(|binding| binding.session_id == session_id)
         {
-            match worktree_unsaved_work(&binding.path) {
+            match worktree_unsaved_work(
+                &binding.path,
+                RepoHookLayer::of_session(binding.skip_repo_hooks),
+            ) {
                 WorktreeWork::Saved => {}
                 held @ WorktreeWork::Held { .. } => return held,
             }
@@ -1027,6 +1072,7 @@ impl WorktreeManager {
         warnings: &mut Vec<SessionWarning>,
         on_remove_error: impl FnOnce(&str),
     ) -> bool {
+        let layer = RepoHookLayer::of_session(binding.skip_repo_hooks);
         // pre-remove fires IN the worktree while it still exists.
         if binding.path.is_dir() {
             self.run_remove_hook(
@@ -1038,7 +1084,7 @@ impl WorktreeManager {
             );
         }
         // The binding is the ownership proof; only an owned worktree is removed.
-        let removed = match worktree_remove(&binding.repository, &binding.path) {
+        let removed = match worktree_remove(&binding.repository, layer, &binding.path) {
             Ok(()) => true,
             Err(message) => {
                 on_remove_error(&message);
@@ -1049,7 +1095,7 @@ impl WorktreeManager {
         // whenever the binding is dropped, even when the checkout survived
         // (compensation keeps the session record then). A later compensation
         // retry only removes, never re-binds, so no refetch can observe this.
-        delete_session_fetched_ref(&binding.repository, &binding.session_id);
+        delete_session_fetched_ref(&binding.repository, layer, &binding.session_id);
         // post-remove fires IN the repository (the worktree is gone). If the
         // repository itself is gone, skip with a warning rather than spawn in a
         // non-existent cwd.
@@ -1075,10 +1121,14 @@ impl WorktreeManager {
 
     /// Prune a stale git admin entry and remove any leftover directory so a
     /// fresh `git worktree add` can reuse the path.
-    fn reset_stale_worktree(repository: &Path, path: &Path) -> Result<(), ProtocolError> {
+    fn reset_stale_worktree(
+        repository: &Path,
+        layer: RepoHookLayer,
+        path: &Path,
+    ) -> Result<(), ProtocolError> {
         // `git worktree prune` clears admin entries for vanished worktrees; a
         // failure here is non-fatal (the add below is the real gate).
-        if let Err(message) = worktree_prune(repository) {
+        if let Err(message) = worktree_prune(repository, layer) {
             debug!(error = %message, "git worktree prune failed before recreate");
         }
         if path.exists() {
@@ -1098,6 +1148,7 @@ impl WorktreeManager {
     /// long as an existing `--base-branch` is supplied.
     fn resolve_base_branch(
         repository: &Path,
+        layer: RepoHookLayer,
         req: &WorktreeRequest,
     ) -> Result<BaseRef, ProtocolError> {
         let Some(requested) = req
@@ -1107,14 +1158,14 @@ impl WorktreeManager {
             .filter(|b| !b.is_empty())
         else {
             // No base requested: branch from the repository's current branch.
-            return Self::default_branch(repository).map(|name| BaseRef {
+            return Self::default_branch(repository, layer).map(|name| BaseRef {
                 name,
                 fetched: None,
             });
         };
 
         // `requested` was validated for flag injection by the caller.
-        match branch_exists(repository, requested) {
+        match branch_exists(repository, layer, requested) {
             Ok(true) => Ok(BaseRef {
                 name: requested.to_owned(),
                 fetched: None,
@@ -1122,7 +1173,7 @@ impl WorktreeManager {
             // An explicitly requested base is never replaced by another branch:
             // either origin supplies it, or the create fails.
             Ok(false) => {
-                if !has_origin(repository) {
+                if !has_origin(repository, layer) {
                     return Err(error(
                         ErrorClass::Runtime,
                         "invalid_base_branch",
@@ -1130,7 +1181,7 @@ impl WorktreeManager {
                         Some("create the base branch or omit --base-branch".to_owned()),
                     ));
                 }
-                match fetch_origin(repository, requested) {
+                match fetch_origin(repository, layer, requested) {
                     Ok(fetched) => Ok(BaseRef {
                         name: requested.to_owned(),
                         fetched: Some(fetched),
@@ -1165,6 +1216,7 @@ impl WorktreeManager {
         repository: &Path,
         req: &WorktreeRequest,
     ) -> Result<BaseRef, ProtocolError> {
+        let layer = RepoHookLayer::of_session(req.skip_repo_hooks);
         // A remote branch takes its commit from `origin/<branch>`: a project's
         // default base only names the binding's diff base and is neither
         // verified nor fetched.
@@ -1176,7 +1228,7 @@ impl WorktreeManager {
                 });
             }
         }
-        Self::resolve_base_branch(repository, req).map_err(|mut err| {
+        Self::resolve_base_branch(repository, layer, req).map_err(|mut err| {
             if req.branch_source == BranchSource::Remote && err.code == "invalid_base_branch" {
                 err.recover = Some(
                     "check out a branch in the repository (--base-branch cannot be combined with --from-remote)"
@@ -1199,8 +1251,11 @@ impl WorktreeManager {
     /// Also used by `session::diff` to resolve the fallback base ref when a
     /// session's `session.diff` request gives no explicit `base` and the
     /// worktree binding recorded none either.
-    pub(crate) fn default_branch(repository: &Path) -> Result<String, ProtocolError> {
-        let default = current_branch(repository).map_err(|message| {
+    pub(crate) fn default_branch(
+        repository: &Path,
+        layer: RepoHookLayer,
+    ) -> Result<String, ProtocolError> {
+        let default = current_branch(repository, layer).map_err(|message| {
             error(
                 ErrorClass::Runtime,
                 "invalid_base_branch",
@@ -1227,6 +1282,7 @@ impl WorktreeManager {
     /// different.
     fn warn_ignored_base_branch(
         repository: &Path,
+        layer: RepoHookLayer,
         path: &Path,
         req: &WorktreeRequest,
         base_branch: &str,
@@ -1241,7 +1297,7 @@ impl WorktreeManager {
         if !explicit_base {
             return;
         }
-        let branch_commit = git_capture(path, &["rev-parse", "--verify", "HEAD^{commit}"]);
+        let branch_commit = git_capture(path, layer, &["rev-parse", "--verify", "HEAD^{commit}"]);
         // A start point other than the base's name is the fetched commit; the
         // local base is named by its full ref, so a same-named tag cannot win.
         let base_rev = if start_point == base_branch {
@@ -1249,7 +1305,7 @@ impl WorktreeManager {
         } else {
             format!("{start_point}^{{commit}}")
         };
-        let base_commit = git_capture(repository, &["rev-parse", "--verify", &base_rev]);
+        let base_commit = git_capture(repository, layer, &["rev-parse", "--verify", &base_rev]);
         if let (Ok(branch_commit), Ok(base_commit)) = (&branch_commit, &base_commit) {
             if branch_commit == base_commit {
                 return;
@@ -1286,14 +1342,15 @@ impl WorktreeManager {
         base_fetched: Option<FetchedBase>,
         warnings: &mut Vec<SessionWarning>,
     ) -> Result<(String, Option<FetchedBase>, Option<RemotePlan>), ProtocolError> {
+        let layer = RepoHookLayer::of_session(req.skip_repo_hooks);
         if req.branch_source == BranchSource::Remote {
-            let plan = plan_remote_branch(repository, &req.branch, req.on_diverged)?;
+            let plan = plan_remote_branch(repository, layer, &req.branch, req.on_diverged)?;
             warnings.extend(plan.warning(&req.branch));
             return Ok((plan.fetched.commit.clone(), None, Some(plan)));
         }
         let (start_point, fetched) = match base_fetched {
             Some(fetched) => (fetched.commit.clone(), Some(fetched)),
-            None => Self::fetch_start_point(repository, base_branch, warnings),
+            None => Self::fetch_start_point(repository, layer, base_branch, warnings),
         };
         Ok((start_point, fetched, None))
     }
@@ -1308,14 +1365,15 @@ impl WorktreeManager {
     /// tip, not the stale local ref.
     fn fetch_start_point(
         repository: &Path,
+        layer: RepoHookLayer,
         base_branch: &str,
         warnings: &mut Vec<SessionWarning>,
     ) -> (String, Option<FetchedBase>) {
-        if !has_origin(repository) {
+        if !has_origin(repository, layer) {
             // No remote to fetch from — branch from the local base ref.
             return (base_branch.to_owned(), None);
         }
-        match fetch_origin(repository, base_branch) {
+        match fetch_origin(repository, layer, base_branch) {
             // Branch from the pinned commit so the worktree starts up to date
             // rather than from the stale local ref.
             Ok(fetched) => (fetched.commit.clone(), Some(fetched)),
@@ -1336,17 +1394,18 @@ impl WorktreeManager {
     /// one from the base ref. Returns whether it checked out an existing branch.
     fn create_worktree(
         repository: &Path,
+        layer: RepoHookLayer,
         path: &Path,
         branch: &str,
         start_point: &str,
     ) -> Result<bool, ProtocolError> {
-        let exists = matches!(branch_exists(repository, branch), Ok(true));
+        let exists = matches!(branch_exists(repository, layer, branch), Ok(true));
         let result = if exists {
             // The branch already exists (e.g. a recreate after the dir was lost):
             // check it out rather than failing on `-b`.
-            worktree_add_existing(repository, path, branch)
+            worktree_add_existing(repository, layer, path, branch)
         } else {
-            worktree_add_new(repository, path, branch, start_point)
+            worktree_add_new(repository, layer, path, branch, start_point)
         };
         result
             .map(|()| exists)
@@ -1513,23 +1572,23 @@ fn is_valid_worktree(path: &Path) -> bool {
 /// non-repo directory is rejected. Accepting bare here is what makes the worktree
 /// path the valid escape hatch for a bare project (an in-place session is refused
 /// on a bare repo precisely because it has no working tree to run in).
-fn is_git_repo(repo: &Path) -> bool {
+fn is_git_repo(repo: &Path, layer: RepoHookLayer) -> bool {
     let answers_true =
-        |args: &[&str]| matches!(git_capture(repo, args), Ok(out) if out.trim() == "true");
+        |args: &[&str]| matches!(git_capture(repo, layer, args), Ok(out) if out.trim() == "true");
     answers_true(&["rev-parse", "--is-inside-work-tree"])
         || answers_true(&["rev-parse", "--is-bare-repository"])
 }
 
 /// The repository's current branch (used as the default base ref).
-fn current_branch(repo: &Path) -> Result<String, String> {
-    git_capture(repo, &["symbolic-ref", "--short", "HEAD"])
+fn current_branch(repo: &Path, layer: RepoHookLayer) -> Result<String, String> {
+    git_capture(repo, layer, &["symbolic-ref", "--short", "HEAD"])
 }
 
 /// Three-valued branch existence (Kandev `branchExists`): `Ok(true)` exists,
 /// `Ok(false)` git ran and the ref is absent, `Err` could not tell.
-fn branch_exists(repo: &Path, branch: &str) -> Result<bool, String> {
+fn branch_exists(repo: &Path, layer: RepoHookLayer, branch: &str) -> Result<bool, String> {
     let refname = format!("refs/heads/{branch}");
-    let mut cmd = git_command(repo)?;
+    let mut cmd = git_command(repo, layer)?;
     cmd.args(["rev-parse", "--verify", "--quiet", &refname]);
     let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
     match output.status.code() {
@@ -1543,13 +1602,17 @@ fn branch_exists(repo: &Path, branch: &str) -> Result<bool, String> {
 }
 
 /// Whether the repository has an `origin` remote configured.
-pub(crate) fn has_origin(repo: &Path) -> bool {
-    git_capture(repo, &["remote", "get-url", "origin"]).is_ok()
+pub(crate) fn has_origin(repo: &Path, layer: RepoHookLayer) -> bool {
+    git_capture(repo, layer, &["remote", "get-url", "origin"]).is_ok()
 }
 
 /// Reject a base ref that git would not accept as a ref name. This keeps refspec
 /// syntax (`:`, `+`, `*`, whitespace, ...) out of the fetch refspec built from it.
-pub(crate) fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), String> {
+pub(crate) fn check_fetch_source(
+    repo: &Path,
+    layer: RepoHookLayer,
+    base_branch: &str,
+) -> Result<(), String> {
     // `+` is a valid ref character but a leading one would make the refspec a
     // forced update.
     if base_branch.starts_with(['-', '+']) {
@@ -1557,7 +1620,7 @@ pub(crate) fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), S
             "base ref {base_branch:?} cannot begin with '-' or '+'"
         ));
     }
-    let mut cmd = git_command(repo)?;
+    let mut cmd = git_command(repo, layer)?;
     cmd.args(["check-ref-format", "--allow-onelevel", base_branch]);
     let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
     if output.status.success() {
@@ -1574,11 +1637,12 @@ pub(crate) fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), S
 /// parsed positionally (the branch is validated by the caller).
 fn worktree_add_new(
     repo: &Path,
+    layer: RepoHookLayer,
     path: &Path,
     branch: &str,
     start_point: &str,
 ) -> Result<(), String> {
-    let mut cmd = git_command(repo)?;
+    let mut cmd = git_command(repo, layer)?;
     cmd.arg("worktree")
         .arg("add")
         .arg("-b")
@@ -1586,25 +1650,30 @@ fn worktree_add_new(
         .arg("--end-of-options")
         .arg(path)
         .arg(start_point);
-    run_admin_command(repo, cmd)
+    run_admin_command(repo, layer, cmd)
 }
 
 /// `git worktree add <path> <branch>` — check out an existing branch.
-fn worktree_add_existing(repo: &Path, path: &Path, branch: &str) -> Result<(), String> {
-    let mut cmd = git_command(repo)?;
+fn worktree_add_existing(
+    repo: &Path,
+    layer: RepoHookLayer,
+    path: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    let mut cmd = git_command(repo, layer)?;
     cmd.arg("worktree")
         .arg("add")
         .arg("--end-of-options")
         .arg(path)
         .arg(branch);
-    run_admin_command(repo, cmd)
+    run_admin_command(repo, layer, cmd)
 }
 
 /// `git worktree remove --force <path>` — remove the checkout (not the branch).
-fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
-    let mut cmd = git_command(repo)?;
+fn worktree_remove(repo: &Path, layer: RepoHookLayer, path: &Path) -> Result<(), String> {
+    let mut cmd = git_command(repo, layer)?;
     cmd.arg("worktree").arg("remove").arg("--force").arg(path);
-    run_admin_command(repo, cmd)
+    run_admin_command(repo, layer, cmd)
 }
 
 /// Locks guarding a repository's `worktrees/` admin directory, keyed by the
@@ -1652,9 +1721,10 @@ struct AdminLock {
 ///
 /// Every spelling of one repository resolves to the same lock; distinct
 /// repositories get distinct locks and so never wait on each other.
-fn admin_lock(repo: &Path) -> Result<Arc<AdminLock>, String> {
+fn admin_lock(repo: &Path, layer: RepoHookLayer) -> Result<Arc<AdminLock>, String> {
     let common_dir = git_capture(
         repo,
+        layer,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let key = canonical_or_original(Path::new(&common_dir));
@@ -1733,8 +1803,8 @@ fn acquire_within<G>(
 /// Run a git command that rewrites `repo`'s `worktrees/` admin directory while
 /// holding that repository's [`admin_lock`]. The command keeps its own
 /// [`GIT_COMMAND_TIMEOUT`]; the lock wait is bounded by the same value.
-fn run_admin_command(repo: &Path, cmd: Command) -> Result<(), String> {
-    run_admin_command_within(repo, cmd, GIT_COMMAND_TIMEOUT)
+fn run_admin_command(repo: &Path, layer: RepoHookLayer, cmd: Command) -> Result<(), String> {
+    run_admin_command_within(repo, layer, cmd, GIT_COMMAND_TIMEOUT)
 }
 
 /// [`run_admin_command`] with an explicit bound on the lock wait.
@@ -1744,10 +1814,11 @@ fn run_admin_command(repo: &Path, cmd: Command) -> Result<(), String> {
 /// its output afterwards needs no lock.
 fn run_admin_command_within(
     repo: &Path,
+    layer: RepoHookLayer,
     cmd: Command,
     lock_timeout: Duration,
 ) -> Result<(), String> {
-    let lock = admin_lock(repo)?;
+    let lock = admin_lock(repo, layer)?;
     let guard = lock_within(&lock, lock_timeout)?;
     let output = run_output_bounded_then(
         cmd,
@@ -1765,13 +1836,14 @@ fn run_admin_command_within(
 /// its repository is gone or `git worktree prune` ran to drop the vanished
 /// worktree's admin entry (git keeps a locked entry, as it does for any prune).
 fn checkout_released(binding: &WorktreeBinding) -> bool {
+    let layer = RepoHookLayer::of_session(binding.skip_repo_hooks);
     if binding.path.exists() {
         return false;
     }
     if !binding.repository.is_dir() {
         return true;
     }
-    match worktree_prune(&binding.repository) {
+    match worktree_prune(&binding.repository, layer) {
         Ok(()) => true,
         Err(message) => {
             warn!(
@@ -1785,10 +1857,10 @@ fn checkout_released(binding: &WorktreeBinding) -> bool {
 }
 
 /// `git worktree prune` — drop admin entries for vanished worktrees.
-fn worktree_prune(repo: &Path) -> Result<(), String> {
-    let mut cmd = git_command(repo)?;
+fn worktree_prune(repo: &Path, layer: RepoHookLayer) -> Result<(), String> {
+    let mut cmd = git_command(repo, layer)?;
     cmd.args(["worktree", "prune"]);
-    run_admin_command(repo, cmd)
+    run_admin_command(repo, layer, cmd)
 }
 
 /// Reports whether removing the checkout at `path` would destroy work.
@@ -1799,13 +1871,17 @@ fn worktree_prune(repo: &Path) -> Result<(), String> {
 /// a commit no other ref contains. Every git failure is a
 /// [`SessionRetentionHold::WorktreeUnknown`] hold: an unattended caller must not
 /// delete a checkout it could not read.
-fn worktree_unsaved_work(path: &Path) -> WorktreeWork {
+fn worktree_unsaved_work(path: &Path, layer: RepoHookLayer) -> WorktreeWork {
     if !path.is_dir() {
         // Nothing is on disk to lose; removal only prunes git's admin entry.
         return WorktreeWork::Saved;
     }
     // Ignored files are excluded on purpose (see `WorktreeManager::unsaved_work`).
-    match git_capture(path, &["status", "--porcelain", "--untracked-files=normal"]) {
+    match git_capture(
+        path,
+        layer,
+        &["status", "--porcelain", "--untracked-files=normal"],
+    ) {
         Ok(status) => {
             if let Some((hold, detail)) = status_hold(&status) {
                 return WorktreeWork::Held { hold, detail };
@@ -1818,7 +1894,7 @@ fn worktree_unsaved_work(path: &Path) -> WorktreeWork {
             }
         }
     }
-    unpushed_hold(path)
+    unpushed_hold(path, layer)
 }
 
 /// Returns the hold implied by `git status --porcelain` output, if any.
@@ -1853,8 +1929,8 @@ fn status_hold(status: &str) -> Option<(SessionRetentionHold, String)> {
 ///
 /// The worktree's own branch is excluded from the search: it is the ref the
 /// removal leaves behind, so it cannot prove the commits exist anywhere else.
-fn unpushed_hold(path: &Path) -> WorktreeWork {
-    let head = match git_capture(path, &["rev-parse", "--verify", "HEAD"]) {
+fn unpushed_hold(path: &Path, layer: RepoHookLayer) -> WorktreeWork {
+    let head = match git_capture(path, layer, &["rev-parse", "--verify", "HEAD"]) {
         Ok(head) => head,
         Err(message) => {
             return WorktreeWork::Held {
@@ -1864,9 +1940,10 @@ fn unpushed_hold(path: &Path) -> WorktreeWork {
         }
     };
     // A detached HEAD has no own branch, which only widens the search.
-    let own_branch = git_capture(path, &["symbolic-ref", "--quiet", "HEAD"]).ok();
+    let own_branch = git_capture(path, layer, &["symbolic-ref", "--quiet", "HEAD"]).ok();
     let containing = match git_capture(
         path,
+        layer,
         &[
             "for-each-ref",
             "--contains",
@@ -1972,6 +2049,9 @@ pub(crate) struct HookContext {
     pub stop_reason: Option<&'static str>,
     /// Agent activity value (`POHUNEK_ACTIVITY`) for `agent-state`.
     pub activity: Option<&'static str>,
+    /// Whether the in-repo layer runs after the host-global one. Selects the
+    /// scripts; never exported to the hook.
+    pub repo_layer: RepoHookLayer,
 }
 
 /// Build the env-clear allowlist a hook runs with: `PATH`/`HOME` passed through
@@ -2017,9 +2097,38 @@ fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
     env
 }
 
+/// The environment entries that turn git's own hooks off for a host-global
+/// script of a session that skips its checkout's hooks: the script runs git in
+/// that checkout too. Its cleared environment `env` holds no other pair, so
+/// the pairs start at 0, and the configured hooks are those git sees in `cwd`
+/// with `env`. A session that runs its checkout's hooks gets none.
+///
+/// # Errors
+///
+/// The listing's message: the script does not run with a hook left on.
+fn host_git_hooks_off(
+    layer: RepoHookLayer,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    if layer == RepoHookLayer::Run {
+        return Ok(Vec::new());
+    }
+    let hooks = list_config_hooks(cwd, env)?;
+    git_hooks_off_pairs(0, &hooks).map_err(|error| error.msg)
+}
+
 /// Resolve a hook's in-repo script path: `<in_repo_dir>/.pohunek/hooks/<event>`,
 /// or — for `post-create` only — the legacy `.pohunek/setup` fallback (never both).
-fn resolve_in_repo_hook(event: HookEvent, in_repo_dir: &Path) -> Option<PathBuf> {
+/// `None` without a lookup when `layer` skips the in-repo layer.
+fn resolve_in_repo_hook(
+    event: HookEvent,
+    in_repo_dir: &Path,
+    layer: RepoHookLayer,
+) -> Option<PathBuf> {
+    if layer == RepoHookLayer::Skip {
+        return None;
+    }
     let hook = in_repo_dir.join(".pohunek/hooks").join(event.as_env());
     if hook.is_file() {
         return Some(hook);
@@ -2036,7 +2145,8 @@ fn resolve_in_repo_hook(event: HookEvent, in_repo_dir: &Path) -> Option<PathBuf>
 /// Run the lifecycle hooks for `event`, composing the **host-global layer first,
 /// then the in-repo layer** (each an independent, env-cleared spawn; a failure in
 /// one is its own warning and does not stop the other). In-repo hooks are looked
-/// up under `in_repo_dir`; the host-global layer under `<config_dir>/hooks/`.
+/// up under `in_repo_dir` unless `ctx.repo_layer` skips that layer; the
+/// host-global layer under `<config_dir>/hooks/`.
 ///
 /// Each hook runs with a **cleared environment** plus only the [`hook_env`]
 /// allowlist (closing the env-inheritance exfil gap: a hostile committed hook can
@@ -2097,34 +2207,37 @@ fn run_hook_layers(
     let env = hook_env(event, ctx);
     let cwd = &ctx.cwd_or(in_repo_dir);
     // Host-global layer first (composed, not overridden).
-    if let Some(config_dir) = config_dir {
-        let host_script = config_dir.join("hooks").join(event.as_env());
-        if host_script.is_file() {
-            let outcome = run_timed_hook(
-                &HookRun {
-                    event,
-                    layer: HookLayer::Host,
-                    session_id: &ctx.session_id,
-                    script: &host_script,
-                    cwd,
-                    env: &env,
-                    timeout,
-                },
-                warnings,
-                stderr_tails.as_mut(),
-            );
-            if required && outcome != HookRunOutcome::Succeeded {
-                return Some(RequiredHookFailure {
-                    layer: HookLayer::Host,
-                    detail: last_warning_detail(warnings, outcome),
-                    not_run: resolve_in_repo_hook(event, in_repo_dir)
-                        .into_iter()
-                        .collect(),
-                });
+    if let Some(host_script) = host_hook_script(config_dir, event) {
+        let outcome = match host_git_hooks_off(ctx.repo_layer, cwd, &env) {
+            Ok(pairs) => {
+                let host_env: Vec<_> = env.iter().cloned().chain(pairs).collect();
+                run_timed_hook(
+                    &HookRun {
+                        event,
+                        layer: HookLayer::Host,
+                        session_id: &ctx.session_id,
+                        script: &host_script,
+                        cwd,
+                        env: &host_env,
+                        timeout,
+                    },
+                    warnings,
+                    stderr_tails.as_mut(),
+                )
             }
+            Err(err) => hook_not_spawned(event, &host_script, &err, warnings),
+        };
+        if required && outcome != HookRunOutcome::Succeeded {
+            return Some(RequiredHookFailure {
+                layer: HookLayer::Host,
+                detail: last_warning_detail(warnings, outcome),
+                not_run: resolve_in_repo_hook(event, in_repo_dir, ctx.repo_layer)
+                    .into_iter()
+                    .collect(),
+            });
         }
     }
-    if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
+    if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir, ctx.repo_layer) {
         let outcome = run_timed_hook(
             &HookRun {
                 event,
@@ -2567,7 +2680,11 @@ fn terminate_process_group(child: &mut Child) {
 }
 
 /// A `git` command scoped to `repo` via `-C` (passed as an `OsStr` so non-UTF-8
-/// repo paths survive).
+/// repo paths survive), with the options of the session's hook `layer`
+/// ([`RepoHookLayer::git_options`]). A skipped layer also turns off every
+/// filter driver and every configured hook the configuration seen from `repo`
+/// defines ([`repo_hooks::git_programs_off_env`]); the listing runs once per
+/// command, so one configured since the last command is off too.
 ///
 /// The program is the trusted absolute path
 /// [`trusted_program`](crate::agent::trusted_program) resolves once, so no
@@ -2576,11 +2693,65 @@ fn terminate_process_group(child: &mut Child) {
 /// # Errors
 ///
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
-/// like a failed spawn.
-pub(crate) fn git_command(repo: &Path) -> Result<Command, String> {
-    let mut cmd = crate::git::command()?;
-    cmd.arg("-C").arg(repo);
+/// like a failed spawn. Under a skipped layer, a listing that fails, times out
+/// or overflows returns its message: the command does not run with a driver
+/// or hook left on.
+pub(crate) fn git_command(repo: &Path, layer: RepoHookLayer) -> Result<Command, String> {
+    let scoped = || -> Result<Command, String> {
+        let mut cmd = crate::git::command()?;
+        cmd.args(layer.git_options());
+        cmd.arg("-C").arg(repo);
+        Ok(cmd)
+    };
+    let mut cmd = scoped()?;
+    if layer == RepoHookLayer::Skip {
+        let mut listing = scoped()?;
+        listing.args(repo_hooks::GIT_PROGRAM_LISTING);
+        let output = run_output_bounded(listing, GIT_COMMAND_TIMEOUT)?;
+        let listed = listed_keys(&output, "filter drivers and hooks")?;
+        cmd.envs(repo_hooks::git_programs_off_env(listed));
+    }
     Ok(cmd)
+}
+
+/// The keys a `git config --get-regexp` listing printed: exit 0 with keys, or
+/// exit 1 with none.
+///
+/// # Errors
+///
+/// Any other exit, naming `what` was listed.
+fn listed_keys<'a>(output: &'a Output, what: &str) -> Result<&'a [u8], String> {
+    match output.status.code() {
+        Some(0) => Ok(output.stdout.as_slice()),
+        Some(1) if output.stdout.is_empty() => Ok(&[]),
+        _ => Err(format!(
+            "listing the configured {what} failed: {}",
+            output_failure_message(output)
+        )),
+    }
+}
+
+/// The configured hooks (`hook.<name>.*`) git sees in `dir` when it runs with
+/// exactly the environment `env` (later entries win), for a process the
+/// daemon starts in a session's checkout without wrapping its git: the agent
+/// and the host hook scripts.
+///
+/// # Errors
+///
+/// A listing that cannot run, fails, times out or overflows, or a hook name
+/// that is not UTF-8.
+pub(crate) fn list_config_hooks(
+    dir: &Path,
+    env: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    let mut cmd = Command::new(crate::git::executable()?);
+    cmd.env_clear()
+        .envs(env.iter().map(|(name, value)| (name, value)))
+        .arg("-C")
+        .arg(dir)
+        .args(repo_hooks::CONFIG_HOOK_LISTING);
+    let output = run_output_bounded(cmd, GIT_COMMAND_TIMEOUT)?;
+    repo_hooks::config_hook_names(listed_keys(&output, "hooks")?)
 }
 
 /// Run a `git` invocation built with [`git_command`], discarding stdout but
@@ -2645,16 +2816,16 @@ fn run_output_bounded_then(
 }
 
 /// Run `git -C <repo> <args>` capturing trimmed stdout on success.
-fn git_run(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = git_command(repo)?;
+fn git_run(repo: &Path, layer: RepoHookLayer, args: &[&str]) -> Result<String, String> {
+    let mut cmd = git_command(repo, layer)?;
     cmd.args(args);
     run_command(cmd)
 }
 
 /// Like [`git_run`] but for read-only probes: identical behavior, named to make
 /// call sites read as "capture this value".
-fn git_capture(repo: &Path, args: &[&str]) -> Result<String, String> {
-    git_run(repo, args)
+fn git_capture(repo: &Path, layer: RepoHookLayer, args: &[&str]) -> Result<String, String> {
+    git_run(repo, layer, args)
 }
 
 /// herdr-style failure message: prefer trimmed stderr, then stdout, then a

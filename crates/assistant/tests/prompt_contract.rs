@@ -153,6 +153,8 @@ fn capabilities() -> Value {
         integration_agent_skill_supported: true,
         session_new_branch_source_supported: true,
         session_new_agent_options_supported: true,
+        host_hooks: None,
+        session_new_skip_repo_hooks_supported: false,
     })
     .expect("serialize the capability snapshot")
 }

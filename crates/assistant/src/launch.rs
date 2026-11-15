@@ -276,6 +276,7 @@ pub async fn prepare_with_options(
         context_package_digest,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     Ok(PreparedLaunch {

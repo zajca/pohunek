@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use pohunek_test_support::env::TestEnv;
 
 use super::fetch::fetch_origin;
-use super::{branch_exists, worktree_add_new, worktree_remove};
+use super::{branch_exists, worktree_add_new, worktree_remove, RepoHookLayer};
 
 /// Variables the child starts with: each points Git at a repository, index or
 /// worktree that does not exist.
@@ -139,10 +139,14 @@ fn daemon_git_under_ambient_git_variables() {
 
     // A worktree operation addresses the same repository.
     let checkout = env.root().join("checkout");
-    worktree_add_new(&repo, &checkout, "feature", "main").expect("add worktree");
+    worktree_add_new(&repo, RepoHookLayer::Run, &checkout, "feature", "main")
+        .expect("add worktree");
     assert!(checkout.join("README.md").is_file());
-    assert_eq!(branch_exists(&repo, "feature"), Ok(true));
-    worktree_remove(&repo, &checkout).expect("remove worktree");
+    assert_eq!(
+        branch_exists(&repo, RepoHookLayer::Run, "feature"),
+        Ok(true)
+    );
+    worktree_remove(&repo, RepoHookLayer::Run, &checkout).expect("remove worktree");
     assert!(!checkout.exists());
 
     // The quarantine marker forbids ref updates of any git child that sees it,
@@ -152,10 +156,19 @@ fn daemon_git_under_ambient_git_variables() {
         "the child starts with the quarantine marker set to an existing directory"
     );
     let quarantined = env.root().join("quarantined");
-    worktree_add_new(&repo, &quarantined, "quarantined-feature", "main")
-        .expect("add worktree despite the quarantine marker");
-    assert_eq!(branch_exists(&repo, "quarantined-feature"), Ok(true));
-    worktree_remove(&repo, &quarantined).expect("remove quarantined worktree");
+    worktree_add_new(
+        &repo,
+        RepoHookLayer::Run,
+        &quarantined,
+        "quarantined-feature",
+        "main",
+    )
+    .expect("add worktree despite the quarantine marker");
+    assert_eq!(
+        branch_exists(&repo, RepoHookLayer::Run, "quarantined-feature"),
+        Ok(true)
+    );
+    worktree_remove(&repo, RepoHookLayer::Run, &quarantined).expect("remove quarantined worktree");
 
     // A replace ref substitutes `HEAD` with the first commit; the daemon applies
     // it like the fixture does.
@@ -262,7 +275,8 @@ fn daemon_worktree_add_ignores_command_scoped_hooks_path() {
     std::fs::remove_file(&marker).expect("remove marker");
 
     let checkout = env.root().join("checkout");
-    worktree_add_new(&repo, &checkout, "feature", "main").expect("add worktree");
+    worktree_add_new(&repo, RepoHookLayer::Run, &checkout, "feature", "main")
+        .expect("add worktree");
     assert!(checkout.is_dir());
     assert!(
         !marker.exists(),
@@ -393,7 +407,8 @@ fn daemon_fetch_under_exec_path() {
     assert!(marker.is_file(), "the inherited exec path runs the helper");
     std::fs::remove_file(&marker).expect("remove marker");
 
-    fetch_origin(&repo, "main").expect_err("the fetch from an unreachable remote fails");
+    fetch_origin(&repo, RepoHookLayer::Run, "main")
+        .expect_err("the fetch from an unreachable remote fails");
     assert!(
         !marker.exists(),
         "the daemon's fetch ran a helper from the inherited GIT_EXEC_PATH"
@@ -552,7 +567,8 @@ fn daemon_git_subprocesses_under_user_variables() {
 
     // The daemon's fetch reaches the same transport with the persistent
     // variables only.
-    fetch_origin(&repo, "main").expect_err("the fetch from an unreachable remote fails");
+    fetch_origin(&repo, RepoHookLayer::Run, "main")
+        .expect_err("the fetch from an unreachable remote fails");
     let fetch_names = recorded_names(&fetch_record);
     for (name, _) in KEPT_USER_VARS {
         assert!(
@@ -573,7 +589,14 @@ fn daemon_git_subprocesses_under_user_variables() {
     assert!(!trace.exists(), "the daemon's fetch wrote the trace file");
 
     // The checkout of a new worktree runs the smudge filter with the same set.
-    worktree_add_new(&repo, &env.root().join("checkout"), "feature", "main").expect("add worktree");
+    worktree_add_new(
+        &repo,
+        RepoHookLayer::Run,
+        &env.root().join("checkout"),
+        "feature",
+        "main",
+    )
+    .expect("add worktree");
     let filter_names = recorded_names(&filter_record);
     for (name, _) in KEPT_USER_VARS {
         assert!(
@@ -665,7 +688,8 @@ fn daemon_fetch_under_protocol_trust_marker() {
         "the inherited trust marker must refuse the user-allowed protocol"
     );
 
-    let fetched = fetch_origin(&repo, "main").expect("the daemon's fetch is user-initiated");
+    let fetched = fetch_origin(&repo, RepoHookLayer::Run, "main")
+        .expect("the daemon's fetch is user-initiated");
     assert_eq!(
         fetched.commit,
         fixture_git(&env, &source, &["rev-parse", "HEAD"])

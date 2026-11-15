@@ -564,6 +564,15 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/project/candidates.rs` — `project.candidates` aggregation, bounds and path filters.
 - `crates/daemon/src/external/history.rs` — the bounded, symlink-safe read of agent history heads for `project.candidates`.
 - `crates/daemon/src/worktree/mod.rs`
+- `crates/daemon/src/worktree/repo_hooks.rs` — hook layer selection for
+  `skip_repo_hooks`, the `hook_required_skipped` check, the host-global
+  script presence `host.inspect` reports as `host_hooks`, and git's own hooks
+  and fsmonitor hook turned off for such a session (the `-c
+  core.hooksPath=/dev/null -c core.fsmonitor=false` of every daemon git
+  command, the listing of filter drivers and configured hooks and the pairs
+  that turn them off, the `--no-textconv` of its session diff, the
+  `GIT_CONFIG_COUNT` pairs of the agent and the host hook scripts with their
+  own configured-hook listing, `git_hooks_env_conflict`).
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/capabilities.rs`
 - `crates/daemon/src/integration/mod.rs`

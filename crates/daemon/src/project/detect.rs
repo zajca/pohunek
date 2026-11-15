@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
-use crate::worktree::{canonical_or_original, redact_url_credentials};
+use crate::worktree::{canonical_or_original, redact_url_credentials, RepoHookLayer};
 
 /// Wall-clock bound on a single detection `git` call. Detection runs on the
 /// session-start hot path, so a wedged/slow `git` must never block it: a call
@@ -110,6 +110,7 @@ fn git_reports_no_repository(cwd: &Path) -> bool {
     };
     command
         .env("LC_ALL", "C")
+        .args(RepoHookLayer::Skip.git_options())
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -317,9 +318,19 @@ fn warn_git_too_old() {
 /// stdout on a zero exit and `None` on any failure (see [`run_bounded`]). Shared
 /// with [`crate::project`] so `project show`'s live `git worktree list` is bound
 /// by the same hot-path discipline as detection.
+///
+/// Detection reads any directory a caller names, including a checkout whose
+/// content the session distrusts, so it runs with the hook directory and the
+/// fsmonitor hook off ([`RepoHookLayer::Skip`]). Its read-only queries fire no
+/// hook event and apply no filter, so a configured hook or filter driver
+/// cannot run either.
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let mut command = crate::git::command().ok()?;
-    command.arg("-C").arg(cwd).args(args);
+    command
+        .args(RepoHookLayer::Skip.git_options())
+        .arg("-C")
+        .arg(cwd)
+        .args(args);
     run_bounded(command, DETECT_GIT_TIMEOUT)
 }
 

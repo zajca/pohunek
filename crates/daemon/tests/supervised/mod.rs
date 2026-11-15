@@ -462,6 +462,7 @@ impl Installation {
             context_package_digest: None,
             fetch_ref: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 
@@ -846,6 +847,7 @@ impl Installation {
             ended_at: None,
             exit_code: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         };
         self.store()
             .record_session(&SessionRecord {
@@ -900,6 +902,7 @@ impl Installation {
             launch_checkout: None,
             context_pin: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 

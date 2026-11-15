@@ -9625,6 +9625,7 @@ while os.getppid() == parent:
                 ..Default::default()
             },
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         };
         let store_path = root.join("data/metadata.jsonl");
         let store = Store::new(store_path.clone());
@@ -9655,6 +9656,7 @@ while os.getppid() == parent:
             launch_checkout: None,
             context_pin: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         };
         store
             .record_session(&SessionRecord {
@@ -10083,6 +10085,7 @@ while os.getppid() == parent:
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create after daemon replacement");
@@ -11210,6 +11213,7 @@ while os.getppid() == parent:
                     ..Default::default()
                 },
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             },
             recovery: Some(ResumeBinding {
                 spawned_by: None,
@@ -11236,6 +11240,7 @@ while os.getppid() == parent:
                 launch_checkout: None,
                 context_pin: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -12811,6 +12816,7 @@ handler = "codex-hook-v1"
             context_package_digest: None,
             fetch_ref: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 
@@ -21060,6 +21066,7 @@ generation "$1"
                         context_package_digest: None,
                         fetch_ref: None,
                         agent_options: std::collections::BTreeMap::new(),
+                        skip_repo_hooks: false,
                     })
                     .await
                     .expect("create a supervised session");

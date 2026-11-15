@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
-use super::launch_input::LaunchSubject;
+use super::launch_input::{pin_git_hooks_off, LaunchSubject};
 use crate::agent::host::{
     CheckoutTrust, LaunchPin, ProfileRevision, RuntimeDefinition, RuntimeHost,
 };
@@ -1005,6 +1005,7 @@ impl SessionRegistry {
             is_linked_worktree: entry.info.is_linked_worktree,
             metadata: entry.info.metadata.clone(),
             spawned_by: entry.info.spawned_by.clone(),
+            skip_repo_hooks: entry.info.skip_repo_hooks,
             // Structural relaunch snapshot (C.4): copied verbatim from the frozen
             // entry snapshot on EVERY persist and on explicit resume, so neither a
             // resize re-persist nor a terminal relaunch can overwrite the
@@ -1129,11 +1130,15 @@ impl SessionRegistry {
                 trusted_args: &trusted_args,
             },
         )?;
+        let mut env_extra = inputs.env;
+        if binding.skip_repo_hooks {
+            pin_git_hooks_off(&relaunch.base_environment, &mut env_extra, &binding.cwd).await?;
+        }
         let opts = LaunchOpts {
             cwd: binding.cwd.clone(),
             cols: binding.cols,
             rows: binding.rows,
-            env_extra: inputs.env,
+            env_extra,
             validated_program,
             worker_file: inputs.worker_file,
         };
@@ -1194,6 +1199,7 @@ impl SessionRegistry {
                 worktree_path,
                 metadata: binding.metadata,
                 spawned_by: binding.spawned_by,
+                skip_repo_hooks: binding.skip_repo_hooks,
                 create_request: None,
                 warnings: outdated_hooks,
                 // The live entry's launch marker is carried when the resumed entry

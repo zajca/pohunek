@@ -902,6 +902,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
             generation_recorded: None,
         }),
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 

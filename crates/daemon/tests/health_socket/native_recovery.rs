@@ -37,6 +37,9 @@ struct ClaudeRig {
     server: tokio::task::JoinHandle<()>,
     session: SessionInfo,
     argv_log: PathBuf,
+    /// One line per agent launch: the session id and the agent's
+    /// `GIT_CONFIG_COUNT` and its pairs 0 to 3.
+    git_env_log: PathBuf,
     ack_log: PathBuf,
     config_home: PathBuf,
     worker_state_root: PathBuf,
@@ -105,6 +108,7 @@ impl ClaudeRig {
             .expect("install managed Claude hook");
         let hook = config_home.join("hooks/pohunek-agent-state.sh");
         let argv_log = state.join("argv.log");
+        let git_env_log = state.join("git-env.log");
         let ack_log = state.join("hook-ack.log");
         let script = bin.join("fixture-agent.sh");
         write_executable(
@@ -112,6 +116,7 @@ impl ClaudeRig {
             &format!(
                 "#!/bin/bash\n\
                  printf '%s\\n' \"$*\" >> {argv:?}\n\
+                 printf '%s %s %s %s %s %s %s %s %s %s\\n' \"$POHUNEK_SESSION_ID\" \"${{GIT_CONFIG_COUNT:-}}\" \"${{GIT_CONFIG_KEY_0:-}}\" \"${{GIT_CONFIG_VALUE_0:-}}\" \"${{GIT_CONFIG_KEY_1:-}}\" \"${{GIT_CONFIG_VALUE_1:-}}\" \"${{GIT_CONFIG_KEY_2:-}}\" \"${{GIT_CONFIG_VALUE_2:-}}\" \"${{GIT_CONFIG_KEY_3:-}}\" \"${{GIT_CONFIG_VALUE_3:-}}\" >> {git_env:?}\n\
                  printf '\\033[?2004h'\n\
                  while read -r action source reference; do\n\
                    case \"$action\" in\n\
@@ -120,6 +125,7 @@ impl ClaudeRig {
                    esac\n\
                  done\n",
                 argv = argv_log.display().to_string(),
+                git_env = git_env_log.display().to_string(),
                 hook = hook.display().to_string(),
                 ack = ack_log.display().to_string(),
             ),
@@ -193,6 +199,7 @@ impl ClaudeRig {
             server,
             session,
             argv_log,
+            git_env_log,
             ack_log,
             config_home,
             worker_state_root,
@@ -493,6 +500,75 @@ async fn a_recovered_session_keeps_the_key_of_its_creating_request() {
         "the recovery wrote the key to the durable record"
     );
     assert_eq!(after_restart.session.id, id);
+    rig.stop_daemon().await;
+}
+
+/// A session started with `skip_repo_hooks` keeps the switch through a resume,
+/// which rebuilds the session from its resume binding, and through a daemon
+/// restart after it (#2366). Its directory is a repository that configures a
+/// hook (`hook.resume-lint.command`); both launches turn it off by name.
+#[tokio::test]
+async fn a_resumed_session_keeps_skipping_the_repository_hooks() {
+    let mut rig = ClaudeRig::new("claude-skip-resume").await;
+    for args in [
+        &["init", "-q"][..],
+        &["config", "hook.resume-lint.command", "true"],
+        &["config", "hook.resume-lint.event", "post-index-change"],
+    ] {
+        let status = pohunek_test_support::git::command()
+            .arg("-C")
+            .arg(rig.cwd.to_path_buf())
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
+    let mut params =
+        serde_json::to_value(session_params_in(rig.cwd.to_path_buf())).expect("serialize params");
+    params["agent"] = serde_json::json!("claude-fixture");
+    params["skip_repo_hooks"] = serde_json::json!(true);
+    let created = keyed_create(&mut rig.control, &params).await;
+    assert!(
+        created.session.skip_repo_hooks,
+        "the create records the switch"
+    );
+    let id = created.session.id.clone();
+    rig.additional_sessions.push(id.clone());
+    rig.transcript(LAUNCH);
+    rig.report_for(&id, "startup", LAUNCH).await;
+    rig.stop(&id).await;
+    ok_payload(rig.resume_session(&id).await);
+
+    let resumed = inspect_session(&mut rig.control, &id).await;
+    assert!(resumed.skip_repo_hooks, "the relaunch keeps the switch");
+    // Both launches of the switched agent get git's hooks turned off; the
+    // rig's own session, started without the switch, does not.
+    let launches = std::fs::read_to_string(&rig.git_env_log).expect("read the git env log");
+    let of = |session: &SessionId| {
+        launches
+            .lines()
+            .filter(|line| line.split(' ').next() == Some(session.0.as_str()))
+            .map(|line| line.split_once(' ').map_or("", |(_, rest)| rest).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        of(&id),
+        vec![
+            "4 core.hooksPath /dev/null core.fsmonitor false hook.resume-lint.event  \
+             hook.resume-lint.enabled false";
+            2
+        ],
+        "create and relaunch: {launches}"
+    );
+    assert_eq!(of(&rig.session.id), vec![" ".repeat(8)], "{launches}");
+
+    rig.stop(&id).await;
+    let mut rig = rig.restarted().await;
+    let after_restart = inspect_session(&mut rig.control, &id).await;
+    assert!(
+        after_restart.skip_repo_hooks,
+        "the recovery wrote the switch to the durable record"
+    );
     rig.stop_daemon().await;
 }
 

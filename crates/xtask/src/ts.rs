@@ -746,6 +746,7 @@ fn session_minimal() -> SessionInfo {
         ended_at: None,
         exit_code: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 
@@ -867,6 +868,7 @@ fn session_full() -> SessionInfo {
         ended_at: Some(UPDATED_AT.to_owned()),
         exit_code: Some(SUCCESS_EXIT_CODE),
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: true,
     }
 }
 

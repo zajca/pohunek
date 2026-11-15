@@ -142,6 +142,10 @@ mod session_new_cwd;
 mod session_new_fetch_ref;
 #[path = "session_new_input_ack.rs"]
 mod session_new_input_ack;
+#[path = "session_new_no_repo_hooks.rs"]
+mod session_new_no_repo_hooks;
+#[path = "session_new_no_repo_hooks_gate.rs"]
+mod session_new_no_repo_hooks_gate;
 #[path = "session_new_outcome.rs"]
 mod session_new_outcome;
 #[path = "session_new_request_id.rs"]

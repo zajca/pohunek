@@ -14,7 +14,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 
 const SCHEMA_18_FINISHED: &str = include_str!("../src/store/fixtures/schema-18/finished.jsonl");
 const SCHEMA_18_LOST: &str = include_str!("../src/store/fixtures/schema-18/metadata.jsonl");
-const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-20/metadata.jsonl");
+const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-21/metadata.jsonl");
 
 /// The last update of the schema-18 finished fixture.
 const FINISHED_UPDATED_AT: &str = "2026-10-13T13:53:30.947477438Z";

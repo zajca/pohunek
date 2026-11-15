@@ -875,6 +875,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
             context_package_digest: None,
             fetch_ref: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         })
         .expect("serialize session.new params"),
     );
@@ -1406,6 +1407,7 @@ impl SecretEnvHost {
             context_package_digest: None,
             fetch_ref: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         })
         .expect("serialize session.new params");
         params["secret_env"] = secret_env;

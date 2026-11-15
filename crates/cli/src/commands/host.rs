@@ -259,6 +259,9 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
     let _ = writeln!(output, "  protocol_version:   {}", caps.protocol_version);
     let _ = writeln!(output, "  git_available:      {}", caps.git_available);
     let _ = writeln!(output, "  worktree_supported: {}", caps.worktree_supported);
+    if let Some(hooks) = caps.host_hooks {
+        let _ = writeln!(output, "  host_hooks:         {}", host_hook_events(hooks));
+    }
     output.push_str("  supported_agents:   ");
     // Agent names are free strings since Part C (base kinds + host profiles).
     output.push_str(&caps.supported_agents.join(", "));
@@ -294,6 +297,28 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
         );
     }
     output
+}
+
+/// The events the host-global hook layer has a script for, in lifecycle
+/// order, or `none`.
+fn host_hook_events(hooks: protocol::HostHookScripts) -> String {
+    let events: Vec<&str> = [
+        (hooks.pre_create, "pre-create"),
+        (hooks.post_create, "post-create"),
+        (hooks.session_start, "session-start"),
+        (hooks.agent_state, "agent-state"),
+        (hooks.session_stop, "session-stop"),
+        (hooks.pre_remove, "pre-remove"),
+        (hooks.post_remove, "post-remove"),
+    ]
+    .into_iter()
+    .filter_map(|(present, event)| present.then_some(event))
+    .collect();
+    if events.is_empty() {
+        "none".to_owned()
+    } else {
+        events.join(", ")
+    }
 }
 
 /// Render only public, owner-safe governance information for one daemon route.
@@ -435,6 +460,8 @@ mod tests {
             git_available: true,
             worktree_supported: true,
             session_new_agent_options_supported: true,
+            host_hooks: None,
+            session_new_skip_repo_hooks_supported: false,
         };
         let output = render_capabilities_human("host-b", &caps);
         assert!(output.contains("host host-b capabilities"));
@@ -498,6 +525,8 @@ mod tests {
             integration_agent_skill_supported: true,
             session_new_branch_source_supported: true,
             session_new_agent_options_supported: true,
+            host_hooks: None,
+            session_new_skip_repo_hooks_supported: false,
         };
         let output = render_capabilities_human("host-b", &caps);
         assert!(output

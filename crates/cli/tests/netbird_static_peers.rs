@@ -196,6 +196,7 @@ fn serve_session_and_track(
                                 ended_at: None,
                                 exit_code: None,
                                 agent_options: std::collections::BTreeMap::new(),
+                                skip_repo_hooks: false,
                             };
                             json!([session])
                         }
