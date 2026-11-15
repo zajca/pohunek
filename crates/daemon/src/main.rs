@@ -885,7 +885,7 @@ enum SupervisionMode {
 }
 
 /// The command line of `pohunekd`.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 struct DaemonArguments {
     /// The installed `service.toml`, which selects native supervision.
     service_config: Option<PathBuf>,
@@ -2279,7 +2279,7 @@ mod supervision_tests {
 
     use super::{
         apply_service_settings, env_bool, parse_arguments, select_supervision,
-        warn_unknown_service_keys, worker_working_directory, DaemonArguments, SupervisionMode,
+        warn_unknown_service_keys, worker_working_directory, SupervisionMode,
         OBSERVE_EXTERNAL_AGENTS_ENV,
     };
 
@@ -2498,32 +2498,23 @@ mod supervision_tests {
     }
 
     #[test]
-    fn the_command_line_accepts_one_absolute_service_config_and_local_only() {
+    fn the_command_line_accepts_only_one_absolute_service_config() {
         assert_eq!(
-            parse_arguments(arguments(&[])).expect("no flag"),
-            DaemonArguments::default()
+            parse_arguments(arguments(&[]))
+                .expect("no flag")
+                .service_config,
+            None
         );
         assert_eq!(
             parse_arguments(arguments(&["--service-config", "/etc/p/service.toml"]))
-                .expect("absolute path"),
-            DaemonArguments {
-                service_config: Some(PathBuf::from("/etc/p/service.toml")),
-                local_only: false,
-            }
-        );
-        assert_eq!(
-            parse_arguments(arguments(&["--local-only", "--service-config", "/s.toml"]))
-                .expect("both flags"),
-            DaemonArguments {
-                service_config: Some(PathBuf::from("/s.toml")),
-                local_only: true,
-            }
+                .expect("absolute path")
+                .service_config,
+            Some(PathBuf::from("/etc/p/service.toml"))
         );
         for rejected in [
             &["--service-config"][..],
             &["--service-config", "service.toml"],
             &["--service-config", "/a.toml", "--service-config", "/b.toml"],
-            &["--local-only", "--local-only"],
             &["--worker-launcher", "subprocess"],
         ] {
             assert!(

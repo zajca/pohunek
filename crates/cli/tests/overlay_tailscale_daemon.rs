@@ -405,3 +405,19 @@ fn a_local_only_daemon_never_queries_or_binds_a_listed_overlay() {
         host.log_text()
     );
 }
+
+/// A repeated `--local-only` is refused at startup, naming the flag.
+#[test]
+fn a_repeated_local_only_flag_is_refused() {
+    let host = Host::new(false);
+    let mut daemon = host.start_with(&["--local-only", "--local-only"]);
+    let status = poll_until("the daemon to exit", || daemon.0.try_wait().ok().flatten());
+    assert!(!status.success(), "{status}");
+    assert!(
+        host.log_text()
+            .contains("--local-only was given more than once"),
+        "{}",
+        host.log_text()
+    );
+    assert!(host.binds().is_empty(), "nothing is bound");
+}

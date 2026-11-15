@@ -1060,10 +1060,12 @@ impl Driver<'_> {
         }
     }
 
-    /// The login row: every record read so far, those of the theme picker
-    /// included, and the window of [`LOGIN_RECORD_WINDOW`] from the login
-    /// screen for a record after the first `picker_records`;
-    /// `final_record` is `null` when there are none.
+    /// The login row: `records` holds every record read so far, those read
+    /// before the theme picker was answered included; `final_record` is the
+    /// last record after the first `picker_records`, waited for up to
+    /// [`LOGIN_RECORD_WINDOW`] from the login screen, and `null` when none
+    /// arrived. The 7501 contract has no record for the picker, so a record
+    /// read before it (a startup `idle`) says nothing about the login screen.
     fn read_login(
         &mut self,
         session: &mut Session,
@@ -1074,7 +1076,13 @@ impl Driver<'_> {
             std::thread::sleep(POLL_INTERVAL);
             self.read_records(session)?;
         }
-        self.read_row(session, Instant::now(), false)
+        let mut row = self.read_row(session, Instant::now(), false)?;
+        row.final_record = row
+            .records
+            .get(picker_records..)
+            .and_then(<[String]>::last)
+            .cloned();
+        Ok(row)
     }
 
     /// Reads the row at its read point. The activity and the stale-record

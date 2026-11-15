@@ -97,7 +97,7 @@ The scenarios:
 | `idle_after_turn` | none | `Reply with the single word OK.` | a `working` record and then `done` or `idle` |
 | `permission_prompt` | `--permission-mode=default` | `Run the shell command touch canary-permission with the Bash tool.` | the first `blocked` record, then the first notification |
 | `mcp_elicitation` | `--mcp-config=<scratch>/mcp.json --allowedTools=mcp__canary__ask --strict-mcp-config` | `Call the ask tool of the canary MCP server.` | the first `blocked` record, then the first notification |
-| `login_screen` | none; an empty config home | none; Enter on the first-run theme picker | the first record after the theme picker, or 10 s after the login method list is on screen (`final_record` is then `null`) |
+| `login_screen` | none; an empty config home | none; Enter on the first-run theme picker | the first record after the theme picker, or 10 s after the login method list is on screen; `final_record` is the last record after the picker, `null` when none arrived |
 | `running_turn` | none | `Write a 400 word story about a lighthouse.` | the first `working` record, before the turn ends |
 
 Each session starts in `--workdir`. Before the prompt the capture waits for
@@ -120,8 +120,11 @@ row reads at the login method list: the capture answers the theme picker
 with Enter (its default) and then waits for the login screen. It checks the
 screen again right before the key and stops with exit 4 if the folder-trust
 dialog is showing, since Enter there would trust the directory. A record
-the picker emitted would stay in the row's `records`. The theme picker in an
-account scenario exits 2: finish Claude's first run for that config first.
+read before the picker was answered (a startup `idle`, say) stays in the
+row's `records` but never becomes its `final_record`: the contract defines
+no record for the picker, so such a record says nothing about the login
+screen. The theme picker in an account scenario exits 2: finish Claude's
+first run for that config first.
 
 The records of a row are those read up to its read point, and the reads
 that depend on the held record (the activity and the stale-record check)

@@ -655,6 +655,38 @@ fn one_scenario_holds_exactly_its_row() {
     assert_eq!(theme_input(&workdir), "\r");
 }
 
+/// A record read on the theme picker stays in the login row's `records` but
+/// is not its `final_record`: the row describes the login screen.
+#[test]
+fn a_theme_picker_record_is_not_the_login_final_record() {
+    let capture = Capture::new();
+    let workdir = capture.workdir(&["picker-record"]);
+    let release = capture.release_dir();
+    let output = capture.capture(
+        &release,
+        &capture.claude(),
+        None,
+        &workdir,
+        &[
+            "--scenario",
+            "login_screen",
+            "--step-timeout-secs",
+            ANSWERING_STEP_TIMEOUT,
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    capture.assert_no_survivors();
+    let row = &capture.capture_document()["scenarios"]["login_screen"];
+    assert_eq!(row["records"], serde_json::json!(["state=idle"]));
+    assert_eq!(row["final_record"], serde_json::Value::Null);
+    assert_eq!(theme_input(&workdir), "\r");
+}
+
 /// An account whose config home has not finished Claude's first run shows the
 /// theme picker; the capture refuses it and types nothing into it.
 #[test]
