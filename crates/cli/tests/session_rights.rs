@@ -427,8 +427,10 @@ fn a_process_that_left_the_tree_keeps_owner_rights() {
         (!scenario.is_live(&w2)).then_some(())
     });
 
-    let doctor = scenario.host.ok(&["doctor"]);
-    let check = doctor["checks"]
+    // The doctor exits non-zero when a provider on the host is out of range,
+    // which says nothing about the rights check read below.
+    let (_, doctor) = scenario.host.json(&["doctor"]);
+    let check = doctor["ok"]["checks"]
         .as_array()
         .expect("doctor checks")
         .iter()
