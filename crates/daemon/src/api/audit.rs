@@ -69,6 +69,7 @@ fn changes_session(method: &str) -> bool {
     matches!(
         method,
         method::SESSION_NEW
+            | method::SESSION_ADOPT
             | method::SESSION_STOP
             | method::SESSION_RESUME
             | method::SESSION_REMOVE

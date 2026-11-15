@@ -7,8 +7,9 @@
 //!   PTY root, or on Linux runs in a session's worker unit. It may mutate only
 //!   the descendants of that session, and may send input to its parent.
 //! - [`CallerClass::OwnerShell`]: the same, for a `shell` runtime session no
-//!   session spawned, which keeps owner rights. A shell a session spawned is
-//!   a `Session` of its own tree.
+//!   session spawned, and for a session whose profile sets
+//!   `[rights] owner_equivalent`; both keep owner rights. A shell a session
+//!   spawned is a `Session` of its own tree.
 //! - [`CallerClass::Owner`]: everything else, including the owner's terminal,
 //!   services outside every session tree, and a process that left its tree.
 //! - [`CallerClass::Unknown`]: a peer of another user, or one the kernel can
@@ -28,6 +29,7 @@ use tracing::warn;
 
 use super::native_attestation::{ControlPeer, PeerStanding};
 use super::{is_terminal, SessionRegistry};
+use crate::agent::profile::rights::{rights_of, ProfileRights};
 use crate::procwatch::{Pid, ProcessIdentity, ProcessInspector};
 use pohunek_platform::supervisor::Namespace;
 
@@ -153,13 +155,38 @@ impl SessionRegistry {
         };
         let roots = self.live_roots().await;
         let inspector = self.inner.inspector.as_ref();
-        if let Some(id) = ancestry_session(inspector, process, &roots) {
-            return roots.class_of(id);
+        let Some(id) = ancestry_session(inspector, process, &roots)
+            .or_else(|| worker_unit_session(inspector, process, &roots))
+        else {
+            return CallerClass::Owner;
+        };
+        if self
+            .session_profile_rights(&id)
+            .await
+            .is_some_and(|rights| rights.owner_equivalent)
+        {
+            return CallerClass::OwnerShell(id);
         }
-        if let Some(id) = worker_unit_session(inspector, process, &roots) {
-            return roots.class_of(id);
-        }
-        CallerClass::Owner
+        roots.class_of(id)
+    }
+
+    /// The `[rights]` of the profile the live session `id` was launched from.
+    ///
+    /// `None` for a session the registry does not hold.
+    pub(crate) async fn session_profile_rights(&self, id: &SessionId) -> Option<ProfileRights> {
+        let agent = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| entry.info.agent.clone())?;
+        let profiles = self.inner.profiles.clone();
+        self.inner
+            .background
+            .spawn_blocking("profile_rights", move || rights_of(&profiles, &agent))
+            .await
+            .ok()
     }
 
     async fn live_roots(&self) -> Roots {
@@ -242,7 +269,7 @@ impl SessionRegistry {
 ///
 /// A visited set bounds the walk, so a malformed loop in the records cannot
 /// hang the caller.
-fn descends_from<'a>(
+pub(super) fn descends_from<'a>(
     lookup: impl Fn(&SessionId) -> Option<&'a protocol::SessionInfo>,
     session: &SessionId,
     ancestor: &SessionId,

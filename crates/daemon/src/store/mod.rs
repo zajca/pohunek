@@ -1322,6 +1322,41 @@ impl Store {
         Ok(self.write_entries(records, &snapshot)?.with_value(true))
     }
 
+    /// Replaces the parent link of one session's current record, in the record
+    /// and in its embedded recovery binding, and leaves every other field as
+    /// persisted.
+    ///
+    /// The record is re-read under the write lock, like
+    /// [`Self::replace_session_metadata`]. No record at all is a no-op
+    /// success.
+    pub fn replace_session_spawned_by(
+        &self,
+        session_id: &str,
+        spawned_by: Option<&protocol::SpawnedBy>,
+        updated_at: &str,
+    ) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.record.session_id == session_id)
+        else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        let record = entry.edit();
+        record.info.spawned_by = spawned_by.cloned();
+        updated_at.clone_into(&mut record.info.updated_at);
+        if let Some(recovery) = record.recovery.as_mut() {
+            recovery.spawned_by = spawned_by.cloned();
+        }
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
+    }
+
     /// Removes one logical session and preserves every other record kind.
     pub fn remove_session(&self, session_id: &str) -> io::Result<StoreMutation<bool>> {
         let _guard = self

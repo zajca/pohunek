@@ -114,6 +114,25 @@ impl Scenario {
         }
     }
 
+    /// Writes the profile `name`, the claude scenario profile plus `rights`
+    /// as its `[rights]` table body.
+    fn add_profile(&self, name: &str, rights: &str) {
+        let agents_dir = self.host.env.config_home().join("pohunek").join("agents");
+        let base = fs::read_to_string(agents_dir.join(format!("{AGENT_PROFILE}.toml")))
+            .expect("read the scenario profile");
+        let path = agents_dir.join(format!("{name}.toml"));
+        fs::write(&path, format!("{base}\n[rights]\n{rights}\n")).expect("write the profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("keep the profile private");
+    }
+
+    /// The session `id` records as its parent, if any.
+    fn parent_of(&self, id: &str) -> Option<String> {
+        self.state(id)["spawned_by"]["session_id"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
     /// Creates a session of `profile`, spawned by `parent` when given, and
     /// waits until its agent runs.
     fn spawn(&self, profile: &str, name: &str, parent: Option<&str>) -> String {
@@ -145,11 +164,17 @@ impl Scenario {
     /// Runs `pohunek <arguments>` inside the PTY tree of `session` and returns
     /// its exit code and combined output.
     fn inside(&self, session: &str, arguments: &str) -> (i32, String) {
+        self.inside_with(session, "", arguments)
+    }
+
+    /// [`Self::inside`] with `assignments` (`NAME=value ...`) in the command's
+    /// environment.
+    fn inside_with(&self, session: &str, assignments: &str, arguments: &str) -> (i32, String) {
         let number = self.next_result.get();
         self.next_result.set(number + 1);
         let result = self.results.join(format!("{number}.txt"));
         let command = format!(
-            "{} {arguments} >{} 2>&1; echo rc=$? >>{}",
+            "{assignments} {} {arguments} >{} 2>&1; echo rc=$? >>{}",
             self.cli.display(),
             result.display(),
             result.display()
@@ -447,5 +472,167 @@ fn a_process_that_left_the_tree_keeps_owner_rights() {
         detail.contains("placement: ancestry") && !detail.contains("cgroup"),
         "{detail}"
     );
+    scenario.finish();
+}
+
+/// Runs `session new` for `profile` inside `session` and returns the created
+/// session's id, or the refused result.
+fn spawn_inside(
+    scenario: &Scenario,
+    session: &str,
+    profile: &str,
+    prefix: &str,
+) -> Result<String, (i32, String)> {
+    let cwd = scenario.host.env.cwd().display().to_string();
+    let result = scenario.inside_with(
+        session,
+        prefix,
+        &format!("session new --agent {profile} --cwd {cwd} --json"),
+    );
+    if result.0 != 0 {
+        return Err(result);
+    }
+    let document: Value = serde_json::from_str(&result.1).expect("session new JSON");
+    Ok(document["ok"]["session"]["id"]
+        .as_str()
+        .or_else(|| document["ok"]["id"].as_str())
+        .expect("created session id")
+        .to_owned())
+}
+
+/// Rows 10 and 11: a session spawns under itself whatever markers it sends.
+#[test]
+fn a_session_spawns_under_itself_and_cannot_name_another_origin() {
+    let scenario = Scenario::start();
+    let manager = scenario.spawn(AGENT_PROFILE, "manager", None);
+    let w1 = scenario.spawn(AGENT_PROFILE, "worker-one", Some(&manager));
+
+    let child = spawn_inside(&scenario, &w1, AGENT_PROFILE, "").expect("a worker spawns a child");
+    assert_eq!(scenario.parent_of(&child).as_deref(), Some(w1.as_str()));
+
+    let before = scenario.host.json(&["session", "list"]).1["ok"]
+        .as_array()
+        .expect("sessions")
+        .len();
+    let forged = format!("POHUNEK_SESSION_ID={manager} POHUNEK_DAEMON_ID={SPAWNER_DAEMON}");
+    let refused = spawn_inside(&scenario, &w1, AGENT_PROFILE, &forged)
+        .expect_err("markers naming another session are refused");
+    assert_denied(&refused, "origin_mismatch");
+    let after = scenario.host.json(&["session", "list"]).1["ok"]
+        .as_array()
+        .expect("sessions")
+        .len();
+    assert_eq!(before, after, "the refused request created no session");
+
+    // The owner's own request records the markers it sends.
+    let adopted = scenario.spawn(AGENT_PROFILE, "owner-made", Some(&manager));
+    assert_eq!(
+        scenario.parent_of(&adopted).as_deref(),
+        Some(manager.as_str())
+    );
+    scenario.finish();
+}
+
+/// Rows 12-15: the owner moves a session under a new parent, and the rights
+/// follow the link; a session cannot adopt, and a loop is refused.
+#[test]
+fn adopt_moves_a_session_and_its_rights_to_the_new_parent() {
+    let scenario = Scenario::start();
+    let m1 = scenario.spawn(AGENT_PROFILE, "manager-one", None);
+    let m2 = scenario.spawn(AGENT_PROFILE, "manager-two", None);
+    let w1 = scenario.spawn(AGENT_PROFILE, "worker", Some(&m1));
+
+    let before = scenario.inside(&m2, &format!("session input {w1} hello --json"));
+    assert_denied(&before, "not_descendant");
+
+    let adopt = scenario.host.ok(&["session", "adopt", &w1, &m2]);
+    assert_eq!(
+        adopt["session"]["spawned_by"]["session_id"],
+        m2.as_str(),
+        "{adopt}"
+    );
+    assert_eq!(scenario.parent_of(&w1).as_deref(), Some(m2.as_str()));
+
+    let after = scenario.inside(&m2, &format!("session input {w1} hello --json"));
+    assert_eq!(after.0, 0, "{}", after.1);
+    let old = scenario.inside(&m1, &format!("session input {w1} hello --json"));
+    assert_denied(&old, "not_descendant");
+
+    // A session cannot give itself, or anything, a new parent.
+    let from_inside = scenario.inside(&m1, &format!("session adopt {w1} {m1} --json"));
+    assert_denied(&from_inside, "owner_only");
+    assert_eq!(scenario.parent_of(&w1).as_deref(), Some(m2.as_str()));
+
+    // A loop and a self-parent are refused for the owner too.
+    let (code, cycle) = scenario.host.json(&["session", "adopt", &m2, &w1]);
+    assert_ne!(code, 0, "{cycle}");
+    assert!(
+        cycle.to_string().contains("session_adopt_refused"),
+        "{cycle}"
+    );
+    assert!(cycle.to_string().contains("reason=cycle"), "{cycle}");
+    let (code, own) = scenario.host.json(&["session", "adopt", &w1, &w1]);
+    assert_ne!(code, 0, "{own}");
+    assert!(own.to_string().contains("reason=self_parent"), "{own}");
+    assert_eq!(scenario.parent_of(&m2), None);
+    scenario.finish();
+}
+
+/// Rows 16-18: `spawn_profiles` lists exactly the profiles a session may
+/// launch, and an empty list forbids spawning.
+#[test]
+fn spawn_profiles_limit_what_a_session_launches() {
+    let scenario = Scenario::start();
+    scenario.add_profile(
+        "rights-lead",
+        &format!("spawn_profiles = [\"{AGENT_PROFILE}\"]"),
+    );
+    scenario.add_profile("rights-closed", "spawn_profiles = []");
+    let lead = scenario.spawn("rights-lead", "lead", None);
+    let closed = scenario.spawn("rights-closed", "closed", None);
+
+    spawn_inside(&scenario, &lead, AGENT_PROFILE, "").expect("a listed profile is launched");
+    let refused = spawn_inside(&scenario, &lead, SHELL_PROFILE, "")
+        .expect_err("a profile off the list is refused");
+    assert_denied(&refused, "spawn_profile_not_allowed");
+    let none = spawn_inside(&scenario, &closed, AGENT_PROFILE, "")
+        .expect_err("an empty list forbids spawning");
+    assert_denied(&none, "spawn_profile_not_allowed");
+
+    // A table the daemon cannot read grants nothing and does not load.
+    scenario.add_profile("rights-bad", "owner_equivalent = \"yes\"");
+    let (code, bad) = scenario
+        .host
+        .json(&["session", "new", "--agent", "rights-bad"]);
+    assert_ne!(code, 0, "{bad}");
+    assert!(bad.to_string().contains("invalid_profile"), "{bad}");
+    scenario.finish();
+}
+
+/// Row 19: a profile with `owner_equivalent` gives its session the owner's
+/// rights, and a profile without it does not.
+#[test]
+fn an_owner_equivalent_profile_acts_like_the_owner() {
+    let scenario = Scenario::start();
+    scenario.add_profile("rights-manager", "owner_equivalent = true");
+    let manager = scenario.spawn("rights-manager", "manager", None);
+    let plain = scenario.spawn(AGENT_PROFILE, "plain", None);
+    let w1 = scenario.spawn(AGENT_PROFILE, "worker-one", None);
+    let w2 = scenario.spawn(AGENT_PROFILE, "worker-two", None);
+
+    // The control: a session without the flag cannot reach a non-descendant.
+    let refused = scenario.inside(&plain, &format!("session stop {w1} --json"));
+    assert_denied(&refused, "not_descendant");
+    assert!(scenario.is_live(&w1));
+
+    let stop = scenario.inside(&manager, &format!("session stop {w2} --json"));
+    assert_eq!(stop.0, 0, "{}", stop.1);
+    poll_until("the worker to stop", || {
+        (!scenario.is_live(&w2)).then_some(())
+    });
+    // The same profile spawns under the caller's own session and may adopt.
+    let adopt = scenario.inside(&manager, &format!("session adopt {w1} {manager} --json"));
+    assert_eq!(adopt.0, 0, "{}", adopt.1);
+    assert_eq!(scenario.parent_of(&w1).as_deref(), Some(manager.as_str()));
     scenario.finish();
 }

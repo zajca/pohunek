@@ -180,6 +180,7 @@ pub use native_attestation::ControlPeer;
 pub(crate) use native_attestation::PeerStanding;
 pub use reconcile::upgrade_preflight;
 pub(crate) use rejected_lines::RejectedLinesState;
+pub(crate) mod adopt;
 pub(crate) mod remove_tree;
 mod resume;
 mod retention;
@@ -877,6 +878,10 @@ struct SessionRegistryInner {
     /// [`SessionRegistry::set_metadata`], so a metadata edit is never overwritten
     /// by a record built from an earlier snapshot.
     persist_lock: Mutex<()>,
+    /// The roots of the `session.remove_tree` cascades in progress. A
+    /// `session.adopt` of a session inside one of those trees is refused, so
+    /// a cascade never removes a session the owner just moved elsewhere.
+    removing_roots: std::sync::Mutex<HashSet<SessionId>>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
     #[cfg(test)]
@@ -2791,6 +2796,7 @@ impl SessionRegistry {
                 produced_events,
                 store,
                 persist_lock: Mutex::new(()),
+                removing_roots: std::sync::Mutex::new(HashSet::new()),
                 #[cfg(test)]
                 resume_writes_blocked: AtomicBool::new(false),
                 #[cfg(test)]

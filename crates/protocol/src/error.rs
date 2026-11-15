@@ -739,6 +739,19 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/session_adopt_refused` error.
+    ///
+    /// `reason` is `self_parent`, `cycle` or `tree_removal_in_progress`.
+    #[must_use]
+    pub fn session_adopt_refused(reason: &'static str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_adopt_refused",
+            format!("the session cannot be given that parent (reason={reason})"),
+            None,
+        )
+    }
+
     /// The canonical `daemon/method_not_found` error for an unknown method.
     #[must_use]
     pub fn method_not_found(method: &str) -> Self {

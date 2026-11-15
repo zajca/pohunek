@@ -111,6 +111,9 @@ pub(crate) async fn remove_tree(
     params: &SessionRemoveTreeParams,
 ) -> Result<SessionRemoveTreeResult, ProtocolError> {
     let cleanup = UnconfirmedCleanup::from(params.accept_unconfirmed_cleanup);
+    // Registered before the snapshot: a `session.adopt` inside this tree is
+    // refused from here on, and one that finished earlier is in the snapshot.
+    let _cascade = registry.begin_tree_removal(&params.session_id);
     let snapshot = registry.list_raw().await;
     let tree = SessionTree::new(&snapshot);
     let descendants = tree.descendants_post_order(&params.session_id);
@@ -258,8 +261,8 @@ async fn remove_descendant(
         }
     }
     // A snapshot descendant the fresh list no longer names was removed
-    // concurrently, which counts as removed; `spawned_by` never changes,
-    // so the fresh enumeration covers every snapshot descendant.
+    // concurrently, which counts as removed; `session.adopt` is refused inside
+    // the cascade, so the fresh enumeration covers every snapshot descendant.
     if doomed {
         return kept_removal(
             node,

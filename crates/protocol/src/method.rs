@@ -25,19 +25,19 @@ use crate::{
     ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectCandidatesParams,
     ProjectCandidatesResult, ProjectInfo, ProjectListParams, ProjectPromptParams,
     ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
-    SessionDiffParams, SessionDiffResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionReadParams, SessionReadResult, SessionReleaseAgentParams,
-    SessionReleaseAgentResult, SessionRemoveResult, SessionRemoveTreeParams,
-    SessionRemoveTreeResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionResumeResult,
-    SessionRetentionParams, SessionRetentionResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionStopResult, SessionWaitParams,
-    SessionWaitResult, SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    ProjectShowParams, ProjectShowResult, SessionAdoptParams, SessionAdoptResult,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
+    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListParams,
+    SessionNewParams, SessionNewResult, SessionOutputParams, SessionOutputResult,
+    SessionReadParams, SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionRemoveTreeParams, SessionRemoveTreeResult, SessionRenameParams,
+    SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
+    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
+    SessionWaitTurnParams, SessionWaitTurnResult, WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -223,6 +223,15 @@ method_table!(
     SessionRemoveTreeResult,
     "SessionRemoveTreeParams",
     "SessionRemoveTreeResult";
+
+    /// Give a session a new parent, owner only.
+    SessionAdopt,
+    SESSION_ADOPT,
+    "session.adopt",
+    SessionAdoptParams,
+    SessionAdoptResult,
+    "SessionAdoptParams",
+    "SessionAdoptResult";
 
     /// Create an attach stream for a session.
     SessionAttach,

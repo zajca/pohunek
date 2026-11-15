@@ -457,6 +457,29 @@ async fn handle_negotiated(
         }
     }
 
+    if request.method() == method::SESSION_ADOPT {
+        let class = caller_class(state).await;
+        let reason = match class {
+            CallerClass::Owner | CallerClass::OwnerShell(_) => None,
+            CallerClass::Session(_) => Some("owner_only"),
+            CallerClass::Unknown => Some("unknown_caller"),
+        };
+        if let Some(reason) = reason {
+            let target = request
+                .params()
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            audit::record_rights_refusal(request, state, &class, target, reason);
+            return Response::err(
+                selected_version,
+                request.id(),
+                ProtocolError::session_right_denied(reason),
+            )
+            .expect("deserialized request ids satisfy response validation");
+        }
+    }
+
     // Stop and remove release what a session owns and need no resolvable
     // runtime; the registry refuses an external session itself.
     let releases_only = matches!(
@@ -481,7 +504,14 @@ async fn handle_negotiated(
             json!({ "subscribed": true }),
         )
         .expect("deserialized request ids satisfy response validation"),
-        method::SESSION_NEW => session::handle_session_new(request, &state.sessions).await,
+        method::SESSION_NEW => match attested_spawn_origin(request, state).await {
+            Ok(spawned_by) => {
+                session::handle_session_new(request, &state.sessions, spawned_by).await
+            }
+            Err(error) => Response::err(selected_version, request.id(), error)
+                .expect("deserialized request ids satisfy response validation"),
+        },
+        method::SESSION_ADOPT => session::handle_session_adopt(request, &state.sessions).await,
         method::SESSION_LIST => session::handle_session_list(request, &state.sessions).await,
         method::SESSION_INSPECT => session::handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => session::handle_session_stop(request, &state.sessions).await,
@@ -609,6 +639,67 @@ async fn handle_negotiated(
         )
         .expect("deserialized request ids satisfy response validation"),
     }
+}
+
+/// The parent link a `session.new` records, taken from the kernel peer.
+///
+/// The owner and the owner's shells may name an origin in the request markers,
+/// which are recorded as sent. A session's process tree gets its own session
+/// as the parent whatever it sends: markers naming another session are
+/// refused with `origin_mismatch`, and the profile the new session runs must
+/// be one the caller's profile lists in `spawn_profiles`.
+async fn attested_spawn_origin(
+    request: &Request,
+    state: &DaemonState,
+) -> Result<Option<protocol::SpawnedBy>, ProtocolError> {
+    let class = caller_class(state).await;
+    let caller = match &class {
+        CallerClass::Owner | CallerClass::OwnerShell(_) => {
+            return Ok(session::request_spawned_by(request));
+        }
+        CallerClass::Unknown => return Err(refuse_spawn(request, state, &class, "unknown_caller")),
+        CallerClass::Session(caller) => caller,
+    };
+    let daemon_id = state.sessions.daemon_instance_id();
+    let names_other = request
+        .origin_session_id()
+        .is_some_and(|claimed| claimed != caller)
+        || request
+            .origin_daemon_id()
+            .is_some_and(|claimed| claimed != daemon_id);
+    if names_other {
+        return Err(refuse_spawn(request, state, &class, "origin_mismatch"));
+    }
+    let Some(rights) = state.sessions.session_profile_rights(caller).await else {
+        return Err(refuse_spawn(request, state, &class, "unknown_caller"));
+    };
+    let agent = request
+        .params()
+        .get("agent")
+        .and_then(serde_json::Value::as_str);
+    if agent.is_some_and(|agent| !rights.allows_spawn(agent)) {
+        return Err(refuse_spawn(
+            request,
+            state,
+            &class,
+            "spawn_profile_not_allowed",
+        ));
+    }
+    Ok(Some(protocol::SpawnedBy {
+        session_id: caller.clone(),
+        daemon_id: daemon_id.to_owned(),
+    }))
+}
+
+/// Audits a refused `session.new` and returns the error that answers it.
+fn refuse_spawn(
+    request: &Request,
+    state: &DaemonState,
+    class: &CallerClass,
+    reason: &'static str,
+) -> ProtocolError {
+    audit::record_rights_refusal(request, state, class, "", reason);
+    ProtocolError::session_right_denied(reason)
 }
 
 /// The session a request addresses for the rights check: every self-target
