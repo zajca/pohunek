@@ -5,6 +5,258 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.43.0
+
+### 2026-11-14, activity cursor on list and inspect, #1318
+
+- `session.list` and `session.inspect` report `activity_epoch` and
+  `activity_revision` of the returned snapshot once activity was recorded, so
+  a buffered `agent_state` event naming the snapshot's runtime and the same
+  epoch whose revision is not greater reads as older than the snapshot. The
+  Rust
+  `SessionInfo::activity_cursor` and `agent_state_is_stale` helpers order one
+  buffered event against a snapshot. See [Sessions](concepts/sessions.md) and
+  `docs/public-api.md`.
+
+### 2026-11-14, conflict generation record, #2145
+
+- A `conflict` runtime on list, inspect and event responses reports
+  `generation_recorded`: `true` when the record names the worker generation
+  that stop and remove prove, `false` otherwise. The Rust `can_stop` and
+  `can_remove` helpers are false for a conflict that reports `false`, matching
+  the daemon's refusal. See [Sessions](concepts/sessions.md) and
+  `docs/public-api.md`.
+
+### 2026-11-14, profile launch options, #2150
+
+- Host agent profiles accept `[options.<id>]` tables: closed choices with a
+  label, a default and per-choice `args`, `env` and `min_runtime`. The selected
+  choices' args follow the profile args in option-id order and their env joins
+  the profile env; choice env keys, values and args pass the load rules of
+  [Agent profiles](concepts/agent-profiles.md#launch-options).
+- `session.new` takes `agent_options` (behind
+  `session_new_agent_options_supported`; the Rust client and the TypeScript SDK
+  refuse with `session_new_agent_options_unsupported` and send nothing) and
+  refuses an undeclared option or choice (`agent_option_unknown`,
+  `agent_option_choice_unknown`, `agent_options_not_declared`) or an
+  unavailable floored choice (`agent_option_choice_unavailable`).
+  `pohunek session new --opt OPTION=CHOICE` sends it.
+- Sessions record the resolved choices (`SessionInfo.agent_options`, store
+  schema 20) and resume with them; the profile revision covers only the
+  selected choices, and a removed recorded choice is `agent_option_choice_missing`
+  even with `--accept-profile-change`.
+- `host.inspect` reports `AgentRuntime.options` with each choice's availability,
+  and `pohunek plugin profile show <name> [--json]` prints them.
+
+### 2026-11-14, profile presets and fold, #2150
+
+- A host profile file whose root holds a `[preset]` table is a preset: it
+  names a parent profile and a selection of its options (`[preset.options]`,
+  optional `locked`), plus `display_name` and `audience`, and launches as the
+  parent with the merged selection under its own name and labels. A selection
+  sent to a locked preset is `agent_options_locked`. See
+  [Agent profiles](concepts/agent-profiles.md#presets).
+- A preset session's revision is the parent's followed by the parent name, so
+  editing the parent's selected choice or re-parenting needs a decision, while
+  the preset's labels, `locked` and choices do not. `package.bind_profile`
+  (`plugin profile migrate`) refuses a preset, the release step skips it, and
+  `host.inspect` lists it with its labels, its choices as defaults, and no
+  options when locked.
+- `pohunek plugin profile fold <name>... --into <parent> --dry-run [--json]`
+  proposes a parent with `[options]` and one preset per input, with env
+  values replaced by placeholders and credential-looking arguments refused.
+- `pohunek plugin profile create` takes `--options-file <path>` (`options_toml`
+  on `package.create_profile`, behind `package_create_profile_options_supported`)
+  and `--preset-of <parent> [--opt OPTION=CHOICE]... [--locked]`, which writes a
+  preset through the new local-only `package.create_preset` method (behind
+  `package_create_preset_supported`). `plugin profile list` shows a preset with
+  the state `preset` and `preset_of` in `--json`.
+
+### 2026-11-14, per-session attention isolation, #2166
+
+- `pohunek.attention.children=isolate` on a parent session withholds the attention of everything spawned under it: the attention coordinator suppresses the descendants' blocked and approval inbox records at both the defer and the post-debounce flush check (their turn signals are still recorded, `session.wait_turn` keeps working), and `session.list` annotates the affected rows with `attention_isolated_by` (nearest flagged ancestor wins; never on `session inspect`). See the protocol reference and [Sessions](concepts/sessions.md).
+
+### 2026-11-14, stop through a pending terminal commit, #2330
+
+- `session stop` and `session rm` right after a session ends no longer fail
+  with `worker_operation_failed` "terminal journal commit is still pending;
+  retry stop" when the worker's 10 s wait for its terminal commit elapses on a
+  loaded host: the daemon sends the stop once more, which waits up to another
+  10 s for the commit. A commit still pending after both waits fails as before,
+  and the pending stop intent decides the outcome. See
+  [Sessions](concepts/sessions.md).
+
+### 2026-11-14, a repaint keeps a record-backed approval open, #2339
+
+- After a record-backed `blocked` opened an approval, a `Working/Process` edge
+  (output no detection rule names) no longer resolves it. Such output appears
+  only once the record is gone (a root `clear`, a lag resync, a reconfigure),
+  because a held record suppresses the process edge, and on a runtime that
+  reports its own status it is a repaint, the same rule `session.input`
+  already applies to process-sourced working. The approval stays unread
+  until a working edge from the program's status channel or a screen rule,
+  which resolves it also straight after the repaint's own `Working`. Before,
+  the outcome after a root `clear` depended on how the terminal chunked the
+  redraw: a single-chunk redraw left the approval unread, a split one
+  acknowledged it. See the architecture section on OSC 7501 program status.
+
+### 2026-11-14, profile option follow-ups, #2343
+
+- A resume records the option choices its profile resolution took on the
+  session (`SessionInfo.agent_options`, the resume binding): the recorded ones,
+  and the default of an option the record lacks. A relaunch accepted with
+  `accept_profile_change` after an option was added therefore lists that
+  option's default, and the record always matches the frozen profile revision.
+  New scenarios pin the recorded choices on the adopted built-in, newer-version
+  and repinned resume paths. See [Agent profiles](concepts/agent-profiles.md).
+
+### 2026-11-14, Onboarding guide, #2344
+
+- New [Onboarding](guides/onboarding.md) guide (`guide/onboarding`, intents
+  `setup` and `project`) for an assistant session marked with `onboard.mode`:
+  the host checks with their pass condition and fix owner, project proposals
+  from `project candidates` (exists, not registered, used within 90 days or
+  with at least 3 sessions), session groups through `companion.group`, profiles
+  only through `plugin profile create`, the guided and automatic mode rules
+  with the grant ids and the non-grantable floor, the hand-over wording, the
+  `onboard.state=done` end marker, and the Claude allow and deny rules and the
+  Codex arguments of the `pohunek-onboard` launch profile.
+
+### 2026-11-14, plugin profile rm, #2346
+
+- `pohunek plugin profile rm <name> --digest <file digest> [--json]` and the
+  local-only `package.remove_profile` method (behind
+  `package_remove_profile_supported`) remove a host profile or preset file only
+  while it still has the `file_digest` that `plugin profile list --json --all`
+  reports; the removal is daemon-mediated and bound to the inode it read. New
+  error codes: `package_profile_builtin`, `package_profile_package_runtime`,
+  `package_profile_in_use`, `package_profile_has_presets` (both follow the file a
+  name opens, including in-tree links and case-folded spellings); a changed file
+  is `package_profile_digest_mismatch`. A create that resolved a profile removed
+  before it took the launch guard fails with `agent_profile_not_found`. See
+  [Agent profiles](concepts/agent-profiles.md) and
+  [Runtime packages](guides/runtime-packages.md).
+
+### 2026-11-14, onboarding removal floor, #2349
+
+- The [Onboarding](guides/onboarding.md) floor names
+  `pohunek session retention sweep` with `--apply` and
+  `pohunek plugin profile rm`. The Claude deny table has
+  `Bash(pohunek session retention sweep *--apply*)` and
+  `Bash(pohunek plugin profile rm *)` (always). Like the other `Bash` deny
+  rules, they refuse the usual spellings of these commands and are not a
+  security boundary.
+- `cargo xtask docs check` fails (`onboarding-floor`) in three cases:
+  - a `pohunek` command of the floor has no always-on deny rule;
+  - a `--flag` the floor names for a command has no always-on rule carrying
+    that flag;
+  - a `Bash(pohunek ...)` deny rule names no floor command and is not one of
+    the listed gap rules.
+
+### 2026-11-14, retried stop keeps its connection, #2352
+
+- A stop the worker refuses because its terminal commit is still pending is
+  sent once more on the control connection the stop still holds, so the
+  retried stop never waits for the connection again: a stop waits for the
+  connection once and for the worker's answer at most twice, the bound the SDK
+  stop budget covers. See [Sessions](concepts/sessions.md).
+
+### 2026-11-14, worker logs why a runtime faulted, #2354
+
+- The worker logs a `worker.runtime.faulted` ERROR event with `error.message`
+  whenever a session runtime faults, so the cause of a stop or removal that
+  fails with `worker_operation_failed` "runtime faulted before its terminal
+  journal commit" is in the session's worker log. See
+  [Debug a durable session runtime](runbooks/debug-session-runtime.md).
+
+### 2026-11-13, stale program-status record fallback, #2138
+
+- A `[program_status]` manifest may declare `stale_after_ms` (1..=3600000
+  milliseconds). A held OSC 7501 record that disagrees with the screen for
+  that long (a `blocked` record over an idle or working screen with no
+  dialog, a `working` record over a weak blocker, an `idle`/`done`/`error`
+  record over a working spinner) arbitrates as absent until the next record,
+  so the screen rules decide. A visible dialog still wins at once; the
+  staleness clock runs on no other disagreement. Only the Claude manifest
+  declares the key (`stale_after_ms = 30000`); the feature
+  `program-status-staleness-v1` owns it and the Claude package 2.2.0 requires
+  it, so an older core refuses the package. Each fallback start and end is
+  logged at info level under `session.program_status.gate` with the record
+  state, the record age, the winning rule and the screen state; the
+  `agent_state` event and `session.detection` carry the same frozen values
+  as `fallback`, and `session detection` prints them. An idle under the
+  fallback resolves a record-backed blocked attention, the way an idle
+  record closes it after a dismissed dialog. See
+  [Program status (OSC 7501)](guides/claude-package.md#program-status-osc-7501)
+  and the architecture section on OSC 7501 program status.
+
+### 2026-11-13, profile display name and audience, #2150
+
+- Host agent profiles accept two optional presentation-only top-level keys:
+  `display_name` (trimmed free text, at most 128 bytes, no hidden or separator
+  characters) and `audience` (`owner`, `agent` or `hidden`; absent means
+  `owner`). An invalid value is `invalid_profile` at launch. Neither key enters
+  the profile revision, so label edits never trigger `agent_profile_changed`.
+  `host.inspect` reports them on each resolvable profile's `runtimes` entry and
+  `session list`/`session inspect` carry the live label as `agent_display_name`;
+  the human `host inspect` table, `session list` (as `<agent> (<display_name>)`)
+  and `inspect`, and `plugin profile list` (owner profiles by default, `--all`
+  reveals the rest; new `DISPLAY NAME`/`AUDIENCE` columns) show them. See
+  [Agent profiles](concepts/agent-profiles.md#presentation-labels).
+
+### 2026-11-13, session remove_tree cascade, #2167
+
+- `pohunek session rm <id> --with-children` runs the `session.remove_tree` cascade: the root plus every session whose `spawned_by` chain leads to it, enumerated from a snapshot, removed deepest first, bounded at 64 sessions (`bad_request` beyond). An unknown root is `session_not_found`, an external root `session_external_read_only`, both before anything is removed.
+- Every descendant goes through the normal `session.remove` safety with one exception: a live descendant is kept with reason `live` and is never stopped. Only the named root follows `session.remove` exactly, including stopping a live root. A dirty-worktree descendant is kept with `worktree_held` (never waived by `accept_unconfirmed_cleanup`), an `external` descendant with `external`, a generationless `conflict` with `not_removable` without consent and removed with `identity_proof_skipped` under `accept_unconfirmed_cleanup: true`; a kept or refused node keeps its ancestors with `descendant_kept`, and a child that appears mid-cascade is kept with `descendant_added`.
+- Origin-session guard: `session.remove_tree` is denied with `plugin_self_target_denied` when the target is the caller's origin session, exactly like `session.remove`. See the public API reference and [Sessions](concepts/sessions.md#removing-a-session-and-its-children).
+
+### 2026-11-13, push reuse, #2204
+
+- A `main` push of `ci.yml` while the workflow-level `CI_REUSE_PUSH` kill switch is `"true"` reuses the green legs of the previous runs of the same tree from this repository (pull request runs, prior main pushes, tier=main delta dispatches, within 24 hours, fork runs never). `scripts/ci-reuse` reads the consumer event: a delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`), a `main` push may match by recorded tested tree; it decides per job the newest green leg among the candidates, writes per-job `run_id`s and a `source_runs` output, and writes the reuse record only on success. `scripts/ci-evidence` accepts dispatch evidence only from a same-commit source and push evidence from same-tree sources, verifies each reused job against its own source run (age per leg, `success` conclusion, required steps by display name) and names all of them. `test-duplicates` downloads each reused job's JUnit
+reports from the source run its record entry names, then the run's own
+reports. `cargo-audit` is never reused, the advisory database changes independently of the tree; nightly and schedule runs never reuse; the delta dispatch is unchanged.
+
+### 2026-11-13, protocol window wording, #2215
+
+- The session-metadata predicates and the protocol window docs state the one-version window (`5..=5`); a peer of another version fails with `daemon/version_mismatch`.
+
+### 2026-11-13, fetch_ref tracking refs, #2263
+
+- The `session.new` `fetch_ref` fetch moves no remote-tracking ref, even one a
+  configured `remote.origin.fetch` refspec maps; the daemon's own base and
+  branch fetches still move `refs/remotes/origin/*` like an owner's fetch. See
+  [Worktrees](concepts/worktrees.md#fetching-one-extra-ref).
+
+### 2026-11-12, Skill refusal for a profile over a runtime without hooks, #2187
+
+- `pohunek integration install --skill` and `integration uninstall --skill` (also `skill_only`) for a host profile whose runtime has no daemon-managed hook integration (a profile over Pi) answer `integration_agent_skill_unsupported` instead of `agent_not_installable`, as `--agent pi` already did; the message is `<runtime id or profile NAME> has no daemon-managed hook integration, so the daemon cannot install its agent skill` with the hint to drop `--skill`; a runtime with hooks but no skill location keeps the hint to install a package version that declares one. See [Runtime packages](guides/runtime-packages.md#agent-skill-location).
+
+### 2026-11-12, delta dispatch reuse, #2203
+
+- A `workflow_dispatch` run of `ci.yml` with `tier=main` accepts `delta: true`: the `delta reuse` job finds the newest pull request run of the same tree (within 24 hours) and reuses its green legs; the reusable jobs those legs name skip instead of running again. `scripts/ci-reuse` decides the skip list from `scripts/ci-reuse.json` (21 jobs, `mode == "full"` required for the selection-dependent ones, ambiguous sources run everything). A full dispatch (`delta: false`) stays the default and `scripts/release` keeps dispatching full runs. `scripts/ci-evidence` accepts the union of the evidence run and the recorded source run as evidence for the commit and names both runs in its report.
+
+### 2026-11-12, session new fetch_ref CLI, #2216
+
+- `pohunek session new --fetch-ref <ref> --fetch-commit <sha>` (requires `--branch`) fetches one extra ref from `origin` into the worktree's repository without checking it out (a GitHub pull-request head is `refs/pull/<n>/head`); the commit is a full lowercase hex id the ref must peel to, the `--json` output carries it as a top-level `fetched_ref` and the human output prints `fetched: <source> -> <ref> at <commit>`. The capability refusal lives in the Rust client gate (`session_new_fetch_ref_unsupported`, class `daemon`, before anything is sent); a first response without the outcome from an advertised daemon fails with `fetch_ref_outcome_missing` (the session keeps running, its id in `details.session_id`), and a `--request-id` replay answers `replayed: true` with no `fetched_ref`; the fetch itself needs git 2.29 or newer on the host and fails with `fetch_ref_failed` on older hosts. `pohunek assistant` takes no such flag. See the CLI reference and [Worktrees](concepts/worktrees.md#fetching-one-extra-ref).
+
+### 2026-11-12, session new fetch_ref, #2216
+
+- `session.new` with `branch` accepts an optional `fetch_ref` (`source_ref` plus
+  `commit`): the daemon fetches one extra ref from `origin` into the worktree's
+  repository without checking it out, after base resolution and before any hook
+  runs, and promotes it to `refs/pohunek/sessions/<session_id>/fetched` once
+  the checkout stands, which lives for as long as the worktree binding (a
+  failed or refused request leaves nothing behind; `FETCH_HEAD` gains no entry
+  from it (which needs git 2.29 or newer) and no submodule is recursed
+  into). A GitHub pull-request head is
+  `refs/pull/<n>/head`; the daemon has no forge-specific knowledge. The commit
+  is a full lowercase hex id the fetched ref must peel to. The first response
+  reports `fetched_ref` (`ref`, `source_ref`, `commit`); a replay and the
+  stored session never carry it. Clients check
+  `HostCapabilities.session_new_fetch_ref_supported` first (the Rust client and
+  the TypeScript SDK refuse with `session_new_fetch_ref_unsupported` without
+  sending). See [Worktrees](concepts/worktrees.md#fetching-one-extra-ref).
+
 ## 0.42.0
 
 ### 2026-11-11, conflict session removal, #1362

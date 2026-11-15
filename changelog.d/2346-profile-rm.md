@@ -1,4 +1,0 @@
----
-kind: added
----
-`pohunek plugin profile rm <name> --digest <sha256:...>` removes a host agent profile or preset through the daemon (the new local-only `package.remove_profile` method, capability `package_remove_profile_supported`), only while the file still has the digest `plugin profile list --json --all` reports, so a tool that created a profile, such as an onboarding Undo, removes exactly that file and keeps one the owner edited since (`package_profile_digest_mismatch`). Built-in and package-served runtime names (`package_profile_builtin`, `package_profile_package_runtime`), a profile a running session uses (`package_profile_in_use`) and a parent that presets name (`package_profile_has_presets`) are refused; a stopped session of a removed profile resumes once the profile is restored. ([#2346](https://github.com/zajca/pohunek/issues/2346))
