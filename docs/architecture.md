@@ -2375,7 +2375,8 @@ that remain are cheap, free-by-default, or inherited:
   `Session(X)` caller that targets X itself gets the same code even when the
   request carries no markers, and `session.attach` of X keeps
   `attach_self_feedback`. Every
-  refusal writes one audit line on the `audit.session_change` target with the
+  refusal writes a refusal line next to the request line on the
+  `audit.session_change` target, with the
   caller class and session, the peer pid and uid, the method, the target, the
   reason and the request id, and never the params, input bytes, names or
   metadata values. `pohunek doctor` reports the `session_rights` check with
@@ -2391,8 +2392,14 @@ that remain are cheap, free-by-default, or inherited:
   markers are recorded as sent. `session.adopt` gives a session a new parent
   and is owner only: a `Session(X)` caller gets `owner_only`. It refuses a
   loop and a session inside a `session.remove_tree` cascade in progress with
-  `session_adopt_refused`. `[rights]` is read from the owner-private profile
-  file, never from a request. The manager profiles of the owner's own tooling
+  `session_adopt_refused`. The package methods that write profile files
+  (`package.create_profile`, `package.create_preset`,
+  `package.remove_profile`, `package.bind_profile`) are owner only in the same
+  way. A session holds the `[rights]` its profile had at launch or resume,
+  narrowed by the file as it reads now, so an edit never widens a running
+  session. An `owner_equivalent` profile keeps its own `spawn_profiles` list.
+  `[rights]` is read from the owner-private profile file, never from a
+  request. The manager profiles of the owner's own tooling
   set `owner_equivalent = true`; every other profile keeps the tree rule.
 
   This is a guardrail, not a wall. A process of the same user that leaves the

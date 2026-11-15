@@ -297,12 +297,16 @@ another user, or one the kernel no longer attests). `session.new` from inside a
 session records that session as `spawned_by` whatever markers it sends; markers
 naming another session are `origin_mismatch`, and a profile outside the
 caller profile's `[rights] spawn_profiles` is `spawn_profile_not_allowed`.
-`session.adopt` is owner only (`owner_only`). A target the daemon does not
+`session.adopt`, `package.create_profile`, `package.create_preset`,
+`package.remove_profile` and `package.bind_profile` are owner only
+(`owner_only`); `session.resume` of a descendant needs a profile its caller's
+`spawn_profiles` allows. A target the daemon does not
 hold keeps its own `session_not_found`. Callers outside every session tree, in a
 `shell` runtime session that no session spawned, and remote overlay connections keep owner rights; a shell a session spawned has the rights of its own tree. A
 process that leaves the tree keeps owner rights too; see the Security Model of
-the architecture document. Each refusal writes one audit line (caller class and
-session, peer pid and uid, method, target, reason, request id; never params).
+the architecture document. Each refusal writes a refusal line (caller class and
+session, peer pid and uid, method, target, reason, request id; never params)
+next to the request line.
 No protocol version changes. The lifecycle reports
 `session.report_agent`, `session.release_agent`, and `session.report_native_id`
 are explicitly allowed because hooks must report their own session; the public

@@ -131,7 +131,8 @@ The assistant must:
 - The parent link is attested for a process inside a session's tree: a
   `session.new` from there records that session as `spawned_by` and refuses
   markers that name another session (`origin_mismatch`). Only the owner moves a
-  session under another parent (`session.adopt`; a session gets `owner_only`).
+  session under another parent (`session.adopt`; a session gets `owner_only`),
+  and the package methods that write profile files are owner only too.
   A profile's `[rights]` table is the owner's lever: `spawn_profiles` limits what
   a session launches, and `owner_equivalent = true` gives a manager profile the
   rights of the owner's shell.
