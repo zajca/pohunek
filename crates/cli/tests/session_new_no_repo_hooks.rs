@@ -662,20 +662,34 @@ const TRACKED_FILE: &str = "README.md";
 /// The tracked file whose diff goes through the fixture's textconv driver.
 const CONVERTED_FILE: &str = "notes.txt";
 
+/// The tracked files of the fixture's two filter drivers, `plain` and
+/// `a=b.c` (a name `git -c` cannot express). `plain` is `required`, so a
+/// git command that empties its commands but keeps it required fails. They
+/// sort after `tools/`, so a checkout writes the filter program before it
+/// smudges them.
+const FILTERED_FILES: [&str; 2] = ["zz.dat", "zz.eq"];
+
+/// An untracked file the `plain` filter driver applies to, which
+/// `session diff` renders through `git diff --no-index`.
+const UNTRACKED_FILTERED_FILE: &str = "zz-new.dat";
+
 impl Scene {
     /// A fixture repository whose base branch carries a git hook for each of
     /// [`GIT_HOOKS`] below `.githooks`, and whose configuration names that
     /// directory with a relative `core.hooksPath` (husky style), so a git
     /// command run inside a checkout resolves the hooks of that checkout.
     ///
-    /// The configuration also names two more programs by a path inside the
+    /// The configuration also names more programs by a path inside the
     /// checkout: `core.fsmonitor=tools/fsmonitor`, which `git status` and
-    /// `git diff` run, and the textconv driver `tools/textconv` that the
-    /// committed `.gitattributes` selects for `*.txt`.
+    /// `git diff` run, the textconv driver `tools/textconv` that the committed
+    /// `.gitattributes` selects for `*.txt`, and the filter drivers `plain`
+    /// (`*.dat`, clean and smudge) and `a=b.c` (`*.eq`, clean) whose program is
+    /// `tools/filter`.
     ///
     /// Each program appends `<name>:<GIT_CONFIG_COUNT>` to `git.log` (a hook
-    /// `git:<hook>:...`); the daemon's own git commands carry no count and log
-    /// `daemon`.
+    /// `git:<hook>:...`, a filter `filter:<clean|smudge|clean-eq>:...`); the
+    /// daemon's own git commands of a session without the switch carry no
+    /// count and log `daemon`.
     fn init_git_hook_repo(&self) {
         let marker = |name: &str| format!("{name}:${{GIT_CONFIG_COUNT:-daemon}}");
         let mut files: Vec<_> = GIT_HOOKS
@@ -702,23 +716,46 @@ impl Scene {
                 self.appending("git.log", &marker("textconv"))
             ),
         ));
-        files.push((".gitattributes".to_owned(), "*.txt diff=conv\n".to_owned()));
+        files.push((
+            "tools/filter".to_owned(),
+            format!("{}cat\n", self.appending("git.log", &marker("filter:$1"))),
+        ));
+        files.push((
+            ".gitattributes".to_owned(),
+            "*.txt diff=conv\n*.dat filter=plain\n*.eq filter=a=b.c\n".to_owned(),
+        ));
         files.push((CONVERTED_FILE.to_owned(), "reviewed\n".to_owned()));
+        for filtered in FILTERED_FILES {
+            files.push((filtered.to_owned(), "filtered\n".to_owned()));
+        }
         self.init_repo(&files);
         self.git(&["config", "core.hooksPath", ".githooks"]);
         self.git(&["config", "core.fsmonitor", "tools/fsmonitor"]);
         self.git(&["config", "diff.conv.textconv", "tools/textconv"]);
+        self.git(&["config", "filter.plain.clean", "tools/filter clean"]);
+        self.git(&["config", "filter.plain.smudge", "tools/filter smudge"]);
+        self.git(&["config", "filter.plain.required", "true"]);
+        self.git(&["config", "filter.a=b.c.clean", "tools/filter clean-eq"]);
     }
 
-    /// Changes the converted file and moves the tracked file's mtime in
-    /// `checkout`, so the next `session diff` diffs it through the textconv
-    /// driver and its `git status` rewrites the index.
+    /// Changes the converted file and the filtered files and adds an
+    /// untracked filtered file in `checkout`, and moves the tracked file's
+    /// mtime, so the next `session diff` runs the textconv driver and both
+    /// clean filters (tracked and `--no-index`) and its `git status` rewrites
+    /// the index.
     fn edit_checkout(checkout: &Path, seconds_ahead: u64) {
         fs::write(
             checkout.join(CONVERTED_FILE),
             "changed by the pull request\n",
         )
         .expect("change the converted file");
+        for filtered in FILTERED_FILES.into_iter().chain([UNTRACKED_FILTERED_FILE]) {
+            fs::write(
+                checkout.join(filtered),
+                format!("changed {seconds_ahead}\n"),
+            )
+            .expect("change a filtered file");
+        }
         Scene::stale_index(checkout, seconds_ahead);
     }
 
@@ -798,12 +835,16 @@ impl Scene {
     }
 }
 
-/// Git's own hooks, rows 19 to 21 and 23: with a relative `core.hooksPath`,
-/// `core.fsmonitor` and textconv driver naming programs the checkout carries,
-/// a switched session runs none of them: not through the daemon's git
-/// commands (create, `session diff`, removal), not through the agent's git
-/// and not through a host-global script's git. The agent still sees its own
-/// `GIT_CONFIG_COUNT` setting: the pinned settings are appended behind it.
+/// Git's own hooks, rows 19 to 21, 23 and 24: with a relative
+/// `core.hooksPath`, `core.fsmonitor`, textconv driver and filter drivers
+/// naming programs the checkout carries, a switched session runs no hook,
+/// fsmonitor or textconv program: not through the daemon's git commands
+/// (create, `session diff`, removal), not through the agent's git and not
+/// through a host-global script's git. The daemon's git runs no filter
+/// program either; the agent's own git applies the configured filters, so
+/// its filter runs (count 3) are the only entries the log may hold. The agent
+/// still sees its own `GIT_CONFIG_COUNT` setting: the pinned settings are
+/// appended behind it.
 #[tokio::test]
 async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     let scene = Scene::start(Vec::new(), &[]).await;
@@ -828,19 +869,25 @@ async fn a_switched_session_runs_no_git_hook_its_checkout_carries() {
     scene.diffed(&id).await;
     scene.stopped_and_removed(&id).await;
 
+    let agent_filter_run = |entry: &String| entry.starts_with("filter:") && entry.ends_with(":3");
     assert_eq!(
-        scene.entries("git.log"),
+        scene
+            .entries("git.log")
+            .into_iter()
+            .filter(|entry| !agent_filter_run(entry))
+            .collect::<Vec<_>>(),
         Vec::<String>::new(),
-        "no git hook, fsmonitor or textconv program of the checkout ran"
+        "no git hook, fsmonitor, textconv or daemon-side filter program of the checkout ran"
     );
     scene.harness.stop().await;
 }
 
-/// Control of rows 19 to 21 and 23: the same fixture without the switch runs
-/// the checkout's git hook and fsmonitor through the agent's `git status`,
-/// all three through the daemon's git of `session diff`, and a host-global
-/// script's git resolves the checkout's hook directory, so the empty log
-/// above is evidence.
+/// Control of rows 19 to 21, 23 and 24: the same fixture without the switch
+/// runs the checkout's git hook and fsmonitor through the agent's
+/// `git status`, the smudge filter through the daemon's checkout, the hook,
+/// fsmonitor, textconv and both clean filters through the daemon's git of
+/// `session diff`, and a host-global script's git resolves the checkout's hook
+/// directory, so the log above is evidence.
 #[tokio::test]
 async fn without_the_switch_the_checkout_git_hooks_run() {
     let scene = Scene::start(Vec::new(), &[]).await;
@@ -861,6 +908,15 @@ async fn without_the_switch_the_checkout_git_hooks_run() {
         scene.wait_for_entry("git.log", entry).await;
     }
 
+    assert!(
+        scene
+            .entries("git.log")
+            .iter()
+            .any(|entry| entry == "filter:smudge:daemon"),
+        "the daemon's checkout ran the smudge filter: {:?}",
+        scene.entries("git.log")
+    );
+
     let inspected = scene.inspected(&id).await;
     let checkout = PathBuf::from(inspected["worktree_path"].as_str().expect("worktree path"));
     let count = |entry: &str| {
@@ -874,6 +930,8 @@ async fn without_the_switch_the_checkout_git_hooks_run() {
         "git:post-index-change:daemon",
         "fsmonitor:daemon",
         "textconv:daemon",
+        "filter:clean:daemon",
+        "filter:clean-eq:daemon",
     ]
     .map(|entry| (entry, count(entry)))
     .into();

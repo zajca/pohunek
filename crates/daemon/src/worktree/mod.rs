@@ -2657,7 +2657,10 @@ fn terminate_process_group(child: &mut Child) {
 
 /// A `git` command scoped to `repo` via `-C` (passed as an `OsStr` so non-UTF-8
 /// repo paths survive), with the options of the session's hook `layer`
-/// ([`RepoHookLayer::git_options`]).
+/// ([`RepoHookLayer::git_options`]). A skipped layer also turns off every
+/// filter driver the configuration seen from `repo` defines
+/// ([`repo_hooks::filter_drivers_off_env`]); the listing runs once per command,
+/// so a driver configured since the last command is off too.
 ///
 /// The program is the trusted absolute path
 /// [`trusted_program`](crate::agent::trusted_program) resolves once, so no
@@ -2666,11 +2669,33 @@ fn terminate_process_group(child: &mut Child) {
 /// # Errors
 ///
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
-/// like a failed spawn.
+/// like a failed spawn. Under a skipped layer, a filter driver listing that
+/// fails, times out or overflows returns its message: the command does not
+/// run with drivers left on.
 pub(crate) fn git_command(repo: &Path, layer: RepoHookLayer) -> Result<Command, String> {
-    let mut cmd = crate::git::command()?;
-    cmd.args(layer.git_options());
-    cmd.arg("-C").arg(repo);
+    let scoped = || -> Result<Command, String> {
+        let mut cmd = crate::git::command()?;
+        cmd.args(layer.git_options());
+        cmd.arg("-C").arg(repo);
+        Ok(cmd)
+    };
+    let mut cmd = scoped()?;
+    if layer == RepoHookLayer::Skip {
+        let mut listing = scoped()?;
+        listing.args(repo_hooks::FILTER_DRIVER_LISTING);
+        let output = run_output_bounded(listing, GIT_COMMAND_TIMEOUT)?;
+        let listed = match output.status.code() {
+            Some(0) => output.stdout.as_slice(),
+            Some(1) if output.stdout.is_empty() => &[],
+            _ => {
+                return Err(format!(
+                    "listing the configured filter drivers failed: {}",
+                    output_failure_message(&output)
+                ))
+            }
+        };
+        cmd.envs(repo_hooks::filter_drivers_off_env(listed));
+    }
     Ok(cmd)
 }
 

@@ -2723,63 +2723,129 @@ fn unsaved_work_clears_a_binding_whose_checkout_is_already_gone() {
     );
 }
 
-/// Rows 20 and 23: the pre-removal check of a binding started with the switch
-/// (`git status` inside its checkout) runs no git hook and no fsmonitor hook
-/// the checkout carries, although a relative `core.hooksPath` and
-/// `core.fsmonitor` resolve to them there; the same check of a binding
-/// without the switch runs them.
+/// The markers [`checkout_with_git_programs`] programs append to.
+#[cfg(unix)]
+struct GitProgramMarkers {
+    hook: PathBuf,
+    fsmonitor: PathBuf,
+    filter: PathBuf,
+}
+
+/// Commits to `repo` a git hook (`.githooks/post-index-change`), an
+/// fsmonitor hook and a filter program (`tools/`), and names each in the
+/// repository configuration by a path relative to the checkout: a relative
+/// `core.hooksPath` and `core.fsmonitor`, and the filter drivers `plain`
+/// (clean, smudge, `required`, for `zz.dat`) and `a=b.c` (clean, for `zz.eq`).
+/// Each program appends to its marker below `markers`; the filter program
+/// appends its first argument (`clean`, `smudge` or `clean-eq`).
+#[cfg(unix)]
+fn checkout_with_git_programs(repo: &Path, markers: &Path) -> GitProgramMarkers {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let marked = GitProgramMarkers {
+        hook: markers.join("ran"),
+        fsmonitor: markers.join("fsmonitor"),
+        filter: markers.join("filter"),
+    };
+    // A failing fsmonitor hook makes git fall back to a full scan.
+    let programs = [
+        (".githooks/post-index-change", "\"$PWD\"", &marked.hook, ""),
+        (
+            "tools/fsmonitor",
+            "fsmonitor",
+            &marked.fsmonitor,
+            "exit 1\n",
+        ),
+        ("tools/filter", "\"$1\"", &marked.filter, "cat\n"),
+    ];
+    for (relative, logged, marker, tail) in programs {
+        let program = repo.join(relative);
+        fs::create_dir_all(program.parent().expect("program directory"))
+            .expect("create the program directory");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' {logged} >> '{}'\n{tail}",
+                marker.display()
+            ),
+        )
+        .expect("write the program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).expect("program mode");
+    }
+    // The filtered files sort after `tools/`, so a checkout writes the filter
+    // program before it smudges them.
+    fs::write(
+        repo.join(".gitattributes"),
+        "zz.dat filter=plain\nzz.eq filter=a=b.c\n",
+    )
+    .expect("write .gitattributes");
+    fs::write(repo.join("zz.dat"), "filtered\n").expect("write a filtered file");
+    fs::write(repo.join("zz.eq"), "filtered\n").expect("write a filtered file");
+    git_in(repo, &["add", "."]);
+    git_in(
+        repo,
+        &["commit", "-q", "-m", "a checkout with git programs"],
+    );
+    for (key, value) in [
+        ("core.hooksPath", ".githooks"),
+        ("core.fsmonitor", "tools/fsmonitor"),
+        ("filter.plain.clean", "tools/filter clean"),
+        ("filter.plain.smudge", "tools/filter smudge"),
+        ("filter.plain.required", "true"),
+        ("filter.a=b.c.clean", "tools/filter clean-eq"),
+    ] {
+        git_in(repo, &["config", key, value]);
+    }
+    marked
+}
+
+/// Rows 20, 23 and 24: the pre-removal check of a binding started with the
+/// switch (`git status` inside its checkout) runs no git hook, no fsmonitor
+/// hook and no filter driver program the checkout carries, although a relative
+/// `core.hooksPath`, `core.fsmonitor` and filter command resolve to them there,
+/// and its checkout (`git worktree add`) runs no smudge filter either; the same
+/// binding and check without the switch run them. One filter driver's name
+/// holds a `=`, which `git -c` cannot express; the other is `required`, so
+/// emptying its commands without turning that off fails the check.
 #[cfg(unix)]
 #[test]
 fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let mgr = manager("unsaved-git-hooks");
     let repo = init_repo("unsaved-git-hooks-repo");
-    let markers = unique_dir("unsaved-git-hooks-marker");
-    let marker = markers.join("ran");
-    let fsmonitor_marker = markers.join("fsmonitor");
-    let hook = repo.join(".githooks/post-index-change");
-    fs::create_dir_all(hook.parent().expect("hook directory")).expect("create .githooks");
-    fs::write(
-        &hook,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> '{}'\n",
-            marker.display()
-        ),
-    )
-    .expect("write the hook");
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook mode");
-    let fsmonitor = repo.join("tools/fsmonitor");
-    fs::create_dir_all(fsmonitor.parent().expect("tools directory")).expect("create tools");
-    // A failing fsmonitor hook makes git fall back to a full scan.
-    fs::write(
-        &fsmonitor,
-        format!(
-            "#!/bin/sh\nprintf 'fsmonitor\\n' >> '{}'\nexit 1\n",
-            fsmonitor_marker.display()
-        ),
-    )
-    .expect("write the fsmonitor hook");
-    fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o755)).expect("hook mode");
-    git_in(&repo, &["add", "."]);
-    git_in(&repo, &["commit", "-q", "-m", "a checkout with a git hook"]);
-    git_in(&repo, &["config", "core.hooksPath", ".githooks"]);
-    git_in(&repo, &["config", "core.fsmonitor", "tools/fsmonitor"]);
+    let GitProgramMarkers {
+        hook: marker,
+        fsmonitor: fsmonitor_marker,
+        filter: filter_marker,
+    } = checkout_with_git_programs(&repo, &unique_dir("unsaved-git-hooks-marker"));
+    let filter_runs = || fs::read_to_string(&filter_marker).unwrap_or_default();
     let mut switched = request("s-skip", &repo, "review/skip");
     switched.skip_repo_hooks = true;
     let skipped = mgr.bind(&switched).expect("bind the switched session");
+    assert_eq!(
+        filter_runs(),
+        "",
+        "the switched checkout ran no smudge filter"
+    );
     let running = mgr
         .bind(&request("s-run", &repo, "review/run"))
         .expect("bind the control session");
+    assert!(
+        filter_runs().lines().any(|run| run == "smudge"),
+        "without the switch the checkout runs the smudge filter: {:?}",
+        filter_runs()
+    );
     let _ = fs::remove_file(&marker);
     let _ = fs::remove_file(&fsmonitor_marker);
+    let _ = fs::remove_file(&filter_marker);
     let stale_index = |checkout: &Path| {
-        fs::File::options()
-            .write(true)
-            .open(checkout.join("README.md"))
-            .expect("open the tracked file")
-            .set_modified(std::time::SystemTime::now() + Duration::from_hours(24))
-            .expect("move the tracked file's mtime");
+        for tracked in ["README.md", "zz.dat", "zz.eq"] {
+            fs::File::options()
+                .write(true)
+                .open(checkout.join(tracked))
+                .expect("open the tracked file")
+                .set_modified(std::time::SystemTime::now() + Duration::from_hours(24))
+                .expect("move the tracked file's mtime");
+        }
     };
 
     stale_index(&skipped.path);
@@ -2789,6 +2855,7 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         !fsmonitor_marker.exists(),
         "the switched check ran no fsmonitor hook"
     );
+    assert_eq!(filter_runs(), "", "the switched check ran no filter");
 
     stale_index(&running.path);
     assert_eq!(mgr.unsaved_work("s-run"), WorktreeWork::Saved);
@@ -2800,6 +2867,13 @@ fn the_pre_removal_check_of_a_switched_binding_runs_no_git_hook_of_its_checkout(
         fsmonitor_marker.exists(),
         "without the switch the check runs the checkout's fsmonitor hook"
     );
+    for driver in ["clean", "clean-eq"] {
+        assert!(
+            filter_runs().lines().any(|run| run == driver),
+            "without the switch the check runs the {driver} filter: {:?}",
+            filter_runs()
+        );
+    }
 }
 
 #[test]

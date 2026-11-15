@@ -203,16 +203,24 @@ anywhere passes.
 The switch also turns off the programs git itself runs that a repository
 configuration can name by a path relative to the checkout a git command runs
 in: its hooks (`core.hooksPath`, husky style), its fsmonitor hook
-(`core.fsmonitor`) and, for `session diff`, textconv drivers (which the
-checkout's `.gitattributes` selects). Without the switch a git command there
-runs the copies the checkout carries. With it:
+(`core.fsmonitor`) and, for the daemon's git, filter drivers and textconv
+drivers (which the checkout's `.gitattributes` selects). Without the switch a
+git command there runs the copies the checkout carries. With it:
 
 - Every git command the daemon runs for the session (create, fetch, `git
   worktree add` and `remove`, `session diff`, the pre-removal check of a
   retention sweep, the rollback) runs with `-c core.hooksPath=/dev/null -c
   core.fsmonitor=false`, and `session diff` also passes `--no-textconv`
-  (external diff drivers are off for every session diff). Project detection
-  runs its read-only git queries with the same settings for every session.
+  (external diff drivers are off for every session diff). Each of those
+  commands also turns off every filter driver the configuration it sees
+  defines (`filter.<driver>.clean`, `smudge` and `process` empty, `required`
+  false), listed with `git config` just before the command runs. They go in
+  as `GIT_CONFIG_COUNT` pairs, because `git -c` splits at the first `=` and a
+  driver name may hold one; a listing that fails fails the command. So the
+  checkout is written without smudge filters (a Git LFS file stays a pointer
+  file) and `session diff` and the pre-removal check compare the files as
+  they are on disk. Project detection runs its read-only git queries, which
+  apply no filter, with the hook and fsmonitor settings for every session.
 - The agent's environment gets `core.hooksPath=/dev/null` and
   `core.fsmonitor=false` as two more `GIT_CONFIG_COUNT` pairs
   (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`), on the first launch and on
@@ -230,13 +238,13 @@ runs the copies the checkout carries. With it:
 - Each host-global hook script of the session gets the same pairs, so its git
   in the checkout runs no hook and no fsmonitor hook of it.
 
-Outside the switch: filter drivers (`filter.<driver>.clean`, `smudge`,
-`process`) that the repository configuration names and the checkout's
-`.gitattributes` selects. A git command that reads such a file (the daemon's
-`git status`, the agent's git) runs them, so a host that reviews untrusted
-checkouts names no filter command by a path relative to the checkout. The
-agent's own `git diff` also applies the configured textconv and external diff
-drivers.
+Outside the switch: the git of the agent and of the host hook scripts still
+applies the filter, textconv and external diff drivers the configuration
+defines. Turning filters off there would change what the agent's own
+`git add` and `git commit` write (a Git LFS file would be committed whole, not
+as a pointer), and a list taken at launch would miss a driver configured
+later. A host that reviews untrusted checkouts names no filter, textconv or
+diff command by a path relative to the checkout.
 
 The switch belongs to the session started with it. A session started later in
 the same checkout, an agent's child or an in-place `--cwd` session, does not

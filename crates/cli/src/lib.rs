@@ -1154,9 +1154,11 @@ enum SessionAction {
         /// head. A `[hooks] required` event the host has no script for fails
         /// the start with `hook_required_skipped`. Git's own hooks and its
         /// fsmonitor hook are off for the session too: for the daemon's git
-        /// commands, for the agent and for the host hook scripts. An agent
-        /// environment that sets `GIT_CONFIG_PARAMETERS` or a non-numeric
-        /// `GIT_CONFIG_COUNT` fails the start with `git_hooks_env_conflict`.
+        /// commands, for the agent and for the host hook scripts. The daemon's
+        /// git also applies no filter driver (a Git LFS file stays a pointer
+        /// file); the agent's git still does. An agent environment that sets
+        /// `GIT_CONFIG_PARAMETERS` or a non-numeric `GIT_CONFIG_COUNT` fails
+        /// the start with `git_hooks_env_conflict`.
         /// Not inherited by later sessions in the same checkout. Needs a
         /// daemon that advertises `session_new_skip_repo_hooks_supported`.
         #[arg(long)]

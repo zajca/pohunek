@@ -1850,10 +1850,11 @@ Important fields:
   `skip_repo_hooks` and runs none of the in-repo hook layer for any of its
   lifecycle hooks, and none of git's own hooks and no fsmonitor hook: the
   daemon's git commands for the session run with `core.hooksPath=/dev/null`
-  and `core.fsmonitor=false` (and its `session.diff` with `--no-textconv`),
-  and the agent (on every launch) and the host-global hook scripts get both
+  and `core.fsmonitor=false` and with every filter driver the configuration
+  defines turned off (and its `session.diff` with `--no-textconv`), and the
+  agent (on every launch) and the host-global hook scripts get the two
   settings as two more `GIT_CONFIG_COUNT` pairs behind the pairs their
-  environment already sets. Filter drivers stay outside the switch. Absent
+  environment already sets; their own git still applies filter drivers. Absent
   (false) otherwise. Set at creation and never changed, it is
   persisted (store schema 21), so a resume and a daemon restart keep it, and
   `session.new`, `session.list`, `session.inspect` and events report it. A

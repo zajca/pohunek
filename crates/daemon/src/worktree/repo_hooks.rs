@@ -11,6 +11,9 @@
 
 // Rust guideline compliant 2026-11-15
 
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use protocol::{
@@ -84,6 +87,66 @@ impl RepoHookLayer {
             Self::Skip => &["--no-textconv"],
         }
     }
+}
+
+/// The `git config` arguments that list every configured filter driver key,
+/// NUL-terminated, for [`filter_drivers_off_env`]. Exit 1 means none is set.
+pub(crate) const FILTER_DRIVER_LISTING: [&str; 5] =
+    ["config", "--name-only", "-z", "--get-regexp", r"^filter\."];
+/// The settings that turn one filter driver off: git runs no `clean`,
+/// `smudge` or `process` command whose value is empty, and a driver that is
+/// not `required` passes the content through unchanged instead of failing.
+const FILTER_DRIVER_OFF: [(&str, &str); 4] = [
+    ("clean", ""),
+    ("smudge", ""),
+    ("process", ""),
+    ("required", "false"),
+];
+
+/// The environment entries that turn off every filter driver `listing` names,
+/// for a daemon `git` command of a session that skips its checkout's hooks.
+///
+/// A driver is defined only in git configuration, but the checkout's
+/// `.gitattributes` selects it, and a configuration may name its program by a
+/// path inside the checkout; `status`, `diff` and a checkout would run that
+/// program as the daemon user. `listing` is the output of
+/// [`FILTER_DRIVER_LISTING`] run like the command itself, so it sees the same
+/// configuration. The entries are `GIT_CONFIG_COUNT` pairs, not `-c`, because
+/// `-c` splits at the first `=` and a driver name may hold one. They start at
+/// pair 0: the daemon's `git` inherits no git configuration variables.
+pub(crate) fn filter_drivers_off_env(listing: &[u8]) -> Vec<(OsString, OsString)> {
+    let names: BTreeSet<&[u8]> = listing
+        .split(|byte| *byte == 0)
+        .filter_map(|key| key.strip_prefix(b"filter."))
+        .filter_map(|rest| {
+            let dot = rest.iter().rposition(|byte| *byte == b'.')?;
+            Some(&rest[..dot])
+        })
+        .collect();
+    let mut entries = vec![(
+        OsString::from(GIT_CONFIG_COUNT),
+        OsString::from((names.len() * FILTER_DRIVER_OFF.len()).to_string()),
+    )];
+    let pairs = names.iter().flat_map(|name| {
+        FILTER_DRIVER_OFF
+            .iter()
+            .map(move |setting| (*name, setting))
+    });
+    for (index, (name, (variable, value))) in pairs.enumerate() {
+        let mut key = b"filter.".to_vec();
+        key.extend_from_slice(name);
+        key.push(b'.');
+        key.extend_from_slice(variable.as_bytes());
+        entries.push((
+            OsString::from(format!("GIT_CONFIG_KEY_{index}")),
+            OsString::from_vec(key),
+        ));
+        entries.push((
+            OsString::from(format!("GIT_CONFIG_VALUE_{index}")),
+            OsString::from(*value),
+        ));
+    }
+    entries
 }
 
 /// The environment entries that turn git's own hooks and the fsmonitor hook

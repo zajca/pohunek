@@ -569,8 +569,9 @@ Daemon, sessions, integrations, and project state:
   script presence `host.inspect` reports as `host_hooks`, and git's own hooks
   and fsmonitor hook turned off for such a session (the `-c
   core.hooksPath=/dev/null -c core.fsmonitor=false` of every daemon git
-  command, the `--no-textconv` of its session diff, the `GIT_CONFIG_COUNT`
-  pairs of the agent and the host hook scripts, `git_hooks_env_conflict`).
+  command, the filter driver listing and the pairs that turn those drivers
+  off, the `--no-textconv` of its session diff, the `GIT_CONFIG_COUNT` pairs
+  of the agent and the host hook scripts, `git_hooks_env_conflict`).
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/capabilities.rs`
 - `crates/daemon/src/integration/mod.rs`
