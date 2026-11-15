@@ -29,6 +29,13 @@ CLI. It writes `capture.json` and `daemon.log` into `--out` for `compare` to
 diff. Whatever the records say, a completed run exits 0; comparing is
 `compare`'s job.
 
+The isolated daemon runs with `pohunekd --local-only` (#2368): it serves its
+own Unix socket only and never starts the remote control listener, so it
+never asks an overlay (NetBird, Tailscale) for an address or binds the host's
+overlay port. The capture requires the daemon log line `remote control
+listener disabled by --local-only` before it starts a session, so the release
+binaries must be recent enough to accept the flag.
+
 Prerequisites:
 
 - A release tree: `cargo xtask release test-runtime --output <dir> --runtime
@@ -88,9 +95,9 @@ The scenarios:
 | scenario | profile arguments | prompt | read point |
 | --- | --- | --- | --- |
 | `idle_after_turn` | none | `Reply with the single word OK.` | a `working` record and then `done` or `idle` |
-| `permission_prompt` | `--permission-mode=default` | `Run the shell command true with the Bash tool.` | the first `blocked` record, then the first notification |
+| `permission_prompt` | `--permission-mode=default` | `Run the shell command touch canary-permission with the Bash tool.` | the first `blocked` record, then the first notification |
 | `mcp_elicitation` | `--mcp-config=<scratch>/mcp.json --allowedTools=mcp__canary__ask --strict-mcp-config` | `Call the ask tool of the canary MCP server.` | the first `blocked` record, then the first notification |
-| `login_screen` | none; an empty config home | none | the first record, or 10 s after the login method list is on screen (`final_record` is then `null`) |
+| `login_screen` | none; an empty config home | none; Enter on the first-run theme picker | the first record after the theme picker, or 10 s after the login method list is on screen; `final_record` is the last record after the picker, `null` when none arrived |
 | `running_turn` | none | `Write a 400 word story about a lighthouse.` | the first `working` record, before the turn ends |
 
 Each session starts in `--workdir`. Before the prompt the capture waits for
@@ -100,6 +107,28 @@ the first screen: the prompt, the login method list (the package's
 the message to trust the workdir in Claude for that config first; no prompt
 is sent while the dialog is on screen. The login method list in an account
 scenario exits 2: log in to that account first.
+
+`permission_prompt` asks for a command that writes a file, because Claude
+runs a read-only command such as `true` without asking (observed with
+2.1.322 in `default` mode). The capture never approves it, so the file is
+not created.
+
+An empty config home first shows Claude's first-run theme picker (the
+package's `theme_picker` rule), then the login method list. The OSC 7501
+contract has no record for either first-run dialog, so the `login_screen`
+row reads at the login method list: the capture answers the theme picker
+with Enter (its default) and then waits for the login screen. It checks the
+screen again right before the key and stops with exit 4 if the folder-trust
+dialog is showing, since Enter there would trust the directory. A record
+written before the picker (a startup `idle`, say) stays in the row's
+`records` but never becomes its `final_record`: the contract defines no
+record for the picker, so such a record says nothing about the login
+screen. The boundary is the output read after the screen showed the picker,
+right before the key; the worker retains output before its screen shows it,
+so that read holds every record written before the picker. In an empty
+config home an `idle` record is not taken for Claude's prompt: only the
+screen decides there. The theme picker in an account scenario exits 2: finish Claude's
+first run for that config first.
 
 The records of a row are those read up to its read point, and the reads
 that depend on the held record (the activity and the stale-record check)
@@ -112,14 +141,17 @@ every failure, the session is stopped before the daemon stops.
 
 Side effects: every account scenario runs Claude as that account and may
 spend its quota. The scenarios approve no tool call, so nothing is written
-to `--workdir`. The isolation root holds the daemon, its sockets, the
+to `--workdir`; the theme picker's Enter goes to the empty login config home,
+which is removed with the isolation root. The isolation root holds the daemon, its sockets, the
 profiles, an empty login config home, and the scratch `mcp.json` and MCP
 server; it is removed at the end of the run. `daemon.log` holds the
 isolated daemon's own log.
 
 The `mcp_elicitation` and `login_screen` rows, and the Claude flag
 spellings of the profile arguments (from the Claude Code CLI reference),
-are verified at the first real run (#2101 tracks the login result).
+were verified at the first real run with Claude 2.1.322 (#2101): the login
+method list emits no record (`final_record: "none"`) and raises
+`agent_blocked` through its screen rule.
 
 Exit codes:
 
@@ -200,7 +232,10 @@ Exit codes:
 | 3 | at least one row is UNVERIFIED (expected value `null`) and none mismatch |
 
 A row whose expected value is `null` is UNVERIFIED by definition and never a
-pass. `compare` never writes the expected file: there is no `--update`
+pass: `null` means the expectation is unknown. An expected `final_record` of
+`"none"` states that the scenario emits no record: it is VERIFIED when the
+captured `final_record` is `null` and a MISMATCH when a record arrived
+(`- <scenario>/final_record: none`, `+ ...: "<record>"`). `compare` never writes the expected file: there is no `--update`
 flag, and an expectation changes only by a reviewed hand edit with its
 evidence in the commit message.
 

@@ -119,6 +119,24 @@ impl Capture {
         dir
     }
 
+    /// #2368: the daemon log in `--out` confirms `--local-only` and shows no
+    /// overlay listener attempt.
+    fn assert_local_only_daemon(&self) {
+        let log =
+            std::fs::read_to_string(self.out().join("daemon.log")).expect("read the daemon log");
+        assert!(
+            log.contains("remote control listener disabled by --local-only"),
+            "{log}"
+        );
+        for overlay in [
+            "remote control listener not bound",
+            "over overlay",
+            "overlay CLI",
+        ] {
+            assert!(!log.contains(overlay), "the daemon log holds `{overlay}`");
+        }
+    }
+
     /// The launch lines the stand-in appended beside the config home.
     fn argv_log(&self) -> String {
         std::fs::read_to_string(self.env.cwd().join("argv.log")).unwrap_or_default()
@@ -538,7 +556,7 @@ fn every_scenario_matches_the_expected_table() {
     let report = String::from_utf8_lossy(&compared.stdout).into_owned();
     assert_eq!(
         compared.status.code(),
-        Some(3),
+        Some(0),
         "compare: {report}{}",
         stderr_of(&compared)
     );
@@ -546,6 +564,7 @@ fn every_scenario_matches_the_expected_table() {
         "idle_after_turn",
         "permission_prompt",
         "mcp_elicitation",
+        "login_screen",
         "running_turn",
     ] {
         assert!(
@@ -555,12 +574,6 @@ fn every_scenario_matches_the_expected_table() {
             "{row} is VERIFIED: {report}"
         );
     }
-    assert!(
-        report
-            .lines()
-            .any(|line| line.starts_with("login_screen") && line.ends_with("| UNVERIFIED")),
-        "{report}"
-    );
 
     let document = capture.capture_document();
     assert_eq!(document["claude_version"], "2.1.322 (Claude Code)");
@@ -571,6 +584,12 @@ fn every_scenario_matches_the_expected_table() {
     assert_eq!(
         document["scenarios"]["running_turn"]["final_record"],
         "state=working"
+    );
+    capture.assert_local_only_daemon();
+    assert_eq!(
+        theme_input(&workdir),
+        "\r",
+        "the login scenario answers the theme picker with one Enter"
     );
     for file in ["capture.json", "daemon.log"] {
         let text = std::fs::read_to_string(capture.out().join(file)).expect("read the output file");
@@ -596,7 +615,8 @@ fn every_scenario_matches_the_expected_table() {
 }
 
 /// One `--scenario` yields exactly its row; the login row keeps the record
-/// the login screen emitted, also when a blank screen comes first.
+/// the login screen emitted, also when a blank screen and the first-run theme
+/// picker come first.
 #[test]
 fn one_scenario_holds_exactly_its_row() {
     let capture = Capture::new();
@@ -632,6 +652,97 @@ fn one_scenario_holds_exactly_its_row() {
         scenarios["login_screen"]["records"],
         serde_json::json!(["state=blocked:kind=auth"])
     );
+    assert_eq!(theme_input(&workdir), "\r");
+}
+
+/// A record written right before the theme picker (in the same write) stays
+/// in the login row's `records` but is never its `final_record`: the row
+/// describes the login screen, and the boundary is taken from the output
+/// read after the picker was detected, not from an earlier poll.
+#[test]
+fn a_record_before_the_theme_picker_is_not_the_login_final_record() {
+    // The blank start puts the picker in the middle of the first-screen
+    // polls instead of before the first one.
+    login_row_keeps_a_pre_picker_record(&["picker-record", "slow-start"]);
+}
+
+/// A startup `idle` record on a blank screen before the theme picker does
+/// not count as Claude's prompt in an empty config home: the login scenario
+/// waits for the screen and still reads the login row.
+#[test]
+fn a_startup_idle_before_the_theme_picker_is_not_a_prompt() {
+    login_row_keeps_a_pre_picker_record(&["startup-idle"]);
+}
+
+/// Runs `login_screen` with the stand-in switches `mode` and checks the row:
+/// the pre-picker `idle` in `records`, no `final_record`, one Enter typed.
+fn login_row_keeps_a_pre_picker_record(mode: &[&str]) {
+    let capture = Capture::new();
+    let workdir = capture.workdir(mode);
+    let release = capture.release_dir();
+    let output = capture.capture(
+        &release,
+        &capture.claude(),
+        None,
+        &workdir,
+        &[
+            "--scenario",
+            "login_screen",
+            "--step-timeout-secs",
+            ANSWERING_STEP_TIMEOUT,
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{mode:?}: stderr: {}",
+        stderr_of(&output)
+    );
+    capture.assert_no_survivors();
+    let row = &capture.capture_document()["scenarios"]["login_screen"];
+    assert_eq!(
+        row["records"],
+        serde_json::json!(["state=idle"]),
+        "{mode:?}"
+    );
+    assert_eq!(row["final_record"], serde_json::Value::Null, "{mode:?}");
+    assert_eq!(theme_input(&workdir), "\r", "{mode:?}");
+}
+
+/// An account whose config home has not finished Claude's first run shows the
+/// theme picker; the capture refuses it and types nothing into it.
+#[test]
+fn an_account_scenario_refuses_the_first_run_theme_picker() {
+    let capture = Capture::new();
+    let workdir = capture.workdir(&[]);
+    let config = capture.env.cwd().join("fresh-config");
+    std::fs::create_dir(&config).expect("mkdir");
+    let release = capture.release_dir();
+    let output = capture.capture(
+        &release,
+        &capture.claude(),
+        Some(&config),
+        &workdir,
+        &[
+            "--scenario",
+            "idle_after_turn",
+            "--step-timeout-secs",
+            ANSWERING_STEP_TIMEOUT,
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("first-run theme picker"),
+        "{}",
+        stderr_of(&output)
+    );
+    capture.assert_no_survivors();
+    assert_eq!(theme_input(&workdir), "", "no key reached the picker");
 }
 
 /// C5.
@@ -760,6 +871,11 @@ fn untrusted_workdir_stops_before_any_prompt() {
         typed.is_empty(),
         "nothing is typed into the trust dialog: {typed:?}"
     );
+}
+
+/// The bytes the stand-in read on its theme picker in `workdir`.
+fn theme_input(workdir: &Path) -> String {
+    std::fs::read_to_string(workdir.join("theme-input.log")).unwrap_or_default()
 }
 
 /// The processes whose command line or environment holds `root`.

@@ -128,7 +128,9 @@ impl Scenario {
     const fn prompt(self) -> Option<&'static str> {
         match self {
             Self::IdleAfterTurn => Some("Reply with the single word OK."),
-            Self::PermissionPrompt => Some("Run the shell command true with the Bash tool."),
+            Self::PermissionPrompt => {
+                Some("Run the shell command touch canary-permission with the Bash tool.")
+            }
             Self::McpElicitation => Some("Call the ask tool of the canary MCP server."),
             Self::RunningTurn => Some("Write a 400 word story about a lighthouse."),
             Self::LoginScreen => None,
@@ -147,7 +149,8 @@ enum Profile {
     /// The account with the canary MCP server configured and its `ask` tool
     /// pre-allowed, so the call reaches the elicitation without a prompt.
     Mcp,
-    /// An empty config home: Claude shows its login method list.
+    /// An empty config home: Claude shows its first-run theme picker, then
+    /// its login method list.
     Login,
 }
 
@@ -212,6 +215,7 @@ const DETECT_MANIFEST: &str = "detect.toml";
 /// Rules of the Claude detection manifest the driver evaluates on the screen.
 const FOLDER_TRUST_RULE: &str = "folder_trust_dialog";
 const LOGIN_METHOD_RULE: &str = "login_method_list";
+const THEME_PICKER_RULE: &str = "theme_picker";
 
 /// Keys a rule the driver evaluates may carry: it reads only `region` and
 /// `regex`, so a rule with any other matcher is refused instead of misread.
@@ -280,7 +284,7 @@ fn run_in_root(
     let channel = args.release_dir.join("runtime").join(CATALOG_FILE);
     let mut host =
         Host::prepare(root, &args.release_dir, &anchor, &channel).map_err(XtaskError::Usage)?;
-    let outcome = match host.launch(root) {
+    let outcome = match host.launch_local_only(root) {
         Ok(()) => {
             let mut driver = Driver {
                 host: &mut host,
@@ -482,6 +486,7 @@ impl ScreenRule {
 struct ScreenRules {
     folder_trust: ScreenRule,
     login_method: ScreenRule,
+    theme_picker: ScreenRule,
 }
 
 impl ScreenRules {
@@ -517,6 +522,7 @@ impl ScreenRules {
         Ok(Self {
             folder_trust: screen_rule(&manifest, FOLDER_TRUST_RULE)?,
             login_method: screen_rule(&manifest, LOGIN_METHOD_RULE)?,
+            theme_picker: screen_rule(&manifest, THEME_PICKER_RULE)?,
         })
     }
 }
@@ -599,11 +605,15 @@ impl From<XtaskError> for StepFailure {
 }
 
 /// What the first screen of a session shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstScreen {
     /// The prompt is ready for input.
     Prompt,
     /// The login method list.
     Login,
+    /// The first-run theme picker, which comes before the login method list
+    /// in an empty config home.
+    Theme,
 }
 
 /// The output cursor of one session's runtime: the identity every offset is
@@ -837,10 +847,24 @@ impl Driver<'_> {
 
     /// Drives the scenario's steps up to its read point and reads the row.
     fn drive(&mut self, session: &mut Session) -> Result<ScenarioRow, StepFailure> {
-        let first = self.wait_first_screen(session)?;
         let scenario = session.scenario;
+        let mut first = self.wait_first_screen(session, scenario, false)?;
+        // The records that precede the theme picker the key answered; the
+        // login row's `final_record` comes from the records after them.
+        let mut picker_records = 0;
+        if (scenario, first) == (Scenario::LoginScreen, FirstScreen::Theme) {
+            picker_records = self.accept_theme(session)?;
+            first = self.wait_first_screen(session, scenario, true)?;
+        }
         match (scenario, first) {
-            (Scenario::LoginScreen, FirstScreen::Login) => return self.read_login(session),
+            (Scenario::LoginScreen, FirstScreen::Login) => {
+                return self.read_login(session, picker_records)
+            }
+            (_, FirstScreen::Theme) => {
+                return Err(StepFailure::Refused(
+                    "Claude shows its first-run theme picker: finish Claude's first run for the account of `--claude-config-dir` first".to_owned(),
+                ))
+            }
             (Scenario::LoginScreen, FirstScreen::Prompt) => {
                 return Err(StepFailure::Refused(
                     "Claude opened its prompt without a login in an empty config home".to_owned(),
@@ -916,7 +940,12 @@ impl Driver<'_> {
 
     /// Waits until the first screen shows the prompt or the login method list.
     /// The folder-trust dialog stops the run: the capture never answers it.
-    fn wait_first_screen(&mut self, session: &mut Session) -> Result<FirstScreen, StepFailure> {
+    fn wait_first_screen(
+        &mut self,
+        session: &mut Session,
+        scenario: Scenario,
+        theme_answered: bool,
+    ) -> Result<FirstScreen, StepFailure> {
         let deadline = Instant::now() + self.args.step_timeout;
         loop {
             self.read_records(session)?;
@@ -928,13 +957,20 @@ impl Driver<'_> {
             if self.screen_rules.login_method.matches(&detection) {
                 return Ok(FirstScreen::Login);
             }
+            // After the answer the picker stays until Claude redraws; the
+            // wait goes on for the screen that follows it.
+            if !theme_answered && self.screen_rules.theme_picker.matches(&detection) {
+                return Ok(FirstScreen::Theme);
+            }
             // A blank screen before the agent draws anything may read idle
             // too, so `idle` counts only from a record or a matched screen
-            // rule.
-            let idle_record = session
-                .records
-                .last()
-                .is_some_and(|record| record == "state=idle");
+            // rule. In an empty config home a startup `idle` record may come
+            // before the first-run screens, so only the screen decides there.
+            let idle_record = scenario != Scenario::LoginScreen
+                && session
+                    .records
+                    .last()
+                    .is_some_and(|record| record == "state=idle");
             let screen_idle = activity.as_deref() == Some("idle")
                 && detection["status"]["state_source"] == SCREEN_STATE_SOURCE;
             if idle_record || screen_idle {
@@ -944,6 +980,46 @@ impl Driver<'_> {
                 return Err(self.timed_out("wait for the first screen"));
             }
             std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Answers the first-run theme picker of an empty config home with its
+    /// default, the one input the login scenario sends. The picker emits no
+    /// program-status record (the 7501 contract has none for first-run
+    /// dialogs), so the row's read point stays the login method list. The
+    /// screen is checked once more right before the key: Enter on the
+    /// folder-trust dialog would trust the directory.
+    ///
+    /// Returns how many records precede the picker the key answered. The
+    /// worker retains output bytes before its screen shows them and the
+    /// daemon's detection follows that screen, so a full read after the
+    /// detection that matched the picker holds every record written before
+    /// the picker was drawn.
+    fn accept_theme(&mut self, session: &mut Session) -> Result<usize, StepFailure> {
+        let detection = self.detection(session)?;
+        if self.screen_rules.folder_trust.matches(&detection) {
+            return Err(self.untrusted());
+        }
+        if !self.screen_rules.theme_picker.matches(&detection) {
+            return Err(StepFailure::Refused(format!(
+                "the screen no longer shows the theme picker (`{}`) the key was meant for",
+                self.screen_rules.theme_picker.id
+            )));
+        }
+        self.read_records(session)?;
+        let picker_records = session.records.len();
+        let what = "accept the theme picker's default";
+        let (code, document) = self.cli_document(
+            &["session", "input", session.id.as_str(), "", "--json"],
+            what,
+        )?;
+        if code == Some(0) {
+            Ok(picker_records)
+        } else {
+            Err(StepFailure::Refused(format!(
+                "cannot {what}: {}",
+                document["err"]
+            )))
         }
     }
 
@@ -994,16 +1070,29 @@ impl Driver<'_> {
         }
     }
 
-    /// The login row: the records read so far plus any that arrive within
-    /// [`LOGIN_RECORD_WINDOW`] of the login screen; `final_record` is `null`
-    /// when none arrived.
-    fn read_login(&mut self, session: &mut Session) -> Result<ScenarioRow, StepFailure> {
+    /// The login row: `records` holds every record read so far, those read
+    /// before the theme picker was answered included; `final_record` is the
+    /// last record after the first `picker_records`, waited for up to
+    /// [`LOGIN_RECORD_WINDOW`] from the login screen, and `null` when none
+    /// arrived. The 7501 contract has no record for the picker, so a record
+    /// read before it (a startup `idle`) says nothing about the login screen.
+    fn read_login(
+        &mut self,
+        session: &mut Session,
+        picker_records: usize,
+    ) -> Result<ScenarioRow, StepFailure> {
         let window_end = Instant::now() + LOGIN_RECORD_WINDOW;
-        while session.records.is_empty() && Instant::now() < window_end {
+        while session.records.len() == picker_records && Instant::now() < window_end {
             std::thread::sleep(POLL_INTERVAL);
             self.read_records(session)?;
         }
-        self.read_row(session, Instant::now(), false)
+        let mut row = self.read_row(session, Instant::now(), false)?;
+        row.final_record = row
+            .records
+            .get(picker_records..)
+            .and_then(<[String]>::last)
+            .cloned();
+        Ok(row)
     }
 
     /// Reads the row at its read point. The activity and the stale-record

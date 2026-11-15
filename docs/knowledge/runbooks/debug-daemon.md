@@ -73,7 +73,11 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    supervisor exits or panics unexpectedly, the daemon logs
    `remote listener supervisor failed; shutting down daemon` with the overlay
    identifier and exits after controlled cleanup instead of remaining ready
-   without that listener.
+   without that listener. A daemon that logged `remote control listener
+   disabled by --local-only; serving local-only` was started with
+   `pohunekd --local-only` and has no remote listener by design: isolated test
+   daemons (the Claude canary capture) run that way, the installed service
+   never does.
 7. If a session was expected, run `pohunek session list --json` on the relevant
    host and inspect the specific session with `pohunek session inspect <target>`.
 8. If the daemon restarted, do not infer session exit from the closed control or

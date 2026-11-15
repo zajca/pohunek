@@ -29,6 +29,9 @@
 //! - J: the capture allowlist branches (unknown top-level key, unknown
 //!   scenario name, unknown `activity`, `pohunek_version` with a free tail):
 //!   each refuses it as exit 2, naming the field.
+//! - K: an expected `final_record` of `"none"` (no record arrives) is
+//!   VERIFIED against a captured `null` and a MISMATCH against a captured
+//!   record, with `-`/`+` lines naming `none` and the record.
 
 // Rust guideline compliant 2026-11-13
 
@@ -279,12 +282,59 @@ fn capture_row_without_attention_is_mismatch_with_one_sided_leaf() {
 #[test]
 fn checked_in_table_is_exercised() {
     let canary = Canary::new();
-    let output = canary.compare_checked_in("capture-match.json");
+    let output = canary.compare_checked_in("capture-no-record.json");
     assert_eq!(
         output.status.code(),
-        Some(3),
-        "the checked-in table matches the fixture with the login row UNVERIFIED: stderr {}",
+        Some(0),
+        "the checked-in table verifies every row of the fixture: stderr {}{}",
+        stdout_of(&output),
         stderr_of(&output)
+    );
+}
+
+#[test]
+fn an_expected_no_record_verifies_a_captured_null() {
+    let canary = Canary::new();
+    let output = canary.compare("expected-no-record.json", "capture-no-record.json");
+    let stdout = stdout_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "every row is VERIFIED: {stdout}{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout.contains("login_screen | none [agent_blocked] | null [agent_blocked] | VERIFIED"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_expected_no_record_mismatches_a_captured_record() {
+    let canary = Canary::new();
+    let output = canary.compare("expected-no-record.json", "capture-match.json");
+    let stdout = stdout_of(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a record where none is expected exits 1: {stdout}{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout.contains("login_screen | none [agent_blocked] | state=working [] | MISMATCH"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "- login_screen/final_record: none"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "+ login_screen/final_record: \"state=working\""),
+        "{stdout}"
     );
 }
 

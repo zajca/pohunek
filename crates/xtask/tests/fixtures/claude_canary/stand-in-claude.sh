@@ -11,11 +11,17 @@
 #   untrusted     draw the folder-trust dialog, emit nothing
 #   silent        answer no prompt with a record
 #   login-record  emit `state=blocked:kind=auth` on the login screen
+#   picker-record emit `state=idle` right before the theme picker, in the
+#                 same printf
+#   startup-idle  emit `state=idle` and keep the screen blank for a second
+#                 before the theme picker
 #   slow-start    show a blank screen for two seconds before the first screen
-# An empty `CLAUDE_CONFIG_DIR` draws the login method list. Input is read
-# with `dd bs=1`, one read(2) per byte: BSD `head -c 1` reads the terminal
-# through a stdio buffer and drops the rest of a prompt. Bytes typed into
-# the folder-trust dialog are appended to `input.log` beside `argv.log`.
+# An empty `CLAUDE_CONFIG_DIR` draws the first-run theme picker and, after a
+# carriage return, the login method list; the bytes typed into the picker are
+# appended to `theme-input.log` in the working directory. Input is read with
+# `dd bs=1`, one read(2) per byte: BSD `head -c 1` reads the terminal through
+# a stdio buffer and drops the rest of a prompt. Bytes typed into the
+# folder-trust dialog are appended to `input.log` beside `argv.log`.
 if [ "$1" = --version ]; then printf '%s\n' '2.1.322 (Claude Code)'; exit 0; fi
 config=${CLAUDE_CONFIG_DIR:?}
 logs=$(dirname "$config")
@@ -29,7 +35,19 @@ if [ -e ./untrusted ]; then
   printf '\033[2J\033[H%s\r\n Do you trust the files in this folder?\r\n ❯ 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm · Esc to cancel\r\n' "$rule"
   while :; do dd bs=1 count=1 2>/dev/null >> "$logs/input.log"; done
 fi
+cr=$(printf '\r')
 if [ -z "$(ls -A "$config" 2>/dev/null)" ]; then
+  if [ -e ./startup-idle ]; then emit idle; sleep 1; fi
+  picker_record=
+  if [ -e ./picker-record ]; then picker_record='\033]7501;state=idle:app=claude-code\033\\'; fi
+  # One printf: the record comes right before the picker, without a pause.
+  # shellcheck disable=SC2059
+  printf "$picker_record\033[2J\033[H%s\r\n Choose the text style that looks best with your terminal\r\n ❯ Dark mode\r\n   Light mode\r\n" "$rule"
+  while :; do
+    c=$(dd bs=1 count=1 2>/dev/null)
+    printf '%s' "$c" >> ./theme-input.log
+    if [ "$c" = "$cr" ]; then break; fi
+  done
   printf '\033[2J\033[H%s\r\n Select login method:\r\n ❯ 1. Claude account with subscription\r\n   2. Anthropic Console account\r\n' "$rule"
   if [ -e ./login-record ]; then emit 'blocked:kind=auth'; fi
   hold
@@ -49,7 +67,7 @@ submit() {
   if [ -e ./silent ]; then return; fi
   case "$1" in
     'Reply with the single word OK.') emit working; sleep 1; emit done ;;
-    'Run the shell command true with the Bash tool.')
+    'Run the shell command touch canary-permission with the Bash tool.')
       emit working
       # A multi-byte character and a record each split across two writes,
       # so a reader poll can end inside either one.
@@ -64,7 +82,6 @@ submit() {
     *) emit error ;;
   esac
 }
-cr=$(printf '\r')
 pending=
 while :; do
   c=$(dd bs=1 count=1 2>/dev/null)

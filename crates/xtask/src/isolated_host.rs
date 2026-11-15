@@ -94,6 +94,13 @@ const HOME_PLACEHOLDER: &str = "<USER_HOME>";
 /// Command search path of every child: the system directories only.
 const CHILD_PATH: &str = "/usr/bin:/bin";
 
+/// The daemon flag that keeps the remote control listener off.
+const LOCAL_ONLY_FLAG: &str = "--local-only";
+
+/// What the daemon logs, before it accepts connections, when
+/// [`LOCAL_ONLY_FLAG`] is in force.
+const LOCAL_ONLY_LOG_LINE: &str = "remote control listener disabled by --local-only";
+
 /// UTF-8 locale of every child; macOS ships no `C.UTF-8`.
 const CHILD_LOCALE: &str = if cfg!(target_os = "macos") {
     "en_US.UTF-8"
@@ -378,6 +385,30 @@ impl Host {
 
     /// Starts the daemon of the prefix and waits until it accepts connections.
     pub(crate) fn launch(&mut self, root: &Root) -> Result<(), String> {
+        self.launch_with(root, &[])
+    }
+
+    /// Starts the daemon of the prefix with `--local-only`, waits until it
+    /// accepts connections and requires its log to confirm that the remote
+    /// control listener is off: on a host with an overlay, the daemon would
+    /// otherwise try to serve the control protocol on the host's overlay
+    /// address.
+    pub(crate) fn launch_local_only(&mut self, root: &Root) -> Result<(), String> {
+        self.launch_with(root, &[LOCAL_ONLY_FLAG])?;
+        let log = fs::read_to_string(root.path().join(DAEMON_LOG_FILE))
+            .map_err(|error| format!("cannot read the daemon log: {error}"))?;
+        if log.contains(LOCAL_ONLY_LOG_LINE) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the daemon log does not confirm `{LOCAL_ONLY_FLAG}` (`{LOCAL_ONLY_LOG_LINE}`)"
+            ))
+        }
+    }
+
+    /// Starts the daemon of the prefix with `arguments` and waits until it
+    /// accepts connections.
+    fn launch_with(&mut self, root: &Root, arguments: &[&str]) -> Result<(), String> {
         let log = File::create(root.path().join(DAEMON_LOG_FILE))
             .map_err(|error| format!("cannot create the daemon log: {error}"))?;
         let log_err = log
@@ -385,6 +416,7 @@ impl Host {
             .map_err(|error| format!("cannot duplicate the daemon log: {error}"))?;
         let mut command = Command::new(self.prefix.join("pohunekd"));
         command
+            .args(arguments)
             .current_dir(root.path().join(WORK_DIRECTORY))
             .env_clear()
             .envs(self.environment.iter().cloned())

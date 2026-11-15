@@ -5,8 +5,10 @@
 //! expected table `compat/claude/canary/expected.json` and prints one row per
 //! scenario with the expected and observed `final_record` and `attention`
 //! values and a verdict. A row whose expected value is `null` is
-//! UNVERIFIED by definition and never a pass. Expectations change only by a
-//! reviewed hand edit with its evidence, never from a run.
+//! UNVERIFIED by definition and never a pass. An expected `final_record` of
+//! `"none"` states that no record arrives: it verifies against a captured
+//! `null` and mismatches any record. Expectations change only by a reviewed
+//! hand edit with its evidence, never from a run.
 //!
 //! Rust guideline compliant 2026-11-13
 
@@ -35,6 +37,10 @@ const SCENARIOS: [&str; 5] = [
     "login_screen",
     "running_turn",
 ];
+
+/// Expected `final_record` meaning that the scenario emits no record; a
+/// captured `null` matches it. `null` in the table means unknown instead.
+const NO_RECORD: &str = "none";
 
 /// Exit code of a compare that verified every row except UNVERIFIED ones.
 const UNVERIFIED_EXIT_CODE: i32 = 3;
@@ -320,7 +326,8 @@ fn compare(expected_path: &Path, capture_path: &Path) -> Result<CompareReport, X
 ///
 /// A row with a `null` value is UNVERIFIED by definition and never a pass.
 /// A row that omits a compared field stores no expectation for it, so it is
-/// UNVERIFIED as well.
+/// UNVERIFIED as well. An expected [`NO_RECORD`] matches only a captured
+/// `null` `final_record`.
 fn compare_row(scenario: &str, expected_row: &Value, observed_row: &Value) -> (Row, Vec<String>) {
     let expected_final = expected_row.get("final_record");
     let expected_attention = expected_row.get("attention");
@@ -338,13 +345,24 @@ fn compare_row(scenario: &str, expected_row: &Value, observed_row: &Value) -> (R
         );
     }
     let mut row_diff = Vec::new();
-    collect_leaf_diffs(
-        scenario,
-        expected_final,
-        observed_row.get("final_record"),
-        "final_record",
-        &mut row_diff,
-    );
+    let observed_final = observed_row.get("final_record");
+    if expected_final.and_then(Value::as_str) == Some(NO_RECORD) {
+        if !observed_final.is_some_and(Value::is_null) {
+            row_diff.push(format!("- {scenario}/final_record: {NO_RECORD}"));
+            row_diff.push(format!(
+                "+ {scenario}/final_record: {}",
+                observed_final.map_or_else(|| "absent".to_owned(), Value::to_string)
+            ));
+        }
+    } else {
+        collect_leaf_diffs(
+            scenario,
+            expected_final,
+            observed_final,
+            "final_record",
+            &mut row_diff,
+        );
+    }
     collect_leaf_diffs(
         scenario,
         expected_attention,

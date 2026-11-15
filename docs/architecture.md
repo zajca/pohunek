@@ -724,6 +724,10 @@ transport classes:
   provider's validated current local member address and per-overlay port, never
   `0.0.0.0`. Reachability and authentication are provided by that overlay;
   NetBird is the default provider and Tailscale a supported opt-in provider.
+  `pohunekd --local-only` starts no remote listener and asks no overlay for an
+  address; it logs `remote control listener disabled by --local-only; serving
+  local-only`. Isolated test daemons, such as the Claude canary capture's, use it
+  on hosts that run an overlay.
 
 The control protocol is **newline-delimited JSON**: one JSON request per line,
 one JSON response line for ordinary requests. Long-lived subscriptions keep the
