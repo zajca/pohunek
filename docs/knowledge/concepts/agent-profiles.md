@@ -367,6 +367,30 @@ absent on the wire means `owner`; bare runtimes carry neither), and `session lis
 label live as `agent_display_name` (absent when the profile sets none, or no
 longer resolves). See the public API reference for the wire shape.
 
+## Session rights
+
+A profile may carry a `[rights]` table that says what the sessions launched
+from it may do to other sessions (see the [trust model](../safety/trust-model.md)):
+
+```toml
+base = "claude"
+
+[rights]
+owner_equivalent = true               # the tree has the rights of the owner's shell
+spawn_profiles = ["worker", "review"] # the profiles it may launch
+```
+
+`owner_equivalent` is meant for manager profiles: the sessions run with the
+owner's rights, so a manager session reaches sessions it did not spawn.
+`spawn_profiles` lists exact profile names; an empty list forbids spawning and
+an absent key leaves it unrestricted. A request that names a profile outside
+the list is refused with `session_right_denied` (`reason=spawn_profile_not_allowed`).
+The table is read from the profile file, never from a request, and an unknown
+key or an entry that is not a profile name is `invalid_profile`. Unlike a
+presentation label it is part of the profile revision, so a change asks for
+`--accept-profile-change` on the next resume. A profile without the table has
+neither key.
+
 ## Launch options
 
 A profile may offer a few closed choices a launch picks from, for example the

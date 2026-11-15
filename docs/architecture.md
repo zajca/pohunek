@@ -181,7 +181,10 @@ admission policy: the `spawned_by` attribution of a session
 metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); both have
 shipped. Metadata stays opaque to the daemon. Attribution is an authorization input
 only through the session rights rule (see Security Model): a session caller
-reaches its `spawned_by` descendants. The same attribution keys the session-tree views:
+reaches its `spawned_by` descendants. The parent link is attested: a
+`session.new` from inside a session records that session, whatever markers
+the request carries, and only the owner changes a link afterwards, with
+`session.adopt`. The same attribution keys the session-tree views:
 `session.list` counts direct children per entry, `--tree` and the
 `top_level` / `spawned_by` list filters read them, `session.retention.sweep`
 selects by spawner, and `session.remove_tree` removes a subtree deepest
@@ -2348,7 +2351,8 @@ that remain are cheap, free-by-default, or inherited:
   `session.remove`, `session.remove_accepting_unconfirmed`,
   `session.remove_tree`, `session.rename`, `session.set_metadata`,
   `session.input`, `session.resize` and `session.attach`. Read methods,
-  `session.new` and every non-session method are not checked.
+  `session.new` and `session.adopt` have their own rules below; every other
+  non-session method is not checked.
 
   | Caller | Evidence | Class |
   |---|---|---|
@@ -2358,6 +2362,7 @@ that remain are cheap, free-by-default, or inherited:
   | Linux, no ancestry match, the control group is inside session X's worker unit | control group | `Session(X)` |
   | Ancestry names X and the control group names another session | both | `Session(X)`; ancestry wins |
   | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights; a shell a session spawned is `Session(X)` of its own tree |
+  | The session X the caller belongs to runs a profile with `[rights] owner_equivalent = true` | profile file | `OwnerShell(X)`: owner rights |
   | None of the above: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
 
   A `Session(X)` caller may mutate a session only when it is a descendant of
@@ -2375,6 +2380,20 @@ that remain are cheap, free-by-default, or inherited:
   reason and the request id, and never the params, input bytes, names or
   metadata values. `pohunek doctor` reports the `session_rights` check with
   the placement mode: `ancestry+cgroup` where each worker runs as a systemd user unit, otherwise `ancestry`.
+
+  `session.new` from a `Session(X)` caller records `spawned_by` as X, with the
+  daemon's own id, whatever the request markers say. Markers that name another
+  session or daemon are refused with `session_right_denied`
+  (`reason=origin_mismatch`), and a profile outside the `[rights]
+  spawn_profiles` list of X's profile with `spawn_profile_not_allowed` (an
+  empty list forbids spawning; an absent key is unrestricted; an unreadable
+  profile file forbids spawning). From the owner and the owner's shells the
+  markers are recorded as sent. `session.adopt` gives a session a new parent
+  and is owner only: a `Session(X)` caller gets `owner_only`. It refuses a
+  loop and a session inside a `session.remove_tree` cascade in progress with
+  `session_adopt_refused`. `[rights]` is read from the owner-private profile
+  file, never from a request. The manager profiles of the owner's own tooling
+  set `owner_equivalent = true`; every other profile keeps the tree rule.
 
   This is a guardrail, not a wall. A process of the same user that leaves the
   session tree keeps owner rights, and so does one that reads the owner's

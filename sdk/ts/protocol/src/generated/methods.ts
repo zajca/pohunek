@@ -63,6 +63,8 @@ import type {
   ProjectRenameParams,
   ProjectShowParams,
   ProjectShowResult,
+  SessionAdoptParams,
+  SessionAdoptResult,
   SessionAttachParams,
   SessionAttachResult,
   SessionDetachParams,
@@ -148,6 +150,7 @@ export interface Methods {
   "project.remove": { params: ProjectRemoveParams; output: ProjectRemoveResult };
   "project.rename": { params: ProjectRenameParams; output: ProjectInfo };
   "project.show": { params: ProjectShowParams; output: ProjectShowResult };
+  "session.adopt": { params: SessionAdoptParams; output: SessionAdoptResult };
   "session.attach": { params: SessionAttachParams; output: SessionAttachResult };
   "session.detach": { params: SessionDetachParams; output: SessionDetachResult };
   "session.detection": { params: SessionDetectionParams; output: SessionDetectionResult };
@@ -214,6 +217,7 @@ export const METHOD_NAMES = [
   "project.remove",
   "project.rename",
   "project.show",
+  "session.adopt",
   "session.attach",
   "session.detach",
   "session.detection",

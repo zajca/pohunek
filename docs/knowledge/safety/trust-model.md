@@ -128,6 +128,13 @@ The assistant must:
   tree (a double fork, `systemd-run --user --scope`). It is a guardrail against
   a confused worker, not isolation from a hostile one; run untrusted agents in
   the isolation track (#88). `pohunek doctor` shows the `session_rights` check.
+- The parent link is attested for a process inside a session's tree: a
+  `session.new` from there records that session as `spawned_by` and refuses
+  markers that name another session (`origin_mismatch`). Only the owner moves a
+  session under another parent (`session.adopt`; a session gets `owner_only`).
+  A profile's `[rights]` table is the owner's lever: `spawn_profiles` limits what
+  a session launches, and `owner_equivalent = true` gives a manager profile the
+  rights of the owner's shell.
 - The Rust SDK inherits that origin from the calling process by default
   (`OriginSource::Environment`, which reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID`). `OriginSource::Omitted` makes a connection attach no

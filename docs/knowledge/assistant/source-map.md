@@ -532,6 +532,10 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/rights.rs` — session rights: caller classification
   by kernel peer (ancestry, worker-unit control group) and the descendant target
   rule behind `session_right_denied`.
+- `crates/daemon/src/session/adopt.rs` — `session.adopt`: the owner-only parent
+  change and the cascade registration that refuses it inside a `remove_tree`.
+- `crates/daemon/src/agent/profile/rights.rs` — the profile `[rights]` table
+  (`owner_equivalent`, `spawn_profiles`).
 - `crates/daemon/src/session/turn_wait.rs` — `session.wait_turn`: edge-triggered
   selection, `targets_ended`, `cursor_reset`, per-target progress.
 - `crates/daemon/src/session/turn_events.rs` — the in-memory turn-event journal,
