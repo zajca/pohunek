@@ -496,6 +496,41 @@ async fn a_recovered_session_keeps_the_key_of_its_creating_request() {
     rig.stop_daemon().await;
 }
 
+/// A session started with `skip_repo_hooks` keeps the switch through a resume,
+/// which rebuilds the session from its resume binding, and through a daemon
+/// restart after it (#2366).
+#[tokio::test]
+async fn a_resumed_session_keeps_skipping_the_repository_hooks() {
+    let mut rig = ClaudeRig::new("claude-skip-resume").await;
+    let mut params =
+        serde_json::to_value(session_params_in(rig.cwd.to_path_buf())).expect("serialize params");
+    params["agent"] = serde_json::json!("claude-fixture");
+    params["skip_repo_hooks"] = serde_json::json!(true);
+    let created = keyed_create(&mut rig.control, &params).await;
+    assert!(
+        created.session.skip_repo_hooks,
+        "the create records the switch"
+    );
+    let id = created.session.id.clone();
+    rig.additional_sessions.push(id.clone());
+    rig.transcript(LAUNCH);
+    rig.report_for(&id, "startup", LAUNCH).await;
+    rig.stop(&id).await;
+    ok_payload(rig.resume_session(&id).await);
+
+    let resumed = inspect_session(&mut rig.control, &id).await;
+    assert!(resumed.skip_repo_hooks, "the relaunch keeps the switch");
+
+    rig.stop(&id).await;
+    let mut rig = rig.restarted().await;
+    let after_restart = inspect_session(&mut rig.control, &id).await;
+    assert!(
+        after_restart.skip_repo_hooks,
+        "the recovery wrote the switch to the durable record"
+    );
+    rig.stop_daemon().await;
+}
+
 /// A session that has captured a native id keeps a metadata edit in its durable
 /// session record.
 #[tokio::test]

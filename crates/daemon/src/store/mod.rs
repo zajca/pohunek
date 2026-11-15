@@ -160,6 +160,11 @@ pub struct ResumeBinding {
     /// kept so a relaunch of the session reports the same spawner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_by: Option<protocol::SpawnedBy>,
+    /// [`protocol::SessionInfo::skip_repo_hooks`], kept so a relaunch of the
+    /// session keeps skipping the in-repo hook layer. Absent (false) on a
+    /// binding stored before schema 21.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_repo_hooks: bool,
     /// Structural relaunch snapshot (C.4): the resolved launch program, frozen at
     /// creation so a host profile's `program` override survives a restart even if
     /// the profile is later edited or deleted. Serde default (`""`) for a legacy
@@ -267,6 +272,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             #[serde(default)]
             spawned_by: Option<protocol::SpawnedBy>,
             #[serde(default)]
+            skip_repo_hooks: bool,
+            #[serde(default)]
             program: String,
             #[serde(default)]
             args: Vec<String>,
@@ -317,6 +324,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             is_linked_worktree: raw.is_linked_worktree,
             metadata: raw.metadata,
             spawned_by: raw.spawned_by,
+            skip_repo_hooks: raw.skip_repo_hooks,
             program: raw.program,
             args: raw.args,
             input_rules: raw.input_rules,
@@ -458,6 +466,11 @@ pub struct WorktreeBinding {
     /// may be wiped on upgrade), this just keeps the read path simple.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Whether the owning session skips the in-repo hook layer, so the
+    /// pre-/post-remove hooks of this worktree run the host-global layer only.
+    /// Absent (false) on a binding stored before schema 21.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_repo_hooks: bool,
     /// Creation timestamp (RFC3339).
     pub created_at: String,
     /// Last-update timestamp (RFC3339).
@@ -2807,6 +2820,7 @@ mod tests {
             launch_checkout: None,
             context_pin: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 
@@ -2840,6 +2854,7 @@ mod tests {
             project_id: None,
             created_at: "2026-06-19T00:00:00Z".to_owned(),
             updated_at: "2026-06-19T00:00:00Z".to_owned(),
+            skip_repo_hooks: false,
         }
     }
 
@@ -2887,7 +2902,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":20,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2903,7 +2918,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":20,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -3015,7 +3030,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":20,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3137,7 +3152,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":20,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":21,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),

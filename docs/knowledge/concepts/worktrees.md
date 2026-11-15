@@ -179,6 +179,28 @@ not apply to it. A required hook that outlasts the client's request timeout
 ends the call with the outcome-unknown error while the daemon rolls back: check
 `session list` before retrying.
 
+A checkout carries its own hook layer, so a pull-request head started with
+`--base-branch refs/pull/<n>/head` would run scripts its author wrote. `pohunek
+session new --no-repo-hooks` (`skip_repo_hooks` on `session.new`) runs none of
+the repository layer, neither `.pohunek/hooks/<event>` nor the legacy
+`.pohunek/setup`, for any event of that session and for its whole life:
+`pre-create`, `post-create`, `session-start`, `agent-state`, `session-stop`,
+`pre-remove` and `post-remove`, also after a resume, a daemon restart, and in
+the rollback of a failed create. The daemon never looks the layer up for such a
+session, so a link or any other path shape in the checkout cannot bring it back.
+The host's scripts in `~/.config/pohunek/hooks/` still run, in the checkout; a
+host that must not run code there either has no such script or refuses the start
+first (`host inspect --json` reports `host_hooks`, one boolean per event). The
+session reports `skip_repo_hooks: true` in `session new --json`, `session
+inspect` and `session list`. When `[hooks] required` lists an event that only
+the skipped layer could run (the host has no script for it), the start fails
+with `hook_required_skipped` before any hook, fetch or git command runs and
+before anything is created; a host script removed after that check fails the
+create at its `post-create` step with the same code, and the create is rolled
+back. Without the switch the rule is unchanged: a required event with no script
+anywhere passes. Git's own hooks are outside this switch: `git worktree add`
+runs the repository's `post-checkout` hook.
+
 A host or repository `pre-remove` hook runs inside the worktree before
 `pohunek session rm` deletes it, and `post-remove` runs in the repository
 afterwards, so a project can release what its `post-create` hook provisioned

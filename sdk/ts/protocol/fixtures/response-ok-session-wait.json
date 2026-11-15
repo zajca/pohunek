@@ -71,6 +71,7 @@
       "project_label": "pohunek",
       "repo": "/workspace/pohunek",
       "rows": 32,
+      "skip_repo_hooks": true,
       "spawned_by": {
         "daemon_id": "d-spawner-fixture",
         "session_id": "s-spawner-fixture"

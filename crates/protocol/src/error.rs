@@ -35,6 +35,12 @@ pub const AGENT_OPTION_CHOICE_MISSING_CODE: &str = "agent_option_choice_missing"
 /// Error code a client raises when the daemon cannot honor `agent_options`.
 pub const SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE: &str =
     "session_new_agent_options_unsupported";
+/// Error code a client raises when the daemon cannot honor `skip_repo_hooks`.
+pub const SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE: &str =
+    "session_new_skip_repo_hooks_unsupported";
+/// Error code of a `session.new` with `skip_repo_hooks` whose `hooks.required`
+/// names an event that only the skipped in-repo layer could run.
+pub const HOOK_REQUIRED_SKIPPED_CODE: &str = "hook_required_skipped";
 /// Error code a client raises when the daemon cannot isolate the attention of
 /// descendants of a session flagged with the reserved attention metadata key.
 pub const SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE: &str =
@@ -1623,6 +1629,25 @@ impl ProtocolError {
             SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE,
             format!(
                 "{target} predates agent_options and would launch every option with its default; nothing was sent"
+            ),
+            Some("upgrade the daemon, then retry".to_owned()),
+        )
+    }
+
+    /// The `daemon/session_new_skip_repo_hooks_unsupported` error a client
+    /// raises before it sends `session.new` to a daemon that cannot honor
+    /// `skip_repo_hooks`.
+    #[must_use]
+    pub fn session_new_skip_repo_hooks_unsupported(host: Option<&str>) -> Self {
+        let target = host.map_or_else(
+            || "the local daemon".to_owned(),
+            |route| format!("host '{route}'"),
+        );
+        Self::new(
+            ErrorClass::Daemon,
+            SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE,
+            format!(
+                "{target} predates skip_repo_hooks and would run the repository's hooks; nothing was sent"
             ),
             Some("upgrade the daemon, then retry".to_owned()),
         )

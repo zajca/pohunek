@@ -1543,6 +1543,7 @@ where
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
     exchange(
         framed,
@@ -2720,6 +2721,7 @@ where
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
     let created: protocol::SessionNewResult = call(
         framed,

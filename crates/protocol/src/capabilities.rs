@@ -241,6 +241,16 @@ pub struct HostCapabilities {
     /// default. `false` is likewise omitted on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_new_agent_options_supported: bool,
+    /// Whether `session.new` honors `skip_repo_hooks`: the session runs none
+    /// of the in-repo hook layer (`.pohunek/hooks/<event>`, `.pohunek/setup`)
+    /// for any lifecycle hook, also after a resume or a daemon restart.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `false`; it
+    /// would drop `skip_repo_hooks` silently and run the repository's hooks,
+    /// so a client refuses to send the switch without it. `false` is likewise
+    /// omitted on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_new_skip_repo_hooks_supported: bool,
     /// Whether the daemon isolates the attention of descendants of a session
     /// carrying the reserved [`crate::session::ATTENTION_CHILDREN_METADATA_KEY`]
     /// metadata key set to
@@ -354,4 +364,45 @@ pub struct HostCapabilities {
     /// wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub integration_agent_skill_supported: bool,
+    /// Which lifecycle events have a host-global hook script
+    /// (`<config_dir>/hooks/<event>`) that would run when the event fires now.
+    /// It names no path and no content. Read at the time of the answer: a
+    /// script added or removed later changes what runs. Answered with
+    /// `skip_runtime_probes` too.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `None`:
+    /// unknown, not "no scripts".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub host_hooks: Option<HostHookScripts>,
+}
+
+/// Whether the host-global hook layer has a script for each lifecycle event.
+///
+/// `true` means `<config_dir>/hooks/<event>` is a file, which the daemon runs
+/// for every session when the event fires, before the in-repo layer and also
+/// for a session started with `skip_repo_hooks`. A host whose host-global
+/// layer is disabled reports every event `false`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one independent presence flag per lifecycle hook event"
+)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "HostHookScripts.ts"))]
+pub struct HostHookScripts {
+    /// `pre-create`: before `git worktree add`, in the source repository.
+    pub pre_create: bool,
+    /// `post-create`: after `git worktree add`, in the new worktree.
+    pub post_create: bool,
+    /// `pre-remove`: before `git worktree remove`, in the worktree.
+    pub pre_remove: bool,
+    /// `post-remove`: after `git worktree remove`, in the source repository.
+    pub post_remove: bool,
+    /// `session-start`: after the session's PTY launched, in its cwd.
+    pub session_start: bool,
+    /// `session-stop`: when the session reaches a terminal state, in its cwd.
+    pub session_stop: bool,
+    /// `agent-state`: when the detected agent activity changes, in its cwd.
+    pub agent_state: bool,
 }

@@ -552,6 +552,19 @@ pub struct SessionNewParams {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[cfg_attr(feature = "ts", ts(optional, as = "Option<BTreeMap<String, String>>"))]
     pub agent_options: BTreeMap<String, String>,
+    /// Skip the in-repo hook layer (`.pohunek/hooks/<event>` and the legacy
+    /// `.pohunek/setup`) for every lifecycle hook of the session, for its
+    /// whole life: create, session, agent-state and remove events. The
+    /// host-global layer still runs. When `hooks.required` names an event the
+    /// host-global layer has no script for, the create fails with
+    /// `hook_required_skipped` before anything runs. Recorded as
+    /// [`SessionInfo::skip_repo_hooks`]. A daemon that does not advertise
+    /// `HostCapabilities::session_new_skip_repo_hooks_supported` would drop
+    /// the field silently and run the repository's hooks, so a client checks
+    /// the flag before sending it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<bool>"))]
+    pub skip_repo_hooks: bool,
 }
 
 /// Most bytes a [`SessionNewParams::client_request_id`] may hold.
@@ -3406,6 +3419,14 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub spawned_by: Option<SpawnedBy>,
+    /// Whether the session runs none of the in-repo hook layer
+    /// (`.pohunek/hooks/<event>`, `.pohunek/setup`) for any of its lifecycle
+    /// hooks, as [`SessionNewParams::skip_repo_hooks`] requested. Set at
+    /// creation and never changed; persisted, so a resume and a daemon
+    /// restart keep it. Omitted from the wire form when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<bool>"))]
+    pub skip_repo_hooks: bool,
     /// Nearest flagged ancestor isolating this session's attention, set only
     /// on `session.list` responses. `Some` names the ancestor carrying
     /// [`ATTENTION_CHILDREN_METADATA_KEY`] set to [`ATTENTION_CHILDREN_ISOLATE`];
@@ -4383,6 +4404,7 @@ mod tests {
             ended_at: None,
             exit_code: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         }
     }
 

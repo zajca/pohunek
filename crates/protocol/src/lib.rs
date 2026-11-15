@@ -56,7 +56,9 @@ pub use assistant::{
     ConceptMeta, ConceptType, ASSISTANT_CONTEXT_PACKAGE_ID,
 };
 #[doc(inline)]
-pub use capabilities::{AgentRuntime, HostCapabilities, HostInspectParams, ProfileAudience};
+pub use capabilities::{
+    AgentRuntime, HostCapabilities, HostHookScripts, HostInspectParams, ProfileAudience,
+};
 #[doc(inline)]
 pub use command::{CommandErrorKind, CommandRunParams, CommandRunResult};
 #[doc(inline)]
@@ -76,10 +78,11 @@ pub use envelope::{EnvelopeError, Event, Request, Response, StateSource};
 pub use error::{
     official_package_id, official_package_install_only_step, official_package_install_step,
     ErrorClass, ErrorDetails, InputNotSubmittedReason, ProcessExit, ProtocolError,
-    AGENT_OPTION_CHOICE_MISSING_CODE, SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE,
-    SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE, SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE,
-    SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE, SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE,
-    SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE, SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
+    AGENT_OPTION_CHOICE_MISSING_CODE, HOOK_REQUIRED_SKIPPED_CODE,
+    SESSION_ATTENTION_ISOLATION_UNSUPPORTED_CODE, SESSION_LIST_TREE_FILTERS_UNSUPPORTED_CODE,
+    SESSION_NEW_AGENT_OPTIONS_UNSUPPORTED_CODE, SESSION_NEW_CONTEXT_PIN_UNSUPPORTED_CODE,
+    SESSION_NEW_FETCH_REF_UNSUPPORTED_CODE, SESSION_NEW_REQUEST_ID_UNSUPPORTED_CODE,
+    SESSION_NEW_SKIP_REPO_HOOKS_UNSUPPORTED_CODE, SESSION_REMOVE_TREE_UNSUPPORTED_CODE,
     SESSION_REQUEST_CONFLICT_CODE, SESSION_REQUEST_IN_PROGRESS_CODE,
     SESSION_RETENTION_SELECTOR_UNSUPPORTED_CODE,
 };

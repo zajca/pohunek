@@ -341,6 +341,7 @@ fn session_info() -> SessionInfo {
             generation_recorded: None,
         }),
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 

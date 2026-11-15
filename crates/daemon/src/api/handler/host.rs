@@ -17,8 +17,8 @@ use crate::session::SessionRegistry;
 /// request; the version probes behind them come from the daemon's probe cache
 /// (see [`crate::capabilities::ProbeCache`]). The inventory is built on a
 /// blocking thread, so a slow probe never stalls other requests. With
-/// `skip_runtime_probes` only the feature flags are answered and nothing is
-/// resolved or probed. Transport agnostic: the same handler answers over the
+/// `skip_runtime_probes` only the feature flags and the host-global hook
+/// scripts are answered and nothing is resolved or probed. Transport agnostic: the same handler answers over the
 /// local Unix socket and over an overlay TCP connection. The reported protocol
 /// version is the one this connection negotiated.
 pub(super) async fn handle_host_inspect(
@@ -39,6 +39,7 @@ pub(super) async fn handle_host_inspect(
             sessions.package_authority().index_install_supported();
         capabilities.package_install_index_context_supported =
             capabilities.package_install_index_supported;
+        capabilities.host_hooks = Some(crate::worktree::host_hook_scripts(sessions.config_dir()));
         return ok_value(request, &capabilities);
     }
     let sessions = sessions.clone();
@@ -56,6 +57,8 @@ pub(super) async fn handle_host_inspect(
                 sessions.package_authority().index_install_supported();
             capabilities.package_install_index_context_supported =
                 capabilities.package_install_index_supported;
+            capabilities.host_hooks =
+                Some(crate::worktree::host_hook_scripts(sessions.config_dir()));
             Ok(capabilities)
         },
         "host_inspect_task_panicked",

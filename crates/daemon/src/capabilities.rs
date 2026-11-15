@@ -404,6 +404,7 @@ fn capability_snapshot(
         session_new_context_pin_supported: true,
         session_new_fetch_ref_supported: true,
         session_new_agent_options_supported: true,
+        session_new_skip_repo_hooks_supported: true,
         session_attention_isolation_supported: true,
         session_list_tree_filters_supported: true,
         session_retention_selector_supported: true,
@@ -418,6 +419,8 @@ fn capability_snapshot(
         package_create_preset_supported: true,
         package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
+        // Filled by the `host.inspect` handler from the registry's config dir.
+        host_hooks: None,
     }
 }
 

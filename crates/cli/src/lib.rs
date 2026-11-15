@@ -1147,6 +1147,15 @@ enum SessionAction {
             value_parser = commands::session::parse_agent_option
         )]
         opt: Vec<(String, String)>,
+        /// Run none of the checkout's own hooks (`.pohunek/hooks/<event>` and
+        /// the legacy `.pohunek/setup`) for any lifecycle event of this
+        /// session, for its whole life; the host's hooks still run. For a
+        /// checkout whose content you do not trust, such as a pull-request
+        /// head. A `[hooks] required` event the host has no script for fails
+        /// the start with `hook_required_skipped`. Needs a daemon that
+        /// advertises `session_new_skip_repo_hooks_supported`.
+        #[arg(long)]
+        no_repo_hooks: bool,
         /// Initial text to inject into the session after the PTY is spawned.
         #[arg(long, group = "initial_input")]
         input: Option<String>,
@@ -1859,6 +1868,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     fetch_ref,
                     fetch_commit,
                     opt,
+                    no_repo_hooks,
                     input,
                     input_stdin,
                     input_ack_timeout_ms,
@@ -1897,6 +1907,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             }),
                             // Checked before any connection is dialed.
                             agent_options: commands::session::agent_option_map(opt)?,
+                            skip_repo_hooks: no_repo_hooks,
                             input,
                             input_ack_timeout_ms,
                             request_timeout_ms,

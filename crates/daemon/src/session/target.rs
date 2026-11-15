@@ -86,6 +86,9 @@ pub(super) struct PtySessionSpec {
     /// Origin of the request that created the session, carried unchanged by
     /// every later registration of it.
     pub(super) spawned_by: Option<protocol::SpawnedBy>,
+    /// Whether the session skips the in-repo hook layer, carried unchanged by
+    /// every later registration of it.
+    pub(super) skip_repo_hooks: bool,
     /// Idempotency key of the creating request, carried unchanged by every
     /// later registration of the session.
     pub(super) create_request: Option<Box<CreateRequest>>,
@@ -428,6 +431,7 @@ impl SessionRegistry {
                     .unwrap_or(protocol::BranchSource::Local),
                 on_diverged: params.on_diverged,
                 fetch_ref: params.fetch_ref.clone(),
+                skip_repo_hooks: params.skip_repo_hooks,
             })
             .await?;
         Ok(TargetResolution {
@@ -773,6 +777,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             spawned_by,
+            skip_repo_hooks,
             create_request,
             warnings,
             reference_launch,
@@ -922,6 +927,7 @@ impl SessionRegistry {
             worktree_path: worktree_path.clone(),
             metadata: metadata.clone(),
             spawned_by: spawned_by.clone(),
+            skip_repo_hooks,
             warnings: warnings.clone(),
             capability_refusals: None,
             children: None,
@@ -963,6 +969,7 @@ impl SessionRegistry {
                 is_linked_worktree,
                 metadata: metadata.clone(),
                 spawned_by: spawned_by.clone(),
+                skip_repo_hooks,
                 program: snapshot.program.clone(),
                 args: snapshot.args.clone(),
                 input_rules: StoredInputRules::from(input_rules),
@@ -1118,6 +1125,7 @@ impl SessionRegistry {
             worktree_path,
             metadata,
             spawned_by,
+            skip_repo_hooks,
             warnings,
             capability_refusals: None,
             children: None,

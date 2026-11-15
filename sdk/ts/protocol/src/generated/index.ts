@@ -62,6 +62,7 @@ export type { HostCapabilities } from "./HostCapabilities";
 export type { HostClass } from "./HostClass";
 export type { HostDiscoverParams } from "./HostDiscoverParams";
 export type { HostGovernanceStatus } from "./HostGovernanceStatus";
+export type { HostHookScripts } from "./HostHookScripts";
 export type { HostId } from "./HostId";
 export type { HostInspectParams } from "./HostInspectParams";
 export type { HostOwner } from "./HostOwner";

@@ -7,6 +7,7 @@ use super::{
     ENV_SESSION_ID, ENV_SOCKET_PATH, PROTOCOL_VERSION,
 };
 use crate::integration::hook_retry_deadline;
+use crate::worktree::RepoHookLayer;
 use protocol::{
     ENV_HOOK_ADMISSION_RETRY, ENV_HOOK_RETRY_BACKOFF_MAX_MS, ENV_HOOK_RETRY_BACKOFF_MS,
     ENV_HOOK_RETRY_DEADLINE_MS,
@@ -24,6 +25,7 @@ pub(super) struct AgentStateHookSnapshot {
     cwd: PathBuf,
     agent: String,
     activity: AgentActivity,
+    skip_repo_hooks: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +37,25 @@ pub(super) struct SessionHookRequest {
     pub(super) agent: String,
     pub(super) stop_reason: Option<&'static str>,
     pub(super) activity: Option<&'static str>,
+    /// The session's recorded [`protocol::SessionInfo::skip_repo_hooks`].
+    pub(super) skip_repo_hooks: bool,
+}
+
+impl SessionHookRequest {
+    /// The `event` hook of the session `info` describes, without a stop reason
+    /// or an activity value.
+    pub(super) fn of(event: HookEvent, info: &protocol::SessionInfo) -> Self {
+        Self {
+            event,
+            cwd: info.cwd.clone(),
+            session_id: info.id.0.clone(),
+            project_id: info.project_id.clone(),
+            agent: info.agent.clone(),
+            stop_reason: None,
+            activity: None,
+            skip_repo_hooks: info.skip_repo_hooks,
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -122,6 +143,7 @@ impl SessionRegistry {
                 base_branch: None,
                 stop_reason: request.stop_reason,
                 activity: request.activity,
+                repo_layer: RepoHookLayer::of_session(request.skip_repo_hooks),
             };
             let mut warnings = Vec::new();
             run_hook(
@@ -229,6 +251,7 @@ impl SessionRegistry {
             cwd: entry.info.cwd.clone(),
             agent: entry.info.agent.clone(),
             activity: entry.info.activity?,
+            skip_repo_hooks: entry.info.skip_repo_hooks,
         })
     }
 
@@ -244,6 +267,7 @@ impl SessionRegistry {
                     cwd: entry.info.cwd.clone(),
                     agent: entry.info.agent.clone(),
                     activity: entry.info.activity?,
+                    skip_repo_hooks: entry.info.skip_repo_hooks,
                 })
             })
             .collect()
@@ -479,6 +503,7 @@ fn fire_agent_state_hook(
         agent: snapshot.agent,
         stop_reason: None,
         activity: Some(agent_activity_env(snapshot.activity)),
+        skip_repo_hooks: snapshot.skip_repo_hooks,
     });
     let done_tx = done_tx.clone();
     registry.spawn_background("agent_state_hook_done", async move {

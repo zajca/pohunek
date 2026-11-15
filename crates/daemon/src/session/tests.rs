@@ -219,6 +219,7 @@ pub(super) fn params() -> SessionNewParams {
         context_package_digest: None,
         fetch_ref: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     }
 }
 
@@ -1698,6 +1699,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         launch_checkout: None,
         context_pin: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
     let package_pin = |runtime: &str| {
         LaunchPin::Pinned(Box::new(LaunchBinding {
@@ -6366,6 +6368,7 @@ async fn session_start_hook_is_terminated_after_hook_timeout() {
         base_branch: None,
         stop_reason: None,
         activity: None,
+        repo_layer: crate::worktree::RepoHookLayer::Run,
     };
 
     // The hook is parked on the gate until the test releases it, so `run_hook`
@@ -19276,6 +19279,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         launch_checkout: None,
         context_pin: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     let err = registry
@@ -19872,6 +19876,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         launch_checkout: None,
         context_pin: None,
         agent_options: std::collections::BTreeMap::new(),
+        skip_repo_hooks: false,
     };
 
     for (program, version_output) in [
@@ -20276,6 +20281,7 @@ async fn resume_binding_restores_metadata_from_store() {
             launch_checkout: None,
             context_pin: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())

@@ -311,6 +311,7 @@ impl Fixture {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create the stand-in agent session")
@@ -612,6 +613,7 @@ async fn a_held_working_record_ends_with_the_nested_codex() {
                 context_package_digest: None,
                 fetch_ref: None,
                 agent_options: std::collections::BTreeMap::new(),
+                skip_repo_hooks: false,
             })
             .await
             .expect("create the shell session")

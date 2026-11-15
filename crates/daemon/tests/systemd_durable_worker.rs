@@ -1267,6 +1267,7 @@ impl Fixture {
             ended_at: None,
             exit_code: None,
             agent_options: std::collections::BTreeMap::new(),
+            skip_repo_hooks: false,
         };
         let store = Store::new(self.data_home.join("pohunek/metadata.jsonl"));
         store
@@ -1314,6 +1315,7 @@ impl Fixture {
                     launch_checkout: None,
                     context_pin: None,
                     agent_options: std::collections::BTreeMap::new(),
+                    skip_repo_hooks: false,
                 }),
                 active_agent_origin: None,
                 native_identity_ordering: None,

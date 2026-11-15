@@ -267,6 +267,14 @@ export type SessionInfo = {
    */
   spawned_by?: SpawnedBy;
   /**
+   * Whether the session runs none of the in-repo hook layer
+   * (`.pohunek/hooks/<event>`, `.pohunek/setup`) for any of its lifecycle
+   * hooks, as [`SessionNewParams::skip_repo_hooks`] requested. Set at
+   * creation and never changed; persisted, so a resume and a daemon
+   * restart keep it. Omitted from the wire form when false.
+   */
+  skip_repo_hooks?: boolean;
+  /**
    * Nearest flagged ancestor isolating this session's attention, set only
    * on `session.list` responses. `Some` names the ancestor carrying
    * [`ATTENTION_CHILDREN_METADATA_KEY`] set to [`ATTENTION_CHILDREN_ISOLATE`];

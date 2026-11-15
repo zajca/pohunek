@@ -1005,6 +1005,7 @@ impl SessionRegistry {
             is_linked_worktree: entry.info.is_linked_worktree,
             metadata: entry.info.metadata.clone(),
             spawned_by: entry.info.spawned_by.clone(),
+            skip_repo_hooks: entry.info.skip_repo_hooks,
             // Structural relaunch snapshot (C.4): copied verbatim from the frozen
             // entry snapshot on EVERY persist and on explicit resume, so neither a
             // resize re-persist nor a terminal relaunch can overwrite the
@@ -1194,6 +1195,7 @@ impl SessionRegistry {
                 worktree_path,
                 metadata: binding.metadata,
                 spawned_by: binding.spawned_by,
+                skip_repo_hooks: binding.skip_repo_hooks,
                 create_request: None,
                 warnings: outdated_hooks,
                 // The live entry's launch marker is carried when the resumed entry

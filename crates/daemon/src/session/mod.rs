@@ -3764,15 +3764,7 @@ impl SessionRegistry {
         if info.native_session_id.is_some() {
             self.persist_resume_binding(&info.id).await;
         }
-        self.spawn_session_hook(SessionHookRequest {
-            event: HookEvent::SessionStart,
-            cwd: info.cwd.clone(),
-            session_id: info.id.0.clone(),
-            project_id: info.project_id.clone(),
-            agent: info.agent.clone(),
-            stop_reason: None,
-            activity: None,
-        });
+        self.spawn_session_hook(SessionHookRequest::of(HookEvent::SessionStart, &info));
         let Some(input) = pending_initial_input else {
             return Ok((info, None));
         };
@@ -4754,6 +4746,7 @@ impl SessionRegistry {
             worktree_path,
             metadata: params.metadata.clone(),
             spawned_by,
+            skip_repo_hooks: params.skip_repo_hooks,
             create_request,
             warnings,
             reference_launch,
@@ -7959,13 +7952,8 @@ impl SessionRegistry {
         // binding (serialized against any racing resize/capture write).
         self.persist_resume_binding(id).await;
         self.spawn_session_hook(SessionHookRequest {
-            event: HookEvent::SessionStop,
-            cwd: committed_info.cwd.clone(),
-            session_id: committed_info.id.0.clone(),
-            project_id: committed_info.project_id.clone(),
-            agent: committed_info.agent.clone(),
             stop_reason: Some(updated.stop_reason),
-            activity: None,
+            ..SessionHookRequest::of(HookEvent::SessionStop, &committed_info)
         });
         self.emit(updated.event, committed_info.as_ref());
         if had_background {
@@ -8697,6 +8685,8 @@ fn external_session_info(
         output_force_closed: false,
         metadata: BTreeMap::new(),
         spawned_by: None,
+        // An observed process was not started by a `session.new`.
+        skip_repo_hooks: false,
         attention_isolated_by: None,
         created_at: now.clone(),
         updated_at: now,
@@ -8947,6 +8937,7 @@ fn create_intent_record(
         worktree_path: None,
         metadata: params.metadata.clone(),
         spawned_by: spawned_by.cloned(),
+        skip_repo_hooks: params.skip_repo_hooks,
         warnings: Vec::new(),
         capability_refusals: None,
         children: None,

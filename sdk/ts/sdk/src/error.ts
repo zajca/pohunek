@@ -49,6 +49,7 @@ export const ClientErrorCode = {
   SessionNewContextPinUnsupported: "session_new_context_pin_unsupported",
   SessionNewFetchRefUnsupported: "session_new_fetch_ref_unsupported",
   SessionNewAgentOptionsUnsupported: "session_new_agent_options_unsupported",
+  SessionNewSkipRepoHooksUnsupported: "session_new_skip_repo_hooks_unsupported",
   SessionAttentionIsolationUnsupported: "session_attention_isolation_unsupported",
   SessionListTreeFiltersUnsupported: "session_list_tree_filters_unsupported",
   SessionRetentionSelectorUnsupported: "session_retention_selector_unsupported",
@@ -81,6 +82,7 @@ export type ClientErrorKind =
   | "sessionNewContextPinUnsupported"
   | "sessionNewFetchRefUnsupported"
   | "sessionNewAgentOptionsUnsupported"
+  | "sessionNewSkipRepoHooksUnsupported"
   | "sessionAttentionIsolationUnsupported"
   | "sessionListTreeFiltersUnsupported"
   | "sessionRetentionSelectorUnsupported"
@@ -397,6 +399,25 @@ export class ClientError extends Error {
       protocolError(
         ClientErrorClass.Daemon,
         ClientErrorCode.SessionNewAgentOptionsUnsupported,
+        msg,
+        "upgrade the daemon, then retry",
+      ),
+    );
+  }
+
+  /**
+   * The daemon does not advertise `session_new_skip_repo_hooks_supported`, so
+   * it would drop `skip_repo_hooks` silently and run the repository's hooks.
+   */
+  public static sessionNewSkipRepoHooksUnsupported(host: string | undefined): ClientError {
+    const target = daemonTarget(host);
+    const msg = `${target} predates skip_repo_hooks and would run the repository's hooks; nothing was sent`;
+    return new ClientError(
+      "sessionNewSkipRepoHooksUnsupported",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.SessionNewSkipRepoHooksUnsupported,
         msg,
         "upgrade the daemon, then retry",
       ),

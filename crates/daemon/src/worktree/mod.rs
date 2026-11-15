@@ -56,6 +56,7 @@ mod fetch;
 mod fetch_ref;
 mod git_output;
 mod remote;
+mod repo_hooks;
 mod stderr_drain;
 mod stderr_tail;
 
@@ -64,6 +65,8 @@ pub(crate) use fetch_ref::check_session_fetch_request;
 use fetch_ref::delete_session_fetched_ref;
 pub(crate) use remote::note_backup;
 use remote::{create_remote_worktree, plan_remote_branch, verify_start, RemotePlan};
+use repo_hooks::{check_required_layer, host_hook_script};
+pub(crate) use repo_hooks::{host_hook_scripts, RepoHookLayer};
 use stderr_tail::{CaptureSettings, HookOrigin, StderrCapture};
 
 /// Relative path of the optional per-repository setup script, run inside a
@@ -138,6 +141,9 @@ pub struct WorktreeRequest {
     /// under `refs/pohunek/sessions/<session_id>/fetched`. Applied exactly
     /// once per session: a reused worktree reports it without refetching.
     pub fetch_ref: Option<FetchRefRequest>,
+    /// Whether the session skips the in-repo hook layer; recorded on the
+    /// binding so every remove hook of the worktree skips it too.
+    pub skip_repo_hooks: bool,
 }
 
 /// Result of a successful [`WorktreeManager::bind`].
@@ -376,6 +382,14 @@ impl WorktreeManager {
         if let Some(fetch) = req.fetch_ref.as_ref() {
             check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
         }
+        // A required hook the skipped in-repo layer alone could run refuses
+        // the create before any git command, fetch or hook runs.
+        check_required_layer(
+            HookEvent::PostCreate,
+            &self.required_hooks,
+            RepoHookLayer::of_session(req.skip_repo_hooks),
+            self.config_dir.as_deref(),
+        )?;
         let repository = canonical_or_original(&req.repo);
         if !is_git_repo(&repository) {
             return Err(error(
@@ -567,6 +581,7 @@ impl WorktreeManager {
             agent: req.agent.clone(),
             status: WorktreeStatus::Active,
             project_id: req.project_id.clone(),
+            skip_repo_hooks: req.skip_repo_hooks,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -630,6 +645,23 @@ impl WorktreeManager {
                 )
             })
             .transpose()?;
+        // The host script the preflight found may be gone by now; the
+        // checkout and its binding stay for the session's compensation.
+        check_required_layer(
+            HookEvent::PostCreate,
+            &self.required_hooks,
+            RepoHookLayer::of_session(req.skip_repo_hooks),
+            self.config_dir.as_deref(),
+        )
+        .map_err(|err| {
+            match source
+                .as_ref()
+                .and_then(|source| source.backup_ref.as_deref())
+            {
+                Some(backup) => note_backup(err, &req.branch, backup),
+                None => err,
+            }
+        })?;
         // Post-create hook (replaces the legacy `.pohunek/setup` script, which it
         // still falls back to): runs IN the freshly created worktree.
         if let Some(failure) = self.run_worktree_hook(
@@ -697,6 +729,7 @@ impl WorktreeManager {
             base_branch: Some(base_branch.to_owned()),
             stop_reason: None,
             activity: None,
+            repo_layer: RepoHookLayer::of_session(req.skip_repo_hooks),
         };
         run_hook_layers(
             event,
@@ -734,6 +767,7 @@ impl WorktreeManager {
             base_branch: Some(binding.base_branch.clone()),
             stop_reason: None,
             activity: None,
+            repo_layer: RepoHookLayer::of_session(binding.skip_repo_hooks),
         };
         // Remove-hook warnings are only logged, so their stderr is never kept.
         run_hook(
@@ -1972,6 +2006,9 @@ pub(crate) struct HookContext {
     pub stop_reason: Option<&'static str>,
     /// Agent activity value (`POHUNEK_ACTIVITY`) for `agent-state`.
     pub activity: Option<&'static str>,
+    /// Whether the in-repo layer runs after the host-global one. Selects the
+    /// scripts; never exported to the hook.
+    pub repo_layer: RepoHookLayer,
 }
 
 /// Build the env-clear allowlist a hook runs with: `PATH`/`HOME` passed through
@@ -2019,7 +2056,15 @@ fn hook_env(event: HookEvent, ctx: &HookContext) -> Vec<(String, String)> {
 
 /// Resolve a hook's in-repo script path: `<in_repo_dir>/.pohunek/hooks/<event>`,
 /// or — for `post-create` only — the legacy `.pohunek/setup` fallback (never both).
-fn resolve_in_repo_hook(event: HookEvent, in_repo_dir: &Path) -> Option<PathBuf> {
+/// `None` without a lookup when `layer` skips the in-repo layer.
+fn resolve_in_repo_hook(
+    event: HookEvent,
+    in_repo_dir: &Path,
+    layer: RepoHookLayer,
+) -> Option<PathBuf> {
+    if layer == RepoHookLayer::Skip {
+        return None;
+    }
     let hook = in_repo_dir.join(".pohunek/hooks").join(event.as_env());
     if hook.is_file() {
         return Some(hook);
@@ -2036,7 +2081,8 @@ fn resolve_in_repo_hook(event: HookEvent, in_repo_dir: &Path) -> Option<PathBuf>
 /// Run the lifecycle hooks for `event`, composing the **host-global layer first,
 /// then the in-repo layer** (each an independent, env-cleared spawn; a failure in
 /// one is its own warning and does not stop the other). In-repo hooks are looked
-/// up under `in_repo_dir`; the host-global layer under `<config_dir>/hooks/`.
+/// up under `in_repo_dir` unless `ctx.repo_layer` skips that layer; the
+/// host-global layer under `<config_dir>/hooks/`.
 ///
 /// Each hook runs with a **cleared environment** plus only the [`hook_env`]
 /// allowlist (closing the env-inheritance exfil gap: a hostile committed hook can
@@ -2097,34 +2143,31 @@ fn run_hook_layers(
     let env = hook_env(event, ctx);
     let cwd = &ctx.cwd_or(in_repo_dir);
     // Host-global layer first (composed, not overridden).
-    if let Some(config_dir) = config_dir {
-        let host_script = config_dir.join("hooks").join(event.as_env());
-        if host_script.is_file() {
-            let outcome = run_timed_hook(
-                &HookRun {
-                    event,
-                    layer: HookLayer::Host,
-                    session_id: &ctx.session_id,
-                    script: &host_script,
-                    cwd,
-                    env: &env,
-                    timeout,
-                },
-                warnings,
-                stderr_tails.as_mut(),
-            );
-            if required && outcome != HookRunOutcome::Succeeded {
-                return Some(RequiredHookFailure {
-                    layer: HookLayer::Host,
-                    detail: last_warning_detail(warnings, outcome),
-                    not_run: resolve_in_repo_hook(event, in_repo_dir)
-                        .into_iter()
-                        .collect(),
-                });
-            }
+    if let Some(host_script) = host_hook_script(config_dir, event) {
+        let outcome = run_timed_hook(
+            &HookRun {
+                event,
+                layer: HookLayer::Host,
+                session_id: &ctx.session_id,
+                script: &host_script,
+                cwd,
+                env: &env,
+                timeout,
+            },
+            warnings,
+            stderr_tails.as_mut(),
+        );
+        if required && outcome != HookRunOutcome::Succeeded {
+            return Some(RequiredHookFailure {
+                layer: HookLayer::Host,
+                detail: last_warning_detail(warnings, outcome),
+                not_run: resolve_in_repo_hook(event, in_repo_dir, ctx.repo_layer)
+                    .into_iter()
+                    .collect(),
+            });
         }
     }
-    if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir) {
+    if let Some(in_repo_script) = resolve_in_repo_hook(event, in_repo_dir, ctx.repo_layer) {
         let outcome = run_timed_hook(
             &HookRun {
                 event,

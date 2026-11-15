@@ -171,4 +171,17 @@ export type SessionNewParams = {
    * the flag before sending it.
    */
   agent_options?: { [key in string]: string };
+  /**
+   * Skip the in-repo hook layer (`.pohunek/hooks/<event>` and the legacy
+   * `.pohunek/setup`) for every lifecycle hook of the session, for its
+   * whole life: create, session, agent-state and remove events. The
+   * host-global layer still runs. When `hooks.required` names an event the
+   * host-global layer has no script for, the create fails with
+   * `hook_required_skipped` before anything runs. Recorded as
+   * [`SessionInfo::skip_repo_hooks`]. A daemon that does not advertise
+   * `HostCapabilities::session_new_skip_repo_hooks_supported` would drop
+   * the field silently and run the repository's hooks, so a client checks
+   * the flag before sending it.
+   */
+  skip_repo_hooks?: boolean;
 };

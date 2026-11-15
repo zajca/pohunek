@@ -189,6 +189,7 @@ fn request(session: &str, repo: &Path, branch: &str) -> WorktreeRequest {
         branch_source: protocol::BranchSource::Local,
         on_diverged: None,
         fetch_ref: None,
+        skip_repo_hooks: false,
     }
 }
 

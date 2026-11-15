@@ -80,6 +80,15 @@ export function carriesAgentOptions(params: unknown): boolean {
   return !(isObject(value) && !Array.isArray(value) && Object.keys(value).length === 0);
 }
 
+/**
+ * Whether `params` asks to skip the in-repo hook layer: `skip_repo_hooks` set to
+ * anything but `false`. A non-boolean value is the daemon's to refuse; an older
+ * daemon would drop it and run the repository's hooks.
+ */
+export function carriesSkipRepoHooks(params: unknown): boolean {
+  return isObject(params) && isSet(params["skip_repo_hooks"]) && params["skip_repo_hooks"] !== false;
+}
+
 /** Whether `params` carries a `fetch_ref` the daemon must fetch and pin. */
 export function carriesFetchRef(params: unknown): boolean {
   return isObject(params) && isSet(params["fetch_ref"]);
