@@ -18,9 +18,9 @@
       "source": "#2084 Q1 comment, Claude 2.1.322"
     },
     "login_screen": {
-      "final_record": null,
-      "attention": null,
-      "source": "UNVERIFIED: first real run (#2101)"
+      "final_record": "none",
+      "attention": ["agent_blocked"],
+      "source": "#2101 real capture, Claude 2.1.322: no record at the first-run theme picker or the login method list; the login_method_list screen rule raises agent_blocked"
     },
     "running_turn": {
       "final_record": "state=working",

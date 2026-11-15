@@ -142,7 +142,9 @@ isolated daemon's own log.
 
 The `mcp_elicitation` and `login_screen` rows, and the Claude flag
 spellings of the profile arguments (from the Claude Code CLI reference),
-are verified at the first real run (#2101 tracks the login result).
+were verified at the first real run with Claude 2.1.322 (#2101): the login
+method list emits no record (`final_record: "none"`) and raises
+`agent_blocked` through its screen rule.
 
 Exit codes:
 
@@ -223,7 +225,10 @@ Exit codes:
 | 3 | at least one row is UNVERIFIED (expected value `null`) and none mismatch |
 
 A row whose expected value is `null` is UNVERIFIED by definition and never a
-pass. `compare` never writes the expected file: there is no `--update`
+pass: `null` means the expectation is unknown. An expected `final_record` of
+`"none"` states that the scenario emits no record: it is VERIFIED when the
+captured `final_record` is `null` and a MISMATCH when a record arrived
+(`- <scenario>/final_record: none`, `+ ...: "<record>"`). `compare` never writes the expected file: there is no `--update`
 flag, and an expectation changes only by a reviewed hand edit with its
 evidence in the commit message.
 

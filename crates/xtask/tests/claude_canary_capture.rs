@@ -556,7 +556,7 @@ fn every_scenario_matches_the_expected_table() {
     let report = String::from_utf8_lossy(&compared.stdout).into_owned();
     assert_eq!(
         compared.status.code(),
-        Some(3),
+        Some(0),
         "compare: {report}{}",
         stderr_of(&compared)
     );
@@ -564,6 +564,7 @@ fn every_scenario_matches_the_expected_table() {
         "idle_after_turn",
         "permission_prompt",
         "mcp_elicitation",
+        "login_screen",
         "running_turn",
     ] {
         assert!(
@@ -573,12 +574,6 @@ fn every_scenario_matches_the_expected_table() {
             "{row} is VERIFIED: {report}"
         );
     }
-    assert!(
-        report
-            .lines()
-            .any(|line| line.starts_with("login_screen") && line.ends_with("| UNVERIFIED")),
-        "{report}"
-    );
 
     let document = capture.capture_document();
     assert_eq!(document["claude_version"], "2.1.322 (Claude Code)");
