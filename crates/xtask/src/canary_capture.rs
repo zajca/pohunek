@@ -848,14 +848,13 @@ impl Driver<'_> {
     /// Drives the scenario's steps up to its read point and reads the row.
     fn drive(&mut self, session: &mut Session) -> Result<ScenarioRow, StepFailure> {
         let scenario = session.scenario;
-        let mut first = self.wait_first_screen(session, false)?;
-        // Records read before the theme picker was answered belong to the
-        // picker; the login window waits for one after it.
+        let mut first = self.wait_first_screen(session, scenario, false)?;
+        // The records that precede the theme picker the key answered; the
+        // login row's `final_record` comes from the records after them.
         let mut picker_records = 0;
         if (scenario, first) == (Scenario::LoginScreen, FirstScreen::Theme) {
-            self.accept_theme(session)?;
-            picker_records = session.records.len();
-            first = self.wait_first_screen(session, true)?;
+            picker_records = self.accept_theme(session)?;
+            first = self.wait_first_screen(session, scenario, true)?;
         }
         match (scenario, first) {
             (Scenario::LoginScreen, FirstScreen::Login) => {
@@ -944,6 +943,7 @@ impl Driver<'_> {
     fn wait_first_screen(
         &mut self,
         session: &mut Session,
+        scenario: Scenario,
         theme_answered: bool,
     ) -> Result<FirstScreen, StepFailure> {
         let deadline = Instant::now() + self.args.step_timeout;
@@ -964,11 +964,13 @@ impl Driver<'_> {
             }
             // A blank screen before the agent draws anything may read idle
             // too, so `idle` counts only from a record or a matched screen
-            // rule.
-            let idle_record = session
-                .records
-                .last()
-                .is_some_and(|record| record == "state=idle");
+            // rule. In an empty config home a startup `idle` record may come
+            // before the first-run screens, so only the screen decides there.
+            let idle_record = scenario != Scenario::LoginScreen
+                && session
+                    .records
+                    .last()
+                    .is_some_and(|record| record == "state=idle");
             let screen_idle = activity.as_deref() == Some("idle")
                 && detection["status"]["state_source"] == SCREEN_STATE_SOURCE;
             if idle_record || screen_idle {
@@ -987,7 +989,13 @@ impl Driver<'_> {
     /// dialogs), so the row's read point stays the login method list. The
     /// screen is checked once more right before the key: Enter on the
     /// folder-trust dialog would trust the directory.
-    fn accept_theme(&mut self, session: &Session) -> Result<(), StepFailure> {
+    ///
+    /// Returns how many records precede the picker the key answered. The
+    /// worker retains output bytes before its screen shows them and the
+    /// daemon's detection follows that screen, so a full read after the
+    /// detection that matched the picker holds every record written before
+    /// the picker was drawn.
+    fn accept_theme(&mut self, session: &mut Session) -> Result<usize, StepFailure> {
         let detection = self.detection(session)?;
         if self.screen_rules.folder_trust.matches(&detection) {
             return Err(self.untrusted());
@@ -998,13 +1006,15 @@ impl Driver<'_> {
                 self.screen_rules.theme_picker.id
             )));
         }
+        self.read_records(session)?;
+        let picker_records = session.records.len();
         let what = "accept the theme picker's default";
         let (code, document) = self.cli_document(
             &["session", "input", session.id.as_str(), "", "--json"],
             what,
         )?;
         if code == Some(0) {
-            Ok(())
+            Ok(picker_records)
         } else {
             Err(StepFailure::Refused(format!(
                 "cannot {what}: {}",

@@ -120,10 +120,14 @@ row reads at the login method list: the capture answers the theme picker
 with Enter (its default) and then waits for the login screen. It checks the
 screen again right before the key and stops with exit 4 if the folder-trust
 dialog is showing, since Enter there would trust the directory. A record
-read before the picker was answered (a startup `idle`, say) stays in the
-row's `records` but never becomes its `final_record`: the contract defines
-no record for the picker, so such a record says nothing about the login
-screen. The theme picker in an account scenario exits 2: finish Claude's
+written before the picker (a startup `idle`, say) stays in the row's
+`records` but never becomes its `final_record`: the contract defines no
+record for the picker, so such a record says nothing about the login
+screen. The boundary is the output read after the screen showed the picker,
+right before the key; the worker retains output before its screen shows it,
+so that read holds every record written before the picker. In an empty
+config home an `idle` record is not taken for Claude's prompt: only the
+screen decides there. The theme picker in an account scenario exits 2: finish Claude's
 first run for that config first.
 
 The records of a row are those read up to its read point, and the reads

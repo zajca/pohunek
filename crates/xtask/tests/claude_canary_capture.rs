@@ -655,12 +655,30 @@ fn one_scenario_holds_exactly_its_row() {
     assert_eq!(theme_input(&workdir), "\r");
 }
 
-/// A record read on the theme picker stays in the login row's `records` but
-/// is not its `final_record`: the row describes the login screen.
+/// A record written right before the theme picker (in the same write) stays
+/// in the login row's `records` but is never its `final_record`: the row
+/// describes the login screen, and the boundary is taken from the output
+/// read after the picker was detected, not from an earlier poll.
 #[test]
-fn a_theme_picker_record_is_not_the_login_final_record() {
+fn a_record_before_the_theme_picker_is_not_the_login_final_record() {
+    // The blank start puts the picker in the middle of the first-screen
+    // polls instead of before the first one.
+    login_row_keeps_a_pre_picker_record(&["picker-record", "slow-start"]);
+}
+
+/// A startup `idle` record on a blank screen before the theme picker does
+/// not count as Claude's prompt in an empty config home: the login scenario
+/// waits for the screen and still reads the login row.
+#[test]
+fn a_startup_idle_before_the_theme_picker_is_not_a_prompt() {
+    login_row_keeps_a_pre_picker_record(&["startup-idle"]);
+}
+
+/// Runs `login_screen` with the stand-in switches `mode` and checks the row:
+/// the pre-picker `idle` in `records`, no `final_record`, one Enter typed.
+fn login_row_keeps_a_pre_picker_record(mode: &[&str]) {
     let capture = Capture::new();
-    let workdir = capture.workdir(&["picker-record"]);
+    let workdir = capture.workdir(mode);
     let release = capture.release_dir();
     let output = capture.capture(
         &release,
@@ -677,14 +695,18 @@ fn a_theme_picker_record_is_not_the_login_final_record() {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "stderr: {}",
+        "{mode:?}: stderr: {}",
         stderr_of(&output)
     );
     capture.assert_no_survivors();
     let row = &capture.capture_document()["scenarios"]["login_screen"];
-    assert_eq!(row["records"], serde_json::json!(["state=idle"]));
-    assert_eq!(row["final_record"], serde_json::Value::Null);
-    assert_eq!(theme_input(&workdir), "\r");
+    assert_eq!(
+        row["records"],
+        serde_json::json!(["state=idle"]),
+        "{mode:?}"
+    );
+    assert_eq!(row["final_record"], serde_json::Value::Null, "{mode:?}");
+    assert_eq!(theme_input(&workdir), "\r", "{mode:?}");
 }
 
 /// An account whose config home has not finished Claude's first run shows the

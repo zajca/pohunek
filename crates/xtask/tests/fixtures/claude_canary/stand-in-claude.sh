@@ -11,7 +11,10 @@
 #   untrusted     draw the folder-trust dialog, emit nothing
 #   silent        answer no prompt with a record
 #   login-record  emit `state=blocked:kind=auth` on the login screen
-#   picker-record emit `state=idle` on the theme picker
+#   picker-record emit `state=idle` right before the theme picker, in the
+#                 same printf
+#   startup-idle  emit `state=idle` and keep the screen blank for a second
+#                 before the theme picker
 #   slow-start    show a blank screen for two seconds before the first screen
 # An empty `CLAUDE_CONFIG_DIR` draws the first-run theme picker and, after a
 # carriage return, the login method list; the bytes typed into the picker are
@@ -34,8 +37,12 @@ if [ -e ./untrusted ]; then
 fi
 cr=$(printf '\r')
 if [ -z "$(ls -A "$config" 2>/dev/null)" ]; then
-  printf '\033[2J\033[H%s\r\n Choose the text style that looks best with your terminal\r\n ❯ Dark mode\r\n   Light mode\r\n' "$rule"
-  if [ -e ./picker-record ]; then emit idle; fi
+  if [ -e ./startup-idle ]; then emit idle; sleep 1; fi
+  picker_record=
+  if [ -e ./picker-record ]; then picker_record='\033]7501;state=idle:app=claude-code\033\\'; fi
+  # One printf: the record comes right before the picker, without a pause.
+  # shellcheck disable=SC2059
+  printf "$picker_record\033[2J\033[H%s\r\n Choose the text style that looks best with your terminal\r\n ❯ Dark mode\r\n   Light mode\r\n" "$rule"
   while :; do
     c=$(dd bs=1 count=1 2>/dev/null)
     printf '%s' "$c" >> ./theme-input.log
