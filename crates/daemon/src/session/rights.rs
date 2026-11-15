@@ -6,8 +6,9 @@
 //! - [`CallerClass::Session`]: the process descends from a managed session's
 //!   PTY root, or on Linux runs in a session's worker unit. It may mutate only
 //!   the descendants of that session, and may send input to its parent.
-//! - [`CallerClass::OwnerShell`]: the same, for a `shell` runtime session,
-//!   which keeps owner rights.
+//! - [`CallerClass::OwnerShell`]: the same, for a `shell` runtime session no
+//!   session spawned, which keeps owner rights. A shell a session spawned is
+//!   a `Session` of its own tree.
 //! - [`CallerClass::Owner`]: everything else, including the owner's terminal,
 //!   services outside every session tree, and a process that left its tree.
 //! - [`CallerClass::Unknown`]: a peer of another user, or one the kernel can
@@ -22,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use protocol::{method, AgentActivity, RuntimeRef, SessionId};
+use protocol::{method, AgentActivity, ProtocolError, RuntimeRef, SessionId};
 use tracing::warn;
 
 use super::native_attestation::{ControlPeer, PeerStanding};
@@ -85,6 +86,9 @@ pub(crate) enum Denial {
     ParentBlocked,
     /// The caller could not be placed.
     UnknownCaller,
+    /// The target is the caller's own session, which the origin-session guard
+    /// refuses with its own code whether or not the request carries markers.
+    SelfTarget,
 }
 
 impl Denial {
@@ -94,16 +98,26 @@ impl Denial {
             Self::NotDescendant => "not_descendant",
             Self::ParentBlocked => "parent_blocked",
             Self::UnknownCaller => "unknown_caller",
+            Self::SelfTarget => "self_target",
+        }
+    }
+
+    /// The error a refused request answers with.
+    pub(crate) fn error(self) -> ProtocolError {
+        match self {
+            Self::SelfTarget => ProtocolError::plugin_self_target_denied(),
+            other => ProtocolError::session_right_denied(other.code()),
         }
     }
 }
 
-/// How the daemon places a caller on this platform, for the doctor.
+/// How the daemon places a caller, for the doctor.
 ///
-/// Linux also reads the control group because workers run as systemd user
-/// units there; macOS has ancestry only.
-pub(crate) const fn platform_mode() -> &'static str {
-    if cfg!(target_os = "linux") {
+/// The control group counts only where the service manager runs each worker as
+/// its own systemd user unit, which `units` says. Daemons that run workers as
+/// direct children, and macOS, place a caller by ancestry alone.
+pub(crate) const fn platform_mode(units: bool) -> &'static str {
+    if cfg!(target_os = "linux") && units {
         "ancestry+cgroup"
     } else {
         "ancestry"
@@ -160,7 +174,10 @@ impl SessionRegistry {
                 continue;
             }
             roots.live.insert(id.clone());
-            if entry.info.agent_base == RuntimeRef::shell() {
+            // A shell session a session spawned gets the rights of its own
+            // tree only, so a worker cannot reach owner rights by typing into
+            // a shell it started.
+            if entry.info.agent_base == RuntimeRef::shell() && entry.info.spawned_by.is_none() {
                 roots.shell.insert(id.clone());
             }
             if let Some(root) = entry.root_process {
@@ -186,8 +203,17 @@ impl SessionRegistry {
             CallerClass::Unknown => return Err(Denial::UnknownCaller),
             CallerClass::Session(caller) => caller,
         };
-        let sessions = self.inner.sessions.lock().await;
         let target = SessionId(target.to_owned());
+        if target == *caller {
+            // Attaching to the caller's own session keeps its own guard
+            // (`attach_self_feedback`), which reads the client's origin.
+            return if method == method::SESSION_ATTACH {
+                Ok(())
+            } else {
+                Err(Denial::SelfTarget)
+            };
+        }
+        let sessions = self.inner.sessions.lock().await;
         let Some(target_entry) = sessions.get(&target) else {
             return Ok(());
         };

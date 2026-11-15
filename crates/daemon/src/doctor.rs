@@ -75,6 +75,7 @@ pub(crate) async fn report(
     let overlay_diagnostics = overlays.diagnostics.to_vec();
     let overlays_from_file = overlays.from_file;
     let mode = supervision_mode(supervision.as_ref());
+    let worker_units = supervision.as_ref().is_some_and(|active| active.native);
     let worker = supervision.map(|active| WorkerCandidate {
         path: active.worker_executable,
         source: WorkerSource::Supervision,
@@ -117,7 +118,7 @@ pub(crate) async fn report(
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
-    checks.push(session_rights_check());
+    checks.push(session_rights_check(worker_units));
     Ok(bounded_report(checks))
 }
 
@@ -916,13 +917,13 @@ fn placement_check(
 
 /// The check that names the limit of the session rights guardrail and the
 /// platform mode that places a caller in a session tree.
-fn session_rights_check() -> DoctorCheck {
+fn session_rights_check(worker_units: bool) -> DoctorCheck {
     check(
         SESSION_RIGHTS_CHECK,
         DoctorStatus::Ok,
         &format!(
             "guardrail: processes that leave a session tree keep owner rights (see security model); placement: {}",
-            crate::session::rights::platform_mode()
+            crate::session::rights::platform_mode(worker_units)
         ),
     )
 }

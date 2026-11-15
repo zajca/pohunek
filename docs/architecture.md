@@ -2353,11 +2353,11 @@ that remain are cheap, free-by-default, or inherited:
   | Caller | Evidence | Class |
   |---|---|---|
   | Remote overlay connection, or in-process dispatch | no kernel peer | `Owner` (the overlay policy is the gate) |
-  | Local peer of another user, or a peer the kernel no longer attests | socket credentials | `Unknown`: every checked mutation is refused with `unknown_caller` |
+  | Local peer of another user, a peer the kernel no longer attests, or an accepted socket the kernel could not attest | socket credentials | `Unknown`: every checked mutation is refused with `unknown_caller` |
   | Ancestry reaches a live session's PTY root (pid and start identity, at most 128 parent links) | parent walk | `Session(X)` |
   | Linux, no ancestry match, the control group is inside session X's worker unit | control group | `Session(X)` |
   | Ancestry names X and the control group names another session | both | `Session(X)`; ancestry wins |
-  | Ancestry reaches a `shell` runtime session X | session record | `OwnerShell(X)`: owner rights |
+  | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights; a shell a session spawned is `Session(X)` of its own tree |
   | None of the above: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
 
   A `Session(X)` caller may mutate a session only when it is a descendant of
@@ -2366,12 +2366,15 @@ that remain are cheap, free-by-default, or inherited:
   `session.input` only and not while the parent's activity is `blocked`.
   Everything else is refused with `runtime/session_right_denied`; its message
   carries `reason=not_descendant`, `parent_blocked` or `unknown_caller`. The
-  origin-session guard runs first and keeps `plugin_self_target_denied`. Every
+  origin-session guard runs first and keeps `plugin_self_target_denied`; a
+  `Session(X)` caller that targets X itself gets the same code even when the
+  request carries no markers, and `session.attach` of X keeps
+  `attach_self_feedback`. Every
   refusal writes one audit line on the `audit.session_change` target with the
   caller class and session, the peer pid and uid, the method, the target, the
   reason and the request id, and never the params, input bytes, names or
   metadata values. `pohunek doctor` reports the `session_rights` check with
-  the placement mode: `ancestry+cgroup` on Linux, `ancestry` on macOS.
+  the placement mode: `ancestry+cgroup` where each worker runs as a systemd user unit, otherwise `ancestry`.
 
   This is a guardrail, not a wall. A process of the same user that leaves the
   session tree keeps owner rights, and so does one that reads the owner's

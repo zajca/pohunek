@@ -158,20 +158,29 @@ impl Scenario {
         read_result(&result)
     }
 
-    /// Runs `pohunek <arguments>` from a process that left the session's tree:
-    /// the command runs in a subshell the agent's child shell does not wait
-    /// for, so it is reparented away from the PTY root.
+    /// Runs `pohunek <arguments>` from a process that left the session's tree.
+    ///
+    /// The escape is the reparent, which is what a double fork does and which
+    /// `setsid` alone does not do (it keeps the parent; macOS has no `setsid`
+    /// command). A background subshell waits on a FIFO until the agent's child
+    /// shell has exited. The agent reads its next line only after that shell
+    /// ended, so by the time the second line releases the subshell it has been
+    /// reparented away from the PTY root.
     fn detached(&self, session: &str, arguments: &str) -> (i32, String) {
         let number = self.next_result.get();
         self.next_result.set(number + 1);
         let result = self.results.join(format!("{number}.txt"));
+        let fifo = self.results.join(format!("{number}.fifo"));
+        self.send(session, &format!("run:mkfifo {}", fifo.display()));
         let command = format!(
-            "( {} {arguments} >{} 2>&1; echo rc=$? >>{} ) &",
+            "( read _ <{} ; {} {arguments} >{} 2>&1; echo rc=$? >>{} ) &",
+            fifo.display(),
             self.cli.display(),
             result.display(),
             result.display()
         );
         self.send(session, &format!("run:{command}"));
+        self.send(session, &format!("run:echo go >{}", fifo.display()));
         read_result(&result)
     }
 
@@ -280,6 +289,23 @@ fn a_session_reaches_its_descendants_and_its_parent_only() {
     let attach = scenario.inside(&w1, &format!("attach {w2}"));
     assert_denied(&attach, "not_descendant");
 
+    // A session's own session keeps the existing refusals, with or without
+    // the markers the CLI sends.
+    let own_stop = scenario.inside(&w1, &format!("session stop {w1} --json"));
+    assert_ne!(own_stop.0, 0, "{}", own_stop.1);
+    assert!(
+        own_stop.1.contains("plugin_self_target_denied"),
+        "{}",
+        own_stop.1
+    );
+    let own_attach = scenario.inside(&w1, &format!("attach {w1}"));
+    assert_ne!(own_attach.0, 0, "{}", own_attach.1);
+    assert!(
+        own_attach.1.contains("refusing to attach to session"),
+        "{}",
+        own_attach.1
+    );
+
     // The audit lines name the refusal and never the request's text.
     poll_until("the audit lines of the three refusals", || {
         (scenario.refusals().len() >= 3).then_some(())
@@ -348,13 +374,35 @@ fn a_worker_cannot_answer_a_blocked_parent() {
     scenario.finish();
 }
 
-/// Row 6: a managed shell session keeps owner rights.
+/// Row 6: a managed shell session keeps owner rights unless a session spawned it.
 #[test]
 fn a_shell_session_keeps_owner_rights() {
     let scenario = Scenario::start();
     let manager = scenario.spawn(AGENT_PROFILE, "manager", None);
     let victim = scenario.spawn(AGENT_PROFILE, "victim", Some(&manager));
+    let worker = scenario.spawn(AGENT_PROFILE, "worker", Some(&manager));
     let shell = scenario.spawn(SHELL_PROFILE, "shell", None);
+    // The control: the same command from a worker of the same tree is refused.
+    let refused = scenario.inside(&worker, &format!("session stop {victim} --json"));
+    assert_denied(&refused, "not_descendant");
+    assert!(scenario.is_live(&victim));
+    // A shell a worker spawned has the rights of its own tree, not the owner's.
+    let spawned = scenario.inside(
+        &worker,
+        &format!("session new --agent {SHELL_PROFILE} --json"),
+    );
+    assert_eq!(spawned.0, 0, "{}", spawned.1);
+    let document: Value = serde_json::from_str(&spawned.1).expect("session new JSON");
+    let child_shell = document["ok"]["session"]["id"]
+        .as_str()
+        .or_else(|| document["ok"]["id"].as_str())
+        .expect("spawned shell id")
+        .to_owned();
+    scenario
+        .host
+        .wait_screen_line(&child_shell, "rights-agent ready");
+    let from_child = scenario.inside(&child_shell, &format!("session stop {victim} --json"));
+    assert_denied(&from_child, "not_descendant");
     let stop = scenario.inside(&shell, &format!("session stop {victim} --json"));
     assert_eq!(stop.0, 0, "{}", stop.1);
     poll_until("the victim to stop", || {
@@ -390,6 +438,11 @@ fn a_process_that_left_the_tree_keeps_owner_rights() {
     let detail = check["detail"].as_str().expect("detail");
     assert!(
         detail.contains("processes that leave a session tree keep owner rights"),
+        "{detail}"
+    );
+    // Workers of this daemon are direct children, so only ancestry places a caller.
+    assert!(
+        detail.contains("placement: ancestry") && !detail.contains("cgroup"),
         "{detail}"
     );
     scenario.finish();

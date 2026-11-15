@@ -105,6 +105,9 @@ pub struct DaemonState {
     /// The rights class of this connection's caller, computed on the first
     /// rights-checked request and kept for the connection.
     pub(crate) rights_class: Arc<tokio::sync::OnceCell<CallerClass>>,
+    /// Whether this state serves an accepted local socket whose peer the kernel
+    /// could not attest; such a caller is [`CallerClass::Unknown`].
+    pub(crate) socket_unattested: bool,
     /// Runs package commands. States that serve one daemon share one service,
     /// so its limits hold across transports.
     pub package_commands: PackageCommandService,
@@ -180,6 +183,7 @@ impl DaemonState {
             control_peer: None,
             remote_peer: None,
             rights_class: Arc::default(),
+            socket_unattested: false,
             package_commands,
         }
     }
@@ -202,6 +206,7 @@ impl DaemonState {
         self.control_peer = None;
         self.remote_peer = None;
         self.rights_class = Arc::default();
+        self.socket_unattested = false;
         self
     }
 
@@ -215,6 +220,7 @@ impl DaemonState {
     /// Attach the kernel-attested peer of one accepted connection.
     #[must_use]
     pub fn with_control_peer(mut self, peer: Option<Arc<ControlPeer>>) -> Self {
+        self.socket_unattested = peer.is_none();
         self.control_peer = peer;
         self.rights_class = Arc::default();
         self
@@ -446,12 +452,8 @@ async fn handle_negotiated(
             .await
         {
             audit::record_rights_refusal(request, state, &class, target, denial.code());
-            return Response::err(
-                selected_version,
-                request.id(),
-                ProtocolError::session_right_denied(denial.code()),
-            )
-            .expect("deserialized request ids satisfy response validation");
+            return Response::err(selected_version, request.id(), denial.error())
+                .expect("deserialized request ids satisfy response validation");
         }
     }
 
@@ -631,7 +633,11 @@ async fn caller_class(state: &DaemonState) -> CallerClass {
         return CallerClass::Owner;
     }
     let Some(peer) = state.control_peer.as_deref() else {
-        return CallerClass::Owner;
+        return if state.socket_unattested {
+            CallerClass::Unknown
+        } else {
+            CallerClass::Owner
+        };
     };
     let class = state
         .rights_class

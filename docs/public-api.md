@@ -294,7 +294,7 @@ only, the caller session's parent while the parent's activity is not
 ends in `reason=not_descendant`, `parent_blocked` or `unknown_caller` (a peer of
 another user, or one the kernel no longer attests). A target the daemon does not
 hold keeps its own `session_not_found`. Callers outside every session tree, in a
-`shell` runtime session, and remote overlay connections keep owner rights. A
+`shell` runtime session that no session spawned, and remote overlay connections keep owner rights; a shell a session spawned has the rights of its own tree. A
 process that leaves the tree keeps owner rights too; see the Security Model of
 the architecture document. Each refusal writes one audit line (caller class and
 session, peer pid and uid, method, target, reason, request id; never params).
@@ -1172,7 +1172,7 @@ child's session or the process table, or a process that carries the generation's
 marker could not be classified, so the generation is not reported clean.
 `daemon.doctor` adds one `session_rights` check, always `ok`, whose detail states
 that processes that leave a session tree keep owner rights and names the
-placement mode (`ancestry+cgroup` on Linux, `ancestry` on macOS).
+placement mode: `ancestry+cgroup` when the service manager runs each worker as a systemd user unit, otherwise `ancestry`.
 
 `daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
 naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`
