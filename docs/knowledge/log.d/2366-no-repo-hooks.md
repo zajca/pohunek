@@ -10,7 +10,10 @@
   [Worktrees](concepts/worktrees.md).
 - Sessions record the switch (`SessionInfo.skip_repo_hooks`, on the resume
   binding and the worktree binding, store schema 21), and a keyed create
-  fingerprints it.
+  fingerprints it. The schema step is the fail-closed choice: an older daemon
+  refuses the schema-21 store instead of dropping the switch and running the
+  checkout's hooks; a rollback restores the `metadata.jsonl.pre-schema-20`
+  backup.
 - With the switch, a `hooks.required` event the host has no script for fails
   the create with `hook_required_skipped` before anything runs.
 - With the switch, the session runs none of git's own hooks: a relative

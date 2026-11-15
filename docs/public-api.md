@@ -1855,6 +1855,8 @@ Important fields:
   sets. Absent (false) otherwise. Set at creation and never changed, it is
   persisted (store schema 21), so a resume and a daemon restart keep it, and
   `session.new`, `session.list`, `session.inspect` and events report it. A
+  daemon that predates schema 21 refuses such a store at startup instead of
+  reading the session without the switch. A
   session started later in the same checkout (a child, an in-place session)
   does not inherit it; a client passes `skip_repo_hooks` to each such session.
 - `agent_base`: the `RuntimeRef` of the runtime backing the session, for
