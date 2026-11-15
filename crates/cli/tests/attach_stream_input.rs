@@ -69,6 +69,9 @@ const PIPE_GROWTH_PROBE_BYTES: usize = 256 * 1024;
 /// client and the stream hold, less than the client's input queue limit.
 const UNREAD_PASTE_BYTES: usize = 768 * 1024;
 
+/// Size of one read of the fixture's input.
+const INPUT_CHUNK_BYTES: usize = 1024;
+
 /// Output the stream writes after it read the client's input to its end.
 const ANSWER: &[u8] = b"answer-after-the-input-was-delivered\n";
 
@@ -628,9 +631,16 @@ fn serve_answering_attach_stream(
     let mut input = reader.buffer().to_vec();
     let mut stream = reader.into_inner();
     let _sent = events.send(StreamEvent::StreamOpened);
-    stream
-        .read_to_end(&mut input)
-        .expect("read the client's input");
+    // A chunked `read` loop: `read_to_end` on this stream stayed blocked after
+    // the client had written its input and shut its write half down (macOS).
+    let mut chunk = [0_u8; INPUT_CHUNK_BYTES];
+    loop {
+        let count = stream.read(&mut chunk).expect("read the client's input");
+        if count == 0 {
+            break;
+        }
+        input.extend_from_slice(&chunk[..count]);
+    }
     // Reported before the answer so a scenario that times out can tell whether
     // the client ever ended its input.
     let _sent = events.send(StreamEvent::InputReceived(input.len()));
