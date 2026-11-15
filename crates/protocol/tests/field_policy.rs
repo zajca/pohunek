@@ -548,6 +548,8 @@ const ROWS: &[Row] = &[
     row!(ProjectShowParams, Lenient, LENIENT_PARAMS),
     row!(ProjectShowResult, Lenient, LENIENT_RESULT),
     row!(RuntimeInventoryEvent, Lenient, LENIENT_EVENT),
+    row!(SessionAdoptParams, Strict, PARAMS_STRICT),
+    row!(SessionAdoptResult, Lenient, LENIENT_RESULT),
     row!(SessionAttachParams, Lenient, LENIENT_PARAMS),
     row!(SessionAttachResult, Lenient, LENIENT_RESULT),
     row!(SessionDetachParams, Lenient, LENIENT_PARAMS),
