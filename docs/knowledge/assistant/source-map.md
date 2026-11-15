@@ -565,8 +565,11 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/external/history.rs` — the bounded, symlink-safe read of agent history heads for `project.candidates`.
 - `crates/daemon/src/worktree/mod.rs`
 - `crates/daemon/src/worktree/repo_hooks.rs` — hook layer selection for
-  `skip_repo_hooks`, the `hook_required_skipped` check, and the host-global
-  script presence `host.inspect` reports as `host_hooks`.
+  `skip_repo_hooks`, the `hook_required_skipped` check, the host-global
+  script presence `host.inspect` reports as `host_hooks`, and git's own hooks
+  turned off for such a session (the `-c core.hooksPath=/dev/null` of every
+  daemon git command, the `GIT_CONFIG_COUNT` pair of the agent and the host
+  hook scripts, `git_hooks_env_conflict`).
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/capabilities.rs`
 - `crates/daemon/src/integration/mod.rs`

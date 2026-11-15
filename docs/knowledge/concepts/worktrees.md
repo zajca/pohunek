@@ -198,13 +198,38 @@ with `hook_required_skipped` before any hook, fetch or git command runs and
 before anything is created; a host script removed after that check fails the
 create at its `post-create` step with the same code, and the create is rolled
 back. Without the switch the rule is unchanged: a required event with no script
-anywhere passes. Git's own hooks are outside this switch: `git worktree add`
-runs the repository's `post-checkout` hook, and a git command run inside the
-checkout (the daemon's `git status` for `session diff` and before a removal, or
-the agent's own git) runs that repository's hooks. A relative `core.hooksPath`
-(husky style) resolves inside the checkout for such a command, so a host that
-reviews untrusted trees keeps `core.hooksPath` unset or absolute for that
-repository.
+anywhere passes.
+
+The switch also runs none of git's own hooks for the session. A relative
+`core.hooksPath` (husky style) resolves inside the checkout a git command runs
+in, so without the switch a git command there runs hooks the checkout carries.
+With it:
+
+- Every git command the daemon runs for the session (create, fetch, `git
+  worktree add` and `remove`, `session diff`, the pre-removal check of a
+  retention sweep, the rollback) runs with `-c core.hooksPath=/dev/null`.
+  Project detection runs its read-only git queries that way for every session.
+- The agent's environment gets `core.hooksPath=/dev/null` as one more
+  `GIT_CONFIG_COUNT` pair (`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`), on the
+  first launch and on every relaunch, so the agent's own git in the checkout
+  runs no hook either, including the repository's own `.git/hooks`. The pairs
+  the agent environment already sets (from the profile `[env]` or the
+  environment allowlist) keep their values: the new pair is appended behind
+  them. An agent environment that sets `GIT_CONFIG_PARAMETERS` (git reads it
+  after the pairs, so it could turn the hooks back on) or a `GIT_CONFIG_COUNT`
+  that is not a decimal number fails the start with `git_hooks_env_conflict`
+  (the create is rolled back) and fails a relaunch with the same code; the
+  error names the variable, not its value.
+  `GIT_CONFIG_COUNT` needs git 2.31 or newer, which project detection already
+  requires.
+- Each host-global hook script of the session gets the same pair, so its git in
+  the checkout runs no hook of it.
+
+The switch belongs to the session started with it. A session started later in
+the same checkout, an agent's child or an in-place `--cwd` session, does not
+inherit it: `spawned_by` is an origin the caller states, not one the daemon
+proves. A client that reviews an untrusted checkout passes `--no-repo-hooks`
+(or `skip_repo_hooks`) to every session it starts there.
 
 A host or repository `pre-remove` hook runs inside the worktree before
 `pohunek session rm` deletes it, and `post-remove` runs in the repository
