@@ -88,6 +88,8 @@ enum StreamEvent {
     InputReceived(usize),
     /// The client forwarded the line typed while its terminal took no output.
     KeystrokeReceived,
+    /// The fixture accepted the raw attach stream, before it read any input.
+    StreamOpened,
 }
 
 /// How the fixture's raw attach stream behaves.
@@ -455,7 +457,7 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
     let Ok(shown) = shown_rx.recv_timeout(HANG_GUARD) else {
         // Names the side that stalled: the stream either saw the end of the
         // client's input or never did.
-        let stream_saw_input_end = observed.try_recv();
+        let stream_events: Vec<StreamEvent> = observed.try_iter().collect();
         let _killed = cli.0.kill();
         let _reaped = cli.0.wait();
         let errors = errors_rx.recv_timeout(HANG_GUARD);
@@ -465,13 +467,17 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
             .recv_timeout(HANG_GUARD)
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         panic!(
-            "the client ends once the stream closed; stream input end: \
-             {stream_saw_input_end:?}, client stdout: {shown:?}, client stderr: {errors:?}"
+            "the client ends once the stream closed; stream events: \
+             {stream_events:?}, client stdout: {shown:?}, client stderr: {errors:?}"
         );
     };
     let status = cli.0.wait().expect("wait for pohunek attach");
 
     assert!(status.success(), "{status}");
+    assert_eq!(
+        observed.recv_timeout(HANG_GUARD),
+        Ok(StreamEvent::StreamOpened)
+    );
     assert_eq!(
         observed.recv_timeout(HANG_GUARD),
         Ok(StreamEvent::InputReceived(KEYSTROKE.len()))
@@ -621,6 +627,7 @@ fn serve_answering_attach_stream(
 ) {
     let mut input = reader.buffer().to_vec();
     let mut stream = reader.into_inner();
+    let _sent = events.send(StreamEvent::StreamOpened);
     stream
         .read_to_end(&mut input)
         .expect("read the client's input");
