@@ -741,7 +741,13 @@ async fn resume_profile_allowed(
         return Ok(());
     };
     let Some(rights) = state.sessions.session_profile_rights(caller).await else {
-        return Err(refuse_resume(request, state, &class, target, "unknown_caller"));
+        return Err(refuse_resume(
+            request,
+            state,
+            &class,
+            target,
+            "unknown_caller",
+        ));
     };
     let target_rights = state.sessions.profile_rights(&agent).await;
     if rights.allows_spawn(&agent, &target_rights) {

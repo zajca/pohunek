@@ -886,7 +886,8 @@ struct SessionRegistryInner {
     /// The `[rights]` each live session's profile held when the session was
     /// launched or resumed. A session's rights are these narrowed by the
     /// profile file as it reads now, so an edit never widens a running session.
-    launch_rights: std::sync::Mutex<HashMap<SessionId, crate::agent::profile::rights::ProfileRights>>,
+    launch_rights:
+        std::sync::Mutex<HashMap<SessionId, crate::agent::profile::rights::ProfileRights>>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
     #[cfg(test)]

@@ -767,7 +767,14 @@ fn a_replaced_profile_keeps_its_rights_table() {
     let digest = scenario.digest_of("rights-kept");
 
     let (code, replaced) = scenario.host.json(&[
-        "plugin", "profile", "create", "rights-kept", "--base", "shell", "--replace", &digest,
+        "plugin",
+        "profile",
+        "create",
+        "rights-kept",
+        "--base",
+        "shell",
+        "--replace",
+        &digest,
     ]);
     assert_eq!(code, 0, "{replaced}");
     let text = fs::read_to_string(&path).expect("read the profile");
@@ -786,7 +793,10 @@ fn a_replaced_profile_keeps_its_rights_table() {
         &digest,
     ]);
     assert_ne!(code, 0, "{refused}");
-    assert_eq!(refused["err"]["code"], "package_profile_unusable", "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "package_profile_unusable",
+        "{refused}"
+    );
     assert_eq!(fs::read_to_string(&path).expect("read the profile"), text);
     scenario.finish();
 }
