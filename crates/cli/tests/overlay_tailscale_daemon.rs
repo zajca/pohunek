@@ -87,8 +87,14 @@ impl Host {
     /// Starts the daemon with the environment of the service job: the
     /// bootstrap allowlist and the executable search path, nothing else.
     fn start(&self) -> Daemon {
+        self.start_with(&[])
+    }
+
+    /// Starts the daemon like [`Host::start`] with `arguments` on its command
+    /// line.
+    fn start_with(&self, arguments: &[&str]) -> Daemon {
         let mut daemon = Command::new(bin_exe("pohunek").with_file_name("pohunekd"));
-        daemon.env_clear();
+        daemon.args(arguments).env_clear();
         for key in BOOTSTRAP_ENV_ALLOWLIST {
             if let Some(value) = self.env.environment().get(std::ffi::OsStr::new(key)) {
                 daemon.env(key, value);
@@ -361,4 +367,41 @@ fn the_unconfigured_default_stays_disabled_without_its_cli() {
         host.log_text()
     );
     assert!(host.binds().is_empty());
+}
+
+/// `--local-only` keeps the remote listener off even for an overlay listed in
+/// `overlays.toml` whose CLI reports a usable address: the daemon never asks
+/// the overlay for its address and binds nothing, and says so in its log.
+#[test]
+fn a_local_only_daemon_never_queries_or_binds_a_listed_overlay() {
+    let host = Host::new(true);
+    host.fake.install(&usable());
+    let _daemon = host.start_with(&["--local-only"]);
+    host.wait_for_log("remote control listener disabled by --local-only; serving local-only");
+    host.wait_for_log("ready; serving control protocol");
+    let output = host
+        .env
+        .command(bin_exe("pohunek"))
+        .env("PATH", host.fake.bin_dir())
+        .args(["session", "list", "--json"])
+        .output()
+        .expect("run the local CLI");
+    assert!(
+        output.status.success(),
+        "the local socket answers: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        host.binds().is_empty(),
+        "nothing is bound: {:?}",
+        host.binds()
+    );
+    assert_eq!(host.fake.invocations(), 0, "no overlay status query");
+    assert!(
+        !host
+            .log_text()
+            .contains("remote control listener not bound"),
+        "{}",
+        host.log_text()
+    );
 }

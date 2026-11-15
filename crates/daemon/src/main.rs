@@ -19,6 +19,11 @@
 //!
 //! Anything else fails at startup.
 //!
+//! `pohunekd --local-only` serves the local Unix socket alone: the remote
+//! control listener is never started, so the daemon queries no overlay for a
+//! listener address and binds no TCP socket. Isolated test daemons on a host
+//! with an overlay use it.
+//!
 //! `pohunekd upgrade-preflight` is the one other mode. It prints, as one JSON
 //! document, whether this build would adopt the live sessions of the installed
 //! state, reading the store, the worker journals and the process table only. It
@@ -40,7 +45,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
+use overlay::{ConfiguredTransport, OverlayId};
 use pohunek_daemon::api::{
     ConnectionTasks, ControlServer, DaemonState, HealthInfo, OpenedListener, OverlaySource,
     RemoteServer,
@@ -109,6 +114,8 @@ const WORKER_LAUNCHER_ENV: &str = "POHUNEK_WORKER_LAUNCHER";
 const SUBPROCESS_LAUNCHER: &str = "subprocess";
 /// Command-line flag naming the installed `service.toml`.
 const SERVICE_CONFIG_FLAG: &str = "--service-config";
+/// Command-line flag that keeps the remote control listener off.
+const LOCAL_ONLY_FLAG: &str = "--local-only";
 /// Overrides the durable worker binary path used by the subprocess launcher.
 /// When unset, the daemon uses the `pohunek-sessiond` co-located next to itself.
 const WORKER_BIN_ENV: &str = "POHUNEK_WORKER_BIN";
@@ -573,8 +580,9 @@ fn ensure_runtimes(
 async fn run() -> Result<(), DaemonError> {
     // 1. Select worker supervision and resolve all paths up front; fail fast on
     //    a missing mode or required env.
+    let arguments = parse_arguments(std::env::args_os().skip(1))?;
     let mode = select_supervision(
-        parse_service_config(std::env::args_os().skip(1))?,
+        arguments.service_config,
         std::env::var_os(WORKER_LAUNCHER_ENV),
     )?;
     let paths = Paths::resolve()?;
@@ -627,6 +635,9 @@ async fn run() -> Result<(), DaemonError> {
         "pohunekd starting"
     );
     info!(lock = %paths.lock.display(), "acquired single-instance lock");
+    if arguments.local_only {
+        info!("remote control listener disabled by {LOCAL_ONLY_FLAG}; serving local-only");
+    }
     log_arena_bound();
 
     // 6. Build the session registry with the hook-handshake socket path, the
@@ -792,9 +803,16 @@ async fn run() -> Result<(), DaemonError> {
     } else {
         MissingCli::Disable
     };
+    // `--local-only` serves no overlay: no listener task starts, so nothing
+    // queries an overlay for its address or binds a TCP socket.
+    let listened: &[ConfiguredTransport] = if arguments.local_only {
+        &[]
+    } else {
+        registry.entries()
+    };
     let remote_serve = serve_remote(
         remote_state,
-        &registry,
+        listened,
         missing_cli,
         (shutdown, remote_connections),
         move || {
@@ -866,13 +884,30 @@ enum SupervisionMode {
     Subprocess,
 }
 
-/// Parses `pohunekd [--service-config <absolute path>]`.
-fn parse_service_config(
+/// The command line of `pohunekd`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DaemonArguments {
+    /// The installed `service.toml`, which selects native supervision.
+    service_config: Option<PathBuf>,
+    /// `--local-only`: no remote control listener.
+    local_only: bool,
+}
+
+/// Parses `pohunekd [--service-config <absolute path>] [--local-only]`.
+fn parse_arguments(
     arguments: impl IntoIterator<Item = OsString>,
-) -> Result<Option<PathBuf>, DaemonError> {
+) -> Result<DaemonArguments, DaemonError> {
     let mut arguments = arguments.into_iter();
-    let mut service_config = None;
+    let mut parsed = DaemonArguments::default();
     while let Some(argument) = arguments.next() {
+        if argument == LOCAL_ONLY_FLAG {
+            if std::mem::replace(&mut parsed.local_only, true) {
+                return Err(DaemonError::Arguments(format!(
+                    "{LOCAL_ONLY_FLAG} was given more than once"
+                )));
+            }
+            continue;
+        }
         if argument != SERVICE_CONFIG_FLAG {
             return Err(DaemonError::Arguments(format!(
                 "unexpected argument {}",
@@ -888,13 +923,13 @@ fn parse_service_config(
                 path.display()
             )));
         }
-        if service_config.replace(path).is_some() {
+        if parsed.service_config.replace(path).is_some() {
             return Err(DaemonError::Arguments(format!(
                 "{SERVICE_CONFIG_FLAG} was given more than once"
             )));
         }
     }
-    Ok(service_config)
+    Ok(parsed)
 }
 
 /// Chooses exactly one supervision mode from the command line and
@@ -1336,7 +1371,7 @@ fn next_retry_interval(current: Duration) -> Duration {
 /// Serve the remote transport when its port configuration is valid.
 async fn serve_remote<F>(
     state: DaemonState,
-    registry: &OverlayRegistry,
+    overlays: &[ConfiguredTransport],
     missing_cli: MissingCli,
     (shutdown, connections): (CancellationToken, ConnectionTasks),
     begin_daemon_shutdown: F,
@@ -1344,8 +1379,8 @@ async fn serve_remote<F>(
 where
     F: FnOnce(),
 {
-    let mut tasks = Vec::with_capacity(registry.entries().len());
-    for configured in registry.entries() {
+    let mut tasks = Vec::with_capacity(overlays.len());
+    for configured in overlays {
         let configured = configured.clone();
         let overlay_id = configured.id().clone();
         let state = state.clone();
@@ -2243,8 +2278,8 @@ mod supervision_tests {
     use pohunek_test_support::process_env::ProcessEnv;
 
     use super::{
-        apply_service_settings, env_bool, parse_service_config, select_supervision,
-        warn_unknown_service_keys, worker_working_directory, SupervisionMode,
+        apply_service_settings, env_bool, parse_arguments, select_supervision,
+        warn_unknown_service_keys, worker_working_directory, DaemonArguments, SupervisionMode,
         OBSERVE_EXTERNAL_AGENTS_ENV,
     };
 
@@ -2463,22 +2498,37 @@ mod supervision_tests {
     }
 
     #[test]
-    fn the_command_line_accepts_only_one_absolute_service_config() {
-        assert_eq!(parse_service_config(arguments(&[])).expect("no flag"), None);
+    fn the_command_line_accepts_one_absolute_service_config_and_local_only() {
         assert_eq!(
-            parse_service_config(arguments(&["--service-config", "/etc/p/service.toml"]))
+            parse_arguments(arguments(&[])).expect("no flag"),
+            DaemonArguments::default()
+        );
+        assert_eq!(
+            parse_arguments(arguments(&["--service-config", "/etc/p/service.toml"]))
                 .expect("absolute path"),
-            Some(PathBuf::from("/etc/p/service.toml"))
+            DaemonArguments {
+                service_config: Some(PathBuf::from("/etc/p/service.toml")),
+                local_only: false,
+            }
+        );
+        assert_eq!(
+            parse_arguments(arguments(&["--local-only", "--service-config", "/s.toml"]))
+                .expect("both flags"),
+            DaemonArguments {
+                service_config: Some(PathBuf::from("/s.toml")),
+                local_only: true,
+            }
         );
         for rejected in [
             &["--service-config"][..],
             &["--service-config", "service.toml"],
             &["--service-config", "/a.toml", "--service-config", "/b.toml"],
+            &["--local-only", "--local-only"],
             &["--worker-launcher", "subprocess"],
         ] {
             assert!(
                 matches!(
-                    parse_service_config(arguments(rejected)),
+                    parse_arguments(arguments(rejected)),
                     Err(DaemonError::Arguments(_))
                 ),
                 "{rejected:?} must be rejected"
