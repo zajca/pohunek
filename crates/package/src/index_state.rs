@@ -143,7 +143,7 @@ impl Registry {
         reserved.sort();
         reserved.dedup();
         if reserved.len() > MAX_RESERVED_RUNTIME_IDS {
-            return Err(RegistryError::Corrupt);
+            return Err(RegistryError::TooManyReservedRuntimeIds);
         }
         merged.reserved_runtime_ids = reserved.into_iter().collect();
         if merged == current {
@@ -161,6 +161,9 @@ impl Registry {
                 .collect(),
         };
         let bytes = serde_json::to_vec(&file).map_err(|_cause| RegistryError::Corrupt)?;
+        if bytes.len() > MAX_INDEX_STATE_BYTES {
+            return Err(RegistryError::TooManyReservedRuntimeIds);
+        }
         self.root
             .replace_file(INDEX_STATE_NAME, INDEX_STATE_TEMP_NAME, &bytes, FILE_MODE)
             .map_err(replace_failure)?;

@@ -334,6 +334,21 @@ pub(crate) fn index_apply_kind(error: package::IndexError) -> PackageErrorKind {
 /// new codes. Callers compare the returned sequence against the persisted
 /// marks before storing (`record_index` silently returns current on a
 /// below-mark document).
+/// Shared verification inputs for the stored document: anchor revoked keys union
+/// catalog-state revoked keys. Apply, install-by-id and the doctor verify
+/// through this one source so they never diverge (M5).
+pub(crate) fn verification_base_revoked(
+    anchor: &HostTrustAnchor,
+    catalog_state: &CatalogState,
+) -> BTreeSet<KeyId> {
+    anchor
+        .inputs
+        .revoked
+        .union(catalog_state.revoked_key_ids())
+        .cloned()
+        .collect()
+}
+
 pub(super) fn verify_index_for_apply(
     bytes: &[u8],
     endorser: &RootKey,
@@ -342,12 +357,7 @@ pub(super) fn verify_index_for_apply(
     state: &IndexVerifierState,
     now: u64,
 ) -> Result<VerifiedIndex, PackageErrorKind> {
-    let base_revoked: BTreeSet<KeyId> = anchor
-        .inputs
-        .revoked
-        .union(catalog_state.revoked_key_ids())
-        .cloned()
-        .collect();
+    let base_revoked = verification_base_revoked(anchor, catalog_state);
     verify_index(bytes, endorser, &base_revoked, state, now).map_err(index_apply_kind)
 }
 

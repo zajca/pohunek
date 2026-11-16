@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hostcheck::{OverlayChecks, StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
-use package::registry::PackageSource;
+use package::registry::PackageProvenance;
 use protocol::{
     DoctorCheck, DoctorReport, DoctorStatus, IntegrationDoctorParams, IntegrationFindingCode,
     IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
@@ -1133,6 +1133,8 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
 )]
 fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorCheck {
     const CHECK: &str = "plugin_index";
+    const INVALID: &str = "index_invalid: run `pohunek plugin index refresh`";
+    const STALE: &str = "stale: run `pohunek plugin index refresh`";
     let CatalogTrust::Loaded(anchor) = catalog_trust else {
         return check(CHECK, DoctorStatus::Ok, "not_used");
     };
@@ -1142,66 +1144,89 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
     };
     let registry = store.registry();
     let Ok(state) = registry.state() else {
-        return check(CHECK, DoctorStatus::Fail, "index_invalid");
+        return check(CHECK, DoctorStatus::Fail, INVALID);
     };
-    let has_official = state
+    let has_index_origin = state
         .packages()
         .iter()
-        .any(|r| r.source() == PackageSource::Official);
-    let stored = [1u64, 2u64]
-        .iter()
-        .filter_map(|schema| registry.stored_index(*schema).ok().flatten())
-        .max_by_key(|stored| stored.stored_at);
+        .any(|r| r.provenance() == PackageProvenance::Index);
+    let mut stored: Option<package::StoredIndex> = None;
+    let mut unreadable = false;
+    for schema in [1u64, 2u64] {
+        match registry.stored_index(schema) {
+            Ok(found) => {
+                if let Some(found) = found {
+                    if stored
+                        .as_ref()
+                        .is_none_or(|s: &package::StoredIndex| found.stored_at > s.stored_at)
+                    {
+                        stored = Some(found);
+                    }
+                }
+            }
+            Err(_) => unreadable = true,
+        }
+    }
+    // Unreadable stored bytes (oversized, damaged sidecar, wrong mode) is
+    // index_invalid, never not_used (M4).
+    if unreadable {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    }
     let Some(stored) = stored else {
-        return if has_official {
-            check(CHECK, DoctorStatus::Warn, "not_refreshed")
+        return if has_index_origin {
+            check(
+                CHECK,
+                DoctorStatus::Warn,
+                "not_refreshed: run `pohunek plugin index refresh`",
+            )
         } else {
             check(CHECK, DoctorStatus::Ok, "not_used")
         };
     };
     if stored.bytes.len() > package::MAX_INDEX_BYTES {
-        return check(CHECK, DoctorStatus::Fail, "index_invalid");
+        return check(CHECK, DoctorStatus::Fail, INVALID);
     }
-    let endorser = match anchor.index() {
-        crate::catalog_anchor::IndexTrust::Loaded(endorser) => endorser.as_ref(),
-        _ => return check(CHECK, DoctorStatus::Warn, "stale"),
-    };
-    let catalog_state = registry.catalog_state().ok();
-    let index_state = registry.index_state().ok();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
-    let base: std::collections::BTreeSet<package::KeyId> = {
-        let mut set = std::collections::BTreeSet::new();
-        if let Some(state) = &catalog_state {
-            set.extend(state.revoked_key_ids().iter().cloned());
-        }
-        set
+    // Missing endorser with a stored document: a stored copy exists, so the
+    // missing channel file does not hide it (L6: no silent stale).
+    let endorser = match anchor.index() {
+        crate::catalog_anchor::IndexTrust::Loaded(endorser) => endorser.as_ref(),
+        _ => return check(CHECK, DoctorStatus::Warn, STALE),
     };
-    let verified = package::verify_index(
-        &stored.bytes,
-        endorser,
-        &base,
-        &index_state.clone().unwrap_or_default(),
-        now,
-    );
+    let Ok(catalog_state) = registry.catalog_state() else {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    };
+    let Ok(index_state) = registry.index_state() else {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    };
+    // One verification-input source for apply, install and doctor (M5).
+    let base = crate::packages::verification_base_revoked(anchor, &catalog_state);
+    let verified = package::verify_index(&stored.bytes, endorser, &base, &index_state, now);
     let verified = match verified {
         Ok(v) => v,
         Err(error) => {
             return match error {
-                package::IndexError::Expired => check(CHECK, DoctorStatus::Warn, "index_expired"),
+                package::IndexError::Expired => check(
+                    CHECK,
+                    DoctorStatus::Warn,
+                    "index_expired: installed packages keep working",
+                ),
                 package::IndexError::StaleSequence { .. }
                 | package::IndexError::StaleRevocation { .. } => {
-                    check(CHECK, DoctorStatus::Warn, "stale")
+                    check(CHECK, DoctorStatus::Warn, STALE)
                 }
-                _ => check(CHECK, DoctorStatus::Fail, "index_invalid"),
+                _ => check(CHECK, DoctorStatus::Fail, INVALID),
             };
         }
     };
-    // Delisted: Official-origin installed digest no longer listed under its id.
+    // Delisted: index-origin installed digest no longer listed under its id.
+    // Catalog-origin (bundled codex/claude/hermes) records are never checked
+    // here (H2): the release catalog is a separate document family.
     let mut delisted: Option<(String, String)> = None;
     for record in state.packages() {
-        if record.source() != PackageSource::Official {
+        if record.provenance() != PackageProvenance::Index {
             continue;
         }
         let digest = record.digest();
@@ -1221,34 +1246,30 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         return check(
             CHECK,
             DoctorStatus::Fail,
-            &format!("package_revoked: {id}@{ver}"),
+            &format!("package_revoked: {id}@{ver}: run `pohunek plugin update {id}` or remove it"),
         );
     }
     // Reserved: local (ExplicitDigest/Link) holding a reserved runtime id.
-    let reserved = index_state
-        .as_ref()
-        .map(|s| s.reserved_runtime_ids.clone())
-        .unwrap_or_default();
+    // The declared runtime id from the descriptor is used, not the package
+    // id suffix (H1): a community package cannot hide by renaming its id.
+    // An unreadable descriptor is a package fault reported elsewhere; here
+    // it is not treated as reserved.
+    let reserved = &index_state.reserved_runtime_ids;
     let mut reserved_hit: Option<(String, String)> = None;
     for record in state.packages() {
-        if !matches!(
-            record.source(),
-            PackageSource::ExplicitDigest | PackageSource::Link
-        ) {
+        if record.provenance() != PackageProvenance::Local {
             continue;
         }
-        if let Some(suffix) = record
-            .identity()
-            .id
-            .as_str()
-            .strip_prefix(package::OFFICIAL_RUNTIME_PACKAGE_PREFIX)
-        {
-            if let Ok(runtime) = protocol::RuntimeId::parse(suffix) {
-                if reserved.contains(&runtime) {
-                    reserved_hit = Some((record.identity().id.to_string(), runtime.to_string()));
-                    break;
-                }
-            }
+        let Ok(descriptor) = store.read_descriptor(record.digest(), record.identity()) else {
+            continue;
+        };
+        let Some(runtime_def) = descriptor.runtime() else {
+            continue;
+        };
+        let runtime = runtime_def.runtime_id();
+        if reserved.contains(runtime) {
+            reserved_hit = Some((record.identity().id.to_string(), runtime.to_string()));
+            break;
         }
     }
     if let Some((id, rt)) = reserved_hit {
@@ -1258,11 +1279,11 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
             &format!("runtime_id_reserved_by_official: {id} runtime {rt}"),
         );
     }
-    let fresh = now.saturating_sub(stored.stored_at) <= 24 * 60 * 60;
+    let fresh = now.saturating_sub(stored.stored_at) <= package::index_store::STORED_INDEX_MAX_AGE;
     if fresh {
         check(CHECK, DoctorStatus::Ok, "current")
     } else {
-        check(CHECK, DoctorStatus::Warn, "stale")
+        check(CHECK, DoctorStatus::Warn, STALE)
     }
 }
 

@@ -946,6 +946,7 @@ async fn a_command_of_a_revoked_catalog_authorized_package_is_not_run() {
             identity: serde_json::from_value(json!({ "id": PACKAGE, "version": "1.0.0" }))
                 .expect("package identity"),
             source: package::registry::PackageSource::Official,
+            provenance: package::registry::PackageProvenance::Catalog,
             enabled: true,
             select: true,
             installed_at_unix_seconds: 1,

@@ -37,6 +37,7 @@ pub use self::authority::PackageService;
 pub(crate) use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority};
 pub use self::retention::PackageUninstallError;
 pub(crate) use self::retention::{installed_digests, RetainedPins};
+pub(crate) use self::trust::verification_base_revoked;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -44,14 +45,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use package::catalog_state::CatalogState;
 use package::registry::{
-    InstallRequest, InstallStatus, PackageRecord, PackageSource as RecordSource, RegistryError,
-    RegistryState,
+    InstallRequest, InstallStatus, PackageProvenance, PackageRecord, PackageSource as RecordSource,
+    RegistryError, RegistryState,
 };
 use package::revoked_digests::RevokedDigests;
 use package::{
     archive_digest, read_archive, read_archive_with_digest, IndexVerifierState, Limits, LocalTrust,
     LocalTrustError, PackageDigest, RootKey, VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES,
-    MAX_INDEX_BYTES, OFFICIAL_RUNTIME_PACKAGE_PREFIX,
+    MAX_INDEX_BYTES,
 };
 use protocol::{
     CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
@@ -98,6 +99,7 @@ struct Prepared {
     identity: PackageIdentity,
     authority: Authority,
     source: RecordSource,
+    provenance: PackageProvenance,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
     /// The plugin index that authorized the package, recorded before the
@@ -117,6 +119,7 @@ struct CommandsPrepared {
     commands: Vec<CommandInfo>,
     identity: PackageIdentity,
     source: RecordSource,
+    provenance: PackageProvenance,
     /// The plugin index that authorized the package, recorded before the
     /// install; only a context package authorized by the index has one.
     index: Option<VerifiedIndex>,
@@ -1124,6 +1127,7 @@ fn prepare_local(
             commands,
             identity,
             source: RecordSource::ExplicitDigest,
+            provenance: PackageProvenance::Local,
             index: None,
         })));
     };
@@ -1145,6 +1149,7 @@ fn prepare_local(
         identity,
         authority: Authority::Local,
         source: RecordSource::ExplicitDigest,
+        provenance: PackageProvenance::Local,
         catalog: None,
         index: None,
     })))
@@ -1207,6 +1212,7 @@ fn prepare_official(
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
+        provenance: PackageProvenance::Catalog,
         catalog: Some(verified),
         index: None,
     })
@@ -1279,6 +1285,7 @@ fn prepare_indexed(
             commands,
             identity,
             source: RecordSource::Official,
+            provenance: PackageProvenance::Index,
             index: Some(verified),
         })));
     };
@@ -1302,6 +1309,7 @@ fn prepare_indexed(
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
+        provenance: PackageProvenance::Index,
         catalog: None,
         index: Some(verified),
     })))
@@ -1351,6 +1359,7 @@ fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, Pa
             commands,
             identity,
             source: RecordSource::Link,
+            provenance: PackageProvenance::Local,
             index: None,
         })));
     };
@@ -1363,6 +1372,7 @@ fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, Pa
         identity,
         authority: Authority::Local,
         source: RecordSource::Link,
+        provenance: PackageProvenance::Local,
         catalog: None,
         index: None,
     })))
@@ -1374,6 +1384,7 @@ struct Install {
     digest: PackageDigest,
     identity: PackageIdentity,
     source: RecordSource,
+    provenance: PackageProvenance,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
     /// The plugin index that authorized the package, recorded before the
@@ -1403,6 +1414,7 @@ fn commit_candidate(
                 digest: prepared.digest,
                 identity: prepared.identity,
                 source: prepared.source,
+                provenance: prepared.provenance,
                 catalog: None,
                 index: prepared.index,
                 integration: Integration::Known(None),
@@ -1439,6 +1451,7 @@ fn commit_install(
             digest: prepared.digest,
             identity: prepared.identity,
             source: prepared.source,
+            provenance: prepared.provenance,
             catalog: prepared.catalog,
             index: prepared.index,
         },
@@ -1474,6 +1487,7 @@ fn refuse_loader_rejection(
 
 /// Records the package and rebuilds the runtime registry; a dry run stops
 /// before the first write.
+#[allow(clippy::too_many_lines, reason = "one install path")]
 fn install_package(
     context: &Context,
     install: Install,
@@ -1485,6 +1499,7 @@ fn install_package(
         digest,
         identity,
         source,
+        provenance,
         catalog,
         index,
         integration,
@@ -1563,6 +1578,7 @@ fn install_package(
             expected: &digest,
             identity,
             source,
+            provenance,
             enabled: plan.enable,
             select,
             installed_at_unix_seconds: now,
@@ -1595,27 +1611,20 @@ fn install_package(
     })
 }
 
-/// Refuses a local (digest/link) package in the official runtime namespace
-/// when the accumulated reserved runtime ids cover its runtime id.
+/// Refuses a local (digest/link) package whose declared runtime id was
+/// reserved by a verified official index.
 ///
-/// Only data drives this refusal: the documented Pi `--sha256` flow works
-/// until a verified official index has listed `pohunek.runtime.pi`, after
-/// which the id is reserved. The compiled floor (shell, codex, claude,
-/// hermes) is refused by `LocalTrust` independently of any stored index.
+/// The check is data-driven only: the runtime id the descriptor declares
+/// must be in the accumulated `reserved_runtime_ids`. The package id is
+/// irrelevant, so the guard cannot be bypassed by renaming the package
+/// (Scenario 6). The compiled floor (`shell`, `codex`, `claude`, `hermes`)
+/// is refused by `LocalTrust` independently of any stored index; the Pi
+/// `--sha256` flow works until a verified index has listed `pi`.
 fn refuse_official_namespace(
     context: &Context,
     package_id: &PackageId,
     runtime_id: &protocol::RuntimeId,
 ) -> Result<(), PackageErrorKind> {
-    let suffix = package_id
-        .as_str()
-        .strip_prefix(OFFICIAL_RUNTIME_PACKAGE_PREFIX);
-    let Some(suffix) = suffix else {
-        return Ok(());
-    };
-    if suffix != runtime_id.as_str() {
-        return Ok(());
-    }
     let state = context
         .store
         .registry()
@@ -1624,9 +1633,10 @@ fn refuse_official_namespace(
     if state.reserved_runtime_ids.contains(runtime_id) {
         warn!(
             package = %package_id,
-            "a local package in the official namespace was refused: its runtime id is reserved by a recorded index"
+            runtime_id = %runtime_id,
+            "a local package was refused: its runtime id is reserved by a recorded index"
         );
-        Err(PackageErrorKind::NamespaceReserved)
+        Err(PackageErrorKind::RuntimeNotClaimable)
     } else {
         Ok(())
     }
@@ -1652,9 +1662,7 @@ impl PackageService {
     ) -> Result<PluginIndexApplyResult, PackageErrorKind> {
         self.package_transaction(move |context, _retained| {
             let (anchor, endorser) = context.index_endorser().map_err(|error| match error {
-                PackageErrorKind::TrustUnavailable | PackageErrorKind::TrustAnchorInvalid => {
-                    PackageErrorKind::IndexChannelMissing
-                }
+                PackageErrorKind::TrustUnavailable => PackageErrorKind::IndexChannelMissing,
                 other => other,
             })?;
             let registry = context.store.registry();
@@ -1690,11 +1698,13 @@ impl PackageService {
                     envelope.schema_version
                 });
             let stored_at = unix_now()?;
-            registry
-                .store_index(schema_version, &verified, &bytes, stored_at)
-                .map_err(|error| registry_kind(&error))?;
+            // Marks first, like the install path: if record_index fails, the
+            // stored document must not become newer than the marks (L4).
             registry
                 .record_index(&verified)
+                .map_err(|error| registry_kind(&error))?;
+            registry
+                .store_index(schema_version, &verified, &bytes, stored_at)
                 .map_err(|error| registry_kind(&error))?;
             Ok(PluginIndexApplyResult {
                 sequence: verified.sequence(),

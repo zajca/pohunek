@@ -23,11 +23,14 @@ use persisted_shape::{
 use protocol::{PackageDigest, PackageId, PackageIdentity, PackageVersion};
 use serde_json::Value;
 
-use super::{PackageRecord, PackageSource, RegistryState, REGISTRY_SCHEMA};
+use super::{PackageProvenance, PackageRecord, PackageSource, RegistryState, REGISTRY_SCHEMA};
 use crate::manifest::ManifestDigest;
 
 /// Registry key and value snapshots by schema version.
-const SNAPSHOTS: &[(u32, &str)] = &[(1, include_str!("fixtures/registry-1.txt"))];
+const SNAPSHOTS: &[(u32, &str)] = &[
+    (1, include_str!("fixtures/registry-1.txt")),
+    (2, include_str!("fixtures/registry-2.txt")),
+];
 
 /// Leaf paths that hold digests, identifiers and versions.
 fn free_text() -> Vec<Vec<String>> {
@@ -58,6 +61,7 @@ fn record(byte: char, id: &str, source: PackageSource) -> PackageRecord {
             version: PackageVersion::parse("1.0.0").expect("package version"),
         },
         source,
+        provenance: PackageProvenance::Catalog,
         manifest: ManifestDigest::parse(&byte.to_string().repeat(64)).expect("manifest digest"),
         installed_at_unix_seconds: 1,
         enabled: true,
@@ -65,10 +69,16 @@ fn record(byte: char, id: &str, source: PackageSource) -> PackageRecord {
 }
 
 fn enums() -> Vec<EnumEntry> {
-    vec![EnumEntry {
-        paths: vec!["registry.packages[].source".to_owned()],
-        values: unit_values!(PackageSource: Official, ExplicitDigest, Link),
-    }]
+    vec![
+        EnumEntry {
+            paths: vec!["registry.packages[].source".to_owned()],
+            values: unit_values!(PackageSource: Official, ExplicitDigest, Link),
+        },
+        EnumEntry {
+            paths: vec!["registry.packages[].provenance".to_owned()],
+            values: unit_values!(PackageProvenance: Index, Catalog, Local),
+        },
+    ]
 }
 
 /// A record that names one package per source and selects the first.
@@ -105,11 +115,13 @@ fn assert_fields_are_reviewed(state: &RegistryState) {
         digest: _,
         identity: _,
         source,
+        provenance,
         manifest: _,
         installed_at_unix_seconds: _,
         enabled: _,
     } = &packages[0];
     let _: &PackageSource = source;
+    let _: &PackageProvenance = provenance;
 }
 
 fn registry_shape() -> BTreeSet<String> {

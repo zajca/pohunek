@@ -812,7 +812,9 @@ fn install_acme_version(
     version: &str,
     select: bool,
 ) -> protocol::PackageDigest {
-    use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
+    use package::registry::{
+        InstallRequest, PackageProvenance, PackageSource as InstallSource, Registry,
+    };
     use package::{build_archive, read_archive, ArchiveEntry, Limits};
 
     let entries = [
@@ -844,6 +846,7 @@ fn install_acme_version(
                 version: protocol::PackageVersion::parse(version).expect("package version"),
             },
             source: InstallSource::ExplicitDigest,
+            provenance: PackageProvenance::Local,
             enabled: true,
             select,
             installed_at_unix_seconds: 1_700_000_000,

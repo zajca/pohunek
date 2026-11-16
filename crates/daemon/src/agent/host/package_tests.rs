@@ -6,7 +6,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
-use package::registry::{InstallRequest, PackageSource as InstallSource, Registry, RegistryError};
+use package::registry::{
+    InstallRequest, PackageProvenance, PackageSource as InstallSource, Registry, RegistryError,
+};
 use package::verify::VerifyError;
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
 use protocol::{
@@ -191,6 +193,11 @@ fn install_from(
             expected: &built.digest,
             identity: built.identity.clone(),
             source,
+            provenance: if matches!(source, InstallSource::Official) {
+                PackageProvenance::Catalog
+            } else {
+                PackageProvenance::Local
+            },
             enabled,
             select,
             installed_at_unix_seconds: INSTALLED_AT,

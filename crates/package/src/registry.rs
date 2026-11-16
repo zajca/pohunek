@@ -52,8 +52,10 @@ const LOCK_NAME: &str = "registry.lock";
 /// Name of the directory that holds the package roots.
 const PACKAGES_DIR: &str = "packages";
 
-/// Schema version of the registry record this crate reads and writes.
-const REGISTRY_SCHEMA: u32 = 1;
+/// Schema version of the registry record this crate writes.
+const REGISTRY_SCHEMA: u32 = 2;
+/// Previous schema this crate still reads, upgrading every record by source.
+const REGISTRY_SCHEMA_V1: u32 = 1;
 
 /// Largest accepted registry record: 1 MiB.
 ///
@@ -87,13 +89,31 @@ pub fn files_path(root: &Path, digest: &PackageDigest) -> PathBuf {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PackageSource {
-    /// Authorized through the signed official catalog.
+    /// Authorized through the signed official catalog or the plugin index.
     Official,
     /// Installed from an archive the owner pinned by digest: local third-party
     /// trust only.
     ExplicitDigest,
     /// Copied from a developer directory with `link`.
     Link,
+}
+
+/// How an installed package was authorized, for doctor provenance checks.
+///
+/// The registry schema 2 field every record carries. Schema 1 records have
+/// none; they upgrade by source (`Official` to `catalog`, the rest to
+/// `local`) and never to `index`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, Ord, PartialOrd)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PackageProvenance {
+    /// Authorized by the plugin index (`plugin.index.apply` stored copy or
+    /// a staged index install).
+    Index,
+    /// Authorized by the signed release catalog.
+    Catalog,
+    /// Local trust: an explicit digest or a linked developer directory.
+    Local,
 }
 
 /// One installed package.
@@ -103,9 +123,40 @@ pub struct PackageRecord {
     digest: PackageDigest,
     identity: PackageIdentity,
     source: PackageSource,
+    provenance: PackageProvenance,
     manifest: ManifestDigest,
     installed_at_unix_seconds: u64,
     enabled: bool,
+}
+
+/// Schema 1 record: no provenance field. Upgraded by source on read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PackageRecordV1 {
+    digest: PackageDigest,
+    identity: PackageIdentity,
+    source: PackageSource,
+    manifest: ManifestDigest,
+    installed_at_unix_seconds: u64,
+    enabled: bool,
+}
+
+impl PackageRecordV1 {
+    fn into_record(self) -> PackageRecord {
+        let provenance = match self.source {
+            PackageSource::Official => PackageProvenance::Catalog,
+            _ => PackageProvenance::Local,
+        };
+        PackageRecord {
+            digest: self.digest,
+            identity: self.identity,
+            source: self.source,
+            provenance,
+            manifest: self.manifest,
+            installed_at_unix_seconds: self.installed_at_unix_seconds,
+            enabled: self.enabled,
+        }
+    }
 }
 
 impl PackageRecord {
@@ -125,6 +176,12 @@ impl PackageRecord {
     #[must_use]
     pub fn source(&self) -> PackageSource {
         self.source
+    }
+
+    /// Whether the index, the catalog, or local trust authorized it.
+    #[must_use]
+    pub fn provenance(&self) -> PackageProvenance {
+        self.provenance
     }
 
     /// Digest of the manifest recorded at install time.
@@ -154,6 +211,32 @@ pub struct RegistryState {
     generation: u64,
     packages: Vec<PackageRecord>,
     selected: BTreeMap<PackageId, PackageDigest>,
+}
+
+/// Schema 1 registry: packages without provenance. Upgraded by source.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryStateV1 {
+    #[allow(dead_code, reason = "schema is checked before this struct is used")]
+    schema: u32,
+    generation: u64,
+    packages: Vec<PackageRecordV1>,
+    selected: BTreeMap<PackageId, PackageDigest>,
+}
+
+impl RegistryStateV1 {
+    fn into_state(self) -> RegistryState {
+        RegistryState {
+            schema: REGISTRY_SCHEMA,
+            generation: self.generation,
+            packages: self
+                .packages
+                .into_iter()
+                .map(PackageRecordV1::into_record)
+                .collect(),
+            selected: self.selected,
+        }
+    }
 }
 
 impl RegistryState {
@@ -346,6 +429,10 @@ pub enum RegistryError {
     /// [`Registry::uninstall`] removes such a package.
     #[error("the package root verifies; use uninstall")]
     RootIntact,
+    /// Recording the index would exceed the reserved runtime id limit or
+    /// the persisted state size; nothing was written.
+    #[error("the index state would exceed the reserved runtime id limit")]
+    TooManyReservedRuntimeIds,
     /// Recording the catalog would exceed [`crate::MAX_REVOKED_KEYS`]
     /// persisted revoked key ids; nothing was written.
     #[error("the catalog state would exceed the revoked key limit")]
@@ -385,6 +472,8 @@ pub struct InstallRequest<'a> {
     pub identity: PackageIdentity,
     /// How the package was authorized.
     pub source: PackageSource,
+    /// Whether the index, the catalog, or local trust authorized it.
+    pub provenance: PackageProvenance,
     /// Whether the package starts enabled.
     pub enabled: bool,
     /// Whether the package becomes the selected one for its id.
@@ -577,6 +666,7 @@ impl Registry {
             digest,
             identity: request.identity.clone(),
             source: request.source,
+            provenance: request.provenance,
             manifest: installation.root.manifest_digest().clone(),
             installed_at_unix_seconds: request.installed_at_unix_seconds,
             enabled: request.enabled,
@@ -929,6 +1019,15 @@ fn parse_state(bytes: &[u8]) -> Result<RegistryState, RegistryError> {
         schema: u32,
     }
     let header: Header = serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
+    if header.schema == REGISTRY_SCHEMA_V1 {
+        let v1: RegistryStateV1 =
+            serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
+        let state = v1.into_state();
+        if state.validate() {
+            return Ok(state);
+        }
+        return Err(RegistryError::Corrupt);
+    }
     if header.schema != REGISTRY_SCHEMA {
         return Err(RegistryError::UnsupportedSchema);
     }

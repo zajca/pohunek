@@ -82,8 +82,6 @@ fn capabilities() -> HostCapabilities {
         package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
         package_index_apply_supported: false,
-        runtime_api: None,
-        runtime_features: Vec::new(),
         session_new_branch_source_supported: true,
         session_new_agent_options_supported: true,
         host_hooks: None,

@@ -450,13 +450,11 @@ pub(crate) async fn resolve(
 ///
 /// Returns the first failed step as an [`Error`]; nothing is sent to the
 /// daemon by this function.
-pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
-    let client = client()?;
-    let selection = select_entry(&client, request, index_url).await?;
+async fn stage_from_selection(client: &Client, selection: Selection) -> Result<Staged, Error> {
     let resolved = selection.resolved();
     let Selection { index_bytes, entry } = selection;
     let archive_url = checked_url(&entry.url)?;
-    let archive = fetch(&client, &archive_url, Download::Archive).await?;
+    let archive = fetch(client, &archive_url, Download::Archive).await?;
     let actual = archive_digest(&archive).map_err(|_error| Error::ArchiveDigestMismatch {
         expected: resolved.digest.as_str().to_owned(),
         actual: "unreadable".to_owned(),
@@ -480,6 +478,33 @@ pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Resu
         archive_path,
         index_path,
     })
+}
+
+/// Stage the archive for `request` from the stored index copy, with no index
+/// fetch. Fails when nothing usable is stored or the package is not listed.
+pub(crate) async fn stage_from_stored(request: &PackageRef) -> Result<Staged, Error> {
+    let client = client()?;
+    let stored = read_stored().ok_or(Error::IndexInvalid {
+        detail: "no stored index document to install from".to_owned(),
+    })?;
+    let selection = select_from_bytes(&stored.bytes, request)?;
+    stage_from_selection(&client, selection).await
+}
+
+pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
+    let client = client()?;
+    let selection = match select_entry(&client, request, index_url).await {
+        Ok(s) => s,
+        Err(fetch_err) => {
+            // Fetch failed: fall back to the stored unexpired copy when it
+            // lists the package, else surface the fetch error (M2).
+            let Some(stored) = read_stored() else {
+                return Err(fetch_err);
+            };
+            select_from_bytes(&stored.bytes, request)?
+        }
+    };
+    stage_from_selection(&client, selection).await
 }
 
 fn staging_failed(error: &std::io::Error) -> Error {
@@ -567,4 +592,57 @@ pub(crate) struct StagedOfficial {
 pub(crate) fn stored_is_fresh() -> bool {
     let Some(at) = stored_at() else { return false };
     unix_now().saturating_sub(at) <= STORED_INDEX_MAX_AGE
+}
+
+#[derive(Debug)]
+struct StoredEntry {
+    bytes: Vec<u8>,
+    stored_at: u64,
+}
+
+fn read_stored() -> Option<StoredEntry> {
+    let plugins = crate::paths::Paths::plugins_dir().ok()?;
+    let index_dir = plugins.join("index");
+    let sidecar = index_dir.join("stored.json");
+    let raw = std::fs::read(&sidecar).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let mut best: Option<StoredEntry> = None;
+    for (key, file_name) in [
+        ("official-v1", "official-v1.json"),
+        ("official-v2", "official-v2.json"),
+    ] {
+        let Some(at) = value.get(key).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let bytes = std::fs::read(index_dir.join(file_name)).ok()?;
+        let envelope = parse_index_envelope(&bytes).ok()?;
+        if unix_now() >= envelope.index.expires_at {
+            continue;
+        }
+        if best.as_ref().is_none_or(|s| at > s.stored_at) {
+            best = Some(StoredEntry {
+                bytes,
+                stored_at: at,
+            });
+        }
+    }
+    best
+}
+
+fn select_from_bytes(bytes: &[u8], request: &PackageRef) -> Result<Selection, Error> {
+    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
+        detail: "this build has no semantic version to match entries against".to_owned(),
+    })?;
+    let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
+    let envelope = parse_index_envelope(bytes).map_err(|error| Error::IndexInvalid {
+        detail: error.to_string(),
+    })?;
+    if unix_now() >= envelope.index.expires_at {
+        return Err(Error::IndexExpired);
+    }
+    let entry = select(&envelope.index.entries, request, &core, &platform)?.clone();
+    Ok(Selection {
+        index_bytes: bytes.to_vec(),
+        entry,
+    })
 }

@@ -415,8 +415,6 @@ fn capability_snapshot(
         package_install_index_supported: false,
         package_install_index_context_supported: false,
         package_index_apply_supported: false,
-        runtime_api: Some(crate::agent::host::SUPPORTED_RUNTIME_API),
-        runtime_features: crate::agent::host::feature_names(),
         package_bind_profile_expected_supported: true,
         package_create_profile_supported: true,
         package_create_profile_options_supported: true,

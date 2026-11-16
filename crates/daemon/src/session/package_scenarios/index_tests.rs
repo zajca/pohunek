@@ -1159,6 +1159,234 @@ async fn a_host_without_a_channel_refuses_index_installs_and_keeps_catalog_insta
 }
 
 #[tokio::test]
+async fn scenario_1_apply_stores_and_registers_reserved() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-1");
+    let sequence = now();
+    let package = idxfix("1.0.0");
+    let path = fixture.write(
+        "index.json",
+        &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
+    );
+    let result = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path })
+        .await
+        .expect("apply");
+    assert_eq!(result.sequence, sequence);
+    assert_eq!(result.entries, 1);
+    assert_eq!(index_state(&fixture).index_high_water, Some(sequence));
+}
+
+#[tokio::test]
+async fn scenario_2_rollback_leaves_stored_bytes_identical() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-2");
+    let sequence = now();
+    let package = idxfix("1.0.0");
+    let doc = keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]);
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write("a.json", &doc),
+        })
+        .await
+        .expect("apply");
+    let registry = Registry::open_at(&fixture.plugins, Limits::DEFAULT).expect("registry");
+    let before = registry
+        .stored_index(1)
+        .expect("stored")
+        .expect("present")
+        .bytes;
+    let low = keys.signed(sequence - 5, vec![idxfix_entry(&package, "1.0.0")]);
+    let err = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write("b.json", &low),
+        })
+        .await
+        .expect_err("rollback");
+    assert_eq!(err, PackageErrorKind::IndexRollback);
+    let after = Registry::open_at(&fixture.plugins, Limits::DEFAULT)
+        .expect("registry")
+        .stored_index(1)
+        .expect("stored")
+        .expect("present")
+        .bytes;
+    assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn scenario_5_index_origin_provenance_not_catalog() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-5");
+    let sequence = now();
+    let v1 = idxfix("1.0.0");
+    let doc = keys.signed(sequence, vec![idxfix_entry(&v1, "1.0.0")]);
+    fixture
+        .registry
+        .packages()
+        .package_install(index_install(&fixture, &v1, &doc, false))
+        .await
+        .expect("install");
+    let registry = Registry::open_at(&fixture.plugins, Limits::DEFAULT).expect("registry");
+    let state = registry.state().expect("state");
+    let rec = state
+        .packages()
+        .iter()
+        .find(|r| r.digest() == &v1.digest)
+        .expect("record");
+    assert_eq!(
+        rec.provenance(),
+        package::registry::PackageProvenance::Index
+    );
+}
+
+#[tokio::test]
+async fn scenario_6_guard_blocks_renamed_ids() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-6");
+    let sequence = now();
+    let listed = Package::build("pohunek.runtime.aurora", "1.0.0", "aurora", INERT_PROGRAM);
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write(
+                "i.json",
+                &keys.signed(
+                    sequence,
+                    vec![index_entry(
+                        &listed,
+                        "pohunek.runtime.aurora",
+                        "aurora",
+                        "1.0.0",
+                    )],
+                ),
+            ),
+        })
+        .await
+        .expect("apply");
+    for id in ["community.aurora", "pohunek.runtime.foo"] {
+        let pkg = Package::build(id, "1.0.0", "aurora", INERT_PROGRAM);
+        let err = fixture
+            .registry
+            .packages()
+            .package_install(PackageInstallParams {
+                archive_path: fixture.write_archive(&pkg),
+                trust: PackageTrust::ExplicitDigest {
+                    digest: pkg.digest.clone(),
+                },
+                enable: true,
+                select: true,
+                dry_run: false,
+                accept_commands: false,
+            })
+            .await
+            .expect_err("reserved runtime must be refused");
+        assert_eq!(err, PackageErrorKind::RuntimeNotClaimable, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn scenario_7_damaged_sidecar_is_replaced_by_refresh() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-7");
+    let seq = now();
+    let pkg = idxfix("1.0.0");
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write(
+                "a.json",
+                &keys.signed(seq, vec![idxfix_entry(&pkg, "1.0.0")]),
+            ),
+        })
+        .await
+        .expect("apply");
+    std::fs::write(
+        fixture.plugins.join("index").join("stored.json"),
+        b"corrupt",
+    )
+    .expect("corrupt");
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write(
+                "b.json",
+                &keys.signed(seq, vec![idxfix_entry(&pkg, "1.0.0")]),
+            ),
+        })
+        .await
+        .expect("repair");
+    let stored = Registry::open_at(&fixture.plugins, Limits::DEFAULT)
+        .expect("registry")
+        .stored_index(1)
+        .expect("stored")
+        .expect("present");
+    assert!(stored.stored_at > 0);
+}
+
+#[tokio::test]
+async fn scenario_7_expired_document_refused_at_apply() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-7-expired");
+    let past = now().saturating_sub(30 * DAY);
+    let pkg = idxfix("1.0.0");
+    let expired = keys.signed(past, vec![idxfix_entry(&pkg, "1.0.0")]);
+    let err = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write("old.json", &expired),
+        })
+        .await
+        .expect_err("expired");
+    assert!(matches!(err, PackageErrorKind::IndexExpired), "{err:?}");
+}
+
+#[tokio::test]
+async fn scenario_8_catalog_install_with_stored_index_present() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-8");
+    let seq = now();
+    let pkg = idxfix("1.0.0");
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write(
+                "i.json",
+                &keys.signed(seq, vec![idxfix_entry(&pkg, "1.0.0")]),
+            ),
+        })
+        .await
+        .expect("apply");
+    let catalog_package = Package::pi();
+    let catalog_document = signed_by(
+        &keys.root,
+        catalog(5, vec![entry(&catalog_package, PACKAGE, RUNTIME, "1.0.0")]),
+    );
+    let installed = fixture
+        .registry
+        .packages()
+        .package_install(catalog_install(
+            &fixture,
+            &catalog_package,
+            &catalog_document,
+            false,
+        ))
+        .await
+        .expect("catalog");
+    assert_eq!(installed.package.origin, PackageOrigin::Official);
+}
+
+#[tokio::test]
 async fn plugin_index_apply_stores_and_accumulates_reserved_ids() {
     let keys = Keys::new();
     let fixture = keys.fixture("apply-stores");
@@ -1243,5 +1471,5 @@ async fn namespace_guard_data_driven_both_sides() {
         })
         .await
         .expect_err("after admission");
-    assert_eq!(err, PackageErrorKind::NamespaceReserved);
+    assert_eq!(err, PackageErrorKind::RuntimeNotClaimable);
 }

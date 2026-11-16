@@ -1028,9 +1028,6 @@ pub enum PackageErrorKind {
     IndexRollback,
     /// The host has no stored plugin index to apply.
     IndexChannelMissing,
-    /// A local package claims a runtime id reserved by the stored official
-    /// index (official namespace `pohunek.runtime.*`).
-    NamespaceReserved,
 }
 
 impl PackageErrorKind {
@@ -1084,7 +1081,6 @@ impl PackageErrorKind {
             Self::IndexExpired => "index_expired",
             Self::IndexRollback => "index_rollback",
             Self::IndexChannelMissing => "index_channel_missing",
-            Self::NamespaceReserved => "package_namespace_reserved",
         }
     }
 
@@ -1188,8 +1184,7 @@ impl PackageErrorKind {
             Self::IndexInvalid => "the plugin index is invalid or unverifiable",
             Self::IndexExpired => "the plugin index has expired",
             Self::IndexRollback => "the plugin index is older than the recorded one",
-            Self::IndexChannelMissing => "this host has no stored plugin index",
-            Self::NamespaceReserved => "install by id or from the release catalog",
+            Self::IndexChannelMissing => "this host has no plugin index channel file beside the daemon executable",
         }
     }
 
@@ -1275,7 +1270,6 @@ impl PackageErrorKind {
             Self::IndexInvalid => "stage a signed plugin index document and apply it again",
             Self::IndexExpired | Self::IndexRollback => "refresh the plugin index with `pohunek plugin index refresh`",
             Self::IndexChannelMissing => "run `pohunek plugin index refresh`, or install with an explicit digest instead",
-            Self::NamespaceReserved => "install by id or from the release catalog",
         }
     }
 

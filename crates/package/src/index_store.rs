@@ -15,11 +15,12 @@ use std::io::ErrorKind;
 use pohunek_platform::filesystem::FsError;
 use serde::{Deserialize, Serialize};
 
-use crate::layout::{DIRECTORY_MODE, FILE_MODE};
+use crate::layout::{COLLECT_PREFIX, DIRECTORY_MODE, FILE_MODE};
 use crate::plugin_index::{
     VerifiedIndex, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2, MAX_INDEX_BYTES,
 };
 use crate::registry::{registry_fs, replace_failure, Registry, RegistryError};
+use pohunek_platform::filesystem::{EntryKind, StageOutcome};
 
 /// Name of the stored-index directory inside the plugin root.
 const INDEX_DIR: &str = "index";
@@ -35,6 +36,12 @@ const STORED_SCHEMA: u32 = 1;
 const MAX_STORED_BYTES: usize = 4 * 1024;
 /// How many reserved ids accumulate in the index state.
 pub(crate) const MAX_RESERVED_RUNTIME_IDS: usize = 256;
+/// Maximum age of a stored index copy before the CLI refreshes it.
+pub const STORED_INDEX_MAX_AGE: u64 = 24 * 60 * 60;
+/// Sidecar key for the schema 1 document.
+pub const SIDECAR_KEY_V1: &str = "official-v1";
+/// Sidecar key for the schema 2 document.
+pub const SIDECAR_KEY_V2: &str = "official-v2";
 
 /// What `Registry` stored for one schema file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +80,17 @@ impl StoredIndex {
 #[serde(deny_unknown_fields)]
 struct StoredFile {
     schema: u32,
+    #[serde(
+        default,
+        rename = "official-v1",
+        skip_serializing_if = "Option::is_none"
+    )]
     official_v1: Option<u64>,
+    #[serde(
+        default,
+        rename = "official-v2",
+        skip_serializing_if = "Option::is_none"
+    )]
     official_v2: Option<u64>,
 }
 
@@ -134,7 +151,8 @@ impl Registry {
     /// `schema_version`, setting `stored_at`, under the registry lock.
     ///
     /// The caller must have verified the bytes and checked the rollback
-    /// against the persisted marks before calling; this only writes.
+    /// against the persisted marks before calling; this only writes. A
+    /// damaged sidecar is replaced by a valid refresh (scenario 7).
     pub fn store_index(
         &self,
         schema_version: u64,
@@ -155,7 +173,11 @@ impl Registry {
         dir.replace_file(file_name, DOC_TEMP_NAME, bytes, FILE_MODE)
             .map_err(replace_failure)?;
         // Update the sidecar in the same lock hold.
-        let mut sidecar = Self::read_sidecar(&dir)?;
+        let mut sidecar = Self::read_sidecar(&dir).unwrap_or(StoredFile {
+            schema: STORED_SCHEMA,
+            official_v1: None,
+            official_v2: None,
+        });
         match file_name {
             "official-v2.json" => sidecar.official_v2 = Some(stored_at),
             _ => sidecar.official_v1 = Some(stored_at),
@@ -173,8 +195,14 @@ impl Registry {
     }
 
     fn remove_stale_temporary_in(dir: &pohunek_platform::filesystem::TrustedDir, name: &str) {
-        // replace_file creates its temp exclusively; a stale temp from a
-        // stopped writer is left for the next attempt to fail closed.
-        let _ = (dir.path(), name);
+        // Same rule as the other registry files: a writer stopped before
+        // the rename leaves an exclusively-created temp that would wedge
+        // every later replace; remove it best-effort under the lock.
+        let Ok(Some(identity)) = dir.entry_identity(name, EntryKind::RegularFile) else {
+            return;
+        };
+        if let Ok(StageOutcome::Staged(entry)) = dir.stage_random(name, COLLECT_PREFIX, identity) {
+            let _ = entry.remove();
+        }
     }
 }

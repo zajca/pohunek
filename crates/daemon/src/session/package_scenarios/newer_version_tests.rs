@@ -1387,6 +1387,11 @@ fn seed_record(
             expected: &package.digest,
             identity,
             source,
+            provenance: if matches!(source, package::registry::PackageSource::Official) {
+                package::registry::PackageProvenance::Catalog
+            } else {
+                package::registry::PackageProvenance::Local
+            },
             enabled: true,
             select: false,
             installed_at_unix_seconds: 1,

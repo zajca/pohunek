@@ -393,7 +393,9 @@ fn official_definition(official: &OfficialPackage) -> RuntimeDefinition {
 /// Panics when a package cannot be built or installed, which would be a
 /// defect of the fixture.
 pub(crate) fn install_official_packages(plugins_dir: &Path) {
-    use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
+    use package::registry::{
+        InstallRequest, PackageProvenance, PackageSource as InstallSource, Registry,
+    };
     use package::{build_archive, read_archive, Limits};
 
     let registry = Registry::open_at(plugins_dir, Limits::DEFAULT).expect("the plugin root opens");
@@ -419,6 +421,7 @@ pub(crate) fn install_official_packages(plugins_dir: &Path) {
                 expected: &digest,
                 identity: package,
                 source: InstallSource::Official,
+                provenance: PackageProvenance::Catalog,
                 enabled: true,
                 select: true,
                 installed_at_unix_seconds: INSTALLED_AT_UNIX_SECONDS,
@@ -1125,7 +1128,9 @@ fn install_document(
     detect: &str,
     select: bool,
 ) -> PackageDigest {
-    use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
+    use package::registry::{
+        InstallRequest, PackageProvenance, PackageSource as InstallSource, Registry,
+    };
     use package::{build_archive, read_archive, ArchiveEntry, Limits};
 
     let document = document
@@ -1161,6 +1166,7 @@ fn install_document(
                 version: protocol::PackageVersion::parse(version).expect("package version"),
             },
             source: InstallSource::ExplicitDigest,
+            provenance: PackageProvenance::Local,
             enabled: true,
             select,
             installed_at_unix_seconds: INSTALLED_AT_UNIX_SECONDS,

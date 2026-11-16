@@ -229,7 +229,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use package::registry::{InstallRequest, PackageSource};
+    use package::registry::{InstallRequest, PackageProvenance, PackageSource};
     use package::{build_archive, read_archive, ArchiveEntry, Limits};
 
     use super::*;
@@ -320,6 +320,7 @@ mod tests {
                         .expect("version"),
                     },
                     source: PackageSource::ExplicitDigest,
+                    provenance: PackageProvenance::Local,
                     enabled: true,
                     select: false,
                     installed_at_unix_seconds: 1,

@@ -75,13 +75,6 @@ pub(crate) enum Action {
         sub: IndexAction,
     },
 
-    /// Show the daemon's compatibility report.
-    Compat {
-        /// Emit machine-readable JSON instead of text.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Show one installed package: its record, health, and the runtime it declares.
     ///
     /// With several installed versions and no `--digest` or `--version`, the
@@ -193,8 +186,7 @@ impl Action {
             | Self::Select { json, .. }
             | Self::Enable { json, .. }
             | Self::Disable { json, .. }
-            | Self::Doctor { json, .. }
-            | Self::Compat { json } => *json,
+            | Self::Doctor { json, .. } => *json,
             Self::Profile { action } => action.wants_json(),
             Self::Install(args) => args.json,
             Self::Link(args) => args.json,
@@ -314,18 +306,14 @@ pub(crate) struct InstallArgs {
 /// `pohunek plugin index` subcommands.
 #[derive(Debug, Subcommand)]
 pub(crate) enum IndexAction {
-    /// Refresh the stored official plugin index.
+    /// Fetch the official plugin index and store it on the daemon.
     ///
-    /// The stored copy is refreshed only when it is older than 24 hours; a
-    /// fresh copy is reported unchanged. Fetching and verification happen
-    /// here: the daemon stores the exact bytes and re-verifies them.
+    /// Fetching and verification happen here: the daemon stores the exact
+    /// bytes it staged and re-verifies them.
     Refresh {
         /// Plugin index to fetch instead of the official one.
         #[arg(long, value_name = "URL")]
         index_url: Option<String>,
-        /// Force a refresh even when the stored copy is fresh.
-        #[arg(long)]
-        force: bool,
         /// Emit machine-readable JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -352,12 +340,9 @@ pub(crate) struct UpdateArgs {
     /// Installed package to update.
     #[arg(value_name = "PACKAGE")]
     package: PackageId,
-    /// Archive holding the new version. Omit to update by id through the
-    /// plugin index.
+    /// Archive holding the new version.
     #[arg(value_name = "ARCHIVE", value_hint = ValueHint::FilePath)]
-    archive: Option<PathBuf>,
-    #[arg(long, value_name = "URL")]
-    index_url: Option<String>,
+    archive: PathBuf,
     #[command(flatten)]
     trust: TrustArgs,
     /// Consent to the update after reviewing what the package declares.
@@ -518,7 +503,10 @@ pub(crate) enum Error {
 
     /// The daemon cannot authorize installs through a plugin index.
     #[error("the daemon does not support installs through a plugin index")]
-    IndexUnsupported,
+    IndexUnsupported {
+        /// The capability the daemon did not report.
+        capability: &'static str,
+    },
 
     /// The daemon authorizes runtime packages through a plugin index but not
     /// context packages (index schema 2).
@@ -758,7 +746,7 @@ impl Error {
             Self::DownloadTooLarge { .. } => "plugin_download_too_large",
             Self::IndexUnavailable { .. } => "plugin_index_unavailable",
             Self::ArchiveUnavailable { .. } => "plugin_archive_unavailable",
-            Self::IndexUnsupported => "plugin_index_unsupported",
+            Self::IndexUnsupported { .. } => "plugin_index_unsupported",
             Self::IndexContextUnsupported => "plugin_index_context_unsupported",
             Self::IndexInvalid { .. } => "plugin_index_invalid",
             Self::IndexExpired => "plugin_index_expired",
@@ -820,7 +808,7 @@ impl Error {
             Self::IndexUnavailable { .. } | Self::ArchiveUnavailable { .. } => {
                 "check the network and the URL, then retry; nothing was sent to the daemon"
             }
-            Self::IndexUnsupported => {
+            Self::IndexUnsupported { .. } => {
                 "the daemon is older than 0.40 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog"
             }
             Self::IndexContextUnsupported => {
@@ -1062,7 +1050,6 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
         }
         Action::Uninstall(args) => run_uninstall(&args).await?,
         Action::Index { sub } => run_index(sub).await?,
-        Action::Compat { json } => run_compat(json).await?,
         Action::Profile { action } => plugin_profile::run(action).await?,
         Action::Doctor { package, json } => {
             let mut client = connect().await?;
@@ -1107,11 +1094,7 @@ async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
 }
 
 /// Refresh the stored index now (best effort: failure keeps the old copy).
-async fn refresh_now(
-    client: &mut Client,
-    index_url: Option<&str>,
-    _force: bool,
-) -> Result<(), CliError> {
+async fn refresh_now(client: &mut Client, index_url: Option<&str>) -> Result<(), CliError> {
     let context = client
         .host_inspect_with(protocol::HostInspectParams {
             skip_runtime_probes: Some(true),
@@ -1152,11 +1135,22 @@ async fn run_install_by_id(
     {
         require_index_context_support(&mut client).await?;
     }
-    // 24h cadence: use the stored copy when fresh, else refresh first.
+    // 24h cadence: a fresh stored copy is used without fetching. When the
+    // stored copy is stale or missing, refresh first; a failed refresh
+    // falls back to the unexpired stored copy inside stage itself (M2).
+    // The daemon verifies the staged bytes, so an unverified stored copy
+    // cannot install anything.
     if !plugin_index::stored_is_fresh() {
-        let _ = refresh_now(&mut client, args.index_url.as_deref(), false).await;
+        let _ = refresh_now(&mut client, args.index_url.as_deref()).await;
     }
-    let staged = plugin_index::stage(&request, args.index_url.as_deref()).await?;
+    let staged = if plugin_index::stored_is_fresh() {
+        match plugin_index::stage_from_stored(&request).await {
+            Ok(staged) => staged,
+            Err(_) => plugin_index::stage(&request, args.index_url.as_deref()).await?,
+        }
+    } else {
+        plugin_index::stage(&request, args.index_url.as_deref()).await?
+    };
     let source = Source::Archive {
         path: staged.archive_path.clone(),
         trust: PackageTrust::Index {
@@ -1211,7 +1205,10 @@ async fn require_index_support(client: &mut Client) -> Result<(), CliError> {
     {
         Ok(())
     } else {
-        Err(Error::IndexUnsupported.into())
+        Err(Error::IndexUnsupported {
+            capability: "package_install_index_supported",
+        }
+        .into())
     }
 }
 
@@ -1259,9 +1256,7 @@ async fn run_link(args: &LinkArgs) -> Result<(), CliError> {
 
 /// Refresh the stored official plugin index (24h cadence).
 async fn run_index(action: IndexAction) -> Result<(), CliError> {
-    let IndexAction::Refresh {
-        index_url, json, ..
-    } = action;
+    let IndexAction::Refresh { index_url, json } = action;
     let mut client = connect_ingest().await?;
     require_apply_support(&mut client).await?;
     let context = client
@@ -1300,32 +1295,18 @@ async fn require_apply_support(client: &mut Client) -> Result<(), CliError> {
     {
         Ok(())
     } else {
-        Err(Error::IndexUnsupported.into())
+        Err(Error::IndexUnsupported {
+            capability: "package_index_apply_supported",
+        }
+        .into())
     }
 }
 
 async fn run_update(args: &UpdateArgs) -> Result<(), CliError> {
     let mut client = connect_ingest().await?;
-    require_index_support(&mut client).await?;
-    // Update by id when no archive is given: resolve through the index.
-    let staged;
-    let source = if let Some(archive) = &args.archive {
-        Source::Archive {
-            path: canonical_path(archive, "file", Path::is_file)?,
-            trust: trust(&args.trust)?,
-        }
-    } else {
-        let request = PackageRef {
-            id: args.package.clone(),
-            version: None,
-        };
-        staged = plugin_index::stage(&request, args.index_url.as_deref()).await?;
-        Source::Archive {
-            path: staged.archive_path.clone(),
-            trust: PackageTrust::Index {
-                index_path: staged.index_path.clone(),
-            },
-        }
+    let source = Source::Archive {
+        path: canonical_path(&args.archive, "file", Path::is_file)?,
+        trust: trust(&args.trust)?,
     };
     require_index_support_for(&mut client, &source).await?;
     ingest_package(
@@ -1338,23 +1319,6 @@ async fn run_update(args: &UpdateArgs) -> Result<(), CliError> {
         args.json,
     )
     .await
-}
-
-async fn run_compat(json: bool) -> Result<(), CliError> {
-    let mut client = connect().await?;
-    let caps = client
-        .host_inspect_with(protocol::HostInspectParams {
-            skip_runtime_probes: Some(true),
-        })
-        .await?;
-    let out = serde_json::json!({
-        "core_version": caps.daemon_version,
-        "runtime_api": caps.runtime_api,
-        "runtime_features": caps.runtime_features,
-    });
-    let _ = json;
-    println!("{out}");
-    Ok(())
 }
 
 async fn run_inspect(selector: &SelectorArgs, json: bool) -> Result<(), CliError> {

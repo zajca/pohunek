@@ -3928,8 +3928,6 @@ fn host_capabilities_json_shape_roundtrips() {
         package_remove_profile_supported: true,
         integration_agent_skill_supported: true,
         package_index_apply_supported: true,
-        runtime_api: Some(1),
-        runtime_features: vec!["package-commands-v1".to_owned()],
         host_hooks: None,
         session_new_skip_repo_hooks_supported: false,
     };
@@ -3978,9 +3976,7 @@ fn host_capabilities_json_shape_roundtrips() {
             "package_create_preset_supported": true,
             "package_remove_profile_supported": true,
             "integration_agent_skill_supported": true,
-            "package_index_apply_supported": true,
-            "runtime_api": 1,
-            "runtime_features": ["package-commands-v1"]
+            "package_index_apply_supported": true
         })
     );
 
