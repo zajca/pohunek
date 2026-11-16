@@ -15,7 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 
 const SCHEMA_20_SESSION: &str = include_str!("../src/store/fixtures/schema-20/metadata.jsonl");
 const SCHEMA_20_WORKTREE: &str = include_str!("../src/store/fixtures/schema-20/worktree.jsonl");
-const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-21/metadata.jsonl");
+const CURRENT_SCHEMA: &str = include_str!("../src/store/fixtures/schema-22/metadata.jsonl");
 
 fn fixture_store(root: &std::path::Path, contents: &str) -> Store {
     let path = root.join("metadata.jsonl");
