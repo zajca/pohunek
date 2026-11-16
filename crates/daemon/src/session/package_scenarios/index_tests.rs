@@ -1588,134 +1588,369 @@ async fn scenario_m5_doctor_damaged_state_is_index_state_unreadable() {
     assert!(detail.contains("--repair-state"), "{detail}");
 }
 
-/// N2 recovery: a damaged `index-state.json` refuses installs and a plain
-/// refresh with `package_index_state_unreadable`; `repair_state: true`
-/// moves the damaged file aside and re-derives marks as max(fetched,
-/// stored copy), after which a local install succeeds.
+/// Installs `package` under the owner's exact-digest trust.
+async fn install_local(fixture: &Fixture, package: &Package) -> Result<(), PackageErrorKind> {
+    fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(package),
+            trust: PackageTrust::ExplicitDigest {
+                digest: package.digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .map(|_report| ())
+}
+
+/// `plugin.index.apply` of `document`, with or without `repair_state`.
+async fn apply_document(
+    fixture: &Fixture,
+    document: &[u8],
+    repair_state: bool,
+) -> Result<protocol::PluginIndexApplyResult, PackageErrorKind> {
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write("apply.json", document),
+            repair_state,
+        })
+        .await
+}
+
+/// Replaces `index-state.json` with `bytes` at `mode`.
+fn plant_state(fixture: &Fixture, bytes: &[u8], mode: u32) {
+    let path = fixture.plugins.join("index-state.json");
+    std::fs::write(&path, bytes).expect("plant the state file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("state mode");
+}
+
+/// The preserved copies of a damaged state file: name and bytes.
+fn damaged_copies(fixture: &Fixture) -> Vec<(String, Vec<u8>)> {
+    let mut copies: Vec<_> = std::fs::read_dir(&fixture.plugins)
+        .expect("read the plugin root")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            name.starts_with("index-state.json.damaged-").then(|| {
+                let bytes = std::fs::read(entry.path()).expect("read a preserved copy");
+                (name, bytes)
+            })
+        })
+        .collect();
+    copies.sort();
+    copies
+}
+
+/// A document listing one runtime entry for `runtime`.
+fn runtime_document(keys: &Keys, sequence: u64, runtime: &str) -> Vec<u8> {
+    let listed = Package::build(
+        &format!("pohunek.runtime.{runtime}"),
+        "1.0.0",
+        runtime,
+        INERT_PROGRAM,
+    );
+    keys.signed(
+        sequence,
+        vec![index_entry(
+            &listed,
+            &format!("pohunek.runtime.{runtime}"),
+            runtime,
+            "1.0.0",
+        )],
+    )
+}
+
+/// N2 recovery, end to end: a damaged `index-state.json` refuses local
+/// installs and a plain refresh with `package_index_state_unreadable` and is
+/// left untouched; `repair_state` replaces it, keeps the damaged bytes beside
+/// it with the same mode, raises the marks to the fetched sequence, and the
+/// next local install succeeds.
 #[tokio::test]
 async fn scenario_n2_repair_state_replaces_damaged_file() {
     let keys = Keys::new();
     let fixture = keys.fixture("n2-repair-state");
-    let local = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
-    let digest = local.digest.clone();
-    fixture
-        .registry
-        .packages()
-        .package_install(PackageInstallParams {
-            archive_path: fixture.write_archive(&local),
-            trust: PackageTrust::ExplicitDigest {
-                digest: digest.clone(),
-            },
-            enable: true,
-            select: true,
-            dry_run: false,
-            accept_commands: false,
-        })
+    apply_document(
+        &fixture,
+        &runtime_document(&keys, now() - 100, "aurora"),
+        false,
+    )
+    .await
+    .expect("first apply stores a copy");
+    let damaged = b"{not json".to_vec();
+    plant_state(&fixture, &damaged, 0o600);
+
+    let fetched_sequence = now();
+    let document = runtime_document(&keys, fetched_sequence, "aurora");
+    let plain = apply_document(&fixture, &document, false)
         .await
-        .expect("local install");
-    // Apply a verified index so a stored copy exists with a known sequence.
-    let entry = idxfix_entry(&idxfix("1.0.0"), "1.0.0");
-    let sequence = now() - 100;
-    let _result = fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: fixture
-                .plugins
-                .join("apply-index.json")
-                .to_str()
-                .expect("path")
-                .to_owned(),
-            repair_state: false,
-        })
-        .await;
-    // (The staging file above does not exist; the apply fails harmlessly.
-    // We instead directly damage the state file and use repair on a
-    // real verified document below.)
-    let state_path = fixture.plugins.join("index-state.json");
-    std::fs::write(&state_path, b"{not json").expect("corrupt state");
-    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))
-        .expect("owner-private");
-    // Plain refresh must refuse with the specific code.
-    let _damaged_apply = fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: fixture
-                .plugins
-                .join("nonexistent.json")
-                .to_str()
-                .expect("path")
-                .to_owned(),
-            repair_state: false,
-        })
-        .await;
-    // A local install is fail-closed.
-    let second = Package::build("community.aurora", "1.1.0", "aurora", INERT_PROGRAM);
-    let err = fixture
-        .registry
-        .packages()
-        .package_install(PackageInstallParams {
-            archive_path: fixture.write_archive(&second),
-            trust: PackageTrust::ExplicitDigest {
-                digest: second.digest.clone(),
-            },
-            enable: true,
-            select: true,
-            dry_run: false,
-            accept_commands: false,
-        })
-        .await
-        .expect_err("fail-closed");
-    assert_eq!(err, PackageErrorKind::IndexStateUnreadable);
-    // The damaged file is still there (not deleted by the refusal).
-    assert!(state_path.exists());
-    // Repair: stage a verified document and apply with repair_state.
-    let repair_pkg = idxfix("1.0.0");
-    let document = keys.signed(now(), vec![idxfix_entry(&repair_pkg, "1.0.0")]);
-    let staged = fixture.write("repair-index.json", &document);
-    let result = fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: staged,
-            repair_state: true,
-        })
+        .expect_err("a plain refresh is refused");
+    assert_eq!(plain, PackageErrorKind::IndexStateUnreadable);
+    assert_eq!(
+        std::fs::read(fixture.plugins.join("index-state.json")).expect("state"),
+        damaged,
+        "a refused refresh leaves the damaged file in place"
+    );
+    assert!(damaged_copies(&fixture).is_empty());
+    let local = Package::build("community.dev", "1.0.0", "devrt", INERT_PROGRAM);
+    assert_eq!(
+        install_local(&fixture, &local)
+            .await
+            .expect_err("fail-closed"),
+        PackageErrorKind::IndexStateUnreadable
+    );
+
+    let result = apply_document(&fixture, &document, true)
         .await
         .expect("repair apply");
-    assert!(result.sequence > 0);
-    // Damaged file moved aside (fresh state file now exists at the path),
-    // fresh state readable.
-    let damaged_files: Vec<_> = std::fs::read_dir(&fixture.plugins)
-        .expect("read dir")
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_str().expect("name").to_owned())
-        .filter(|n| n.starts_with("index-state.json.damaged-"))
-        .collect();
+    assert_eq!(result.sequence, fetched_sequence);
+    let copies = damaged_copies(&fixture);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(copies[0].1, damaged, "the damaged bytes are preserved");
+    let mode = |name: &str| {
+        std::fs::metadata(fixture.plugins.join(name))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
     assert_eq!(
-        damaged_files.len(),
-        1,
-        "damaged file moved aside: {damaged_files:?}"
+        mode(&copies[0].0),
+        0o600,
+        "the preserved copy keeps its mode"
     );
-    // A new local install now succeeds.
-    let third = Package::build("community.aurora", "1.2.0", "aurora", INERT_PROGRAM);
-    fixture
-        .registry
-        .packages()
-        .package_install(PackageInstallParams {
-            archive_path: fixture.write_archive(&third),
-            trust: PackageTrust::ExplicitDigest {
-                digest: third.digest.clone(),
-            },
-            enable: true,
-            select: true,
-            dry_run: false,
-            accept_commands: false,
-        })
+    assert_eq!(mode("index-state.json"), 0o600);
+    assert_eq!(
+        index_state(&fixture).index_high_water,
+        Some(fetched_sequence)
+    );
+    install_local(&fixture, &local)
         .await
-        .expect("local install after repair");
-    let _ = entry;
-    let _ = sequence;
+        .expect("a local install succeeds after the repair");
+}
+
+/// M-e: a repair never accepts a document below the stored verified copy: the
+/// damaged file, the stored copy and the marks stay as they were.
+#[tokio::test]
+async fn scenario_n2_repair_refuses_a_document_below_the_stored_copy() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-repair-rollback");
+    let high = now();
+    apply_document(&fixture, &runtime_document(&keys, high, "aurora"), false)
+        .await
+        .expect("apply stores the high copy");
+    let stored_before = Registry::open_at(&fixture.plugins, Limits::DEFAULT)
+        .expect("registry")
+        .stored_index(INDEX_SCHEMA_VERSION)
+        .expect("stored")
+        .expect("present")
+        .bytes;
+    let damaged = b"{not json".to_vec();
+    plant_state(&fixture, &damaged, 0o600);
+
+    let error = apply_document(
+        &fixture,
+        &runtime_document(&keys, high - 50, "aurora"),
+        true,
+    )
+    .await
+    .expect_err("a lagging mirror is refused");
+    assert_eq!(error, PackageErrorKind::IndexRollback);
+    assert_eq!(
+        std::fs::read(fixture.plugins.join("index-state.json")).expect("state"),
+        damaged
+    );
+    assert!(damaged_copies(&fixture).is_empty());
+    let stored_after = Registry::open_at(&fixture.plugins, Limits::DEFAULT)
+        .expect("registry")
+        .stored_index(INDEX_SCHEMA_VERSION)
+        .expect("stored")
+        .expect("present")
+        .bytes;
+    assert_eq!(
+        stored_before, stored_after,
+        "the newer stored copy survives"
+    );
+}
+
+/// A repair keeps what the stored verified copy established: its reserved
+/// runtime ids stay reserved and the marks are the larger sequence.
+#[tokio::test]
+async fn scenario_n2_repair_keeps_the_stored_copys_reservations_and_marks() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-repair-union");
+    let stored_sequence = now() - 10;
+    apply_document(
+        &fixture,
+        &runtime_document(&keys, stored_sequence, "aurora"),
+        false,
+    )
+    .await
+    .expect("apply");
+    plant_state(&fixture, b"{not json", 0o600);
+    let fetched_sequence = now();
+    apply_document(
+        &fixture,
+        &runtime_document(&keys, fetched_sequence, "borealis"),
+        true,
+    )
+    .await
+    .expect("repair");
+    let state = index_state(&fixture);
+    assert_eq!(state.index_high_water, Some(fetched_sequence));
+    let reserved: Vec<_> = state
+        .reserved_runtime_ids
+        .iter()
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    assert_eq!(reserved, ["aurora", "borealis"]);
+    let local = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
+    assert_eq!(
+        install_local(&fixture, &local).await.expect_err("reserved"),
+        PackageErrorKind::RuntimeNotClaimable
+    );
+}
+
+/// A state file from a newer schema (after a downgrade) is repairable like a
+/// corrupt one, and refused without the flag.
+#[tokio::test]
+async fn scenario_n2_downgrade_schema_state_is_repairable() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-downgrade");
+    let document = runtime_document(&keys, now(), "aurora");
+    apply_document(&fixture, &document, false)
+        .await
+        .expect("apply");
+    plant_state(&fixture, br#"{"schema":99}"#, 0o600);
+    assert_eq!(
+        apply_document(&fixture, &document, false)
+            .await
+            .expect_err("refused"),
+        PackageErrorKind::IndexStateUnreadable
+    );
+    apply_document(&fixture, &document, true)
+        .await
+        .expect("repair");
+    assert_eq!(damaged_copies(&fixture).len(), 1);
+    assert!(index_state(&fixture).index_high_water.is_some());
+}
+
+/// A state file with the wrong mode is not repaired: apply and installs refuse
+/// with `package_index_state_unreadable`, never `package_registry_failed`, and
+/// the file is untouched.
+#[tokio::test]
+async fn scenario_n2_unsafe_state_is_refused_and_never_repaired() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-unsafe");
+    let document = runtime_document(&keys, now(), "aurora");
+    apply_document(&fixture, &document, false)
+        .await
+        .expect("apply");
+    let path = fixture.plugins.join("index-state.json");
+    let before = std::fs::read(&path).expect("state");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("widen");
+    for repair in [false, true] {
+        assert_eq!(
+            apply_document(&fixture, &document, repair)
+                .await
+                .expect_err("refused"),
+            PackageErrorKind::IndexStateUnreadable,
+            "repair_state={repair}"
+        );
+    }
+    let local = Package::build("community.dev", "1.0.0", "devrt", INERT_PROGRAM);
+    assert_eq!(
+        install_local(&fixture, &local).await.expect_err("refused"),
+        PackageErrorKind::IndexStateUnreadable,
+        "a local install on an unsafe state file is not a registry failure"
+    );
+    assert_eq!(std::fs::read(&path).expect("state"), before);
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o666
+    );
+    assert!(damaged_copies(&fixture).is_empty());
+}
+
+/// M-d: a repair that fails after the damaged file was read leaves a state
+/// file in place, so the host never falls back to the empty verifier state.
+#[tokio::test]
+async fn scenario_n2_a_failed_repair_never_leaves_the_host_without_a_state_file() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-failed-repair");
+    let document = runtime_document(&keys, now(), "aurora");
+    apply_document(&fixture, &document, false)
+        .await
+        .expect("apply");
+    let damaged = b"{not json".to_vec();
+    plant_state(&fixture, &damaged, 0o600);
+    // A directory where the temporary file belongs makes the commit fail.
+    std::fs::create_dir(fixture.plugins.join("index-state.json.tmp")).expect("block the temp");
+    apply_document(&fixture, &document, true)
+        .await
+        .expect_err("the repair cannot commit");
+    assert_eq!(
+        std::fs::read(fixture.plugins.join("index-state.json")).expect("a state file remains"),
+        damaged
+    );
+    let local = Package::build("community.dev", "1.0.0", "devrt", INERT_PROGRAM);
+    assert_eq!(
+        install_local(&fixture, &local)
+            .await
+            .expect_err("still fail-closed"),
+        PackageErrorKind::IndexStateUnreadable
+    );
+}
+
+/// L4: a preserved copy never replaces an earlier one, whatever second it
+/// is taken in.
+#[tokio::test]
+async fn scenario_n2_repair_never_replaces_an_earlier_preserved_copy() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-two-copies");
+    let document = runtime_document(&keys, now(), "aurora");
+    apply_document(&fixture, &document, false)
+        .await
+        .expect("apply");
+    let start = now();
+    for second in start - 2..=start + 5 {
+        std::fs::write(
+            fixture
+                .plugins
+                .join(format!("index-state.json.damaged-{second}")),
+            b"earlier",
+        )
+        .expect("earlier copy");
+    }
+    plant_state(&fixture, b"{second damage", 0o600);
+    apply_document(&fixture, &document, true)
+        .await
+        .expect("repair");
+    let copies = damaged_copies(&fixture);
+    assert_eq!(copies.len(), 9, "{copies:?}");
+    assert_eq!(
+        copies
+            .iter()
+            .filter(|(_, bytes)| bytes == b"earlier")
+            .count(),
+        8
+    );
+    assert_eq!(
+        copies
+            .iter()
+            .filter(|(_, bytes)| bytes == b"{second damage")
+            .count(),
+        1
+    );
 }
 
 /// M1: an index install stores the document alongside the marks, so a
@@ -1754,8 +1989,35 @@ async fn scenario_m1_staged_install_stores_document() {
     );
 }
 
-/// M5: an expired stored document refuses install from stored and the
-/// saved package keeps launching.
+/// A stored copy that cannot be written never fails a verified index install:
+/// the package installs and the marks are raised.
+#[tokio::test]
+async fn scenario_a_failed_store_never_fails_an_index_install() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("store-failure");
+    // A regular file where the stored-index directory belongs.
+    std::fs::write(fixture.plugins.join("index"), b"not a directory").expect("block the store");
+    let package = idxfix("1.0.0");
+    let sequence = now();
+    fixture
+        .registry
+        .packages()
+        .package_install(index_install(
+            &fixture,
+            &package,
+            &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
+            false,
+        ))
+        .await
+        .expect("the install does not depend on the stored copy");
+    assert_eq!(index_state(&fixture).index_high_water, Some(sequence));
+    assert_eq!(
+        fixture.serving(INDEXED_RUNTIME),
+        Some(package.digest.clone())
+    );
+}
+
+/// M5: an expired document is refused at apply and nothing is stored.
 #[tokio::test]
 async fn scenario_m5_expired_stored_document_refused() {
     let keys = Keys::new();
@@ -1778,118 +2040,59 @@ async fn scenario_m5_expired_stored_document_refused() {
     assert!(registry.stored_index(1).expect("stored").is_none());
 }
 
-/// M6: a schema 1 registry upgrades by source, keeps selected, and the
-/// next write is schema 2.
+/// M6: a schema 1 registry (checked-in bytes written before the provenance
+/// field existed) reads with provenance derived from the source, keeps all
+/// three records and the selection, and its next write is schema 2.
 #[tokio::test]
 async fn scenario_m6_schema1_upgrades_by_source() {
     use package::registry::{PackageProvenance, PackageSource};
-    let root = std::env::temp_dir().join(format!(
-        "pohunek-m6-schema-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("root");
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-        .expect("owner-private dir");
-    std::fs::create_dir_all(root.join("packages")).expect("packages");
-    std::fs::set_permissions(
-        root.join("packages"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .expect("owner-private packages");
-    // Hand-write a byte-exact schema 1 registry: one `official`, one
-    // `explicit_digest` and one `link` record. `PackageDigest` is
-    // `sha256:<64 hex>`; `ManifestDigest` is 64 hex without the prefix
-    // (it serializes as the raw hex of the manifest bytes).
-    let digest_a = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-    let digest_b = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
-    let digest_c = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
-    let manifest = "0000000000000000000000000000000000000000000000000000000000000003";
-    let manifest_b = "0000000000000000000000000000000000000000000000000000000000000004";
-    let manifest_c = "0000000000000000000000000000000000000000000000000000000000000005";
-    let body = serde_json::json!({
-        "schema": 1,
-        "generation": 3,
-        "packages": [
-            {
-                "digest": digest_a,
-                "identity": { "id": "pohunek.runtime.pi", "version": "1.0.0" },
-                "source": "official",
-                "manifest": manifest,
-                "installed_at_unix_seconds": 1,
-                "enabled": true,
-            },
-            {
-                "digest": digest_b,
-                "identity": { "id": "community.aurora", "version": "1.0.0" },
-                "source": "explicit_digest",
-                "manifest": manifest_b,
-                "installed_at_unix_seconds": 2,
-                "enabled": true,
-            },
-            {
-                "digest": digest_c,
-                "identity": { "id": "community.dev", "version": "1.0.0" },
-                "source": "link",
-                "manifest": manifest_c,
-                "installed_at_unix_seconds": 3,
-                "enabled": true,
-            },
-        ],
-        "selected": { "pohunek.runtime.pi": digest_a },
-    });
+    let fixture = Fixture::new("m6-schema1");
+    let root = fixture.dir.join("m6-registry");
+    std::fs::create_dir_all(root.join("packages")).expect("root");
+    for directory in [root.clone(), root.join("packages")] {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("owner-private dir");
+    }
+    let registry_file = root.join("registry.json");
     std::fs::write(
-        root.join("registry.json"),
-        serde_json::to_vec(&body).expect("json"),
+        &registry_file,
+        include_bytes!("fixtures/registry-schema1.json"),
     )
     .expect("write registry");
-    std::fs::set_permissions(
-        root.join("registry.json"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .expect("owner-private");
+    std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600))
+        .expect("owner-private");
     let registry = Registry::open_at(&root, Limits::DEFAULT).expect("registry");
     let state = registry.state().expect("state");
     let provenances: Vec<_> = state
         .packages()
         .iter()
-        .map(|r| (r.source(), r.provenance()))
+        .map(|record| (record.source(), record.provenance()))
         .collect();
-    for (source, provenance) in &provenances {
-        match source {
-            PackageSource::Official => assert_eq!(*provenance, PackageProvenance::Catalog),
-            _ => assert_eq!(*provenance, PackageProvenance::Local),
-        }
-    }
-    // The next mutation writes schema 2.
-    let header: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("registry.json")).expect("read back"))
-            .expect("json");
     assert_eq!(
-        header.get("schema").and_then(|v| v.as_u64()),
-        Some(1),
-        "fixture still schema 1 before a write"
+        provenances,
+        [
+            (PackageSource::Official, PackageProvenance::Catalog),
+            (PackageSource::ExplicitDigest, PackageProvenance::Local),
+            (PackageSource::Link, PackageProvenance::Local),
+        ]
     );
-    let digest = state.packages()[0].digest().clone();
-    registry.set_enabled(&digest, false).expect("set_enabled");
-    let after: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("registry.json")).expect("read after"))
-            .expect("json after");
+    let pi = state.packages()[0].digest().clone();
     assert_eq!(
-        after.get("schema").and_then(|v| v.as_u64()),
-        Some(2),
-        "next write is schema 2"
+        state.selected(&PackageId::parse("pohunek.runtime.pi").expect("id")),
+        Some(&pi),
+        "the selection survives the upgrade"
     );
-    std::fs::remove_dir_all(&root).ok();
+    let schema = |path: &std::path::Path| -> u64 {
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).expect("read"))
+            .expect("json")["schema"]
+            .as_u64()
+            .expect("schema")
+    };
+    assert_eq!(schema(&registry_file), 1, "no write has happened yet");
+    registry.set_enabled(&pi, false).expect("set_enabled");
+    assert_eq!(schema(&registry_file), 2, "the next write is schema 2");
+    assert_eq!(registry.state().expect("state").packages().len(), 3);
 }
-
-// ---------------------------------------------------------------------------
-// M5: the daemon [`crate::doctor::report`] `plugin_index` check over the
-// fixture plugin root. `Paths.state_dir` is the fixture root itself, so
-// `plugins_dir()` resolves to `fixture.plugins`.
-// ---------------------------------------------------------------------------
 
 async fn doctor_plugin_index(fixture: &Fixture) -> Vec<protocol::DoctorCheck> {
     let paths = crate::Paths {
@@ -1977,29 +2180,21 @@ async fn scenario_m5_doctor_current_after_apply_and_catalog_runtime_stays_ok() {
     );
 }
 
-/// M5-3 (daemon half): an expired stored copy surfaces as `index_expired`
-/// (warn, packages keep working); an expired apply is refused.
+/// M5-3: a stored copy older than 24 h that has not expired warns with
+/// `stale`; the document stays usable.
 #[tokio::test]
-async fn scenario_m5_doctor_expired_stored_copy_warns() {
+async fn scenario_m5_doctor_stale_stored_copy_warns() {
     let keys = Keys::new();
-    let fixture = keys.fixture("m5-doctor-expired");
+    let fixture = keys.fixture("m5-doctor-stale");
     let package = idxfix("1.0.0");
-    // A past document is never stored by apply (refused), so plant the
-    // situation via store_index-like state: apply a fresh doc, then age
-    // the sidecar clock by rewriting stored.json to the past.
-    let sequence = now();
-    fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: fixture.write(
-                "index.json",
-                &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
-            ),
-            repair_state: false,
-        })
-        .await
-        .expect("apply");
+    apply_document(
+        &fixture,
+        &keys.signed(now(), vec![idxfix_entry(&package, "1.0.0")]),
+        false,
+    )
+    .await
+    .expect("apply");
+    // The daemon clock is not injectable; the sidecar's `stored_at` is aged.
     let index_dir = fixture.plugins.join("index");
     let past = now().saturating_sub(2 * package::index_store::STORED_INDEX_MAX_AGE);
     std::fs::write(
@@ -2014,10 +2209,6 @@ async fn scenario_m5_doctor_expired_stored_copy_warns() {
     .expect("mode");
     let checks = doctor_plugin_index(&fixture).await;
     assert_eq!(checks.len(), 1);
-    // Freshness is judged by the verifier (expires_at), and the stored doc
-    // is fresh here, so doctor is still current; the stale sidecar alone
-    // yields a stale warn only when the doc itself is past its lifetime.
-    // This test pins the wire detail for the stale sidecar case.
     assert_eq!(checks[0].status, protocol::DoctorStatus::Warn);
     assert!(
         checks[0].detail.starts_with("stale"),
@@ -2063,88 +2254,31 @@ async fn scenario_m5_doctor_package_revoked_after_delisting() {
         "{}",
         checks[0].detail
     );
+    assert_eq!(
+        fixture.serving(INDEXED_RUNTIME),
+        Some(package.digest.clone()),
+        "a delisted package keeps serving: doctor is a warning, not a launch gate"
+    );
 }
 
-/// M5-6: a local (ExplicitDigest and Link) package holding a reserved
-/// runtime id warns in doctor. Already-installed local packages still
-/// launch (proven by serving before the warning).
+/// M5-6: a local package installed before the official index reserved its
+/// runtime id keeps serving after the reservation, and doctor warns.
 #[tokio::test]
 async fn scenario_m5_doctor_reserved_runtime_warns() {
     let keys = Keys::new();
     let fixture = keys.fixture("m5-doctor-reserved");
-    let sequence = now();
-    let listed = Package::build("pohunek.runtime.aurora", "1.0.0", "aurora", INERT_PROGRAM);
-    fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: fixture.write(
-                "i.json",
-                &keys.signed(
-                    sequence,
-                    vec![index_entry(
-                        &listed,
-                        "pohunek.runtime.aurora",
-                        "aurora",
-                        "1.0.0",
-                    )],
-                ),
-            ),
-            repair_state: false,
-        })
+    let local = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
+    install_local(&fixture, &local)
+        .await
+        .expect("local install before the reservation");
+    apply_document(&fixture, &runtime_document(&keys, now(), "aurora"), false)
         .await
         .expect("apply");
-    // Install a local package claiming the reserved runtime id through the
-    // direct registry path (bypassing the guard already proven by
-    // scenario_6_guard_blocks_renamed_ids): use install after apply only
-    // via a package that was installed BEFORE the apply. Re-create here by
-    // installing before apply via mark surgery is not available, so build
-    // the claim by installing after apply through the same public RPC —
-    // the guard refuses, so the doctor half is covered by applying first
-    // on a fresh fixture: install local, then apply.
-    let fixture = keys.fixture("m5-doctor-reserved-2");
-    let local = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
-    fixture
-        .registry
-        .packages()
-        .package_install(PackageInstallParams {
-            archive_path: fixture.write_archive(&local),
-            trust: PackageTrust::ExplicitDigest {
-                digest: local.digest.clone(),
-            },
-            enable: true,
-            select: true,
-            dry_run: false,
-            accept_commands: false,
-        })
-        .await
-        .expect("local install before admission");
     assert_eq!(
         fixture.serving("aurora"),
         Some(local.digest.clone()),
-        "the installed local package launches"
+        "the installed local package still launches after the reservation"
     );
-    let listed = Package::build("pohunek.runtime.aurora", "1.0.0", "aurora", INERT_PROGRAM);
-    fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: fixture.write(
-                "i.json",
-                &keys.signed(
-                    sequence,
-                    vec![index_entry(
-                        &listed,
-                        "pohunek.runtime.aurora",
-                        "aurora",
-                        "1.0.0",
-                    )],
-                ),
-            ),
-            repair_state: false,
-        })
-        .await
-        .expect("apply");
     let checks = doctor_plugin_index(&fixture).await;
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].status, protocol::DoctorStatus::Warn);
@@ -2157,47 +2291,64 @@ async fn scenario_m5_doctor_reserved_runtime_warns() {
     );
 }
 
-/// M5-7: a damaged stored document fails doctor, and a stale temporary
-/// does not wedge the registry (r1 M3).
+/// Scenario 6, link path: a linked directory that declares a runtime id the
+/// official index reserved is refused like an exact-digest install.
+#[tokio::test]
+async fn scenario_6_a_linked_directory_cannot_claim_a_reserved_runtime() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("scenario-6-link");
+    apply_document(&fixture, &runtime_document(&keys, now(), RUNTIME), false)
+        .await
+        .expect("apply");
+    let directory = fixture.dir.join("developer");
+    std::fs::create_dir(&directory).expect("developer directory");
+    let source = crate::agent::host::fixture::pi_shaped_document(
+        std::path::Path::new(INERT_PROGRAM),
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .replace(
+        "detect_manifest = \"any\"",
+        "detect_manifest = \"detect.toml\"",
+    );
+    std::fs::write(directory.join("runtime.toml"), &source).expect("descriptor");
+    std::fs::write(
+        directory.join("detect.toml"),
+        "[[rules]]\nid = \"idle_prompt\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n",
+    )
+    .expect("manifest");
+    let error = fixture
+        .registry
+        .packages()
+        .package_link(protocol::PackageLinkParams {
+            directory: directory.to_str().expect("utf-8").to_owned(),
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect_err("the reserved runtime id is refused");
+    assert_eq!(error, PackageErrorKind::RuntimeNotClaimable);
+}
+
+/// Scenario 7: a damaged stored document fails doctor without stopping the
+/// daemon, and a refresh repairs it even with a stale temporary file beside it.
 #[tokio::test]
 async fn scenario_m5_doctor_damaged_stored_document_and_stale_temp() {
     let keys = Keys::new();
     let fixture = keys.fixture("m5-doctor-damaged");
-    let sequence = now();
     let package = idxfix("1.0.0");
-    fixture
-        .registry
-        .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams {
-            index_path: fixture.write(
-                "index.json",
-                &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
-            ),
-            repair_state: false,
-        })
+    let document = keys.signed(now(), vec![idxfix_entry(&package, "1.0.0")]);
+    apply_document(&fixture, &document, false)
         .await
         .expect("apply");
-    std::fs::write(
-        fixture.plugins.join("index").join("official-v1.json"),
-        b"corrupt",
-    )
-    .expect("corrupt doc");
-    std::fs::set_permissions(
-        fixture.plugins.join("index").join("official-v1.json"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .expect("mode");
-    // A stale temporary must not be treated as the documents.
-    std::fs::write(
-        fixture.plugins.join("index").join("document.json.tmp"),
-        b"stale",
-    )
-    .expect("stale temp");
-    std::fs::set_permissions(
-        fixture.plugins.join("index").join("document.json.tmp"),
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .expect("mode");
+    let index_dir = fixture.plugins.join("index");
+    for (name, bytes) in [
+        ("official-v1.json", &b"corrupt"[..]),
+        ("document.json.tmp", b"stale"),
+    ] {
+        std::fs::write(index_dir.join(name), bytes).expect("plant");
+        std::fs::set_permissions(index_dir.join(name), std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+    }
     let checks = doctor_plugin_index(&fixture).await;
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].status, protocol::DoctorStatus::Fail);
@@ -2206,47 +2357,83 @@ async fn scenario_m5_doctor_damaged_stored_document_and_stale_temp() {
         "{}",
         checks[0].detail
     );
+
+    apply_document(&fixture, &document, false)
+        .await
+        .expect("a refresh replaces the damaged document despite the stale temporary");
+    let checks = doctor_plugin_index(&fixture).await;
+    assert_eq!(
+        (checks[0].status, checks[0].detail.as_str()),
+        (protocol::DoctorStatus::Ok, "current")
+    );
 }
 
-/// M5 M1 regression: `plugin update <pkg> <archive> --sha256` works on a
-/// host with no index channel file (without `package_index_apply_supported`).
+/// An index-origin package without any stored copy (a host that installed by
+/// id before the stored index existed) warns with `not_refreshed`, never fails.
 #[tokio::test]
-async fn scenario_m5_update_sha256_without_index_channel() {
-    let fixture = Fixture::with_trust(
-        "m5-update-no-channel",
-        crate::catalog_anchor::CatalogTrust::Absent,
+async fn scenario_m5_doctor_not_refreshed_for_an_index_package_without_a_stored_copy() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("m5-doctor-not-refreshed");
+    let package = idxfix("1.0.0");
+    fixture
+        .registry
+        .packages()
+        .package_install(index_install(
+            &fixture,
+            &package,
+            &keys.signed(now(), vec![idxfix_entry(&package, "1.0.0")]),
+            false,
+        ))
+        .await
+        .expect("index install");
+    std::fs::remove_dir_all(fixture.plugins.join("index")).expect("drop the stored copy");
+    let checks = doctor_plugin_index(&fixture).await;
+    assert_eq!(checks[0].status, protocol::DoctorStatus::Warn);
+    assert!(
+        checks[0].detail.starts_with("not_refreshed:"),
+        "{}",
+        checks[0].detail
     );
-    let package = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
-    fixture
-        .registry
-        .packages()
-        .package_install(PackageInstallParams {
-            archive_path: fixture.write_archive(&package),
-            trust: PackageTrust::ExplicitDigest {
-                digest: package.digest.clone(),
-            },
-            enable: true,
-            select: true,
-            dry_run: false,
-            accept_commands: false,
-        })
-        .await
-        .expect("local install without channel");
-    let next = Package::build("community.aurora", "1.1.0", "aurora", INERT_PROGRAM);
-    fixture
-        .registry
-        .packages()
-        .package_install(PackageInstallParams {
-            archive_path: fixture.write_archive(&next),
-            trust: PackageTrust::ExplicitDigest {
-                digest: next.digest.clone(),
-            },
-            enable: true,
-            select: true,
-            dry_run: false,
-            accept_commands: false,
-        })
-        .await
-        .expect("local update without channel");
-    assert_eq!(fixture.serving("aurora"), Some(next.digest.clone()));
+}
+
+/// A stored copy past its `expires_at` warns with `package_index_expired`; the
+/// installed package keeps serving.
+#[tokio::test]
+async fn scenario_m5_doctor_reports_an_expired_stored_copy() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("m5-doctor-index-expired");
+    let package = idxfix("1.0.0");
+    install_local(
+        &fixture,
+        &Package::build("community.dev", "1.0.0", "devrt", INERT_PROGRAM),
+    )
+    .await
+    .expect("local install creates the registry");
+    // An expired document cannot be applied, so the stored files are planted.
+    let sequence = now() - 8 * DAY;
+    let expired = keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]);
+    let index_dir = fixture.plugins.join("index");
+    std::fs::create_dir_all(&index_dir).expect("index dir");
+    std::fs::set_permissions(&index_dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    std::fs::write(index_dir.join("official-v1.json"), &expired).expect("document");
+    std::fs::write(
+        index_dir.join("stored.json"),
+        serde_json::to_vec(&serde_json::json!({"schema": 1, "official-v1": now()})).expect("json"),
+    )
+    .expect("sidecar");
+    for name in ["official-v1.json", "stored.json"] {
+        std::fs::set_permissions(index_dir.join(name), std::fs::Permissions::from_mode(0o600))
+            .expect("mode");
+    }
+    let checks = doctor_plugin_index(&fixture).await;
+    assert_eq!(checks[0].status, protocol::DoctorStatus::Warn);
+    assert!(
+        checks[0].detail.starts_with("package_index_expired:"),
+        "{}",
+        checks[0].detail
+    );
+    assert!(
+        fixture.serving("devrt").is_some(),
+        "installed packages keep serving"
+    );
 }

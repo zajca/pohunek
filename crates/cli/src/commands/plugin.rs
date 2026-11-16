@@ -1098,16 +1098,13 @@ async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
     .await
 }
 
-/// Refresh the stored index now (best effort: failure keeps the old copy).
-async fn refresh_now(client: &mut Client, index_url: Option<&str>) -> Result<(), CliError> {
-    refresh_now_with_repair(client, index_url, false).await
-}
-
-async fn refresh_now_with_repair(
+/// Fetches the official index, stages it and has the daemon verify and store
+/// it. `repair_state` asks the daemon to replace a damaged `index-state.json`.
+async fn refresh_stored(
     client: &mut Client,
     index_url: Option<&str>,
     repair_state: bool,
-) -> Result<(), CliError> {
+) -> Result<protocol::PluginIndexApplyResult, CliError> {
     let context = client
         .host_inspect_with(protocol::HostInspectParams {
             skip_runtime_probes: Some(true),
@@ -1120,8 +1117,32 @@ async fn refresh_now_with_repair(
             index_path: staged.index_path,
             repair_state,
         })
-        .await?;
-    Ok(())
+        .await
+}
+
+/// Stages an install from the stored index after refreshing it.
+///
+/// A failed refresh falls back to the unexpired stored copy with a warning
+/// that names the refresh error. When the copy does not list the package, the
+/// index is fetched directly; any other stored-copy failure returns the
+/// refresh error itself, never a misleading "invalid index".
+async fn stage_after_refresh(
+    client: &mut Client,
+    request: &PackageRef,
+) -> Result<plugin_index::Staged, CliError> {
+    match refresh_stored(client, None, false).await {
+        Ok(_) => Ok(plugin_index::stage_from_stored(request).await?),
+        Err(refresh_error) => match plugin_index::stage_from_stored(request).await {
+            Ok(staged) => {
+                eprintln!("warning: could not refresh the stored plugin index: {refresh_error}");
+                Ok(staged)
+            }
+            Err(error) if plugin_index::is_not_listed(&error) => {
+                Ok(plugin_index::stage(request, None).await?)
+            }
+            Err(_) => Err(refresh_error),
+        },
+    }
 }
 
 /// Install `<package-id>[@<version>]`: fetch the index and the archive it
@@ -1149,42 +1170,26 @@ async fn run_install_by_id(
     {
         require_index_context_support(&mut client).await?;
     }
-    // 24h cadence: a fresh stored copy is used without fetching. When the
-    // stored copy is stale or missing, refresh first (one fetch). The
-    // refresh error is surfaced, not swallowed: the install still falls
-    // back to the unexpired stored copy when it lists the package, but
-    // the user sees why it is stale.
-    //
-    // A custom --index-url replaces the stored copy for this install:
-    // skip the cadence and the stored copy entirely and fetch the given
-    // index directly.
+    // A custom --index-url replaces the stored copy for this install. A daemon
+    // without `plugin.index.apply` has no stored copy to use or refresh, so the
+    // index is fetched directly. Otherwise a stored copy younger than 24 h
+    // serves the install; a stale, missing or non-listing copy is refreshed
+    // first.
+    let kind = plugin_index::wanted_kind(&request);
     let staged = if args.index_url.is_some() {
         plugin_index::stage(&request, args.index_url.as_deref()).await?
     } else if !apply_supported(&mut client).await? {
-        // No refresh channel (0.40-0.43 daemon): fetch the index directly,
-        // the base behaviour. Never render a no-stored-copy `IndexInvalid`.
         plugin_index::stage(&request, None).await?
-    } else if !plugin_index::stored_is_fresh() {
-        // Apply-supported but stale/missing: refresh first. With no usable
-        // stored copy a failed refresh surfaces its own error, never
-        // `IndexInvalid` (the stored copy is missing, not malformed).
-        match refresh_now(&mut client, None).await {
-            Ok(()) => plugin_index::stage_from_stored(&request).await?,
-            Err(refresh_error) => match plugin_index::stage_from_stored(&request).await {
-                Ok(staged) => {
-                    eprintln!(
-                        "warning: could not refresh the stored plugin index: {refresh_error}"
-                    );
-                    staged
-                }
-                Err(error) if plugin_index::is_not_listed(&error) => {
-                    plugin_index::stage(&request, None).await?
-                }
-                Err(_) => return Err(refresh_error),
-            },
+    } else if plugin_index::stored_is_fresh(kind) {
+        match plugin_index::stage_from_stored(&request).await {
+            Ok(staged) => staged,
+            Err(error) if plugin_index::is_not_listed(&error) => {
+                stage_after_refresh(&mut client, &request).await?
+            }
+            Err(error) => return Err(error.into()),
         }
     } else {
-        plugin_index::stage_from_stored(&request).await?
+        stage_after_refresh(&mut client, &request).await?
     };
     let source = Source::Archive {
         path: staged.archive_path.clone(),
@@ -1298,19 +1303,7 @@ async fn run_index(action: IndexAction) -> Result<(), CliError> {
     } = action;
     let mut client = connect_ingest().await?;
     require_apply_support(&mut client).await?;
-    let context = client
-        .host_inspect_with(protocol::HostInspectParams {
-            skip_runtime_probes: Some(true),
-        })
-        .await?
-        .package_install_index_context_supported;
-    let staged = plugin_index::stage_official(index_url.as_deref(), context).await?;
-    let result = client
-        .call::<method::PluginIndexApply>(protocol::PluginIndexApplyParams {
-            index_path: staged.index_path.clone(),
-            repair_state,
-        })
-        .await?;
+    let result = refresh_stored(&mut client, index_url.as_deref(), repair_state).await?;
     print_output(json, &result, || {
         format!(
             "sequence {} (schema {}, {} entries, expires {}, stored {})\n",
@@ -1342,9 +1335,9 @@ async fn require_apply_support(client: &mut Client) -> Result<(), CliError> {
     }
 }
 
-/// Whether the daemon supports plugin.index.apply (refresh). A 0.40-0.43
-/// daemon reports `package_install_index_supported` but has no apply: by-id
-/// installs there fetch the index directly (base behaviour).
+/// Whether the daemon supports `plugin.index.apply` (refresh). A daemon that
+/// reports `package_install_index_supported` without it has no stored index:
+/// by-id installs there fetch the index directly.
 async fn apply_supported(client: &mut Client) -> Result<bool, CliError> {
     Ok(client
         .host_inspect_with(protocol::HostInspectParams {

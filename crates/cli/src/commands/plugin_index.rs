@@ -31,31 +31,37 @@ use crate::commands::plugin::Error;
 /// release of the index repository.
 pub(crate) const OFFICIAL_INDEX_URL: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v1.json";
 
-/// Test-build override for the official index URL (loopback rigs only).
-#[cfg(test)]
+/// The official plugin index URL, schema 1. Test builds (`cargo test`, the
+/// `test-util` feature) read `POHUNEK_TEST_OFFICIAL_INDEX_URL` so a loopback
+/// server can stand in for it; a release binary neither contains nor reads
+/// the variable.
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn official_index_url() -> String {
     std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL")
         .unwrap_or_else(|_| OFFICIAL_INDEX_URL.to_owned())
 }
-#[cfg(not(test))]
+
+/// The official plugin index URL, schema 1.
+#[cfg(not(any(test, feature = "test-util")))]
 pub(crate) fn official_index_url() -> String {
-    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL")
-        .unwrap_or_else(|_| OFFICIAL_INDEX_URL.to_owned())
+    OFFICIAL_INDEX_URL.to_owned()
 }
 
 /// The official plugin index, schema 2 (runtime and context entries), which
 /// the index repository publishes beside the schema 1 document.
 pub(crate) const OFFICIAL_INDEX_URL_V2: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v2.json";
 
-#[cfg(test)]
+/// The official plugin index URL, schema 2; see [`official_index_url`].
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn official_index_url_v2() -> String {
     std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2")
         .unwrap_or_else(|_| OFFICIAL_INDEX_URL_V2.to_owned())
 }
-#[cfg(not(test))]
+
+/// The official plugin index URL, schema 2; see [`official_index_url`].
+#[cfg(not(any(test, feature = "test-util")))]
 pub(crate) fn official_index_url_v2() -> String {
-    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2")
-        .unwrap_or_else(|_| OFFICIAL_INDEX_URL_V2.to_owned())
+    OFFICIAL_INDEX_URL_V2.to_owned()
 }
 
 /// Core version an entry's `core` range is matched against: this build's.
@@ -334,7 +340,7 @@ fn unix_now() -> u64 {
 
 /// The kind of entry `request` can resolve to: ids under the context prefix
 /// resolve to `context` entries only, every other id to `runtime` entries.
-fn wanted_kind(request: &PackageRef) -> IndexEntryKind {
+pub(crate) fn wanted_kind(request: &PackageRef) -> IndexEntryKind {
     if request
         .id
         .as_str()
@@ -508,7 +514,7 @@ async fn stage_from_selection(client: &Client, selection: Selection) -> Result<S
 /// fetch. Fails when nothing usable is stored or the package is not listed.
 pub(crate) async fn stage_from_stored(request: &PackageRef) -> Result<Staged, Error> {
     let client = client()?;
-    let stored = read_stored().ok_or(Error::IndexInvalid {
+    let stored = read_stored(wanted_kind(request)).ok_or(Error::IndexInvalid {
         detail: "no stored index document to install from".to_owned(),
     })?;
     let selection = select_from_bytes(&stored.bytes, request)?;
@@ -561,24 +567,6 @@ fn write_staged(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<Strin
         })
 }
 
-/// Read the stored sidecar and return the freshest `stored_at`.
-///
-/// Returns `None` when there is no stored copy yet. The CLI reads the same
-/// file the daemon wrote; it is local-only and same-user.
-fn stored_at() -> Option<u64> {
-    let plugins = crate::paths::Paths::plugins_dir().ok()?;
-    let sidecar = plugins.join("index").join("stored.json");
-    let bytes = std::fs::read(&sidecar).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let mut max: Option<u64> = None;
-    for key in [SIDECAR_KEY_V1, SIDECAR_KEY_V2] {
-        if let Some(v) = value.get(key).and_then(serde_json::Value::as_u64) {
-            max = Some(max.map_or(v, |m: u64| m.max(v)));
-        }
-    }
-    max
-}
-
 /// Fetch the official index document (v2 when `context`) and stage it for apply.
 pub(crate) async fn stage_official(
     index_url: Option<&str>,
@@ -614,10 +602,11 @@ pub(crate) struct StagedOfficial {
     pub(crate) index_path: String,
 }
 
-/// Whether the stored index is fresh enough to use without fetching.
-pub(crate) fn stored_is_fresh() -> bool {
-    let Some(at) = stored_at() else { return false };
-    unix_now().saturating_sub(at) <= STORED_INDEX_MAX_AGE
+/// Whether the stored copy that can serve `kind` is usable and younger than
+/// [`STORED_INDEX_MAX_AGE`]. An expired copy is never fresh.
+pub(crate) fn stored_is_fresh(kind: IndexEntryKind) -> bool {
+    read_stored(kind)
+        .is_some_and(|stored| unix_now().saturating_sub(stored.stored_at) <= STORED_INDEX_MAX_AGE)
 }
 
 #[derive(Debug)]
@@ -626,18 +615,26 @@ struct StoredEntry {
     stored_at: u64,
 }
 
-fn read_stored() -> Option<StoredEntry> {
+/// The newest unexpired stored document that can serve an install of `kind`.
+///
+/// A context package is listed only by the schema 2 document; a runtime
+/// package by either. The CLI reads the files the daemon wrote: they are
+/// local, same-user and verified again by the daemon at install.
+fn read_stored(kind: IndexEntryKind) -> Option<StoredEntry> {
     let plugins = crate::paths::Paths::plugins_dir().ok()?;
     let index_dir = plugins.join("index");
-    let sidecar = index_dir.join("stored.json");
-    let raw = std::fs::read(&sidecar).ok()?;
+    let raw = std::fs::read(index_dir.join("stored.json")).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let candidates: &[(&str, &str)] = match kind {
+        IndexEntryKind::Context => &[(SIDECAR_KEY_V2, "official-v2.json")],
+        IndexEntryKind::Runtime => &[
+            (SIDECAR_KEY_V1, "official-v1.json"),
+            (SIDECAR_KEY_V2, "official-v2.json"),
+        ],
+    };
     let mut best: Option<StoredEntry> = None;
-    for (key, file_name) in [
-        (SIDECAR_KEY_V1, "official-v1.json"),
-        (SIDECAR_KEY_V2, "official-v2.json"),
-    ] {
-        let Some(at) = value.get(key).and_then(serde_json::Value::as_u64) else {
+    for (key, file_name) in candidates {
+        let Some(at) = value.get(*key).and_then(serde_json::Value::as_u64) else {
             continue;
         };
         // One missing or expired schema does not abort the other.
@@ -650,7 +647,7 @@ fn read_stored() -> Option<StoredEntry> {
         if unix_now() >= envelope.index.expires_at {
             continue;
         }
-        if best.as_ref().is_none_or(|s| at > s.stored_at) {
+        if best.as_ref().is_none_or(|stored| at > stored.stored_at) {
             best = Some(StoredEntry {
                 bytes,
                 stored_at: at,

@@ -73,15 +73,16 @@ region = "whole_recent"
 any = [{ contains = "ready" }]
 "#;
 
-fn runtime_document(version: &str) -> String {
+/// A runtime package descriptor for `package` serving `runtime`.
+fn runtime_document_of(package: &str, runtime: &str, version: &str) -> String {
     format!(
         r#"schema = 1
-id = "{PACKAGE_ID}"
+id = "{package}"
 version = "{version}"
 runtime_api = 1
 
 [runtime]
-id = "{RUNTIME}"
+id = "{runtime}"
 name = "Idx fixture"
 program = "{PROGRAM}"
 args = []
@@ -133,10 +134,15 @@ struct Archive {
 }
 
 fn archive(version: &str) -> Archive {
+    archive_of(PACKAGE_ID, RUNTIME, version)
+}
+
+/// An archive of the runtime package `package` serving `runtime`.
+fn archive_of(package: &str, runtime: &str, version: &str) -> Archive {
     let entries = [
         ArchiveEntry {
             path: "runtime.toml".to_owned(),
-            contents: runtime_document(version).into_bytes(),
+            contents: runtime_document_of(package, runtime, version).into_bytes(),
             executable: false,
         },
         ArchiveEntry {
@@ -156,6 +162,8 @@ fn archive(version: &str) -> Archive {
 /// What the signed index lists for one archive.
 struct Listing {
     archive: Archive,
+    package: &'static str,
+    runtime: &'static str,
     version: &'static str,
     url: String,
     platform: String,
@@ -164,8 +172,20 @@ struct Listing {
 
 impl Listing {
     fn new(version: &'static str, url: String) -> Self {
+        Self::of(PACKAGE_ID, RUNTIME, version, url)
+    }
+
+    /// A listing of `package` serving `runtime`.
+    fn of(
+        package: &'static str,
+        runtime: &'static str,
+        version: &'static str,
+        url: String,
+    ) -> Self {
         Self {
-            archive: archive(version),
+            archive: archive_of(package, runtime, version),
+            package,
+            runtime,
             version,
             url,
             platform: host_platform(),
@@ -175,9 +195,9 @@ impl Listing {
 
     fn entry(&self) -> IndexEntry {
         IndexEntry {
-            package_id: PackageId::parse(PACKAGE_ID).expect("package id"),
+            package_id: PackageId::parse(self.package).expect("package id"),
             kind: None,
-            runtime_id: Some(RuntimeId::parse(RUNTIME).expect("runtime id")),
+            runtime_id: Some(RuntimeId::parse(self.runtime).expect("runtime id")),
             version: PackageVersion::parse(self.version).expect("version"),
             digest: self.archive.digest.clone(),
             url: self.url.clone(),
@@ -238,11 +258,28 @@ impl Keys {
         sequence: u64,
         entries: Vec<IndexEntry>,
     ) -> Vec<u8> {
+        self.document_living(schema, signer, sequence, INDEX_LIFETIME, entries)
+    }
+
+    /// A schema 1 document signed by K, current as of now, that expires
+    /// `lifetime` seconds after its sequence.
+    fn signed_living(&self, lifetime: u64, entries: Vec<IndexEntry>) -> Vec<u8> {
+        self.document_living(INDEX_SCHEMA_VERSION, &self.key, now(), lifetime, entries)
+    }
+
+    fn document_living(
+        &self,
+        schema: u64,
+        signer: &SigningKey,
+        sequence: u64,
+        lifetime: u64,
+        entries: Vec<IndexEntry>,
+    ) -> Vec<u8> {
         let body = IndexBody {
             schema_version: schema,
             scope: "official".to_owned(),
             sequence,
-            expires_at: sequence + INDEX_LIFETIME,
+            expires_at: sequence + lifetime,
             entries,
         };
         let message = index_signing_message(&body).expect("index message");
@@ -467,10 +504,16 @@ impl Rig {
         let entries: Vec<_> = listings.iter().map(Listing::entry).collect();
         self.server
             .set(INDEX_PATH, Route::Body(self.keys.signed(entries.clone())));
-        self.server.set(
-            "/official-index-v2.json",
-            Route::Body(self.keys.signed_v2(entries)),
-        );
+        // A schema 2 document names the kind of every entry.
+        let kinded = entries
+            .into_iter()
+            .map(|mut entry| {
+                entry.kind = Some(IndexEntryKind::Runtime);
+                entry
+            })
+            .collect();
+        self.server
+            .set(INDEX_PATH_V2, Route::Body(self.keys.signed_v2(kinded)));
         for listing in listings {
             self.server.set(
                 &archive_path(listing.version),
@@ -574,6 +617,174 @@ async fn text(rig: &Rig, arguments: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Path of the schema 2 index document on the loopback server.
+const INDEX_PATH_V2: &str = "/official-index-v2.json";
+
+/// Environment variables that replace the official index URLs in a test build.
+const OFFICIAL_URL_V1_VARIABLE: &str = "POHUNEK_TEST_OFFICIAL_INDEX_URL";
+const OFFICIAL_URL_V2_VARIABLE: &str = "POHUNEK_TEST_OFFICIAL_INDEX_URL_V2";
+
+/// Seconds a stored copy is aged to count as older than 24 hours.
+const STALE_AGE: u64 = 25 * DAY;
+
+/// How long the short-lived fixture index lives, and the pause granularity
+/// while a test waits for it to expire.
+const SHORT_LIFETIME: u64 = 3;
+const EXPIRY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What one CLI run printed.
+struct Run {
+    code: i32,
+    document: Value,
+    stderr: String,
+}
+
+impl Rig {
+    /// Official index URLs that point at this rig's server.
+    fn official_urls(&self) -> [(&'static str, String); 2] {
+        [
+            (OFFICIAL_URL_V1_VARIABLE, self.server.url(INDEX_PATH)),
+            (OFFICIAL_URL_V2_VARIABLE, self.server.url(INDEX_PATH_V2)),
+        ]
+    }
+
+    /// Official index URLs that nothing answers on.
+    fn dead_urls() -> [(&'static str, String); 2] {
+        [
+            (
+                OFFICIAL_URL_V1_VARIABLE,
+                format!("http://127.0.0.1:{CLOSED_PORT}{INDEX_PATH}"),
+            ),
+            (
+                OFFICIAL_URL_V2_VARIABLE,
+                format!("http://127.0.0.1:{CLOSED_PORT}{INDEX_PATH_V2}"),
+            ),
+        ]
+    }
+
+    /// `pohunek <arguments> --json` with `env` added to the environment.
+    async fn run(&self, arguments: &[&str], env: &[(&str, String)]) -> Run {
+        let mut all = arguments.to_vec();
+        all.push("--json");
+        let extra: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let output = self.install.run_with_env(&all, &extra).await;
+        let document = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "stdout of {all:?} is one JSON document ({error}): {} / {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        Run {
+            code: output.status.code().expect("exit code"),
+            document,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    /// `plugin index refresh --index-url <url> [extra]`.
+    async fn refresh_from(&self, url: &str, extra: &[&str]) -> (i32, Value) {
+        let mut arguments = vec!["plugin", "index", "refresh", "--index-url", url];
+        arguments.extend_from_slice(extra);
+        self.install.json(&arguments).await
+    }
+
+    /// A refresh from the schema 1 document that must succeed.
+    async fn refresh(&self) -> Value {
+        let (code, document) = self.refresh_from(&self.index_url(), &[]).await;
+        assert_eq!(code, 0, "{document}");
+        document
+    }
+
+    /// The plugin root of the rig's daemon.
+    fn plugins_dir(&self) -> PathBuf {
+        self.install
+            .env
+            .state_home()
+            .join("pohunek")
+            .join("plugins")
+    }
+
+    /// Rewrites the stored-at clock of every stored schema in the sidecar to
+    /// `age` seconds ago. The CLI and the daemon read the real clock, so the
+    /// age is set on disk.
+    fn age_stored(&self, age: u64) {
+        let sidecar_path = self.plugins_dir().join("index").join("stored.json");
+        let raw = fs::read(&sidecar_path).expect("read the sidecar");
+        let mut sidecar: Value = serde_json::from_slice(&raw).expect("the sidecar is JSON");
+        for key in ["official-v1", "official-v2"] {
+            if sidecar.get(key).is_some() {
+                sidecar[key] = serde_json::json!(now() - age);
+            }
+        }
+        fs::write(&sidecar_path, serde_json::to_vec(&sidecar).expect("json"))
+            .expect("write the sidecar");
+        fs::set_permissions(&sidecar_path, fs::Permissions::from_mode(0o600))
+            .expect("sidecar mode");
+    }
+
+    /// The `plugin_index` check of `pohunek doctor`: exit code, status, detail.
+    async fn doctor_index(&self) -> (i32, String, String) {
+        let (code, document) = self.install.json(&["doctor"]).await;
+        let check = document["ok"]["checks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("doctor lists checks: {document}"))
+            .iter()
+            .find(|check| check["name"] == "plugin_index")
+            .unwrap_or_else(|| panic!("doctor reports plugin_index: {document}"))
+            .clone();
+        (
+            code,
+            check["status"].as_str().expect("status").to_owned(),
+            check["detail"].as_str().expect("detail").to_owned(),
+        )
+    }
+
+    /// Whether the host launches sessions of `runtime`.
+    async fn serves(&self, runtime: &str) -> bool {
+        let (code, document) = self.install.json(&["host", "inspect", "local"]).await;
+        assert_eq!(code, 0, "{document}");
+        document["ok"]["supported_agents"]
+            .as_array()
+            .expect("supported_agents")
+            .iter()
+            .any(|agent| agent == runtime)
+    }
+
+    /// The `index_high_water` mark the daemon persisted.
+    fn index_high_water(&self) -> u64 {
+        let bytes = fs::read(self.plugins_dir().join("index-state.json")).expect("read the state");
+        let state: Value = serde_json::from_slice(&bytes).expect("the state is JSON");
+        state["index_high_water"]
+            .as_u64()
+            .expect("a high-water mark")
+    }
+
+    /// Versions of the installed packages, selected ones marked.
+    async fn selected_versions(&self) -> Vec<String> {
+        self.install
+            .packages()
+            .await
+            .iter()
+            .filter(|package| package["selected"] == true)
+            .map(|package| {
+                package["package"]["version"]
+                    .as_str()
+                    .expect("version")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// Blocks until `expires_at` of a short-lived document has passed.
+    async fn wait_for_expiry(&self, sequence: u64) {
+        while now() < sequence + SHORT_LIFETIME {
+            // timing-allowed: #1614 the daemon checks expiry against the wall clock, so a signed document can only expire in real time
+            tokio::time::sleep(EXPIRY_POLL).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn install_by_id_takes_the_highest_version_and_a_pinned_version_that_one() {
     let rig = Rig::start().await;
@@ -614,10 +825,10 @@ async fn install_by_id_takes_the_highest_version_and_a_pinned_version_that_one()
     assert_eq!(selected[0]["package"]["version"], "0.2.0");
 }
 
-/// Scenario 4 (24 h cadence): the first by-id install refreshes once
-/// (one index fetch); a second install within 24 h performs no fetch
-/// (the archive comes from the stored copy); after aging the sidecar it
-/// refreshes again (exactly one index fetch).
+/// Scenario 4 (24 h cadence): installs within 24 h of a refresh fetch no index
+/// (the stored copy resolves the version); once the stored copy is older than
+/// 24 h the next install refreshes it with exactly one index fetch. The clock
+/// is not injected: the sidecar's `stored_at` is aged on disk.
 #[tokio::test]
 async fn scenario_4_stored_copy_fresh_24h_no_fetch_then_refresh_once() {
     let rig = Rig::start().await;
@@ -625,11 +836,9 @@ async fn scenario_4_stored_copy_fresh_24h_no_fetch_then_refresh_once() {
     rig.clear_stored();
     rig.clear_requests();
 
-    // Setup: `plugin index refresh --index-url` fetches the document once
-    // and stores it daemon-side (stored copy + sidecar). The by-id
-    // install below must use this stored copy without any fetch.
+    // `plugin index refresh --index-url` fetches the document once and the
+    // daemon stores it with its sidecar.
     let index_url = rig.index_url();
-    let index_url_v2 = rig.server.url("/official-index-v2.json");
     let (code, document) = rig
         .install
         .json(&["plugin", "index", "refresh", "--index-url", &index_url])
@@ -656,8 +865,7 @@ async fn scenario_4_stored_copy_fresh_24h_no_fetch_then_refresh_once() {
     );
     rig.clear_requests();
 
-    // First by-id install within 24 h: no index fetch; the archive is
-    // fetched once (the stored copy resolves the highest version).
+    // Within 24 h: no index fetch, only the archive.
     let (code, document) = rig
         .install
         .json(&["plugin", "install", PACKAGE_ID, "--yes"])
@@ -671,8 +879,6 @@ async fn scenario_4_stored_copy_fresh_24h_no_fetch_then_refresh_once() {
     assert_eq!(first_requests.len(), 1, "{first_requests:?}");
 
     rig.clear_requests();
-    // Second by-id install within 24 h: no index fetch, archive fetch only
-    // (the stored copy already resolved the highest version).
     let (code, document) = rig
         .install
         .json(&["plugin", "install", PACKAGE_ID, "--yes"])
@@ -683,58 +889,26 @@ async fn scenario_4_stored_copy_fresh_24h_no_fetch_then_refresh_once() {
         !second_requests.contains(&INDEX_PATH.to_owned()),
         "no index fetch within 24h: {second_requests:?}"
     );
-    // The stored copy is the same one, so no refresh request happens.
     assert_eq!(second_requests.len(), 1, "{second_requests:?}");
 
-    // Age the sidecar beyond 24 h: `stored_is_fresh` is now false, so the
-    // next by-id install attempts a `refresh_now` (which fails closed
-    // here because the without-URL refresh goes to the production
-    // OFFICIAL_INDEX_URL and the test has no route to it) and still uses
-    // the unexpired stored copy. Pin the behavior: no index fetch from
-    // the test server happens, only the archive fetch. A later explicit
-    // `plugin index refresh --index-url` fetches once.
-    let sidecar_path = index_dir.join("stored.json");
-    let raw = fs::read(&sidecar_path).expect("read sidecar");
-    let mut sidecar: serde_json::Value = serde_json::from_slice(&raw).expect("json");
-    let past = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("epoch")
-        .as_secs()
-        - 25 * DAY;
-    for key in ["official-v1", "official-v2"] {
-        if sidecar.get(key).is_some() {
-            sidecar[key] = serde_json::json!(past);
-        }
-    }
-    fs::write(&sidecar_path, serde_json::to_vec(&sidecar).expect("json")).expect("write sidecar");
-    fs::set_permissions(&sidecar_path, fs::Permissions::from_mode(0o600)).expect("sidecar mode");
+    // The clock is not injected: the sidecar's `stored_at` is aged on disk.
+    // The stale copy makes the install refresh once from the official URLs
+    // (the loopback server): the schema 2 document, then the archive.
+    rig.age_stored(STALE_AGE);
     rig.clear_requests();
-    // After aging, the by-id install refreshes once against the loopback
-    // official URL (injected for the test build): exactly one index fetch.
-    let output = rig
-        .install
-        .run_with_env(
-            &["plugin", "install", PACKAGE_ID, "--yes", "--json"],
-            &[
-                ("POHUNEK_TEST_OFFICIAL_INDEX_URL", &index_url),
-                ("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2", &index_url_v2),
-            ],
+    let run = rig
+        .run(
+            &["plugin", "install", PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
         )
         .await;
-    let _ = (&output.stdout, &output.stderr);
-    assert_eq!(output.status.code(), Some(0));
-    eprintln!(
-        "CLI stdout: {} stderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
     let third_requests = rig.server.requests();
     assert_eq!(
-        third_requests.first(),
-        Some(&"/official-index-v2.json".to_owned()),
-        "after aging the sidecar the install fetches the index exactly once: {third_requests:?}"
+        third_requests,
+        vec![INDEX_PATH_V2.to_owned(), archive_path("0.2.0")],
+        "a stale stored copy is refreshed exactly once"
     );
-    assert_eq!(third_requests.len(), 2, "{third_requests:?}");
     // An explicit refresh also fetches exactly once.
     rig.clear_requests();
     let (code, document) = rig
@@ -1385,66 +1559,29 @@ async fn a_context_entry_never_authorizes_a_runtime_archive() {
     rig.assert_nothing_installed().await;
 }
 
-/// N1: a daemon without the index channel reports neither install-index
-/// nor apply support; a by-id install is refused `plugin_index_unsupported`
-/// before any fetch, and the cadence/stored copy is not consulted.
+/// A daemon without the index channel refuses a by-id install before any
+/// fetch, with or without `--index-url`.
 #[tokio::test]
-async fn n1_no_apply_support_installs_via_base_stage() {
+async fn a_daemon_without_the_channel_refuses_a_by_id_install_before_any_fetch() {
     let keys = Keys::new();
     let install = Install::start_with_channel(&keys.anchor(), None).await;
     let server = Server::start();
+    let urls = [
+        (OFFICIAL_URL_V1_VARIABLE, server.url(INDEX_PATH)),
+        (OFFICIAL_URL_V2_VARIABLE, server.url(INDEX_PATH_V2)),
+    ];
+    let env: Vec<(&str, &str)> = urls.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let url = server.url(INDEX_PATH);
-    let (code, document) = install
-        .json(&[
-            "plugin",
-            "install",
-            PACKAGE_ID,
-            "--yes",
-            "--index-url",
-            &url,
-        ])
-        .await;
-    assert_eq!(code, 1, "{document}");
-    assert_eq!(err_code(&document), "plugin_index_unsupported");
-    assert!(server.requests().is_empty(), "{:?}", server.requests());
-    // A by-id install without --index-url also refuses before any fetch.
-    let (code, document) = install
-        .json(&["plugin", "install", PACKAGE_ID, "--yes"])
-        .await;
-    assert_eq!(code, 1, "{document}");
-    assert_eq!(err_code(&document), "plugin_index_unsupported");
-    assert!(server.requests().is_empty(), "{:?}", server.requests());
-}
-
-/// N1: with apply support and no stored copy, a failed refresh returns
-/// the refresh error code rather than `plugin_index_invalid`.
-#[tokio::test]
-async fn n1_failed_refresh_without_stored_copy_surfaces_refresh_error() {
-    let rig = Rig::start().await;
-    rig.publish(&[Listing::new(
-        "1.0.0",
-        rig.server.url(&archive_path("1.0.0")),
-    )]);
-    // No stored copy yet. The refresh must go to the production URL
-    // (no --index-url on the by-id install path); we simulate an
-    // unreachable network by using an invalid loopback port via the
-    // injected URL override in the refresh path — the by-id install
-    // itself has no override, so we assert the fallback error code is
-    // not `plugin_index_invalid` when the daemon rejects the refresh.
-    // Instead, test the explicit refresh error path directly:
-    let (code, document) = rig
-        .install
-        .json(&[
-            "plugin",
-            "index",
-            "refresh",
-            "--index-url",
-            "http://127.0.0.1:1/index.json",
-        ])
-        .await;
-    assert_eq!(code, 1, "{document}");
-    let code = err_code(&document).to_owned();
-    assert_ne!(code, "plugin_index_invalid", "refresh error is surfaced");
+    for extra in [&["--index-url", url.as_str()][..], &[][..]] {
+        let mut arguments = vec!["plugin", "install", PACKAGE_ID, "--yes"];
+        arguments.extend_from_slice(extra);
+        arguments.push("--json");
+        let output = install.run_with_env(&arguments, &env).await;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+        assert_eq!(err_code(&document), "plugin_index_unsupported");
+        assert!(server.requests().is_empty(), "{:?}", server.requests());
+    }
 }
 
 #[tokio::test]
@@ -1460,14 +1597,37 @@ async fn a_schema_2_index_still_installs_runtime_packages() {
     assert_eq!(rig.install.packages().await.len(), 1);
 }
 
-/// Serves `HostCapabilities` of a daemon that reads the plugin index but not
-/// its context entries, on `socket`, until the test process ends.
-fn serve_daemon_without_the_context_flag(socket: &std::path::Path) {
-    use protocol::{Request, Response, PROTOCOL_VERSION};
+/// What a fake daemon received.
+#[derive(Clone, Default)]
+struct Received {
+    methods: Arc<Mutex<Vec<String>>>,
+    installs: Arc<Mutex<Vec<Value>>>,
+}
 
+impl Received {
+    fn methods(&self) -> Vec<String> {
+        self.methods.lock().expect("methods").clone()
+    }
+
+    fn installs(&self) -> Vec<Value> {
+        self.installs.lock().expect("installs").clone()
+    }
+}
+
+/// Serves a daemon on `socket` until the test process ends: `host.inspect`
+/// reports `capabilities` on top of a bare host, `package.list` is empty,
+/// `package.install` and every other method answer an error. Every method it
+/// receives is recorded.
+fn serve_fake_daemon(socket: &std::path::Path, capabilities: Value) -> Received {
+    use protocol::{ErrorClass, ProtocolError, Request, Response, PROTOCOL_VERSION};
+
+    let received = Received::default();
     let listener = std::os::unix::net::UnixListener::bind(socket).expect("bind the daemon socket");
+    let shared = received.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let received = shared.clone();
+            let capabilities = capabilities.clone();
             std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream);
                 let mut line = String::new();
@@ -1478,28 +1638,58 @@ fn serve_daemon_without_the_context_flag(socket: &std::path::Path) {
                     }
                     let request: Request =
                         serde_json::from_str(line.trim_end()).expect("parse a request");
+                    received
+                        .methods
+                        .lock()
+                        .expect("methods")
+                        .push(request.method().to_owned());
                     let result = match request.method() {
-                        protocol::method::DAEMON_HEALTH => serde_json::json!({
+                        protocol::method::DAEMON_HEALTH => Ok(serde_json::json!({
                             "status": "ok",
                             "daemon_version": "fixture",
                             "protocol_version": PROTOCOL_VERSION.get()
-                        }),
-                        protocol::method::HOST_INSPECT => serde_json::json!({
-                            "daemon_version": "fixture",
-                            "protocol_version": PROTOCOL_VERSION.get(),
-                            "supported_agents": [],
-                            "runtimes": [],
-                            "git_available": false,
-                            "worktree_supported": false,
-                            "terminal_read_supported": false,
-                            "output_read_supported": false,
-                            "session_wait_supported": false,
-                            "package_install_index_supported": true
-                        }),
-                        other => panic!("the CLI sent an unexpected request: {other}"),
+                        })),
+                        protocol::method::HOST_INSPECT => {
+                            let mut host = serde_json::json!({
+                                "daemon_version": "fixture",
+                                "protocol_version": PROTOCOL_VERSION.get(),
+                                "supported_agents": [],
+                                "runtimes": [],
+                                "git_available": false,
+                                "worktree_supported": false,
+                                "terminal_read_supported": false,
+                                "output_read_supported": false,
+                                "session_wait_supported": false
+                            });
+                            for (name, value) in capabilities.as_object().expect("capabilities") {
+                                host[name] = value.clone();
+                            }
+                            Ok(host)
+                        }
+                        protocol::method::PACKAGE_LIST => {
+                            Ok(serde_json::json!({"generation": 0, "packages": []}))
+                        }
+                        other => {
+                            if other == protocol::method::PACKAGE_INSTALL {
+                                received
+                                    .installs
+                                    .lock()
+                                    .expect("installs")
+                                    .push(request.params().clone());
+                            }
+                            Err(ProtocolError::new(
+                                ErrorClass::Runtime,
+                                "fixture_request_refused",
+                                format!("the fixture daemon refuses {other}"),
+                                None,
+                            ))
+                        }
                     };
-                    let response = Response::ok(PROTOCOL_VERSION, request.id(), result)
-                        .expect("valid fixture response");
+                    let response = match result {
+                        Ok(value) => Response::ok(PROTOCOL_VERSION, request.id(), value),
+                        Err(error) => Response::err(PROTOCOL_VERSION, request.id(), error),
+                    }
+                    .expect("valid fixture response");
                     writeln!(
                         reader.get_mut(),
                         "{}",
@@ -1510,20 +1700,75 @@ fn serve_daemon_without_the_context_flag(socket: &std::path::Path) {
             });
         }
     });
+    received
+}
+
+/// A private environment whose control socket is served by a fake daemon.
+fn fake_daemon_env(capabilities: Value) -> (pohunek_test_support::env::TestEnv, Received) {
+    let env = pohunek_test_support::env::TestEnv::new().expect("private environment");
+    let runtime = env.runtime_dir().join("pohunek");
+    fs::create_dir(&runtime).expect("create the socket directory");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
+        .expect("make the socket directory private");
+    let received = serve_fake_daemon(&runtime.join("daemon.sock"), capabilities);
+    (env, received)
+}
+
+/// A daemon that reads the index but has no `plugin.index.apply` has no stored
+/// copy to read or refresh: a by-id install fetches the official index
+/// directly and hands the archive to `package.install`.
+#[test]
+fn a_daemon_without_apply_support_installs_through_the_direct_fetch() {
+    let (env, received) = fake_daemon_env(serde_json::json!({
+        "package_install_index_supported": true,
+        "package_index_apply_supported": false
+    }));
+    let keys = Keys::new();
+    let server = Server::start();
+    let listing = Listing::new("0.1.0", server.url(&archive_path("0.1.0")));
+    server.set(INDEX_PATH, Route::Body(keys.signed(vec![listing.entry()])));
+    server.set(&archive_path("0.1.0"), Route::Body(listing.archive.bytes));
+
+    let output = env
+        .command(bin_exe("pohunek"))
+        .args(["plugin", "install", PACKAGE_ID, "--yes", "--json"])
+        .env(OFFICIAL_URL_V1_VARIABLE, server.url(INDEX_PATH))
+        .env(OFFICIAL_URL_V2_VARIABLE, server.url(INDEX_PATH_V2))
+        .output()
+        .expect("run pohunek plugin install");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(err_code(&document), "fixture_request_refused", "{document}");
+    let methods = received.methods();
+    assert!(
+        methods
+            .iter()
+            .any(|m| m == protocol::method::PACKAGE_INSTALL),
+        "the CLI reached package.install: {methods:?}"
+    );
+    assert!(
+        !methods
+            .iter()
+            .any(|m| m == protocol::method::PLUGIN_INDEX_APPLY),
+        "no stored copy is refreshed on a daemon without apply support: {methods:?}"
+    );
+    let installs = received.installs();
+    assert_eq!(installs[0]["trust"]["kind"], "index", "{installs:?}");
+    assert_eq!(
+        server.requests(),
+        vec![INDEX_PATH.to_owned(), archive_path("0.1.0")],
+        "exactly the index and the archive are fetched"
+    );
 }
 
 /// A daemon that reads the index but not context entries refuses a context
 /// install before the CLI fetches anything.
 #[test]
 fn a_daemon_without_the_context_flag_refuses_a_context_install_before_any_fetch() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let env = pohunek_test_support::env::TestEnv::new().expect("private environment");
-    let runtime = env.runtime_dir().join("pohunek");
-    fs::create_dir(&runtime).expect("create the socket directory");
-    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
-        .expect("make the socket directory private");
-    serve_daemon_without_the_context_flag(&runtime.join("daemon.sock"));
+    let (env, _received) = fake_daemon_env(serde_json::json!({
+        "package_install_index_supported": true
+    }));
     let server = Server::start();
 
     let output = env
@@ -1552,4 +1797,535 @@ fn a_daemon_without_the_context_flag_refuses_a_context_install_before_any_fetch(
         "nothing is fetched: {:?}",
         server.requests()
     );
+}
+
+/// Package ids and runtime ids of the local community fixtures.
+const LOCAL_PACKAGE_ID: &str = "community.idxloc";
+const LOCAL_RUNTIME: &str = "idxloc";
+const RESERVED_PACKAGE_ID: &str = "pohunek.runtime.idxres";
+const RESERVED_RUNTIME: &str = "idxres";
+
+/// A by-id install with no stored copy and an unreachable official index
+/// reports the refresh failure, not an invalid index.
+#[tokio::test]
+async fn a_failed_refresh_without_a_stored_copy_reports_the_refresh_error() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("1.0.0")]);
+    rig.clear_stored();
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", PACKAGE_ID, "--yes"],
+            &Rig::dead_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 1, "{}", run.document);
+    assert_eq!(err_code(&run.document), "plugin_index_unavailable");
+    assert!(
+        rig.server.requests().is_empty(),
+        "{:?}",
+        rig.server.requests()
+    );
+    rig.assert_nothing_installed().await;
+}
+
+/// `--index-url` replaces the stored copy for one install: the given index is
+/// fetched and its version installed although a stored copy lists another.
+#[tokio::test]
+async fn an_index_url_install_bypasses_the_stored_copy() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    rig.refresh().await;
+    let newer = rig.listing("0.2.0");
+    rig.server.set(
+        "/other-index.json",
+        Route::Body(rig.keys.signed(vec![newer.entry()])),
+    );
+    rig.server.set(
+        &archive_path("0.2.0"),
+        Route::Body(newer.archive.bytes.clone()),
+    );
+    rig.clear_requests();
+
+    let other = rig.server.url("/other-index.json");
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            PACKAGE_ID,
+            "--index-url",
+            &other,
+            "--yes",
+        ])
+        .await;
+
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(
+        rig.server.requests(),
+        vec!["/other-index.json".to_owned(), archive_path("0.2.0")],
+        "the given index is fetched, the stored copy is not used"
+    );
+    assert_eq!(rig.selected_versions().await, ["0.2.0"]);
+}
+
+/// A stale stored copy whose refresh fails still serves the install, and the
+/// CLI says why the copy is stale.
+#[tokio::test]
+async fn an_unreachable_index_falls_back_to_the_unexpired_stored_copy() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    rig.refresh().await;
+    rig.age_stored(STALE_AGE);
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", PACKAGE_ID, "--yes"],
+            &Rig::dead_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert!(
+        run.stderr
+            .contains("warning: could not refresh the stored plugin index"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(rig.server.requests(), vec![archive_path("0.1.0")]);
+    assert_eq!(rig.selected_versions().await, ["0.1.0"]);
+}
+
+/// Contract scenario 1: a refresh stores the document, doctor reports the
+/// index as current and the daemon's high-water mark is the document sequence.
+#[tokio::test]
+async fn a_refresh_leaves_doctor_current_and_records_the_sequence() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+
+    let document = rig.refresh().await;
+
+    let sequence = document["ok"]["sequence"].as_u64().expect("sequence");
+    let (code, status, detail) = rig.doctor_index().await;
+    assert_eq!(
+        (status.as_str(), detail.as_str()),
+        ("ok", "current"),
+        "{code}"
+    );
+    assert_eq!(rig.index_high_water(), sequence);
+}
+
+/// Contract scenario 3: an index that expired after it was stored, with the
+/// official URL unreachable, fails the install with the refresh error; doctor
+/// only warns and the installed package keeps launching.
+#[tokio::test]
+async fn an_expired_stored_copy_and_an_unreachable_index_fail_with_the_refresh_error() {
+    let rig = Rig::start().await;
+    let listing = rig.listing("0.1.0");
+    rig.publish(std::slice::from_ref(&listing));
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(
+            rig.keys
+                .signed_living(SHORT_LIFETIME, vec![listing.entry()]),
+        ),
+    );
+    let sequence = rig.refresh().await["ok"]["sequence"]
+        .as_u64()
+        .expect("sequence");
+    rig.wait_for_expiry(sequence).await;
+
+    let (code, status, detail) = rig.doctor_index().await;
+    assert_eq!(status, "warn", "{detail}");
+    assert!(detail.starts_with("package_index_expired"), "{detail}");
+    assert_eq!(code, 0, "an expired index is a warning");
+    let run = rig
+        .run(
+            &["plugin", "install", PACKAGE_ID, "--yes"],
+            &Rig::dead_urls(),
+        )
+        .await;
+    assert_eq!(run.code, 1, "{}", run.document);
+    assert_eq!(err_code(&run.document), "plugin_index_unavailable");
+    assert!(rig.serves(RUNTIME).await, "the installed package launches");
+    assert_eq!(rig.selected_versions().await, ["0.1.0"]);
+}
+
+/// An expired stored copy is never fresh, however recently it was stored: the
+/// install refreshes with exactly one index fetch instead of failing on it.
+#[tokio::test]
+async fn an_expired_stored_copy_younger_than_a_day_is_refreshed() {
+    let rig = Rig::start().await;
+    let listing = rig.listing("0.1.0");
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(
+            rig.keys
+                .signed_living(SHORT_LIFETIME, vec![listing.entry()]),
+        ),
+    );
+    let sequence = rig.refresh().await["ok"]["sequence"]
+        .as_u64()
+        .expect("sequence");
+    rig.wait_for_expiry(sequence).await;
+    rig.publish(&[rig.listing("0.1.0"), rig.listing("0.2.0")]);
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert_eq!(
+        rig.server.requests(),
+        vec![INDEX_PATH_V2.to_owned(), archive_path("0.2.0")],
+        "one index fetch, then the archive"
+    );
+    assert_eq!(rig.selected_versions().await, ["0.2.0"]);
+}
+
+/// The schema 2 form of a runtime listing.
+fn runtime_entry_of_kind(listing: &Listing) -> IndexEntry {
+    let mut entry = listing.entry();
+    entry.kind = Some(IndexEntryKind::Runtime);
+    entry
+}
+
+/// A stored schema 1 copy cannot list a context package: the context install
+/// refreshes the schema 2 document instead of consulting it.
+#[tokio::test]
+async fn a_context_install_ignores_a_fresh_schema_1_stored_copy() {
+    let rig = Rig::start().await;
+    let runtime = rig.listing("0.1.0");
+    rig.publish(std::slice::from_ref(&runtime));
+    let context = context_archive("0.3.0");
+    rig.server.set(
+        INDEX_PATH_V2,
+        Route::Body(rig.keys.signed_v2(vec![
+            runtime_entry_of_kind(&runtime),
+            rig.context_entry(&context, "0.3.0"),
+        ])),
+    );
+    rig.server
+        .set(&archive_path("0.3.0"), Route::Body(context.bytes.clone()));
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    rig.refresh().await;
+    let sidecar = fs::read(rig.plugins_dir().join("index").join("stored.json")).expect("sidecar");
+    let sidecar: Value = serde_json::from_slice(&sidecar).expect("sidecar JSON");
+    assert!(sidecar.get("official-v1").is_some(), "{sidecar}");
+    assert!(sidecar.get("official-v2").is_none(), "{sidecar}");
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", CONTEXT_PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert_eq!(
+        rig.server.requests(),
+        vec![INDEX_PATH_V2.to_owned(), archive_path("0.3.0")]
+    );
+}
+
+/// A fresh stored copy that does not list the package makes the install
+/// refresh once and install what the refreshed index lists.
+#[tokio::test]
+async fn a_fresh_stored_copy_without_the_package_is_refreshed_once() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    rig.server
+        .set(INDEX_PATH, Route::Body(rig.keys.signed(Vec::new())));
+    rig.refresh().await;
+    // Younger than a day, yet older than the schema 2 copy the refresh stores.
+    rig.age_stored(DAY / 24);
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert_eq!(
+        rig.server.requests(),
+        vec![INDEX_PATH_V2.to_owned(), archive_path("0.1.0")]
+    );
+    assert_eq!(rig.selected_versions().await, ["0.1.0"]);
+}
+
+/// Contract scenario 5: an installed package that a later index no longer
+/// lists fails doctor with `package_revoked` but stays installed and served.
+#[tokio::test]
+async fn delisting_an_installed_package_fails_doctor_and_keeps_it_serving() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    rig.server
+        .set(INDEX_PATH, Route::Body(rig.keys.signed(Vec::new())));
+    rig.refresh().await;
+
+    let (code, status, detail) = rig.doctor_index().await;
+
+    assert_eq!(status, "fail", "{detail}");
+    assert!(detail.starts_with("package_revoked:"), "{detail}");
+    assert_ne!(code, 0, "a failed check fails doctor");
+    assert!(rig.serves(RUNTIME).await, "the delisted package launches");
+    let packages = rig.install.packages().await;
+    assert_eq!(packages.len(), 1, "{packages:?}");
+    assert_eq!(packages[0]["enabled"], true);
+    assert_eq!(packages[0]["selected"], true);
+}
+
+/// Contract scenario 6: an index that reserves the runtime id of a package
+/// installed earlier warns in doctor and leaves it serving, while a new local
+/// package, archive or directory, cannot claim the reserved id.
+#[tokio::test]
+async fn a_reserved_runtime_id_warns_and_refuses_new_local_claims() {
+    let rig = Rig::start().await;
+    let local = archive_of("community.idxres", RESERVED_RUNTIME, "1.0.0");
+    let local_file = rig.install.write("local.tar.zst", &local.bytes);
+    let path = |file: &PathBuf| file.to_str().expect("utf-8 path").to_owned();
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            &path(&local_file),
+            "--sha256",
+            local.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    assert!(rig.serves(RESERVED_RUNTIME).await);
+    let official = Listing::of(
+        RESERVED_PACKAGE_ID,
+        RESERVED_RUNTIME,
+        "1.0.0",
+        rig.server.url(&archive_path("1.0.0")),
+    );
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.signed(vec![official.entry()])),
+    );
+    rig.refresh().await;
+
+    let (code, status, detail) = rig.doctor_index().await;
+
+    assert_eq!(status, "warn", "{detail}");
+    assert!(
+        detail.starts_with("runtime_id_reserved_by_official:"),
+        "{detail}"
+    );
+    assert_eq!(code, 0, "a warning keeps doctor green");
+    assert!(
+        rig.serves(RESERVED_RUNTIME).await,
+        "the package installed before the reservation keeps launching"
+    );
+
+    let claim = archive_of("community.idxres2", RESERVED_RUNTIME, "1.0.0");
+    let claim_file = rig.install.write("claim.tar.zst", &claim.bytes);
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            &path(&claim_file),
+            "--sha256",
+            claim.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "package_runtime_not_claimable");
+
+    let directory = rig.install.env.root().join("claim-dir");
+    fs::create_dir_all(&directory).expect("create the package directory");
+    fs::write(
+        directory.join("runtime.toml"),
+        runtime_document_of("community.idxres3", RESERVED_RUNTIME, "1.0.0"),
+    )
+    .expect("write the descriptor");
+    fs::write(directory.join("detect.toml"), DETECT_MANIFEST).expect("write the detect manifest");
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "link",
+            directory.to_str().expect("utf-8 path"),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "package_runtime_not_claimable");
+    assert_eq!(rig.install.packages().await.len(), 1);
+}
+
+/// Contract scenario 7: a damaged stored document fails the doctor check,
+/// leaves the daemon answering, and the next refresh repairs it.
+#[tokio::test]
+async fn a_damaged_stored_document_fails_doctor_until_the_next_refresh() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    rig.refresh().await;
+    let stored = rig.plugins_dir().join("index").join("official-v1.json");
+    fs::write(&stored, b"corrupt").expect("corrupt the stored document");
+    fs::set_permissions(&stored, fs::Permissions::from_mode(0o600)).expect("mode");
+
+    let (_code, status, detail) = rig.doctor_index().await;
+    assert_eq!(status, "fail", "{detail}");
+    assert!(detail.starts_with("package_index_invalid:"), "{detail}");
+    assert!(rig.install.packages().await.is_empty());
+
+    rig.refresh().await;
+    let (_code, status, detail) = rig.doctor_index().await;
+    assert_eq!((status.as_str(), detail.as_str()), ("ok", "current"));
+}
+
+/// Plain mode bits of `path`.
+fn mode_of(path: &std::path::Path) -> u32 {
+    fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
+/// The files `--repair-state` preserved a damaged state file as.
+fn damaged_copies(rig: &Rig) -> Vec<PathBuf> {
+    fs::read_dir(rig.plugins_dir())
+        .expect("read the plugin root")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("index-state.json.damaged-"))
+        })
+        .collect()
+}
+
+/// A damaged `index-state.json` refuses a plain refresh with its own code;
+/// `--repair-state` preserves the damaged bytes with the same mode and
+/// replaces the file, after which plain refreshes work again.
+#[tokio::test]
+async fn repair_state_replaces_a_damaged_state_file() {
+    const DAMAGED: &[u8] = b"{not json";
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    let sequence = rig.refresh().await["ok"]["sequence"]
+        .as_u64()
+        .expect("sequence");
+    let state = rig.plugins_dir().join("index-state.json");
+    let mode = mode_of(&state);
+    fs::write(&state, DAMAGED).expect("corrupt the state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(mode)).expect("mode");
+
+    let (code, document) = rig.refresh_from(&rig.index_url(), &[]).await;
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "package_index_state_unreadable");
+    assert!(damaged_copies(&rig).is_empty());
+
+    let (code, document) = rig
+        .refresh_from(&rig.index_url(), &["--repair-state"])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let copies = damaged_copies(&rig);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(fs::read(&copies[0]).expect("read the copy"), DAMAGED);
+    assert_eq!(mode_of(&copies[0]), mode, "the copy keeps the file's mode");
+    assert!(rig.index_high_water() >= sequence);
+
+    let (code, document) = rig.refresh_from(&rig.index_url(), &[]).await;
+    assert_eq!(code, 0, "{document}");
+}
+
+/// `--repair-state` never accepts a document below the stored verified copy:
+/// the damaged file stays where it is.
+#[tokio::test]
+async fn repair_state_refuses_a_document_below_the_stored_copy() {
+    const DAMAGED: &[u8] = b"{not json";
+    let rig = Rig::start().await;
+    let listing = rig.listing("0.1.0");
+    rig.publish(std::slice::from_ref(&listing));
+    let sequence = rig.refresh().await["ok"]["sequence"]
+        .as_u64()
+        .expect("sequence");
+    let state = rig.plugins_dir().join("index-state.json");
+    let mode = mode_of(&state);
+    fs::write(&state, DAMAGED).expect("corrupt the state");
+    fs::set_permissions(&state, fs::Permissions::from_mode(mode)).expect("mode");
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(
+            rig.keys
+                .document(&rig.keys.key, sequence - 1_000, vec![listing.entry()]),
+        ),
+    );
+
+    let (code, document) = rig
+        .refresh_from(&rig.index_url(), &["--repair-state"])
+        .await;
+
+    assert_eq!(code, 1, "{document}");
+    assert_eq!(err_code(&document), "package_index_rollback");
+    assert!(damaged_copies(&rig).is_empty(), "nothing was moved aside");
+    assert_eq!(fs::read(&state).expect("read the state"), DAMAGED);
+}
+
+/// A `--sha256` install and update need no index channel: a host without the
+/// channel file updates a local archive to a newer version.
+#[tokio::test]
+async fn a_sha256_update_works_on_a_host_without_the_index_channel() {
+    let keys = Keys::new();
+    let install = Install::start_with_channel(&keys.anchor(), None).await;
+    let first = archive_of(LOCAL_PACKAGE_ID, LOCAL_RUNTIME, "0.1.0");
+    let second = archive_of(LOCAL_PACKAGE_ID, LOCAL_RUNTIME, "0.2.0");
+    let first_file = install.write("0.1.0.tar.zst", &first.bytes);
+    let second_file = install.write("0.2.0.tar.zst", &second.bytes);
+    let path = |file: &PathBuf| file.to_str().expect("utf-8 path").to_owned();
+
+    let (code, document) = install
+        .json(&[
+            "plugin",
+            "install",
+            &path(&first_file),
+            "--sha256",
+            first.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let (code, document) = install
+        .json(&[
+            "plugin",
+            "update",
+            LOCAL_PACKAGE_ID,
+            &path(&second_file),
+            "--sha256",
+            second.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+
+    assert_eq!(code, 0, "{document}");
+    let selected: Vec<_> = install
+        .packages()
+        .await
+        .into_iter()
+        .filter(|package| package["selected"] == true)
+        .collect();
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    assert_eq!(selected[0]["package"]["version"], "0.2.0");
 }

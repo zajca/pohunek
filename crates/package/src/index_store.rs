@@ -152,7 +152,7 @@ impl Registry {
     ///
     /// The caller must have verified the bytes and checked the rollback
     /// against the persisted marks before calling; this only writes. A
-    /// damaged sidecar is replaced by a valid refresh (scenario 7).
+    /// damaged sidecar is replaced by a valid refresh.
     pub fn store_index(
         &self,
         schema_version: u64,

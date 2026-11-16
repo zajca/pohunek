@@ -483,16 +483,25 @@ in `index-state.json`: the declared runtime ids of every verified document ever
 stored. `plugin.index.apply` (the CLI's `plugin index refresh`) verifies and
 stores; a by-id install stores the verified document whenever it raises the
 index marks, so the stored copy never stays below the marks. The CLI refreshes
-on demand only: it uses the stored copy when younger than 24h, refreshes when
-older, and surfaces refresh failures as a warning while still falling back to
-the unexpired stored copy on a miss only. `--index-url` replaces the stored
-copy for that install. A local (`--sha256`/`link`) install whose declared
-runtime id is in `reserved_runtime_ids` is refused with
-`package_runtime_not_claimable` (data-driven, no package-id prefix check); a
-damaged `index-state.json` refuses the same way with
-`package_index_state_unreadable` until `pohunek plugin index refresh --repair-state` replaces it (plain refresh refuses a damaged file; wrong mode/owner gets a distinct detail).
+on demand only: it uses the stored copy when it is unexpired, younger than
+24h and of the schema the package needs (a context package needs the schema 2
+copy), and refreshes first otherwise. A failed refresh falls back to an
+unexpired stored copy with a warning, and without one returns the refresh
+error; a fresh copy that does not list the package triggers one refresh.
+`--index-url` bypasses the stored copy for that install. A local
+(`--sha256`/`link`) install whose declared runtime id is in
+`reserved_runtime_ids` is refused with `package_runtime_not_claimable`
+(data-driven, no package-id prefix check). An `index-state.json` that is
+damaged, of an unsupported schema or has the wrong mode or owner refuses local
+installs, links and refreshes with `package_index_state_unreadable`.
+`pohunek plugin index refresh --repair-state` repairs a damaged or
+unsupported-schema file: it verifies the fetched document against the stored
+verified copy (a lower sequence is `package_index_rollback`), commits the new
+state first, and keeps the damaged bytes as `index-state.json.damaged-<unix-ts>`
+with the same mode. A wrong mode or owner is never repaired.
 Doctor verifies the stored copy: `current`, `stale`, `package_index_expired`,
-`package_index_invalid`, `package_revoked` (index-provenance delisting only;
+`package_index_invalid`, `package_index_state_unreadable`, `not_refreshed` (an index-origin
+package and no stored copy), `package_revoked` (index-provenance delisting only;
 catalog-provenance bundled runtimes are never checked here), or
 `runtime_id_reserved_by_official` (local-provenance holder of a reserved id).
 

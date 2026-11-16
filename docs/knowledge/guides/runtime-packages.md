@@ -854,7 +854,7 @@ repeating the command; the CLI never retries an install on its own.
   signature, the revocations and the archive digest. The CLI checks
   `host.inspect` for `package_install_index_supported` before it fetches
   anything and fails with `plugin_index_unsupported` when it is absent, which
-  means a daemon older than 0.44 or a host without the channel file. A
+  means a daemon older than 0.40 or a host without the channel file. A
   `pohunek.context.*` reference also needs `package_install_index_context_supported`
   (`plugin_index_context_unsupported` when absent) and is resolved from the
   schema 2 document `official-index-v2.json` only; a runtime reference reads

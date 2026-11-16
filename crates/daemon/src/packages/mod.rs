@@ -64,7 +64,7 @@ use protocol::{
 };
 use tracing::warn;
 
-use self::error::{registry_kind, rejection_kind};
+use self::error::{index_state_kind, registry_kind, rejection_kind};
 use self::fault::fault_of;
 use self::selection::{block_of, conflict, declared_by, Integration, Integrations};
 use self::source::{build_directory, read_archive_file, read_regular_file};
@@ -106,7 +106,7 @@ struct Prepared {
     /// install.
     index: Option<VerifiedIndex>,
     /// Exact index bytes, stored alongside the marks so the stored copy
-    /// never stays below them .
+    /// never stays below them.
     index_bytes: Option<Vec<u8>>,
 }
 
@@ -127,7 +127,7 @@ struct CommandsPrepared {
     /// install; only a context package authorized by the index has one.
     index: Option<VerifiedIndex>,
     /// Exact index bytes, stored alongside the marks so the stored copy
-    /// never stays below them .
+    /// never stays below them.
     index_bytes: Option<Vec<u8>>,
 }
 
@@ -936,19 +936,23 @@ fn check_claim(
     authority: Authority,
 ) -> Result<(), PackageErrorKind> {
     let runtime_id = definition.runtime_id();
-    decide_claim(
-        runtime_id,
-        package,
-        authority,
-        runtimes.served_by(runtime_id).as_ref(),
+    let served_by = runtimes.served_by(runtime_id);
+    decide_claim(runtime_id, package, authority, served_by.as_ref()).map_err(
+        |refusal| match refusal {
+            ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
+            ClaimRefusal::Conflict => {
+                // The wire error carries a code only; the log names the holder the
+                // operator has to remove.
+                warn!(
+                    runtime_id = %runtime_id,
+                    package = %package,
+                    served_by = ?served_by,
+                    "package_runtime_conflict: remove the package that serves the runtime id"
+                );
+                PackageErrorKind::RuntimeConflict
+            }
+        },
     )
-    .map_err(|refusal| match refusal {
-        ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
-        ClaimRefusal::Conflict => {
-            warn!(runtime_id = %runtime_id, package = %package, "package_runtime_conflict");
-            PackageErrorKind::RuntimeConflict
-        }
-    })
 }
 
 /// Proves that the installed package `digest` still loads and, when it
@@ -1090,16 +1094,9 @@ fn prepare_archive(
             let catalog_state = registry
                 .catalog_state()
                 .map_err(|error| registry_kind(&error))?;
-            // A damaged/unreadable index state is `package_index_state_unreadable`,
-            // never `package_registry_failed` (fail-closed).
-            let index_state = registry.index_state().map_err(|error| match error {
-                RegistryError::Busy => PackageErrorKind::Busy,
-                RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
-                    PackageErrorKind::IndexStateUnreadable
-                }
-                RegistryError::Unsafe => PackageErrorKind::IndexStateUnreadable,
-                _ => PackageErrorKind::RegistryFailed,
-            })?;
+            let index_state = registry
+                .index_state()
+                .map_err(|error| index_state_kind(&error))?;
             let candidate = prepare_indexed(
                 &IndexTrustInputs {
                     anchor,
@@ -1413,7 +1410,7 @@ struct Install {
     /// install.
     index: Option<VerifiedIndex>,
     /// Exact index bytes, stored alongside the marks so the stored copy
-    /// never stays below them .
+    /// never stays below them.
     index_bytes: Option<Vec<u8>>,
     /// The integration the package declares; none for a package without a
     /// runtime.
@@ -1599,14 +1596,17 @@ fn install_package(
         registry
             .record_index(index)
             .map_err(|error| registry_kind(&error))?;
-        // the stored copy follows the marks in the same install, so a
-        // staged-index install never leaves the stored copy below them.
+        // The stored copy follows the marks in the same install. A failed
+        // write leaves the marks raised and the copy absent or older, which
+        // the next refresh and doctor report; it never fails the install.
         if let Some(index_bytes) = index_bytes.as_ref() {
-            let schema_version =
-                parse_index_envelope(index_bytes).map_or(1, |envelope| envelope.schema_version);
-            registry
-                .store_index(schema_version, index, index_bytes, now)
-                .map_err(|error| registry_kind(&error))?;
+            let schema_version = parse_index_envelope(index_bytes)
+                .map_or(package::INDEX_SCHEMA_VERSION, |envelope| {
+                    envelope.schema_version
+                });
+            if let Err(error) = registry.store_index(schema_version, index, index_bytes, now) {
+                warn!(%error, "the plugin index was verified but its stored copy was not written");
+            }
         }
     }
     let report = registry
@@ -1648,17 +1648,8 @@ fn install_package(
     })
 }
 
-/// Refuses a local (digest/link) package whose declared runtime id was
-/// reserved by a verified official index.
-///
-/// The check is data-driven only: the runtime id the descriptor declares
-/// must be in the accumulated `reserved_runtime_ids`. The package id is
-/// irrelevant, so the guard cannot be bypassed by renaming the package.
-/// The compiled floor (`shell`, `codex`, `claude`, `hermes`)
-/// is refused by `LocalTrust` independently of any stored index; the Pi
-/// `--sha256` flow works until a verified index has listed `pi`.
-/// The shared reserved-runtime predicate used by the install guard and
-/// the doctor check: the descriptor's declared runtime id belongs to the
+/// The shared reserved-runtime predicate used by the install guard and the
+/// doctor check: the descriptor's declared runtime id belongs to the
 /// accumulated reserved set.
 #[must_use]
 pub(crate) fn is_reserved_runtime_id(
@@ -1668,6 +1659,15 @@ pub(crate) fn is_reserved_runtime_id(
     reserved_runtime_ids.contains(runtime_id)
 }
 
+/// Refuses a local (digest/link) package whose declared runtime id was
+/// reserved by a verified official index.
+///
+/// The check is data-driven only: the runtime id the descriptor declares
+/// must be in the accumulated `reserved_runtime_ids`. The package id is
+/// irrelevant, so the guard cannot be bypassed by renaming the package.
+/// The compiled floor (`shell`, `codex`, `claude`, `hermes`) is refused by
+/// `LocalTrust` independently of any stored index; the Pi `--sha256` flow
+/// works until a verified index has listed `pi`.
 fn refuse_reserved_runtime(
     context: &Context,
     package_id: &PackageId,
@@ -1677,13 +1677,7 @@ fn refuse_reserved_runtime(
         .store
         .registry()
         .index_state()
-        .map_err(|error| match error {
-            RegistryError::Busy => PackageErrorKind::Busy,
-            RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
-                PackageErrorKind::IndexStateUnreadable
-            }
-            _ => PackageErrorKind::RegistryFailed,
-        })?;
+        .map_err(|error| index_state_kind(&error))?;
     if is_reserved_runtime_id(&state.reserved_runtime_ids, runtime_id) {
         warn!(
             package = %package_id,
@@ -1710,7 +1704,6 @@ impl PackageService {
     /// [`PackageErrorKind::IndexRollback`] for a sequence below the recorded
     /// high-water marks, and [`PackageErrorKind::IndexChannelMissing`] when
     /// no index channel is loaded.
-    #[allow(clippy::too_many_lines, reason = "apply + repair in one transaction")]
     pub async fn package_index_apply(
         &self,
         params: PluginIndexApplyParams,
@@ -1724,23 +1717,39 @@ impl PackageService {
             let catalog_state = registry
                 .catalog_state()
                 .map_err(|error| registry_kind(&error))?;
-            // A damaged/unreadable index state is `package_index_state_unreadable`,
-            // never `package_registry_failed` (fail-closed).
-            let index_state = registry.index_state().map_err(|error| match error {
-                RegistryError::Busy => PackageErrorKind::Busy,
-                RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
-                    PackageErrorKind::IndexStateUnreadable
-                }
-                RegistryError::Unsafe => PackageErrorKind::IndexStateUnreadable,
-                _ => PackageErrorKind::RegistryFailed,
-            });
             let repair = params.repair_state;
-            let index_state = match index_state {
+            let stored_at = unix_now()?;
+            // Documents the host stored and verified earlier; they bound a
+            // repair from below.
+            let mut stored_verified = Vec::new();
+            let index_state = match registry.index_state() {
                 Ok(state) => state,
-                Err(PackageErrorKind::IndexStateUnreadable) if repair => {
-                    package::IndexVerifierState::default()
+                Err(RegistryError::Corrupt | RegistryError::UnsupportedSchema) if repair => {
+                    for schema in [
+                        package::INDEX_SCHEMA_VERSION,
+                        package::INDEX_SCHEMA_VERSION_2,
+                    ] {
+                        let Ok(Some(stored)) = registry.stored_index(schema) else {
+                            continue;
+                        };
+                        if let Ok(document) = trust::verify_index_for_apply(
+                            &stored.bytes,
+                            endorser,
+                            anchor,
+                            &catalog_state,
+                            &package::IndexVerifierState::default(),
+                            stored.stored_at,
+                        ) {
+                            stored_verified.push(document);
+                        }
+                    }
+                    // The fetched document is verified against what the stored
+                    // copies already established, so a lower one is refused as
+                    // a rollback and the repair never lowers a mark.
+                    package::registry::Registry::state_of_documents(&stored_verified)
+                        .map_err(|error| registry_kind(&error))?
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(index_state_kind(&error)),
             };
             let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
             let bytes = read_regular_file(&params.index_path, max)
@@ -1751,7 +1760,7 @@ impl PackageService {
                 anchor,
                 &catalog_state,
                 &index_state,
-                unix_now()?,
+                stored_at,
             )?;
             // Explicit rollback defence: record_index would silently no-op.
             if index_state
@@ -1767,53 +1776,14 @@ impl PackageService {
                 .map_or(package::INDEX_SCHEMA_VERSION, |envelope| {
                     envelope.schema_version
                 });
-            let stored_at = unix_now()?;
-            // Marks first, like the install path: if record_index fails, the
-            // stored document must not become newer than the marks. When
-            // `repair_state` is set and the state was damaged, repair moves
-            // the file aside and re-derives marks as max(fetched, stored).
+            // Marks first, like the install path: if recording fails, the
+            // stored document must not become newer than the marks.
             if repair {
-                if registry.index_state().is_err() {
-                    let stored_verified = registry.stored_index(schema_version).ok().flatten();
-                    let stored_verified = match stored_verified {
-                        Some(stored) => {
-                            let state = package::IndexVerifierState::default();
-                            trust::verify_index_for_apply(
-                                &stored.bytes,
-                                endorser,
-                                anchor,
-                                &catalog_state,
-                                &state,
-                                stored_at,
-                            )
-                            .ok()
-                        }
-                        None => None,
-                    };
-                    let empty_state = package::IndexVerifierState::default();
-                    let stored_ref = stored_verified
-                        .as_ref()
-                        .map(|verified| (verified, &empty_state));
-                    registry.repair_index_state(&verified, stored_ref).map_err(
-                        |error| match error {
-                            RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
-                                PackageErrorKind::IndexStateUnreadable
-                            }
-                            RegistryError::Unsafe => PackageErrorKind::IndexStateUnreadable,
-                            RegistryError::Busy => PackageErrorKind::Busy,
-                            other => registry_kind(&other),
-                        },
-                    )?;
-                } else {
-                    registry
-                        .record_index(&verified)
-                        .map_err(|error| registry_kind(&error))?;
-                }
+                registry.repair_index_state(&verified, &stored_verified)
             } else {
-                registry
-                    .record_index(&verified)
-                    .map_err(|error| registry_kind(&error))?;
+                registry.record_index(&verified)
             }
+            .map_err(|error| index_state_kind(&error))?;
             registry
                 .store_index(schema_version, &verified, &bytes, stored_at)
                 .map_err(|error| registry_kind(&error))?;
