@@ -1232,7 +1232,7 @@ struct SessionEntry {
     /// The `[rights]` of the session's profile at launch. A record written
     /// before the field existed has none, and the session takes the profile
     /// file as it reads at its first use.
-    launch_rights: Option<ProfileRights>,
+    launch_rights: Option<Box<ProfileRights>>,
 }
 
 /// Discovery inventory as the session tests read it.
@@ -2511,7 +2511,7 @@ impl SessionRegistry {
             runtime,
             active_agent_origin: active_agent_origin(entry),
             create_request: entry.create_request.clone(),
-            launch_rights: entry.launch_rights.as_ref().map(ProfileRights::to_record),
+            launch_rights: entry.launch_rights.as_deref().map(ProfileRights::to_record),
         }
     }
 
@@ -7665,16 +7665,15 @@ impl SessionRegistry {
             Ok(None) => base.clone(),
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
-        let outcome = self
-            .commit_runtime_transition(
-                id,
-                expected,
-                &base,
-                &durable_base,
-                candidate,
-                RuntimeMetadataPolicy::Live,
-            )
-            .await;
+        let outcome = Box::pin(self.commit_runtime_transition(
+            id,
+            expected,
+            &base,
+            &durable_base,
+            candidate,
+            RuntimeMetadataPolicy::Live,
+        ))
+        .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(error) = &outcome {
             warn!(session_id = %id.0, error = %error, "failed to persist reconnected worker");
         }

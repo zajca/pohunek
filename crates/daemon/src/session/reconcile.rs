@@ -1523,7 +1523,7 @@ impl SessionRegistry {
         let mut record = match self.roll_back_undelivered_create(record).await {
             UndeliveredCreate::Proceed(record) => record,
             UndeliveredCreate::Pending(record) => {
-                self.hold_pending_unpersisted(record, retry).await;
+                Box::pin(self.hold_pending_unpersisted(record, retry)).await;
                 return true;
             }
             UndeliveredCreate::Gone(id) => {
@@ -4397,7 +4397,7 @@ impl SessionRegistry {
             launch_rights: record
                 .launch_rights
                 .as_ref()
-                .map(ProfileRights::from_record),
+                .map(|held| Box::new(ProfileRights::from_record(held))),
         };
         let listed = record.clone();
         match self.write_record_and_install(&id, record, entry).await {
@@ -4751,7 +4751,7 @@ impl SessionRegistry {
             launch_rights: record
                 .launch_rights
                 .as_ref()
-                .map(ProfileRights::from_record),
+                .map(|held| Box::new(ProfileRights::from_record(held))),
         };
         (record, entry)
     }

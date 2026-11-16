@@ -208,7 +208,7 @@ impl SessionRegistry {
         let held = sessions
             .get_mut(id)?
             .launch_rights
-            .get_or_insert_with(|| live.clone());
+            .get_or_insert_with(|| Box::new(live.clone()));
         Some(held.narrowed_by(&live))
     }
 

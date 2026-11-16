@@ -187,12 +187,11 @@ async fn a_live_session_without_a_verified_root_leaves_outside_callers_unattribu
         "a launched session has verified roots"
     );
 
-    {
-        let mut sessions = fixture.registry.inner.sessions.lock().await;
-        let entry = sessions.get_mut(&id).expect("the session is held");
-        entry.root_process = None;
-        entry.worker_root = None;
-    }
+    let mut sessions = fixture.registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&id).expect("the session is held");
+    entry.root_process = None;
+    entry.worker_root = None;
+    drop(sessions);
     let (class, keep) = fixture.registry.classify_caller(&outside).await;
     assert_eq!(class, CallerClass::Unattributed);
     assert!(!keep, "the placement is made again on the next request");
@@ -200,7 +199,7 @@ async fn a_live_session_without_a_verified_root_leaves_outside_callers_unattribu
         fixture.registry.unverified_root_sessions().await,
         vec![id.clone()]
     );
-    let check = crate::doctor::session_rights_check(false, &[id.clone()]);
+    let check = crate::doctor::session_rights_check(false, std::slice::from_ref(&id));
     assert_eq!(check.status, protocol::DoctorStatus::Fail);
     assert!(check.detail.contains(&id.0), "{}", check.detail);
 

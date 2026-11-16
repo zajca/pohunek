@@ -1192,7 +1192,7 @@ impl SessionRegistry {
             create_request,
             root_process: Some(started.root_process),
             worker_root: Some(started.worker_root),
-            launch_rights: Some(self.profile_rights(&info.agent).await),
+            launch_rights: Some(Box::new(self.profile_rights(&info.agent).await)),
         };
         #[cfg(test)]
         self.hold_launch_commit().await;
