@@ -197,8 +197,9 @@ names its step in the evidence:
    nothing. A context entry has no runtime: the inspect reports the package
    enabled and selected without a `runtime_id` and without a fault, and a
    `pohunek.context.assistant` entry also renders the assistant prompt
-   (`assistant help --print-prompt --json`; a rig with no agents passes when
-   that fails with `no_capable_agent`).
+   (`assistant help --agent prove-assistant --print-prompt --json`) through a
+   stub agent the rig writes before the daemon starts, so the readback
+   touches the installed package.
 6. `cleanup`: the daemon stops and the root is removed. A failure here is a
    failure of the proof, also when the earlier steps passed.
 

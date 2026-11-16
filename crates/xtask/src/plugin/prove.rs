@@ -206,6 +206,32 @@ fn fail(step: Step) -> impl Fn(String) -> Verdict {
     move |detail| Verdict { step, detail }
 }
 
+/// Writes a host profile that selects `program` explicitly, so the assistant
+/// readback of a context proof runs against a capable agent: `no_capable_agent`
+/// can no longer stand in for a package the rig never read. The profile names
+/// its base runtime only to stay resolvable; `--print-prompt` starts no
+/// session, so the stub program never runs.
+fn write_stub_agent_profile(root: &Root, program: &Path) -> Result<(), String> {
+    let agents = root.config_home().join("agents");
+    create_directory(&agents)?;
+    fs::write(
+        agents.join("prove-assistant.toml"),
+        format!("base = \"shell\"\nprogram = \"{}\"\n", program.display()),
+    )
+    .map_err(|error| format!("cannot write the stub agent profile: {error}"))
+}
+
+/// Writes the stub program the assistant readback selects: it exits at once,
+/// so a launch that reached it would fail instead of passing silently.
+fn write_stub_agent_program(root: &Root) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = root.path().join("prove-assistant-agent");
+    fs::write(&path, "#!/bin/sh\nexit 3\n")
+        .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o755)))
+        .map_err(|error| format!("cannot write the stub agent program: {error}"))?;
+    Ok(path)
+}
+
 /// Runs the steps in order. The isolation root exists only after the digest
 /// step passed, and is removed on every path.
 fn run_steps(
@@ -249,6 +275,17 @@ fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), Stri
         if entry.runtime_id.is_some() {
             return Err("a context entry names no runtime".to_owned());
         }
+        let descriptor = verified
+            .entries()
+            .iter()
+            .find(|entry| entry.path == crate::catalog::DESCRIPTOR_PATH)
+            .ok_or_else(|| "the archive has no `runtime.toml`".to_owned())?;
+        let (_package_id, _version, table) =
+            crate::catalog::descriptor_package(&descriptor.contents)
+                .map_err(|error| error.to_string())?;
+        if table.get("runtime").is_some() || table.get("context").is_none() {
+            return Err("the archive is not a context package".to_owned());
+        }
         let (package_id, version) =
             crate::catalog::archive_package(&verified, Path::new("archive"))
                 .map_err(|error| error.to_string())?;
@@ -285,6 +322,10 @@ fn prove_in(
     )
     .map_err(fail(Step::Host))?;
     outcome.core_version = Some(host.core_version().map_err(fail(Step::Host))?);
+    if entry.kind() == package::IndexEntryKind::Context {
+        let stub = write_stub_agent_program(root).map_err(fail(Step::Host))?;
+        write_stub_agent_profile(root, &stub).map_err(fail(Step::Host))?;
+    }
     host.launch_local_only(root).map_err(fail(Step::Host))?;
 
     let archive_path = write_archive(archive, root).map_err(fail(Step::Install))?;
@@ -392,9 +433,10 @@ fn install(
 /// package doctor finds nothing. A context entry has no runtime, so the
 /// runtime invocation is replaced by reading the package back: inspect must
 /// report it enabled and selected without a fault, and the assistant entry
-/// must render its prompt (a proof rig holds no agents, so the readiness
-/// probe fails closed: `no_capable_agent` passes, while a missing or damaged
-/// assistant package fails).
+/// must render its prompt through the stub agent the rig writes before the
+/// daemon starts, so the readback touches the installed package. The stub
+/// never launches (`--print-prompt` starts no session); a missing or damaged
+/// assistant package fails, and so does a prompt the daemon cannot compose.
 fn inspect(host: &mut Host, entry: &package::IndexEntry) -> Result<(), String> {
     let output = host.cli(&["plugin", "inspect", entry.package_id.as_str(), "--json"])?;
     let inspected = json_result(&output, "`pohunek plugin inspect`")?;
@@ -412,22 +454,17 @@ fn inspect(host: &mut Host, entry: &package::IndexEntry) -> Result<(), String> {
             );
         }
         if entry.package_id.as_str() == protocol::ASSISTANT_CONTEXT_PACKAGE_ID {
-            let output = host.cli(&["assistant", "help", "--print-prompt", "--json"])?;
-            if output.code == Some(0) {
-                let printed = json_result(&output, "`pohunek assistant help --print-prompt`")?;
-                if printed["prompt"].as_str().is_none_or(str::is_empty) {
-                    return Err("the assistant package printed no prompt".to_owned());
-                }
-            } else {
-                let document: Value = serde_json::from_slice(&output.stdout).map_err(|_error| {
-                    "`pohunek assistant help --print-prompt` printed no JSON document".to_owned()
-                })?;
-                if document["err"]["code"] != "no_capable_agent" {
-                    return Err(format!(
-                        "the assistant package does not render: {}",
-                        document["err"]["code"].as_str().unwrap_or("no error code")
-                    ));
-                }
+            let output = host.cli(&[
+                "assistant",
+                "help",
+                "--agent",
+                "prove-assistant",
+                "--print-prompt",
+                "--json",
+            ])?;
+            let printed = json_result(&output, "`pohunek assistant help --print-prompt`")?;
+            if printed["prompt"].as_str().is_none_or(str::is_empty) {
+                return Err("the assistant package printed no prompt".to_owned());
             }
         }
     } else {

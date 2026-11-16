@@ -162,24 +162,53 @@ impl Plugin {
     }
 
     /// A context package directory: a descriptor with no runtime plus the
-    /// assistant prompt contract, so even the assistant step can run.
+    /// assistant prompt contract, so even the assistant step can run. The
+    /// `without_prompt` variant omits `assistant/system.md`, so the
+    /// assistant readback has a damaged package to refuse.
     fn context_package(&self, name: &str, package_id: &str, version: &str) -> PathBuf {
+        self.context_package_as(name, package_id, version, true)
+    }
+
+    fn context_package_as(
+        &self,
+        name: &str,
+        package_id: &str,
+        version: &str,
+        with_prompt: bool,
+    ) -> PathBuf {
+        self.context_package_with_descriptor(name, package_id, version, with_prompt, None)
+    }
+
+    /// Like [`Self::context_package_as`], with the descriptor body replaced
+    /// by `descriptor` when it is `Some`.
+    fn context_package_with_descriptor(
+        &self,
+        name: &str,
+        package_id: &str,
+        version: &str,
+        with_prompt: bool,
+        descriptor: Option<&str>,
+    ) -> PathBuf {
         let dir = self.dir(name);
-        fs::write(
-            dir.join("runtime.toml"),
-            format!(
+        let descriptor = descriptor.map_or_else(
+            || {
+                format!(
                 "schema = 1\nid = \"{package_id}\"\nversion = \"{version}\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n"
-            ),
-        )
-        .expect("write the descriptor");
+            )
+            },
+            str::to_owned,
+        );
+        fs::write(dir.join("runtime.toml"), descriptor).expect("write the descriptor");
         let bundle = dir.join("bundle");
         fs::create_dir_all(bundle.join("assistant")).expect("bundle directories");
         fs::write(bundle.join("index.md"), "# Index\n").expect("write the index");
-        fs::write(
-            bundle.join("assistant/system.md"),
-            "---\ntype: PromptTemplate\nid: assistant/system\ntitle: Contract\ndescription: Fixture contract.\nsource_kind: manual\nintents: [help]\n---\n\n## Safety\n\n- Never print secrets.\n\n## Navigation\n\n1. Start at the index.\n",
-        )
-        .expect("write the prompt contract");
+        if with_prompt {
+            fs::write(
+                bundle.join("assistant/system.md"),
+                "---\ntype: PromptTemplate\nid: assistant/system\ntitle: Contract\ndescription: Fixture contract.\nsource_kind: manual\nintents: [help]\n---\n\n## Safety\n\n- Never print secrets.\n\n## Navigation\n\n1. Start at the index.\n",
+            )
+            .expect("write the prompt contract");
+        }
         dir
     }
 
@@ -551,6 +580,64 @@ fn the_assistant_context_entry_proves_by_printing_its_prompt() {
     let document = evidence_of(&evidence);
     assert_eq!(document["result"], "pass");
     assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn an_assistant_package_without_its_prompt_contract_fails_at_inspect() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package_as(
+        "damaged-assistant-package",
+        "pohunek.context.assistant",
+        "0.42.0",
+        false,
+    );
+    let (archive, digest) = plugin.build_as(
+        &package,
+        "built",
+        "pohunek.context.assistant-0.42.0.tar.zst",
+    );
+    let entry = plugin.context_entry(
+        "damaged-assistant-entry.toml",
+        "pohunek.context.assistant",
+        &digest,
+        "0.42.0",
+    );
+    let evidence = plugin.path("damaged-assistant-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "inspect");
+    assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn a_context_package_with_a_runtime_descriptor_fails_at_digest() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package_with_descriptor(
+        "runtime-shaped-context-package",
+        "pohunek.context.fixture",
+        "0.2.0",
+        true,
+        Some(
+            "schema = 1\nid = \"pohunek.context.fixture\"\nversion = \"0.2.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[runtime]\nprogram = \"true\"\n\n[context]\ndir = \"bundle\"\n",
+        ),
+    );
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "runtime-shaped-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let evidence = plugin.path("runtime-shaped-context-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 

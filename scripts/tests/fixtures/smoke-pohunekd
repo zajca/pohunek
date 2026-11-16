@@ -20,10 +20,28 @@ if [[ "$mode" == exits ]]; then
   exit 97
 fi
 
+if [[ "$mode" == refuses-local-only ]]; then
+  ready="$XDG_RUNTIME_DIR/pohunek/daemon.ready"
+  mkdir -p "${ready%/*}"
+  : > "$ready"
+  printf 'controlled daemon pid %s\n' "$$"
+  printf '%s\n' 'overlay flag ignored'
+  sleeper=""
+  trap 'rm -f "$ready"; exit 0' TERM
+  while true; do
+    sleep 1 &
+    sleeper=$!
+    wait "$sleeper" || true
+  done
+fi
+if [[ "${1:-}" != --local-only ]]; then
+  exit 93
+fi
 ready="$XDG_RUNTIME_DIR/pohunek/daemon.ready"
 mkdir -p "${ready%/*}"
 : > "$ready"
 printf 'controlled daemon pid %s\n' "$$"
+printf '%s\n' 'remote control listener disabled by --local-only'
 sleeper=""
 if [[ "$mode" == ignores-term ]]; then
   trap '' TERM
