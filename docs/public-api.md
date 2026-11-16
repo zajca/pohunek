@@ -762,7 +762,6 @@ Errors use the error contract below. Every code has fixed message and
 | `index_expired` | `runtime` | The staged plugin index is expired. |
 | `index_rollback` | `runtime` | The staged plugin index sequence is below the recorded high-water mark. |
 | `index_channel_missing` | `runtime` | The host has no stored plugin index channel to apply against. |
-| `package_namespace_reserved` | `runtime` | A local package claims a `pohunek.runtime.*` id reserved by the stored index; install by id or from the release catalog. |
 | `package_revoked` | `runtime` | A recorded catalog revoked the package digest. `session.new`, `session.resume`, a relaunch, `package.select`, `package.set_enabled` (enable) and `package.bind_profile` refuse it, and `package.install --catalog` refuses a revoked digest even when a later catalog lists it. The `recover` text names `pohunek plugin select`. Nothing is changed and the selection is never moved on its own. |
 | `package_revocations_unreadable` | `runtime` | The recorded revoked package digests (`revoked-digests.json`) cannot be read: official packages are refused, catalogs cannot be recorded and `package.doctor` fails with this code. The `recover` text names the repair (fix the file's mode or owner, or restore a copy; a damaged file, or one a newer release wrote, is cleared by removing it and installing the latest release catalog again, which records its revocations anew, while a revocation that no later catalog repeats is lost); the daemon never replaces the file. |
 | `package_commands_client_unsupported` | `runtime` | The descriptor declares `[commands]` and the request did not set `accept_commands`; nothing was recorded, a dry run included. |
@@ -770,7 +769,7 @@ Errors use the error contract below. Every code has fixed message and
 | `official_trust_anchor_invalid` | `configuration` | The host's catalog trust anchor exists but cannot be trusted (unsafe location, permissions or ownership, or invalid content), so an official package cannot be authorized. |
 | `package_incompatible` | `runtime` | The package does not support this core version or platform. |
 | `package_descriptor_invalid` | `runtime` | The package's runtime descriptor is not a valid runtime definition. |
-| `package_runtime_not_claimable` | `runtime` | The package claims a runtime id it may not serve. |
+| `package_runtime_not_claimable` | `runtime` | The package claims a runtime id it may not serve. A local (`--sha256`/`link`) package declaring an id the verified stored official index has reserved is also refused with this code; a damaged `index-state.json` refuses with `index_state_unreadable` instead. |
 | `package_runtime_conflict` | `runtime` | Another package or a built-in runtime serves the runtime id. |
 | `package_not_installed` | `runtime` | The digest is not installed. |
 | `package_identity_installed` | `runtime` | The package id and version are installed from another archive. |

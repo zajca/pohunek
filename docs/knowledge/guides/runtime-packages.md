@@ -818,6 +818,11 @@ repeating the command; the CLI never retries an install on its own.
   supplies (`sha256:<64 hex>` or the bare hex `sha256sum` prints). The archive
   carries no signature; the owner vouches for these exact bytes. This trust can
   never authorize an official runtime id such as `codex`, `claude`, or `hermes`.
+  It is also refused (with `package_runtime_not_claimable`) when the declared
+  runtime id belongs to a runtime id that a verified stored official index
+  has reserved (`pohunek plugin index refresh` records it); before any
+  verified index has listed `pi`, the documented Pi `--sha256` flow keeps
+  working.
 - `--catalog <file>` authorizes an official package through the signed catalog,
   verified against the trust anchor file shipped beside the daemon (see the
   [runtime catalog](../concepts/runtime-catalog.md#trust-anchor-file)). A host
@@ -849,7 +854,7 @@ repeating the command; the CLI never retries an install on its own.
   signature, the revocations and the archive digest. The CLI checks
   `host.inspect` for `package_install_index_supported` before it fetches
   anything and fails with `plugin_index_unsupported` when it is absent, which
-  means a daemon older than 0.40 or a host without the channel file. A
+  means a daemon older than 0.44 or a host without the channel file. A
   `pohunek.context.*` reference also needs `package_install_index_context_supported`
   (`plugin_index_context_unsupported` when absent) and is resolved from the
   schema 2 document `official-index-v2.json` only; a runtime reference reads
@@ -861,6 +866,10 @@ repeating the command; the CLI never retries an install on its own.
   before anything reaches the daemon. The review prints the resolved
   `<package-id>@<version>` and digest, and the command to repeat names that
   exact version.
+  The by-id install reads the daemon's stored copy when it is younger than 24h,
+  refreshes once when it is older, and with `--index-url` always fetches from that
+  URL and ignores the stored copy; `--index-url` with a different URL is a
+  transport replacement, not a trust root — the daemon still verifies it.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 

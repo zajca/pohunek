@@ -325,10 +325,6 @@ pub(crate) fn index_apply_kind(error: package::IndexError) -> PackageErrorKind {
     }
 }
 
-/// Verifies a staged index for `plugin.index.apply`, mapping failures to the
-/// new codes. Callers compare the returned sequence against the persisted
-/// marks before storing (`record_index` silently returns current on a
-/// below-mark document).
 /// Shared verification inputs: anchor revoked keys union catalog-state
 /// revoked keys. Apply, install and doctor verify through this one source.
 pub(crate) fn verification_base_revoked(
@@ -343,6 +339,10 @@ pub(crate) fn verification_base_revoked(
         .collect()
 }
 
+/// Verifies a staged index for `plugin.index.apply`, mapping failures to the
+/// new codes. Callers compare the returned sequence against the persisted
+/// marks before storing (`record_index` silently returns current on a
+/// below-mark document).
 pub(super) fn verify_index_for_apply(
     bytes: &[u8],
     endorser: &RootKey,

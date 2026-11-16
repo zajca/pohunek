@@ -476,6 +476,26 @@ structure (platforms, URL of printable ASCII up to 512 bytes, core string of
 digest, one-to-one package and runtime ids). `parse_index_envelope` runs only
 the first five checks for untrusted version selection.
 
+**Stored copy.** The daemon persists the verified document byte-exact under
+`<plugins>/index/` (`official-v1.json`/`official-v2.json` with a `stored.json`
+sidecar recording `stored_at` per schema) and accumulates `reserved_runtime_ids`
+in `index-state.json`: the declared runtime ids of every verified document ever
+stored. `plugin.index.apply` (the CLI's `plugin index refresh`) verifies and
+stores; a by-id install stores the verified document whenever it raises the
+index marks, so the stored copy never stays below the marks. The CLI refreshes
+on demand only: it uses the stored copy when younger than 24h, refreshes when
+older, and surfaces refresh failures as a warning while still falling back to
+the unexpired stored copy on a miss only. `--index-url` replaces the stored
+copy for that install. A local (`--sha256`/`link`) install whose declared
+runtime id is in `reserved_runtime_ids` is refused with
+`package_runtime_not_claimable` (data-driven, no package-id prefix check); a
+damaged `index-state.json` refuses the same way with
+`index_state_unreadable` until `pohunek plugin index refresh` repairs it.
+Doctor verifies the stored copy: `current`, `stale`, `index_expired`,
+`index_invalid`, `package_revoked` (index-provenance delisting only;
+catalog-provenance bundled runtimes are never checked here), or
+`runtime_id_reserved_by_official` (local-provenance holder of a reserved id).
+
 **Install-time authorization.** `VerifiedIndex::authorize` takes the entry
 with the given digest and checks, first failure wins: listed (`NotListed`),
 kind `runtime` (`KindMismatch`), identity equal (`IdentityMismatch`), `pohunek.` namespace (`Namespace`),

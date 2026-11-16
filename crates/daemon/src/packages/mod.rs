@@ -1643,10 +1643,21 @@ fn install_package(
 ///
 /// The check is data-driven only: the runtime id the descriptor declares
 /// must be in the accumulated `reserved_runtime_ids`. The package id is
-/// irrelevant, so the guard cannot be bypassed by renaming the package
-/// (Scenario 6). The compiled floor (`shell`, `codex`, `claude`, `hermes`)
+/// irrelevant, so the guard cannot be bypassed by renaming the package.
+/// The compiled floor (`shell`, `codex`, `claude`, `hermes`)
 /// is refused by `LocalTrust` independently of any stored index; the Pi
 /// `--sha256` flow works until a verified index has listed `pi`.
+/// The shared reserved-runtime predicate used by the install guard and
+/// the doctor check: the descriptor's declared runtime id belongs to the
+/// accumulated reserved set.
+#[must_use]
+pub(crate) fn is_reserved_runtime_id(
+    reserved_runtime_ids: &std::collections::BTreeSet<protocol::RuntimeId>,
+    runtime_id: &protocol::RuntimeId,
+) -> bool {
+    reserved_runtime_ids.contains(runtime_id)
+}
+
 fn refuse_reserved_runtime(
     context: &Context,
     package_id: &PackageId,
@@ -1663,7 +1674,7 @@ fn refuse_reserved_runtime(
             }
             _ => PackageErrorKind::RegistryFailed,
         })?;
-    if state.reserved_runtime_ids.contains(runtime_id) {
+    if is_reserved_runtime_id(&state.reserved_runtime_ids, runtime_id) {
         warn!(
             package = %package_id,
             runtime_id = %runtime_id,
@@ -1732,7 +1743,7 @@ impl PackageService {
                 });
             let stored_at = unix_now()?;
             // Marks first, like the install path: if record_index fails, the
-            // stored document must not become newer than the marks (L4).
+            // stored document must not become newer than the marks.
             registry
                 .record_index(&verified)
                 .map_err(|error| registry_kind(&error))?;

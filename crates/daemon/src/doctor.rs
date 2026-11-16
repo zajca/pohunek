@@ -1168,7 +1168,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         }
     }
     // Unreadable stored bytes (oversized, damaged sidecar, wrong mode) is
-    // index_invalid, never not_used (M4).
+    // `index_invalid`, never `not_used`.
     if unreadable {
         return check(CHECK, DoctorStatus::Fail, INVALID);
     }
@@ -1190,7 +1190,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     // Missing endorser with a stored document: a stored copy exists, so the
-    // missing channel file does not hide it (L6: no silent stale).
+    // missing channel file does not hide it (no silent stale).
     let endorser = match anchor.index() {
         crate::catalog_anchor::IndexTrust::Loaded(endorser) => endorser.as_ref(),
         _ => return check(CHECK, DoctorStatus::Warn, STALE),
@@ -1205,7 +1205,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
             "index_state_unreadable: run `pohunek plugin index refresh`",
         );
     };
-    // One verification-input source for apply, install and doctor (M5).
+    // One verification-input source for apply, install and doctor.
     let base = crate::packages::verification_base_revoked(anchor, &catalog_state);
     let verified = package::verify_index(&stored.bytes, endorser, &base, &index_state, now);
     let verified = match verified {
@@ -1227,7 +1227,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
     };
     // Delisted: index-origin installed digest no longer listed under its id.
     // Catalog-origin (bundled codex/claude/hermes) records are never checked
-    // here (H2): the release catalog is a separate document family.
+    // here: the release catalog is a separate document family.
     let mut delisted: Option<(String, String)> = None;
     for record in state.packages() {
         if record.provenance() != PackageProvenance::Index {
@@ -1255,7 +1255,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
     }
     // Reserved: local (ExplicitDigest/Link) holding a reserved runtime id.
     // The declared runtime id from the descriptor is used, not the package
-    // id suffix (H1): a community package cannot hide by renaming its id.
+    // id suffix: a community package cannot hide by renaming its id.
     // An unreadable descriptor is a package fault reported elsewhere; here
     // it is not treated as reserved.
     let reserved = &index_state.reserved_runtime_ids;
@@ -1271,7 +1271,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
             continue;
         };
         let runtime = runtime_def.runtime_id();
-        if reserved.contains(runtime) {
+        if crate::packages::is_reserved_runtime_id(reserved, runtime) {
             reserved_hit = Some((record.identity().id.to_string(), runtime.to_string()));
             break;
         }

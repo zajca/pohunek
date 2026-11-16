@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -607,6 +608,125 @@ async fn install_by_id_takes_the_highest_version_and_a_pinned_version_that_one()
         .collect();
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0]["package"]["version"], "0.2.0");
+}
+
+/// Scenario 4 (24 h cadence): the first by-id install refreshes once
+/// (one index fetch); a second install within 24 h performs no fetch
+/// (the archive comes from the stored copy); after aging the sidecar it
+/// refreshes again (exactly one index fetch).
+#[tokio::test]
+async fn scenario_4_stored_copy_fresh_24h_no_fetch_then_refresh_once() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0"), rig.listing("0.2.0")]);
+    rig.clear_stored();
+    rig.clear_requests();
+
+    // Setup: `plugin index refresh --index-url` fetches the document once
+    // and stores it daemon-side (stored copy + sidecar). The by-id
+    // install below must use this stored copy without any fetch.
+    let index_url = rig.index_url();
+    let (code, document) = rig
+        .install
+        .json(&["plugin", "index", "refresh", "--index-url", &index_url])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let refresh_requests = rig.server.requests();
+    assert_eq!(
+        refresh_requests.first(),
+        Some(&INDEX_PATH.to_owned()),
+        "the refresh fetches the index once: {refresh_requests:?}"
+    );
+    assert_eq!(refresh_requests.len(), 1, "{refresh_requests:?}");
+    let index_dir = rig
+        .install
+        .env
+        .state_home()
+        .join("pohunek")
+        .join("plugins")
+        .join("index");
+    assert!(index_dir.join("stored.json").exists(), "sidecar exists");
+    assert!(
+        index_dir.join("official-v1.json").exists(),
+        "stored document exists"
+    );
+    rig.clear_requests();
+
+    // First by-id install within 24 h: no index fetch; the archive is
+    // fetched once (the stored copy resolves the highest version).
+    let (code, document) = rig
+        .install
+        .json(&["plugin", "install", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let first_requests = rig.server.requests();
+    assert!(
+        !first_requests.contains(&INDEX_PATH.to_owned()),
+        "no index fetch within 24h: {first_requests:?}"
+    );
+    assert_eq!(first_requests.len(), 1, "{first_requests:?}");
+
+    rig.clear_requests();
+    // Second by-id install within 24 h: no index fetch, archive fetch only
+    // (the stored copy already resolved the highest version).
+    let (code, document) = rig
+        .install
+        .json(&["plugin", "install", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let second_requests = rig.server.requests();
+    assert!(
+        !second_requests.contains(&INDEX_PATH.to_owned()),
+        "no index fetch within 24h: {second_requests:?}"
+    );
+    // The stored copy is the same one, so no refresh request happens.
+    assert_eq!(second_requests.len(), 1, "{second_requests:?}");
+
+    // Age the sidecar beyond 24 h: `stored_is_fresh` is now false, so the
+    // next by-id install attempts a `refresh_now` (which fails closed
+    // here because the without-URL refresh goes to the production
+    // OFFICIAL_INDEX_URL and the test has no route to it) and still uses
+    // the unexpired stored copy. Pin the behavior: no index fetch from
+    // the test server happens, only the archive fetch. A later explicit
+    // `plugin index refresh --index-url` fetches once.
+    let sidecar_path = index_dir.join("stored.json");
+    let raw = fs::read(&sidecar_path).expect("read sidecar");
+    let mut sidecar: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+    let past = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("epoch")
+        .as_secs()
+        - 25 * DAY;
+    for key in ["official-v1", "official-v2"] {
+        if sidecar.get(key).is_some() {
+            sidecar[key] = serde_json::json!(past);
+        }
+    }
+    fs::write(&sidecar_path, serde_json::to_vec(&sidecar).expect("json")).expect("write sidecar");
+    fs::set_permissions(&sidecar_path, fs::Permissions::from_mode(0o600)).expect("sidecar mode");
+    rig.clear_requests();
+    let (code, document) = rig
+        .install
+        .json(&["plugin", "install", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let third_requests = rig.server.requests();
+    assert!(
+        !third_requests.contains(&INDEX_PATH.to_owned()),
+        "the stale path falls back to the unexpired stored copy (no test-server index fetch): {third_requests:?}"
+    );
+    // After the cadence window an explicit refresh fetches exactly once.
+    rig.clear_requests();
+    let (code, document) = rig
+        .install
+        .json(&["plugin", "index", "refresh", "--index-url", &index_url])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let fourth_requests = rig.server.requests();
+    assert_eq!(
+        fourth_requests,
+        vec![INDEX_PATH.to_owned()],
+        "an explicit refresh after 24h fetches the index once"
+    );
 }
 
 #[tokio::test]
