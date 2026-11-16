@@ -28,11 +28,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use protocol::{method, AgentActivity, ProtocolError, RuntimeRef, SessionId};
+use protocol::{method, AgentActivity, ProtocolError, RuntimeRef, RuntimeState, SessionId};
 use tracing::warn;
 
 use super::native_attestation::{ControlPeer, PeerStanding};
-use super::{is_terminal, SessionRegistry};
+use super::{is_terminal, RuntimeHandle, SessionRegistry};
 use crate::agent::profile::rights::{rights_of, ProfileRights};
 use crate::procwatch::{Pid, ProcessIdentity, ProcessInspector};
 use pohunek_platform::supervisor::Namespace;
@@ -261,7 +261,15 @@ impl SessionRegistry {
             for root in attested.into_iter().flatten() {
                 roots.by_pid.insert(root.pid, (id.clone(), root));
             }
-            if attested.iter().all(Option::is_none) {
+            // A runtime that is lost, conflicting, incompatible or finished
+            // holds no process of its own to attribute.
+            let bears_process = match &entry.runtime {
+                RuntimeHandle::Worker(_) => true,
+                RuntimeHandle::Unavailable(state) => {
+                    matches!(state, RuntimeState::Starting | RuntimeState::Reconnecting)
+                }
+            };
+            if bears_process && attested.iter().all(Option::is_none) {
                 roots.unverified.push(id.clone());
             }
         }
