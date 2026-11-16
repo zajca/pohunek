@@ -15,7 +15,13 @@
 //! - a proof of the fixture passes, removes its prefix and never touches the
 //!   caller's runtime directory or launches the runtime program;
 //! - a runtime id an index never authorizes fails at `install`, a differing
-//!   digest or identity at `digest`, a missing or exiting daemon at `host`;
+//!   digest, id or version at `digest` for either kind, a runtime-shaped or
+//!   `[context]`-less descriptor at `digest`, a damaged assistant package at
+//!   `inspect`, a missing or exiting daemon at `host`;
+//! - a `--no-enable` install fails at `inspect` for being disabled, and a
+//!   proof alongside a newer installed version of the same package fails at
+//!   `install` on the default path and at `inspect` under `--no-enable` for
+//!   being unselected;
 //! - a proof that cannot run writes no evidence and does not replace an
 //!   existing one.
 
@@ -135,6 +141,12 @@ impl Plugin {
     /// Builds `package` into a new directory and returns the archive path and
     /// its digest.
     fn build(&self, package: &Path, out: &str) -> (PathBuf, String) {
+        self.build_as(package, out, ARCHIVE_NAME)
+    }
+
+    /// Builds `package` into a new directory and returns the archive of
+    /// `archive_name` and its digest.
+    fn build_as(&self, package: &Path, out: &str, archive_name: &str) -> (PathBuf, String) {
         let out = self.dir(out);
         let output = self.xtask(&[
             "plugin",
@@ -152,7 +164,81 @@ impl Plugin {
         let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
         let fields: Vec<&str> = stdout.trim_end().split(' ').collect();
         assert_eq!(fields.len(), 7, "one line of seven fields: {stdout:?}");
-        (out.join(ARCHIVE_NAME), fields[5].to_owned())
+        (out.join(archive_name), fields[5].to_owned())
+    }
+
+    /// A context package directory: a descriptor with no runtime plus the
+    /// assistant prompt contract, so even the assistant step can run. The
+    /// `without_prompt` variant omits `assistant/system.md`, so the
+    /// assistant readback has a damaged package to refuse.
+    fn context_package(&self, name: &str, package_id: &str, version: &str) -> PathBuf {
+        self.context_package_as(name, package_id, version, true)
+    }
+
+    fn context_package_as(
+        &self,
+        name: &str,
+        package_id: &str,
+        version: &str,
+        with_prompt: bool,
+    ) -> PathBuf {
+        self.context_package_with_descriptor(name, package_id, version, with_prompt, None)
+    }
+
+    /// Like [`Self::context_package_as`], with the descriptor body replaced
+    /// by `descriptor` when it is `Some`.
+    fn context_package_with_descriptor(
+        &self,
+        name: &str,
+        package_id: &str,
+        version: &str,
+        with_prompt: bool,
+        descriptor: Option<&str>,
+    ) -> PathBuf {
+        let dir = self.dir(name);
+        let descriptor = descriptor.map_or_else(
+            || {
+                format!(
+                "schema = 1\nid = \"{package_id}\"\nversion = \"{version}\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n"
+            )
+            },
+            str::to_owned,
+        );
+        fs::write(dir.join("runtime.toml"), descriptor).expect("write the descriptor");
+        let bundle = dir.join("bundle");
+        fs::create_dir_all(bundle.join("assistant")).expect("bundle directories");
+        fs::write(bundle.join("index.md"), "# Index\n").expect("write the index");
+        if with_prompt {
+            fs::write(
+                bundle.join("assistant/system.md"),
+                "---\ntype: PromptTemplate\nid: assistant/system\ntitle: Contract\ndescription: Fixture contract.\nsource_kind: manual\nintents: [help]\n---\n\n## Safety\n\n- Never print secrets.\n\n## Navigation\n\n1. Start at the index.\n",
+            )
+            .expect("write the prompt contract");
+        }
+        dir
+    }
+
+    /// A context entry file for `archive` with the given identity.
+    fn context_entry(&self, name: &str, package_id: &str, digest: &str, version: &str) -> PathBuf {
+        let text = format!(
+            "package_id = \"{package_id}\"\n\
+             kind = \"context\"\n\
+             version = \"{version}\"\n\
+             digest = \"{digest}\"\n\
+             url = \"https://github.com/pohunekd/plugin-kitfixture/releases/download/v{version}/{package_id}-{version}.tar.zst\"\n\
+             platforms = [\"{}\"]\n\
+             core = \">=0.42.0\"\n\n\
+             [source]\n\
+             repo = \"pohunekd/plugin-kitfixture\"\n\
+             repo_id = 1001\n\
+             tag = \"v{version}\"\n\
+             commit = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+             built_with = \"v0.42.0\"\n",
+            host_platform().expect("this platform has an index platform name")
+        );
+        let path = self.path(name);
+        fs::write(&path, text).expect("write the entry");
+        path
     }
 
     /// An entry file for `archive` with the given identity.
@@ -191,6 +277,60 @@ impl Plugin {
             "--evidence",
             s(evidence),
         ])
+    }
+
+    fn prove_no_enable(
+        &self,
+        archive: &Path,
+        entry: &Path,
+        release: &Path,
+        evidence: &Path,
+    ) -> Output {
+        self.xtask(&[
+            "plugin",
+            "prove",
+            "--archive",
+            s(archive),
+            "--entry",
+            s(entry),
+            "--release-dir",
+            s(release),
+            "--evidence",
+            s(evidence),
+            "--no-enable",
+        ])
+    }
+
+    /// A proof that installs `pre_install` alongside the archive first, so
+    /// the proved version runs next to another installed version.
+    fn prove_with_pre_install(
+        &self,
+        archive: &Path,
+        entry: &Path,
+        release: &Path,
+        evidence: &Path,
+        pre_install: &Path,
+        no_enable: bool,
+    ) -> Output {
+        let mut args = vec![
+            "plugin".to_owned(),
+            "prove".to_owned(),
+            "--archive".to_owned(),
+            s(archive).to_owned(),
+            "--entry".to_owned(),
+            s(entry).to_owned(),
+            "--release-dir".to_owned(),
+            s(release).to_owned(),
+            "--evidence".to_owned(),
+            s(evidence).to_owned(),
+            "--pre-install".to_owned(),
+            s(pre_install).to_owned(),
+        ];
+        if no_enable {
+            args.push("--no-enable".to_owned());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.xtask(&refs)
     }
 
     /// Proof roots left in `TMPDIR`.
@@ -443,6 +583,307 @@ fn the_fixture_proves_in_isolation_and_leaves_nothing() {
         matches!(decoy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "the proof connected to the caller's control socket"
     );
+}
+
+#[test]
+fn a_context_entry_proves_by_reading_the_package_back() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("context-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let evidence = plugin.path("context-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("plugin prove ok: pohunek.context.fixture 0.2.0 {digest}\n")
+    );
+
+    let document = evidence_of(&evidence);
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["result"], "pass");
+    assert!(document["failed_step"].is_null());
+    assert_eq!(document["package_id"], "pohunek.context.fixture");
+    assert_eq!(document["version"], "0.2.0");
+    assert_eq!(document["digest"], digest);
+    assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn the_assistant_context_entry_proves_by_printing_its_prompt() {
+    let plugin = Plugin::new();
+    let package =
+        plugin.context_package("assistant-package", "pohunek.context.assistant", "0.42.0");
+    let (archive, digest) = plugin.build_as(
+        &package,
+        "built",
+        "pohunek.context.assistant-0.42.0.tar.zst",
+    );
+    let entry = plugin.context_entry(
+        "assistant-entry.toml",
+        "pohunek.context.assistant",
+        &digest,
+        "0.42.0",
+    );
+    let evidence = plugin.path("assistant-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "pass");
+    assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn an_assistant_package_without_its_prompt_contract_fails_at_inspect() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package_as(
+        "damaged-assistant-package",
+        "pohunek.context.assistant",
+        "0.42.0",
+        false,
+    );
+    let (archive, digest) = plugin.build_as(
+        &package,
+        "built",
+        "pohunek.context.assistant-0.42.0.tar.zst",
+    );
+    let entry = plugin.context_entry(
+        "damaged-assistant-entry.toml",
+        "pohunek.context.assistant",
+        &digest,
+        "0.42.0",
+    );
+    let evidence = plugin.path("damaged-assistant-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "inspect");
+    assert_eq!(document["kind"], "context");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn a_context_package_with_a_runtime_descriptor_fails_at_digest() {
+    // Descriptor shape variants the digest step must refuse before any
+    // prefix exists: one with a `[runtime]` table, one with no `[context]`
+    // table. Each scenario keeps the real digest and identity, so only the
+    // shape refusal can fail the proof.
+    for (name, descriptor) in [
+        (
+            "runtime",
+            "schema = 1\nid = \"pohunek.context.fixture\"\nversion = \"0.2.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[runtime]\nprogram = \"true\"\n\n[context]\ndir = \"bundle\"\n",
+        ),
+        (
+            "no-context",
+            "schema = 1\nid = \"pohunek.context.fixture\"\nversion = \"0.2.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n",
+        ),
+    ] {
+        let plugin = Plugin::new();
+        let package = plugin.context_package_with_descriptor(
+            &format!("runtime-shaped-context-package-{name}"),
+            "pohunek.context.fixture",
+            "0.2.0",
+            true,
+            Some(descriptor),
+        );
+        let (archive, digest) = plugin.build_as(
+            &package,
+            "built",
+            "pohunek.context.fixture-0.2.0.tar.zst",
+        );
+        let entry = plugin.context_entry(
+            &format!("runtime-shaped-context-entry-{name}.toml"),
+            "pohunek.context.fixture",
+            &digest,
+            "0.2.0",
+        );
+        let evidence = plugin.path(&format!("runtime-shaped-context-evidence-{name}.json"));
+        let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+        assert_eq!(output.status.code(), Some(1), "{name}: {}", stderr_of(&output));
+        let document = evidence_of(&evidence);
+        assert_eq!(document["result"], "fail", "{name}");
+        assert_eq!(document["failed_step"], "digest", "{name}");
+        assert_eq!(document["kind"], "context", "{name}");
+        assert_eq!(document["core_version"], Value::Null, "{name}");
+        assert_eq!(plugin.leftover_roots(), Vec::<String>::new(), "{name}");
+    }
+}
+
+/// Context identity: the entry carries the archive's digest but a foreign
+/// package id or version, so the proof must fail at `digest` before any
+/// prefix exists. The passing digest is the 0.2.0 build proved by
+/// `a_context_entry_proves_by_reading_the_package_back`: only the entry
+/// names a foreign package id or version, so the digest step's identity
+/// comparison is the only check that can fail the proof.
+#[test]
+fn a_context_identity_mismatch_fails_at_digest_before_any_prefix_exists() {
+    // The archive and its digest are the 0.2.0 build the passing proof
+    // above reads back; only the entry names a foreign package id or
+    // version, so the digest step's identity comparison is the only check
+    // that can fail the proof.
+    let plugin = Plugin::new();
+    let package = plugin.context_package("identity-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    for (name, package_id, version) in [
+        ("package", "pohunek.context.other", "0.2.0"),
+        ("version", "pohunek.context.fixture", "0.3.0"),
+    ] {
+        let entry = plugin.context_entry(
+            &format!("identity-{name}-entry.toml"),
+            package_id,
+            &digest,
+            version,
+        );
+        let evidence = plugin.path(&format!("identity-{name}-evidence.json"));
+        let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name}: {}",
+            stderr_of(&output)
+        );
+        let document = evidence_of(&evidence);
+        assert_eq!(document["result"], "fail", "{name}");
+        assert_eq!(document["failed_step"], "digest", "{name}");
+        assert_eq!(document["kind"], "context", "{name}");
+        assert_eq!(document["core_version"], Value::Null, "{name}");
+        assert_eq!(plugin.leftover_roots(), Vec::<String>::new(), "{name}");
+    }
+}
+
+#[test]
+fn a_context_archive_mismatch_fails_at_digest_before_any_prefix_exists() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("context-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, _digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "context-entry.toml",
+        "pohunek.context.fixture",
+        ABSENT_DIGEST,
+        "0.2.0",
+    );
+    let evidence = plugin.path("context-evidence.json");
+
+    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "digest");
+    assert_eq!(document["kind"], "context");
+    assert_eq!(document["core_version"], Value::Null);
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+/// A `--no-enable` install leaves the context package disabled but still
+/// selected, so the proof must fail at `inspect` when the predicate
+/// refuses the disabled install.
+#[test]
+fn a_disabled_context_install_fails_at_inspect() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("disabled-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "disabled-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let evidence = plugin.path("disabled-context-evidence.json");
+
+    let output = plugin.prove_no_enable(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "inspect");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+/// A newer installed version of the same package leaves the proved context
+/// version unselected, so the proof must fail at `install` on the default
+/// path and at `inspect` under `--no-enable`. Each new version needs its
+/// own one-entry trust, so the pre-installed archive carries its own entry
+/// and is installed through a digest trust.
+fn unselected_proof_setup(plugin: &Plugin) -> (PathBuf, PathBuf, PathBuf) {
+    let older = plugin.context_package("unselected-older", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) = plugin.build_as(
+        &older,
+        "unselected-older-out",
+        "pohunek.context.fixture-0.2.0.tar.zst",
+    );
+    let newer = plugin.context_package("unselected-newer", "pohunek.context.fixture", "0.3.0");
+    let (pre_archive, _pre_digest) = plugin.build_as(
+        &newer,
+        "unselected-newer-out",
+        "pohunek.context.fixture-0.3.0.tar.zst",
+    );
+    let entry = plugin.context_entry(
+        "unselected-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    (archive, entry, pre_archive)
+}
+
+#[test]
+fn an_unselected_context_install_fails_at_install() {
+    let plugin = Plugin::new();
+    let (archive, entry, pre_archive) = unselected_proof_setup(&plugin);
+    let evidence = plugin.path("unselected-context-evidence.json");
+    let output = plugin.prove_with_pre_install(
+        &archive,
+        &entry,
+        &release_dir(),
+        &evidence,
+        &pre_archive,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "install");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn an_unselected_context_install_fails_at_inspect_when_not_enabled() {
+    let plugin = Plugin::new();
+    let (archive, entry, pre_archive) = unselected_proof_setup(&plugin);
+    let evidence = plugin.path("unselected-no-enable-context-evidence.json");
+    let output = plugin.prove_with_pre_install(
+        &archive,
+        &entry,
+        &release_dir(),
+        &evidence,
+        &pre_archive,
+        true,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "inspect");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 
 #[test]

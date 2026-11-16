@@ -150,7 +150,7 @@ the workspace, so code built from the workspace never holds it.
 | `index attach --unsigned <unsigned.json> --key-id <K> --signature <sig.hex> --anchor <anchor.json> --channel <channel.json> --output <signed.json>` | the signed index | `verify_index` with the signer `K` |
 | `index verify --index <signed.json> --anchor <anchor.json> --channel <channel.json> [--index-high-water <n>] [--revocation-high-water <n>]` | nothing | `verify_index` at the current time |
 | `index verify --record <record.json> --revocations <revocations.json> [--previous-revocations <file>] --anchor <anchor.json> --channel <channel.json>` | nothing | the record, the list signature and, with `--previous-revocations`, a higher sequence and a superset |
-| `index throwaway --entries <dir> --output <dir>` | an anchor, a channel and an index of a random root | the index under its own anchor |
+| `index throwaway --entries <dir> --output <dir> [--schema-version 2]` | an anchor, a channel and an index of a random root | the index under its own anchor |
 
 The signer signs `message.bin` as a plain Ed25519 message and writes the
 signature as 128 lowercase hex characters (one optional newline). A signature
@@ -161,7 +161,10 @@ reaches the index; `index build --print-source` is how admission reads it.
 
 `index throwaway` is for proofs only: its root and key exist for the run, its
 output lies outside the checkout, and the committed anchor and channel do not
-name its root, so `index verify` against them fails.
+name its root, so `index verify` against them fails. The default schema 1
+lists runtime entries only and names the document `official-index-v1.json`;
+`--schema-version 2` also lists `context` entries and names the document
+`official-index-v2.json`, which is what a context proof needs.
 
 ## 6. Build and prove a plugin archive
 
@@ -186,16 +189,31 @@ names its step in the evidence:
    copied beside the throwaway anchor and channel, and the daemon starts with a
    cleared environment, its own home, XDG directories and control socket.
 4. `install`: `pohunek plugin install <archive> --index <index> --yes --json`
-   reports `installed`, origin `official`, enabled and selected.
-5. `inspect`: `pohunek plugin inspect <package_id> --json` reports the entry's
-   runtime without a fault, and `pohunek plugin doctor <package_id>` finds
-   nothing.
+   reports `installed`, origin `official` and the entry's digest. Every
+   entry must install enabled, and selected except for a context entry
+   under `--no-enable`. A runtime entry also installs selected; a context
+   entry installs against the schema 2 throwaway document
+   (`official-index-v2.json`).
+5. `inspect`: `pohunek plugin inspect <package_id> --json` reports the
+   entry's runtime id and digest without a fault, and `pohunek plugin doctor
+   <package_id>` finds
+   nothing. A context entry has no runtime: the inspect reports the package
+   enabled and selected without a `runtime_id` and without a fault, and a
+   `pohunek.context.assistant` entry also renders the assistant prompt
+   (`assistant help --agent prove-assistant --print-prompt --json`); the
+   explicit agent name skips auto selection (the host reports no such agent),
+   so the readback touches the installed package; a `prove --no-enable`
+   install stages a disabled install the inspect predicate must refuse for
+   being disabled, and a `prove --pre-install` newer version leaves the
+   proved version unselected for the install check on the default path and
+   for the inspect predicate under `--no-enable`.
 6. `cleanup`: the daemon stops and the root is removed. A failure here is a
    failure of the proof, also when the earlier steps passed.
 
 The root is removed on every path. The evidence is
 `{"schema":1,"core_version":...,"package_id":...,"version":...,"digest":...,
-"platform":...,"result":"pass"|"fail","failed_step":null|"<step>"}`;
+"platform":...,"result":"pass"|"fail","failed_step":null|"<step>"}`
+plus `"kind":"context"` for a context entry;
 `core_version` is the first line of `pohunekd --version` and is `null` when the
 proof ended before `pohunekd --version` ran. The exit status is 0 for a pass, 1 for a
 failed step and 2 for a refused invocation (an unreadable input, or an evidence

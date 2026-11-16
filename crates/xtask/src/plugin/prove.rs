@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use package::{
     host_platform, read_archive, Limits, ANCHOR_FILE_NAME, INDEX_CHANNEL_FILE_NAME,
-    OFFICIAL_INDEX_FILE_NAME,
+    OFFICIAL_INDEX_FILE_NAME, OFFICIAL_INDEX_FILE_NAME_V2,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -78,6 +78,13 @@ pub(crate) struct ProveArgs {
     pub(crate) entry: PathBuf,
     pub(crate) release_dir: PathBuf,
     pub(crate) evidence: PathBuf,
+    /// Install the package disabled (it stays selected), so `inspect`
+    /// must refuse it for being disabled.
+    pub(crate) no_enable: bool,
+    /// Install this extra archive first through a digest trust, so the
+    /// proof runs alongside another installed version: a newer version of
+    /// the same package leaves the proved version unselected.
+    pub(crate) pre_install: Option<PathBuf>,
 }
 
 /// A failed proof: the step that failed and why. Its exit status is 1.
@@ -110,6 +117,8 @@ struct Evidence<'a> {
     package_id: &'a str,
     version: &'a str,
     digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a str>,
     platform: &'a str,
     result: &'static str,
     failed_step: Option<&'static str>,
@@ -127,13 +136,17 @@ struct Outcome {
 /// Returns `Ok` with the one-line report for a pass and `Err` for a failed
 /// proof or a refused input. An invocation that cannot name its entry or
 /// platform, or whose evidence path exists, writes no evidence.
+///
+/// A runtime entry proves a runtime package: the install must report the
+/// runtime enabled and selected, and the inspect must see the runtime
+/// without a fault. A context entry proves a context package: the inspect
+/// must report the package enabled and selected, and an entry for
+/// `pohunek.context.assistant` must let `assistant help --agent prove-assistant --print-prompt`
+/// print a prompt (the explicit agent name skips auto selection and the
+/// host reports no such agent).
 pub(crate) fn prove(args: &ProveArgs) -> Result<String, XtaskError> {
     let entry = entry_of(&args.entry)?;
-    if entry.kind() == package::IndexEntryKind::Context {
-        return Err(XtaskError::Usage(
-            "plugin prove proves runtime entries; a context entry is proved by installing it through the index with `pohunek plugin install`".to_owned(),
-        ));
-    }
+    let is_context = entry.kind() == package::IndexEntryKind::Context;
     let platform = host_platform().ok_or_else(|| {
         XtaskError::Usage("this platform has no plugin index platform name".to_owned())
     })?;
@@ -149,12 +162,14 @@ pub(crate) fn prove(args: &ProveArgs) -> Result<String, XtaskError> {
     }
 
     let digest = entry.digest.as_str();
+    let kind = is_context.then_some("context");
     let evidence = Evidence {
         schema: EVIDENCE_SCHEMA,
         core_version: outcome.core_version.as_deref(),
         package_id: entry.package_id.as_str(),
         version: entry.version.as_str(),
         digest,
+        kind,
         platform: &platform,
         result: if outcome.failure.is_some() {
             "fail"
@@ -229,8 +244,8 @@ fn run_steps(
 /// Step 1: the archive is the one the entry lists.
 ///
 /// The SHA-256 of the file bytes equals the entry's digest, the archive reads
-/// under the strict reader, and its descriptor names the entry's package id,
-/// runtime id and version.
+/// under the strict reader, and its descriptor names the entry's package id
+/// and version, plus the runtime id for a runtime entry.
 fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), String> {
     let actual = format!("sha256:{}", hex(&Sha256::digest(archive)));
     if actual != entry.digest.as_str() {
@@ -238,6 +253,29 @@ fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), Stri
     }
     let verified = read_archive(archive, &Limits::DEFAULT)
         .map_err(|error| format!("the archive is not a valid package: {error}"))?;
+    if entry.kind() == package::IndexEntryKind::Context {
+        if entry.runtime_id.is_some() {
+            return Err("a context entry names no runtime".to_owned());
+        }
+        let descriptor = verified
+            .entries()
+            .iter()
+            .find(|entry| entry.path == crate::catalog::DESCRIPTOR_PATH)
+            .ok_or_else(|| "the archive has no `runtime.toml`".to_owned())?;
+        let (_package_id, _version, table) =
+            crate::catalog::descriptor_package(&descriptor.contents)
+                .map_err(|error| error.to_string())?;
+        if table.get("runtime").is_some() || table.get("context").is_none() {
+            return Err("the archive is not a context package".to_owned());
+        }
+        let (package_id, version) =
+            crate::catalog::archive_package(&verified, Path::new("archive"))
+                .map_err(|error| error.to_string())?;
+        if package_id != entry.package_id || version != entry.version {
+            return Err("the archive descriptor differs from the entry's identity".to_owned());
+        }
+        return Ok(());
+    }
     let identity =
         archive_identity(&verified, Path::new("archive")).map_err(|error| error.to_string())?;
     if identity.package_id != entry.package_id
@@ -266,10 +304,14 @@ fn prove_in(
     )
     .map_err(fail(Step::Host))?;
     outcome.core_version = Some(host.core_version().map_err(fail(Step::Host))?);
-    host.launch(root).map_err(fail(Step::Host))?;
+    host.launch_local_only(root).map_err(fail(Step::Host))?;
 
-    let archive_path = write_archive(archive, root).map_err(fail(Step::Install))?;
-    install(&mut host, entry, &archive_path, &trust).map_err(fail(Step::Install))?;
+    let archive_path = write_archive(archive, root, ARCHIVE_FILE).map_err(fail(Step::Install))?;
+    if let Some(pre_install) = &args.pre_install {
+        pre_install_archive(&mut host, pre_install).map_err(fail(Step::Install))?;
+    }
+    install(&mut host, entry, &archive_path, &trust, args.no_enable)
+        .map_err(fail(Step::Install))?;
     inspect(&mut host, entry).map_err(fail(Step::Inspect))?;
     Ok(host)
 }
@@ -292,9 +334,15 @@ fn write_trust(
     .map_err(|error| format!("cannot copy the entry file: {error}"))?;
     let trust = root.path().join(TRUST_DIRECTORY);
     create_directory(&trust)?;
+    let schema_version = if entry.kind() == package::IndexEntryKind::Context {
+        package::INDEX_SCHEMA_VERSION_2
+    } else {
+        package::INDEX_SCHEMA_VERSION
+    };
     throwaway(&ThrowawayArgs {
         entries: tree,
         output: trust.clone(),
+        schema_version,
     })
     .map_err(|error| error.to_string())?;
     Ok(trust)
@@ -308,16 +356,33 @@ fn create_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot create `{}`: {error}", path.display()))
 }
 
-/// Writes the digest-checked archive bytes where the daemon can read them.
-fn write_archive(archive: &[u8], root: &Root) -> Result<PathBuf, String> {
+/// Writes the archive bytes where the daemon can read them.
+fn write_archive(archive: &[u8], root: &Root, name: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = root.path().join(ARCHIVE_DIRECTORY);
     create_directory(&directory)?;
-    let path = directory.join(ARCHIVE_FILE);
+    let path = directory.join(name);
     fs::write(&path, archive)
         .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(ARCHIVE_MODE)))
         .map_err(|error| format!("cannot write the archive copy: {error}"))?;
     Ok(path)
+}
+
+/// Step 4 setup: installs an extra archive through a digest trust, so the
+/// proof runs alongside another installed version of the same package. Only
+/// the proved version goes through the entry's index path; this install only
+/// stages the unselected state the `install` and `inspect` flag checks must
+/// refuse.
+fn pre_install_archive(host: &mut Host, archive: &Path) -> Result<(), String> {
+    let bytes = fs::read(archive)
+        .map_err(|error| format!("cannot read the pre-installed archive: {error}"))?;
+    let digest = format!("sha256:{}", hex(&Sha256::digest(&bytes)));
+    let stored = archive.to_string_lossy().into_owned();
+    let output = host.cli(&[
+        "plugin", "install", &stored, "--sha256", &digest, "--yes", "--json",
+    ])?;
+    let _ = json_result(&output, "`pohunek plugin install --sha256`")?;
+    Ok(())
 }
 
 /// The `ok` member of a `--json` document, or the failure the document names.
@@ -331,47 +396,117 @@ fn json_result(output: &crate::isolated_host::Output, what: &str) -> Result<Valu
     Err(format!("{what} was refused: {code}"))
 }
 
-/// Step 4: install through the index path and require an enabled, selected
-/// official package with the entry's digest.
+/// Step 4: install through the index path and require the entry's official
+/// package with the entry's digest. Every entry requires `enabled` here;
+/// `selected` is required here too, except for a context entry under
+/// `--no-enable` (a disabled install is inspected but cannot pass the
+/// inspect predicate). The runtime inspect step checks only the runtime id,
+/// the digest and the fault, and the runtime install step owns the flag
+/// checks for it. The context inspect step adds the `runtime_id` and
+/// `fault` checks, which the context install step never asserts.
 fn install(
     host: &mut Host,
     entry: &package::IndexEntry,
     archive: &Path,
     trust: &Path,
+    no_enable: bool,
 ) -> Result<(), String> {
     let archive = archive.to_string_lossy();
-    let index = trust.join(OFFICIAL_INDEX_FILE_NAME);
+    let index_name = if entry.kind() == package::IndexEntryKind::Context {
+        OFFICIAL_INDEX_FILE_NAME_V2
+    } else {
+        OFFICIAL_INDEX_FILE_NAME
+    };
+    let index = trust.join(index_name);
     let index = index.to_string_lossy();
-    let output = host.cli(&[
+    let mut arguments = vec![
         "plugin", "install", &archive, "--index", &index, "--yes", "--json",
-    ])?;
+    ];
+    if no_enable {
+        arguments.push("--no-enable");
+    }
+    let output = host.cli(&arguments)?;
     let installed = json_result(&output, "`pohunek plugin install`")?;
     let package = &installed["package"];
+    let context = entry.kind() == package::IndexEntryKind::Context;
     if installed["status"] != "installed"
         || package["origin"] != "official"
-        || package["enabled"] != true
-        || package["selected"] != true
         || package["digest"] != entry.digest.as_str()
+        || (!context && (package["enabled"] != true || package["selected"] != true))
+        || (context && !no_enable && (package["enabled"] != true || package["selected"] != true))
     {
-        return Err("the install did not report the entry's archive as an enabled, selected official package".to_owned());
+        return Err(
+            "the install did not report the entry's archive as an official package".to_owned(),
+        );
     }
     Ok(())
 }
 
-/// Step 5: the daemon reports the entry's runtime without a fault, and the
-/// package doctor finds nothing.
+/// Step 5: the daemon reports the entry's package without a fault, and the
+/// package doctor finds nothing. A context entry has no runtime, so the
+/// runtime invocation is replaced by reading the package back: inspect must
+/// report it enabled and selected without a fault, and the assistant entry
+/// must render its prompt for the explicit `--agent prove-assistant` name, so
+/// the readback touches the installed package. The explicit name skips auto
+/// selection (the host reports no such agent) and `--print-prompt` starts no
+/// session; a missing or damaged assistant package fails, and so does a
+/// prompt the daemon cannot compose.
+///
+/// A `--no-enable` context install reaches this predicate disabled (but
+/// still selected), and a pre-installed newer version leaves the proved
+/// version unselected: both must fail here.
+fn check_inspected_context(
+    entry: &package::IndexEntry,
+    package: &serde_json::Value,
+) -> Result<(), String> {
+    if !package["runtime_id"].is_null() {
+        return Err("the installed package serves a runtime".to_owned());
+    }
+    if !package["fault"].is_null() {
+        return Err("the installed package reports a fault".to_owned());
+    }
+    if package["digest"] != entry.digest.as_str() {
+        return Err("the installed digest differs from the entry's".to_owned());
+    }
+    if package["enabled"] != true {
+        return Err("the installed package is disabled".to_owned());
+    }
+    if package["selected"] != true {
+        return Err("the installed package is not selected".to_owned());
+    }
+    Ok(())
+}
+
 fn inspect(host: &mut Host, entry: &package::IndexEntry) -> Result<(), String> {
     let output = host.cli(&["plugin", "inspect", entry.package_id.as_str(), "--json"])?;
     let inspected = json_result(&output, "`pohunek plugin inspect`")?;
     let package = &inspected["package"];
-    let runtime = entry.runtime_id.as_ref().map(protocol::RuntimeId::as_str);
-    if package["runtime_id"].as_str() != runtime
-        || !package["fault"].is_null()
-        || package["digest"] != entry.digest.as_str()
-    {
-        return Err(
-            "the inspected package is not the entry's runtime, or reports a fault".to_owned(),
-        );
+    if entry.kind() == package::IndexEntryKind::Context {
+        check_inspected_context(entry, package)?;
+        if entry.package_id.as_str() == protocol::ASSISTANT_CONTEXT_PACKAGE_ID {
+            let output = host.cli(&[
+                "assistant",
+                "help",
+                "--agent",
+                "prove-assistant",
+                "--print-prompt",
+                "--json",
+            ])?;
+            let printed = json_result(&output, "`pohunek assistant help --print-prompt`")?;
+            if printed["prompt"].as_str().is_none_or(str::is_empty) {
+                return Err("the assistant package printed no prompt".to_owned());
+            }
+        }
+    } else {
+        let runtime = entry.runtime_id.as_ref().map(protocol::RuntimeId::as_str);
+        if package["runtime_id"].as_str() != runtime
+            || !package["fault"].is_null()
+            || package["digest"] != entry.digest.as_str()
+        {
+            return Err(
+                "the inspected package is not the entry's runtime, or reports a fault".to_owned(),
+            );
+        }
     }
     let doctor = host.cli(&["plugin", "doctor", entry.package_id.as_str()])?;
     if doctor.code != Some(0) {

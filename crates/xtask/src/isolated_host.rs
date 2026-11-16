@@ -95,11 +95,11 @@ const HOME_PLACEHOLDER: &str = "<USER_HOME>";
 const CHILD_PATH: &str = "/usr/bin:/bin";
 
 /// The daemon flag that keeps the remote control listener off.
-const LOCAL_ONLY_FLAG: &str = "--local-only";
+pub(crate) const LOCAL_ONLY_FLAG: &str = "--local-only";
 
 /// What the daemon logs, before it accepts connections, when
 /// [`LOCAL_ONLY_FLAG`] is in force.
-const LOCAL_ONLY_LOG_LINE: &str = "remote control listener disabled by --local-only";
+pub(crate) const LOCAL_ONLY_LOG_LINE: &str = "remote control listener disabled by --local-only";
 
 /// UTF-8 locale of every child; macOS ships no `C.UTF-8`.
 const CHILD_LOCALE: &str = if cfg!(target_os = "macos") {
@@ -381,11 +381,6 @@ impl Host {
             daemon: None,
             commands: 0,
         })
-    }
-
-    /// Starts the daemon of the prefix and waits until it accepts connections.
-    pub(crate) fn launch(&mut self, root: &Root) -> Result<(), String> {
-        self.launch_with(root, &[])
     }
 
     /// Starts the daemon of the prefix with `--local-only`, waits until it

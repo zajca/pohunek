@@ -55,6 +55,8 @@ readonly NO_COLOR_VALUE="1"
 readonly DEFAULT_TEMP_PARENT="/tmp"
 readonly FALLBACK_TEMP_PARENT="/var/tmp"
 readonly RELEASE_BINARIES=(pohunek pohunekd pohunek-sessiond)
+# Supports the proof rigs: only this flag runs a release daemon.
+readonly LOCAL_ONLY_FLAG=--local-only
 readonly ANCHOR_FILE_NAME="runtime-catalog-anchor.json"
 # Where a release daemon archive carries its Hermes package and signed catalog.
 readonly RELEASE_PACKAGE_PATH="runtime/packages/hermes.tar.zst"
@@ -475,9 +477,11 @@ else
 
   # `env` is started directly, not through a shell function, so it execs the
   # daemon in the background process and `$!` is the daemon's own pid.
+  # Proof rigs start the daemon with `--local-only`, so the smoke exercises
+  # the same flag and the overlay listener stays disabled on the release.
   "$ENV_EXECUTABLE" -i "${isolated_environment[@]}" \
     SHELL="$DAEMON_SHELL" POHUNEK_WORKER_LAUNCHER="$DAEMON_LAUNCHER" \
-    "$release_smoke_prefix/pohunekd" >"$release_smoke_daemon_log" 2>&1 &
+    "$release_smoke_prefix/pohunekd" "$LOCAL_ONLY_FLAG" >"$release_smoke_daemon_log" 2>&1 &
   release_smoke_daemon_pid=$!
 
   attempt=0
@@ -493,6 +497,11 @@ else
     fi
     "$SLEEP_EXECUTABLE" "$DAEMON_READY_INTERVAL_SECONDS"
   done
+
+  if ! grep -Fq -- 'remote control listener disabled by --local-only' "$release_smoke_daemon_log"; then
+    daemon_log_tail
+    fail "the release daemon did not run with --local-only: no overlay-disabled line in its log"
+  fi
 
   # Each result is captured by a plain assignment, so a failing command ends the
   # smoke through `set -e` before its output is inspected.

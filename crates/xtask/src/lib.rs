@@ -986,7 +986,8 @@ enum IndexAction {
     /// discarded; neither seed is written. `--output` must be an existing
     /// empty directory outside the checkout. It receives
     /// `runtime-catalog-anchor.json` (the throwaway root only),
-    /// `plugin-index-channel.json` and `official-index-v1.json`; no release
+    /// `plugin-index-channel.json` and `official-index-v1.json` (or
+    /// `official-index-v2.json` with `--schema-version 2`); no release
     /// anchor trusts them.
     Throwaway {
         /// Entries tree.
@@ -995,6 +996,11 @@ enum IndexAction {
         /// Existing empty directory that receives the three files.
         #[arg(long, value_name = "DIR")]
         output: PathBuf,
+        /// Schema of the signed document: 1 lists runtime entries only and is
+        /// read by every release since 0.40; 2 also lists `context` entries
+        /// and is read from 0.42.
+        #[arg(long, value_name = "VERSION", default_value_t = 1)]
+        schema_version: u64,
     },
     /// Write the channel document that names the index endorser root.
     ///
@@ -1034,9 +1040,11 @@ enum PluginAction {
     /// throwaway index that lists only that entry), `host` (the release
     /// executables from `--release-dir` start in a private prefix),
     /// `install`, `inspect`, and `cleanup` (the daemon stops and the prefix
-    /// is removed). The evidence file is written for a pass and for a failed
-    /// step; the exit status is 0 only for a pass, 1 for a failed step and 2
-    /// for a refused invocation.
+    /// is removed). A context entry proves a context package: the inspect
+    /// must report it enabled and selected without a fault, and reads the package
+    /// back instead of invoking a runtime. The evidence file is written for a
+    /// pass and for a failed step; the exit status is 0 only for a pass, 1
+    /// for a failed step and 2 for a refused invocation.
     Prove {
         /// Package archive to prove.
         #[arg(long, value_name = "FILE")]
@@ -1050,6 +1058,16 @@ enum PluginAction {
         /// Evidence file to write; it must not exist yet.
         #[arg(long, value_name = "FILE")]
         evidence: PathBuf,
+        /// Install the package disabled (it stays selected), so `inspect`
+        /// must refuse it for being disabled.
+        #[arg(long)]
+        no_enable: bool,
+        /// Install this extra archive first through a digest trust, so the
+        /// proof runs alongside another installed version of the same
+        /// package: a newer version leaves the proved version unselected,
+        /// which the flag checks must refuse.
+        #[arg(long, value_name = "FILE")]
+        pre_install: Option<PathBuf>,
     },
 }
 
@@ -1439,9 +1457,16 @@ fn run_index_tooling(action: IndexAction) -> Result<(), XtaskError> {
             }
         },
         check @ IndexAction::CheckEntry { .. } => run_index_check_entry(check)?,
-        IndexAction::Throwaway { entries, output } => {
-            let written =
-                plugin_index::throwaway(&plugin_index::ThrowawayArgs { entries, output })?;
+        IndexAction::Throwaway {
+            entries,
+            output,
+            schema_version,
+        } => {
+            let written = plugin_index::throwaway(&plugin_index::ThrowawayArgs {
+                entries,
+                output,
+                schema_version,
+            })?;
             println!(
                 "index throwaway ok: entries={} endorser={} signer={}",
                 written.entries, written.endorser, written.signer
@@ -1465,12 +1490,16 @@ fn run_plugin(action: PluginAction) -> Result<(), XtaskError> {
             entry,
             release_dir,
             evidence,
+            no_enable,
+            pre_install,
         } => {
             let report = plugin::prove(&plugin::ProveArgs {
                 archive,
                 entry,
                 release_dir,
                 evidence,
+                no_enable,
+                pre_install,
             })?;
             println!("{report}");
         }

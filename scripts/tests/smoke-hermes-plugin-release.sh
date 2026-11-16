@@ -4,7 +4,11 @@ set -euo pipefail
 script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 fixture_root="$script_root/scripts/tests/fixtures"
 smoke="$script_root/scripts/smoke-hermes-plugin-release"
-test_root="$(mktemp -d /var/tmp/pohunek-smoke.XXXXXX)"
+# A short fixed parent: $TMPDIR is long on macOS (/var/folders/.../T/) and
+# would push the daemon socket path over its byte budget, so the test root
+# never lives under it. /tmp resolves short on both macOS (/private/tmp)
+# and Linux.
+test_root="$(mktemp -d /tmp/pohunek-smoke.XXXXXX)"
 unsafe_temp_parent="$test_root/u"
 safe_temp_parent="$test_root/s"
 mkdir -p "$unsafe_temp_parent/.git" "$safe_temp_parent"
@@ -123,6 +127,11 @@ fi
 
 # A daemon that never accepts connections fails the smoke before any install.
 expect_failure 'exited before it accepted connections' "$(release ok exits)" "$safe_temp_parent" "$safe_temp_parent"
+
+# A daemon that starts without confirming `--local-only` in its log fails the
+# smoke: the release must exercise the overlay-disabled start the proof rigs
+# rely on.
+expect_failure 'did not run with --local-only' "$(release ok ignores-local-only)" "$safe_temp_parent" "$safe_temp_parent"
 
 # A daemon that ignores SIGTERM is killed after the exit bound and fails the
 # smoke instead of hanging it. The bound is lowered to 5 polls (one second) so
