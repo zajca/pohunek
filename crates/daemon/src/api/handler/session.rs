@@ -37,11 +37,6 @@ pub(super) async fn handle_session_new(
     let requested_input = params.input.is_some();
     match sessions.create_outcome_spawned_by(params, spawned_by).await {
         Ok(outcome) => {
-            // A replayed request returns a session that already holds its
-            // launch rights.
-            if !outcome.replayed {
-                sessions.record_launch_rights(&outcome.session.id).await;
-            }
             let result = SessionNewResult {
                 session: outcome.session,
                 applied_input: requested_input.then_some(true),
@@ -200,7 +195,6 @@ pub(super) async fn handle_session_resume(request: &Request, state: &DaemonState
         .await
     {
         Ok(session) => {
-            state.sessions.record_launch_rights(&session.id).await;
             ok_value(request, &SessionResumeResult { session })
         }
         Err(err) => error_value(request, err),

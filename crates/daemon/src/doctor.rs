@@ -67,6 +67,7 @@ pub(crate) async fn report(
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
     placements: &[(protocol::SessionId, protocol::SessionPlacement)],
+    unverified_roots: &[protocol::SessionId],
     probe_clock: &ProbeClock,
     probe_budget: Duration,
 ) -> Result<DoctorReport, DoctorReportError> {
@@ -118,7 +119,7 @@ pub(crate) async fn report(
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
-    checks.push(session_rights_check(worker_units));
+    checks.push(session_rights_check(worker_units, unverified_roots));
     Ok(bounded_report(checks))
 }
 
@@ -916,8 +917,28 @@ fn placement_check(
 }
 
 /// The check that names the limit of the session rights guardrail and the
-/// platform mode that places a caller in a session tree.
-fn session_rights_check(worker_units: bool) -> DoctorCheck {
+/// platform mode that places a caller in a session tree. It fails while a live
+/// session has no verified root, naming the session.
+pub(crate) fn session_rights_check(
+    worker_units: bool,
+    unverified_roots: &[protocol::SessionId],
+) -> DoctorCheck {
+    if !unverified_roots.is_empty() {
+        let names = unverified_roots
+            .iter()
+            .take(MAX_PLACEMENT_SESSIONS_LISTED)
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return check(
+            SESSION_RIGHTS_CHECK,
+            DoctorStatus::Fail,
+            &format!(
+                "{} live session(s) have no verified root process ({names}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends.",
+                unverified_roots.len()
+            ),
+        );
+    }
     check(
         SESSION_RIGHTS_CHECK,
         DoctorStatus::Ok,
@@ -1228,6 +1249,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
+            &[],
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )
@@ -1311,6 +1333,7 @@ mod tests {
                 total: 0,
                 may_pin: 0,
             },
+            &[],
             &[],
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,

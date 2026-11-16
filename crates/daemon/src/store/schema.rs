@@ -35,7 +35,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 21;
+pub const STORE_SCHEMA_VERSION: u32 = 22;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -133,6 +133,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
     Migration {
         from: 20,
         apply: migrate_v20_to_v21,
+    },
+    Migration {
+        from: 21,
+        apply: migrate_v21_to_v22,
     },
 ];
 
@@ -326,6 +330,14 @@ fn migrate_v19_to_v20(_record: &mut Map<String, Value>) {}
 /// No session of schema 20 could skip the in-repo hook layer; an absent flag
 /// reads as false. The step changes nothing.
 fn migrate_v20_to_v21(_record: &mut Map<String, Value>) {}
+
+/// Schema 21 to 22: a session record may carry the `[rights]` its profile held
+/// at launch (`launch_rights.owner_equivalent`, `launch_rights.spawn_profiles`).
+///
+/// A record written without the field was launched before the rights were
+/// recorded; its session takes the profile file as it reads at its first use,
+/// which is how every schema 21 session reads. The step changes nothing.
+fn migrate_v21_to_v22(_record: &mut Map<String, Value>) {}
 
 /// Removes the fork keys from one native launch spec.
 #[expect(

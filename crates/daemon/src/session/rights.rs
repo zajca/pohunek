@@ -14,6 +14,10 @@
 //!   services outside every session tree, and a process that left its tree.
 //! - [`CallerClass::Unknown`]: a peer of another user, or one the kernel can
 //!   no longer attest. Every rights-checked mutation is refused.
+//! - [`CallerClass::Unattributed`]: a process no session root attributes while
+//!   a live session has no verified root, so it may belong to that session.
+//!   Every rights-checked mutation is refused, and the doctor names the
+//!   session.
 //!
 //! This is a guardrail, not a wall. A process of the same user that leaves the
 //! session tree keeps owner rights: `setsid` plus a double fork where only
@@ -55,6 +59,8 @@ pub(crate) enum CallerClass {
     Session(SessionId),
     /// A caller the daemon cannot place; mutations are refused.
     Unknown,
+    /// A caller outside every verified root while a live session has none.
+    Unattributed,
 }
 
 impl CallerClass {
@@ -65,6 +71,7 @@ impl CallerClass {
             Self::OwnerShell(_) => "owner_shell",
             Self::Session(_) => "session",
             Self::Unknown => "unknown",
+            Self::Unattributed => "unattributed",
         }
     }
 
@@ -72,7 +79,7 @@ impl CallerClass {
     pub(crate) const fn session(&self) -> Option<&SessionId> {
         match self {
             Self::OwnerShell(id) | Self::Session(id) => Some(id),
-            Self::Owner | Self::Unknown => None,
+            Self::Owner | Self::Unknown | Self::Unattributed => None,
         }
     }
 }
@@ -88,6 +95,9 @@ pub(crate) enum Denial {
     ParentBlocked,
     /// The caller could not be placed.
     UnknownCaller,
+    /// The caller is outside every verified session root while a live session
+    /// has none, so it may belong to that session.
+    UnattributedCaller,
     /// The target is the caller's own session, which the origin-session guard
     /// refuses with its own code whether or not the request carries markers.
     SelfTarget,
@@ -100,6 +110,7 @@ impl Denial {
             Self::NotDescendant => "not_descendant",
             Self::ParentBlocked => "parent_blocked",
             Self::UnknownCaller => "unknown_caller",
+            Self::UnattributedCaller => "unattributed_caller",
             Self::SelfTarget => "self_target",
         }
     }
@@ -134,9 +145,9 @@ struct Roots {
     live: HashSet<SessionId>,
     /// The live sessions of the `shell` runtime.
     shell: HashSet<SessionId>,
-    /// Whether a live session has no known PTY root, so a process in its tree
+    /// The live sessions with no verified root, so a process in their tree
     /// would not be placed.
-    rootless: bool,
+    unverified: Vec<SessionId>,
 }
 
 impl Roots {
@@ -153,9 +164,9 @@ impl SessionRegistry {
     /// Places the peer of a local control connection in a rights class.
     ///
     /// The second value says whether the class may be kept for the life of the
-    /// connection. An `Owner` placement made while a live session has no known
-    /// root is not: the caller may belong to that session, and the next
-    /// request places it again.
+    /// connection. A caller outside every root while a live session has no
+    /// verified root is `Unattributed` and is not kept: the next request
+    /// places it again.
     pub(crate) async fn classify_caller(&self, peer: &ControlPeer) -> (CallerClass, bool) {
         let process = match peer.standing() {
             PeerStanding::Process(process) => process,
@@ -168,7 +179,11 @@ impl SessionRegistry {
         let Some(id) = ancestry_session(inspector, process, &roots)
             .or_else(|| worker_unit_session(inspector, process, &roots))
         else {
-            return (CallerClass::Owner, !roots.rootless);
+            return if roots.unverified.is_empty() {
+                (CallerClass::Owner, true)
+            } else {
+                (CallerClass::Unattributed, false)
+            };
         };
         if self
             .session_profile_rights(&id)
@@ -183,24 +198,17 @@ impl SessionRegistry {
     /// The rights of the live session `id`: those its profile held at launch,
     /// narrowed by the profile file as it reads now.
     ///
-    /// `None` for a session the registry does not hold. A session whose launch
-    /// rights were not recorded, such as one restored after a daemon restart,
-    /// takes the file as it reads at its first use.
+    /// `None` for a session the registry does not hold. A session whose record
+    /// predates the recorded launch rights takes the file as it reads at its
+    /// first use.
     pub(crate) async fn session_profile_rights(&self, id: &SessionId) -> Option<ProfileRights> {
-        let agent = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .get(id)
-            .map(|entry| entry.info.agent.clone())?;
+        let agent = self.session_agent(id).await?;
         let live = self.profile_rights(&agent).await;
-        let mut launch = self
-            .inner
+        let mut sessions = self.inner.sessions.lock().await;
+        let held = sessions
+            .get_mut(id)?
             .launch_rights
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let held = launch.entry(id.clone()).or_insert_with(|| live.clone());
+            .get_or_insert_with(|| live.clone());
         Some(held.narrowed_by(&live))
     }
 
@@ -212,27 +220,6 @@ impl SessionRegistry {
             .await
             .get(id)
             .map(|entry| entry.info.agent.clone())
-    }
-
-    /// Records the rights the profile of the session `id` holds now as the
-    /// rights the session was launched with.
-    pub(crate) async fn record_launch_rights(&self, id: &SessionId) {
-        let Some(agent) = self
-            .inner
-            .sessions
-            .lock()
-            .await
-            .get(id)
-            .map(|entry| entry.info.agent.clone())
-        else {
-            return;
-        };
-        let live = self.profile_rights(&agent).await;
-        self.inner
-            .launch_rights
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), live);
     }
 
     /// The `[rights]` of the profile `agent`, read from its file.
@@ -254,7 +241,7 @@ impl SessionRegistry {
             by_pid: HashMap::new(),
             live: HashSet::new(),
             shell: HashSet::new(),
-            rootless: false,
+            unverified: Vec::new(),
         };
         for (id, entry) in sessions.iter() {
             if is_terminal(entry.info.state) {
@@ -267,14 +254,40 @@ impl SessionRegistry {
             if entry.info.agent_base == RuntimeRef::shell() && entry.info.spawned_by.is_none() {
                 roots.shell.insert(id.clone());
             }
-            match entry.root_process {
-                Some(root) => {
-                    roots.by_pid.insert(root.pid, (id.clone(), root));
-                }
-                None => roots.rootless = true,
+            // The worker is the ancestor of every process of the session, so
+            // it places a caller before the PTY root is known and after the
+            // PTY root has exited.
+            let attested = [entry.root_process, entry.worker_root];
+            for root in attested.into_iter().flatten() {
+                roots.by_pid.insert(root.pid, (id.clone(), root));
+            }
+            if attested.iter().all(Option::is_none) {
+                roots.unverified.push(id.clone());
+            }
+        }
+        // A launch records its worker before the worker forks the PTY child,
+        // so a process of a session still being launched is placed below it.
+        for (id, reservation) in self
+            .inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            if sessions.contains_key(id) {
+                continue;
+            }
+            roots.live.insert(id.clone());
+            if let Some(worker) = reservation.worker_root {
+                roots.by_pid.insert(worker.pid, (id.clone(), worker));
             }
         }
         roots
+    }
+
+    /// The live sessions whose root the daemon could not verify.
+    pub(crate) async fn unverified_root_sessions(&self) -> Vec<SessionId> {
+        self.live_roots().await.unverified
     }
 
     /// Applies the target rule to a caller of `class` that requests `method`
@@ -291,6 +304,7 @@ impl SessionRegistry {
         let caller = match class {
             CallerClass::Owner | CallerClass::OwnerShell(_) => return Ok(()),
             CallerClass::Unknown => return Err(Denial::UnknownCaller),
+            CallerClass::Unattributed => return Err(Denial::UnattributedCaller),
             CallerClass::Session(caller) => caller,
         };
         let target = SessionId(target.to_owned());

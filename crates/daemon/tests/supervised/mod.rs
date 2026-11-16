@@ -852,6 +852,7 @@ impl Installation {
         self.store()
             .record_session(&SessionRecord {
                 create_request: None,
+                launch_rights: None,
                 schema_version: 1,
                 session_id: session_id.to_owned(),
                 desired_state: DesiredState::Running,

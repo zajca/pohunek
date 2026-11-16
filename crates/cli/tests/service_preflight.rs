@@ -184,6 +184,7 @@ impl Host {
         }
         let record = SessionRecord {
             create_request: None,
+            launch_rights: None,
             schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
             session_id: SESSION.to_owned(),
             desired_state: DesiredState::Running,

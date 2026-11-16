@@ -42,6 +42,7 @@ use super::{
     SessionRegistry, SessionRuntime, SessionState, StateSource, TurnEvents, Unavailability,
     UnconfirmedCleanup, Worker, WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
+use crate::agent::profile::rights::ProfileRights;
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
 use crate::procwatch::ProcessInspector;
@@ -4065,6 +4066,7 @@ impl SessionRegistry {
             (transaction.kind == crate::store::TransactionKind::Recover)
                 .then(|| transaction.previous_worker_instance_id.clone())
         });
+        let worker_process = snapshot.worker_process;
         let Some(child) = snapshot.child_process else {
             return !self
                 .insert_lost_record(
@@ -4388,6 +4390,11 @@ impl SessionRegistry {
                 pid: child.pid,
                 start_identity: crate::procwatch::StartIdentity::new(child.start_identity),
             }),
+            worker_root: Some(crate::procwatch::ProcessIdentity {
+                pid: worker_process.pid,
+                start_identity: crate::procwatch::StartIdentity::new(worker_process.start_identity),
+            }),
+            launch_rights: record.launch_rights.as_ref().map(ProfileRights::from_record),
         };
         let listed = record.clone();
         match self.write_record_and_install(&id, record, entry).await {
@@ -4737,6 +4744,8 @@ impl SessionRegistry {
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
             root_process: None,
+            worker_root: None,
+            launch_rights: record.launch_rights.as_ref().map(ProfileRights::from_record),
         };
         (record, entry)
     }
@@ -9666,6 +9675,7 @@ while os.getppid() == parent:
         store
             .record_session(&SessionRecord {
                 create_request: None,
+                launch_rights: None,
                 schema_version: 1,
                 session_id: session_id.to_owned(),
                 desired_state: DesiredState::Running,
@@ -11148,6 +11158,7 @@ while os.getppid() == parent:
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         SessionRecord {
             create_request: None,
+            launch_rights: None,
             schema_version: 1,
             session_id: "s-identity".to_owned(),
             desired_state: DesiredState::Running,

@@ -463,6 +463,7 @@ async fn handle_negotiated(
             CallerClass::Owner | CallerClass::OwnerShell(_) => None,
             CallerClass::Session(_) => Some("owner_only"),
             CallerClass::Unknown => Some("unknown_caller"),
+            CallerClass::Unattributed => Some("unattributed_caller"),
         };
         if let Some(reason) = reason {
             // Only a session id is read into the audit line; profile names
@@ -686,6 +687,9 @@ async fn attested_spawn_origin(
             return Ok(session::request_spawned_by(request));
         }
         CallerClass::Unknown => return Err(refuse_spawn(request, state, &class, "unknown_caller")),
+        CallerClass::Unattributed => {
+            return Err(refuse_spawn(request, state, &class, "unattributed_caller"))
+        }
         CallerClass::Session(caller) => caller,
     };
     let daemon_id = state.sessions.daemon_instance_id();

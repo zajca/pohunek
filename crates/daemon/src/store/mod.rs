@@ -805,6 +805,21 @@ pub struct SessionRecord {
     /// `SessionInfo`: the daemon matches a repeated key against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_request: Option<Box<CreateRequest>>,
+    /// The `[rights]` of the session's profile as they read when the session
+    /// was launched. Rights only narrow from there. Absent for a session
+    /// launched before schema 22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_rights: Option<LaunchRights>,
+}
+
+/// The `[rights]` a session was launched with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRights {
+    /// The session's process tree has owner rights.
+    pub owner_equivalent: bool,
+    /// The profiles the session may launch; absent is unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_profiles: Option<Vec<String>>,
 }
 
 /// The idempotency key of a session's creating request and its fingerprint.
@@ -2937,7 +2952,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":22,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2953,7 +2968,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":22,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -3065,7 +3080,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":22,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3187,7 +3202,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":21,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":22,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),

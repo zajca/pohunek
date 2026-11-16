@@ -50,6 +50,22 @@ pub(crate) struct ProfileRights {
 }
 
 impl ProfileRights {
+    /// The rights a session record holds.
+    pub(crate) fn from_record(record: &crate::store::LaunchRights) -> Self {
+        Self {
+            owner_equivalent: record.owner_equivalent,
+            spawn_profiles: record.spawn_profiles.clone(),
+        }
+    }
+
+    /// The form a session record persists.
+    pub(crate) fn to_record(&self) -> crate::store::LaunchRights {
+        crate::store::LaunchRights {
+            owner_equivalent: self.owner_equivalent,
+            spawn_profiles: self.spawn_profiles.clone(),
+        }
+    }
+
     /// A profile without a `[rights]` table.
     const fn unrestricted() -> Self {
         Self {

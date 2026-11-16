@@ -52,7 +52,7 @@ use serde_json::{json, Value};
 
 use super::schema::{MIGRATIONS, STORE_SCHEMA_VERSION};
 use super::{
-    ActiveAgentOrigin, CreateRequest, DesiredState, NativeIdentityOrdering, ProjectRecord, Record,
+    ActiveAgentOrigin, CreateRequest, LaunchRights, DesiredState, NativeIdentityOrdering, ProjectRecord, Record,
     ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction, StoredInputRules,
     TransactionKind, WorktreeBinding, WorktreeStatus,
 };
@@ -83,6 +83,7 @@ const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (19, include_str!("fixtures/shape/schema-19.txt")),
     (20, include_str!("fixtures/shape/schema-20.txt")),
     (21, include_str!("fixtures/shape/schema-21.txt")),
+    (22, include_str!("fixtures/shape/schema-22.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -317,7 +318,8 @@ fn session_json_with(recovery: &Value) -> Value {
             "reason": "none"
         },
         "active_agent_origin": "reported",
-        "create_request": {"id": "req-1", "fingerprint": "v1:0123456789abcdef"}
+        "create_request": {"id": "req-1", "fingerprint": "v1:0123456789abcdef"},
+        "launch_rights": {"owner_equivalent": true, "spawn_profiles": ["worker"]}
     });
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
@@ -413,9 +415,15 @@ fn assert_every_field_is_reviewed(
         runtime,
         active_agent_origin,
         create_request,
+        launch_rights,
     } = session;
     let _: &DesiredState = desired_state;
     let _: &Option<ActiveAgentOrigin> = active_agent_origin;
+    if let Some(LaunchRights {
+        owner_equivalent: _,
+        spawn_profiles: _,
+    }) = launch_rights
+    {}
     if let Some(request) = create_request {
         let CreateRequest {
             id: _,
@@ -911,6 +919,7 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.native_identity_ordering.runtime_id",
     "session.create_request.id",
     "session.create_request.fingerprint",
+    "session.launch_rights.spawn_profiles[]",
     "session.runtime.worker_id",
     "session.runtime.runtime_id",
     "session.runtime.service_id",
