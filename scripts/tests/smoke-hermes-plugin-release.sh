@@ -124,9 +124,10 @@ fi
 # A daemon that never accepts connections fails the smoke before any install.
 expect_failure 'exited before it accepted connections' "$(release ok exits)" "$safe_temp_parent" "$safe_temp_parent"
 
-# A daemon that refuses to start without `--local-only` fails the smoke: the
-# release must exercise the overlay-disabled start the proof rigs rely on.
-expect_failure 'did not run with --local-only' "$(release ok refuses-local-only)" "$safe_temp_parent" "$safe_temp_parent"
+# A daemon that starts without confirming `--local-only` in its log fails the
+# smoke: the release must exercise the overlay-disabled start the proof rigs
+# rely on.
+expect_failure 'did not run with --local-only' "$(release ok ignores-local-only)" "$safe_temp_parent" "$safe_temp_parent"
 
 # A daemon that ignores SIGTERM is killed after the exit bound and fails the
 # smoke instead of hanging it. The bound is lowered to 5 polls (one second) so

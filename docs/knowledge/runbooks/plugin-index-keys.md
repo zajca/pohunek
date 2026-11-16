@@ -189,17 +189,20 @@ names its step in the evidence:
    copied beside the throwaway anchor and channel, and the daemon starts with a
    cleared environment, its own home, XDG directories and control socket.
 4. `install`: `pohunek plugin install <archive> --index <index> --yes --json`
-   reports `installed`, origin `official`, enabled and selected. A context
+   reports `installed` and origin `official`. A context
    entry installs against the schema 2 throwaway document
    (`official-index-v2.json`).
 5. `inspect`: `pohunek plugin inspect <package_id> --json` reports the entry's
-   runtime without a fault, and `pohunek plugin doctor <package_id>` finds
+   runtime enabled, selected and without a fault, and `pohunek plugin doctor
+   <package_id>` finds
    nothing. A context entry has no runtime: the inspect reports the package
    enabled and selected without a `runtime_id` and without a fault, and a
    `pohunek.context.assistant` entry also renders the assistant prompt
-   (`assistant help --agent prove-assistant --print-prompt --json`) through a
-   stub agent the rig writes before the daemon starts, so the readback
-   touches the installed package.
+   (`assistant help --agent prove-assistant --print-prompt --json`); the
+   explicit agent name skips auto selection (the host reports no such agent),
+   so the readback touches the installed package; a `prove --no-enable`
+   install stages the disabled row-5 install the inspect predicate must
+   refuse.
 6. `cleanup`: the daemon stops and the root is removed. A failure here is a
    failure of the proof, also when the earlier steps passed.
 

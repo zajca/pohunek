@@ -15,7 +15,9 @@
 //! - a proof of the fixture passes, removes its prefix and never touches the
 //!   caller's runtime directory or launches the runtime program;
 //! - a runtime id an index never authorizes fails at `install`, a differing
-//!   digest or identity at `digest`, a missing or exiting daemon at `host`;
+//!   digest, id or version at `digest` for either kind, a runtime-shaped or
+//!   `[context]`-less descriptor at `digest`, a damaged assistant package at
+//!   `inspect`, a missing or exiting daemon at `host`;
 //! - a proof that cannot run writes no evidence and does not replace an
 //!   existing one.
 
@@ -270,6 +272,28 @@ impl Plugin {
             s(release),
             "--evidence",
             s(evidence),
+        ])
+    }
+
+    fn prove_no_enable(
+        &self,
+        archive: &Path,
+        entry: &Path,
+        release: &Path,
+        evidence: &Path,
+    ) -> Output {
+        self.xtask(&[
+            "plugin",
+            "prove",
+            "--archive",
+            s(archive),
+            "--entry",
+            s(entry),
+            "--release-dir",
+            s(release),
+            "--evidence",
+            s(evidence),
+            "--no-enable",
         ])
     }
 
@@ -616,29 +640,92 @@ fn an_assistant_package_without_its_prompt_contract_fails_at_inspect() {
 
 #[test]
 fn a_context_package_with_a_runtime_descriptor_fails_at_digest() {
-    let plugin = Plugin::new();
-    let package = plugin.context_package_with_descriptor(
-        "runtime-shaped-context-package",
-        "pohunek.context.fixture",
-        "0.2.0",
-        true,
-        Some(
+    // Descriptor shape variants the digest step must refuse before any
+    // prefix exists: one with a `[runtime]` table, one with no `[context]`
+    // table. Each scenario keeps the real digest and identity, so only the
+    // shape refusal can fail the proof.
+    for (name, descriptor) in [
+        (
+            "runtime",
             "schema = 1\nid = \"pohunek.context.fixture\"\nversion = \"0.2.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[runtime]\nprogram = \"true\"\n\n[context]\ndir = \"bundle\"\n",
         ),
-    );
+        (
+            "no-context",
+            "schema = 1\nid = \"pohunek.context.fixture\"\nversion = \"0.2.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n",
+        ),
+    ] {
+        let plugin = Plugin::new();
+        let package = plugin.context_package_with_descriptor(
+            &format!("runtime-shaped-context-package-{name}"),
+            "pohunek.context.fixture",
+            "0.2.0",
+            true,
+            Some(descriptor),
+        );
+        let (archive, digest) = plugin.build_as(
+            &package,
+            "built",
+            "pohunek.context.fixture-0.2.0.tar.zst",
+        );
+        let entry = plugin.context_entry(
+            &format!("runtime-shaped-context-entry-{name}.toml"),
+            "pohunek.context.fixture",
+            &digest,
+            "0.2.0",
+        );
+        let evidence = plugin.path(&format!("runtime-shaped-context-evidence-{name}.json"));
+        let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+        assert_eq!(output.status.code(), Some(1), "{name}: {}", stderr_of(&output));
+        let document = evidence_of(&evidence);
+        assert_eq!(document["result"], "fail", "{name}");
+        assert_eq!(document["failed_step"], "digest", "{name}");
+        assert_eq!(document["kind"], "context", "{name}");
+        assert_eq!(document["core_version"], Value::Null, "{name}");
+        assert_eq!(plugin.leftover_roots(), Vec::<String>::new(), "{name}");
+    }
+}
+
+/// Context identity, case-table row 4: the entry carries the archive's
+/// digest but a foreign package id or version, so the proof must fail at
+/// `digest` before any prefix exists. The passing digest is the 0.2.0
+/// build proved by `a_context_entry_proves_by_reading_the_package_back`;
+/// removing the identity comparison lets the same proof continue past
+/// `digest`, which the r2 mutation run records.
+#[test]
+fn a_context_identity_mismatch_fails_at_digest_before_any_prefix_exists() {
+    // The archive and its digest are the 0.2.0 build the passing proof
+    // above reads back; only the entry names a foreign package id or
+    // version, so the digest step's identity comparison is the only check
+    // that can fail the proof.
+    let plugin = Plugin::new();
+    let package = plugin.context_package("identity-package", "pohunek.context.fixture", "0.2.0");
     let (archive, digest) =
         plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
-    let entry = plugin.context_entry(
-        "runtime-shaped-context-entry.toml",
-        "pohunek.context.fixture",
-        &digest,
-        "0.2.0",
-    );
-    let evidence = plugin.path("runtime-shaped-context-evidence.json");
-
-    let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
-    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+    for (name, package_id, version) in [
+        ("package", "pohunek.context.other", "0.2.0"),
+        ("version", "pohunek.context.fixture", "0.3.0"),
+    ] {
+        let entry = plugin.context_entry(
+            &format!("identity-{name}-entry.toml"),
+            package_id,
+            &digest,
+            version,
+        );
+        let evidence = plugin.path(&format!("identity-{name}-evidence.json"));
+        let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name}: {}",
+            stderr_of(&output)
+        );
+        let document = evidence_of(&evidence);
+        assert_eq!(document["result"], "fail", "{name}");
+        assert_eq!(document["failed_step"], "digest", "{name}");
+        assert_eq!(document["kind"], "context", "{name}");
+        assert_eq!(document["core_version"], Value::Null, "{name}");
+        assert_eq!(plugin.leftover_roots(), Vec::<String>::new(), "{name}");
+    }
 }
 
 #[test]
@@ -662,6 +749,35 @@ fn a_context_archive_mismatch_fails_at_digest_before_any_prefix_exists() {
     assert_eq!(document["failed_step"], "digest");
     assert_eq!(document["kind"], "context");
     assert_eq!(document["core_version"], Value::Null);
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+/// Context identity, case-table row 5: the install leaves the context
+/// package disabled and unselected through `--no-enable`, so the proof must
+/// fail at `inspect` when the predicate refuses it. Removing the
+/// enabled/selected refusal lets the same proof pass, which the r2 mutation
+/// run records.
+#[test]
+fn a_disabled_context_install_fails_at_inspect() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("disabled-package", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "disabled-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let evidence = plugin.path("disabled-context-evidence.json");
+
+    let output = plugin.prove_no_enable(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "inspect");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
     assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 

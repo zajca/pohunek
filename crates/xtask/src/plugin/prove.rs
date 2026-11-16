@@ -78,6 +78,9 @@ pub(crate) struct ProveArgs {
     pub(crate) entry: PathBuf,
     pub(crate) release_dir: PathBuf,
     pub(crate) evidence: PathBuf,
+    /// Install the package disabled and unselected, so `inspect` must
+    /// refuse it: the row-5 scenario that pins the inspect predicate.
+    pub(crate) no_enable: bool,
 }
 
 /// A failed proof: the step that failed and why. Its exit status is 1.
@@ -132,10 +135,11 @@ struct Outcome {
 ///
 /// A runtime entry proves a runtime package: the install must report the
 /// runtime enabled and selected, and the inspect must see the runtime
-/// without a fault. A context entry proves a context package: the install
+/// without a fault. A context entry proves a context package: the inspect
 /// must report the package enabled and selected, and an entry for
-/// `pohunek.context.assistant` must let `assistant help --print-prompt`
-/// print a prompt.
+/// `pohunek.context.assistant` must let `assistant help --agent prove-assistant --print-prompt`
+/// print a prompt (the explicit agent name skips auto selection and the
+/// host reports no such agent).
 pub(crate) fn prove(args: &ProveArgs) -> Result<String, XtaskError> {
     let entry = entry_of(&args.entry)?;
     let is_context = entry.kind() == package::IndexEntryKind::Context;
@@ -204,32 +208,6 @@ fn check_evidence_path(path: &Path) -> Result<(), XtaskError> {
 
 fn fail(step: Step) -> impl Fn(String) -> Verdict {
     move |detail| Verdict { step, detail }
-}
-
-/// Writes a host profile that selects `program` explicitly, so the assistant
-/// readback of a context proof runs against a capable agent: `no_capable_agent`
-/// can no longer stand in for a package the rig never read. The profile names
-/// its base runtime only to stay resolvable; `--print-prompt` starts no
-/// session, so the stub program never runs.
-fn write_stub_agent_profile(root: &Root, program: &Path) -> Result<(), String> {
-    let agents = root.config_home().join("agents");
-    create_directory(&agents)?;
-    fs::write(
-        agents.join("prove-assistant.toml"),
-        format!("base = \"shell\"\nprogram = \"{}\"\n", program.display()),
-    )
-    .map_err(|error| format!("cannot write the stub agent profile: {error}"))
-}
-
-/// Writes the stub program the assistant readback selects: it exits at once,
-/// so a launch that reached it would fail instead of passing silently.
-fn write_stub_agent_program(root: &Root) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = root.path().join("prove-assistant-agent");
-    fs::write(&path, "#!/bin/sh\nexit 3\n")
-        .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o755)))
-        .map_err(|error| format!("cannot write the stub agent program: {error}"))?;
-    Ok(path)
 }
 
 /// Runs the steps in order. The isolation root exists only after the digest
@@ -322,14 +300,11 @@ fn prove_in(
     )
     .map_err(fail(Step::Host))?;
     outcome.core_version = Some(host.core_version().map_err(fail(Step::Host))?);
-    if entry.kind() == package::IndexEntryKind::Context {
-        let stub = write_stub_agent_program(root).map_err(fail(Step::Host))?;
-        write_stub_agent_profile(root, &stub).map_err(fail(Step::Host))?;
-    }
     host.launch_local_only(root).map_err(fail(Step::Host))?;
 
     let archive_path = write_archive(archive, root).map_err(fail(Step::Install))?;
-    install(&mut host, entry, &archive_path, &trust).map_err(fail(Step::Install))?;
+    install(&mut host, entry, &archive_path, &trust, args.no_enable)
+        .map_err(fail(Step::Install))?;
     inspect(&mut host, entry).map_err(fail(Step::Inspect))?;
     Ok(host)
 }
@@ -397,13 +372,20 @@ fn json_result(output: &crate::isolated_host::Output, what: &str) -> Result<Valu
     Err(format!("{what} was refused: {code}"))
 }
 
-/// Step 4: install through the index path and require an enabled, selected
-/// official package with the entry's digest.
+/// Step 4: install through the index path and require the entry's official
+/// package with the entry's digest. A runtime entry also requires the
+/// enabled and selected flags here, because the runtime inspect step passes
+/// on the runtime id, digest and fault alone. A context entry leaves the
+/// flags to the inspect predicate, the only check that refuses a disabled,
+/// unselected or faulted context install: the passing install report is
+/// what lets that state reach the inspect predicate instead of failing
+/// earlier.
 fn install(
     host: &mut Host,
     entry: &package::IndexEntry,
     archive: &Path,
     trust: &Path,
+    no_enable: bool,
 ) -> Result<(), String> {
     let archive = archive.to_string_lossy();
     let index_name = if entry.kind() == package::IndexEntryKind::Context {
@@ -413,18 +395,25 @@ fn install(
     };
     let index = trust.join(index_name);
     let index = index.to_string_lossy();
-    let output = host.cli(&[
+    let mut arguments = vec![
         "plugin", "install", &archive, "--index", &index, "--yes", "--json",
-    ])?;
+    ];
+    if no_enable {
+        arguments.push("--no-enable");
+    }
+    let output = host.cli(&arguments)?;
     let installed = json_result(&output, "`pohunek plugin install`")?;
     let package = &installed["package"];
+    let context = entry.kind() == package::IndexEntryKind::Context;
     if installed["status"] != "installed"
         || package["origin"] != "official"
-        || package["enabled"] != true
-        || package["selected"] != true
         || package["digest"] != entry.digest.as_str()
+        || (!context && (package["enabled"] != true || package["selected"] != true))
+        || (context && !no_enable && (package["enabled"] != true || package["selected"] != true))
     {
-        return Err("the install did not report the entry's archive as an enabled, selected official package".to_owned());
+        return Err(
+            "the install did not report the entry's archive as an official package".to_owned(),
+        );
     }
     Ok(())
 }
@@ -433,26 +422,43 @@ fn install(
 /// package doctor finds nothing. A context entry has no runtime, so the
 /// runtime invocation is replaced by reading the package back: inspect must
 /// report it enabled and selected without a fault, and the assistant entry
-/// must render its prompt through the stub agent the rig writes before the
-/// daemon starts, so the readback touches the installed package. The stub
-/// never launches (`--print-prompt` starts no session); a missing or damaged
-/// assistant package fails, and so does a prompt the daemon cannot compose.
+/// must render its prompt for the explicit `--agent prove-assistant` name, so
+/// the readback touches the installed package. The explicit name skips auto
+/// selection (the host reports no such agent) and `--print-prompt` starts no
+/// session; a missing or damaged assistant package fails, and so does a
+/// prompt the daemon cannot compose.
+///
+/// The install above leaves a disabled context install in place and fails
+/// only when the inspect predicate refuses it: keeping the predicate honest
+/// is what the `plugin_release` row-5 scenario pins.
+fn check_inspected_context(
+    entry: &package::IndexEntry,
+    package: &serde_json::Value,
+) -> Result<(), String> {
+    if !package["runtime_id"].is_null() {
+        return Err("the installed package serves a runtime".to_owned());
+    }
+    if !package["fault"].is_null() {
+        return Err("the installed package reports a fault".to_owned());
+    }
+    if package["digest"] != entry.digest.as_str() {
+        return Err("the installed digest differs from the entry's".to_owned());
+    }
+    if package["enabled"] != true {
+        return Err("the installed package is disabled".to_owned());
+    }
+    if package["selected"] != true {
+        return Err("the installed package is not selected".to_owned());
+    }
+    Ok(())
+}
+
 fn inspect(host: &mut Host, entry: &package::IndexEntry) -> Result<(), String> {
     let output = host.cli(&["plugin", "inspect", entry.package_id.as_str(), "--json"])?;
     let inspected = json_result(&output, "`pohunek plugin inspect`")?;
     let package = &inspected["package"];
     if entry.kind() == package::IndexEntryKind::Context {
-        if !package["runtime_id"].is_null()
-            || !package["fault"].is_null()
-            || package["digest"] != entry.digest.as_str()
-            || package["enabled"] != true
-            || package["selected"] != true
-        {
-            return Err(
-                "the inspected package is not the entry's enabled, selected context, or reports a fault"
-                    .to_owned(),
-            );
-        }
+        check_inspected_context(entry, package)?;
         if entry.package_id.as_str() == protocol::ASSISTANT_CONTEXT_PACKAGE_ID {
             let output = host.cli(&[
                 "assistant",

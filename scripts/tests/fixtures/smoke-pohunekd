@@ -20,7 +20,7 @@ if [[ "$mode" == exits ]]; then
   exit 97
 fi
 
-if [[ "$mode" == refuses-local-only ]]; then
+if [[ "$mode" == ignores-local-only ]]; then
   ready="$XDG_RUNTIME_DIR/pohunek/daemon.ready"
   mkdir -p "${ready%/*}"
   : > "$ready"

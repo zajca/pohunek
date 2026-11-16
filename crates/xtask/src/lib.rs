@@ -1040,8 +1040,8 @@ enum PluginAction {
     /// throwaway index that lists only that entry), `host` (the release
     /// executables from `--release-dir` start in a private prefix),
     /// `install`, `inspect`, and `cleanup` (the daemon stops and the prefix
-    /// is removed). A context entry proves a context package: the install
-    /// must report it enabled and selected, and the inspect reads the package
+    /// is removed). A context entry proves a context package: the inspect
+    /// must report it enabled and selected without a fault, and reads the package
     /// back instead of invoking a runtime. The evidence file is written for a
     /// pass and for a failed step; the exit status is 0 only for a pass, 1
     /// for a failed step and 2 for a refused invocation.
@@ -1058,6 +1058,10 @@ enum PluginAction {
         /// Evidence file to write; it must not exist yet.
         #[arg(long, value_name = "FILE")]
         evidence: PathBuf,
+        /// Install the package disabled and unselected, so `inspect` must
+        /// refuse it: the row-5 scenario that pins the inspect predicate.
+        #[arg(long)]
+        no_enable: bool,
     },
 }
 
@@ -1480,12 +1484,14 @@ fn run_plugin(action: PluginAction) -> Result<(), XtaskError> {
             entry,
             release_dir,
             evidence,
+            no_enable,
         } => {
             let report = plugin::prove(&plugin::ProveArgs {
                 archive,
                 entry,
                 release_dir,
                 evidence,
+                no_enable,
             })?;
             println!("{report}");
         }
