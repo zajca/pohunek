@@ -292,8 +292,9 @@ descendant of the caller's session along `spawned_by`, or, for `session.input`
 only, the caller session's parent while the parent's activity is not
 `blocked`. Any other target returns `runtime/session_right_denied`; the message
 ends in `reason=not_descendant`, `parent_blocked`, `owner_only`, `origin_mismatch`,
-`spawn_profile_not_allowed` or `unknown_caller` (a peer of
-another user, or one the kernel no longer attests). `session.new` from inside a
+`spawn_profile_not_allowed`, `unknown_caller` (a peer of
+another user, or one the kernel no longer attests) or `unattributed_caller` (no
+session root attributes the peer while a live session has no verified root). `session.new` from inside a
 session records that session as `spawned_by` whatever markers it sends; markers
 naming another session are `origin_mismatch`, and a profile outside the
 caller profile's `[rights] spawn_profiles` is `spawn_profile_not_allowed`.
@@ -1180,9 +1181,9 @@ is absent for a session whose runtime declares no placement, a session that is
 not live, and every list entry, stored record and event never receive it. `unobservable` means the host withheld the PTY
 child's session or the process table, or a process that carries the generation's
 marker could not be classified, so the generation is not reported clean.
-`daemon.doctor` adds one `session_rights` check, always `ok`, whose detail states
+`daemon.doctor` adds one `session_rights` check, `ok` whose detail states
 that processes that leave a session tree keep owner rights and names the
-placement mode: `ancestry+cgroup` when the service manager runs each worker as a systemd user unit, otherwise `ancestry`.
+placement mode: `ancestry+cgroup` when the service manager runs each worker as a systemd user unit, otherwise `ancestry`. The check is `fail` and names the sessions while a live session has no verified root process.
 
 `daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
 naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`

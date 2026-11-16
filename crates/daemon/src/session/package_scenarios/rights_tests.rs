@@ -145,7 +145,10 @@ async fn a_restored_session_keeps_its_launch_rights_and_a_verified_root() {
     );
     let (root, worker_root) = roots_of(&restarted, &id).await;
     let root = root.expect("the adopted session has a PTY root");
-    assert!(worker_root.is_some(), "the adopted session has a worker root");
+    assert!(
+        worker_root.is_some(),
+        "the adopted session has a worker root"
+    );
     let (class, _keep) = restarted
         .registry
         .classify_caller(&ControlPeer::for_test(root))
@@ -166,7 +169,11 @@ async fn a_restored_session_keeps_its_launch_rights_and_a_verified_root() {
         .remove(&id)
         .await
         .expect("remove the session");
-    assert!(restarted.registry.session_profile_rights(&id).await.is_none());
+    assert!(restarted
+        .registry
+        .session_profile_rights(&id)
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -189,14 +196,13 @@ async fn a_live_session_without_a_verified_root_leaves_outside_callers_unattribu
     let (class, keep) = fixture.registry.classify_caller(&outside).await;
     assert_eq!(class, CallerClass::Unattributed);
     assert!(!keep, "the placement is made again on the next request");
-    assert_eq!(fixture.registry.unverified_root_sessions().await, vec![id.clone()]);
+    assert_eq!(
+        fixture.registry.unverified_root_sessions().await,
+        vec![id.clone()]
+    );
     let check = crate::doctor::session_rights_check(false, &[id.clone()]);
     assert_eq!(check.status, protocol::DoctorStatus::Fail);
     assert!(check.detail.contains(&id.0), "{}", check.detail);
 
-    fixture
-        .registry
-        .stop(&id)
-        .await
-        .expect("stop the session");
+    fixture.registry.stop(&id).await.expect("stop the session");
 }

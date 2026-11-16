@@ -52,9 +52,9 @@ use serde_json::{json, Value};
 
 use super::schema::{MIGRATIONS, STORE_SCHEMA_VERSION};
 use super::{
-    ActiveAgentOrigin, CreateRequest, LaunchRights, DesiredState, NativeIdentityOrdering, ProjectRecord, Record,
-    ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction, StoredInputRules,
-    TransactionKind, WorktreeBinding, WorktreeStatus,
+    ActiveAgentOrigin, CreateRequest, DesiredState, LaunchRights, NativeIdentityOrdering,
+    ProjectRecord, Record, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
+    StoredInputRules, TransactionKind, WorktreeBinding, WorktreeStatus,
 };
 use crate::agent::{
     ExistenceCheckKind, NameMatch, NativeArg, NativeReferenceProvenance, SessionRefKind,

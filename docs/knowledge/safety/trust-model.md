@@ -127,7 +127,11 @@ The assistant must:
   and `shell` sessions keep owner rights, and so does a process that leaves the
   tree (a double fork, `systemd-run --user --scope`). It is a guardrail against
   a confused worker, not isolation from a hostile one; run untrusted agents in
-  the isolation track (#88). `pohunek doctor` shows the `session_rights` check.
+  the isolation track (#88). `pohunek doctor` shows the `session_rights` check,
+  which fails and names a live session whose root process the daemon could not
+  verify; until that session's worker is reattached, a caller no root
+  attributes is refused as `unattributed_caller` instead of getting owner
+  rights.
 - The parent link is attested for a process inside a session's tree: a
   `session.new` from there records that session as `spawned_by` and refuses
   markers that name another session (`origin_mismatch`). Only the owner moves a

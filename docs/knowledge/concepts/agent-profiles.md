@@ -399,8 +399,11 @@ the file as it reads when the daemon places a caller (once per connection) and
 when it checks a spawn. An edit that takes rights away applies to the running
 sessions from their next connection; an edit that adds rights applies to the
 sessions launched after it. A file the daemon cannot read, including one with
-unsafe permissions, grants nothing and forbids spawning. A session restored
-after a daemon restart holds the rights the file has at its first use. The
+unsafe permissions, grants nothing and forbids spawning. The launch rights are
+stored in the session record, so a session restored after a daemon restart
+holds the rights it was launched with, never more than the file allows now. A
+session recorded before the rights were stored takes the file as it reads at
+its first use. The
 table is part of the profile revision, so a change also asks for
 `--accept-profile-change` on the next resume.
 

@@ -194,9 +194,7 @@ pub(super) async fn handle_session_resume(request: &Request, state: &DaemonState
         .resume_with(params.session_id(), change)
         .await
     {
-        Ok(session) => {
-            ok_value(request, &SessionResumeResult { session })
-        }
+        Ok(session) => ok_value(request, &SessionResumeResult { session }),
         Err(err) => error_value(request, err),
     }
 }

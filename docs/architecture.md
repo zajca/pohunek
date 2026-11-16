@@ -2358,19 +2358,33 @@ that remain are cheap, free-by-default, or inherited:
   |---|---|---|
   | Remote overlay connection, or in-process dispatch | no kernel peer | `Owner` (the overlay policy is the gate) |
   | Local peer of another user, a peer the kernel no longer attests, or an accepted socket the kernel could not attest | socket credentials | `Unknown`: every checked mutation is refused with `unknown_caller` |
-  | Ancestry reaches a live session's PTY root (pid and start identity, at most 128 parent links) | parent walk | `Session(X)` |
+  | Ancestry reaches a live session's PTY root or its worker process (pid and start identity, at most 128 parent links) | parent walk | `Session(X)` |
   | Linux, no ancestry match, the control group is inside session X's worker unit | control group | `Session(X)` |
   | Ancestry names X and the control group names another session | both | `Session(X)`; ancestry wins |
   | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights; a shell a session spawned is `Session(X)` of its own tree |
   | The session X the caller belongs to runs a profile with `[rights] owner_equivalent = true` | profile file | `OwnerShell(X)`: owner rights |
-  | None of the above: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
+  | None of the above while every live session has a verified root: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
+  | None of the above while a live session has no verified root | | `Unattributed`: every checked mutation is refused with `unattributed_caller`, and the placement is not kept for the connection |
+
+  The daemon starts each session's worker itself, or reattaches a live one
+  after a restart, so it knows the worker's pid and start identity before the
+  worker forks the PTY child. A launch records that identity before the
+  worker initializes, and the session entry keeps it beside the PTY root, so
+  a process of a session placed below the worker is attributed to the session
+  even in the window before the entry exists. A session adopted after a
+  restart takes both identities from the live worker it reattaches to. A live
+  session that holds neither (a worker the daemon could not reattach) is the
+  fault state: `pohunek doctor` fails the `session_rights` check and names the
+  session, and a caller no root attributes is `Unattributed` instead of
+  `Owner` until the worker is reattached or the session ends.
 
   A `Session(X)` caller may mutate a session only when it is a descendant of
   X along `spawned_by` (children, their children, so `session rm --with-children`
   of an own child works). The one other allowed target is X's own parent, for
   `session.input` only and not while the parent's activity is `blocked`.
   Everything else is refused with `runtime/session_right_denied`; its message
-  carries `reason=not_descendant`, `parent_blocked` or `unknown_caller`. The
+  carries `reason=not_descendant`, `parent_blocked`, `unknown_caller` or
+  `unattributed_caller`. The
   origin-session guard runs first and keeps `plugin_self_target_denied`; a
   `Session(X)` caller that targets X itself gets the same code even when the
   request carries no markers, and `session.attach` of X keeps

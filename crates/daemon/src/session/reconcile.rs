@@ -42,8 +42,8 @@ use super::{
     SessionRegistry, SessionRuntime, SessionState, StateSource, TurnEvents, Unavailability,
     UnconfirmedCleanup, Worker, WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
-use crate::agent::profile::rights::ProfileRights;
 use crate::agent::host::RuntimeDefinition;
+use crate::agent::profile::rights::ProfileRights;
 use crate::agent::NativeReferenceProvenance;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
@@ -4394,7 +4394,10 @@ impl SessionRegistry {
                 pid: worker_process.pid,
                 start_identity: crate::procwatch::StartIdentity::new(worker_process.start_identity),
             }),
-            launch_rights: record.launch_rights.as_ref().map(ProfileRights::from_record),
+            launch_rights: record
+                .launch_rights
+                .as_ref()
+                .map(ProfileRights::from_record),
         };
         let listed = record.clone();
         match self.write_record_and_install(&id, record, entry).await {
@@ -4745,7 +4748,10 @@ impl SessionRegistry {
             create_request: record.create_request.clone(),
             root_process: None,
             worker_root: None,
-            launch_rights: record.launch_rights.as_ref().map(ProfileRights::from_record),
+            launch_rights: record
+                .launch_rights
+                .as_ref()
+                .map(ProfileRights::from_record),
         };
         (record, entry)
     }
