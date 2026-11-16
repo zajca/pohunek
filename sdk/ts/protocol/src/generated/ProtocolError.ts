@@ -36,7 +36,9 @@ export type ProtocolError = {
    * `command_failed` carries the process exit, and only a client that called
    * `command.run` can receive that error. `session_request_in_progress` and
    * `session_request_conflict` carry the session id, and only a client that
-   * sent a `client_request_id` can receive them. No older client sees the
+   * sent a `client_request_id` can receive them. `fetch_ref_commit_mismatch`
+   * carries `expected_commit`, `fetched_commit` and `source_ref`, and only a
+   * client that sent `fetch_ref` can receive it. No older client sees the
    * key. It is boxed so the error type stays small in every `Result` that
    * carries it.
    */

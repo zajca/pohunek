@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use protocol::{ErrorClass, FetchRefRequest, FetchedRef, ProtocolError};
+use protocol::{ErrorClass, ErrorDetails, FetchRefRequest, FetchedRef, ProtocolError};
 use tracing::warn;
 
 use super::fetch::{fetch_into_ref_with, fetch_ref_name, FetchScope, FetchedBase};
@@ -329,4 +329,10 @@ fn fetch_ref_commit_mismatch(source_ref: &str, expected: &str, actual: &str) -> 
         ),
         Some("fetch the ref and pass the commit it points to".to_owned()),
     )
+    .with_details(ErrorDetails {
+        expected_commit: Some(expected.to_owned()),
+        fetched_commit: Some(actual.to_owned()),
+        source_ref: Some(source_ref.to_owned()),
+        ..Default::default()
+    })
 }
