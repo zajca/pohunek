@@ -1295,7 +1295,6 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
 mod tests {
     use std::path::Path;
 
-
     use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 
     use super::*;

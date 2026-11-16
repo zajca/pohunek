@@ -725,9 +725,10 @@ async fn an_entry_url_or_redirect_to_a_refused_target_stops_before_the_request()
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_url_refused");
-    // Refresh (one fetch) + stage fetch (one fetch) = the refused fetch is
-    // counted once per caller that has no stored copy.
-    assert_eq!(rig.request_count(), 2, "{:?}", rig.server.requests());
+    // The refused fetch is attempted once; there is no fallback retry on a
+    // fatal (non-miss) error.
+    assert_eq!(rig.request_count(), 1, "{:?}", rig.server.requests());
+    assert_eq!(rig.server.requests(), vec![INDEX_PATH]);
 
     // A redirect of the index to a foreign host is refused before the hop.
     rig.server

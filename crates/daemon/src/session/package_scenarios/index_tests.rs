@@ -1491,7 +1491,9 @@ async fn scenario_m4_damaged_index_state_is_index_state_unreadable() {
         .packages()
         .package_install(PackageInstallParams {
             archive_path: fixture.write_archive(&local),
-            trust: PackageTrust::ExplicitDigest { digest: digest.clone() },
+            trust: PackageTrust::ExplicitDigest {
+                digest: digest.clone(),
+            },
             enable: true,
             select: true,
             dry_run: false,
@@ -1502,15 +1504,12 @@ async fn scenario_m4_damaged_index_state_is_index_state_unreadable() {
     // Corrupt the index state file after the first successful install.
     let state_path = fixture.plugins.join("index-state.json");
     std::fs::write(&state_path, b"{not json").expect("corrupt state");
-    std::fs::set_permissions(
-        &state_path,
-        std::fs::Permissions::from_mode(0o600),
-    )
-    .expect("owner-private"); // requires PermissionsExt below
-    // A repair-free corrupt file must be seen via unsafe read; a fresh
-    // schema is needed to distinguish damage from an unsafe mode. The
-    // daemon's `index_state()` maps damage to `RegistryError::Corrupt`.
-    // Any subsequent local install must refuse fail-closed.
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))
+        .expect("owner-private"); // requires PermissionsExt below
+                                  // A repair-free corrupt file must be seen via unsafe read; a fresh
+                                  // schema is needed to distinguish damage from an unsafe mode. The
+                                  // daemon's `index_state()` maps damage to `RegistryError::Corrupt`.
+                                  // Any subsequent local install must refuse fail-closed.
     let second = Package::build("community.aurora", "1.1.0", "aurora", INERT_PROGRAM);
     let err = fixture
         .registry
@@ -1572,10 +1571,7 @@ async fn scenario_m1_staged_install_stores_document() {
         .expect("indexed install");
     assert_eq!(installed.package.origin, PackageOrigin::Official);
     // The daemon stored the official copy (M1), not just raised marks.
-    let stored = fixture
-        .plugins
-        .join("index")
-        .join("official-v1.json");
+    let stored = fixture.plugins.join("index").join("official-v1.json");
     assert!(stored.exists(), "stored official-v1.json must exist");
     assert_eq!(
         std::fs::read(&stored).expect("read stored"),
@@ -1682,10 +1678,9 @@ async fn scenario_m6_schema1_upgrades_by_source() {
         }
     }
     // The next mutation writes schema 2.
-    let header: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.join("registry.json")).expect("read back"),
-    )
-    .expect("json");
+    let header: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("registry.json")).expect("read back"))
+            .expect("json");
     assert_eq!(
         header.get("schema").and_then(|v| v.as_u64()),
         Some(1),

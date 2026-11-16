@@ -538,7 +538,6 @@ fn write_staged(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<Strin
         })
 }
 
-
 /// Read the stored sidecar and return the freshest `stored_at`.
 ///
 /// Returns `None` when there is no stored copy yet. The CLI reads the same

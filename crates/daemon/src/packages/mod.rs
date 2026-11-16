@@ -1592,9 +1592,8 @@ fn install_package(
         // M1: the stored copy follows the marks in the same install, so a
         // staged-index install never leaves the stored copy below them.
         if let Some(index_bytes) = index_bytes.as_ref() {
-            let schema_version = parse_index_envelope(index_bytes)
-                .map(|envelope| envelope.schema_version)
-                .unwrap_or(1);
+            let schema_version =
+                parse_index_envelope(index_bytes).map_or(1, |envelope| envelope.schema_version);
             registry
                 .store_index(schema_version, index, index_bytes, now)
                 .map_err(|error| registry_kind(&error))?;
