@@ -4487,7 +4487,7 @@ Canonical public codes currently emitted include:
 In the `discovery` row `<overlay>` is `netbird` or `tailscale`: `netbird_cli_missing`,
 `netbird_state_unavailable`, `netbird_state_restricted` and `netbird_listener_address_missing` come from the
 NetBird provider, and `tailscale_cli_missing`, `tailscale_state_unavailable` and
-`tailscale_listener_address_missing` from the Tailscale provider. `netbird_state_restricted` comes only from the NetBird provider, when NetBird 0.83 or later withholds peers and this host's address from an account that does not own the NetBird connection. A malformed
+`tailscale_listener_address_missing` from the Tailscale provider. `netbird_state_restricted` comes only from the NetBird provider, when NetBird 0.83 or later withholds peers and this host's address from an account that does not own the NetBird connection. The `recover` of `netbird_state_restricted` names the `[netbird.static_peers.<name>]` table, the host-id source, and `netbird profile claim`. `overlay_discovery_failed` lists each overlay with its code and carries the remedy of a restricted overlay in `recover`. A malformed
 `overlays.toml` is always `overlay_configuration_invalid`; no provider has its own
 configuration code.
 
@@ -5309,7 +5309,8 @@ Public exports:
   stable overlay IDs and one non-zero daemon port per provider.
 - `OverlayTransport`: provider contract whose required typed identity resolver
   must match only the requested peer-ID or FQDN field; implementations cannot
-  inherit an untyped selector fallback.
+  inherit an untyped selector fallback. A provider fills `remedy` with a
+  bounded, non-secret operator action.
   `discover_snapshot` reads the visible peers and this machine's own identity in
   one pass; a provider that derives both from one state read overrides it, so
   discovery runs the provider once and the `local` record and the peers cannot

@@ -71,11 +71,77 @@ fn governance_status(reported: &str) -> Value {
     serde_json::to_value(status).expect("status JSON")
 }
 
+fn capabilities() -> protocol::HostCapabilities {
+    protocol::HostCapabilities {
+        daemon_version: "fixture".to_owned(),
+        protocol_version: protocol::PROTOCOL_VERSION,
+        supported_agents: vec!["codex".to_owned()],
+        runtimes: vec![protocol::AgentRuntime {
+            agent: "codex".to_owned(),
+            agent_base: None,
+            available: true,
+            path: None,
+            version: None,
+            supported: None,
+            config_home_id: None,
+            display_name: None,
+            audience: None,
+            options: Vec::new(),
+        }],
+        git_available: true,
+        worktree_supported: true,
+        terminal_read_supported: true,
+        output_read_supported: true,
+        session_wait_supported: true,
+        session_wait_turn_supported: true,
+        session_new_cwd_supported: true,
+        session_new_input_ack_supported: true,
+        session_new_secret_env_supported: true,
+        session_new_request_id_supported: true,
+        session_new_context_pin_supported: true,
+        session_new_fetch_ref_supported: true,
+        session_attention_isolation_supported: true,
+        session_list_tree_filters_supported: true,
+        session_retention_selector_supported: true,
+        session_remove_tree_supported: false,
+        session_adopt_supported: false,
+        package_install_commands_supported: true,
+        package_install_index_supported: false,
+        package_bind_profile_expected_supported: true,
+        package_install_index_context_supported: false,
+        package_create_profile_supported: true,
+        package_create_profile_options_supported: true,
+        package_create_preset_supported: true,
+        package_remove_profile_supported: true,
+        integration_agent_skill_supported: true,
+        package_index_apply_supported: false,
+        session_new_branch_source_supported: true,
+        session_new_agent_options_supported: true,
+        host_hooks: None,
+        session_new_skip_repo_hooks_supported: false,
+    }
+}
+
 fn result_for(request: &Request, reported: &str) -> Value {
     match request.method() {
-        protocol::method::SESSION_LIST => json!([]),
+        protocol::method::SESSION_LIST | protocol::method::PROJECT_LIST => json!([]),
         protocol::method::HOST_GOVERNANCE_INSPECT => governance_status(reported),
         protocol::method::SESSION_ATTACH => json!({"stream_id": "stream-1"}),
+        protocol::method::HOST_INSPECT => {
+            serde_json::to_value(capabilities()).expect("serialize capabilities")
+        }
+        protocol::method::COMMAND_RUN => serde_json::to_value(protocol::CommandRunResult {
+            package: protocol::PackageIdentity {
+                id: protocol::PackageId::parse("pkg").expect("valid package id"),
+                version: protocol::PackageVersion::parse("1").expect("valid version"),
+            },
+            command: protocol::CommandName::parse("cmd").expect("valid command name"),
+            digest: protocol::PackageDigest::parse(&format!("sha256:{}", "0".repeat(64)))
+                .expect("valid digest"),
+            output: String::new(),
+            duration_ms: 0,
+        })
+        .expect("serialize command run"),
         _ => json!({}),
     }
 }
@@ -479,6 +545,14 @@ fn a_restricted_overview_without_the_table_keeps_failing_closed() {
         "the restricted code: {text}"
     );
     assert!(
+        !text.contains("the host is not listed in netbird.static_peers"),
+        "NoTable should not have NotListed suffix: {text}"
+    );
+    assert!(
+        !text.contains("used only while the NetBird daemon status is Connected"),
+        "NoTable should not have NotConnected suffix: {text}"
+    );
+    assert!(
         fs::read_to_string(&capture).unwrap_or_default().is_empty(),
         "no dial without the table"
     );
@@ -533,6 +607,10 @@ fn a_connecting_overview_never_resolves_the_static_peer() {
     assert!(
         out.contains("netbird_state_restricted"),
         "the restricted code: {out}"
+    );
+    assert!(
+        out.contains("used only while the NetBird daemon status is Connected"),
+        "NotConnected detail: {out}"
     );
     assert!(
         fs::read_to_string(&capture).unwrap_or_default().is_empty(),
@@ -673,6 +751,10 @@ fn an_unmatched_name_fails_with_the_restricted_error() {
     assert!(
         out.contains("netbird_state_restricted"),
         "restricted code: {out}"
+    );
+    assert!(
+        out.contains("the host is not listed in netbird.static_peers"),
+        "NotListed detail: {out}"
     );
     assert!(
         run.dialed.is_empty(),
@@ -1477,5 +1559,79 @@ fn each_uniqueness_rule_fails_alone() {
         "shared short name",
         "overlay_configuration_invalid",
         "netbird.static_peers.vps2 and netbird.static_peers.vps3 share a selector name",
+    );
+}
+
+#[test]
+fn autoreview_call_shapes_reach_a_static_peer_as_a_non_owner_account() {
+    let pinned = host_id(b'A');
+    let reported = host_id(b'A');
+    let arg_sets: [(&[&str], &str); 3] = [
+        (
+            &["--host", PEER_NAME, "project", "list", "--json"],
+            protocol::method::PROJECT_LIST,
+        ),
+        (
+            &["host", "inspect", PEER_NAME, "--json"],
+            protocol::method::HOST_INSPECT,
+        ),
+        (
+            &[
+                "host",
+                "command",
+                "run",
+                PEER_NAME,
+                "pkg",
+                "cmd",
+                "--timeout-ms",
+                "5000",
+                "--json",
+            ],
+            protocol::method::COMMAND_RUN,
+        ),
+    ];
+    for (args, expected) in arg_sets {
+        let run = run_pinned(args, &pinned, &reported);
+        assert!(
+            run.output.status.success(),
+            "args {args:?} failed: {}",
+            diagnostics(&run.output)
+        );
+        assert!(
+            run.dialed.iter().any(|l| l.starts_with(PEER_IP)),
+            "args {args:?} dialed {:?}",
+            run.dialed
+        );
+        let served = &run.served;
+        assert_eq!(
+            served.first().map(String::as_str).unwrap_or_default(),
+            protocol::method::HOST_GOVERNANCE_INSPECT,
+            "args {args:?} first served {served:?}"
+        );
+        assert!(
+            served.iter().any(|m| m.as_str() == expected),
+            "args {args:?} served {served:?}, expected {expected}"
+        );
+    }
+}
+
+#[test]
+fn a_mismatching_pin_refuses_host_command_run_before_the_command() {
+    let pinned = host_id(b'A');
+    let reported = host_id(b'B');
+    let run = run_pinned(
+        &["host", "command", "run", PEER_NAME, "pkg", "cmd", "--json"],
+        &pinned,
+        &reported,
+    );
+    assert!(!run.output.status.success(), "should fail");
+    let out = diagnostics(&run.output);
+    assert!(out.contains("host_identity_mismatch"), "{out}");
+    assert!(
+        !run.served
+            .iter()
+            .any(|m| m == protocol::method::COMMAND_RUN),
+        "command should not be served: {:?}",
+        run.served
     );
 }

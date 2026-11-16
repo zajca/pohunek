@@ -261,6 +261,10 @@ fn a_restricted_netbird_overview_warns_about_the_connection_owner() {
         detail(netbird).contains("restricted to the owner"),
         "{netbird}"
     );
+    assert!(
+        detail(netbird).contains("netbird profile claim"),
+        "{netbird}"
+    );
 }
 
 /// A file the loader refuses is reported by the doctor rather than aborting it,
@@ -416,3 +420,7 @@ fn an_unreachable_peer_names_the_overlay_the_address_and_the_port() {
     assert!(stderr.contains(&target), "{stderr}");
     assert!(stderr.contains("overlays.toml"), "{stderr}");
 }
+
+// Row 8 is covered at the client boundary by
+// crates/client/tests/failed_overlays_remedy.rs: the CLI config allows one
+// provider per host, so the multi-failure branch is unreachable from here.

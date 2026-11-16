@@ -89,13 +89,16 @@ pub enum OverlayError {
         detail: String,
     },
     /// The provider answers, but withholds its peers and this host's address
-    /// from this account.
+    /// from this account. A provider fills `remedy` with a bounded,
+    /// non-secret action that lets this account read the state.
     #[error("overlay {overlay} state is restricted for this account: {detail}")]
     StateRestricted {
         /// Stable overlay identifier.
         overlay: OverlayId,
         /// Bounded, non-secret provider detail.
         detail: String,
+        /// Bounded, non-secret action that lets this account read the state.
+        remedy: String,
     },
     /// Provider configuration is invalid.
     #[error("overlay {overlay} configuration is invalid: {detail}")]

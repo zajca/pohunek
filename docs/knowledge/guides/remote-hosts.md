@@ -107,19 +107,41 @@ The trust anchor is the owner-chosen `host_id`: it names the exact daemon
 that must answer at the static `address`, verified by
 `host.governance.inspect` before any other request.
 
-- **Accounts that do not own the connection.** Find the subnet and the
-  peer `fqdn` from `netbird status --json` run as the owning account (or
-  from the Dashboards settings); the host id from `pohunek host governance
-  inspect local --json` on the peer. On the peer the selector is `local`.
-  The pin compares the host id the dialled
-  daemon reports with `host.governance.inspect` against the pinned one
-  before any other request; a different id is refused as
-  `host_identity_mismatch`. The pin does not protect against a different
-  mesh member that took the pinned address and reports the pinned host
-  id itself (the id is self-reported and not detected).
-  `host_identity_mismatch` means the dialled daemon does not report the
-  pinned host id: run `pohunek host governance inspect local` on the
-  peer and correct the `address`/`host_id`.
+- **Accounts that do not own the connection.**
+  1. Why: NetBird 0.83+ gives peers and this host's address only to the
+  profile's single owner and root. Group ownership does not exist. On a
+  headless host nobody owns the default profile (NetBird auto-claims it
+  only for a console user), so every non-root account is restricted.
+  `netbird profile list --show-owner` shows the owner.
+  2. Static peer (recommended for a service account): find the subnet and
+  the peer `fqdn` from `netbird status --json` run as the owning account
+  (or from the Dashboard's settings); the host id from `pohunek host
+  governance inspect local --json` on the peer. On the peer the selector
+  is `local`. The pin compares the host id the dialled daemon reports with
+  `host.governance.inspect` against the pinned one before any other
+  request; a different id is refused as `host_identity_mismatch`. The pin
+  does not protect against a different mesh member that took the pinned
+  address and reports the pinned host id itself (the id is self-reported
+  and not detected). `host_identity_mismatch` means the dialled daemon
+  does not report the pinned host id: run `pohunek host governance inspect
+  local` on the peer and correct the `address`/`host_id`. The static-peer
+  table covers only connections this account opens: this account's own
+  `pohunekd` still has no NetBird address and serves local-only, which
+  `pohunek doctor` reports as its `overlay_netbird_listener` check with no
+  listener address.
+  3. Give the connection to the account that needs it with `sudo netbird
+  profile claim <profile> --owner <account>`: that account becomes the
+  only owner. It can then connect, disconnect and reconfigure the NetBird
+  connection, and the previous owner loses full status. Use it when that
+  account is the only user of the connection, or when its daemon must
+  serve over NetBird. See the [profile
+  ownership](https://docs.netbird.io/client/profile-ownership)
+  documentation.
+  4. `NB_DISABLE_PROFILE_OWNERSHIP=true` with `--allow-group` removes
+  NetBird's isolation between local users (NetBird: single-user devices
+  only). Pohunek does not recommend it.
+  5. Holding NetBird below 0.83 drops NetBird's local IPC authorization and
+  is not a supported fix.
 
 ### Diagnostics
 
@@ -303,12 +325,7 @@ macOS-specific routing, bridging, or relay mode.
   daemon logs `overlay CLI missing; serving local-only and retrying` and binds as
   soon as the CLI is found. For a VPN that was not ready, wait one retry
   interval and look for `serving control protocol over overlay`.
-  - **NetBird 0.83 non-owner account.** `netbird status` shows peers only to
-    the account that owns the NetBird connection (and root); pohunek run as
-    another account fails with `netbird_state_restricted` unless the owner
-    lists the peer as a static peer in `overlays.toml` with its pinned host
-    id. Run pohunek as the owning account, pin NetBird to 0.82.x, or
-    configure the static peer (see [Static peers](#static-peers)).
+  - **NetBird 0.83 non-owner account.** Run `netbird profile list --show-owner`; then follow the static-peer or `netbird profile claim` path in the section above and read the `recover` text of `netbird_state_restricted`.
 
 The future public team relay does not replace this direct overlay model and does
 not require NetBird. After host enrollment and transport work land, an enrolled

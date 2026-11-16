@@ -14,6 +14,9 @@ use crate::{NetbirdError, NetbirdStatus, Peer, StaticPeers};
 /// Stable identifier used by every `NetBird` route and wire record.
 pub const NETBIRD_OVERLAY_ID: &str = "netbird";
 
+/// What lets an account that does not own the `NetBird` connection reach a peer.
+const RESTRICTED_REMEDY: &str = "list the host under [netbird.static_peers.<name>] in overlays.toml with its address, fqdn and the host_id that `pohunek host governance inspect local --json` prints on that host; or, if this account is the only user of the NetBird connection, have root run `sudo netbird profile claim <profile> --owner <account>` (`netbird profile list --show-owner` shows the active profile and its owner); see docs/knowledge/guides/remote-hosts.md";
+
 /// `NetBird` provider adapter.
 #[derive(Debug)]
 pub struct NetbirdTransport {
@@ -128,9 +131,19 @@ impl OverlayTransport for NetbirdTransport {
                     resolve_identity_from_status(&status, identity, self.id())
                 }
                 View::Restricted { daemon_status } => {
-                    let restricted = restricted_error(&daemon_status, self.id());
-                    if !connected_restricted(&daemon_status) || self.static_peers.is_none() {
-                        return Err(restricted);
+                    if self.static_peers.is_none() {
+                        return Err(restricted_error(
+                            &daemon_status,
+                            RestrictedReason::NoTable,
+                            self.id(),
+                        ));
+                    }
+                    if !connected_restricted(&daemon_status) {
+                        return Err(restricted_error(
+                            &daemon_status,
+                            RestrictedReason::NotConnected,
+                            self.id(),
+                        ));
                     }
                     match identity.kind() {
                         ExternalIdentityKind::Fqdn => self
@@ -138,8 +151,18 @@ impl OverlayTransport for NetbirdTransport {
                             .as_ref()
                             .and_then(|peers| peers.match_fqdn(identity.value()))
                             .map(static_peer)
-                            .ok_or(restricted),
-                        ExternalIdentityKind::PeerId => Err(restricted),
+                            .ok_or_else(|| {
+                                restricted_error(
+                                    &daemon_status,
+                                    RestrictedReason::NotListed,
+                                    self.id(),
+                                )
+                            }),
+                        ExternalIdentityKind::PeerId => Err(restricted_error(
+                            &daemon_status,
+                            RestrictedReason::NotListed,
+                            self.id(),
+                        )),
                     }
                 }
             }
@@ -187,14 +210,25 @@ impl OverlayTransport for NetbirdTransport {
 
 impl NetbirdTransport {
     fn static_peer(&self, host: &str, daemon_status: &str) -> Result<ResolvedPeer, OverlayError> {
-        if !connected_restricted(daemon_status) || self.static_peers.is_none() {
-            return Err(restricted_error(daemon_status, self.id()));
+        if self.static_peers.is_none() {
+            return Err(restricted_error(
+                daemon_status,
+                RestrictedReason::NoTable,
+                self.id(),
+            ));
+        }
+        if !connected_restricted(daemon_status) {
+            return Err(restricted_error(
+                daemon_status,
+                RestrictedReason::NotConnected,
+                self.id(),
+            ));
         }
         self.static_peers
             .as_ref()
             .and_then(|peers| peers.match_selector(host))
             .map(static_peer)
-            .ok_or_else(|| restricted_error(daemon_status, self.id()))
+            .ok_or_else(|| restricted_error(daemon_status, RestrictedReason::NotListed, self.id()))
     }
 
     fn cross_check(&self, status: &NetbirdStatus) -> Result<(), OverlayError> {
@@ -249,13 +283,33 @@ fn connected_restricted(daemon_status: &str) -> bool {
     daemon_status.trim().eq_ignore_ascii_case("Connected")
 }
 
-fn restricted_error(daemon_status: &str, id: &OverlayId) -> OverlayError {
-    map_error(
-        NetbirdError::DetailRestricted {
-            daemon_status: daemon_status.to_owned(),
-        },
-        id,
-    )
+#[derive(Copy, Clone)]
+enum RestrictedReason {
+    NoTable,
+    NotConnected,
+    NotListed,
+}
+
+fn restricted_detail(daemon_status: &str) -> String {
+    format!("this account does not own the active NetBird profile (daemon status: {daemon_status})")
+}
+
+fn restricted_error(daemon_status: &str, reason: RestrictedReason, id: &OverlayId) -> OverlayError {
+    let base = restricted_detail(daemon_status);
+    let detail = match reason {
+        RestrictedReason::NoTable => base,
+        RestrictedReason::NotConnected => format!(
+            "{base}; static peers are used only while the NetBird daemon status is Connected"
+        ),
+        RestrictedReason::NotListed => {
+            format!("{base}; the host is not listed in netbird.static_peers")
+        }
+    };
+    OverlayError::StateRestricted {
+        overlay: id.clone(),
+        detail,
+        remedy: RESTRICTED_REMEDY.to_owned(),
+    }
 }
 
 fn static_peer(entry: &crate::StaticPeer) -> ResolvedPeer {
@@ -283,8 +337,10 @@ fn map_error(error: NetbirdError, id: &OverlayId) -> OverlayError {
         NetbirdError::DetailRestricted { daemon_status } => OverlayError::StateRestricted {
             overlay: id.clone(),
             detail: format!(
-                "this account does not own the active NetBird profile (daemon status: {daemon_status})"
+                "{}; static peers are used only by `--host <name>` and never appear in discovery",
+                restricted_detail(&daemon_status)
             ),
+            remedy: RESTRICTED_REMEDY.to_owned(),
         },
         NetbirdError::HostUnknown(host) => OverlayError::HostUnknown {
             host,

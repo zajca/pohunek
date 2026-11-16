@@ -408,19 +408,30 @@ impl ClientError {
                 if let [failure] = failures.as_slice() {
                     overlay_error_to_protocol(&failure.error)
                 } else {
-                    let overlays = failures
+                    let list = failures
                         .iter()
-                        .map(|failure| failure.overlay.as_str())
+                        .map(|failure| {
+                            let code = overlay_error_to_protocol(&failure.error).code;
+                            format!("{} ({code})", failure.overlay)
+                        })
                         .collect::<Vec<_>>()
                         .join(", ");
+                    let mut recover = "run `pohunek doctor` and repair at least one configured overlay".to_owned();
+                    for failure in failures {
+                        if let overlay::OverlayError::StateRestricted { remedy, .. } =
+                            &failure.error
+                        {
+                            recover.push_str("; ");
+                            recover.push_str(failure.overlay.as_str());
+                            recover.push_str(": ");
+                            recover.push_str(remedy);
+                        }
+                    }
                     ProtocolError::new(
                         ErrorClass::Discovery,
                         "overlay_discovery_failed",
-                        format!("all configured overlays failed discovery: {overlays}"),
-                        Some(
-                            "run `pohunek doctor` and repair at least one configured overlay"
-                                .to_owned(),
-                        ),
+                        format!("all configured overlays failed discovery: {list}"),
+                        Some(recover),
                     )
                 }
             }
@@ -608,13 +619,11 @@ fn overlay_error_to_protocol(error: &overlay::OverlayError) -> ProtocolError {
                 "ensure the {overlay} daemon is running and this host is logged in; run `pohunek doctor` to verify"
             )),
         ),
-        overlay::OverlayError::StateRestricted { detail, .. } => ProtocolError::new(
+        overlay::OverlayError::StateRestricted { detail, remedy, .. } => ProtocolError::new(
             ErrorClass::Discovery,
             format!("{overlay}_state_restricted"),
             format!("{overlay} detailed status is restricted to the owner of the {overlay} connection: {detail}"),
-            Some(format!(
-                "run pohunek as the account that owns the {overlay} connection, list the host as a static peer in overlays.toml, or pin {overlay} below the release that restricts status (NetBird 0.83); see docs/knowledge/guides/remote-hosts.md"
-            )),
+            Some(remedy.clone()),
         ),
         overlay::OverlayError::InvalidConfig { detail, .. } => ProtocolError::new(
             ErrorClass::Configuration,
