@@ -4215,8 +4215,7 @@ fn write_multicall_dispatcher(home: &Path, release: &str) -> PathBuf {
 /// lookup names the installed executable from the fixture `HOME`, the
 /// inventory reports the shim path with the installed release, the supported
 /// release launches and resumes, and `pohunek doctor` reports the profile
-/// ready. Removing the install leaves the shim unresolvable without touching
-/// the link, and the launch is refused with the shim guidance.
+/// ready.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_the_shim() {
@@ -4305,26 +4304,154 @@ async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_th
         .unwrap_or_else(|| panic!("doctor reports mise-shim-ok: {doctor}"));
     assert_eq!(check["status"], "ok", "{check}");
 
-    // Removing the install leaves the shim link in place but unresolvable:
-    // the inventory lists it as available-but-unsupported with no version,
-    // and the launch is refused with the shim install guidance.
+    fixture.finish().await;
+}
+
+/// A version-manager shim with no installed release of the agent (issue
+/// #2383, case 4): without the install file the shim link stays valid but
+/// the read-only offline lookup finds nothing, so the inventory lists the
+/// profile as available-but-unsupported with no version, the launch is
+/// refused with the no-installed-release guidance, the doctor detail names
+/// the same fix, and the log holds only the offline lookup with no shim
+/// invocations and no install: the version check never installs a tool.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_mise_shim_without_an_installed_tool_is_refused_and_nothing_is_installed() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let home = fixture.harness.env.home().to_path_buf();
+    let release = locked_release();
+    let shim = write_fake_mise(&root, &home, &release);
     fs::remove_file(home.join(".local/share/fakemise/installs/codex"))
         .expect("remove the fake install");
-    let entry = fixture.inventory_entry("mise-shim-ok").await;
+    let mise_log = home.join("mise.log");
+    fixture.write_profile("mise-shim-missing", Some(&shim));
+
+    let entry = fixture.inventory_entry("mise-shim-missing").await;
     assert_eq!(entry["available"], true, "{entry}");
     assert_eq!(entry["path"], shim.display().to_string(), "{entry}");
     assert!(entry["version"].is_null(), "{entry}");
     assert_eq!(entry["supported"], false, "{entry}");
-    let (code, refused) = fixture.launch("mise-shim-ok", "refused").await;
+
+    let (code, refused) = fixture.launch("mise-shim-missing", "refused").await;
     assert_eq!(code, 1, "{refused}");
     assert_eq!(
         refused["err"]["code"], "agent_runtime_unsupported",
         "{refused}"
     );
+    let message = refused["err"]["msg"].as_str().expect("refusal message");
+    assert!(
+        message.contains("the version manager that provides the selected agent executable has no installed release of it"),
+        "the refusal names the empty install set: {refused}"
+    );
     let recover = refused["err"]["recover"].as_str().unwrap_or("");
     assert!(
-        recover.contains("version manager") || recover.contains("version-manager"),
-        "the refusal names the version-manager shim: {refused}"
+        recover.contains("run the agent once in a login shell"),
+        "the refusal tells the operator to install in a login shell: {refused}"
+    );
+    assert!(
+        recover.contains("never installs or updates"),
+        "the refusal promises no install: {refused}"
+    );
+
+    let doctor = fixture.harness.run(&["doctor", "--json"]).await;
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let check = doctor["ok"]["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "agent_profile_mise-shim-missing")
+        .unwrap_or_else(|| panic!("doctor reports mise-shim-missing: {doctor}"));
+    assert_eq!(check["status"], "fail", "{check}");
+    let detail = check["detail"].as_str().expect("doctor detail");
+    assert!(
+        detail.contains("version-manager shim with no installed release"),
+        "the doctor detail names the empty install set: {check}"
+    );
+
+    // The lookup ran offline and read-only, and nothing else ran the shim:
+    // no install, no shim invocation. A returned launch is not log
+    // readiness: the refused launch never reaches the worker, but the
+    // inventory probe already wrote the log, so wait for the lookup line
+    // and treat a missing log as pending.
+    let log = wait_until("the offline mise lookup finding no install", || async {
+        let log = fs::read_to_string(&mise_log).ok()?;
+        log.lines()
+            .any(|line| {
+                line.starts_with("which codex offline=1 auto=0 home=")
+                    && line.ends_with(&home.display().to_string())
+            })
+            .then_some(log)
+    })
+    .await;
+    assert!(
+        log.lines().all(|line| line.starts_with("which codex")),
+        "only the lookup ran, no shim invocation: {log}"
+    );
+    assert!(
+        log.lines().all(|line| line.contains("auto=0")),
+        "the lookup never ran installing: {log}"
+    );
+    assert!(
+        !home.join(".local/share/fakemise/installs/codex").exists(),
+        "the version check installed nothing"
+    );
+    fixture.finish().await;
+}
+
+/// A version-manager shim whose lookup names another shim (issue #2383,
+/// case 5): the install file points at a second `codex` symlink to the
+/// fake `mise` manager, so the lookup reply is a shim, not a tool. The
+/// daemon refuses the recursion as a failed probe with the wrapper
+/// guidance, the inventory stays unsupported, and `mise.log` shows only the
+/// lookup with no shim invocation of the second link.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_mise_shim_whose_lookup_names_another_shim_is_refused() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let home = fixture.harness.env.home().to_path_buf();
+    let release = locked_release();
+    let shim = write_fake_mise(&root, &home, &release);
+    // Point the install file at a second shim to the same manager: the
+    // lookup names a shim, which the daemon must refuse (no recursion).
+    let inner = home.join("shims").join("inner");
+    std::os::unix::fs::symlink("../mise", &inner).expect("link the inner shim");
+    fs::write(
+        home.join(".local/share/fakemise/installs/codex"),
+        inner.display().to_string(),
+    )
+    .expect("point the fake install at the inner shim");
+    let mise_log = home.join("mise.log");
+    fixture.write_profile("mise-shim-nested", Some(&shim));
+
+    let entry = fixture.inventory_entry("mise-shim-nested").await;
+    assert_eq!(entry["available"], true, "{entry}");
+    assert_eq!(entry["path"], shim.display().to_string(), "{entry}");
+    assert_eq!(entry["supported"], false, "{entry}");
+
+    let (code, refused) = fixture.launch("mise-shim-nested", "refused").await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_runtime_unsupported",
+        "{refused}"
+    );
+    let text = refused.to_string();
+    assert_wrapper_guidance(&text, "the nested-shim refusal");
+
+    // Only the lookup ran; the inner shim never execed (no `shim inner`
+    // line) and the refused launch never reached the worker (no `shim
+    // codex` line).
+    let log = wait_until("the offline mise lookup naming the inner shim", || async {
+        let log = fs::read_to_string(&mise_log).ok()?;
+        log.lines()
+            .any(|line| line.starts_with("which codex offline=1 auto=0 home="))
+            .then_some(log)
+    })
+    .await;
+    assert!(
+        log.lines().all(|line| line.starts_with("which codex")),
+        "only the lookup ran, no shim invocation: {log}"
     );
     fixture.finish().await;
 }
