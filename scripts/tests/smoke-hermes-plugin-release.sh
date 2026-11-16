@@ -4,7 +4,11 @@ set -euo pipefail
 script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 fixture_root="$script_root/scripts/tests/fixtures"
 smoke="$script_root/scripts/smoke-hermes-plugin-release"
-test_root="$(mktemp -d "${TMPDIR:-/tmp}/pohunek-smoke.XXXXXX")"
+# A short fixed parent: $TMPDIR is long on macOS (/var/folders/.../T/) and
+# would push the daemon socket path over its byte budget, so the test root
+# never lives under it. /tmp resolves short on both macOS (/private/tmp)
+# and Linux.
+test_root="$(mktemp -d /tmp/pohunek-smoke.XXXXXX)"
 unsafe_temp_parent="$test_root/u"
 safe_temp_parent="$test_root/s"
 mkdir -p "$unsafe_temp_parent/.git" "$safe_temp_parent"
