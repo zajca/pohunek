@@ -1190,6 +1190,7 @@ impl Git {
             limits: RunLimits::new(GIT_COMMAND_TIMEOUT.min(remaining), GIT_STDOUT_CAP_BYTES),
             stderr: StderrPolicy::Discard,
             stdin,
+            cwd: None,
         };
         match bounded_run::run(&spec, &Instant::now, None) {
             RunOutcome::Exited(output) => {

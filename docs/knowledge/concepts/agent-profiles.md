@@ -78,14 +78,16 @@ without another PATH lookup, so a symlink stays a symlink and `argv[0]` keeps
 the configured name. A same-owner replacement of the file between probe and exec
 remains within the documented single-operator trust boundary. When the
 resolved path is a version-manager shim (a symlink to the `mise` manager under
-another name), the daemon first asks mise read-only which installed executable
-the shim would run and probes that file in the unchanged private sandbox, while
-the launch still goes through the shim link. Other `argv[0]` dispatchers
+another name), the daemon first asks mise read-only, starting in `/`, which
+installed executable the shim would run and probes that file in the private
+sandbox, while the launch still goes through the shim link. Other `argv[0]` dispatchers
 behind a symlink (Volta, snap, a busybox-style multicall binary) are probed
 through their link in the private sandbox; they pass when they answer
-hermetically and are refused with the wrapper guidance otherwise. A project-local
-mise pin in the session working directory does not change the probe: the lookup
-reads the global selection, while the launch may run the project's release. A runtime package can declare its own supported range with a data-driven probe
+hermetically and are refused with the wrapper guidance otherwise. A project
+pin in any directory the lookup would otherwise walk through (including a
+project-local mise pin in the session working directory) does not change the
+probe: the lookup starts in `/` and reads the owner's global/system
+selection, while the launch may run the project's release. A runtime package can declare its own supported range with a data-driven probe
 (`version_probe = { parser = "semver-v1", args, min, below }`, or `semver-line-v1` with an extra
 `line` template such as `codex-cli {version}` for a banner that wraps the release, or
 `semver-revision-line-v1` for a `1.4.13-R2` release); the daemon applies the
@@ -106,8 +108,8 @@ without loading user configuration, requiring credentials or contacting a servic
 Forward the real agent's output rather than printing a made-up supported version.
 The probe's deadline and output limits still apply. A version-manager shim is
 not a wrapper under this contract: it keeps its link name, and the daemon
-dispatches to the executable the manager names instead of expecting the link
-itself to answer hermetically.
+dispatches to the executable the manager names (starting in `/`) instead of
+expecting the link itself to answer hermetically.
 
 An unparseable answer and a failed probe include conditional wrapper recovery
 guidance in the launch refusal and doctor detail. A parsed release outside the

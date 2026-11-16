@@ -3591,6 +3591,36 @@ fn write_wrapper_agent(root: &Path, directory: &str, banner: &str, reference: &s
     path
 }
 
+/// Writes the installed agent for the mise shim scenarios: the same shape
+/// as [`write_wrapper_agent`], but its probe and launch lines also log
+/// `HOME`, so the mise scenarios can assert the probe of the manager-named
+/// executable ran in the daemon's private `pohunek-run-` sandbox and not
+/// under the fixture HOME.
+#[cfg(target_os = "linux")]
+fn write_mise_agent(root: &Path, directory: &str, banner: &str, reference: &str) -> PathBuf {
+    let interpreter = root.join("fake-codex-sh");
+    if !interpreter.exists() {
+        copy_shell_image("/bin/sh", &interpreter)
+            .expect("copy the shell image for the fake agent interpreter");
+    }
+    let reporter = write_identity_reporter(root);
+    let path = root.join(directory).join("codex");
+    fs::create_dir_all(path.parent().expect("the fake agent directory"))
+        .expect("create the fake agent directory");
+    write_executable(
+        &path,
+        format!(
+            "#!{interpreter}\nprintf '%s home=%s\\n' \"$*\" \"$HOME\" >> '{agent_log}'\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\npython3 '{reporter}' '{reference}' '{report_log}'\nwhile :; do sleep 600; done\n",
+            interpreter = path_str(&interpreter),
+            agent_log = root.join(format!("agent-{directory}.log")).display(),
+            reporter = reporter.display(),
+            report_log = root.join("hook-report.log").display(),
+        ),
+    )
+    .expect("write the fake installed agent");
+    path
+}
+
 /// Writes the Python script a fake agent runs to report a native reference
 /// through the real hook endpoint of its worker: the claim names the parent
 /// process (the launch process) and the reference, exactly as a provider
@@ -4140,12 +4170,17 @@ async fn a_wrapper_that_cannot_answer_the_version_probe_is_refused_with_wrapper_
 /// real mise does (`MISE_BIN_NAME = filename(ARGV0)`): under the `mise`
 /// basename it answers `which <name>` from the install files below the
 /// lookup's `HOME` (offline, no install), and any other basename execs its
-/// install file the same way. The shim is `home/shims/codex -> ../mise`.
-/// Each profile's `program` is the absolute shim path. `home/mise.log`
-/// records one line per manager and shim invocation, so the scenario
-/// asserts the lookup ran offline under the fixture HOME and the launch
-/// execed the shim. Everything lives below the fixture `HOME` so every
-/// ancestor of the trust-checked lookup chain is owner-controlled.
+/// install file the same way. Like real mise it walks from its working
+/// directory up to `/` first: a `.tool-versions` naming `codex <uninstalled>`
+/// makes the lookup fail the way an uninstalled project pin does. The shim
+/// is `home/shims/codex -> ../mise`. Each profile's `program` is the
+/// absolute shim path. `home/mise.log` records one line per manager and shim
+/// invocation, so the scenario asserts the lookup ran offline under the
+/// fixture HOME and the launch execed the shim. Everything lives below the
+/// fixture `HOME` so every ancestor of the trust-checked lookup chain is
+/// owner-controlled; the daemon lookup still starts in `/`, so project
+/// config in directories the lookup would otherwise walk through cannot
+/// change the selection.
 #[cfg(target_os = "linux")]
 fn write_fake_mise(root: &Path, home: &Path, release: &str) -> PathBuf {
     let interpreter = root.join("fake-codex-sh");
@@ -4157,7 +4192,7 @@ fn write_fake_mise(root: &Path, home: &Path, release: &str) -> PathBuf {
     write_executable(
         &mise,
         format!(
-            "#!{interpreter}\nlog='{log}'\nname=\"${{0##*/}}\"\nif [ \"$name\" = mise ]; then\n  if [ \"$1\" = which ]; then\n    printf 'which %s offline=%s auto=%s home=%s\\n' \"$2\" \"$MISE_OFFLINE\" \"$MISE_AUTO_INSTALL\" \"$HOME\" >> \"$log\"\n    target=\"$HOME/.local/share/fakemise/installs/$2\"\n    if [ -f \"$target\" ]; then\n      cat \"$target\"\n      exit 0\n    fi\n    echo \"$2 is not installed\" >&2\n    exit 1\n  fi\n  echo 'mise 2026.11.0 linux-x64 (fake)'\n  exit 0\nfi\nprintf 'shim %s %s home=%s\\n' \"$name\" \"$*\" \"$HOME\" >> \"$log\"\ntarget=\"$HOME/.local/share/fakemise/installs/$name\"\nexec \"$(cat \"$target\")\" \"$@\"\n",
+            "#!{interpreter}\nlog='{log}'\nname=\"${{0##*/}}\"\nif [ \"$name\" = mise ]; then\n  if [ \"$1\" = which ]; then\n    printf 'which %s offline=%s auto=%s home=%s cwd=%s\\n' \"$2\" \"$MISE_OFFLINE\" \"$MISE_AUTO_INSTALL\" \"$HOME\" \"$PWD\" >> \"$log\"\n    dir=\"$PWD\"\n    while :; do\n      if [ -f \"$dir/.tool-versions\" ] && grep -q '^codex ' \"$dir/.tool-versions\"; then\n        echo \"codex is not installed\" >&2\n        exit 1\n      fi\n      [ \"$dir\" = / ] && break\n      dir=\"${{dir%/*}}\"\n      [ -z \"$dir\" ] && dir=/\n    done\n    target=\"$HOME/.local/share/fakemise/installs/$2\"\n    if [ -f \"$target\" ]; then\n      cat \"$target\"\n      exit 0\n    fi\n    echo \"$2 is not installed\" >&2\n    exit 1\n  fi\n  echo 'mise 2026.11.0 linux-x64 (fake)'\n  exit 0\nfi\nprintf 'shim %s %s home=%s\\n' \"$name\" \"$*\" \"$HOME\" >> \"$log\"\ntarget=\"$HOME/.local/share/fakemise/installs/$name\"\nexec \"$(cat \"$target\")\" \"$@\"\n",
             interpreter = path_str(&interpreter),
             log = home.join("mise.log").display(),
         ),
@@ -4167,8 +4202,9 @@ fn write_fake_mise(root: &Path, home: &Path, release: &str) -> PathBuf {
     // hook endpoint of its worker like a provider hook does. Its
     // interpreter is a shell copy named for the provider, so the worker
     // admits the process as the launch process of the claim by its
-    // executable name.
-    let agent = write_wrapper_agent(
+    // executable name. The probe and launch lines also log HOME, so the
+    // scenarios assert the probe ran in the private sandbox.
+    let agent = write_mise_agent(
         root,
         "mise-agent",
         &format!("codex-cli {release}"),
@@ -4187,9 +4223,11 @@ fn write_fake_mise(root: &Path, home: &Path, release: &str) -> PathBuf {
 /// Writes a `busybox`-style multicall dispatcher: it answers the package's
 /// probe only when linked under the `codex` basename, and prints the manager
 /// banner under any other name, so dispatching on the link name decides the
-/// installed release instead of the manager's own. Fixture directories live
-/// below the fixture `HOME` so every ancestor of the trust-checked lookup
-/// chain is owner-controlled.
+/// installed release instead of the manager's own. Every line logs the
+/// invoked basename first, so the scenario asserts which link name the probe
+/// and the launch ran under. Fixture directories live below the fixture
+/// `HOME` so every ancestor of the trust-checked lookup chain is
+/// owner-controlled.
 #[cfg(target_os = "linux")]
 fn write_multicall_dispatcher(home: &Path, release: &str) -> PathBuf {
     let tool = home.join("multicall").join("tool");
@@ -4198,7 +4236,7 @@ fn write_multicall_dispatcher(home: &Path, release: &str) -> PathBuf {
     write_executable(
         &tool,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then\n  if [ \"${{0##*/}}\" = codex ]; then\n    echo 'codex-cli {release}'\n    exit 0\n  fi\n  echo 'multicall 9.9.9 manager'\n  exit 0\nfi\nexec sleep 600\n",
+            "#!/bin/sh\nprintf '%s %s\\n' \"${{0##*/}}\" \"$*\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then\n  if [ \"${{0##*/}}\" = codex ]; then\n    echo 'codex-cli {release}'\n    exit 0\n  fi\n  echo 'multicall 9.9.9 manager'\n  exit 0\nfi\nprintf 'launched as %s\\n' \"${{0##*/}}\" >> '{log}'\nexec sleep 600\n",
             log = home.join("multicall.log").display(),
         ),
     )
@@ -4234,7 +4272,9 @@ async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_th
     assert_eq!(entry["supported"], true, "{entry}");
 
     // The lookup ran the manager in manager mode, read-only and offline,
-    // with the fixture HOME; timing lines carry no assertions.
+    // with the fixture HOME, from the filesystem root (so no project
+    // config above the lookup can change the selection); timing lines
+    // carry no assertions.
     let log = wait_until(
         "the offline mise lookup naming the installed tool",
         || async {
@@ -4242,7 +4282,8 @@ async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_th
             log.lines()
                 .any(|line| {
                     line.starts_with("which codex offline=1 auto=0 home=")
-                        && line.ends_with(&home.display().to_string())
+                        && line.contains(&format!("home={}", home.display()))
+                        && line.ends_with("cwd=/")
                 })
                 .then_some(log)
         },
@@ -4252,6 +4293,31 @@ async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_th
         log.lines()
             .all(|line| !line.contains("MISE_OFFLINE=0") && !line.contains("auto=1")),
         "the lookup never ran online or installing: {log}"
+    );
+
+    // The probe of the manager-named executable ran in the daemon's private
+    // sandbox, not under the fixture HOME: the agent logs its HOME on every
+    // invocation, and the first (`--version`) line names a `pohunek-run-`
+    // directory the harness never uses.
+    let agent_log = root.join("agent-mise-agent.log");
+    let probe_home = wait_until("the installed agent's probe HOME", || async {
+        let log = fs::read_to_string(&agent_log).ok()?;
+        log.lines()
+            .find(|line| line.starts_with("--version home="))
+            .map(str::to_owned)
+    })
+    .await;
+    let probe_home = probe_home
+        .strip_prefix("--version home=")
+        .expect("the probe logged its HOME");
+    assert!(
+        probe_home.contains("pohunek-run-"),
+        "the manager-named executable was probed in the private sandbox: {probe_home}"
+    );
+    assert_ne!(
+        Path::new(probe_home),
+        home.as_path(),
+        "the probe did not see the owner HOME"
     );
 
     let (code, launched) = fixture.launch("mise-shim-ok", "shimmed").await;
@@ -4304,6 +4370,64 @@ async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_th
         .unwrap_or_else(|| panic!("doctor reports mise-shim-ok: {doctor}"));
     assert_eq!(check["status"], "ok", "{check}");
 
+    fixture.finish().await;
+}
+
+/// A project pin above the lookup directory does not change the mise
+/// selection (issue #2383, case 11): the lookup starts in `/`, whose only
+/// ancestor is itself, so a `.tool-versions` naming an uninstalled release
+/// in the daemon's own temporary directory (the parent of the
+/// `pohunek-run-` sandboxes, where a shared `/tmp` would hold other users'
+/// files) never reaches the lookup. The fake mise honours such a pin the
+/// way real mise does, so with the sandbox cwd the lookup would fail; from
+/// `/` the inventory still reports the installed tool as supported through
+/// the shim.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_project_config_above_the_lookup_directory_does_not_change_the_mise_selection() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let home = fixture.harness.env.home().to_path_buf();
+    let release = locked_release();
+    let shim = write_fake_mise(&root, &home, &release);
+    let mise_log = home.join("mise.log");
+    // The daemon builds its run sandboxes in the process temporary
+    // directory: a pin there is an ancestor of every sandbox cwd, the way
+    // a shared `/tmp` file is an ancestor of runs without an explicit
+    // lookup directory.
+    let ancestors = std::env::temp_dir();
+    fs::write(ancestors.join(".tool-versions"), "codex 0.0.1\n")
+        .expect("write the ancestor project pin");
+    fixture.write_profile("mise-shim-pinned", Some(&shim));
+
+    let entry = fixture.inventory_entry("mise-shim-pinned").await;
+    assert_eq!(entry["available"], true, "{entry}");
+    assert_eq!(entry["path"], shim.display().to_string(), "{entry}");
+    assert_eq!(entry["version"], release, "{entry}");
+    assert_eq!(entry["supported"], true, "{entry}");
+
+    // The lookup ran from `/`, so the walk never saw the ancestor pin.
+    let log = wait_until(
+        "the offline mise lookup starting at the filesystem root",
+        || async {
+            let log = fs::read_to_string(&mise_log).ok()?;
+            log.lines()
+                .any(|line| {
+                    line.starts_with("which codex offline=1 auto=0 home=")
+                        && line.contains(&format!("home={}", home.display()))
+                        && line.ends_with("cwd=/")
+                })
+                .then_some(log)
+        },
+    )
+    .await;
+    assert!(
+        log.lines()
+            .all(|line| !line.contains("MISE_OFFLINE=0") && !line.contains("auto=1")),
+        "the lookup never ran online or installing: {log}"
+    );
+
+    fs::remove_file(ancestors.join(".tool-versions")).expect("remove the ancestor pin");
     fixture.finish().await;
 }
 
@@ -4379,7 +4503,8 @@ async fn a_mise_shim_without_an_installed_tool_is_refused_and_nothing_is_install
         log.lines()
             .any(|line| {
                 line.starts_with("which codex offline=1 auto=0 home=")
-                    && line.ends_with(&home.display().to_string())
+                    && line.contains(&format!("home={}", home.display()))
+                    && line.ends_with("cwd=/")
             })
             .then_some(log)
     })
@@ -4475,6 +4600,23 @@ async fn a_multicall_link_keeps_its_own_name_for_probe_and_launch() {
     assert_eq!(entry["available"], true, "{entry}");
     assert_eq!(entry["version"], release, "{entry}");
     assert_eq!(entry["supported"], true, "{entry}");
+    // The probe and the launch both ran under the link name, not the
+    // manager basename: every line the dispatcher logs starts with the
+    // invoked basename.
+    let log = wait_until("the probe running under the codex link name", || async {
+        let log = fs::read_to_string(home.join("multicall.log")).ok()?;
+        log.lines()
+            .any(|line| line == "codex --version")
+            .then_some(log)
+    })
+    .await;
+    assert!(
+        log.lines()
+            .next()
+            .is_some_and(|line| line == "codex --version"),
+        "the probe ran under the link name: {log}"
+    );
+
     let (code, launched) = fixture.launch("multicall-codex", "linked").await;
     assert_eq!(code, 0, "{launched}");
     let id = launched["ok"]["id"]
@@ -4483,15 +4625,18 @@ async fn a_multicall_link_keeps_its_own_name_for_probe_and_launch() {
         .to_owned();
     fixture.stop(&id).await;
 
-    // The launch kept the link name: the log's first probe is under `codex`.
-    let log = wait_until("the probe running under the codex link name", || async {
+    // The launch ran under the link name too: the dispatcher records the
+    // basename it launched under before execing the idle process.
+    let log = wait_until("the launch running under the codex link name", || async {
         let log = fs::read_to_string(home.join("multicall.log")).ok()?;
-        log.lines().any(|line| line == "--version").then_some(log)
+        log.lines()
+            .any(|line| line == "launched as codex")
+            .then_some(log)
     })
     .await;
     assert!(
-        log.lines().next().is_some_and(|line| line == "--version"),
-        "the probe ran under the link name: {log}"
+        log.lines().any(|line| line == "launched as codex"),
+        "the launch kept the link name: {log}"
     );
 
     let entry = fixture.inventory_entry("multicall-manager").await;

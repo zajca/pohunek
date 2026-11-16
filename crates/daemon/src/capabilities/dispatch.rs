@@ -4,10 +4,12 @@
 //! its own name: the probe must not run the manager's own `--version`.
 //! Instead, `mise which <name>` names the installed executable the shim would
 //! run, read-only (`MISE_OFFLINE=1`, `MISE_AUTO_INSTALL=0`) and with only the
-//! owner's location variables forwarded. The returned executable is probed in
-//! the unchanged private sandbox; the launch still execs the shim link, so
-//! the manager and any account dispatch on top of it behave as in the user's
-//! shell.
+//! owner's location variables forwarded. The lookup starts in `/`, whose only
+//! ancestor is itself, so mise reads the owner's global/system selection and
+//! no project directory above the lookup can change the named tool. The named
+//! executable is probed in the private sandbox; the launch still execs the
+//! shim link, so the manager and any account dispatch on top of it behave as
+//! in the user's shell.
 
 // Rust guideline compliant 2026-11-16
 
@@ -58,6 +60,13 @@ const LOCATION_VARS: [&str; 12] = [
 
 /// Most stdout a `mise which` reply may hold: an absolute path line.
 const WHICH_OUTPUT_LIMIT: usize = 4 * 1024;
+
+/// The directory the lookup runs in: `/` is root-owned and has no ancestors,
+/// so project config in any directory the lookup would otherwise walk up
+/// through cannot change which installed tool mise names. The lookup takes no
+/// `MISE_CEILING_PATHS`: the ceiling variable is unnecessary when the only
+/// ancestor searched is the root itself.
+const LOOKUP_WORKING_DIRECTORY: &str = "/";
 
 /// How a validated launch path dispatches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,10 +151,11 @@ pub(crate) enum DispatchFailure {
 ///
 /// The manager runs in manager mode (`argv[0]` is its own path) under
 /// [`HomeScope::Owner`] with the owner's location variables plus the offline
-/// and no-install pairs, in the sandbox cwd, bounded by `timeout`. The reply
-/// must be exactly one absolute UTF-8 path to a trusted, non-shim
-/// executable; the trust check is [`resolve_executable_for_lookup`], the
-/// same rule a lookup consults, so the probe and the launch agree.
+/// and no-install pairs, starting in [`LOOKUP_WORKING_DIRECTORY`], bounded by
+/// `timeout`. The reply must be exactly one absolute UTF-8 path to a trusted,
+/// non-shim executable; the trust check is the same rule a launch lookup
+/// consults, so the probe and the launch agree. Returns the trust-checked
+/// path.
 pub(crate) fn resolve(
     manager: &Path,
     bin_name: &str,
@@ -171,6 +181,7 @@ pub(crate) fn resolve(
         limits: RunLimits::new(timeout, WHICH_OUTPUT_LIMIT),
         stderr: StderrPolicy::Discard,
         stdin: None,
+        cwd: Some(Path::new(LOOKUP_WORKING_DIRECTORY)),
     };
     let output = match bounded_run::run(&spec, now, None) {
         RunOutcome::Exited(output) if output.status().success() => output.stdout_lossy(),
@@ -189,7 +200,7 @@ pub(crate) fn resolve(
     if matches!(classify(&resolved), Dispatch::Mise { .. }) {
         return Err(DispatchFailure::Invalid);
     }
-    Ok(path)
+    Ok(resolved)
 }
 
 /// Trims one trailing newline and demands exactly one absolute UTF-8 path.

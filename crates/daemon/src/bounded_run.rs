@@ -114,6 +114,10 @@ pub(crate) struct RunSpec<'a> {
     pub(crate) stderr: StderrPolicy,
     /// A file the child reads as its stdin, or none for a closed stdin.
     pub(crate) stdin: Option<&'a std::fs::File>,
+    /// The directory the child starts in, or none for the sandbox cwd.
+    /// Only the mise-shim lookup sets one (`/`), so directory config above
+    /// the shared temporary directory cannot change the lookup's selection.
+    pub(crate) cwd: Option<&'a Path>,
 }
 
 /// The result of a run whose child exited on its own.
@@ -285,7 +289,7 @@ fn build_command(
             .env("XDG_STATE_HOME", &sandbox.xdg_state_path);
     }
     command
-        .current_dir(&sandbox.cwd_path)
+        .current_dir(spec.cwd.unwrap_or(&sandbox.cwd_path))
         .env("LANG", RUN_LOCALE)
         .env("LC_ALL", RUN_LOCALE)
         .env("XDG_RUNTIME_DIR", &sandbox.xdg_runtime_path)

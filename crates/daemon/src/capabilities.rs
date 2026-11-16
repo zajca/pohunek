@@ -566,7 +566,7 @@ fn plan_versioned_runtime(
     // agent is present but unsupported, with no probe planned. Any other
     // program probes under its own link path, so an `argv[0]` dispatcher
     // behind a link reports the release its own name selects; a plain link
-    // to another executable therefore no longer shares its target's probe.
+    // to another executable probes the link itself.
     let probe_program = match dispatch::classify(program.as_path()) {
         dispatch::Dispatch::Direct => Some(program.as_path().to_path_buf()),
         dispatch::Dispatch::Mise { manager, bin_name } => dispatch::resolve(
@@ -868,8 +868,8 @@ fn validate_definition_launch_detailed_with_clock(
     // A version-manager shim dispatches on its own link name, so running
     // the link reports the manager's own release. `mise which` names the
     // installed executable the shim would run; that executable is probed in
-    // the unchanged private sandbox, and the recorded release is the one
-    // the manager named, while the launch keeps execing the shim link.
+    // the private sandbox, and the recorded release is the one the manager
+    // named, while the launch keeps execing the shim link.
     let probe_path = match dispatch::classify(program.as_path()) {
         dispatch::Dispatch::Direct => program.as_path().to_path_buf(),
         dispatch::Dispatch::Mise { manager, bin_name } => {
@@ -883,7 +883,7 @@ fn validate_definition_launch_detailed_with_clock(
                 now,
             )
             .map_err(|failure| LaunchValidationFailure::from_dispatch(failure, shortened_budget))?;
-            timeout = timeout.saturating_sub(lookup_started.elapsed());
+            timeout = timeout.saturating_sub(now().saturating_duration_since(lookup_started));
             installed
         }
     };
@@ -998,6 +998,7 @@ fn collect_probe(
         limits: RunLimits::new(timeout, VERSION_OUTPUT_LIMIT),
         stderr: StderrPolicy::Discard,
         stdin: None,
+        cwd: None,
     };
     match bounded_run::run(&spec, now, None) {
         RunOutcome::Exited(output) if output.status().success() => {
@@ -2045,120 +2046,6 @@ strategy = "none"
         );
         // A launch without any PATH has no interpreter to find.
         assert_eq!(supported(&BaseEnv::default(), &[]), Some(false));
-    }
-
-    /// A fake mise manager plus one installed tool under `home`: answers
-    /// `mise which <name>` offline with the install file and runs the
-    /// installed executable when invoked through a shim link.
-    fn mise_fixture(root: &std::path::Path, home: &std::path::Path, version: &str) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mise = root.join("mise");
-        std::fs::write(
-            &mise,
-            "#!/bin/sh\n\
-             name=${0##*/}\n\
-             if [ \"$name\" = mise ]; then\n\
-               [ \"$1\" = which ] || { echo \" Mise\"; echo \"mise\"; exit 0; }\n\
-               target=\"$HOME/.local/share/mise/installs/$2\"\n\
-               [ -f \"$target\" ] || { echo \"no such tool\" >&2; exit 1; }\n\
-               cat \"$target\"\n\
-             else\n\
-               exec \"$(cat \"$HOME/.local/share/mise/installs/$name\")\" \" $@\"\n\
-             fi\n",
-        )
-        .expect("write fake mise");
-        std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o755))
-            .expect("make mise executable");
-        let installs = home.join(".local/share/mise/installs");
-        std::fs::create_dir_all(&installs).expect("create installs");
-        let tool = root.join("tool");
-        std::fs::write(&tool, format!("#!/bin/sh\necho {version}\n")).expect("write tool");
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
-            .expect("make tool executable");
-        std::fs::write(installs.join("shim"), tool.display().to_string())
-            .expect("write install file");
-        std::os::unix::fs::symlink(&mise, root.join("shim")).expect("link shim");
-    }
-
-    #[test]
-    fn a_version_manager_shim_probes_the_manager_named_executable() {
-        let root = crate::test_support::scoped_dir("pohunek-mise-shim-probe-");
-        let home = root.join("owner-home");
-        std::fs::create_dir(&home).expect("create owner home");
-        mise_fixture(&root, &home, "1.0.2");
-        let definition = probed_definition(SEMVER_PROBE);
-        // The launch PATH keeps the shim directory first so the shim
-        // still wins, with system directories for the fixture's helpers.
-        let path = format!("{}:/usr/bin:/bin", root.display());
-        let base = BaseEnv::new(std::collections::BTreeMap::from([
-            ("PATH".to_owned(), path),
-            ("HOME".to_owned(), home.display().to_string()),
-        ]))
-        .expect("base environment");
-        let environment = ProbeEnvironment::for_launch(&base, &[]);
-        let binary = root.join("shim").display().to_string();
-        // The inventory probes the manager-named executable while keeping
-        // the launched link path, and the launch probe validates the same.
-        let runtime = probe_versioned_runtime(
-            "tool",
-            RuntimeRef::from_wire("tool"),
-            &binary,
-            &definition,
-            &environment,
-        );
-        assert!(runtime.available);
-        assert_eq!(runtime.path.as_deref(), Some(binary.as_str()));
-        assert_eq!(runtime.version.as_deref(), Some("1.0.2"));
-        assert_eq!(runtime.supported, Some(true));
-        let validated =
-            validate_definition_launch(&definition, Spawn::Program(&binary), &environment)
-                .expect("shim launches")
-                .expect("version probe validates");
-        assert_eq!(validated.as_path(), root.join("shim").as_path());
-    }
-
-    #[test]
-    fn an_uninstalled_shim_has_no_version_and_its_launch_is_unresolved() {
-        let root = crate::test_support::scoped_dir("pohunek-mise-shim-missing-");
-        let home = root.join("owner-home");
-        std::fs::create_dir(&home).expect("create owner home");
-        mise_fixture(&root, &home, "1.0.2");
-        // No install file for this shim name: the lookup names nothing.
-        std::fs::remove_file(home.join(".local/share/mise/installs/shim")).expect("remove install");
-        let definition = probed_definition(SEMVER_PROBE);
-        // The launch PATH keeps the shim directory first so the shim
-        // still wins, with system directories for the fixture's helpers.
-        let path = format!("{}:/usr/bin:/bin", root.display());
-        let base = BaseEnv::new(std::collections::BTreeMap::from([
-            ("PATH".to_owned(), path),
-            ("HOME".to_owned(), home.display().to_string()),
-        ]))
-        .expect("base environment");
-        let environment = ProbeEnvironment::for_launch(&base, &[]);
-        let binary = root.join("shim").display().to_string();
-        let runtime = probe_versioned_runtime(
-            "tool",
-            RuntimeRef::from_wire("tool"),
-            &binary,
-            &definition,
-            &environment,
-        );
-        // Present but versionless: the entry keeps the link, plans no probe.
-        assert!(runtime.available);
-        assert_eq!(runtime.path.as_deref(), Some(binary.as_str()));
-        assert_eq!(runtime.version, None);
-        assert_eq!(runtime.supported, Some(false));
-        let error = validate_definition_launch(&definition, Spawn::Program(&binary), &environment)
-            .expect_err("uninstalled shim");
-        // One `agent_runtime_unsupported` code; the recovery names the
-        // empty install set instead of a version range.
-        assert_eq!(error.code, "agent_runtime_unsupported");
-        assert_eq!(
-            error.recover.as_deref(),
-            Some(
-                "run the agent once in a login shell so its version manager installs it; the version check never installs or updates a tool"
-            )
-        );
     }
 
     #[test]

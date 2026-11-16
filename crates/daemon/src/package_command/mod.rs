@@ -176,6 +176,7 @@ impl PackageCommandService {
                     limits: RunLimits::new(Duration::from_millis(u64::from(timeout)), cap as usize),
                     stderr: StderrPolicy::Discard,
                     stdin: None,
+                    cwd: None,
                 };
                 let outcome = bounded_run::run(&spec, &Instant::now, Some(&cancel));
                 let elapsed = started.elapsed();
