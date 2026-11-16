@@ -4330,6 +4330,27 @@ pub struct SessionRenameResult {
     pub session: SessionInfo,
 }
 
+/// Parameters for `session.adopt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionAdoptParams.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct SessionAdoptParams {
+    /// The session that gets a new parent.
+    pub session_id: SessionId,
+    /// The session that becomes its parent.
+    pub new_parent: SessionId,
+}
+
+/// Result returned by `session.adopt`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionAdoptResult.ts"))]
+pub struct SessionAdoptResult {
+    /// Updated summary of the adopted session.
+    pub session: SessionInfo,
+}
+
 /// Parameters for `session.diff`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

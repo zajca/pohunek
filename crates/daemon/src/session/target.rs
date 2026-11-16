@@ -939,6 +939,9 @@ impl SessionRegistry {
             exit_code: None,
             agent_options: snapshot.agent_options.clone(),
         };
+        // The rights are read once, before any runtime exists, so every record
+        // of this launch carries the snapshot its entry will hold.
+        let launch_rights = self.profile_rights(&agent).await;
         let mut preparing_record = SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
             session_id: id.0.clone(),
@@ -954,6 +957,8 @@ impl SessionRegistry {
             info: preparing_info,
             active_agent_origin: None,
             create_request: create_request.clone(),
+            launch_rights: Some(launch_rights.to_record()),
+            worker_process: None,
             native_identity_ordering: carried_native_report.as_deref().cloned(),
             recovery: Some(ResumeBinding {
                 session_id: id.0.clone(),
@@ -1056,6 +1061,10 @@ impl SessionRegistry {
                 // The job may still be live; it stays recorded for
                 // reconciliation instead of being deleted or killed.
                 // The retry is scheduled whether or not the listing was committed.
+                preparing_record.worker_process = self
+                    .launch_reservation(&id)
+                    .and_then(|reservation| reservation.worker_root)
+                    .and_then(super::worker_process_record);
                 let _persisted = self
                     .insert_unavailable_record(
                         preparing_record,
@@ -1189,6 +1198,10 @@ impl SessionRegistry {
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
             create_request,
+            root_process: Some(started.root_process),
+            worker_root: Some(started.worker_root),
+            recorded_worker: super::RecordedWorker::Unrecorded,
+            launch_rights: Some(Box::new(launch_rights)),
         };
         #[cfg(test)]
         self.hold_launch_commit().await;
@@ -1205,6 +1218,8 @@ impl SessionRegistry {
                         // or killed.
                         // The retry is scheduled whether or not the listing was
                         // committed.
+                        preparing_record.worker_process =
+                            super::worker_process_record(started.worker_root);
                         let _persisted = self
                             .insert_unavailable_record(
                                 preparing_record,
@@ -1325,6 +1340,20 @@ impl SessionRegistry {
             .await
             .map_err(LaunchFailure::Cleaned)?;
         let worker = lifecycle.launch(generation).await?;
+        // The worker forks the PTY child during initialization, so its identity
+        // is recorded first: a process of the session can reach the control
+        // socket before the entry exists, and it is placed below this worker.
+        let worker_root = match worker.inspect().await {
+            Ok(snapshot) => ProcessIdentity {
+                pid: snapshot.worker_process.pid,
+                start_identity: StartIdentity::new(snapshot.worker_process.start_identity),
+            },
+            Err(error) => {
+                let error = super::worker_error_to_protocol(error);
+                return Err(lifecycle.abandon(generation, error).await);
+            }
+        };
+        self.record_launch_worker(id, worker_root);
         match self
             .initialize_runtime(
                 lifecycle,
@@ -1512,6 +1541,10 @@ impl SessionRegistry {
                 pid: child.pid,
                 start_identity: StartIdentity::new(child.start_identity),
             },
+            worker_root: ProcessIdentity {
+                pid: snapshot.worker_process.pid,
+                start_identity: StartIdentity::new(snapshot.worker_process.start_identity),
+            },
             runtime_info: Some(SessionRuntime {
                 state: RuntimeState::Live,
                 runtime_generation,
@@ -1532,6 +1565,7 @@ struct StartedRuntime {
     handle: RuntimeHandle,
     detector_output: super::detector::DetectorOutput,
     root_process: ProcessIdentity,
+    worker_root: ProcessIdentity,
     runtime_info: Option<SessionRuntime>,
 }
 

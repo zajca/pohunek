@@ -28,6 +28,9 @@ const PLACEMENT_ESCAPE_CHECK: &str = "placement_escape";
 /// Most sessions the placement check names in its detail.
 const MAX_PLACEMENT_SESSIONS_LISTED: usize = 8;
 
+/// Name of the check that states the session rights guardrail and its limit.
+const SESSION_RIGHTS_CHECK: &str = "session_rights";
+
 /// Name of the check that reports the metadata-store lines no loader accepts.
 const METADATA_STORE_REJECTED_LINES_CHECK: &str = "metadata_store_rejected_lines";
 
@@ -64,6 +67,7 @@ pub(crate) async fn report(
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
     placements: &[(protocol::SessionId, protocol::SessionPlacement)],
+    root_findings: &crate::session::rights::RootFindings,
     probe_clock: &ProbeClock,
     probe_budget: Duration,
 ) -> Result<DoctorReport, DoctorReportError> {
@@ -72,6 +76,7 @@ pub(crate) async fn report(
     let overlay_diagnostics = overlays.diagnostics.to_vec();
     let overlays_from_file = overlays.from_file;
     let mode = supervision_mode(supervision.as_ref());
+    let worker_units = supervision.as_ref().is_some_and(|active| active.native);
     let worker = supervision.map(|active| WorkerCandidate {
         path: active.worker_executable,
         source: WorkerSource::Supervision,
@@ -114,6 +119,7 @@ pub(crate) async fn report(
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
+    checks.push(session_rights_check(worker_units, root_findings));
     Ok(bounded_report(checks))
 }
 
@@ -910,6 +916,64 @@ fn placement_check(
     )
 }
 
+/// The check that names the limit of the session rights guardrail and the
+/// platform mode that places a caller in a session tree. It fails while a live
+/// session has no verified root, naming the session.
+pub(crate) fn session_rights_check(
+    worker_units: bool,
+    findings: &crate::session::rights::RootFindings,
+) -> DoctorCheck {
+    let named = |sessions: &[protocol::SessionId]| {
+        sessions
+            .iter()
+            .take(MAX_PLACEMENT_SESSIONS_LISTED)
+            .map(|id| id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !findings.unverified.is_empty() {
+        return check(
+            SESSION_RIGHTS_CHECK,
+            DoctorStatus::Fail,
+            &format!(
+                "{} live session(s) have no verified root process ({}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends; if it stays stuck, restart the daemon job (`pohunek service status` names it; `systemctl --user restart <job>` or `launchctl kickstart -k gui/$(id -u)/<label>`), which reattaches every live worker.",
+                findings.unverified.len(),
+                named(&findings.unverified)
+            ),
+        );
+    }
+    if !findings.unadopted.is_empty() {
+        return check(
+            SESSION_RIGHTS_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "{} session(s) run a worker the daemon does not adopt ({}); its processes keep that session's rights, and removing the session retires them.",
+                findings.unadopted.len(),
+                named(&findings.unadopted)
+            ),
+        );
+    }
+    if !findings.unplaced.is_empty() {
+        return check(
+            SESSION_RIGHTS_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "{} session(s) run a worker the daemon does not adopt and holds no process identity for ({}); their processes keep owner rights, and removing the session retires them.",
+                findings.unplaced.len(),
+                named(&findings.unplaced)
+            ),
+        );
+    }
+    check(
+        SESSION_RIGHTS_CHECK,
+        DoctorStatus::Ok,
+        &format!(
+            "guardrail: processes that leave a session tree keep owner rights (see security model); placement: {}",
+            crate::session::rights::platform_mode(worker_units)
+        ),
+    )
+}
+
 /// The check that reports the metadata-store lines no loader accepts. It
 /// carries counts, never a line's text.
 fn rejected_lines_check(state: RejectedLinesState) -> DoctorCheck {
@@ -1210,6 +1274,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
+            &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )
@@ -1294,6 +1359,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
+            &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )

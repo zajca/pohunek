@@ -6,9 +6,9 @@
 //! are thin transport glue.
 
 use protocol::{
-    ErrorClass, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
-    SessionDetectionParams, SessionDiffParams, SessionId, SessionInputParams, SessionListParams,
-    SessionNewParams, SessionNewResult, SessionOutputParams, SessionReadParams,
+    ErrorClass, ProtocolError, Request, Response, SessionAdoptParams, SessionAttachParams,
+    SessionDetachParams, SessionDetectionParams, SessionDiffParams, SessionId, SessionInputParams,
+    SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams, SessionReadParams,
     SessionReleaseAgentParams, SessionRemoveTreeParams, SessionRenameParams,
     SessionReportAgentParams, SessionReportNativeIdParams, SessionResizeParams,
     SessionResumeParams, SessionResumeResult, SessionRetentionParams, SessionScreenParams,
@@ -21,7 +21,11 @@ use crate::session::{
     validate_session_list_filters, ControlPeer, ProfileChange, SessionRegistry, UnconfirmedCleanup,
 };
 
-pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
+pub(super) async fn handle_session_new(
+    request: &Request,
+    sessions: &SessionRegistry,
+    spawned_by: Option<protocol::SpawnedBy>,
+) -> Response {
     let params = match parse_params::<SessionNewParams>(request) {
         Ok(params) => params,
         Err(err) => return error_value(request, err),
@@ -31,10 +35,7 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
     // set means the input was applied. Echoing this lets a client detect an
     // older daemon that silently ignored `input` (which returns no flag).
     let requested_input = params.input.is_some();
-    match sessions
-        .create_outcome_spawned_by(params, request_spawned_by(request))
-        .await
-    {
+    match sessions.create_outcome_spawned_by(params, spawned_by).await {
         Ok(outcome) => {
             let result = SessionNewResult {
                 session: outcome.session,
@@ -54,11 +55,25 @@ pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegi
 ///
 /// The envelope validates the pair as a whole, so either both halves are
 /// present or neither is.
-fn request_spawned_by(request: &Request) -> Option<protocol::SpawnedBy> {
+pub(super) fn request_spawned_by(request: &Request) -> Option<protocol::SpawnedBy> {
     Some(protocol::SpawnedBy {
         session_id: request.origin_session_id()?.clone(),
         daemon_id: request.origin_daemon_id()?.to_owned(),
     })
+}
+
+pub(super) async fn handle_session_adopt(
+    request: &Request,
+    sessions: &SessionRegistry,
+) -> Response {
+    let params = match parse_params::<SessionAdoptParams>(request) {
+        Ok(params) => params,
+        Err(err) => return error_value(request, err),
+    };
+    match sessions.adopt(&params).await {
+        Ok(result) => ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
 }
 
 pub(super) async fn handle_session_list(request: &Request, sessions: &SessionRegistry) -> Response {

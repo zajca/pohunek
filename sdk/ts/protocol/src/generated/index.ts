@@ -186,6 +186,8 @@ export type { RuntimeInventoryEvent } from "./RuntimeInventoryEvent";
 export type { RuntimeInventoryStatus } from "./RuntimeInventoryStatus";
 export type { RuntimeRef } from "./RuntimeRef";
 export type { RuntimeState } from "./RuntimeState";
+export type { SessionAdoptParams } from "./SessionAdoptParams";
+export type { SessionAdoptResult } from "./SessionAdoptResult";
 export type { SessionAttachParams } from "./SessionAttachParams";
 export type { SessionAttachResult } from "./SessionAttachResult";
 export type { SessionBackground } from "./SessionBackground";

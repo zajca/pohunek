@@ -37,6 +37,9 @@ use crate::agent::{
 };
 use crate::project::config::validate_name;
 
+/// The table of a profile file that holds its session rights.
+const RIGHTS_KEY: &str = "rights";
+
 /// Root key of the options text `package.create_profile` accepts.
 const OPTIONS_KEY: &str = "options";
 
@@ -174,7 +177,7 @@ fn create_profile(
         secret_env: params.secret_env.clone(),
         options,
     };
-    let text = compose_profile(&spec);
+    let text = carry_rights(dir.as_ref(), name, compose_profile(&spec))?;
     if let Some(pin) = &pin {
         ensure_coexists(context, &read_state(context)?, retained.gate(), &pin.digest)?;
     }
@@ -237,6 +240,7 @@ fn create_preset(
     let dir = profiles
         .open_for_create(!params.dry_run)
         .map_err(|error| bind_kind(name, error))?;
+    refuse_preset_over_rights(dir.as_ref(), name)?;
     let text = compose_preset(&PresetSpec {
         parent: &params.parent,
         options: &params.options,
@@ -263,6 +267,59 @@ fn create_preset(
         text,
         previous,
     })
+}
+
+/// The `[rights]` table of the profile file `name` holds, if it has one.
+fn existing_rights(
+    dir: Option<&BindDir>,
+    name: &str,
+) -> Result<Option<toml_edit::Item>, PackageErrorKind> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let Some(file) = dir
+        .read_existing(name)
+        .map_err(|error| bind_kind(name, error))?
+    else {
+        return Ok(None);
+    };
+    // A file that does not parse is being repaired, so it carries nothing.
+    Ok(file
+        .text()
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|document| document.get(RIGHTS_KEY).cloned()))
+}
+
+/// `text` with the `[rights]` table of the profile file it replaces.
+///
+/// A profile definition carries no rights of its own, so a replacement never
+/// widens what the owner wrote for the profile it replaces.
+fn carry_rights(
+    dir: Option<&BindDir>,
+    name: &str,
+    text: String,
+) -> Result<String, PackageErrorKind> {
+    let Some(rights) = existing_rights(dir, name)? else {
+        return Ok(text);
+    };
+    let mut document: DocumentMut = text
+        .parse()
+        .map_err(|_error| unusable(name, "the composed profile is not valid TOML"))?;
+    document.insert(RIGHTS_KEY, rights);
+    Ok(document.to_string())
+}
+
+/// Refuses a preset over a profile file that holds a `[rights]` table: a
+/// preset takes its parent's rights and could not keep that table.
+fn refuse_preset_over_rights(dir: Option<&BindDir>, name: &str) -> Result<(), PackageErrorKind> {
+    if existing_rights(dir, name)?.is_some() {
+        return Err(unusable(
+            name,
+            "the profile holds a [rights] table, which a preset cannot carry",
+        ));
+    }
+    Ok(())
 }
 
 /// The `[options]` table of the options text `text` for profile `name`.

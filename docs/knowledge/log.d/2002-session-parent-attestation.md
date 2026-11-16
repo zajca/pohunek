@@ -1,0 +1,3 @@
+## Unreleased (2026-11-15, attested parent and session.adopt, #2002)
+
+- `session.new` from inside a session records that session as `spawned_by`; markers naming another session are refused with `session_right_denied` (`reason=origin_mismatch`). `session.adopt` and `pohunek session adopt <child> <new-parent>` (owner only, `session_adopt_supported`) move a session under a new parent; a session gets `reason=owner_only`, and a loop, a self-parent or a session inside a running `session.remove_tree` is `session_adopt_refused`. A profile's `[rights]` table sets `spawn_profiles` (`reason=spawn_profile_not_allowed`) and `owner_equivalent` ([Agent profiles](concepts/agent-profiles.md#session-rights), [Trust model](safety/trust-model.md)).

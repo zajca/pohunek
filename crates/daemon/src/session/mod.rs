@@ -102,6 +102,7 @@ use ulid::Ulid;
 
 use crate::agent::host::{self, InputReadiness, RuntimeDefinition, RuntimeHost};
 use crate::agent::profile::options::is_option_id;
+use crate::agent::profile::rights::ProfileRights;
 use crate::agent::{
     agent_not_resumable, build_pty_command, resume_pty_command_from_launch, InputRules,
     LaunchCommand, LaunchEnv, LaunchOpts, NativeReferenceProvenance, NativeSessionLaunch,
@@ -177,11 +178,14 @@ mod rejected_lines;
 use claim::{ClaimKey, ClaimOrigin, PendingActivity, PendingRelease};
 use forward::Forwarded;
 pub use native_attestation::ControlPeer;
+pub(crate) use native_attestation::PeerStanding;
 pub use reconcile::upgrade_preflight;
 pub(crate) use rejected_lines::RejectedLinesState;
+pub(crate) mod adopt;
 pub(crate) mod remove_tree;
 mod resume;
 mod retention;
+pub(crate) mod rights;
 mod settle;
 mod supervision;
 mod target;
@@ -875,6 +879,11 @@ struct SessionRegistryInner {
     /// [`SessionRegistry::set_metadata`], so a metadata edit is never overwritten
     /// by a record built from an earlier snapshot.
     persist_lock: Mutex<()>,
+    /// The roots of the `session.remove_tree` cascades in progress, with how
+    /// many run on each. A
+    /// `session.adopt` of a session inside one of those trees is refused, so
+    /// a cascade never removes a session the owner just moved elsewhere.
+    removing_roots: std::sync::Mutex<HashMap<SessionId, usize>>,
     /// Test hook that drops every resume-binding write, standing for a daemon
     /// that died between the session record and its projection.
     #[cfg(test)]
@@ -1211,6 +1220,21 @@ struct SessionEntry {
     /// The idempotency key and fingerprint of the creating `session.new`,
     /// written to every record of the session and never reported to clients.
     create_request: Option<Box<CreateRequest>>,
+    /// The process the runtime's PTY launched, with its start identity. The
+    /// rights classifier matches a caller's ancestry against it; `None` while
+    /// the runtime has no live root the daemon observed.
+    root_process: Option<ProcessIdentity>,
+    /// The session worker process, which the daemon started or reattached with
+    /// a verified identity. Every process of the session descends from it, so
+    /// the classifier places a caller below it in this session even before the
+    /// PTY root is known.
+    worker_root: Option<ProcessIdentity>,
+    /// What the record said about a worker `worker_root` does not name.
+    recorded_worker: RecordedWorker,
+    /// The `[rights]` of the session's profile at launch. A record written
+    /// before the field existed has none, and the session takes the profile
+    /// file as it reads at its first use.
+    launch_rights: Option<Box<ProfileRights>>,
 }
 
 /// Discovery inventory as the session tests read it.
@@ -1223,6 +1247,47 @@ pub(crate) struct RuntimeInventorySnapshot {
 
 /// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
 static NEXT_ENTRY_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Whether a restored session's record named a worker its entry does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedWorker {
+    /// The record named none, or the entry carries the one it named.
+    Unrecorded,
+    /// The record named a worker of another boot, so the session's tree is
+    /// gone and nothing is left to place. This is not a missing root.
+    OtherBoot,
+}
+
+/// The persisted form of a worker process identity.
+///
+/// `None` when the host cannot name its boot, because an identity without a
+/// boot could be matched after a reboot.
+fn worker_process_record(identity: ProcessIdentity) -> Option<crate::store::WorkerProcess> {
+    Some(crate::store::WorkerProcess {
+        pid: identity.pid,
+        start_identity: identity.start_identity.get(),
+        boot_identity: current_boot_id()?,
+    })
+}
+
+/// The identity of the running boot, if the host names it.
+fn current_boot_id() -> Option<String> {
+    pohunek_platform::process::HostInspector::new()
+        .boot_identity()
+        .ok()
+        .map(|boot| boot.as_str().to_owned())
+}
+
+/// The worker process identity a record persisted, when it was recorded under
+/// the running boot. An identity of another boot, or of a host that cannot
+/// name its boot, names no process.
+fn recorded_worker_process(record: &SessionRecord) -> Option<ProcessIdentity> {
+    let worker = record.worker_process.as_ref()?;
+    (current_boot_id().as_deref() == Some(worker.boot_identity.as_str())).then(|| ProcessIdentity {
+        pid: worker.pid,
+        start_identity: crate::procwatch::StartIdentity::new(worker.start_identity),
+    })
+}
 
 fn next_entry_incarnation() -> u64 {
     NEXT_ENTRY_INCARNATION.fetch_add(1, Ordering::Relaxed)
@@ -2265,11 +2330,10 @@ impl SessionRegistry {
             let entry = sessions
                 .get_mut(id)
                 .ok_or_else(|| session_not_found(&id.0))?;
-            let record = build(entry);
-            #[cfg(test)]
-            self.hold_entry_record_write().await;
-            record
+            build(entry)
         };
+        #[cfg(test)]
+        self.hold_entry_record_write().await;
         self.store_session_record(record).await
     }
 
@@ -2489,6 +2553,8 @@ impl SessionRegistry {
             runtime,
             active_agent_origin: active_agent_origin(entry),
             create_request: entry.create_request.clone(),
+            launch_rights: entry.launch_rights.as_deref().map(ProfileRights::to_record),
+            worker_process: entry.worker_root.and_then(worker_process_record),
         }
     }
 
@@ -2785,6 +2851,7 @@ impl SessionRegistry {
                 produced_events,
                 store,
                 persist_lock: Mutex::new(()),
+                removing_roots: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(test)]
                 resume_writes_blocked: AtomicBool::new(false),
                 #[cfg(test)]
@@ -4443,6 +4510,17 @@ impl SessionRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate.clone());
         gate
+    }
+
+    /// The worker the launch of `id` recorded.
+    #[cfg(test)]
+    pub(crate) fn launch_worker_for_test(&self, id: &SessionId) -> Option<ProcessIdentity> {
+        self.inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .and_then(|reservation| reservation.worker_root)
     }
 
     /// The sessions whose launch is in flight.
@@ -7630,16 +7708,15 @@ impl SessionRegistry {
             Ok(None) => base.clone(),
             Err(error) => return RuntimeTransitionOutcome::RetryablePersistenceFailure(error),
         };
-        let outcome = self
-            .commit_runtime_transition(
-                id,
-                expected,
-                &base,
-                &durable_base,
-                candidate,
-                RuntimeMetadataPolicy::Live,
-            )
-            .await;
+        let outcome = Box::pin(self.commit_runtime_transition(
+            id,
+            expected,
+            &base,
+            &durable_base,
+            candidate,
+            RuntimeMetadataPolicy::Live,
+        ))
+        .await;
         if let RuntimeTransitionOutcome::RetryablePersistenceFailure(error) = &outcome {
             warn!(session_id = %id.0, error = %error, "failed to persist reconnected worker");
         }
@@ -8969,6 +9046,8 @@ fn create_intent_record(
         native_identity_ordering: None,
         active_agent_origin: None,
         create_request: create_request.cloned().map(Box::new),
+        launch_rights: None,
+        worker_process: None,
         recovery: None,
         runtime: RuntimeRecord {
             state: RuntimeState::Starting,
@@ -9214,11 +9293,25 @@ impl SessionRegistry {
                 LaunchReservation {
                     agent_base,
                     hook_schema,
+                    worker_root: None,
                 },
             );
         LaunchReservationGuard {
             registry: self.clone(),
             id: id.clone(),
+        }
+    }
+
+    /// Records the worker a launch started, before its PTY child exists.
+    pub(super) fn record_launch_worker(&self, id: &SessionId, worker: ProcessIdentity) {
+        if let Some(reservation) = self
+            .inner
+            .launching
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(id)
+        {
+            reservation.worker_root = Some(worker);
         }
     }
 
@@ -9471,6 +9564,8 @@ impl SessionRegistry {
 struct LaunchReservation {
     agent_base: RuntimeRef,
     hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
+    /// The launched worker, recorded before it forks the PTY child.
+    worker_root: Option<ProcessIdentity>,
 }
 
 /// Releases a launch reservation when dropped: after the launch installed its

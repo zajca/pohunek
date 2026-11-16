@@ -179,8 +179,12 @@ Core keeps only two primitives for it, and no herd definition, limit or
 admission policy: the `spawned_by` attribution of a session
 ([#1300](https://github.com/zajca/pohunek/issues/1300)) and durable session
 metadata ([#1556](https://github.com/zajca/pohunek/issues/1556)); both have
-shipped. Metadata stays opaque to the daemon, and attribution is never an
-authorization input. The same attribution keys the session-tree views:
+shipped. Metadata stays opaque to the daemon. Attribution is an authorization input
+only through the session rights rule (see Security Model): a session caller
+reaches its `spawned_by` descendants. The parent link is attested: a
+`session.new` from inside a session records that session, whatever markers
+the request carries, and only the owner changes a link afterwards, with
+`session.adopt`. The same attribution keys the session-tree views:
 `session.list` counts direct children per entry, `--tree` and the
 `top_level` / `spawned_by` list filters read them, `session.retention.sweep`
 selects by spawner, and `session.remove_tree` removes a subtree deepest
@@ -2337,9 +2341,113 @@ that remain are cheap, free-by-default, or inherited:
   owner-private worker claim is the route for a native reference. The
   pair is atomic and is copied to dedicated wait connections. This narrowly
   prevents an in-session automation client from invoking those nine mutations
-  against the PTY that hosts it, but it is not authentication: any same-user
-  process able to reach the owner socket remains inside the trusted owner-path
-  boundary.
+  against the PTY that hosts it. The markers are client-supplied, so this guard
+  is not authentication; the caller classification below is the guard that is
+  not claimed by the caller.
+- **Caller classification by kernel peer (session rights).** The daemon
+  places the kernel-attested peer of every local connection in a class, once
+  per connection, and re-reads the peer's attestation before each use. The
+  class decides the rights of `session.stop`, `session.resume`,
+  `session.remove`, `session.remove_accepting_unconfirmed`,
+  `session.remove_tree`, `session.rename`, `session.set_metadata`,
+  `session.input`, `session.resize` and `session.attach`. Read methods,
+  `session.new` and `session.adopt` have their own rules below; every other
+  non-session method is not checked.
+
+  | Caller | Evidence | Class |
+  |---|---|---|
+  | Remote overlay connection, or in-process dispatch | no kernel peer | `Owner` (the overlay policy is the gate) |
+  | Local peer of another user, a peer the kernel no longer attests, or an accepted socket the kernel could not attest | socket credentials | `Unknown`: every checked mutation is refused with `unknown_caller` |
+  | Ancestry reaches a live session's PTY root or its worker process (pid and start identity, at most 128 parent links) | parent walk | `Session(X)` |
+  | Linux, no ancestry match, the control group is inside session X's worker unit | control group | `Session(X)` |
+  | Ancestry names X and the control group names another session | both | `Session(X)`; ancestry wins |
+  | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights; a shell a session spawned is `Session(X)` of its own tree |
+  | The session X the caller belongs to runs a profile with `[rights] owner_equivalent = true` | profile file | `OwnerShell(X)`: owner rights |
+  | None of the above while every live session has a worker identity or a control group placement: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
+  | None of the above while a live session has no worker identity the daemon can place by pid or control group | | `Unattributed`: every checked mutation is refused with `unattributed_caller`, and the placement is not kept for the connection |
+
+  The daemon starts each session's worker itself, or reattaches a live one
+  after a restart, so it knows the worker's pid and start identity before the
+  worker forks the PTY child. A launch, a resume and a relaunch record that
+  identity in the launch reservation before the worker initializes, so a
+  process of the session placed below the worker is attributed to it even
+  before the session entry exists, whatever stale identities an earlier
+  runtime of the same session left. The session entry keeps the worker beside
+  the PTY root, and the session record persists the worker's pid, start
+  identity and the boot it counts from. A restart that cannot reach a live
+  worker, and a runtime the daemon refuses to adopt (`Conflict`,
+  `Incompatible`), still place the worker's processes in their session from
+  the record, or from the identity the refused worker reported when it
+  answered; a recorded worker that is gone, or recorded under another boot,
+  leaves nothing to place. A refused runtime no identity is known for keeps
+  owner rights, so removing the session stays possible; `pohunek doctor` warns
+  and names it. The launch rights a session takes at first use are written
+  into its durable record alone, so a stop intent or an unpersisted
+  classification is never overwritten. Roots are matched by pid and start
+  identity together. A live session that holds no worker identity at all
+  (a record written before schema 22 whose worker the daemon could not
+  reattach) on a host without control-group placement is the fault state:
+  `pohunek doctor` fails the `session_rights` check and names the session, and
+  a caller no root attributes is `Unattributed` instead of `Owner` until the
+  worker is reattached or the session ends. `Unattributed` carries a recovery
+  hint: retry once the worker reconnects, or restart the daemon job
+  (`pohunek service status` names it; `systemctl --user restart <job>` or
+  `launchctl kickstart -k gui/$(id -u)/<label>`), which reattaches every live
+  worker.
+
+  A `Session(X)` caller may mutate a session only when it is a descendant of
+  X along `spawned_by` (children, their children, so `session rm --with-children`
+  of an own child works). The one other allowed target is X's own parent, for
+  `session.input` only and not while the parent's activity is `blocked`.
+  Everything else is refused with `runtime/session_right_denied`; its message
+  carries `reason=not_descendant`, `parent_blocked`, `unknown_caller` or
+  `unattributed_caller`. The
+  origin-session guard runs first and keeps `plugin_self_target_denied`; a
+  `Session(X)` caller that targets X itself gets the same code even when the
+  request carries no markers, and `session.attach` of X keeps
+  `attach_self_feedback`. Every
+  refusal writes a refusal line next to the request line on the
+  `audit.session_change` target, with the
+  caller class and session, the peer pid and uid, the method, the target, the
+  reason and the request id, and never the params, input bytes, names or
+  metadata values. `pohunek doctor` reports the `session_rights` check with
+  the placement mode: `ancestry+cgroup` where each worker runs as a systemd user unit, otherwise `ancestry`.
+
+  `session.new` from a `Session(X)` caller records `spawned_by` as X, with the
+  daemon's own id, whatever the request markers say. Markers that name another
+  session or daemon are refused with `session_right_denied`
+  (`reason=origin_mismatch`), and a profile outside the `[rights]
+  spawn_profiles` list of X's profile with `spawn_profile_not_allowed` (an
+  empty list forbids spawning; an absent key is unrestricted; an unreadable
+  profile file forbids spawning). From the owner and the owner's shells the
+  markers are recorded as sent. `session.adopt` gives a session a new parent
+  and is owner only: a `Session(X)` caller gets `owner_only`. It refuses a
+  loop and a session inside a `session.remove_tree` cascade in progress with
+  `session_adopt_refused`. The package methods that write profile files
+  (`package.create_profile`, `package.create_preset`,
+  `package.remove_profile`, `package.bind_profile`) are owner only in the same
+  way. A session holds the `[rights]` its profile had at launch or resume,
+  narrowed by the file as it reads now, so an edit never widens a running
+  session. An `owner_equivalent` profile keeps its own `spawn_profiles` list.
+  `[rights]` is read from the owner-private profile file, never from a
+  request. The manager profiles of the owner's own tooling
+  set `owner_equivalent = true`; every other profile keeps the tree rule.
+
+  This is a guardrail, not a wall. A process of the same user that leaves the
+  session tree keeps owner rights, and so does one that reads the owner's
+  environment (M1: the environment of a process is readable by same-user
+  processes) or moves itself out of the tree (M2):
+
+  | Platform | Primary | Secondary | Escape |
+  |---|---|---|---|
+  | Linux with per-session worker units | ancestry | worker unit control group | `systemd-run --user --scope` moves the process out of the sessions slice |
+  | Linux without units (isolated and test daemons) | ancestry | none | a double fork, reparented to a subreaper or init |
+  | macOS | ancestry (parent pid and start identity) | none | a double fork, reparented to `launchd` |
+
+  The guardrail trusts `spawned_by` records as they are stored, including
+  those written before it existed. Isolating a hostile session is the
+  container and VM track of
+  [#88](https://github.com/zajca/pohunek/issues/88).
 - **Prompt-injection / confused-deputy risk is inherited from the agents.** An
   operator agent that reads attacker-influenced text (a malicious issue, PR, or
   repository content) and then acts is a risk you already accept by running Codex

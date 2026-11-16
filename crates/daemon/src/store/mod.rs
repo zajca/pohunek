@@ -805,6 +805,37 @@ pub struct SessionRecord {
     /// `SessionInfo`: the daemon matches a repeated key against it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub create_request: Option<Box<CreateRequest>>,
+    /// The `[rights]` of the session's profile as they read when the session
+    /// was launched. Rights only narrow from there. Absent for a session
+    /// launched before schema 22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_rights: Option<LaunchRights>,
+    /// The session worker process of the runtime this record describes. The
+    /// worker is the ancestor of every process of the session, so a restart
+    /// that cannot reach the worker still places a caller below it. Absent for
+    /// a session recorded before schema 22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_process: Option<WorkerProcess>,
+}
+
+/// A process by id and start identity within one boot, so a recycled id never
+/// matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerProcess {
+    pub pid: u32,
+    pub start_identity: u64,
+    /// The boot the start identity counts from; it restarts at every boot.
+    pub boot_identity: String,
+}
+
+/// The `[rights]` a session was launched with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchRights {
+    /// The session's process tree has owner rights.
+    pub owner_equivalent: bool,
+    /// The profiles the session may launch; absent is unrestricted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_profiles: Option<Vec<String>>,
 }
 
 /// The idempotency key of a session's creating request and its fingerprint.
@@ -1318,6 +1349,68 @@ impl Store {
         updated_at.clone_into(&mut record.info.updated_at);
         if let Some(recovery) = record.recovery.as_mut() {
             recovery.metadata.clone_from(metadata);
+        }
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
+    }
+
+    /// Records the launch rights of one session's current record when it holds
+    /// none, and leaves every other field as persisted.
+    ///
+    /// The record is re-read under the write lock, so a stop intent, a
+    /// transaction, or a state persisted meanwhile is kept, and rights a
+    /// launch already recorded are never replaced. Returns whether the rights
+    /// were recorded; no record at all is a no-op success.
+    pub fn set_launch_rights(
+        &self,
+        session_id: &str,
+        rights: &LaunchRights,
+    ) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records.sessions.iter_mut().find(|entry| {
+            entry.record.session_id == session_id && entry.record.launch_rights.is_none()
+        }) else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        entry.edit().launch_rights = Some(rights.clone());
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
+    }
+
+    /// Replaces the parent link of one session's current record, in the record
+    /// and in its embedded recovery binding, and leaves every other field as
+    /// persisted.
+    ///
+    /// The record is re-read under the write lock, like
+    /// [`Self::replace_session_metadata`]. No record at all is a no-op
+    /// success.
+    pub fn replace_session_spawned_by(
+        &self,
+        session_id: &str,
+        spawned_by: Option<&protocol::SpawnedBy>,
+        updated_at: &str,
+    ) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records
+            .sessions
+            .iter_mut()
+            .find(|entry| entry.record.session_id == session_id)
+        else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        let record = entry.edit();
+        record.info.spawned_by = spawned_by.cloned();
+        updated_at.clone_into(&mut record.info.updated_at);
+        if let Some(recovery) = record.recovery.as_mut() {
+            recovery.spawned_by = spawned_by.cloned();
         }
         Ok(self.write_entries(records, &snapshot)?.with_value(true))
     }
@@ -2902,7 +2995,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":22,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2918,7 +3011,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":22,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -3030,7 +3123,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":21,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":22,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -3152,7 +3245,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":21,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":22,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),

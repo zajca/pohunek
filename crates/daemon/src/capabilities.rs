@@ -409,6 +409,7 @@ fn capability_snapshot(
         session_list_tree_filters_supported: true,
         session_retention_selector_supported: true,
         session_remove_tree_supported: true,
+        session_adopt_supported: true,
         session_new_branch_source_supported: true,
         package_install_commands_supported: true,
         package_install_index_supported: false,

@@ -175,6 +175,10 @@ impl Host {
     /// is an agent of the hook runtime [`IDENTITY_RUNTIME`], recorded with a
     /// recovery pinned to its official package, whose worker journaled the
     /// active identity it reported and no hook schema.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one seeded record names every persisted field of the session"
+    )]
     fn seed_session(&self, broken_record: bool, reported_identity: bool) {
         let executable = self.root.join("libexec/pohunek-sessiond");
         let mut info = session_info();
@@ -184,6 +188,8 @@ impl Host {
         }
         let record = SessionRecord {
             create_request: None,
+            launch_rights: None,
+            worker_process: None,
             schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
             session_id: SESSION.to_owned(),
             desired_state: DesiredState::Running,

@@ -152,6 +152,8 @@ mod session_new_outcome;
 mod session_new_request_id;
 #[path = "session_process_api.rs"]
 mod session_process_api;
+#[path = "session_rights.rs"]
+mod session_rights;
 #[path = "session_spawned_by.rs"]
 mod session_spawned_by;
 #[path = "session_tree.rs"]

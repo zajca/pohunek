@@ -120,6 +120,30 @@ The assistant must:
   route for a Hermes hook's native reference: the public native-id report
   accepts only the PTY root and refuses `identity-v1` sessions altogether, and
   the Hermes reporter never sends it.
+- A process inside a session's tree is also placed by its kernel peer, not by
+  markers: it may mutate only that session's `spawned_by` descendants, plus type
+  into its parent while the parent is not blocked, and every other target is
+  `session_right_denied`. Owner terminals, services outside every session tree
+  and `shell` sessions keep owner rights, and so does a process that leaves the
+  tree (a double fork, `systemd-run --user --scope`). It is a guardrail against
+  a confused worker, not isolation from a hostile one; run untrusted agents in
+  the isolation track (#88). `pohunek doctor` shows the `session_rights` check,
+  which fails and names a live session whose worker the daemon neither recorded
+  nor can place by control group; until that session's worker is reattached, a
+  caller no root attributes is refused as `unattributed_caller` instead of
+  getting owner rights. A recorded worker that is gone, or recorded under another boot, leaves
+  nothing to place. A worker the daemon refuses to adopt keeps its processes in
+  their session when its identity is known; otherwise they keep owner rights,
+  the doctor warns, and removing the session retires the worker. The refusal
+  names the way out: restart the daemon job.
+- The parent link is attested for a process inside a session's tree: a
+  `session.new` from there records that session as `spawned_by` and refuses
+  markers that name another session (`origin_mismatch`). Only the owner moves a
+  session under another parent (`session.adopt`; a session gets `owner_only`),
+  and the package methods that write profile files are owner only too.
+  A profile's `[rights]` table is the owner's lever: `spawn_profiles` limits what
+  a session launches, and `owner_equivalent = true` gives a manager profile the
+  rights of the owner's shell.
 - The Rust SDK inherits that origin from the calling process by default
   (`OriginSource::Environment`, which reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID`). `OriginSource::Omitted` makes a connection attach no

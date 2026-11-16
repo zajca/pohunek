@@ -183,6 +183,15 @@ export type HostCapabilities = {
    */
   session_remove_tree_supported?: boolean;
   /**
+   * Whether the daemon accepts `session.adopt`, which gives a session a
+   * new parent.
+   *
+   * A daemon that predates the method omits it, which decodes as `false`;
+   * it would answer `method_not_found`. `false` is likewise omitted on
+   * the wire.
+   */
+  session_adopt_supported?: boolean;
+  /**
    * Whether `package.install` and `package.link` accept `accept_commands`
    * and install packages that declare commands.
    *

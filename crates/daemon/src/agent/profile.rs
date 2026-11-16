@@ -87,6 +87,9 @@ struct RawProfile {
     /// choices add args and env to the launch (see [`options`]).
     #[serde(default)]
     options: BTreeMap<String, options::RawOption>,
+    /// Rights of the sessions launched from the profile (see [`rights`]).
+    #[serde(default)]
+    rights: Option<rights::RawRights>,
 }
 
 /// A profile env value. Deserializing a non-string fails with a fixed message
@@ -1585,6 +1588,11 @@ fn resolve_raw(
         .as_ref()
         .map(|label| label.as_str().to_owned());
     let audience = raw.audience.map(presentation::ProfileAudience::get);
+    if let Some(rights) = raw.rights.as_ref() {
+        rights
+            .validate()
+            .map_err(|reason| invalid_profile(name, reason))?;
+    }
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
     let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
@@ -2046,6 +2054,7 @@ mod compose;
 pub(crate) mod options;
 pub(crate) mod presentation;
 mod preset;
+pub(crate) mod rights;
 pub(crate) use bind::{apply_pin, parse_head, BindDir, BindError, Pin, ProfileFile};
 pub(crate) use compose::{compose_preset, compose_profile, PresetSpec, ProfileSpec};
 pub(crate) use options::OptionRequest;

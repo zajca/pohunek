@@ -61,6 +61,17 @@ impl NativeReportRefusal {
     }
 }
 
+/// What [`ControlPeer::standing`] attests about a control peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerStanding {
+    /// The peer runs as another user than the daemon.
+    ForeignUser,
+    /// The peer's socket binding or process no longer matches the one accepted.
+    Unattested,
+    /// The attested, still running peer process.
+    Process(ProcessIdentity),
+}
+
 /// Kernel-attested identity of the process on the other end of one control
 /// connection.
 ///
@@ -115,6 +126,28 @@ impl ControlPeer {
     pub(crate) fn audit_identity(&self) -> (u32, u32) {
         let snapshot = self.binding.snapshot();
         (snapshot.pid, snapshot.uid)
+    }
+
+    /// What the kernel attests about the peer right now, for rights classification.
+    ///
+    /// The binding and the process are re-read, so a socket handed to another
+    /// process, or a peer that has since exited, is [`PeerStanding::Unattested`].
+    pub(crate) fn standing(&self) -> PeerStanding {
+        let daemon_uid = rustix::process::geteuid().as_raw();
+        if self.binding.snapshot().uid != daemon_uid {
+            return PeerStanding::ForeignUser;
+        }
+        if self.binding.revalidate().is_err() {
+            return PeerStanding::Unattested;
+        }
+        #[cfg(test)]
+        let recheck = self.recheck_process;
+        #[cfg(not(test))]
+        let recheck = true;
+        if recheck && live_identity(self.identity.pid) != Some(self.identity) {
+            return PeerStanding::Unattested;
+        }
+        PeerStanding::Process(self.identity)
     }
 
     /// Requires the caller to be the process `params` names, as the daemon's user.

@@ -287,6 +287,14 @@ pub struct HostCapabilities {
     /// the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub session_remove_tree_supported: bool,
+    /// Whether the daemon accepts `session.adopt`, which gives a session a
+    /// new parent.
+    ///
+    /// A daemon that predates the method omits it, which decodes as `false`;
+    /// it would answer `method_not_found`. `false` is likewise omitted on
+    /// the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_adopt_supported: bool,
     /// Whether `package.install` and `package.link` accept `accept_commands`
     /// and install packages that declare commands.
     ///

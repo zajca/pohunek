@@ -371,11 +371,16 @@ impl Rig {
         wait_until(
             "the fixture session commits its terminal outcome",
             || async move {
-                self.registry
-                    .record_exit(&self.session.id, exit, stopped_by_user, None, None)
-                    .await
-                    .expect("terminal commit of the fixture session")
-                    .then_some(())
+                Box::pin(self.registry.record_exit(
+                    &self.session.id,
+                    exit,
+                    stopped_by_user,
+                    None,
+                    None,
+                ))
+                .await
+                .expect("terminal commit of the fixture session")
+                .then_some(())
             },
         )
         .await;
@@ -954,7 +959,7 @@ async fn an_unreported_legacy_switch_survives_the_explicit_stop() {
         rig.registry.stop(&rig.session.id).await.is_err(),
         "the unaskable worker cannot answer its stop RPC"
     );
-    rig.commit_terminal_exit(exit, true).await;
+    Box::pin(rig.commit_terminal_exit(exit, true)).await;
     let stopped = rig
         .registry
         .inspect(&rig.session.id)
@@ -977,7 +982,7 @@ async fn an_unreported_legacy_switch_survives_the_natural_exit() {
     let (rig, _value, exit) =
         switched_legacy_session("codex-legacy-switch-exit", false, |_| {}).await;
 
-    rig.commit_terminal_exit(exit, false).await;
+    Box::pin(rig.commit_terminal_exit(exit, false)).await;
     let ended = rig
         .registry
         .inspect(&rig.session.id)
@@ -1029,7 +1034,7 @@ async fn a_terminal_stop_never_imports_a_foreign_switch_process() {
         rig.registry.stop(&rig.session.id).await.is_err(),
         "the unaskable worker cannot answer its stop RPC"
     );
-    rig.commit_terminal_exit(exit, true).await;
+    Box::pin(rig.commit_terminal_exit(exit, true)).await;
 
     let durable = rig.durable_record();
     assert_eq!(
@@ -1065,7 +1070,7 @@ async fn a_terminal_stop_never_imports_a_stale_switch() {
         rig.registry.stop(&rig.session.id).await.is_err(),
         "the unaskable worker cannot answer its stop RPC"
     );
-    rig.commit_terminal_exit(exit, true).await;
+    Box::pin(rig.commit_terminal_exit(exit, true)).await;
 
     let durable = rig.durable_record();
     assert_eq!(

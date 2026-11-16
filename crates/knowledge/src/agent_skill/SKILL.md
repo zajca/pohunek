@@ -48,7 +48,11 @@ pohunek doctor --json
   `spawned_by` (`session_id`, `daemon_id`); `session list --spawned-by
   <session-id> --json` lists the children of one session. The host records it
   from the request origin, so it is attribution, not a security boundary: a
-  same-user process can omit the origin and then nothing is recorded.
+  same-user process can omit the origin and then nothing is recorded. From
+  inside a session the daemon records the calling session whatever the request
+  says, and a session cannot change a link: a manager that needs another
+  manager to own a worker asks the owner to run
+  `pohunek session adopt <worker> <manager>`.
 - `pohunek doctor --json` reports local environment health: daemon
   reachability, socket and state directories, and required binaries. It checks
   the machine it runs on and ignores the global `--host` flag; run it first

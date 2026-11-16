@@ -367,6 +367,57 @@ absent on the wire means `owner`; bare runtimes carry neither), and `session lis
 label live as `agent_display_name` (absent when the profile sets none, or no
 longer resolves). See the public API reference for the wire shape.
 
+## Session rights
+
+A profile may carry a `[rights]` table that says what the sessions launched
+from it may do to other sessions (see the [trust model](../safety/trust-model.md)):
+
+```toml
+base = "claude"
+
+[rights]
+owner_equivalent = true               # the tree has the rights of the owner's shell
+spawn_profiles = ["worker", "review"] # the profiles it may launch
+```
+
+`owner_equivalent` is meant for manager profiles: the sessions run with the
+owner's rights, so a manager session reaches sessions it did not spawn.
+`spawn_profiles` lists exact profile names; an empty list forbids spawning and
+an absent key leaves it unrestricted, except that a profile with
+`owner_equivalent = true` is launched from a plain session only when that
+session's list names it. An owner-equivalent session keeps its own list: with
+the example above it launches `worker` and `review` and nothing else, and
+`session.resume` of one of its descendants relaunches only a listed profile. A
+request that names a profile outside the list is refused with
+`session_right_denied` (`reason=spawn_profile_not_allowed`). A preset has the
+rights of its parent profile.
+
+The table is read from the profile file, never from a request, and an unknown
+key or an entry that is not a profile name is `invalid_profile`. A session
+holds the rights its profile had when it was launched or resumed, narrowed by
+the file as it reads when the daemon places a caller (once per connection) and
+when it checks a spawn. An edit that takes rights away applies to the running
+sessions from their next connection; an edit that adds rights applies to the
+sessions launched after it. A file the daemon cannot read, including one with
+unsafe permissions, grants nothing and forbids spawning. The launch rights are
+stored in the session record, so a session restored after a daemon restart
+holds the rights it was launched with, never more than the file allows now. A
+session recorded before the rights were stored takes the file as it reads at
+its first use. The
+table is part of the profile revision, so a change also asks for
+`--accept-profile-change` on the next resume.
+
+The package methods that write profile files (`package.create_profile`,
+`package.create_preset`, `package.remove_profile`, `package.bind_profile`) are
+owner only: a call from inside a session's process tree is refused with
+`reason=owner_only`. `plugin profile create <name> --base ... --replace`
+keeps the `[rights]` table of the file it replaces, because a profile
+definition carries none, and a preset cannot replace a profile that has one
+(`package_profile_unusable`). The profile files are still the owner's lever and,
+like every file of the same user, within reach of a same-user process that
+edits them directly. `plugin profile fold` does not read `[rights]`. A profile
+without the table has neither key.
+
 ## Launch options
 
 A profile may offer a few closed choices a launch picks from, for example the

@@ -17,10 +17,10 @@ use base64::Engine as _;
 #[cfg(test)]
 use protocol::Request;
 use protocol::{
-    method, AgentActivity, CwdSource, OutputOffset, RuntimeGeneration, SessionDetectionParams,
-    SessionDetectionResult, SessionDiffParams, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadResult,
+    method, AgentActivity, CwdSource, OutputOffset, RuntimeGeneration, SessionAdoptParams,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadResult,
     SessionReadSource, SessionRemoveResult, SessionRemoveTreeParams, SessionRemoveTreeResult,
     SessionRenameParams, SessionResizeParams, SessionResumeParams, SessionRetentionParams,
     SessionRetentionResult, SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams,
@@ -1844,6 +1844,39 @@ pub(crate) async fn run_rename(
         print!("{}", crate::commands::render_json(&renamed)?);
     } else {
         print!("{}", render_rename_human(&renamed.session));
+    }
+    Ok(())
+}
+
+/// Run `session adopt` against the daemon for `host`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] if the daemon is unreachable, the host cannot be
+/// resolved, the daemon rejects the request (`owner_only` from inside a
+/// session, `session_adopt_refused` for a loop), or the payload does not match
+/// the contract.
+pub(crate) async fn run_adopt(
+    host: &PinnedHost,
+    paths: &Paths,
+    target: &Target,
+    new_parent: &Target,
+    json: bool,
+) -> Result<(), CliError> {
+    let mut client = Client::connect_pinned(host, paths).await?;
+    let adopted = client
+        .call::<method::SessionAdopt>(SessionAdoptParams {
+            session_id: SessionId(target.session_id.clone()),
+            new_parent: SessionId(new_parent.session_id.clone()),
+        })
+        .await?;
+    if json {
+        print!("{}", crate::commands::render_json(&adopted)?);
+    } else {
+        println!(
+            "{} is now a child of {}",
+            target.session_id, new_parent.session_id
+        );
     }
     Ok(())
 }

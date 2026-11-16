@@ -1504,6 +1504,20 @@ enum SessionAction {
         json: bool,
     },
 
+    /// Give a session a new parent. Owner only: a process inside a session
+    /// gets `owner_only`. Needs a daemon that advertises
+    /// `session_adopt_supported`.
+    Adopt {
+        /// The session that gets a new parent: `session-id` or
+        /// `local/session-id`.
+        target: Target,
+        /// The session that becomes its parent, on the same host.
+        new_parent: Target,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Show a unified diff of a session's worktree against its base.
     Diff {
         /// Session target: `session-id` or `local/session-id`.
@@ -1697,6 +1711,7 @@ impl SessionAction {
             | SessionAction::Resize { json, .. }
             | SessionAction::Metadata { json, .. }
             | SessionAction::Rename { json, .. }
+            | SessionAction::Adopt { json, .. }
             | SessionAction::Diff { json, .. } => *json,
             SessionAction::Retention { action } => action.wants_json(),
         }
@@ -2218,6 +2233,20 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     // `--clear` (or no name) clears it; a positional name sets it.
                     let new_name = if clear { None } else { name };
                     commands::session::run_rename(&host, &paths, &target, new_name, json).await?;
+                }
+                SessionAction::Adopt {
+                    target,
+                    new_parent,
+                    json,
+                } => {
+                    let host = effective_host(&global_host, Some(&target));
+                    let host = client::PinnedHost::resolve(&host).await?;
+                    let target =
+                        commands::session::resolve_target_pinned(&host, &paths, &target).await?;
+                    let new_parent =
+                        commands::session::resolve_target_pinned(&host, &paths, &new_parent)
+                            .await?;
+                    commands::session::run_adopt(&host, &paths, &target, &new_parent, json).await?;
                 }
                 SessionAction::Diff { target, base, json } => {
                     let host = effective_host(&global_host, Some(&target));
@@ -2815,6 +2844,7 @@ fn session_action_hosts<'a>(action: &'a SessionAction, global: &'a str) -> Vec<&
         | SessionAction::Resize { target, .. }
         | SessionAction::Metadata { target, .. }
         | SessionAction::Rename { target, .. }
+        | SessionAction::Adopt { target, .. }
         | SessionAction::Diff { target, .. } => vec![target_host(target, global)],
         SessionAction::Wait { target, .. } if !target.is_empty() => target
             .iter()

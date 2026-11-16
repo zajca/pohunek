@@ -719,6 +719,44 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/session_right_denied` error.
+    ///
+    /// The caller runs inside a session's process tree and the request targets
+    /// a session its rights do not cover. `reason` is a stable machine-readable
+    /// code (`not_descendant`, `parent_blocked`, `owner_only`,
+    /// `spawn_profile_not_allowed`, `origin_mismatch`, `unknown_caller` or
+    /// `unattributed_caller`); the message carries nothing else of the request.
+    #[must_use]
+    pub fn session_right_denied(reason: &'static str) -> Self {
+        let recover = if reason == "unattributed_caller" {
+            "`pohunek doctor` names the session with no verified root (check session_rights); \
+             retry once its worker reconnects, or restart the daemon job (`pohunek service status` \
+             names it; `systemctl --user restart <job>` or `launchctl kickstart -k gui/$(id -u)/<label>`), which \
+             reattaches every live worker"
+        } else {
+            "ask the owner to run the request, or act on a session this session spawned"
+        };
+        Self::new(
+            ErrorClass::Runtime,
+            "session_right_denied",
+            format!("the caller's session rights do not cover this request (reason={reason})"),
+            Some(recover.to_owned()),
+        )
+    }
+
+    /// The canonical `runtime/session_adopt_refused` error.
+    ///
+    /// `reason` is `self_parent`, `cycle` or `tree_removal_in_progress`.
+    #[must_use]
+    pub fn session_adopt_refused(reason: &'static str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "session_adopt_refused",
+            format!("the session cannot be given that parent (reason={reason})"),
+            None,
+        )
+    }
+
     /// The canonical `daemon/method_not_found` error for an unknown method.
     #[must_use]
     pub fn method_not_found(method: &str) -> Self {

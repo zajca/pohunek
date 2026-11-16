@@ -23,6 +23,8 @@ mod remove_tests;
 #[cfg(test)]
 mod revocation_tests;
 #[cfg(test)]
+mod rights_tests;
+#[cfg(test)]
 mod selection_tests;
 #[cfg(test)]
 mod test_fixture;
