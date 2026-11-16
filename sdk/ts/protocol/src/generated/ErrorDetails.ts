@@ -20,4 +20,16 @@ export type ErrorDetails = {
    * and `session_request_conflict`.
    */
   session_id?: SessionId;
+  /**
+   * The expected commit for `fetch_ref_commit_mismatch`.
+   */
+  expected_commit?: string;
+  /**
+   * The fetched commit for `fetch_ref_commit_mismatch`.
+   */
+  fetched_commit?: string;
+  /**
+   * The source ref for `fetch_ref_commit_mismatch`.
+   */
+  source_ref?: string;
 };

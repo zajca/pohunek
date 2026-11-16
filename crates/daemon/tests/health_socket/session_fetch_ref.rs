@@ -578,15 +578,27 @@ async fn a_commit_mismatch_fails_without_leaving_anything() {
         Vec::new(),
     )
     .await;
-    let expected = rig.origin_source_ref();
+    let remote_commit = rig.origin_source_ref();
     let other = rig.git(&["rev-parse", "HEAD"]);
     let error = err_payload(rig.new_session(rig.params(SOURCE_REF, &other)).await);
 
     assert_eq!(error.code, "fetch_ref_commit_mismatch", "{}", error.msg);
     assert!(
-        error.msg.contains(&other) && error.msg.contains(&expected),
+        error.msg.contains(&other) && error.msg.contains(&remote_commit),
         "the error names both the expected and the fetched commit: {}",
         error.msg
+    );
+    assert_eq!(
+        error.details.as_ref().unwrap().expected_commit.as_deref(),
+        Some(other.as_str())
+    );
+    assert_eq!(
+        error.details.as_ref().unwrap().fetched_commit.as_deref(),
+        Some(remote_commit.as_str())
+    );
+    assert_eq!(
+        error.details.as_ref().unwrap().source_ref.as_deref(),
+        Some(SOURCE_REF)
     );
     assert!(
         !marker.exists(),

@@ -41,6 +41,14 @@ const ANSWERING_STEP_TIMEOUT: &str = "60";
 /// Step bound of the scenarios that wait for an answer that never comes.
 const SILENT_STEP_TIMEOUT: &str = "3";
 
+/// The deadline is the behaviour under test: rule 4 refuses at it.
+const PROMPT_REFUSAL_STEP_TIMEOUT: &str = "3";
+
+/// The deadline of the scenario with a blocked dialog at the first screen:
+/// the daemon publishes `blocked` only after its 3 s startup grace, so the
+/// bound waits past it before deciding the row timed out.
+const BLOCKED_DIALOG_STEP_TIMEOUT: &str = "8";
+
 fn s(path: &Path) -> &str {
     path.to_str().expect("utf-8 path")
 }
@@ -657,8 +665,10 @@ fn one_scenario_holds_exactly_its_row() {
 
 /// A record written right before the theme picker (in the same write) stays
 /// in the login row's `records` but is never its `final_record`: the row
-/// describes the login screen, and the boundary is taken from the output
-/// read after the picker was detected, not from an earlier poll.
+/// describes the login screen. The boundary is the output read after the
+/// picker was detected, which the ordering argument in `accept_theme` guarantees
+/// holds every record written before the picker (ring push before terminal feed),
+/// regardless of poll timing.
 #[test]
 fn a_record_before_the_theme_picker_is_not_the_login_final_record() {
     // The blank start puts the picker in the middle of the first-screen
@@ -871,6 +881,77 @@ fn untrusted_workdir_stops_before_any_prompt() {
         typed.is_empty(),
         "nothing is typed into the trust dialog: {typed:?}"
     );
+}
+
+/// The login scenario refuses when an empty config home shows the prompt
+/// box directly, without the login method list. The stand-in mode `prompt-box`
+/// draws the prompt with a `state=idle` record and exits 2 with the refusal
+/// message instead of timing out.
+#[test]
+fn login_screen_prompt_refusal_is_detected() {
+    let capture = Capture::new();
+    let workdir = capture.workdir(&["prompt-box"]);
+    let release = capture.release_dir();
+    let output = capture.capture(
+        &release,
+        &capture.claude(),
+        None,
+        &workdir,
+        &[
+            "--scenario",
+            "login_screen",
+            "--step-timeout-secs",
+            PROMPT_REFUSAL_STEP_TIMEOUT,
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output)
+            .contains("Claude opened its prompt without a login in an empty config home"),
+        "{}",
+        stderr_of(&output)
+    );
+    capture.assert_no_survivors();
+}
+
+/// The login scenario times out when an empty config home shows a blocked
+/// dialog under the held `state=idle` record: the deadline `Prompt` branch
+/// needs a last record that is `idle` and a detection that is not blocked,
+/// so a blocked screen is the step timeout, not the refusal.
+#[test]
+fn login_screen_blocked_dialog_is_a_timeout() {
+    let capture = Capture::new();
+    let workdir = capture.workdir(&["api-key-dialog"]);
+    let release = capture.release_dir();
+    let output = capture.capture(
+        &release,
+        &capture.claude(),
+        None,
+        &workdir,
+        &[
+            "--scenario",
+            "login_screen",
+            "--step-timeout-secs",
+            BLOCKED_DIALOG_STEP_TIMEOUT,
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("timed out"),
+        "{}",
+        stderr_of(&output)
+    );
+    capture.assert_no_survivors();
 }
 
 /// The bytes the stand-in read on its theme picker in `workdir`.

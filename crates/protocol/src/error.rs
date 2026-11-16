@@ -136,7 +136,9 @@ pub struct ProtocolError {
     /// `command_failed` carries the process exit, and only a client that called
     /// `command.run` can receive that error. `session_request_in_progress` and
     /// `session_request_conflict` carry the session id, and only a client that
-    /// sent a `client_request_id` can receive them. No older client sees the
+    /// sent a `client_request_id` can receive them. `fetch_ref_commit_mismatch`
+    /// carries `expected_commit`, `fetched_commit` and `source_ref`, and only a
+    /// client that sent `fetch_ref` can receive it. No older client sees the
     /// key. It is boxed so the error type stays small in every `Result` that
     /// carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,6 +164,18 @@ pub struct ErrorDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub session_id: Option<SessionId>,
+    /// The expected commit for `fetch_ref_commit_mismatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub expected_commit: Option<String>,
+    /// The fetched commit for `fetch_ref_commit_mismatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub fetched_commit: Option<String>,
+    /// The source ref for `fetch_ref_commit_mismatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub source_ref: Option<String>,
 }
 
 /// How a process ended abnormally: exactly one of the fields is set.

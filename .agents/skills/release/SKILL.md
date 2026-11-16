@@ -175,8 +175,8 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
      take (restart, re-pair, package upgrade, changed compatibility constant)
      appears under `Upgrading`; write "Nothing to do" when that is true.
    - **After the end marker** goes only what the website must not show: the
-     compatibility notes of step 1 (this body replaces the step 5 one, so keep
-     them here) and the assistant digest of step 9.
+     compatibility notes of step 1 (step 5 publishes them only through this
+     body) and the assistant digest of step 9.
    - **Review.** Send the full body to the release coordinator or the owner and
      publish only after their explicit approval of that text. Before
      publishing, each check prints the value after it:

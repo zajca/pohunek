@@ -16,6 +16,12 @@
 #   startup-idle  emit `state=idle` and keep the screen blank for a second
 #                 before the theme picker
 #   slow-start    show a blank screen for two seconds before the first screen
+#   prompt-box    in an empty config home, emit state=idle and draw
+#                 the prompt box instead of the first-run screens,
+#                 then hold
+#   api-key-dialog in an empty config home, emit state=idle and draw
+#                 the API key approval dialog instead of the first-run
+#                 screens, then hold
 # An empty `CLAUDE_CONFIG_DIR` draws the first-run theme picker and, after a
 # carriage return, the login method list; the bytes typed into the picker are
 # appended to `theme-input.log` in the working directory. Input is read with
@@ -37,6 +43,8 @@ if [ -e ./untrusted ]; then
 fi
 cr=$(printf '\r')
 if [ -z "$(ls -A "$config" 2>/dev/null)" ]; then
+  if [ -e ./prompt-box ]; then emit idle; printf '\033[2J\033[H%s\r\n❯ \r\n%s\r\n  ? for shortcuts' "$rule" "$rule"; hold; fi
+  if [ -e ./api-key-dialog ]; then emit idle; printf '\033[2J\033[H%s\r\n Detected a custom API key in your environment\r\n Do you want to use this API key?\r\n ❯ 1. Yes\r\n   2. No\r\n' "$rule"; hold; fi
   if [ -e ./startup-idle ]; then emit idle; sleep 1; fi
   picker_record=
   if [ -e ./picker-record ]; then picker_record='\033]7501;state=idle:app=claude-code\033\\'; fi
