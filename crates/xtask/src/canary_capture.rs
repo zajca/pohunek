@@ -848,13 +848,13 @@ impl Driver<'_> {
     /// Drives the scenario's steps up to its read point and reads the row.
     fn drive(&mut self, session: &mut Session) -> Result<ScenarioRow, StepFailure> {
         let scenario = session.scenario;
-        let mut first = self.wait_first_screen(session, scenario, false)?;
         // The records that precede the theme picker the key answered; the
         // login row's `final_record` comes from the records after them.
-        let mut picker_records = 0;
+        let mut picker_records = 0usize;
+        let mut first = self.wait_first_screen(session, scenario, false, picker_records)?;
         if (scenario, first) == (Scenario::LoginScreen, FirstScreen::Theme) {
             picker_records = self.accept_theme(session)?;
-            first = self.wait_first_screen(session, scenario, true)?;
+            first = self.wait_first_screen(session, scenario, true, picker_records)?;
         }
         match (scenario, first) {
             (Scenario::LoginScreen, FirstScreen::Login) => {
@@ -945,6 +945,7 @@ impl Driver<'_> {
         session: &mut Session,
         scenario: Scenario,
         theme_answered: bool,
+        picker_records: usize,
     ) -> Result<FirstScreen, StepFailure> {
         let deadline = Instant::now() + self.args.step_timeout;
         loop {
@@ -962,21 +963,39 @@ impl Driver<'_> {
             if !theme_answered && self.screen_rules.theme_picker.matches(&detection) {
                 return Ok(FirstScreen::Theme);
             }
-            // A blank screen before the agent draws anything may read idle
-            // too, so `idle` counts only from a record or a matched screen
-            // rule. In an empty config home a startup `idle` record may come
-            // before the first-run screens, so only the screen decides there.
-            let idle_record = scenario != Scenario::LoginScreen
-                && session
-                    .records
-                    .last()
-                    .is_some_and(|record| record == "state=idle");
+            // A startup `state=idle` can precede first-run screens, so in the login
+            // scenario an idle record counts only after the picker; while Claude holds
+            // the idle record the detector reports `osc_progress` over the prompt box,
+            // so the step deadline decides "straight to the prompt".
+            let last_record_idle = session
+                .records
+                .last()
+                .is_some_and(|record| record == "state=idle");
             let screen_idle = activity.as_deref() == Some("idle")
                 && detection["status"]["state_source"] == SCREEN_STATE_SOURCE;
-            if idle_record || screen_idle {
-                return Ok(FirstScreen::Prompt);
+            if scenario == Scenario::LoginScreen {
+                if theme_answered {
+                    let idle_record = session.records.len() > picker_records && last_record_idle;
+                    if idle_record || screen_idle {
+                        return Ok(FirstScreen::Prompt);
+                    }
+                } else if screen_idle {
+                    return Ok(FirstScreen::Prompt);
+                }
+            } else {
+                let idle_record = last_record_idle;
+                if idle_record || screen_idle {
+                    return Ok(FirstScreen::Prompt);
+                }
             }
             if Instant::now() >= deadline {
+                if scenario == Scenario::LoginScreen
+                    && !theme_answered
+                    && last_record_idle
+                    && activity.as_deref() != Some("blocked")
+                {
+                    return Ok(FirstScreen::Prompt);
+                }
                 return Err(self.timed_out("wait for the first screen"));
             }
             std::thread::sleep(POLL_INTERVAL);
