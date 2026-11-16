@@ -114,15 +114,18 @@ The same two commands run locally:
   in `--release-dir`, and writes the verdict as evidence JSON. It never launches
   the runtime program and never talks to your own daemon. A context entry
   (`kind = "context"`) proves a context package with no runtime: the install
-  must report it official with the entry's digest, and the inspect must
-  report it enabled and selected and read the package back
+  must report it official with the entry's digest, and enabled and selected
+  on the default path, while the inspect must report it enabled and selected
+  and read the package back
   (for `pohunek.context.assistant` it also renders the assistant prompt
   for the explicit `--agent prove-assistant` name, which skips auto selection
   (the host reports no such agent), so the readback touches the installed
   package; --print-prompt starts no session). The digest step refuses a
   descriptor that carries a `[runtime]` table or no `[context]` table
-  (a `prove --no-enable` install stages the disabled row-5 install the
-  inspect predicate must refuse). The evidence of a context proof carries
+  (a `prove --no-enable` install stages a disabled install the inspect
+  predicate must refuse for being disabled, and a `prove --pre-install`
+  newer version leaves the proved version unselected). The evidence of a
+  context proof carries
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
   lists the steps, the evidence fields and the exit statuses.

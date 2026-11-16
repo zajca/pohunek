@@ -5,7 +5,8 @@ kind: added
 the archive as the entry's official package, the inspect must report it
 enabled and selected with no runtime, and the assistant entry renders its
 prompt for an explicit agent name that skips auto selection.
-`prove --no-enable` stages the disabled install the inspect predicate must
-refuse (case-table row 5).
+`prove --no-enable` stages a disabled install the inspect predicate must
+refuse, and `prove --pre-install` stages a newer installed version so the
+proved version stays unselected.
 `cargo xtask index throwaway --schema-version 2` signs a schema 2 document
 for the context tree. ([#2170](https://github.com/zajca/pohunek/issues/2170))

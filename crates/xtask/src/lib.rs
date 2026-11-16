@@ -1058,10 +1058,16 @@ enum PluginAction {
         /// Evidence file to write; it must not exist yet.
         #[arg(long, value_name = "FILE")]
         evidence: PathBuf,
-        /// Install the package disabled and unselected, so `inspect` must
-        /// refuse it: the row-5 scenario that pins the inspect predicate.
+        /// Install the package disabled (it stays selected), so `inspect`
+        /// must refuse it for being disabled.
         #[arg(long)]
         no_enable: bool,
+        /// Install this extra archive first through a digest trust, so the
+        /// proof runs alongside another installed version of the same
+        /// package: a newer version leaves the proved version unselected,
+        /// which the flag checks must refuse.
+        #[arg(long, value_name = "FILE")]
+        pre_install: Option<PathBuf>,
     },
 }
 
@@ -1485,6 +1491,7 @@ fn run_plugin(action: PluginAction) -> Result<(), XtaskError> {
             release_dir,
             evidence,
             no_enable,
+            pre_install,
         } => {
             let report = plugin::prove(&plugin::ProveArgs {
                 archive,
@@ -1492,6 +1499,7 @@ fn run_plugin(action: PluginAction) -> Result<(), XtaskError> {
                 release_dir,
                 evidence,
                 no_enable,
+                pre_install,
             })?;
             println!("{report}");
         }

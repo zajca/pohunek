@@ -4,7 +4,7 @@ set -euo pipefail
 script_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 fixture_root="$script_root/scripts/tests/fixtures"
 smoke="$script_root/scripts/smoke-hermes-plugin-release"
-test_root="$(mktemp -d /var/tmp/pohunek-smoke.XXXXXX)"
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/pohunek-smoke.XXXXXX")"
 unsafe_temp_parent="$test_root/u"
 safe_temp_parent="$test_root/s"
 mkdir -p "$unsafe_temp_parent/.git" "$safe_temp_parent"

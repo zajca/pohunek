@@ -78,9 +78,13 @@ pub(crate) struct ProveArgs {
     pub(crate) entry: PathBuf,
     pub(crate) release_dir: PathBuf,
     pub(crate) evidence: PathBuf,
-    /// Install the package disabled and unselected, so `inspect` must
-    /// refuse it: the row-5 scenario that pins the inspect predicate.
+    /// Install the package disabled (it stays selected), so `inspect`
+    /// must refuse it for being disabled.
     pub(crate) no_enable: bool,
+    /// Install this extra archive first through a digest trust, so the
+    /// proof runs alongside another installed version: a newer version of
+    /// the same package leaves the proved version unselected.
+    pub(crate) pre_install: Option<PathBuf>,
 }
 
 /// A failed proof: the step that failed and why. Its exit status is 1.
@@ -302,7 +306,10 @@ fn prove_in(
     outcome.core_version = Some(host.core_version().map_err(fail(Step::Host))?);
     host.launch_local_only(root).map_err(fail(Step::Host))?;
 
-    let archive_path = write_archive(archive, root).map_err(fail(Step::Install))?;
+    let archive_path = write_archive(archive, root, ARCHIVE_FILE).map_err(fail(Step::Install))?;
+    if let Some(pre_install) = &args.pre_install {
+        pre_install_archive(&mut host, pre_install).map_err(fail(Step::Install))?;
+    }
     install(&mut host, entry, &archive_path, &trust, args.no_enable)
         .map_err(fail(Step::Install))?;
     inspect(&mut host, entry).map_err(fail(Step::Inspect))?;
@@ -349,16 +356,33 @@ fn create_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot create `{}`: {error}", path.display()))
 }
 
-/// Writes the digest-checked archive bytes where the daemon can read them.
-fn write_archive(archive: &[u8], root: &Root) -> Result<PathBuf, String> {
+/// Writes the archive bytes where the daemon can read them.
+fn write_archive(archive: &[u8], root: &Root, name: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = root.path().join(ARCHIVE_DIRECTORY);
     create_directory(&directory)?;
-    let path = directory.join(ARCHIVE_FILE);
+    let path = directory.join(name);
     fs::write(&path, archive)
         .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(ARCHIVE_MODE)))
         .map_err(|error| format!("cannot write the archive copy: {error}"))?;
     Ok(path)
+}
+
+/// Step 4 setup: installs an extra archive through a digest trust, so the
+/// proof runs alongside another installed version of the same package. Only
+/// the proved version goes through the entry's index path; this install only
+/// stages the unselected state the `install` and `inspect` flag checks must
+/// refuse.
+fn pre_install_archive(host: &mut Host, archive: &Path) -> Result<(), String> {
+    let bytes = fs::read(archive)
+        .map_err(|error| format!("cannot read the pre-installed archive: {error}"))?;
+    let digest = format!("sha256:{}", hex(&Sha256::digest(&bytes)));
+    let stored = archive.to_string_lossy().into_owned();
+    let output = host.cli(&[
+        "plugin", "install", &stored, "--sha256", &digest, "--yes", "--json",
+    ])?;
+    let _ = json_result(&output, "`pohunek plugin install --sha256`")?;
+    Ok(())
 }
 
 /// The `ok` member of a `--json` document, or the failure the document names.
@@ -373,13 +397,13 @@ fn json_result(output: &crate::isolated_host::Output, what: &str) -> Result<Valu
 }
 
 /// Step 4: install through the index path and require the entry's official
-/// package with the entry's digest. A runtime entry also requires the
-/// enabled and selected flags here, because the runtime inspect step passes
-/// on the runtime id, digest and fault alone. A context entry leaves the
-/// flags to the inspect predicate, the only check that refuses a disabled,
-/// unselected or faulted context install: the passing install report is
-/// what lets that state reach the inspect predicate instead of failing
-/// earlier.
+/// package with the entry's digest. Every entry requires `enabled` here;
+/// `selected` is required here too, except for a context entry under
+/// `--no-enable` (a disabled install is inspected but cannot pass the
+/// inspect predicate). The runtime inspect step checks only the runtime id,
+/// the digest and the fault, and the runtime install step owns the flag
+/// checks for it. The context inspect step adds the `runtime_id` and
+/// `fault` checks, which the context install step never asserts.
 fn install(
     host: &mut Host,
     entry: &package::IndexEntry,
@@ -428,9 +452,9 @@ fn install(
 /// session; a missing or damaged assistant package fails, and so does a
 /// prompt the daemon cannot compose.
 ///
-/// The install above leaves a disabled context install in place and fails
-/// only when the inspect predicate refuses it: keeping the predicate honest
-/// is what the `plugin_release` row-5 scenario pins.
+/// A `--no-enable` context install reaches this predicate disabled (but
+/// still selected), and a pre-installed newer version leaves the proved
+/// version unselected: both must fail here.
 fn check_inspected_context(
     entry: &package::IndexEntry,
     package: &serde_json::Value,

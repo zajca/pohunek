@@ -18,6 +18,10 @@
 //!   digest, id or version at `digest` for either kind, a runtime-shaped or
 //!   `[context]`-less descriptor at `digest`, a damaged assistant package at
 //!   `inspect`, a missing or exiting daemon at `host`;
+//! - a `--no-enable` install fails at `inspect` for being disabled, and a
+//!   proof alongside a newer installed version of the same package fails at
+//!   `install` on the default path and at `inspect` under `--no-enable` for
+//!   being unselected;
 //! - a proof that cannot run writes no evidence and does not replace an
 //!   existing one.
 
@@ -295,6 +299,38 @@ impl Plugin {
             s(evidence),
             "--no-enable",
         ])
+    }
+
+    /// A proof that installs `pre_install` alongside the archive first, so
+    /// the proved version runs next to another installed version.
+    fn prove_with_pre_install(
+        &self,
+        archive: &Path,
+        entry: &Path,
+        release: &Path,
+        evidence: &Path,
+        pre_install: &Path,
+        no_enable: bool,
+    ) -> Output {
+        let mut args = vec![
+            "plugin".to_owned(),
+            "prove".to_owned(),
+            "--archive".to_owned(),
+            s(archive).to_owned(),
+            "--entry".to_owned(),
+            s(entry).to_owned(),
+            "--release-dir".to_owned(),
+            s(release).to_owned(),
+            "--evidence".to_owned(),
+            s(evidence).to_owned(),
+            "--pre-install".to_owned(),
+            s(pre_install).to_owned(),
+        ];
+        if no_enable {
+            args.push("--no-enable".to_owned());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.xtask(&refs)
     }
 
     /// Proof roots left in `TMPDIR`.
@@ -685,12 +721,12 @@ fn a_context_package_with_a_runtime_descriptor_fails_at_digest() {
     }
 }
 
-/// Context identity, case-table row 4: the entry carries the archive's
-/// digest but a foreign package id or version, so the proof must fail at
-/// `digest` before any prefix exists. The passing digest is the 0.2.0
-/// build proved by `a_context_entry_proves_by_reading_the_package_back`;
-/// removing the identity comparison lets the same proof continue past
-/// `digest`, which the r2 mutation run records.
+/// Context identity: the entry carries the archive's digest but a foreign
+/// package id or version, so the proof must fail at `digest` before any
+/// prefix exists. The passing digest is the 0.2.0 build proved by
+/// `a_context_entry_proves_by_reading_the_package_back`: only the entry
+/// names a foreign package id or version, so the digest step's identity
+/// comparison is the only check that can fail the proof.
 #[test]
 fn a_context_identity_mismatch_fails_at_digest_before_any_prefix_exists() {
     // The archive and its digest are the 0.2.0 build the passing proof
@@ -752,11 +788,9 @@ fn a_context_archive_mismatch_fails_at_digest_before_any_prefix_exists() {
     assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 
-/// Context identity, case-table row 5: the install leaves the context
-/// package disabled and unselected through `--no-enable`, so the proof must
-/// fail at `inspect` when the predicate refuses it. Removing the
-/// enabled/selected refusal lets the same proof pass, which the r2 mutation
-/// run records.
+/// A `--no-enable` install leaves the context package disabled but still
+/// selected, so the proof must fail at `inspect` when the predicate
+/// refuses the disabled install.
 #[test]
 fn a_disabled_context_install_fails_at_inspect() {
     let plugin = Plugin::new();
@@ -772,6 +806,77 @@ fn a_disabled_context_install_fails_at_inspect() {
     let evidence = plugin.path("disabled-context-evidence.json");
 
     let output = plugin.prove_no_enable(&archive, &entry, &release_dir(), &evidence);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "inspect");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+/// A newer installed version of the same package leaves the proved context
+/// version unselected, so the proof must fail at `install` on the default
+/// path and at `inspect` under `--no-enable`. Each new version needs its
+/// own one-entry trust, so the pre-installed archive carries its own entry
+/// and is installed through a digest trust.
+fn unselected_proof_setup(plugin: &Plugin) -> (PathBuf, PathBuf, PathBuf) {
+    let older = plugin.context_package("unselected-older", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) = plugin.build_as(
+        &older,
+        "unselected-older-out",
+        "pohunek.context.fixture-0.2.0.tar.zst",
+    );
+    let newer = plugin.context_package("unselected-newer", "pohunek.context.fixture", "0.3.0");
+    let (pre_archive, _pre_digest) = plugin.build_as(
+        &newer,
+        "unselected-newer-out",
+        "pohunek.context.fixture-0.3.0.tar.zst",
+    );
+    let entry = plugin.context_entry(
+        "unselected-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    (archive, entry, pre_archive)
+}
+
+#[test]
+fn an_unselected_context_install_fails_at_install() {
+    let plugin = Plugin::new();
+    let (archive, entry, pre_archive) = unselected_proof_setup(&plugin);
+    let evidence = plugin.path("unselected-context-evidence.json");
+    let output = plugin.prove_with_pre_install(
+        &archive,
+        &entry,
+        &release_dir(),
+        &evidence,
+        &pre_archive,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "install");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
+#[test]
+fn an_unselected_context_install_fails_at_inspect_when_not_enabled() {
+    let plugin = Plugin::new();
+    let (archive, entry, pre_archive) = unselected_proof_setup(&plugin);
+    let evidence = plugin.path("unselected-no-enable-context-evidence.json");
+    let output = plugin.prove_with_pre_install(
+        &archive,
+        &entry,
+        &release_dir(),
+        &evidence,
+        &pre_archive,
+        true,
+    );
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     let document = evidence_of(&evidence);
     assert_eq!(document["result"], "fail");
