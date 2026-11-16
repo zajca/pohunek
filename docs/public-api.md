@@ -1181,9 +1181,13 @@ is absent for a session whose runtime declares no placement, a session that is
 not live, and every list entry, stored record and event never receive it. `unobservable` means the host withheld the PTY
 child's session or the process table, or a process that carries the generation's
 marker could not be classified, so the generation is not reported clean.
-`daemon.doctor` adds one `session_rights` check, `ok` whose detail states
-that processes that leave a session tree keep owner rights and names the
-placement mode: `ancestry+cgroup` when the service manager runs each worker as a systemd user unit, otherwise `ancestry`. The check is `fail` and names the sessions while a live session has no verified root process.
+`daemon.doctor` adds one `session_rights` check. It is `ok` and its detail
+states that processes that leave a session tree keep owner rights and names the
+placement mode: `ancestry+cgroup` when the service manager runs each worker as a
+systemd user unit, otherwise `ancestry`. It is `fail` and names the sessions
+while a live session has no verified root process, and `warn` and names the
+sessions whose runtime the daemon does not adopt but whose recorded worker keeps
+attributing its processes to the session.
 
 `daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
 naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`

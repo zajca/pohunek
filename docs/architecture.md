@@ -2363,20 +2363,29 @@ that remain are cheap, free-by-default, or inherited:
   | Ancestry names X and the control group names another session | both | `Session(X)`; ancestry wins |
   | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights; a shell a session spawned is `Session(X)` of its own tree |
   | The session X the caller belongs to runs a profile with `[rights] owner_equivalent = true` | profile file | `OwnerShell(X)`: owner rights |
-  | None of the above while every live session has a verified root: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
-  | None of the above while a live session has no verified root | | `Unattributed`: every checked mutation is refused with `unattributed_caller`, and the placement is not kept for the connection |
+  | None of the above while every live session has a worker identity or a control group placement: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
+  | None of the above while a live session has no worker identity the daemon can place by pid or control group | | `Unattributed`: every checked mutation is refused with `unattributed_caller`, and the placement is not kept for the connection |
 
   The daemon starts each session's worker itself, or reattaches a live one
   after a restart, so it knows the worker's pid and start identity before the
-  worker forks the PTY child. A launch records that identity before the
-  worker initializes, and the session entry keeps it beside the PTY root, so
-  a process of a session placed below the worker is attributed to the session
-  even in the window before the entry exists. A session adopted after a
-  restart takes both identities from the live worker it reattaches to. A live
-  session that holds neither (a worker the daemon could not reattach) is the
-  fault state: `pohunek doctor` fails the `session_rights` check and names the
-  session, and a caller no root attributes is `Unattributed` instead of
-  `Owner` until the worker is reattached or the session ends.
+  worker forks the PTY child. A launch, a resume and a relaunch record that
+  identity in the launch reservation before the worker initializes, so a
+  process of the session placed below the worker is attributed to it even
+  before the session entry exists, whatever stale identities an earlier
+  runtime of the same session left. The session entry keeps the worker beside
+  the PTY root, and the session record persists the worker's pid and start
+  identity. A restart that cannot reach a live worker, and a runtime the
+  daemon refuses to adopt (`Conflict`, `Incompatible`), still place the
+  worker's processes in their session from the record; a recorded worker that
+  is gone leaves nothing to place. Roots are matched by pid and start
+  identity together. A live session that holds no worker identity at all
+  (a record written before schema 22 whose worker the daemon could not
+  reattach) on a host without control-group placement is the fault state:
+  `pohunek doctor` fails the `session_rights` check and names the session, and
+  a caller no root attributes is `Unattributed` instead of `Owner` until the
+  worker is reattached or the session ends. `Unattributed` carries a recovery
+  hint: run the request from a remote owner connection, or retry once the
+  worker reconnects.
 
   A `Session(X)` caller may mutate a session only when it is a descendant of
   X along `spawned_by` (children, their children, so `session rm --with-children`

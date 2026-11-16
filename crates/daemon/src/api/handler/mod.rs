@@ -818,8 +818,9 @@ fn rights_target(request: &Request) -> Option<&str> {
 ///
 /// A remote overlay connection and a state without a kernel peer carry owner
 /// rights. A local peer is classified once and the class is kept, while the
-/// peer's attestation is read again before every use. An `Owner` placement
-/// made while a live session has no known root is not kept.
+/// peer's attestation is read again before every use. A caller outside every
+/// session tree while a live session has no verified root is `Unattributed`,
+/// and that class is not kept: the next request places the caller again.
 async fn caller_class(state: &DaemonState) -> CallerClass {
     if state.transport == ControlTransport::Remote {
         return CallerClass::Owner;

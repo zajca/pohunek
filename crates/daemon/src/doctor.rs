@@ -67,7 +67,7 @@ pub(crate) async fn report(
     include_profile_homes: bool,
     rejected_lines: RejectedLinesState,
     placements: &[(protocol::SessionId, protocol::SessionPlacement)],
-    unverified_roots: &[protocol::SessionId],
+    root_findings: &crate::session::rights::RootFindings,
     probe_clock: &ProbeClock,
     probe_budget: Duration,
 ) -> Result<DoctorReport, DoctorReportError> {
@@ -119,7 +119,7 @@ pub(crate) async fn report(
     checks.extend(index_channel_check(catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
-    checks.push(session_rights_check(worker_units, unverified_roots));
+    checks.push(session_rights_check(worker_units, root_findings));
     Ok(bounded_report(checks))
 }
 
@@ -921,21 +921,35 @@ fn placement_check(
 /// session has no verified root, naming the session.
 pub(crate) fn session_rights_check(
     worker_units: bool,
-    unverified_roots: &[protocol::SessionId],
+    findings: &crate::session::rights::RootFindings,
 ) -> DoctorCheck {
-    if !unverified_roots.is_empty() {
-        let names = unverified_roots
+    let named = |sessions: &[protocol::SessionId]| {
+        sessions
             .iter()
             .take(MAX_PLACEMENT_SESSIONS_LISTED)
             .map(|id| id.0.as_str())
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    };
+    if !findings.unverified.is_empty() {
         return check(
             SESSION_RIGHTS_CHECK,
             DoctorStatus::Fail,
             &format!(
-                "{} live session(s) have no verified root process ({names}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends.",
-                unverified_roots.len()
+                "{} live session(s) have no verified root process ({}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends.",
+                findings.unverified.len(),
+                named(&findings.unverified)
+            ),
+        );
+    }
+    if !findings.unadopted.is_empty() {
+        return check(
+            SESSION_RIGHTS_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "{} session(s) run a worker the daemon does not adopt ({}); its processes keep that session's rights, and removing the session retires them.",
+                findings.unadopted.len(),
+                named(&findings.unadopted)
             ),
         );
     }
@@ -1249,7 +1263,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
-            &[],
+            &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )
@@ -1334,7 +1348,7 @@ mod tests {
                 may_pin: 0,
             },
             &[],
-            &[],
+            &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
         )

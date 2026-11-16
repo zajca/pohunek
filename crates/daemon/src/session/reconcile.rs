@@ -65,6 +65,17 @@ pub(super) const RUNTIME_IDENTITY_MISMATCH: &str = "runtime_identity_mismatch";
 /// Reason of a recovery that found the worker it was meant to replace.
 pub(super) const WORKER_GENERATION_NOT_ADVANCED: &str = "worker_generation_not_advanced";
 
+/// `record` carrying the identity of the live worker the daemon observed, so
+/// a runtime it will not adopt still has its processes attributed to the
+/// session.
+fn with_observed_worker(mut record: SessionRecord, snapshot: &InspectSnapshot) -> SessionRecord {
+    record.worker_process = Some(crate::store::WorkerProcess {
+        pid: snapshot.worker_process.pid,
+        start_identity: snapshot.worker_process.start_identity,
+    });
+    record
+}
+
 /// Whether the worker named by `worker_id` and `worker_instance_id` is not the
 /// runtime the record binds; ids the record does not carry never conflict.
 pub(super) fn runtime_identity_conflict(
@@ -1577,8 +1588,13 @@ impl SessionRegistry {
                         worker_id = %candidate.snapshot.worker_id,
                         "live worker is not bound to the record's generation"
                     );
-                    self.mark_pending(record, RuntimeState::Conflict, IDENTITY_MISMATCH, retry)
-                        .await;
+                    self.mark_pending(
+                        with_observed_worker(record, &candidate.snapshot),
+                        RuntimeState::Conflict,
+                        IDENTITY_MISMATCH,
+                        retry,
+                    )
+                    .await;
                     return true;
                 };
                 // A worker older than the worker-instance marker leaves children
@@ -1604,7 +1620,7 @@ impl SessionRegistry {
                     self.mark_inventory_unmanaged(&record.session_id, CODE_WORKER_MARKER_LEGACY)
                         .await;
                     self.mark_pending(
-                        record,
+                        with_observed_worker(record, &candidate.snapshot),
                         RuntimeState::Incompatible,
                         CODE_WORKER_MARKER_LEGACY,
                         retry,
@@ -1619,7 +1635,7 @@ impl SessionRegistry {
                         {
                             tracing::debug!(session_id = %record.session_id, detail, "live worker's job does not match its generation");
                             self.mark_pending(
-                                record,
+                                with_observed_worker(record, &candidate.snapshot),
                                 RuntimeState::Conflict,
                                 IDENTITY_MISMATCH,
                                 retry,
@@ -4747,7 +4763,7 @@ impl SessionRegistry {
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
             root_process: None,
-            worker_root: None,
+            worker_root: super::recorded_worker_process(&record),
             launch_rights: record
                 .launch_rights
                 .as_ref()
@@ -9682,6 +9698,7 @@ while os.getppid() == parent:
             .record_session(&SessionRecord {
                 create_request: None,
                 launch_rights: None,
+                worker_process: None,
                 schema_version: 1,
                 session_id: session_id.to_owned(),
                 desired_state: DesiredState::Running,
@@ -11165,6 +11182,7 @@ while os.getppid() == parent:
         SessionRecord {
             create_request: None,
             launch_rights: None,
+            worker_process: None,
             schema_version: 1,
             session_id: "s-identity".to_owned(),
             desired_state: DesiredState::Running,
@@ -17790,6 +17808,191 @@ generation "$1"
             assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
             assert_eq!(retire_count(&fixture.supervisor, &id), 2);
             assert!(!discovered(&fixture.supervisor, &id).await);
+        }
+
+        /// The identity of the test process, standing for a caller outside every
+        /// session tree.
+        fn outside_peer() -> crate::session::ControlPeer {
+            let (pid, start) = own_identity();
+            crate::session::ControlPeer::for_test(crate::procwatch::ProcessIdentity {
+                pid,
+                start_identity: crate::procwatch::StartIdentity::new(start),
+            })
+        }
+
+        /// A process standing for a session's worker, killed when dropped.
+        struct StandInWorker(std::process::Child);
+
+        impl StandInWorker {
+            fn spawn() -> Self {
+                Self(
+                    std::process::Command::new("sleep")
+                        .arg("60")
+                        .spawn()
+                        .expect("spawn a stand-in worker"),
+                )
+            }
+
+            fn identity(&self) -> (u32, u64) {
+                let identity = HostInspector::new()
+                    .identity(self.0.id())
+                    .expect("inspect the stand-in worker")
+                    .expect("the stand-in worker runs");
+                (identity.pid, identity.start_identity.get())
+            }
+
+            fn peer(&self) -> crate::session::ControlPeer {
+                let (pid, start) = self.identity();
+                crate::session::ControlPeer::for_test(crate::procwatch::ProcessIdentity {
+                    pid,
+                    start_identity: crate::procwatch::StartIdentity::new(start),
+                })
+            }
+        }
+
+        impl Drop for StandInWorker {
+            fn drop(&mut self) {
+                let _killed = self.0.kill();
+                let _reaped = self.0.wait();
+            }
+        }
+
+        fn record_worker(root: &Path, mut record: SessionRecord, worker: Option<(u32, u64)>) {
+            record.worker_process =
+                worker.map(|(pid, start_identity)| crate::store::WorkerProcess {
+                    pid,
+                    start_identity,
+                });
+            Store::new(root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the record with its worker");
+        }
+
+        /// A session whose supervisor cannot be reached is `Reconnecting`: the
+        /// worker the record names is gone, so its tree has nothing left to
+        /// place and the owner's terminal stays the owner.
+        #[tokio::test]
+        async fn a_reconnecting_session_whose_recorded_worker_is_gone_does_not_lock_out_the_owner()
+        {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let gone = dead_worker_with_realistic_start();
+            let record = persist_record(&fixture.root, "s-9101", Some("runtime-s-9101"));
+            record_worker(&fixture.root, record, Some(gone));
+            write_live_journal(&fixture.root, "s-9101", gone, Some("runtime-s-9101"));
+            let id = service_id("s-9101", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-9101").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert!(fixture.registry.root_findings().await.unverified.is_empty());
+            let (class, keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Owner);
+            assert!(keep);
+        }
+
+        /// The same session with no recorded worker cannot be placed, so an
+        /// outside caller is refused and the doctor names the session until the
+        /// supervisor answers and the runtime is settled.
+        #[tokio::test]
+        async fn a_reconnecting_session_with_no_recorded_worker_is_a_named_fault_until_it_settles()
+        {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            persist_record(&fixture.root, "s-9102", Some("runtime-s-9102"));
+            write_live_journal(
+                &fixture.root,
+                "s-9102",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-9102"),
+            );
+            let id = service_id("s-9102", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-9102").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            let session = SessionId("s-9102".to_owned());
+            let findings = fixture.registry.root_findings().await;
+            assert_eq!(findings.unverified, vec![session.clone()]);
+            let (class, keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Unattributed);
+            assert!(!keep, "the placement is made again on the next request");
+            let check = crate::doctor::session_rights_check(false, &findings);
+            assert_eq!(check.status, protocol::DoctorStatus::Fail);
+            assert!(check.detail.contains("s-9102"), "{}", check.detail);
+            let refused = crate::session::rights::Denial::UnattributedCaller.error();
+            assert!(
+                refused
+                    .recover
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("pohunek doctor")),
+                "{refused:?}"
+            );
+
+            wait_state(&fixture.registry, "s-9102", RuntimeState::Lost).await;
+            assert!(fixture.registry.root_findings().await.unverified.is_empty());
+            let (class, _keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Owner);
+        }
+
+        /// A live worker the daemon refuses to adopt keeps attributing its
+        /// processes to their session from the recorded identity, and the doctor
+        /// names the session.
+        #[tokio::test]
+        async fn a_refused_runtime_with_a_live_worker_still_places_its_processes_in_their_session()
+        {
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, worker_instance_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-9103", "worker-s-9103")
+                    .await;
+            let record = persist_record(&fixture.root, "s-9103", Some(worker_instance_id.as_str()));
+            let stand_in = StandInWorker::spawn();
+            record_worker(&fixture.root, record, Some(stand_in.identity()));
+            drop(controller);
+            let socket = runtime_root
+                .join("s-9103")
+                .join(pohunek_paths::WORKER_SOCKET_NAME);
+            let hidden = socket.with_extension("hidden");
+            std::fs::rename(&socket, &hidden).expect("hide the worker socket");
+            fixture.supervisor.script_job(
+                service_id("s-9103", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-9103").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            let session = SessionId("s-9103".to_owned());
+            let (class, keep) = fixture.registry.classify_caller(&stand_in.peer()).await;
+            assert_eq!(
+                class,
+                crate::session::rights::CallerClass::Session(session.clone())
+            );
+            assert!(keep);
+            let (class, _keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Owner);
+            let findings = fixture.registry.root_findings().await;
+            assert_eq!(findings.unadopted, vec![session]);
+            let check = crate::doctor::session_rights_check(false, &findings);
+            assert_eq!(check.status, protocol::DoctorStatus::Warn);
+            assert!(check.detail.contains("s-9103"), "{}", check.detail);
+            server_task.abort();
         }
 
         #[tokio::test]

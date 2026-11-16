@@ -939,6 +939,9 @@ impl SessionRegistry {
             exit_code: None,
             agent_options: snapshot.agent_options.clone(),
         };
+        // The rights are read once, before any runtime exists, so every record
+        // of this launch carries the snapshot its entry will hold.
+        let launch_rights = self.profile_rights(&agent).await;
         let mut preparing_record = SessionRecord {
             schema_version: SESSION_RECORD_SCHEMA_VERSION,
             session_id: id.0.clone(),
@@ -954,7 +957,8 @@ impl SessionRegistry {
             info: preparing_info,
             active_agent_origin: None,
             create_request: create_request.clone(),
-            launch_rights: None,
+            launch_rights: Some(launch_rights.to_record()),
+            worker_process: None,
             native_identity_ordering: carried_native_report.as_deref().cloned(),
             recovery: Some(ResumeBinding {
                 session_id: id.0.clone(),
@@ -1057,6 +1061,10 @@ impl SessionRegistry {
                 // The job may still be live; it stays recorded for
                 // reconciliation instead of being deleted or killed.
                 // The retry is scheduled whether or not the listing was committed.
+                preparing_record.worker_process = self
+                    .launch_reservation(&id)
+                    .and_then(|reservation| reservation.worker_root)
+                    .map(super::worker_process_record);
                 let _persisted = self
                     .insert_unavailable_record(
                         preparing_record,
@@ -1192,7 +1200,7 @@ impl SessionRegistry {
             create_request,
             root_process: Some(started.root_process),
             worker_root: Some(started.worker_root),
-            launch_rights: Some(Box::new(self.profile_rights(&info.agent).await)),
+            launch_rights: Some(Box::new(launch_rights)),
         };
         #[cfg(test)]
         self.hold_launch_commit().await;
@@ -1209,6 +1217,8 @@ impl SessionRegistry {
                         // or killed.
                         // The retry is scheduled whether or not the listing was
                         // committed.
+                        preparing_record.worker_process =
+                            Some(super::worker_process_record(started.worker_root));
                         let _persisted = self
                             .insert_unavailable_record(
                                 preparing_record,

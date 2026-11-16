@@ -724,18 +724,21 @@ impl ProtocolError {
     /// The caller runs inside a session's process tree and the request targets
     /// a session its rights do not cover. `reason` is a stable machine-readable
     /// code (`not_descendant`, `parent_blocked`, `owner_only`,
-    /// `spawn_profile_not_allowed`, `origin_mismatch` or `unknown_caller`); the
-    /// message carries nothing else of the request.
+    /// `spawn_profile_not_allowed`, `origin_mismatch`, `unknown_caller` or
+    /// `unattributed_caller`); the message carries nothing else of the request.
     #[must_use]
     pub fn session_right_denied(reason: &'static str) -> Self {
+        let recover = if reason == "unattributed_caller" {
+            "`pohunek doctor` names the session with no verified root (check session_rights); \
+             retry once its worker reconnects, or run the request from a remote owner connection"
+        } else {
+            "ask the owner to run the request, or act on a session this session spawned"
+        };
         Self::new(
             ErrorClass::Runtime,
             "session_right_denied",
             format!("the caller's session rights do not cover this request (reason={reason})"),
-            Some(
-                "ask the owner to run the request, or act on a session this session spawned"
-                    .to_owned(),
-            ),
+            Some(recover.to_owned()),
         )
     }
 

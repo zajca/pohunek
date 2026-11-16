@@ -1246,6 +1246,22 @@ pub(crate) struct RuntimeInventorySnapshot {
 /// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
 static NEXT_ENTRY_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// The persisted form of a worker process identity.
+fn worker_process_record(identity: ProcessIdentity) -> crate::store::WorkerProcess {
+    crate::store::WorkerProcess {
+        pid: identity.pid,
+        start_identity: identity.start_identity.get(),
+    }
+}
+
+/// The worker process identity a record persisted.
+fn recorded_worker_process(record: &SessionRecord) -> Option<ProcessIdentity> {
+    record.worker_process.map(|worker| ProcessIdentity {
+        pid: worker.pid,
+        start_identity: crate::procwatch::StartIdentity::new(worker.start_identity),
+    })
+}
+
 fn next_entry_incarnation() -> u64 {
     NEXT_ENTRY_INCARNATION.fetch_add(1, Ordering::Relaxed)
 }
@@ -2512,6 +2528,7 @@ impl SessionRegistry {
             active_agent_origin: active_agent_origin(entry),
             create_request: entry.create_request.clone(),
             launch_rights: entry.launch_rights.as_deref().map(ProfileRights::to_record),
+            worker_process: entry.worker_root.map(worker_process_record),
         }
     }
 
@@ -9004,6 +9021,7 @@ fn create_intent_record(
         active_agent_origin: None,
         create_request: create_request.cloned().map(Box::new),
         launch_rights: None,
+        worker_process: None,
         recovery: None,
         runtime: RuntimeRecord {
             state: RuntimeState::Starting,

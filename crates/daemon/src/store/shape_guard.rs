@@ -54,7 +54,7 @@ use super::schema::{MIGRATIONS, STORE_SCHEMA_VERSION};
 use super::{
     ActiveAgentOrigin, CreateRequest, DesiredState, LaunchRights, NativeIdentityOrdering,
     ProjectRecord, Record, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
-    StoredInputRules, TransactionKind, WorktreeBinding, WorktreeStatus,
+    StoredInputRules, TransactionKind, WorkerProcess, WorktreeBinding, WorktreeStatus,
 };
 use crate::agent::{
     ExistenceCheckKind, NameMatch, NativeArg, NativeReferenceProvenance, SessionRefKind,
@@ -319,7 +319,8 @@ fn session_json_with(recovery: &Value) -> Value {
         },
         "active_agent_origin": "reported",
         "create_request": {"id": "req-1", "fingerprint": "v1:0123456789abcdef"},
-        "launch_rights": {"owner_equivalent": true, "spawn_profiles": ["worker"]}
+        "launch_rights": {"owner_equivalent": true, "spawn_profiles": ["worker"]},
+        "worker_process": {"pid": 4242, "start_identity": 987_654_321}
     });
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
@@ -416,6 +417,7 @@ fn assert_every_field_is_reviewed(
         active_agent_origin,
         create_request,
         launch_rights,
+        worker_process,
     } = session;
     let _: &DesiredState = desired_state;
     let _: &Option<ActiveAgentOrigin> = active_agent_origin;
@@ -423,6 +425,11 @@ fn assert_every_field_is_reviewed(
         owner_equivalent: _,
         spawn_profiles: _,
     }) = launch_rights
+    {}
+    if let Some(WorkerProcess {
+        pid: _,
+        start_identity: _,
+    }) = worker_process
     {}
     if let Some(request) = create_request {
         let CreateRequest {

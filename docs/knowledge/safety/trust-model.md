@@ -128,10 +128,12 @@ The assistant must:
   tree (a double fork, `systemd-run --user --scope`). It is a guardrail against
   a confused worker, not isolation from a hostile one; run untrusted agents in
   the isolation track (#88). `pohunek doctor` shows the `session_rights` check,
-  which fails and names a live session whose root process the daemon could not
-  verify; until that session's worker is reattached, a caller no root
-  attributes is refused as `unattributed_caller` instead of getting owner
-  rights.
+  which fails and names a live session whose worker the daemon neither recorded
+  nor can place by control group; until that session's worker is reattached, a
+  caller no root attributes is refused as `unattributed_caller` instead of
+  getting owner rights. A recorded worker that is gone leaves nothing to place,
+  and a worker the daemon refuses to adopt still keeps its processes in their
+  session.
 - The parent link is attested for a process inside a session's tree: a
   `session.new` from there records that session as `spawned_by` and refuses
   markers that name another session (`origin_mismatch`). Only the owner moves a

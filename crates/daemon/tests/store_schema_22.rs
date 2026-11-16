@@ -1,5 +1,5 @@
 //! Schema-21 store migration through the public daemon store boundary, and the
-//! recorded launch rights of a session in the current schema.
+//! recorded launch rights and worker identity of a session in the current schema.
 //!
 //! The schema-21 fixture is a session in the shape the schema-21 daemon writes:
 //! it records no launch rights. The migration leaves it unchanged, so it loads
@@ -60,8 +60,8 @@ fn a_session_recorded_before_launch_rights_loads_without_them() {
     let rewritten = std::fs::read_to_string(root.path().join("metadata.jsonl"))
         .expect("read the migrated store");
     assert!(
-        !rewritten.contains("launch_rights"),
-        "a rewrite never invents launch rights"
+        !rewritten.contains("launch_rights") && !rewritten.contains("worker_process"),
+        "a rewrite never invents launch rights or a worker identity"
     );
 }
 
@@ -74,9 +74,12 @@ fn recorded_launch_rights_load_and_survive_a_rewrite() {
     let rights = session.launch_rights.clone().expect("recorded rights");
     assert!(rights.owner_equivalent);
     assert_eq!(rights.spawn_profiles, Some(vec!["worker".to_owned()]));
+    let worker = session.worker_process.expect("recorded worker identity");
+    assert_eq!((worker.pid, worker.start_identity), (4242, 987_654_321));
     "2026-11-16T00:00:00Z".clone_into(&mut session.info.updated_at);
     store.record_session(&session).expect("rewrite the record");
 
     let reloaded = store.load_sessions().expect("reload the session").remove(0);
     assert_eq!(reloaded.launch_rights, Some(rights));
+    assert_eq!(reloaded.worker_process, Some(worker));
 }

@@ -810,6 +810,19 @@ pub struct SessionRecord {
     /// launched before schema 22.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_rights: Option<LaunchRights>,
+    /// The session worker process of the runtime this record describes. The
+    /// worker is the ancestor of every process of the session, so a restart
+    /// that cannot reach the worker still places a caller below it. Absent for
+    /// a session recorded before schema 22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_process: Option<WorkerProcess>,
+}
+
+/// A process by id and start identity, so a recycled id never matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerProcess {
+    pub pid: u32,
+    pub start_identity: u64,
 }
 
 /// The `[rights]` a session was launched with.

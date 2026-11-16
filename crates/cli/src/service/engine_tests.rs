@@ -7886,6 +7886,7 @@ fn seed_live_session_at(paths: &BasePaths, executable: &Path, session_id: &str, 
     let record = SessionRecord {
         create_request: None,
         launch_rights: None,
+        worker_process: None,
         schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
         session_id: session_id.to_owned(),
         desired_state: DesiredState::Running,

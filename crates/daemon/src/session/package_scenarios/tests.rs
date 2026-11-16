@@ -802,7 +802,7 @@ async fn a_host_without_a_package_store_refuses_package_methods() {
 
 /// Opens a durable-session fixture whose package launches the agent script
 /// and returns it with the script's exit gate.
-async fn session_fixture(
+pub(super) async fn session_fixture(
     tag: &str,
 ) -> (
     Fixture,
@@ -832,7 +832,7 @@ async fn session_fixture(
     (fixture, package, dir, gate, store_path)
 }
 
-fn new_params(dir: &std::path::Path) -> protocol::SessionNewParams {
+pub(super) fn new_params(dir: &std::path::Path) -> protocol::SessionNewParams {
     protocol::SessionNewParams {
         agent: RUNTIME.to_owned(),
         cwd: Some(dir.to_path_buf()),

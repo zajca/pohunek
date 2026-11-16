@@ -35,6 +35,7 @@ use super::native_attestation::{ControlPeer, PeerStanding};
 use super::{is_terminal, RuntimeHandle, SessionRegistry};
 use crate::agent::profile::rights::{rights_of, ProfileRights};
 use crate::procwatch::{Pid, ProcessIdentity, ProcessInspector};
+use crate::store::DesiredState;
 use pohunek_platform::supervisor::Namespace;
 
 /// Most parent links one ancestry walk follows.
@@ -139,8 +140,10 @@ pub(crate) const fn platform_mode(units: bool) -> &'static str {
 
 /// The live sessions a caller can be placed in.
 struct Roots {
-    /// PTY roots by process id; the identity pins the process generation.
-    by_pid: HashMap<Pid, (SessionId, ProcessIdentity)>,
+    /// PTY and worker roots by process id; the identity pins the process
+    /// generation. A pid can hold several identities, since a stale entry
+    /// may name a process whose id a live root has since reused.
+    by_pid: HashMap<Pid, Vec<(SessionId, ProcessIdentity)>>,
     /// Every live session, whether or not its root process is known.
     live: HashSet<SessionId>,
     /// The live sessions of the `shell` runtime.
@@ -148,9 +151,29 @@ struct Roots {
     /// The live sessions with no verified root, so a process in their tree
     /// would not be placed.
     unverified: Vec<SessionId>,
+    /// The sessions whose runtime the daemon refuses to adopt but whose
+    /// recorded worker still places their processes.
+    unadopted: Vec<SessionId>,
+}
+
+/// What the doctor reports about the roots of the live sessions.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct RootFindings {
+    /// Live sessions whose processes the daemon cannot place.
+    pub(crate) unverified: Vec<SessionId>,
+    /// Sessions with a runtime the daemon does not adopt, attributed through
+    /// their recorded worker.
+    pub(crate) unadopted: Vec<SessionId>,
 }
 
 impl Roots {
+    fn add(&mut self, id: &SessionId, root: ProcessIdentity) {
+        self.by_pid
+            .entry(root.pid)
+            .or_default()
+            .push((id.clone(), root));
+    }
+
     fn class_of(&self, id: SessionId) -> CallerClass {
         if self.shell.contains(&id) {
             CallerClass::OwnerShell(id)
@@ -204,12 +227,37 @@ impl SessionRegistry {
     pub(crate) async fn session_profile_rights(&self, id: &SessionId) -> Option<ProfileRights> {
         let agent = self.session_agent(id).await?;
         let live = self.profile_rights(&agent).await;
-        let mut sessions = self.inner.sessions.lock().await;
-        let held = sessions
-            .get_mut(id)?
-            .launch_rights
-            .get_or_insert_with(|| Box::new(live.clone()));
-        Some(held.narrowed_by(&live))
+        let (rights, first_use) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let entry = sessions.get_mut(id)?;
+            let first_use = entry.launch_rights.is_none();
+            let held = entry
+                .launch_rights
+                .get_or_insert_with(|| Box::new(live.clone()));
+            let rights = held.narrowed_by(&live);
+            (
+                rights,
+                first_use && entry.desired_state == DesiredState::Running && !entry.stopping,
+            )
+        };
+        if first_use {
+            // The snapshot is stored at once, so a restart after a profile edit
+            // cannot widen the session.
+            if let Err(error) = self
+                .write_entry_record(id, |entry| {
+                    Self::session_record(id, entry, entry.desired_state, None)
+                })
+                .await
+            {
+                warn!(
+                    name: "session.rights.snapshot_unpersisted",
+                    session_id = %id.0,
+                    error = %error.msg,
+                    "the launch rights snapshot of a session could not be stored"
+                );
+            }
+        }
+        Some(rights)
     }
 
     /// The profile name the session `id` runs, if the registry holds it.
@@ -235,13 +283,24 @@ impl SessionRegistry {
             .unwrap_or_else(|_join_error| ProfileRights::closed())
     }
 
+    /// Whether a control group places a caller in its session, so that a
+    /// session without a known root process is still attributed.
+    fn places_by_control_group(&self) -> bool {
+        cfg!(target_os = "linux")
+            && self
+                .active_supervision()
+                .is_some_and(|supervision| supervision.native)
+    }
+
     async fn live_roots(&self) -> Roots {
+        let by_group = self.places_by_control_group();
         let sessions = self.inner.sessions.lock().await;
         let mut roots = Roots {
             by_pid: HashMap::new(),
             live: HashSet::new(),
             shell: HashSet::new(),
             unverified: Vec::new(),
+            unadopted: Vec::new(),
         };
         for (id, entry) in sessions.iter() {
             if is_terminal(entry.info.state) {
@@ -259,22 +318,40 @@ impl SessionRegistry {
             // PTY root has exited.
             let attested = [entry.root_process, entry.worker_root];
             for root in attested.into_iter().flatten() {
-                roots.by_pid.insert(root.pid, (id.clone(), root));
+                roots.add(id, root);
             }
-            // A runtime that is lost, conflicting, incompatible or finished
-            // holds no process of its own to attribute.
+            // A runtime the daemon holds no worker for may still run
+            // processes: it is reconnecting, starting, or a live worker it
+            // refuses to adopt (`Conflict`, `Incompatible`). Without a
+            // recorded worker identity, and on a host whose control groups do
+            // not place the session, its processes cannot be attributed. A
+            // recorded worker that is gone is not a fault: its tree has
+            // nothing left to place.
             let bears_process = match &entry.runtime {
                 RuntimeHandle::Worker(_) => true,
-                RuntimeHandle::Unavailable(state) => {
-                    matches!(state, RuntimeState::Starting | RuntimeState::Reconnecting)
-                }
+                RuntimeHandle::Unavailable(state) => matches!(
+                    state,
+                    RuntimeState::Starting
+                        | RuntimeState::Reconnecting
+                        | RuntimeState::Conflict
+                        | RuntimeState::Incompatible
+                ),
             };
-            if bears_process && attested.iter().all(Option::is_none) {
+            if bears_process && !by_group && attested.iter().all(Option::is_none) {
                 roots.unverified.push(id.clone());
+            }
+            if matches!(
+                &entry.runtime,
+                RuntimeHandle::Unavailable(RuntimeState::Conflict | RuntimeState::Incompatible)
+            ) && entry.worker_root.is_some()
+            {
+                roots.unadopted.push(id.clone());
             }
         }
         // A launch records its worker before the worker forks the PTY child,
         // so a process of a session still being launched is placed below it.
+        // A resume or relaunch adds the new worker beside the previous
+        // runtime's stale identities.
         for (id, reservation) in self
             .inner
             .launching
@@ -282,20 +359,21 @@ impl SessionRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
         {
-            if sessions.contains_key(id) {
-                continue;
-            }
             roots.live.insert(id.clone());
             if let Some(worker) = reservation.worker_root {
-                roots.by_pid.insert(worker.pid, (id.clone(), worker));
+                roots.add(id, worker);
             }
         }
         roots
     }
 
-    /// The live sessions whose root the daemon could not verify.
-    pub(crate) async fn unverified_root_sessions(&self) -> Vec<SessionId> {
-        self.live_roots().await.unverified
+    /// The sessions the doctor names for their roots.
+    pub(crate) async fn root_findings(&self) -> RootFindings {
+        let roots = self.live_roots().await;
+        RootFindings {
+            unverified: roots.unverified,
+            unadopted: roots.unadopted,
+        }
     }
 
     /// Applies the target rule to a caller of `class` that requests `method`
@@ -391,10 +469,12 @@ fn ancestry_session(
 ) -> Option<SessionId> {
     let mut current = process;
     for _ in 0..MAX_ANCESTRY_DEPTH {
-        if let Some((id, root)) = roots.by_pid.get(&current.pid) {
-            if *root == current {
-                return Some(id.clone());
-            }
+        if let Some((id, _)) = roots
+            .by_pid
+            .get(&current.pid)
+            .and_then(|held| held.iter().find(|(_, root)| *root == current))
+        {
+            return Some(id.clone());
         }
         let parent = match inspector.parent_pid(current.pid) {
             Ok(Some(parent)) if parent > LAST_RESERVED_PID => parent,
