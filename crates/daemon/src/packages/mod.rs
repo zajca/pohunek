@@ -50,9 +50,9 @@ use package::registry::{
 };
 use package::revoked_digests::RevokedDigests;
 use package::{
-    archive_digest, read_archive, read_archive_with_digest, IndexVerifierState, Limits, LocalTrust,
-    LocalTrustError, PackageDigest, RootKey, VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES,
-    MAX_INDEX_BYTES,
+    archive_digest, parse_index_envelope, read_archive, read_archive_with_digest,
+    IndexVerifierState, Limits, LocalTrust, LocalTrustError, PackageDigest, RootKey,
+    VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES, MAX_INDEX_BYTES,
 };
 use protocol::{
     CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
@@ -105,6 +105,9 @@ struct Prepared {
     /// The plugin index that authorized the package, recorded before the
     /// install.
     index: Option<VerifiedIndex>,
+    /// Exact index bytes, stored alongside the marks so the stored copy
+    /// never stays below them (M1).
+    index_bytes: Option<Vec<u8>>,
 }
 
 /// An archive whose descriptor exports commands only, checked like
@@ -123,6 +126,9 @@ struct CommandsPrepared {
     /// The plugin index that authorized the package, recorded before the
     /// install; only a context package authorized by the index has one.
     index: Option<VerifiedIndex>,
+    /// Exact index bytes, stored alongside the marks so the stored copy
+    /// never stays below them (M1).
+    index_bytes: Option<Vec<u8>>,
 }
 
 /// An archive that passed every check an install makes before it writes, by
@@ -1129,6 +1135,7 @@ fn prepare_local(
             source: RecordSource::ExplicitDigest,
             provenance: PackageProvenance::Local,
             index: None,
+            index_bytes: None,
         })));
     };
     LocalTrust::ExplicitDigest(pinned.clone())
@@ -1137,10 +1144,9 @@ fn prepare_local(
             LocalTrustError::ReservedRuntime => PackageErrorKind::RuntimeNotClaimable,
             LocalTrustError::DigestMismatch => PackageErrorKind::ArchiveInvalid,
         })?;
-    // Data-driven namespace: refuse an official-namespaced local package only
-    // when the accumulated reserved ids cover its runtime id; before any
-    // verified index listed it, local trust stands alone (Pi --sha256 flow).
-    refuse_official_namespace(context, &identity.id, definition.runtime_id())?;
+    // Refuse a local package only when the accumulated reserved ids cover
+    // its runtime id; before any verified index listed it, local trust stands alone.
+    refuse_reserved_runtime(context, &identity.id, definition.runtime_id())?;
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
@@ -1152,6 +1158,7 @@ fn prepare_local(
         provenance: PackageProvenance::Local,
         catalog: None,
         index: None,
+        index_bytes: None,
     })))
 }
 
@@ -1215,6 +1222,7 @@ fn prepare_official(
         provenance: PackageProvenance::Catalog,
         catalog: Some(verified),
         index: None,
+        index_bytes: None,
     })
 }
 
@@ -1287,6 +1295,7 @@ fn prepare_indexed(
             source: RecordSource::Official,
             provenance: PackageProvenance::Index,
             index: Some(verified),
+            index_bytes: Some(document),
         })));
     };
     if !commands.is_empty() {
@@ -1312,6 +1321,7 @@ fn prepare_indexed(
         provenance: PackageProvenance::Index,
         catalog: None,
         index: Some(verified),
+        index_bytes: Some(document),
     })))
 }
 
@@ -1361,9 +1371,10 @@ fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, Pa
             source: RecordSource::Link,
             provenance: PackageProvenance::Local,
             index: None,
+            index_bytes: None,
         })));
     };
-    refuse_official_namespace(context, &identity.id, definition.runtime_id())?;
+    refuse_reserved_runtime(context, &identity.id, definition.runtime_id())?;
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
@@ -1375,6 +1386,7 @@ fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, Pa
         provenance: PackageProvenance::Local,
         catalog: None,
         index: None,
+        index_bytes: None,
     })))
 }
 
@@ -1390,6 +1402,9 @@ struct Install {
     /// The plugin index that authorized the package, recorded before the
     /// install.
     index: Option<VerifiedIndex>,
+    /// Exact index bytes, stored alongside the marks so the stored copy
+    /// never stays below them (M1).
+    index_bytes: Option<Vec<u8>>,
     /// The integration the package declares; none for a package without a
     /// runtime.
     integration: Integration,
@@ -1417,6 +1432,7 @@ fn commit_candidate(
                 provenance: prepared.provenance,
                 catalog: None,
                 index: prepared.index,
+                index_bytes: prepared.index_bytes,
                 integration: Integration::Known(None),
                 runtime: None,
                 commands: prepared.commands,
@@ -1454,6 +1470,7 @@ fn commit_install(
             provenance: prepared.provenance,
             catalog: prepared.catalog,
             index: prepared.index,
+            index_bytes: prepared.index_bytes,
         },
         plan,
         retained,
@@ -1502,6 +1519,7 @@ fn install_package(
         provenance,
         catalog,
         index,
+        index_bytes,
         integration,
         runtime,
         commands,
@@ -1571,6 +1589,16 @@ fn install_package(
         registry
             .record_index(index)
             .map_err(|error| registry_kind(&error))?;
+        // M1: the stored copy follows the marks in the same install, so a
+        // staged-index install never leaves the stored copy below them.
+        if let Some(index_bytes) = index_bytes.as_ref() {
+            let schema_version = parse_index_envelope(index_bytes)
+                .map(|envelope| envelope.schema_version)
+                .unwrap_or(1);
+            registry
+                .store_index(schema_version, index, index_bytes, now)
+                .map_err(|error| registry_kind(&error))?;
+        }
     }
     let report = registry
         .install(&InstallRequest {
@@ -1620,7 +1648,7 @@ fn install_package(
 /// (Scenario 6). The compiled floor (`shell`, `codex`, `claude`, `hermes`)
 /// is refused by `LocalTrust` independently of any stored index; the Pi
 /// `--sha256` flow works until a verified index has listed `pi`.
-fn refuse_official_namespace(
+fn refuse_reserved_runtime(
     context: &Context,
     package_id: &PackageId,
     runtime_id: &protocol::RuntimeId,
@@ -1629,7 +1657,13 @@ fn refuse_official_namespace(
         .store
         .registry()
         .index_state()
-        .map_err(|error| registry_kind(&error))?;
+        .map_err(|error| match error {
+            RegistryError::Busy => PackageErrorKind::Busy,
+            RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
+                PackageErrorKind::IndexStateUnreadable
+            }
+            _ => PackageErrorKind::RegistryFailed,
+        })?;
     if state.reserved_runtime_ids.contains(runtime_id) {
         warn!(
             package = %package_id,

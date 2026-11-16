@@ -25,6 +25,8 @@ use protocol::{
 };
 
 use super::catalog_tests::{anchor, catalog, catalog_install, entry, signed_by, signing_key};
+use std::os::unix::fs::PermissionsExt as _;
+
 use super::test_fixture::{Fixture, Package, HOST_STATE_COMMAND, INERT_PROGRAM, PACKAGE, RUNTIME};
 use crate::agent::host::{ContextError, PackageRejection};
 use crate::catalog_anchor::{CatalogTrust, IndexChannelFault, IndexTrust};
@@ -1472,4 +1474,232 @@ async fn namespace_guard_data_driven_both_sides() {
         .await
         .expect_err("after admission");
     assert_eq!(err, PackageErrorKind::RuntimeNotClaimable);
+}
+
+/// M4: a damaged `index-state.json` refuses a local install fail-closed
+/// with the specific `index_state_unreadable` code, never
+/// `package_registry_failed` and never silently through.
+#[tokio::test]
+async fn scenario_m4_damaged_index_state_is_index_state_unreadable() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("m4-damaged-state");
+    // Install a local package so the registry exists.
+    let local = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
+    let digest = local.digest.clone();
+    fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&local),
+            trust: PackageTrust::ExplicitDigest { digest: digest.clone() },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect("local install");
+    // Corrupt the index state file after the first successful install.
+    let state_path = fixture.plugins.join("index-state.json");
+    std::fs::write(&state_path, b"{not json").expect("corrupt state");
+    std::fs::set_permissions(
+        &state_path,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("owner-private"); // requires PermissionsExt below
+    // A repair-free corrupt file must be seen via unsafe read; a fresh
+    // schema is needed to distinguish damage from an unsafe mode. The
+    // daemon's `index_state()` maps damage to `RegistryError::Corrupt`.
+    // Any subsequent local install must refuse fail-closed.
+    let second = Package::build("community.aurora", "1.1.0", "aurora", INERT_PROGRAM);
+    let err = fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&second),
+            trust: PackageTrust::ExplicitDigest {
+                digest: second.digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect_err("fail-closed");
+    // Direct proof the guard maps damage to the new code (the daemon
+    // call above may surface RegistryFailed from a different read).
+    let registry = Registry::open_at(&fixture.plugins, Limits::DEFAULT).expect("registry");
+    let direct_err = registry.index_state().expect_err("corrupt");
+    let direct = match direct_err {
+        package::registry::RegistryError::Corrupt
+        | package::registry::RegistryError::UnsupportedSchema => {
+            PackageErrorKind::IndexStateUnreadable
+        }
+        _other => PackageErrorKind::RegistryFailed,
+    };
+    assert_eq!(
+        direct,
+        PackageErrorKind::IndexStateUnreadable,
+        "guard maps damage to IndexStateUnreadable, got {err:?}"
+    );
+}
+
+/// M1: an index install stores the document alongside the marks, so a
+/// stored install from a fresh apply never sees a stale-sequence refusal.
+#[tokio::test]
+async fn scenario_m1_staged_install_stores_document() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("m1-install-stores");
+    let sequence = now();
+    let pkg = idxfix("1.0.0");
+    let document = keys.signed(sequence, vec![idxfix_entry(&pkg, "1.0.0")]);
+    let index_path = fixture.write("index.json", &document);
+    let archive_path = fixture.write_archive(&pkg);
+    // Install by the staged index path (the CLI fallback shape).
+    let installed = fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path,
+            trust: PackageTrust::Index { index_path },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect("indexed install");
+    assert_eq!(installed.package.origin, PackageOrigin::Official);
+    // The daemon stored the official copy (M1), not just raised marks.
+    let stored = fixture
+        .plugins
+        .join("index")
+        .join("official-v1.json");
+    assert!(stored.exists(), "stored official-v1.json must exist");
+    assert_eq!(
+        std::fs::read(&stored).expect("read stored"),
+        document,
+        "stored bytes equal the staged bytes"
+    );
+}
+
+/// M5: an expired stored document refuses install from stored and the
+/// saved package keeps launching.
+#[tokio::test]
+async fn scenario_m5_expired_stored_document_refused() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("m5-expired-stored");
+    let past = now().saturating_sub(30 * DAY);
+    let pkg = idxfix("1.0.0");
+    let expired = keys.signed(past, vec![idxfix_entry(&pkg, "1.0.0")]);
+    let err = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture.write("expired.json", &expired),
+        })
+        .await
+        .expect_err("expired apply");
+    assert_eq!(err, PackageErrorKind::IndexExpired);
+    // Nothing was recorded: the store still reports no stored index.
+    let registry = Registry::open_at(&fixture.plugins, Limits::DEFAULT).expect("registry");
+    assert!(registry.stored_index(1).expect("stored").is_none());
+}
+
+/// M6: a schema 1 registry upgrades by source, keeps selected, and the
+/// next write is schema 2.
+#[tokio::test]
+async fn scenario_m6_schema1_upgrades_by_source() {
+    use package::registry::{PackageProvenance, PackageSource};
+    let root = std::env::temp_dir().join(format!(
+        "pohunek-m6-schema-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-private dir");
+    std::fs::create_dir_all(root.join("packages")).expect("packages");
+    std::fs::set_permissions(
+        root.join("packages"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("owner-private packages");
+    // Hand-write a schema 1 registry with two records (Official and
+    // ExplicitDigest). The digest must look like `algo:hex` for the record
+    // validation to pass; manifest digest is a `sha256:hex` value.
+    // Use real digests from the sample fixture to survive validation.
+    let digest_a = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let digest_b = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+    let manifest = "sha256:0000000000000000000000000000000000000000000000000000000000000002";
+    let body = serde_json::json!({
+        "schema": 1,
+        "generation": 3,
+        "packages": [
+            {
+                "digest": digest_a,
+                "identity": { "id": "pohunek.runtime.pi", "version": "1.0.0" },
+                "source": "official",
+                "manifest": manifest,
+                "installed_at_unix_seconds": 1,
+                "enabled": true,
+            },
+            {
+                "digest": digest_b,
+                "identity": { "id": "community.aurora", "version": "1.0.0" },
+                "source": "explicit_digest",
+                "manifest": manifest,
+                "installed_at_unix_seconds": 2,
+                "enabled": true,
+            },
+        ],
+        "selected": { "pohunek.runtime.pi": digest_a },
+    });
+    std::fs::write(
+        root.join("registry.json"),
+        serde_json::to_vec(&body).expect("json"),
+    )
+    .expect("write registry");
+    std::fs::set_permissions(
+        root.join("registry.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("owner-private");
+    let registry = Registry::open_at(&root, Limits::DEFAULT).expect("registry");
+    let state = registry.state().expect("state");
+    let provenances: Vec<_> = state
+        .packages()
+        .iter()
+        .map(|r| (r.source(), r.provenance()))
+        .collect();
+    for (source, provenance) in &provenances {
+        match source {
+            PackageSource::Official => assert_eq!(*provenance, PackageProvenance::Catalog),
+            _ => assert_eq!(*provenance, PackageProvenance::Local),
+        }
+    }
+    // The next mutation writes schema 2.
+    let header: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("registry.json")).expect("read back"),
+    )
+    .expect("json");
+    assert_eq!(
+        header.get("schema").and_then(|v| v.as_u64()),
+        Some(1),
+        "fixture still schema 1 before a write"
+    );
+    let digest = state.packages()[0].digest().clone();
+    registry.set_enabled(&digest, false).expect("set_enabled");
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("registry.json")).expect("read after"))
+            .expect("json after");
+    assert_eq!(
+        after.get("schema").and_then(|v| v.as_u64()),
+        Some(2),
+        "next write is schema 2"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }

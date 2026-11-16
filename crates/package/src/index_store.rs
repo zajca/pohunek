@@ -172,12 +172,18 @@ impl Registry {
         let file_name = StoredIndex::file_name_for(schema_version);
         dir.replace_file(file_name, DOC_TEMP_NAME, bytes, FILE_MODE)
             .map_err(replace_failure)?;
-        // Update the sidecar in the same lock hold.
-        let mut sidecar = Self::read_sidecar(&dir).unwrap_or(StoredFile {
-            schema: STORED_SCHEMA,
-            official_v1: None,
-            official_v2: None,
-        });
+        // Update the sidecar in the same lock hold. A damaged sidecar is
+        // replaced by a valid refresh; a read failure is propagated so the
+        // other schema's stored_at is not silently lost.
+        let mut sidecar = match Self::read_sidecar(&dir) {
+            Ok(file) => file,
+            Err(RegistryError::Corrupt | RegistryError::UnsupportedSchema) => StoredFile {
+                schema: STORED_SCHEMA,
+                official_v1: None,
+                official_v2: None,
+            },
+            Err(error) => return Err(error),
+        };
         match file_name {
             "official-v2.json" => sidecar.official_v2 = Some(stored_at),
             _ => sidecar.official_v1 = Some(stored_at),

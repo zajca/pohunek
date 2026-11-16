@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use package::{
-    archive_digest, host_platform, parse_index_envelope, IndexEntry, IndexEntryKind,
+    archive_digest, host_platform, index_store::SIDECAR_KEY_V1, index_store::SIDECAR_KEY_V2,
+    index_store::STORED_INDEX_MAX_AGE, parse_index_envelope, IndexEntry, IndexEntryKind,
     MAX_COMPRESSED_BYTES, MAX_INDEX_BYTES, OFFICIAL_CONTEXT_PACKAGE_PREFIX,
 };
 use protocol::{PackageDigest, PackageId, PackageVersion};
@@ -491,6 +492,20 @@ pub(crate) async fn stage_from_stored(request: &PackageRef) -> Result<Staged, Er
     stage_from_selection(&client, selection).await
 }
 
+/// Whether this error means "the index does not list this package or
+/// version": the result the CLI fallback may retry against a fresh fetch.
+///
+/// Digest mismatches, archive availability, refused URLs, platform and
+/// expiry failures are fatal: re-fetching cannot fix them, so they are
+/// surfaced instead of retried.
+#[must_use]
+pub(crate) fn is_not_listed(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::IndexPackageNotFound { .. } | Error::IndexVersionNotFound { .. }
+    )
+}
+
 /// Fetch the index and select the entry for `request`. One fetch.
 pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
     let client = client()?;
@@ -523,8 +538,6 @@ fn write_staged(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<Strin
         })
 }
 
-/// 24 hours in seconds: the refresh cadence of the stored plugin index.
-pub(crate) const STORED_INDEX_MAX_AGE: u64 = 24 * 60 * 60;
 
 /// Read the stored sidecar and return the freshest `stored_at`.
 ///
@@ -536,7 +549,7 @@ fn stored_at() -> Option<u64> {
     let bytes = std::fs::read(&sidecar).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let mut max: Option<u64> = None;
-    for key in ["official-v1", "official-v2"] {
+    for key in [SIDECAR_KEY_V1, SIDECAR_KEY_V2] {
         if let Some(v) = value.get(key).and_then(serde_json::Value::as_u64) {
             max = Some(max.map_or(v, |m: u64| m.max(v)));
         }
@@ -599,14 +612,19 @@ fn read_stored() -> Option<StoredEntry> {
     let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     let mut best: Option<StoredEntry> = None;
     for (key, file_name) in [
-        ("official-v1", "official-v1.json"),
-        ("official-v2", "official-v2.json"),
+        (SIDECAR_KEY_V1, "official-v1.json"),
+        (SIDECAR_KEY_V2, "official-v2.json"),
     ] {
         let Some(at) = value.get(key).and_then(serde_json::Value::as_u64) else {
             continue;
         };
-        let bytes = std::fs::read(index_dir.join(file_name)).ok()?;
-        let envelope = parse_index_envelope(&bytes).ok()?;
+        // One missing or expired schema does not abort the other.
+        let Ok(bytes) = std::fs::read(index_dir.join(file_name)) else {
+            continue;
+        };
+        let Ok(envelope) = parse_index_envelope(&bytes) else {
+            continue;
+        };
         if unix_now() >= envelope.index.expires_at {
             continue;
         }

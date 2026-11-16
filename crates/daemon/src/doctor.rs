@@ -1199,7 +1199,11 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         return check(CHECK, DoctorStatus::Fail, INVALID);
     };
     let Ok(index_state) = registry.index_state() else {
-        return check(CHECK, DoctorStatus::Fail, INVALID);
+        return check(
+            CHECK,
+            DoctorStatus::Fail,
+            "index_state_unreadable: run `pohunek plugin index refresh`",
+        );
     };
     // One verification-input source for apply, install and doctor (M5).
     let base = crate::packages::verification_base_revoked(anchor, &catalog_state);
@@ -1290,6 +1294,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
 
     use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
 

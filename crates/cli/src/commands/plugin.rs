@@ -809,7 +809,7 @@ impl Error {
                 "check the network and the URL, then retry; nothing was sent to the daemon"
             }
             Self::IndexUnsupported { .. } => {
-                "the daemon is older than 0.40 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog"
+                "the daemon is older than 0.44 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog"
             }
             Self::IndexContextUnsupported => {
                 "the daemon predates context packages in the plugin index (0.42); upgrade the daemon or install the context package from its archive with --sha256"
@@ -1136,15 +1136,29 @@ async fn run_install_by_id(
         require_index_context_support(&mut client).await?;
     }
     // 24h cadence: a fresh stored copy is used without fetching. When the
-    // stored copy is stale or missing, refresh first (one fetch); if that
-    // fails, fall back to the unexpired stored copy when it lists the
-    // package. The daemon verifies the staged bytes.
-    if !plugin_index::stored_is_fresh() {
-        let _ = refresh_now(&mut client, args.index_url.as_deref()).await;
-    }
-    let staged = match plugin_index::stage_from_stored(&request).await {
-        Ok(staged) => staged,
-        Err(_) => plugin_index::stage(&request, args.index_url.as_deref()).await?,
+    // stored copy is stale or missing, refresh first (one fetch). The
+    // refresh error is surfaced, not swallowed: the install still falls
+    // back to the unexpired stored copy when it lists the package, but
+    // the user sees why it is stale.
+    //
+    // A custom --index-url replaces the stored copy for this install:
+    // skip the cadence and the stored copy entirely and fetch the given
+    // index directly (M2).
+    let staged = if args.index_url.is_some() {
+        plugin_index::stage(&request, args.index_url.as_deref()).await?
+    } else {
+        if !plugin_index::stored_is_fresh() {
+            if let Err(error) = refresh_now(&mut client, None).await {
+                eprintln!("warning: could not refresh the stored plugin index: {error}");
+            }
+        }
+        match plugin_index::stage_from_stored(&request).await {
+            Ok(staged) => staged,
+            Err(error) if plugin_index::is_not_listed(&error) => {
+                plugin_index::stage(&request, None).await?
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
     let source = Source::Archive {
         path: staged.archive_path.clone(),

@@ -1028,6 +1028,9 @@ pub enum PackageErrorKind {
     IndexRollback,
     /// The host has no stored plugin index to apply.
     IndexChannelMissing,
+    /// The plugin index state file cannot be read, so the reserved runtime
+    /// ids cannot be checked and a local install is refused fail-closed.
+    IndexStateUnreadable,
 }
 
 impl PackageErrorKind {
@@ -1081,6 +1084,7 @@ impl PackageErrorKind {
             Self::IndexExpired => "index_expired",
             Self::IndexRollback => "index_rollback",
             Self::IndexChannelMissing => "index_channel_missing",
+            Self::IndexStateUnreadable => "index_state_unreadable",
         }
     }
 
@@ -1185,6 +1189,9 @@ impl PackageErrorKind {
             Self::IndexExpired => "the plugin index has expired",
             Self::IndexRollback => "the plugin index is older than the recorded one",
             Self::IndexChannelMissing => "this host has no plugin index channel file beside the daemon executable",
+            Self::IndexStateUnreadable => {
+                "the plugin index state cannot be read, so the reserved runtime ids cannot be checked"
+            },
         }
     }
 
@@ -1270,6 +1277,9 @@ impl PackageErrorKind {
             Self::IndexInvalid => "stage a signed plugin index document and apply it again",
             Self::IndexExpired | Self::IndexRollback => "refresh the plugin index with `pohunek plugin index refresh`",
             Self::IndexChannelMissing => "run `pohunek plugin index refresh`, or install with an explicit digest instead",
+            Self::IndexStateUnreadable => {
+                "run `pohunek plugin index refresh` to restore a readable state file, then retry"
+            },
         }
     }
 

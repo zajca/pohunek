@@ -1,4 +1,4 @@
-## Unreleased (2026-12-01, stored plugin index, #1614)
+## Unreleased (2026-11-16, stored plugin index, #1614)
 
 
 

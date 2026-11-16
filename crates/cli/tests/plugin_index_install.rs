@@ -498,7 +498,7 @@ impl Rig {
     fn clear_stored(&self) {
         let state_home = self.install.env.state_home();
         let index_dir = state_home.join("pohunek").join("plugins").join("index");
-        let _ = fs::remove_dir_all(&index_dir);
+        assert!(fs::remove_dir_all(&index_dir).is_ok() || !index_dir.exists());
     }
 
     /// Requests the test server saw (paths, in order).
