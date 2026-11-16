@@ -88,6 +88,10 @@ enum StreamEvent {
     InputReceived(usize),
     /// The client forwarded the line typed while its terminal took no output.
     KeystrokeReceived,
+    /// The fixture accepted the raw attach stream, before it read any input.
+    StreamOpened,
+    /// Reading the client's input failed; carries the error text.
+    ReadFailed(String),
 }
 
 /// How the fixture's raw attach stream behaves.
@@ -433,6 +437,13 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
     let mut cli = CliProcess(command.spawn().expect("spawn pohunek attach"));
     let mut stdin = cli.0.stdin.take().expect("piped stdin");
     let mut stdout = cli.0.stdout.take().expect("piped stdout");
+    let mut stderr = cli.0.stderr.take().expect("piped stderr");
+    let (errors_tx, errors_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut errors = String::new();
+        let _count = stderr.read_to_string(&mut errors);
+        let _sent = errors_tx.send(errors);
+    });
 
     // The input ends the client's stdin; the stream answers once it read the
     // input to its end, and closes. The client keeps the connection open for
@@ -445,12 +456,37 @@ fn a_piped_attach_keeps_reading_until_the_stream_closes_after_its_input_ended() 
         let _count = stdout.read_to_end(&mut shown);
         let _sent = output.send(shown);
     });
-    let shown = shown_rx
-        .recv_timeout(HANG_GUARD)
-        .expect("the client ends once the stream closed");
+    let Ok(shown) = shown_rx.recv_timeout(HANG_GUARD) else {
+        // Names the side that stalled: the stream either saw the end of the
+        // client's input or never did.
+        let stream_events: Vec<StreamEvent> = observed.try_iter().collect();
+        let _killed = cli.0.kill();
+        let _reaped = cli.0.wait();
+        let errors = errors_rx.recv_timeout(HANG_GUARD);
+        // Whether the client had shown the answer tells a client that never saw
+        // the stream close from one that hung after it.
+        let shown = shown_rx
+            .recv_timeout(HANG_GUARD)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        panic!(
+            "the client ends once the stream closed; stream events: \
+             {stream_events:?}, client stdout: {shown:?}, client stderr: {errors:?}"
+        );
+    };
     let status = cli.0.wait().expect("wait for pohunek attach");
 
     assert!(status.success(), "{status}");
+    let errors = errors_rx
+        .recv_timeout(HANG_GUARD)
+        .expect("the client's stderr ends with the client");
+    assert!(
+        !errors.contains("retrying"),
+        "the attach ran on one stream: {errors:?}"
+    );
+    assert_eq!(
+        observed.recv_timeout(HANG_GUARD),
+        Ok(StreamEvent::StreamOpened)
+    );
     assert_eq!(
         observed.recv_timeout(HANG_GUARD),
         Ok(StreamEvent::InputReceived(KEYSTROKE.len()))
@@ -529,7 +565,7 @@ fn result_for(request: &Request) -> Value {
 /// Writes the whole output, then reads the client's input to its end.
 fn serve_attach_stream(reader: BufReader<UnixStream>, events: &mpsc::Sender<StreamEvent>) {
     // Input the line reader already took past the attach prelude.
-    let mut input = reader.buffer().to_vec();
+    let input = reader.buffer().to_vec();
     let mut stream = reader.into_inner();
     let mut output = vec![b'y'; STREAM_OUTPUT_BYTES];
     output.push(b'\n');
@@ -537,10 +573,7 @@ fn serve_attach_stream(reader: BufReader<UnixStream>, events: &mpsc::Sender<Stre
     output.push(b'\n');
     stream.write_all(&output).expect("write the stream output");
     let _sent = events.send(StreamEvent::OutputWritten);
-    stream
-        .read_to_end(&mut input)
-        .expect("read the client's input");
-    let _sent = events.send(StreamEvent::InputReceived(input.len()));
+    read_input_to_end(stream, input, events, None);
 }
 
 /// Floods output until the client goes away and reads the client's input,
@@ -598,11 +631,46 @@ fn serve_answering_attach_stream(
     reader: BufReader<UnixStream>,
     events: &mpsc::Sender<StreamEvent>,
 ) {
-    let mut input = reader.buffer().to_vec();
-    let mut stream = reader.into_inner();
+    let input = reader.buffer().to_vec();
+    let stream = reader.into_inner();
+    let _sent = events.send(StreamEvent::StreamOpened);
+    read_input_to_end(stream, input, events, Some(ANSWER));
+}
+
+/// Reads the client's input from `stream` to its end, reports it and writes
+/// `answer` when there is one.
+///
+/// The end is awaited through the tokio reactor, the way the daemon's attach
+/// bridge and the CLI's attach loop read their streams. A std blocking read on
+/// this end missed the client's half-close on macOS (#2362). A read error is
+/// reported as an event and closes the stream, so the scenario fails at once
+/// instead of at its deadline.
+fn read_input_to_end(
+    stream: UnixStream,
+    mut input: Vec<u8>,
+    events: &mpsc::Sender<StreamEvent>,
+    answer: Option<&[u8]>,
+) {
     stream
-        .read_to_end(&mut input)
-        .expect("read the client's input");
-    stream.write_all(ANSWER).expect("write the answer");
-    let _sent = events.send(StreamEvent::InputReceived(input.len()));
+        .set_nonblocking(true)
+        .expect("make the fixture stream non-blocking");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .expect("build the fixture runtime");
+    runtime.block_on(async {
+        let mut stream =
+            tokio::net::UnixStream::from_std(stream).expect("register the fixture stream");
+        if let Err(error) = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut input).await {
+            let _sent = events.send(StreamEvent::ReadFailed(error.to_string()));
+            return;
+        }
+        // Reported before the answer so a scenario that times out can tell
+        // whether the client ever ended its input.
+        let _sent = events.send(StreamEvent::InputReceived(input.len()));
+        if let Some(answer) = answer {
+            // A client the scenario already killed no longer reads the answer.
+            let _written = tokio::io::AsyncWriteExt::write_all(&mut stream, answer).await;
+        }
+    });
 }
