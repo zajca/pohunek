@@ -1595,7 +1595,7 @@ fn install_package(
     if let Some(index) = index.as_ref() {
         registry
             .record_index(index)
-            .map_err(|error| registry_kind(&error))?;
+            .map_err(|error| index_state_kind(&error))?;
         // The stored copy follows the marks in the same install. A failed
         // write leaves the marks raised and the copy absent or older, which
         // the next refresh and doctor report; it never fails the install.

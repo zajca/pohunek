@@ -740,15 +740,29 @@ impl Rig {
         )
     }
 
-    /// Whether the host launches sessions of `runtime`.
+    /// Whether the host launches a session of `runtime`.
     async fn serves(&self, runtime: &str) -> bool {
-        let (code, document) = self.install.json(&["host", "inspect", "local"]).await;
+        let cwd = self
+            .install
+            .env
+            .cwd()
+            .to_str()
+            .expect("utf-8 cwd")
+            .to_owned();
+        let (code, document) = self
+            .install
+            .json(&["session", "new", "--agent", runtime, "--cwd", &cwd])
+            .await;
+        if code != 0 {
+            return false;
+        }
+        let session = document["ok"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a session id in {document}"))
+            .to_owned();
+        let (code, document) = self.install.json(&["session", "rm", &session]).await;
         assert_eq!(code, 0, "{document}");
-        document["ok"]["supported_agents"]
-            .as_array()
-            .expect("supported_agents")
-            .iter()
-            .any(|agent| agent == runtime)
+        true
     }
 
     /// The `index_high_water` mark the daemon persisted.
@@ -2039,6 +2053,54 @@ async fn a_context_install_ignores_a_fresh_schema_1_stored_copy() {
     );
 }
 
+/// A schema 1 install raises the marks the stored schema 2 copy shares; the
+/// copy is then below them, so the context install refreshes instead of
+/// staging a document the daemon would refuse.
+#[tokio::test]
+async fn a_context_install_refreshes_a_stored_copy_below_the_marks() {
+    let rig = Rig::start().await;
+    let runtime = rig.listing("0.1.0");
+    rig.publish(std::slice::from_ref(&runtime));
+    let context = context_archive("0.3.0");
+    let entries = vec![
+        runtime_entry_of_kind(&runtime),
+        rig.context_entry(&context, "0.3.0"),
+    ];
+    rig.server.set(
+        INDEX_PATH_V2,
+        Route::Body(rig.keys.document_of(
+            INDEX_SCHEMA_VERSION_2,
+            &rig.keys.key,
+            now() - 100,
+            entries.clone(),
+        )),
+    );
+    rig.server
+        .set(&archive_path("0.3.0"), Route::Body(context.bytes.clone()));
+    let refreshed = rig
+        .run(&["plugin", "index", "refresh"], &rig.official_urls())
+        .await;
+    assert_eq!(refreshed.code, 0, "{}", refreshed.document);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    rig.server
+        .set(INDEX_PATH_V2, Route::Body(rig.keys.signed_v2(entries)));
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", CONTEXT_PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert_eq!(
+        rig.server.requests(),
+        vec![INDEX_PATH_V2.to_owned(), archive_path("0.3.0")]
+    );
+}
+
 /// A fresh stored copy that does not list the package makes the install
 /// refresh once and install what the refreshed index lists.
 #[tokio::test]
@@ -2177,7 +2239,8 @@ async fn a_reserved_runtime_id_warns_and_refuses_new_local_claims() {
 }
 
 /// Contract scenario 7: a damaged stored document fails the doctor check,
-/// leaves the daemon answering, and the next refresh repairs it.
+/// leaves the daemon answering, and the next refresh repairs it. The daemon reads
+/// the stored copy only for doctor and apply, so no start-up path exists to cover.
 #[tokio::test]
 async fn a_damaged_stored_document_fails_doctor_until_the_next_refresh() {
     let rig = Rig::start().await;

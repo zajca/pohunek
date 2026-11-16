@@ -343,7 +343,7 @@ async fn a_signed_index_installs_an_official_package_and_persists_its_marks() {
     let stale = keys.signed(sequence - 1, vec![idxfix_entry(&second, "1.1.0")]);
     assert_eq!(
         install_refused(&fixture, &second, &stale).await,
-        PackageErrorKind::Untrusted
+        PackageErrorKind::IndexRollback
     );
     assert_eq!(
         fixture.snapshot(),
@@ -723,7 +723,7 @@ async fn revoked_keys_and_replayed_revocation_lists_are_refused() {
     );
     assert_eq!(
         install_refused(&by_index, &package, &rotated).await,
-        PackageErrorKind::Untrusted
+        PackageErrorKind::IndexRollback
     );
     assert!(!by_index.root(&package.digest).exists());
 
@@ -1008,7 +1008,7 @@ async fn marks_persisted_before_a_crash_gate_the_retry_and_damaged_state_is_kept
             &keys.signed(sequence - 1, vec![idxfix_entry(&package, "1.0.0")])
         )
         .await,
-        PackageErrorKind::Untrusted,
+        PackageErrorKind::IndexRollback,
         "a document below the persisted mark is refused"
     );
     fixture
@@ -1666,7 +1666,7 @@ fn runtime_document(keys: &Keys, sequence: u64, runtime: &str) -> Vec<u8> {
     )
 }
 
-/// N2 recovery, end to end: a damaged `index-state.json` refuses local
+/// Recovery end to end: a damaged `index-state.json` refuses local
 /// installs and a plain refresh with `package_index_state_unreadable` and is
 /// left untouched; `repair_state` replaces it, keeps the damaged bytes beside
 /// it with the same mode, raises the marks to the fetched sequence, and the
@@ -1734,7 +1734,7 @@ async fn scenario_n2_repair_state_replaces_damaged_file() {
         .expect("a local install succeeds after the repair");
 }
 
-/// M-e: a repair never accepts a document below the stored verified copy: the
+/// A repair never accepts a document below the stored verified copy: the
 /// damaged file, the stored copy and the marks stay as they were.
 #[tokio::test]
 async fn scenario_n2_repair_refuses_a_document_below_the_stored_copy() {
@@ -1881,7 +1881,7 @@ async fn scenario_n2_unsafe_state_is_refused_and_never_repaired() {
     assert!(damaged_copies(&fixture).is_empty());
 }
 
-/// M-d: a repair that fails after the damaged file was read leaves a state
+/// A repair that cannot preserve the damaged bytes leaves the damaged state
 /// file in place, so the host never falls back to the empty verifier state.
 #[tokio::test]
 async fn scenario_n2_a_failed_repair_never_leaves_the_host_without_a_state_file() {
@@ -1893,8 +1893,19 @@ async fn scenario_n2_a_failed_repair_never_leaves_the_host_without_a_state_file(
         .expect("apply");
     let damaged = b"{not json".to_vec();
     plant_state(&fixture, &damaged, 0o600);
-    // A directory where the temporary file belongs makes the commit fail.
-    std::fs::create_dir(fixture.plugins.join("index-state.json.tmp")).expect("block the temp");
+    // Every preserved-copy name of the seconds around now is taken, so the
+    // repair fails at the preserve step, after the new state was encoded.
+    let start = now();
+    for second in start - 1..=start + 3 {
+        for attempt in 0..64 {
+            let name = if attempt == 0 {
+                format!("index-state.json.damaged-{second}")
+            } else {
+                format!("index-state.json.damaged-{second}-{attempt}")
+            };
+            std::fs::write(fixture.plugins.join(name), b"earlier").expect("taken name");
+        }
+    }
     apply_document(&fixture, &document, true)
         .await
         .expect_err("the repair cannot commit");
@@ -1911,8 +1922,8 @@ async fn scenario_n2_a_failed_repair_never_leaves_the_host_without_a_state_file(
     );
 }
 
-/// L4: a preserved copy never replaces an earlier one, whatever second it
-/// is taken in.
+/// A preserved copy never replaces an earlier one, whatever second it is
+/// taken in.
 #[tokio::test]
 async fn scenario_n2_repair_never_replaces_an_earlier_preserved_copy() {
     let keys = Keys::new();
@@ -1979,7 +1990,7 @@ async fn scenario_m1_staged_install_stores_document() {
         .await
         .expect("indexed install");
     assert_eq!(installed.package.origin, PackageOrigin::Official);
-    // The daemon stored the official copy (M1), not just raised marks.
+    // The daemon stored the official copy, not just raised marks.
     let stored = fixture.plugins.join("index").join("official-v1.json");
     assert!(stored.exists(), "stored official-v1.json must exist");
     assert_eq!(
@@ -2017,7 +2028,7 @@ async fn scenario_a_failed_store_never_fails_an_index_install() {
     );
 }
 
-/// M5: an expired document is refused at apply and nothing is stored.
+/// An expired document is refused at apply and nothing is stored.
 #[tokio::test]
 async fn scenario_m5_expired_stored_document_refused() {
     let keys = Keys::new();
@@ -2040,7 +2051,7 @@ async fn scenario_m5_expired_stored_document_refused() {
     assert!(registry.stored_index(1).expect("stored").is_none());
 }
 
-/// M6: a schema 1 registry (checked-in bytes written before the provenance
+/// A schema 1 registry (checked-in bytes written before the provenance
 /// field existed) reads with provenance derived from the source, keeps all
 /// three records and the selection, and its next write is schema 2.
 #[tokio::test]
@@ -2135,7 +2146,7 @@ async fn doctor_plugin_index(fixture: &Fixture) -> Vec<protocol::DoctorCheck> {
         .collect()
 }
 
-/// M5-1: a CLI refresh (`plugin.index.apply`) leaves doctor `current`.
+/// A CLI refresh (`plugin.index.apply`) leaves doctor `current`.
 #[tokio::test]
 async fn scenario_m5_doctor_current_after_apply_and_catalog_runtime_stays_ok() {
     let keys = Keys::new();
@@ -2180,7 +2191,7 @@ async fn scenario_m5_doctor_current_after_apply_and_catalog_runtime_stays_ok() {
     );
 }
 
-/// M5-3: a stored copy older than 24 h that has not expired warns with
+/// A stored copy older than 24 h that has not expired warns with
 /// `stale`; the document stays usable.
 #[tokio::test]
 async fn scenario_m5_doctor_stale_stored_copy_warns() {
@@ -2217,7 +2228,7 @@ async fn scenario_m5_doctor_stale_stored_copy_warns() {
     );
 }
 
-/// M5-5: delisting an installed index-origin digest fails doctor with
+/// Delisting an installed index-origin digest fails doctor with
 /// `package_revoked` while the installed package still launches.
 #[tokio::test]
 async fn scenario_m5_doctor_package_revoked_after_delisting() {
@@ -2261,7 +2272,7 @@ async fn scenario_m5_doctor_package_revoked_after_delisting() {
     );
 }
 
-/// M5-6: a local package installed before the official index reserved its
+/// A local package installed before the official index reserved its
 /// runtime id keeps serving after the reservation, and doctor warns.
 #[tokio::test]
 async fn scenario_m5_doctor_reserved_runtime_warns() {

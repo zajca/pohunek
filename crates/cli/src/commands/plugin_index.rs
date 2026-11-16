@@ -632,6 +632,7 @@ fn read_stored(kind: IndexEntryKind) -> Option<StoredEntry> {
             (SIDECAR_KEY_V2, "official-v2.json"),
         ],
     };
+    let marks = read_marks(&plugins);
     let mut best: Option<StoredEntry> = None;
     for (key, file_name) in candidates {
         let Some(at) = value.get(*key).and_then(serde_json::Value::as_u64) else {
@@ -647,6 +648,17 @@ fn read_stored(kind: IndexEntryKind) -> Option<StoredEntry> {
         if unix_now() >= envelope.index.expires_at {
             continue;
         }
+        // The daemon refuses a document below the shared marks, so such a
+        // copy is not usable; the other schema's install may have raised them.
+        if marks
+            .index_high_water
+            .is_some_and(|mark| envelope.index.sequence < mark)
+            || marks
+                .revocation_high_water
+                .is_some_and(|mark| envelope.revocations.revocations.sequence < mark)
+        {
+            continue;
+        }
         if best.as_ref().is_none_or(|stored| at > stored.stored_at) {
             best = Some(StoredEntry {
                 bytes,
@@ -655,6 +667,22 @@ fn read_stored(kind: IndexEntryKind) -> Option<StoredEntry> {
         }
     }
     best
+}
+
+/// The sequence marks the daemon persists in `index-state.json`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Marks {
+    index_high_water: Option<u64>,
+    revocation_high_water: Option<u64>,
+}
+
+/// The persisted marks; a missing or unreadable file yields none, and the
+/// daemon then decides at install time.
+fn read_marks(plugins: &std::path::Path) -> Marks {
+    std::fs::read(plugins.join("index-state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
 }
 
 fn select_from_bytes(bytes: &[u8], request: &PackageRef) -> Result<Selection, Error> {

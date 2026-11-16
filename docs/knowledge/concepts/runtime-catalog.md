@@ -482,9 +482,10 @@ sidecar recording `stored_at` per schema) and accumulates `reserved_runtime_ids`
 in `index-state.json`: the declared runtime ids of every verified document ever
 stored. `plugin.index.apply` (the CLI's `plugin index refresh`) verifies and
 stores; a by-id install stores the verified document whenever it raises the
-index marks, so the stored copy never stays below the marks. The CLI refreshes
-on demand only: it uses the stored copy when it is unexpired, younger than
-24h and of the schema the package needs (a context package needs the schema 2
+index marks, and a failed store is only logged, so the next refresh or doctor
+reports a missing or older copy. The CLI refreshes on demand only: it uses the
+stored copy when it is unexpired, younger than 24h, not below the index marks
+and of the schema the package needs (a context package needs the schema 2
 copy), and refreshes first otherwise. A failed refresh falls back to an
 unexpired stored copy with a warning, and without one returns the refresh
 error; a fresh copy that does not list the package triggers one refresh.

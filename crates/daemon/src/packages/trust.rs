@@ -124,8 +124,9 @@ pub(super) fn verify_catalog_document(
 ///
 /// # Errors
 ///
-/// Returns [`PackageErrorKind::Untrusted`] for an index that fails
-/// verification.
+/// Returns [`PackageErrorKind::IndexRollback`] for an index below the
+/// recorded sequence or revocation marks and [`PackageErrorKind::Untrusted`]
+/// for any other index that fails verification.
 pub(super) fn verify_index_document(
     bytes: &[u8],
     endorser: &RootKey,
@@ -137,7 +138,11 @@ pub(super) fn verify_index_document(
     let base_revoked = verification_base_revoked(anchor, catalog_state);
     verify_index(bytes, endorser, &base_revoked, state, now).map_err(|error| {
         warn!(%error, "a plugin index was refused");
-        PackageErrorKind::Untrusted
+        match error {
+            package::IndexError::StaleSequence { .. }
+            | package::IndexError::StaleRevocation { .. } => PackageErrorKind::IndexRollback,
+            _ => PackageErrorKind::Untrusted,
+        }
     })
 }
 
