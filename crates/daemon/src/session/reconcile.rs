@@ -12243,7 +12243,8 @@ while os.getppid() == parent:
     /// and returns the pin a session of it froze plus a registry serving it.
     fn pre_schema_package_registry() -> (SessionRegistry, crate::agent::host::LaunchPin) {
         use package::registry::{
-            InstallRequest, PackageSource as InstallSource, Registry as PackageRegistry,
+            InstallRequest, PackageProvenance, PackageSource as InstallSource,
+            Registry as PackageRegistry,
         };
         use package::{build_archive, read_archive, ArchiveEntry, Limits};
         use protocol::{
@@ -12311,6 +12312,7 @@ handler = "codex-hook-v1"
                 expected: &digest,
                 identity: identity.clone(),
                 source: InstallSource::ExplicitDigest,
+                provenance: PackageProvenance::Local,
                 enabled: true,
                 select: true,
                 installed_at_unix_seconds: 1_700_000_000,

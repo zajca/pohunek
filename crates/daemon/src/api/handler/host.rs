@@ -39,6 +39,7 @@ pub(super) async fn handle_host_inspect(
             sessions.package_authority().index_install_supported();
         capabilities.package_install_index_context_supported =
             capabilities.package_install_index_supported;
+        capabilities.package_index_apply_supported = capabilities.package_install_index_supported;
         capabilities.host_hooks = Some(crate::worktree::host_hook_scripts(sessions.config_dir()));
         return ok_value(request, &capabilities);
     }
@@ -56,6 +57,8 @@ pub(super) async fn handle_host_inspect(
             capabilities.package_install_index_supported =
                 sessions.package_authority().index_install_supported();
             capabilities.package_install_index_context_supported =
+                capabilities.package_install_index_supported;
+            capabilities.package_index_apply_supported =
                 capabilities.package_install_index_supported;
             capabilities.host_hooks =
                 Some(crate::worktree::host_hook_scripts(sessions.config_dir()));

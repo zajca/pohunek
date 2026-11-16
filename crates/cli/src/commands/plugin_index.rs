@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use package::{
-    archive_digest, host_platform, parse_index_envelope, IndexEntry, IndexEntryKind,
+    archive_digest, host_platform, index_store::SIDECAR_KEY_V1, index_store::SIDECAR_KEY_V2,
+    index_store::STORED_INDEX_MAX_AGE, parse_index_envelope, IndexEntry, IndexEntryKind,
     MAX_COMPRESSED_BYTES, MAX_INDEX_BYTES, OFFICIAL_CONTEXT_PACKAGE_PREFIX,
 };
 use protocol::{PackageDigest, PackageId, PackageVersion};
@@ -30,9 +31,38 @@ use crate::commands::plugin::Error;
 /// release of the index repository.
 pub(crate) const OFFICIAL_INDEX_URL: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v1.json";
 
+/// The official plugin index URL, schema 1. Test builds (`cargo test`, the
+/// `test-util` feature) read `POHUNEK_TEST_OFFICIAL_INDEX_URL` so a loopback
+/// server can stand in for it; a release binary neither contains nor reads
+/// the variable.
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn official_index_url() -> String {
+    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL")
+        .unwrap_or_else(|_| OFFICIAL_INDEX_URL.to_owned())
+}
+
+/// The official plugin index URL, schema 1.
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) fn official_index_url() -> String {
+    OFFICIAL_INDEX_URL.to_owned()
+}
+
 /// The official plugin index, schema 2 (runtime and context entries), which
 /// the index repository publishes beside the schema 1 document.
 pub(crate) const OFFICIAL_INDEX_URL_V2: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v2.json";
+
+/// The official plugin index URL, schema 2; see [`official_index_url`].
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) fn official_index_url_v2() -> String {
+    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2")
+        .unwrap_or_else(|_| OFFICIAL_INDEX_URL_V2.to_owned())
+}
+
+/// The official plugin index URL, schema 2; see [`official_index_url`].
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) fn official_index_url_v2() -> String {
+    OFFICIAL_INDEX_URL_V2.to_owned()
+}
 
 /// Core version an entry's `core` range is matched against: this build's.
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -310,7 +340,7 @@ fn unix_now() -> u64 {
 
 /// The kind of entry `request` can resolve to: ids under the context prefix
 /// resolve to `context` entries only, every other id to `runtime` entries.
-fn wanted_kind(request: &PackageRef) -> IndexEntryKind {
+pub(crate) fn wanted_kind(request: &PackageRef) -> IndexEntryKind {
     if request
         .id
         .as_str()
@@ -379,10 +409,10 @@ fn select<'a>(
 /// never rejects one because the other was read first.
 async fn fetch_official_index(client: &Client, kind: IndexEntryKind) -> Result<Vec<u8>, Error> {
     let url = match kind {
-        IndexEntryKind::Runtime => OFFICIAL_INDEX_URL,
-        IndexEntryKind::Context => OFFICIAL_INDEX_URL_V2,
+        IndexEntryKind::Runtime => official_index_url(),
+        IndexEntryKind::Context => official_index_url_v2(),
     };
-    fetch(client, &checked_url(url)?, Download::Index).await
+    fetch(client, &checked_url(&url)?, Download::Index).await
 }
 
 /// The index document and the entry `request` resolved to.
@@ -450,13 +480,11 @@ pub(crate) async fn resolve(
 ///
 /// Returns the first failed step as an [`Error`]; nothing is sent to the
 /// daemon by this function.
-pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
-    let client = client()?;
-    let selection = select_entry(&client, request, index_url).await?;
+async fn stage_from_selection(client: &Client, selection: Selection) -> Result<Staged, Error> {
     let resolved = selection.resolved();
     let Selection { index_bytes, entry } = selection;
     let archive_url = checked_url(&entry.url)?;
-    let archive = fetch(&client, &archive_url, Download::Archive).await?;
+    let archive = fetch(client, &archive_url, Download::Archive).await?;
     let actual = archive_digest(&archive).map_err(|_error| Error::ArchiveDigestMismatch {
         expected: resolved.digest.as_str().to_owned(),
         actual: "unreadable".to_owned(),
@@ -482,6 +510,38 @@ pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Resu
     })
 }
 
+/// Stage the archive for `request` from the stored index copy, with no index
+/// fetch. Fails when nothing usable is stored or the package is not listed.
+pub(crate) async fn stage_from_stored(request: &PackageRef) -> Result<Staged, Error> {
+    let client = client()?;
+    let stored = read_stored(wanted_kind(request)).ok_or(Error::IndexInvalid {
+        detail: "no stored index document to install from".to_owned(),
+    })?;
+    let selection = select_from_bytes(&stored.bytes, request)?;
+    stage_from_selection(&client, selection).await
+}
+
+/// Whether this error means "the index does not list this package or
+/// version": the result the CLI fallback may retry against a fresh fetch.
+///
+/// Digest mismatches, archive availability, refused URLs, platform and
+/// expiry failures are fatal: re-fetching cannot fix them, so they are
+/// surfaced instead of retried.
+#[must_use]
+pub(crate) fn is_not_listed(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::IndexPackageNotFound { .. } | Error::IndexVersionNotFound { .. }
+    )
+}
+
+/// Fetch the index and select the entry for `request`. One fetch.
+pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
+    let client = client()?;
+    let selection = select_entry(&client, request, index_url).await?;
+    stage_from_selection(&client, selection).await
+}
+
 fn staging_failed(error: &std::io::Error) -> Error {
     Error::StagingFailed {
         detail: error.kind().to_string(),
@@ -505,4 +565,140 @@ fn write_staged(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<Strin
         .map_err(|_path| Error::StagingFailed {
             detail: "the staging path is not UTF-8".to_owned(),
         })
+}
+
+/// Fetch the official index document (v2 when `context`) and stage it for apply.
+pub(crate) async fn stage_official(
+    index_url: Option<&str>,
+    context: bool,
+) -> Result<StagedOfficial, Error> {
+    let client = client()?;
+    let bytes = if let Some(url) = index_url {
+        fetch(&client, &checked_url(url)?, Download::Index).await?
+    } else {
+        let kind = if context {
+            IndexEntryKind::Context
+        } else {
+            IndexEntryKind::Runtime
+        };
+        fetch_official_index(&client, kind).await?
+    };
+    let dir = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempdir()
+        .map_err(|e| staging_failed(&e))?;
+    let canonical = std::fs::canonicalize(dir.path()).map_err(|e| staging_failed(&e))?;
+    let index_path = write_staged(&canonical, STAGED_INDEX, &bytes)?;
+    Ok(StagedOfficial {
+        _dir: dir,
+        index_path,
+    })
+}
+
+/// A staged official index for `plugin.index.apply`.
+#[derive(Debug)]
+pub(crate) struct StagedOfficial {
+    _dir: TempDir,
+    pub(crate) index_path: String,
+}
+
+/// Whether the stored copy that can serve `kind` is usable and younger than
+/// [`STORED_INDEX_MAX_AGE`]. An expired copy is never fresh.
+pub(crate) fn stored_is_fresh(kind: IndexEntryKind) -> bool {
+    read_stored(kind)
+        .is_some_and(|stored| unix_now().saturating_sub(stored.stored_at) <= STORED_INDEX_MAX_AGE)
+}
+
+#[derive(Debug)]
+struct StoredEntry {
+    bytes: Vec<u8>,
+    stored_at: u64,
+}
+
+/// The newest unexpired stored document that can serve an install of `kind`.
+///
+/// A context package is listed only by the schema 2 document; a runtime
+/// package by either. The CLI reads the files the daemon wrote: they are
+/// local, same-user and verified again by the daemon at install.
+fn read_stored(kind: IndexEntryKind) -> Option<StoredEntry> {
+    let plugins = crate::paths::Paths::plugins_dir().ok()?;
+    let index_dir = plugins.join("index");
+    let raw = std::fs::read(index_dir.join("stored.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let candidates: &[(&str, &str)] = match kind {
+        IndexEntryKind::Context => &[(SIDECAR_KEY_V2, "official-v2.json")],
+        IndexEntryKind::Runtime => &[
+            (SIDECAR_KEY_V1, "official-v1.json"),
+            (SIDECAR_KEY_V2, "official-v2.json"),
+        ],
+    };
+    let marks = read_marks(&plugins);
+    let mut best: Option<StoredEntry> = None;
+    for (key, file_name) in candidates {
+        let Some(at) = value.get(*key).and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        // One missing or expired schema does not abort the other.
+        let Ok(bytes) = std::fs::read(index_dir.join(file_name)) else {
+            continue;
+        };
+        let Ok(envelope) = parse_index_envelope(&bytes) else {
+            continue;
+        };
+        if unix_now() >= envelope.index.expires_at {
+            continue;
+        }
+        // The daemon refuses a document below the shared marks, so such a
+        // copy is not usable; the other schema's install may have raised them.
+        if marks
+            .index_high_water
+            .is_some_and(|mark| envelope.index.sequence < mark)
+            || marks
+                .revocation_high_water
+                .is_some_and(|mark| envelope.revocations.revocations.sequence < mark)
+        {
+            continue;
+        }
+        if best.as_ref().is_none_or(|stored| at > stored.stored_at) {
+            best = Some(StoredEntry {
+                bytes,
+                stored_at: at,
+            });
+        }
+    }
+    best
+}
+
+/// The sequence marks the daemon persists in `index-state.json`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct Marks {
+    index_high_water: Option<u64>,
+    revocation_high_water: Option<u64>,
+}
+
+/// The persisted marks; a missing or unreadable file yields none, and the
+/// daemon then decides at install time.
+fn read_marks(plugins: &std::path::Path) -> Marks {
+    std::fs::read(plugins.join("index-state.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn select_from_bytes(bytes: &[u8], request: &PackageRef) -> Result<Selection, Error> {
+    let core = Version::parse(CORE_VERSION).map_err(|_error| Error::IndexInvalid {
+        detail: "this build has no semantic version to match entries against".to_owned(),
+    })?;
+    let platform = host_platform().ok_or(Error::PlatformUnsupported)?;
+    let envelope = parse_index_envelope(bytes).map_err(|error| Error::IndexInvalid {
+        detail: error.to_string(),
+    })?;
+    if unix_now() >= envelope.index.expires_at {
+        return Err(Error::IndexExpired);
+    }
+    let entry = select(&envelope.index.entries, request, &core, &platform)?.clone();
+    Ok(Selection {
+        index_bytes: bytes.to_vec(),
+        entry,
+    })
 }

@@ -476,6 +476,37 @@ structure (platforms, URL of printable ASCII up to 512 bytes, core string of
 digest, one-to-one package and runtime ids). `parse_index_envelope` runs only
 the first five checks for untrusted version selection.
 
+**Stored copy.** The daemon persists the verified document byte-exact under
+`<plugins>/index/` (`official-v1.json`/`official-v2.json` with a `stored.json`
+sidecar recording `stored_at` per schema) and accumulates `reserved_runtime_ids`
+in `index-state.json`: the declared runtime ids of every verified document ever
+stored. `plugin.index.apply` (the CLI's `plugin index refresh`) verifies and
+stores; a by-id install stores the verified document whenever it raises the
+index marks, and a failed store is only logged, so the next refresh or doctor
+reports a missing or older copy. The CLI refreshes on demand only: it uses the
+stored copy when it is unexpired, younger than 24h, not below the index marks
+and of the schema the package needs (a context package needs the schema 2
+copy), and refreshes first otherwise. A failed refresh falls back to an
+unexpired stored copy with a warning, and without one returns the refresh
+error; a fresh copy that does not list the package triggers one refresh.
+`--index-url` bypasses the stored copy for that install. A local
+(`--sha256`/`link`) install whose declared runtime id is in
+`reserved_runtime_ids` is refused with `package_runtime_not_claimable`
+(data-driven, no package-id prefix check). An `index-state.json` that is
+damaged, of an unsupported schema or has the wrong mode or owner refuses local
+installs, links and refreshes with `package_index_state_unreadable`.
+`pohunek plugin index refresh --repair-state` repairs a damaged or
+unsupported-schema file: it verifies the fetched document against the stored
+verified copy (a lower sequence is `package_index_rollback`), commits the new
+state first, and keeps the damaged bytes as `index-state.json.damaged-<unix-ts>`
+with the same mode. A wrong mode or owner is never repaired.
+Doctor verifies the stored copy: `current`, `stale`, `package_index_expired`,
+`package_index_invalid`, `package_index_state_unreadable`, `not_refreshed` (an index-origin
+package and no stored copy), `package_revoked` (index-provenance delisting only: fail for the selected
+version of an id, warn for an unselected one a profile pin or session still references, silent for
+an unreferenced one; catalog-provenance bundled runtimes are never checked here), or
+`runtime_id_reserved_by_official` (local-provenance holder of a reserved id).
+
 **Install-time authorization.** `VerifiedIndex::authorize` takes the entry
 with the given digest and checks, first failure wins: listed (`NotListed`),
 kind `runtime` (`KindMismatch`), identity equal (`IdentityMismatch`), `pohunek.` namespace (`Namespace`),

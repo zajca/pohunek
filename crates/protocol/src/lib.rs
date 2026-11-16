@@ -146,6 +146,7 @@ pub use package::{
     PackageOrigin, PackageRemoveProfileParams, PackageRemoveProfileResult, PackageRuntimeInfo,
     PackageSelectParams, PackageSelectionBlock, PackageSelectionBlockReason,
     PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
+    PluginIndexApplyParams, PluginIndexApplyResult,
 };
 #[doc(inline)]
 pub use project::{

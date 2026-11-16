@@ -37,6 +37,7 @@ pub use self::authority::PackageService;
 pub(crate) use self::authority::{LaunchGuard, OwnedLaunchGuard, PackageAuthority};
 pub use self::retention::PackageUninstallError;
 pub(crate) use self::retention::{installed_digests, RetainedPins};
+pub(crate) use self::trust::verification_base_revoked;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -44,14 +45,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use package::catalog_state::CatalogState;
 use package::registry::{
-    InstallRequest, InstallStatus, PackageRecord, PackageSource as RecordSource, RegistryError,
-    RegistryState,
+    InstallRequest, InstallStatus, PackageProvenance, PackageRecord, PackageSource as RecordSource,
+    RegistryError, RegistryState,
 };
 use package::revoked_digests::RevokedDigests;
 use package::{
-    archive_digest, read_archive, read_archive_with_digest, IndexVerifierState, Limits, LocalTrust,
-    LocalTrustError, PackageDigest, RootKey, VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES,
-    MAX_INDEX_BYTES,
+    archive_digest, parse_index_envelope, read_archive, read_archive_with_digest,
+    IndexVerifierState, Limits, LocalTrust, LocalTrustError, PackageDigest, RootKey,
+    VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES, MAX_INDEX_BYTES,
 };
 use protocol::{
     CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
@@ -59,11 +60,11 @@ use protocol::{
     PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
     PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
     PackageSelectionBlock, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
-    PackageUninstallResult, ProtocolError,
+    PackageUninstallResult, PluginIndexApplyParams, PluginIndexApplyResult, ProtocolError,
 };
 use tracing::warn;
 
-use self::error::{registry_kind, rejection_kind};
+use self::error::{index_state_kind, registry_kind, rejection_kind};
 use self::fault::fault_of;
 use self::selection::{block_of, conflict, declared_by, Integration, Integrations};
 use self::source::{build_directory, read_archive_file, read_regular_file};
@@ -98,11 +99,15 @@ struct Prepared {
     identity: PackageIdentity,
     authority: Authority,
     source: RecordSource,
+    provenance: PackageProvenance,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
     /// The plugin index that authorized the package, recorded before the
     /// install.
     index: Option<VerifiedIndex>,
+    /// Exact index bytes, stored alongside the marks so the stored copy
+    /// never stays below them.
+    index_bytes: Option<Vec<u8>>,
 }
 
 /// An archive whose descriptor exports commands only, checked like
@@ -117,9 +122,13 @@ struct CommandsPrepared {
     commands: Vec<CommandInfo>,
     identity: PackageIdentity,
     source: RecordSource,
+    provenance: PackageProvenance,
     /// The plugin index that authorized the package, recorded before the
     /// install; only a context package authorized by the index has one.
     index: Option<VerifiedIndex>,
+    /// Exact index bytes, stored alongside the marks so the stored copy
+    /// never stays below them.
+    index_bytes: Option<Vec<u8>>,
 }
 
 /// An archive that passed every check an install makes before it writes, by
@@ -540,7 +549,7 @@ impl PackageService {
         params: PackageLinkParams,
     ) -> Result<PackageInstallResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
-            let candidate = prepare_directory(&params.directory)?;
+            let candidate = prepare_directory(context, &params.directory)?;
             require_commands_opt_in(&candidate, params.accept_commands)?;
             let plan = InstallPlan {
                 enable: false,
@@ -927,16 +936,23 @@ fn check_claim(
     authority: Authority,
 ) -> Result<(), PackageErrorKind> {
     let runtime_id = definition.runtime_id();
-    decide_claim(
-        runtime_id,
-        package,
-        authority,
-        runtimes.served_by(runtime_id).as_ref(),
+    let served_by = runtimes.served_by(runtime_id);
+    decide_claim(runtime_id, package, authority, served_by.as_ref()).map_err(
+        |refusal| match refusal {
+            ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
+            ClaimRefusal::Conflict => {
+                // The wire error carries a code only; the log names the holder the
+                // operator has to remove.
+                warn!(
+                    runtime_id = %runtime_id,
+                    package = %package,
+                    served_by = ?served_by,
+                    "package_runtime_conflict: remove the package that serves the runtime id"
+                );
+                PackageErrorKind::RuntimeConflict
+            }
+        },
     )
-    .map_err(|refusal| match refusal {
-        ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
-        ClaimRefusal::Conflict => PackageErrorKind::RuntimeConflict,
-    })
 }
 
 /// Proves that the installed package `digest` still loads and, when it
@@ -1055,7 +1071,7 @@ fn prepare_archive(
     trust: &PackageTrust,
 ) -> Result<Candidate, PackageErrorKind> {
     match trust {
-        PackageTrust::ExplicitDigest { digest } => prepare_local(path, digest),
+        PackageTrust::ExplicitDigest { digest } => prepare_local(context, path, digest),
         PackageTrust::Catalog { catalog_path } => {
             let anchor = context.catalog_anchor()?;
             let state = context
@@ -1080,7 +1096,7 @@ fn prepare_archive(
                 .map_err(|error| registry_kind(&error))?;
             let index_state = registry
                 .index_state()
-                .map_err(|error| registry_kind(&error))?;
+                .map_err(|error| index_state_kind(&error))?;
             let candidate = prepare_indexed(
                 &IndexTrustInputs {
                     anchor,
@@ -1105,7 +1121,11 @@ fn prepare_archive(
 }
 
 /// Prepares an archive the owner trusts by its exact digest `pinned`.
-fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, PackageErrorKind> {
+fn prepare_local(
+    context: &Context,
+    path: &str,
+    pinned: &PackageDigest,
+) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = read_archive_file(path, &limits)?;
     let (digest, descriptor) = read_authorized(&bytes, pinned, &limits)?;
@@ -1120,7 +1140,9 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, Packag
             commands,
             identity,
             source: RecordSource::ExplicitDigest,
+            provenance: PackageProvenance::Local,
             index: None,
+            index_bytes: None,
         })));
     };
     LocalTrust::ExplicitDigest(pinned.clone())
@@ -1129,6 +1151,9 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, Packag
             LocalTrustError::ReservedRuntime => PackageErrorKind::RuntimeNotClaimable,
             LocalTrustError::DigestMismatch => PackageErrorKind::ArchiveInvalid,
         })?;
+    // Refuse a local package only when the accumulated reserved ids cover
+    // its runtime id; before any verified index listed it, local trust stands alone.
+    refuse_reserved_runtime(context, &identity.id, definition.runtime_id())?;
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
@@ -1137,8 +1162,10 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, Packag
         identity,
         authority: Authority::Local,
         source: RecordSource::ExplicitDigest,
+        provenance: PackageProvenance::Local,
         catalog: None,
         index: None,
+        index_bytes: None,
     })))
 }
 
@@ -1199,8 +1226,10 @@ fn prepare_official(
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
+        provenance: PackageProvenance::Catalog,
         catalog: Some(verified),
         index: None,
+        index_bytes: None,
     })
 }
 
@@ -1271,7 +1300,9 @@ fn prepare_indexed(
             commands,
             identity,
             source: RecordSource::Official,
+            provenance: PackageProvenance::Index,
             index: Some(verified),
+            index_bytes: Some(document),
         })));
     };
     if !commands.is_empty() {
@@ -1294,8 +1325,10 @@ fn prepare_indexed(
         identity,
         authority: Authority::Official,
         source: RecordSource::Official,
+        provenance: PackageProvenance::Index,
         catalog: None,
         index: Some(verified),
+        index_bytes: Some(document),
     })))
 }
 
@@ -1322,7 +1355,7 @@ fn read_authorized(
 }
 
 /// Archives and validates a developer directory.
-fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
+fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = build_directory(directory, &limits)?;
     let archive = read_archive(&bytes, &limits).map_err(|error| {
@@ -1343,9 +1376,12 @@ fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
             commands,
             identity,
             source: RecordSource::Link,
+            provenance: PackageProvenance::Local,
             index: None,
+            index_bytes: None,
         })));
     };
+    refuse_reserved_runtime(context, &identity.id, definition.runtime_id())?;
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
@@ -1354,8 +1390,10 @@ fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
         identity,
         authority: Authority::Local,
         source: RecordSource::Link,
+        provenance: PackageProvenance::Local,
         catalog: None,
         index: None,
+        index_bytes: None,
     })))
 }
 
@@ -1365,11 +1403,15 @@ struct Install {
     digest: PackageDigest,
     identity: PackageIdentity,
     source: RecordSource,
+    provenance: PackageProvenance,
     /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
     /// The plugin index that authorized the package, recorded before the
     /// install.
     index: Option<VerifiedIndex>,
+    /// Exact index bytes, stored alongside the marks so the stored copy
+    /// never stays below them.
+    index_bytes: Option<Vec<u8>>,
     /// The integration the package declares; none for a package without a
     /// runtime.
     integration: Integration,
@@ -1394,8 +1436,10 @@ fn commit_candidate(
                 digest: prepared.digest,
                 identity: prepared.identity,
                 source: prepared.source,
+                provenance: prepared.provenance,
                 catalog: None,
                 index: prepared.index,
+                index_bytes: prepared.index_bytes,
                 integration: Integration::Known(None),
                 runtime: None,
                 commands: prepared.commands,
@@ -1430,8 +1474,10 @@ fn commit_install(
             digest: prepared.digest,
             identity: prepared.identity,
             source: prepared.source,
+            provenance: prepared.provenance,
             catalog: prepared.catalog,
             index: prepared.index,
+            index_bytes: prepared.index_bytes,
         },
         plan,
         retained,
@@ -1465,6 +1511,7 @@ fn refuse_loader_rejection(
 
 /// Records the package and rebuilds the runtime registry; a dry run stops
 /// before the first write.
+#[allow(clippy::too_many_lines, reason = "one install path")]
 fn install_package(
     context: &Context,
     install: Install,
@@ -1476,8 +1523,10 @@ fn install_package(
         digest,
         identity,
         source,
+        provenance,
         catalog,
         index,
+        index_bytes,
         integration,
         runtime,
         commands,
@@ -1546,7 +1595,19 @@ fn install_package(
     if let Some(index) = index.as_ref() {
         registry
             .record_index(index)
-            .map_err(|error| registry_kind(&error))?;
+            .map_err(|error| index_state_kind(&error))?;
+        // The stored copy follows the marks in the same install. A failed
+        // write leaves the marks raised and the copy absent or older, which
+        // the next refresh and doctor report; it never fails the install.
+        if let Some(index_bytes) = index_bytes.as_ref() {
+            let schema_version = parse_index_envelope(index_bytes)
+                .map_or(package::INDEX_SCHEMA_VERSION, |envelope| {
+                    envelope.schema_version
+                });
+            if let Err(error) = registry.store_index(schema_version, index, index_bytes, now) {
+                warn!(%error, "the plugin index was verified but its stored copy was not written");
+            }
+        }
     }
     let report = registry
         .install(&InstallRequest {
@@ -1554,6 +1615,7 @@ fn install_package(
             expected: &digest,
             identity,
             source,
+            provenance,
             enabled: plan.enable,
             select,
             installed_at_unix_seconds: now,
@@ -1584,4 +1646,155 @@ fn install_package(
         commands,
         reloaded: true,
     })
+}
+
+/// The shared reserved-runtime predicate used by the install guard and the
+/// doctor check: the descriptor's declared runtime id belongs to the
+/// accumulated reserved set.
+#[must_use]
+pub(crate) fn is_reserved_runtime_id(
+    reserved_runtime_ids: &std::collections::BTreeSet<protocol::RuntimeId>,
+    runtime_id: &protocol::RuntimeId,
+) -> bool {
+    reserved_runtime_ids.contains(runtime_id)
+}
+
+/// Refuses a local (digest/link) package whose declared runtime id was
+/// reserved by a verified official index.
+///
+/// The check is data-driven only: the runtime id the descriptor declares
+/// must be in the accumulated `reserved_runtime_ids`. The package id is
+/// irrelevant, so the guard cannot be bypassed by renaming the package.
+/// The compiled floor (`shell`, `codex`, `claude`, `hermes`) is refused by
+/// `LocalTrust` independently of any stored index; the Pi `--sha256` flow
+/// works until a verified index has listed `pi`.
+fn refuse_reserved_runtime(
+    context: &Context,
+    package_id: &PackageId,
+    runtime_id: &protocol::RuntimeId,
+) -> Result<(), PackageErrorKind> {
+    let state = context
+        .store
+        .registry()
+        .index_state()
+        .map_err(|error| index_state_kind(&error))?;
+    if is_reserved_runtime_id(&state.reserved_runtime_ids, runtime_id) {
+        warn!(
+            package = %package_id,
+            runtime_id = %runtime_id,
+            "a local package was refused: its runtime id is reserved by a recorded index"
+        );
+        Err(PackageErrorKind::RuntimeNotClaimable)
+    } else {
+        Ok(())
+    }
+}
+
+impl PackageService {
+    /// Verifies, rolls-back-checks and stores a staged plugin index.
+    ///
+    /// Rollback is checked explicitly against the persisted marks before
+    /// `record_index` runs, because `record_index` silently returns the
+    /// current state for a below-mark document instead of an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageErrorKind::IndexInvalid`] for an unverifiable
+    /// document, [`PackageErrorKind::IndexExpired`] for an expired one,
+    /// [`PackageErrorKind::IndexRollback`] for a sequence below the recorded
+    /// high-water marks, and [`PackageErrorKind::IndexChannelMissing`] when
+    /// no index channel is loaded.
+    pub async fn package_index_apply(
+        &self,
+        params: PluginIndexApplyParams,
+    ) -> Result<PluginIndexApplyResult, PackageErrorKind> {
+        self.package_transaction(move |context, _retained| {
+            let (anchor, endorser) = context.index_endorser().map_err(|error| match error {
+                PackageErrorKind::TrustUnavailable => PackageErrorKind::IndexChannelMissing,
+                other => other,
+            })?;
+            let registry = context.store.registry();
+            let catalog_state = registry
+                .catalog_state()
+                .map_err(|error| registry_kind(&error))?;
+            let repair = params.repair_state;
+            let stored_at = unix_now()?;
+            // Documents the host stored and verified earlier; they bound a
+            // repair from below.
+            let mut stored_verified = Vec::new();
+            let index_state = match registry.index_state() {
+                Ok(state) => state,
+                Err(RegistryError::Corrupt | RegistryError::UnsupportedSchema) if repair => {
+                    for schema in [
+                        package::INDEX_SCHEMA_VERSION,
+                        package::INDEX_SCHEMA_VERSION_2,
+                    ] {
+                        let Ok(Some(stored)) = registry.stored_index(schema) else {
+                            continue;
+                        };
+                        if let Ok(document) = trust::verify_index_for_apply(
+                            &stored.bytes,
+                            endorser,
+                            anchor,
+                            &catalog_state,
+                            &package::IndexVerifierState::default(),
+                            stored.stored_at,
+                        ) {
+                            stored_verified.push(document);
+                        }
+                    }
+                    // The fetched document is verified against what the stored
+                    // copies already established, so a lower one is refused as
+                    // a rollback and the repair never lowers a mark.
+                    package::registry::Registry::state_of_documents(&stored_verified)
+                        .map_err(|error| registry_kind(&error))?
+                }
+                Err(error) => return Err(index_state_kind(&error)),
+            };
+            let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
+            let bytes = read_regular_file(&params.index_path, max)
+                .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
+            let verified = trust::verify_index_for_apply(
+                &bytes,
+                endorser,
+                anchor,
+                &catalog_state,
+                &index_state,
+                stored_at,
+            )?;
+            // Explicit rollback defence: record_index would silently no-op.
+            if index_state
+                .index_high_water
+                .is_some_and(|mark| verified.sequence() < mark)
+                || index_state
+                    .revocation_high_water
+                    .is_some_and(|mark| verified.revocation_sequence() < mark)
+            {
+                return Err(PackageErrorKind::IndexRollback);
+            }
+            let schema_version = package::parse_index_envelope(&bytes)
+                .map_or(package::INDEX_SCHEMA_VERSION, |envelope| {
+                    envelope.schema_version
+                });
+            // Marks first, like the install path: if recording fails, the
+            // stored document must not become newer than the marks.
+            if repair {
+                registry.repair_index_state(&verified, &stored_verified)
+            } else {
+                registry.record_index(&verified)
+            }
+            .map_err(|error| index_state_kind(&error))?;
+            registry
+                .store_index(schema_version, &verified, &bytes, stored_at)
+                .map_err(|error| registry_kind(&error))?;
+            Ok(PluginIndexApplyResult {
+                sequence: verified.sequence(),
+                schema_version,
+                expires_at: verified.expires_at(),
+                entries: verified.entries().len() as u64,
+                stored_at,
+            })
+        })
+        .await
+    }
 }

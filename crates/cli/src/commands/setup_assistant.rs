@@ -192,7 +192,10 @@ async fn require_context_install(client: &mut Client) -> Result<(), CliError> {
         })
         .await?;
     if !capabilities.package_install_index_supported {
-        return Err(plugin::Error::IndexUnsupported.into());
+        return Err(plugin::Error::IndexUnsupported {
+            capability: "package_install_index_supported",
+        }
+        .into());
     }
     if !capabilities.package_install_index_context_supported {
         return Err(plugin::Error::IndexContextUnsupported.into());

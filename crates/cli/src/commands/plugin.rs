@@ -69,6 +69,12 @@ pub(crate) enum Action {
         json: bool,
     },
 
+    /// Manage the stored plugin index.
+    Index {
+        #[command(subcommand)]
+        sub: IndexAction,
+    },
+
     /// Show one installed package: its record, health, and the runtime it declares.
     ///
     /// With several installed versions and no `--digest` or `--version`, the
@@ -186,6 +192,9 @@ impl Action {
             Self::Link(args) => args.json,
             Self::Update(args) => args.json,
             Self::Uninstall(args) => args.json,
+            Self::Index { sub } => match sub {
+                IndexAction::Refresh { json, .. } => *json,
+            },
         }
     }
 }
@@ -292,6 +301,26 @@ pub(crate) struct InstallArgs {
     /// Emit machine-readable JSON instead of text.
     #[arg(long)]
     json: bool,
+}
+
+/// `pohunek plugin index` subcommands.
+#[derive(Debug, Subcommand)]
+pub(crate) enum IndexAction {
+    /// Fetch the official plugin index and store it on the daemon.
+    ///
+    /// Fetching and verification happen here: the daemon stores the exact
+    /// bytes it staged and re-verifies them.
+    Refresh {
+        /// Plugin index to fetch instead of the official one.
+        #[arg(long, value_name = "URL")]
+        index_url: Option<String>,
+        /// Replace a damaged `index-state.json` (explicit repair).
+        #[arg(long)]
+        repair_state: bool,
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Arguments of `pohunek plugin link`.
@@ -476,8 +505,11 @@ pub(crate) enum Error {
     },
 
     /// The daemon cannot authorize installs through a plugin index.
-    #[error("the daemon does not support installs through a plugin index")]
-    IndexUnsupported,
+    #[error("the daemon does not support {capability}")]
+    IndexUnsupported {
+        /// The capability the daemon did not report.
+        capability: &'static str,
+    },
 
     /// The daemon authorizes runtime packages through a plugin index but not
     /// context packages (index schema 2).
@@ -717,7 +749,7 @@ impl Error {
             Self::DownloadTooLarge { .. } => "plugin_download_too_large",
             Self::IndexUnavailable { .. } => "plugin_index_unavailable",
             Self::ArchiveUnavailable { .. } => "plugin_archive_unavailable",
-            Self::IndexUnsupported => "plugin_index_unsupported",
+            Self::IndexUnsupported { .. } => "plugin_index_unsupported",
             Self::IndexContextUnsupported => "plugin_index_context_unsupported",
             Self::IndexInvalid { .. } => "plugin_index_invalid",
             Self::IndexExpired => "plugin_index_expired",
@@ -779,9 +811,11 @@ impl Error {
             Self::IndexUnavailable { .. } | Self::ArchiveUnavailable { .. } => {
                 "check the network and the URL, then retry; nothing was sent to the daemon"
             }
-            Self::IndexUnsupported => {
-                "the daemon is older than 0.40 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog"
-            }
+            Self::IndexUnsupported { capability } => match *capability {
+                "package_install_index_supported" => "the daemon is older than 0.40 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog",
+                "package_index_apply_supported" => "the daemon is older than 0.44 or this host has no plugin index channel file beside the daemon executable; upgrade the daemon or install from an archive with --sha256 or --catalog",
+                _ => "upgrade the daemon or install from an archive with --sha256 or --catalog",
+            },
             Self::IndexContextUnsupported => {
                 "the daemon predates context packages in the plugin index (0.42); upgrade the daemon or install the context package from its archive with --sha256"
             }
@@ -1020,6 +1054,7 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             print_output(json, &result, || render_change("Disabled", &result))?;
         }
         Action::Uninstall(args) => run_uninstall(&args).await?,
+        Action::Index { sub } => run_index(sub).await?,
         Action::Profile { action } => plugin_profile::run(action).await?,
         Action::Doctor { package, json } => {
             let mut client = connect().await?;
@@ -1063,6 +1098,53 @@ async fn run_install(args: &InstallArgs) -> Result<(), CliError> {
     .await
 }
 
+/// Fetches the official index, stages it and has the daemon verify and store
+/// it. `repair_state` asks the daemon to replace a damaged `index-state.json`.
+async fn refresh_stored(
+    client: &mut Client,
+    index_url: Option<&str>,
+    repair_state: bool,
+) -> Result<protocol::PluginIndexApplyResult, CliError> {
+    let context = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_install_index_context_supported;
+    let staged = plugin_index::stage_official(index_url, context).await?;
+    client
+        .call::<method::PluginIndexApply>(protocol::PluginIndexApplyParams {
+            index_path: staged.index_path,
+            repair_state,
+        })
+        .await
+}
+
+/// Stages an install from the stored index after refreshing it.
+///
+/// A failed refresh falls back to the unexpired stored copy with a warning
+/// that names the refresh error. When the copy does not list the package, the
+/// index is fetched directly; any other stored-copy failure returns the
+/// refresh error itself, never a misleading "invalid index".
+async fn stage_after_refresh(
+    client: &mut Client,
+    request: &PackageRef,
+) -> Result<plugin_index::Staged, CliError> {
+    match refresh_stored(client, None, false).await {
+        Ok(_) => Ok(plugin_index::stage_from_stored(request).await?),
+        Err(refresh_error) => match plugin_index::stage_from_stored(request).await {
+            Ok(staged) => {
+                eprintln!("warning: could not refresh the stored plugin index: {refresh_error}");
+                Ok(staged)
+            }
+            Err(error) if plugin_index::is_not_listed(&error) => {
+                Ok(plugin_index::stage(request, None).await?)
+            }
+            Err(_) => Err(refresh_error),
+        },
+    }
+}
+
 /// Install `<package-id>[@<version>]`: fetch the index and the archive it
 /// lists, then hand both to the daemon, which verifies them.
 async fn run_install_by_id(
@@ -1088,7 +1170,27 @@ async fn run_install_by_id(
     {
         require_index_context_support(&mut client).await?;
     }
-    let staged = plugin_index::stage(&request, args.index_url.as_deref()).await?;
+    // A custom --index-url replaces the stored copy for this install. A daemon
+    // without `plugin.index.apply` has no stored copy to use or refresh, so the
+    // index is fetched directly. Otherwise a stored copy younger than 24 h
+    // serves the install; a stale, missing or non-listing copy is refreshed
+    // first.
+    let kind = plugin_index::wanted_kind(&request);
+    let staged = if args.index_url.is_some() {
+        plugin_index::stage(&request, args.index_url.as_deref()).await?
+    } else if !apply_supported(&mut client).await? {
+        plugin_index::stage(&request, None).await?
+    } else if plugin_index::stored_is_fresh(kind) {
+        match plugin_index::stage_from_stored(&request).await {
+            Ok(staged) => staged,
+            Err(error) if plugin_index::is_not_listed(&error) => {
+                stage_after_refresh(&mut client, &request).await?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        stage_after_refresh(&mut client, &request).await?
+    };
     let source = Source::Archive {
         path: staged.archive_path.clone(),
         trust: PackageTrust::Index {
@@ -1143,7 +1245,10 @@ async fn require_index_support(client: &mut Client) -> Result<(), CliError> {
     {
         Ok(())
     } else {
-        Err(Error::IndexUnsupported.into())
+        Err(Error::IndexUnsupported {
+            capability: "package_install_index_supported",
+        }
+        .into())
     }
 }
 
@@ -1189,12 +1294,65 @@ async fn run_link(args: &LinkArgs) -> Result<(), CliError> {
     .await
 }
 
+/// Refresh the stored official plugin index (24h cadence).
+async fn run_index(action: IndexAction) -> Result<(), CliError> {
+    let IndexAction::Refresh {
+        index_url,
+        repair_state,
+        json,
+    } = action;
+    let mut client = connect_ingest().await?;
+    require_apply_support(&mut client).await?;
+    let result = refresh_stored(&mut client, index_url.as_deref(), repair_state).await?;
+    print_output(json, &result, || {
+        format!(
+            "sequence {} (schema {}, {} entries, expires {}, stored {})\n",
+            result.sequence,
+            result.schema_version,
+            result.entries,
+            result.expires_at,
+            result.stored_at
+        )
+    })?;
+    Ok(())
+}
+
+/// Is apply supported on this daemon?
+async fn require_apply_support(client: &mut Client) -> Result<(), CliError> {
+    if client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_index_apply_supported
+    {
+        Ok(())
+    } else {
+        Err(Error::IndexUnsupported {
+            capability: "package_index_apply_supported",
+        }
+        .into())
+    }
+}
+
+/// Whether the daemon supports `plugin.index.apply` (refresh). A daemon that
+/// reports `package_install_index_supported` without it has no stored index:
+/// by-id installs there fetch the index directly.
+async fn apply_supported(client: &mut Client) -> Result<bool, CliError> {
+    Ok(client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?
+        .package_index_apply_supported)
+}
+
 async fn run_update(args: &UpdateArgs) -> Result<(), CliError> {
+    let mut client = connect_ingest().await?;
     let source = Source::Archive {
         path: canonical_path(&args.archive, "file", Path::is_file)?,
         trust: trust(&args.trust)?,
     };
-    let mut client = connect_ingest().await?;
     require_index_support_for(&mut client, &source).await?;
     ingest_package(
         &mut client,

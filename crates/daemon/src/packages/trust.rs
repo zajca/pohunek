@@ -124,8 +124,9 @@ pub(super) fn verify_catalog_document(
 ///
 /// # Errors
 ///
-/// Returns [`PackageErrorKind::Untrusted`] for an index that fails
-/// verification.
+/// Returns [`PackageErrorKind::IndexRollback`] for an index below the
+/// recorded sequence or revocation marks and [`PackageErrorKind::Untrusted`]
+/// for any other index that fails verification.
 pub(super) fn verify_index_document(
     bytes: &[u8],
     endorser: &RootKey,
@@ -134,15 +135,14 @@ pub(super) fn verify_index_document(
     state: &IndexVerifierState,
     now: u64,
 ) -> Result<VerifiedIndex, PackageErrorKind> {
-    let base_revoked: BTreeSet<KeyId> = anchor
-        .inputs
-        .revoked
-        .union(catalog_state.revoked_key_ids())
-        .cloned()
-        .collect();
+    let base_revoked = verification_base_revoked(anchor, catalog_state);
     verify_index(bytes, endorser, &base_revoked, state, now).map_err(|error| {
         warn!(%error, "a plugin index was refused");
-        PackageErrorKind::Untrusted
+        match error {
+            package::IndexError::StaleSequence { .. }
+            | package::IndexError::StaleRevocation { .. } => PackageErrorKind::IndexRollback,
+            _ => PackageErrorKind::Untrusted,
+        }
     })
 }
 
@@ -318,6 +318,46 @@ pub(super) fn core_version() -> Result<Version, PackageErrorKind> {
 /// not name.
 pub(super) fn host_platform() -> Result<String, PackageErrorKind> {
     package::host_platform().ok_or(PackageErrorKind::Incompatible)
+}
+
+/// Maps an `IndexError` to the `plugin.index.apply` error kind.
+pub(crate) fn index_apply_kind(error: package::IndexError) -> PackageErrorKind {
+    use package::IndexError as E;
+    match error {
+        E::Expired => PackageErrorKind::IndexExpired,
+        E::StaleSequence { .. } | E::StaleRevocation { .. } => PackageErrorKind::IndexRollback,
+        _ => PackageErrorKind::IndexInvalid,
+    }
+}
+
+/// Shared verification inputs: anchor revoked keys union catalog-state
+/// revoked keys. Apply, install and doctor verify through this one source.
+pub(crate) fn verification_base_revoked(
+    anchor: &HostTrustAnchor,
+    catalog_state: &CatalogState,
+) -> BTreeSet<KeyId> {
+    anchor
+        .inputs
+        .revoked
+        .union(catalog_state.revoked_key_ids())
+        .cloned()
+        .collect()
+}
+
+/// Verifies a staged index for `plugin.index.apply`, mapping failures to the
+/// new codes. Callers compare the returned sequence against the persisted
+/// marks before storing (`record_index` silently returns current on a
+/// below-mark document).
+pub(super) fn verify_index_for_apply(
+    bytes: &[u8],
+    endorser: &RootKey,
+    anchor: &HostTrustAnchor,
+    catalog_state: &CatalogState,
+    state: &IndexVerifierState,
+    now: u64,
+) -> Result<VerifiedIndex, PackageErrorKind> {
+    let base_revoked = verification_base_revoked(anchor, catalog_state);
+    verify_index(bytes, endorser, &base_revoked, state, now).map_err(index_apply_kind)
 }
 
 #[cfg(test)]

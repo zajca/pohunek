@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::{archive_bytes, entry, mode_of, sample_entries, set_mode, PluginFixture};
 use package::install::{install_archive, InstallError};
 use package::registry::{
-    IncompatibleReason, InstallRequest, InstallStatus, PackageSource, Registry, RegistryError,
-    RetainedDigests, RetainedState,
+    IncompatibleReason, InstallRequest, InstallStatus, PackageProvenance, PackageSource, Registry,
+    RegistryError, RetainedDigests, RetainedState,
 };
 use package::verify::VerifyError;
 use package::{read_archive, ArchiveEntry, Limits, PackageDigest};
@@ -67,6 +67,7 @@ fn request(sample: &Sample) -> InstallRequest<'_> {
         expected: &sample.digest,
         identity: sample.identity.clone(),
         source: PackageSource::ExplicitDigest,
+        provenance: PackageProvenance::Local,
         enabled: true,
         select: false,
         installed_at_unix_seconds: 1_700_000_000,
@@ -848,7 +849,7 @@ fn an_unsupported_schema_version_is_reported() {
     let text = std::fs::read_to_string(fixture.registry_file()).unwrap();
     std::fs::write(
         fixture.registry_file(),
-        text.replace("\"schema\":1", "\"schema\":2"),
+        text.replace("\"schema\":2", "\"schema\":99"),
     )
     .unwrap();
 

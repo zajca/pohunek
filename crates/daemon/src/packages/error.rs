@@ -41,6 +41,21 @@ pub(super) fn registry_kind(error: &RegistryError) -> PackageErrorKind {
     }
 }
 
+/// The error kind of a failure to read `index-state.json`.
+///
+/// A damaged, unsupported or unsafe (wrong mode or owner) file is never
+/// `package_registry_failed`: the host stays fail-closed with a code that
+/// names the file, and an operator repairs it explicitly.
+#[must_use]
+pub(super) fn index_state_kind(error: &RegistryError) -> PackageErrorKind {
+    match error {
+        RegistryError::Corrupt | RegistryError::UnsupportedSchema | RegistryError::Unsafe => {
+            PackageErrorKind::IndexStateUnreadable
+        }
+        other => registry_kind(other),
+    }
+}
+
 /// The error kind of a package that cannot be loaded.
 #[must_use]
 pub(super) fn rejection_kind(rejection: &PackageRejection) -> PackageErrorKind {

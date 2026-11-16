@@ -147,6 +147,7 @@ fn capabilities() -> Value {
         package_install_index_supported: false,
         package_bind_profile_expected_supported: true,
         package_install_index_context_supported: false,
+        package_index_apply_supported: false,
         package_create_profile_supported: true,
         package_create_profile_options_supported: true,
         package_create_preset_supported: true,

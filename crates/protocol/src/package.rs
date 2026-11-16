@@ -788,6 +788,45 @@ pub struct PackageInspectResult {
     pub commands_only: bool,
 }
 
+/// Parameters for `plugin.index.apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PluginIndexApplyParams.ts"))]
+pub struct PluginIndexApplyParams {
+    /// Absolute path of the staged plugin index document on the daemon host.
+    pub index_path: String,
+    /// Replace a damaged `index-state.json` (explicit operator step).
+    /// Defaults to `false`; when absent the field is omitted on the wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repair_state: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if expects &bool"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Result of `plugin.index.apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PluginIndexApplyResult.ts"))]
+pub struct PluginIndexApplyResult {
+    /// The recorded index sequence.
+    pub sequence: u64,
+    /// The schema of the stored document.
+    pub schema_version: u64,
+    /// Unix second from which the stored document expires.
+    pub expires_at: u64,
+    /// Number of entries the stored document lists.
+    pub entries: u64,
+    /// Daemon-clock second the document was stored at.
+    pub stored_at: u64,
+}
+
 /// Parameters for `package.doctor`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -993,6 +1032,17 @@ pub enum PackageErrorKind {
     /// catalog-authorized packages are refused and no catalog can be recorded
     /// until it is repaired.
     RevocationsUnreadable,
+    /// The staged plugin index is invalid or unverifiable.
+    IndexInvalid,
+    /// The staged plugin index is expired.
+    IndexExpired,
+    /// The staged plugin index is older than the recorded high-water mark.
+    IndexRollback,
+    /// The host has no stored plugin index to apply.
+    IndexChannelMissing,
+    /// The plugin index state file cannot be read, so the reserved runtime
+    /// ids cannot be checked and a local install is refused fail-closed.
+    IndexStateUnreadable,
 }
 
 impl PackageErrorKind {
@@ -1042,9 +1092,15 @@ impl PackageErrorKind {
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
             Self::Revoked => "package_revoked",
             Self::RevocationsUnreadable => "package_revocations_unreadable",
+            Self::IndexInvalid => "package_index_invalid",
+            Self::IndexExpired => "package_index_expired",
+            Self::IndexRollback => "package_index_rollback",
+            Self::IndexChannelMissing => "package_index_channel_missing",
+            Self::IndexStateUnreadable => "package_index_state_unreadable",
         }
     }
 
+    #[allow(clippy::too_many_lines, reason = "one match arms per error kind")]
     const fn message(self) -> &'static str {
         match self {
             Self::LocalOnly => {
@@ -1141,6 +1197,13 @@ impl PackageErrorKind {
             Self::RevocationsUnreadable => {
                 "the recorded revoked package digests cannot be read, so catalog-authorized packages are refused"
             }
+            Self::IndexInvalid => "the plugin index is invalid or unverifiable",
+            Self::IndexExpired => "the plugin index has expired",
+            Self::IndexRollback => "the plugin index is older than the recorded one",
+            Self::IndexChannelMissing => "this host has no plugin index channel file beside the daemon executable",
+            Self::IndexStateUnreadable => {
+                "the plugin index state cannot be read, so the reserved runtime ids cannot be checked"
+            },
         }
     }
 
@@ -1223,6 +1286,12 @@ impl PackageErrorKind {
             Self::RevocationsUnreadable => {
                 "fix the mode or owner of `revoked-digests.json` in the plugin root, or restore a copy of it, then retry; a damaged file, or one a newer release wrote, is cleared by removing it and installing the latest release catalog again, which records its revocations anew (a revocation that no later catalog repeats is lost)"
             }
+            Self::IndexInvalid => "stage a signed plugin index document and apply it again",
+            Self::IndexExpired | Self::IndexRollback => "refresh the plugin index with `pohunek plugin index refresh`",
+            Self::IndexChannelMissing => "run `pohunek plugin index refresh`, or install with an explicit digest instead",
+            Self::IndexStateUnreadable => {
+                "run `pohunek plugin index refresh --repair-state` to replace the damaged state file, then retry; fix a wrong mode or owner first"
+            },
         }
     }
 

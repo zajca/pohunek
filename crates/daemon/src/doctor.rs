@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hostcheck::{OverlayChecks, StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
+use package::registry::{PackageProvenance, RetainedDigests};
 use protocol::{
     DoctorCheck, DoctorReport, DoctorStatus, IntegrationDoctorParams, IntegrationFindingCode,
     IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
@@ -70,8 +71,10 @@ pub(crate) async fn report(
     root_findings: &crate::session::rights::RootFindings,
     probe_clock: &ProbeClock,
     probe_budget: Duration,
+    referenced: Option<&RetainedDigests>,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
+    let doctor_paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
     let overlay_diagnostics = overlays.diagnostics.to_vec();
     let overlays_from_file = overlays.from_file;
@@ -117,6 +120,7 @@ pub(crate) async fn report(
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
     checks.extend(index_channel_check(catalog_trust));
+    checks.push(plugin_index_check(&doctor_paths, catalog_trust, referenced));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
     checks.push(session_rights_check(worker_units, root_findings));
@@ -1120,6 +1124,201 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
     DoctorCheck::new(name, status, detail)
 }
 
+/// The check for the stored plugin index: verified bytes, freshness and
+/// accumulated reserved ids. Read-only; launching and running sessions are
+/// never affected by a stored-index fault (warning only), while a revoked or
+/// malformed stored document fails the check.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one doctor table branch per stored-index state"
+)]
+fn plugin_index_check(
+    paths: &Paths,
+    catalog_trust: &CatalogTrust,
+    referenced: Option<&RetainedDigests>,
+) -> DoctorCheck {
+    const CHECK: &str = "plugin_index";
+    const INVALID: &str = "package_index_invalid: run `pohunek plugin index refresh`";
+    const STALE: &str = "stale: run `pohunek plugin index refresh`";
+    let CatalogTrust::Loaded(anchor) = catalog_trust else {
+        return check(CHECK, DoctorStatus::Ok, "not_used");
+    };
+    let plugins_dir = paths.plugins_dir();
+    let Ok(Some(store)) = crate::agent::host::PackageStore::open_existing(&plugins_dir) else {
+        return check(CHECK, DoctorStatus::Ok, "not_used");
+    };
+    let registry = store.registry();
+    let Ok(state) = registry.state() else {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    };
+    let has_index_origin = state
+        .packages()
+        .iter()
+        .any(|r| r.provenance() == PackageProvenance::Index);
+    let mut stored: Option<package::StoredIndex> = None;
+    let mut unreadable = false;
+    for schema in [1u64, 2u64] {
+        match registry.stored_index(schema) {
+            Ok(found) => {
+                if let Some(found) = found {
+                    if stored
+                        .as_ref()
+                        .is_none_or(|s: &package::StoredIndex| found.stored_at > s.stored_at)
+                    {
+                        stored = Some(found);
+                    }
+                }
+            }
+            Err(_) => unreadable = true,
+        }
+    }
+    // Unreadable stored bytes (oversized, damaged sidecar, wrong mode) is
+    // `index_invalid`, never `not_used`.
+    if unreadable {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    }
+    let Some(stored) = stored else {
+        return if has_index_origin {
+            check(
+                CHECK,
+                DoctorStatus::Warn,
+                "not_refreshed: run `pohunek plugin index refresh`",
+            )
+        } else {
+            check(CHECK, DoctorStatus::Ok, "not_used")
+        };
+    };
+    if stored.bytes.len() > package::MAX_INDEX_BYTES {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    // Missing endorser with a stored document: a stored copy exists, so the
+    // missing channel file does not hide it (no silent stale).
+    let endorser = match anchor.index() {
+        crate::catalog_anchor::IndexTrust::Loaded(endorser) => endorser.as_ref(),
+        _ => return check(CHECK, DoctorStatus::Warn, STALE),
+    };
+    let Ok(catalog_state) = registry.catalog_state() else {
+        return check(CHECK, DoctorStatus::Fail, INVALID);
+    };
+    let Ok(index_state) = registry.index_state() else {
+        return check(
+            CHECK,
+            DoctorStatus::Fail,
+            "package_index_state_unreadable: run `pohunek plugin index refresh --repair-state`; fix wrong mode/owner first",
+        );
+    };
+    // One verification-input source for apply, install and doctor.
+    let base = crate::packages::verification_base_revoked(anchor, &catalog_state);
+    let verified = package::verify_index(&stored.bytes, endorser, &base, &index_state, now);
+    let verified = match verified {
+        Ok(v) => v,
+        Err(error) => {
+            return match error {
+                package::IndexError::Expired => check(
+                    CHECK,
+                    DoctorStatus::Warn,
+                    "package_index_expired: installed packages keep working",
+                ),
+                package::IndexError::StaleSequence { .. }
+                | package::IndexError::StaleRevocation { .. } => {
+                    check(CHECK, DoctorStatus::Warn, STALE)
+                }
+                _ => check(CHECK, DoctorStatus::Fail, INVALID),
+            };
+        }
+    };
+    // Delisted: index-origin installed digest no longer listed under its id.
+    // The index has no per-digest revocation, so an unlisted digest is the
+    // only withdrawal signal. The selected digest fails; an unselected one
+    // that a profile pin or a retained session still references warns; an
+    // unselected unreferenced one is superseded and not reported. When the
+    // referencing sessions cannot be listed, every unselected digest counts as
+    // referenced. Catalog-origin (bundled codex/claude/hermes) records are
+    // never checked here: the release catalog is a separate document family.
+    let mut failed: Option<(String, String)> = None;
+    let mut warned: Option<(String, String)> = None;
+    for record in state.packages() {
+        if record.provenance() != PackageProvenance::Index {
+            continue;
+        }
+        let digest = record.digest();
+        let listed = verified
+            .entries()
+            .iter()
+            .any(|e| e.package_id == record.identity().id && e.digest == *digest);
+        if listed {
+            continue;
+        }
+        let named = (
+            record.identity().id.to_string(),
+            record.identity().version.to_string(),
+        );
+        let selected = state
+            .selected(&record.identity().id)
+            .is_none_or(|selected| selected == digest);
+        if selected {
+            failed.get_or_insert(named);
+        } else if referenced.is_none_or(|retained| retained.contains(digest)) {
+            warned.get_or_insert(named);
+        }
+    }
+    if let Some((id, ver)) = failed {
+        return check(
+            CHECK,
+            DoctorStatus::Fail,
+            &format!("package_revoked: {id}@{ver}: run `pohunek plugin update {id}` or remove it"),
+        );
+    }
+    if let Some((id, ver)) = warned {
+        return check(
+            CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "package_revoked: {id}@{ver} is not selected but still referenced: remove the profile pin or end the session that uses it"
+            ),
+        );
+    }
+    // Reserved: local (ExplicitDigest/Link) holding a reserved runtime id.
+    // The declared runtime id from the descriptor is used, not the package
+    // id suffix: a community package cannot hide by renaming its id.
+    // An unreadable descriptor is a package fault reported elsewhere; here
+    // it is not treated as reserved.
+    let reserved = &index_state.reserved_runtime_ids;
+    let mut reserved_hit: Option<(String, String)> = None;
+    for record in state.packages() {
+        if record.provenance() != PackageProvenance::Local {
+            continue;
+        }
+        let Ok(descriptor) = store.read_descriptor(record.digest(), record.identity()) else {
+            continue;
+        };
+        let Some(runtime_def) = descriptor.runtime() else {
+            continue;
+        };
+        let runtime = runtime_def.runtime_id();
+        if crate::packages::is_reserved_runtime_id(reserved, runtime) {
+            reserved_hit = Some((record.identity().id.to_string(), runtime.to_string()));
+            break;
+        }
+    }
+    if let Some((id, rt)) = reserved_hit {
+        return check(
+            CHECK,
+            DoctorStatus::Warn,
+            &format!("runtime_id_reserved_by_official: {id} runtime {rt}"),
+        );
+    }
+    let fresh = now.saturating_sub(stored.stored_at) <= package::index_store::STORED_INDEX_MAX_AGE;
+    if fresh {
+        check(CHECK, DoctorStatus::Ok, "current")
+    } else {
+        check(CHECK, DoctorStatus::Warn, STALE)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1277,6 +1476,7 @@ mod tests {
             &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
+            None,
         )
         .await
         .expect("doctor report");
@@ -1362,6 +1562,7 @@ mod tests {
             &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
+            None,
         )
         .await
         .expect("doctor report");

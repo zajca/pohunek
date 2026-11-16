@@ -52,6 +52,13 @@ pub(super) async fn handle_daemon_doctor(
     };
     let overlay_diagnostics =
         pohunek_client::diagnose_overlays(overlays, hostcheck::OVERLAY_PROBE_BUDGET).await;
+    let referenced = match sessions.retained_package_pins().await {
+        Ok(pins) => Some(pins.into_known()),
+        Err(error) => {
+            tracing::warn!(%error, "the sessions that pin packages cannot be listed");
+            None
+        }
+    };
     match crate::doctor::report(
         &paths,
         governance,
@@ -69,6 +76,7 @@ pub(super) async fn handle_daemon_doctor(
         &sessions.root_findings().await,
         sessions.probe_clock(),
         sessions.doctor_probe_budget(),
+        referenced.as_ref(),
     )
     .await
     {

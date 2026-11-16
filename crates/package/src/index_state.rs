@@ -20,13 +20,18 @@
 // Rust guideline compliant 2026-10-04
 
 use std::io::ErrorKind;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use pohunek_platform::filesystem::FsError;
 use serde::{Deserialize, Serialize};
 
+use protocol::RuntimeId;
+
 use crate::catalog::{KeyId, MAX_REVOKED_KEYS};
+use crate::index_store::MAX_RESERVED_RUNTIME_IDS;
 use crate::layout::FILE_MODE;
-use crate::plugin_index::{IndexVerifierState, VerifiedIndex};
+use crate::plugin_index::{IndexEntryKind, IndexVerifierState, VerifiedIndex};
 use crate::registry::{registry_fs, replace_failure, Registry, RegistryError};
 
 /// Name of the index state file inside the plugin root.
@@ -36,8 +41,12 @@ const INDEX_STATE_NAME: &str = "index-state.json";
 /// [`INDEX_STATE_NAME`].
 const INDEX_STATE_TEMP_NAME: &str = "index-state.json.tmp";
 
-/// Schema version of the state file this crate reads and writes.
-const INDEX_STATE_SCHEMA: u32 = 1;
+/// How many preserved copies of a damaged state file one second may hold.
+const MAX_DAMAGED_COPIES: u32 = 64;
+
+/// Writes schema 2; reads schema 1 and 2.
+const INDEX_STATE_SCHEMA: u32 = 2;
+const INDEX_STATE_SCHEMA_V1: u32 = 1;
 
 /// Largest accepted state file: 16 KiB.
 ///
@@ -56,6 +65,8 @@ struct StateFile {
     index_high_water: Option<u64>,
     revocation_high_water: Option<u64>,
     revoked_key_ids: Vec<KeyId>,
+    #[serde(default)]
+    reserved_runtime_ids: Vec<String>,
 }
 
 impl Registry {
@@ -81,6 +92,99 @@ impl Registry {
             Err(error) => return Err(registry_fs(&error)),
         };
         parse_state(&bytes)
+    }
+
+    /// Explicit repair of a damaged (corrupt or unsupported-schema)
+    /// `index-state.json`.
+    ///
+    /// The new state is the union of `verified` and every document in
+    /// `stored`: both marks are the largest sequence among them and the
+    /// revoked key ids and reserved runtime ids are united, so a repair never
+    /// lowers what a verified stored copy already established. The new file
+    /// is committed atomically; the damaged bytes are copied beside it, with the
+    /// same mode, as `index-state.json.damaged-<unix-ts>` before the commit, so
+    /// no moment exists without a state file.
+    ///
+    /// A healthy file takes the ordinary [`Registry::record_index`] path, and
+    /// an unsafe one (wrong mode or owner) is returned as
+    /// [`RegistryError::Unsafe`] untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Busy`] while another writer holds the lock,
+    /// [`RegistryError::Unsafe`], the limit errors of
+    /// [`Registry::record_index`] and [`RegistryError::Filesystem`] when the
+    /// damaged file cannot be preserved; the damaged file stays in place on
+    /// every error except [`RegistryError::CommitUncertain`].
+    pub fn repair_index_state(
+        &self,
+        verified: &VerifiedIndex,
+        stored: &[VerifiedIndex],
+    ) -> Result<IndexVerifierState, RegistryError> {
+        match self.index_state() {
+            Ok(_) => return self.record_index(verified),
+            Err(RegistryError::Corrupt | RegistryError::UnsupportedSchema) => {}
+            Err(error) => return Err(error),
+        }
+        let _lock = self.acquire_lock()?;
+        self.remove_stale_temporary(INDEX_STATE_TEMP_NAME)?;
+        let documents: Vec<&VerifiedIndex> = stored.iter().chain([verified]).collect();
+        let merged = merged_with(&IndexVerifierState::default(), &documents)?;
+        let bytes = encode_state(&merged)?;
+        self.preserve_damaged_state()?;
+        self.root
+            .replace_file(INDEX_STATE_NAME, INDEX_STATE_TEMP_NAME, &bytes, FILE_MODE)
+            .map_err(replace_failure)?;
+        Ok(merged)
+    }
+
+    /// Copies the current state file, with its mode, to a fresh
+    /// `index-state.json.damaged-<unix-ts>[-<n>]` name that never replaces an
+    /// earlier preserved copy.
+    fn preserve_damaged_state(&self) -> Result<(), RegistryError> {
+        let filesystem = |error: std::io::Error| RegistryError::Filesystem { kind: error.kind() };
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        let root = self.root.path();
+        let mut source = std::fs::File::open(root.join(INDEX_STATE_NAME)).map_err(filesystem)?;
+        let mode = source.metadata().map_err(filesystem)?.permissions().mode() & 0o777;
+        for attempt in 0..MAX_DAMAGED_COPIES {
+            let name = if attempt == 0 {
+                format!("{INDEX_STATE_NAME}.damaged-{seconds}")
+            } else {
+                format!("{INDEX_STATE_NAME}.damaged-{seconds}-{attempt}")
+            };
+            let copy = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(root.join(name));
+            match copy {
+                Ok(mut copy) => {
+                    std::io::copy(&mut source, &mut copy).map_err(filesystem)?;
+                    return copy.sync_all().map_err(filesystem);
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(filesystem(error)),
+            }
+        }
+        Err(RegistryError::Filesystem {
+            kind: ErrorKind::AlreadyExists,
+        })
+    }
+
+    /// The verifier state implied by already verified documents: the larger
+    /// marks, the united revoked key ids and the united reserved runtime ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns the limit errors of [`Registry::record_index`].
+    pub fn state_of_documents(
+        documents: &[VerifiedIndex],
+    ) -> Result<IndexVerifierState, RegistryError> {
+        let refs: Vec<&VerifiedIndex> = documents.iter().collect();
+        merged_with(&IndexVerifierState::default(), &refs)
     }
 
     /// Merges a verified index into the persisted state and returns the state
@@ -114,33 +218,73 @@ impl Registry {
         {
             return Ok(current);
         }
-        let mut merged = current.clone();
-        merged.index_high_water = Some(raised(current.index_high_water, verified.sequence()));
-        merged.revocation_high_water = Some(raised(
-            current.revocation_high_water,
-            verified.revocation_sequence(),
-        ));
-        merged
-            .revoked_key_ids
-            .extend(verified.revoked_key_ids().iter().cloned());
-        if merged.revoked_key_ids.len() > MAX_REVOKED_KEYS {
-            return Err(RegistryError::TooManyRevokedKeys);
-        }
+        let merged = merged_with(&current, &[verified])?;
         if merged == current {
             return Ok(current);
         }
-        let file = StateFile {
-            schema: INDEX_STATE_SCHEMA,
-            index_high_water: merged.index_high_water,
-            revocation_high_water: merged.revocation_high_water,
-            revoked_key_ids: merged.revoked_key_ids.iter().cloned().collect(),
-        };
-        let bytes = serde_json::to_vec(&file).map_err(|_cause| RegistryError::Corrupt)?;
+        let bytes = encode_state(&merged)?;
         self.root
             .replace_file(INDEX_STATE_NAME, INDEX_STATE_TEMP_NAME, &bytes, FILE_MODE)
             .map_err(replace_failure)?;
         Ok(merged)
     }
+}
+
+/// `base` raised by every document: marks become the larger value, revoked key
+/// ids and reserved runtime ids are united.
+fn merged_with(
+    base: &IndexVerifierState,
+    documents: &[&VerifiedIndex],
+) -> Result<IndexVerifierState, RegistryError> {
+    let mut merged = base.clone();
+    let mut reserved: Vec<RuntimeId> = merged.reserved_runtime_ids.iter().cloned().collect();
+    for document in documents {
+        merged.index_high_water = Some(raised(merged.index_high_water, document.sequence()));
+        merged.revocation_high_water = Some(raised(
+            merged.revocation_high_water,
+            document.revocation_sequence(),
+        ));
+        merged
+            .revoked_key_ids
+            .extend(document.revoked_key_ids().iter().cloned());
+        reserved.extend(
+            document
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind() == IndexEntryKind::Runtime)
+                .filter_map(|entry| entry.runtime_id.clone()),
+        );
+    }
+    if merged.revoked_key_ids.len() > MAX_REVOKED_KEYS {
+        return Err(RegistryError::TooManyRevokedKeys);
+    }
+    reserved.sort();
+    reserved.dedup();
+    if reserved.len() > MAX_RESERVED_RUNTIME_IDS {
+        return Err(RegistryError::TooManyReservedRuntimeIds);
+    }
+    merged.reserved_runtime_ids = reserved.into_iter().collect();
+    Ok(merged)
+}
+
+/// Serializes `state` as the state file, within [`MAX_INDEX_STATE_BYTES`].
+fn encode_state(state: &IndexVerifierState) -> Result<Vec<u8>, RegistryError> {
+    let file = StateFile {
+        schema: INDEX_STATE_SCHEMA,
+        index_high_water: state.index_high_water,
+        revocation_high_water: state.revocation_high_water,
+        revoked_key_ids: state.revoked_key_ids.iter().cloned().collect(),
+        reserved_runtime_ids: state
+            .reserved_runtime_ids
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&file).map_err(|_cause| RegistryError::Corrupt)?;
+    if bytes.len() > MAX_INDEX_STATE_BYTES {
+        return Err(RegistryError::TooManyReservedRuntimeIds);
+    }
+    Ok(bytes)
 }
 
 /// The larger of a stored mark and a document sequence.
@@ -156,7 +300,7 @@ fn parse_state(bytes: &[u8]) -> Result<IndexVerifierState, RegistryError> {
         schema: u32,
     }
     let header: Header = serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
-    if header.schema != INDEX_STATE_SCHEMA {
+    if header.schema != INDEX_STATE_SCHEMA && header.schema != INDEX_STATE_SCHEMA_V1 {
         return Err(RegistryError::UnsupportedSchema);
     }
     let file: StateFile = serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
@@ -164,12 +308,27 @@ fn parse_state(bytes: &[u8]) -> Result<IndexVerifierState, RegistryError> {
         .revoked_key_ids
         .windows(2)
         .all(|pair| pair[0] < pair[1]);
-    if file.revoked_key_ids.len() > MAX_REVOKED_KEYS || !ordered {
+    let reserved_ordered = file
+        .reserved_runtime_ids
+        .windows(2)
+        .all(|pair| pair[0] < pair[1]);
+    if file.revoked_key_ids.len() > MAX_REVOKED_KEYS
+        || !ordered
+        || file.reserved_runtime_ids.len() > MAX_RESERVED_RUNTIME_IDS
+        || !reserved_ordered
+    {
         return Err(RegistryError::Corrupt);
     }
+    let reserved: Result<std::collections::BTreeSet<RuntimeId>, _> = file
+        .reserved_runtime_ids
+        .iter()
+        .map(|text| RuntimeId::parse(text))
+        .collect();
+    let reserved = reserved.map_err(|_cause| RegistryError::Corrupt)?;
     Ok(IndexVerifierState {
         index_high_water: file.index_high_water,
         revocation_high_water: file.revocation_high_water,
         revoked_key_ids: file.revoked_key_ids.into_iter().collect(),
+        reserved_runtime_ids: reserved,
     })
 }

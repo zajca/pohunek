@@ -181,6 +181,7 @@ pub(crate) fn verify_whole(args: &VerifyIndexArgs, now: u64) -> Result<IndexVeri
         index_high_water: args.index_high_water,
         revocation_high_water: args.revocation_high_water,
         revoked_key_ids: BTreeSet::new(),
+        reserved_runtime_ids: BTreeSet::new(),
     };
     let verified = verify_index(
         &read_index(&args.index)?,

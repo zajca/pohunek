@@ -16,7 +16,7 @@
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
 use package::{
     archive_digest, build_archive, read_archive, AnchorFile, ArchiveEntry, CatalogEntry,
@@ -279,6 +279,17 @@ impl Install {
 
     /// Runs `pohunek <arguments> --json` and returns the exit code and the
     /// single JSON document on stdout.
+    pub(crate) async fn run_with_env(&self, arguments: &[&str], extra: &[(&str, &str)]) -> Output {
+        let mut command = self
+            .env
+            .tokio_command(pohunek_test_support::bin_exe("pohunek"));
+        command.args(arguments).envs(extra.iter().copied());
+        tokio::time::timeout(std::time::Duration::from_secs(120), command.output())
+            .await
+            .expect("timeout")
+            .expect("run pohunek")
+    }
+
     pub(crate) async fn json(&self, arguments: &[&str]) -> (i32, Value) {
         let mut all = arguments.to_vec();
         all.push("--json");

@@ -10,7 +10,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use package::registry::{InstallRequest, PackageSource, Registry};
+use package::registry::{InstallRequest, PackageProvenance, PackageSource, Registry};
 use protocol::{PackageId, PackageIdentity, PackageVersion};
 
 use super::assets;
@@ -196,6 +196,7 @@ fn install_official_hermes(plugins: &Path) {
             expected: &digest,
             identity,
             source: PackageSource::Official,
+            provenance: PackageProvenance::Catalog,
             enabled: true,
             select: true,
             installed_at_unix_seconds: 0,

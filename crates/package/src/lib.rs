@@ -76,7 +76,9 @@ pub mod directory;
 #[cfg(unix)]
 mod hash;
 #[cfg(unix)]
-mod index_state;
+pub mod index_state;
+#[cfg(unix)]
+pub mod index_store;
 #[cfg(unix)]
 pub mod install;
 #[cfg(unix)]
@@ -112,6 +114,7 @@ pub use index_channel::{
     parse_index_channel, IndexChannel, IndexChannelError, INDEX_CHANNEL_FILE_NAME,
     INDEX_CHANNEL_SCHEMA_VERSION, MAX_INDEX_CHANNEL_BYTES,
 };
+pub use index_store::StoredIndex;
 pub use limits::{
     Limits, MAX_COMPRESSED_BYTES, MAX_EXPANDED_BYTES, MAX_EXPANSION_RATIO, MAX_FILES,
     MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_WINDOW_BYTES,
