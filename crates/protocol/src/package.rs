@@ -796,6 +796,18 @@ pub struct PackageInspectResult {
 pub struct PluginIndexApplyParams {
     /// Absolute path of the staged plugin index document on the daemon host.
     pub index_path: String,
+    /// Replace a damaged `index-state.json` (explicit operator step).
+    /// Defaults to `false`; when absent the field is omitted on the wire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub repair_state: bool,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if expects &bool"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Result of `plugin.index.apply`.
@@ -1080,11 +1092,11 @@ impl PackageErrorKind {
             Self::CommandsClientUnsupported => "package_commands_client_unsupported",
             Self::Revoked => "package_revoked",
             Self::RevocationsUnreadable => "package_revocations_unreadable",
-            Self::IndexInvalid => "index_invalid",
-            Self::IndexExpired => "index_expired",
-            Self::IndexRollback => "index_rollback",
-            Self::IndexChannelMissing => "index_channel_missing",
-            Self::IndexStateUnreadable => "index_state_unreadable",
+            Self::IndexInvalid => "package_index_invalid",
+            Self::IndexExpired => "package_index_expired",
+            Self::IndexRollback => "package_index_rollback",
+            Self::IndexChannelMissing => "package_index_channel_missing",
+            Self::IndexStateUnreadable => "package_index_state_unreadable",
         }
     }
 
@@ -1278,7 +1290,7 @@ impl PackageErrorKind {
             Self::IndexExpired | Self::IndexRollback => "refresh the plugin index with `pohunek plugin index refresh`",
             Self::IndexChannelMissing => "run `pohunek plugin index refresh`, or install with an explicit digest instead",
             Self::IndexStateUnreadable => {
-                "run `pohunek plugin index refresh` to restore a readable state file, then retry"
+                "run `pohunek plugin index refresh --repair-state` to replace the damaged state file, then retry; fix a wrong mode or owner first"
             },
         }
     }

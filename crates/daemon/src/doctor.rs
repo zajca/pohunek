@@ -1133,7 +1133,7 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
 )]
 fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorCheck {
     const CHECK: &str = "plugin_index";
-    const INVALID: &str = "index_invalid: run `pohunek plugin index refresh`";
+    const INVALID: &str = "package_index_invalid: run `pohunek plugin index refresh`";
     const STALE: &str = "stale: run `pohunek plugin index refresh`";
     let CatalogTrust::Loaded(anchor) = catalog_trust else {
         return check(CHECK, DoctorStatus::Ok, "not_used");
@@ -1202,7 +1202,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         return check(
             CHECK,
             DoctorStatus::Fail,
-            "index_state_unreadable: run `pohunek plugin index refresh`",
+            "package_index_state_unreadable: run `pohunek plugin index refresh --repair-state`; fix wrong mode/owner first",
         );
     };
     // One verification-input source for apply, install and doctor.
@@ -1215,7 +1215,7 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
                 package::IndexError::Expired => check(
                     CHECK,
                     DoctorStatus::Warn,
-                    "index_expired: installed packages keep working",
+                    "package_index_expired: installed packages keep working",
                 ),
                 package::IndexError::StaleSequence { .. }
                 | package::IndexError::StaleRevocation { .. } => {

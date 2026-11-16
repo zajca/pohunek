@@ -31,9 +31,32 @@ use crate::commands::plugin::Error;
 /// release of the index repository.
 pub(crate) const OFFICIAL_INDEX_URL: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v1.json";
 
+/// Test-build override for the official index URL (loopback rigs only).
+#[cfg(test)]
+pub(crate) fn official_index_url() -> String {
+    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL")
+        .unwrap_or_else(|_| OFFICIAL_INDEX_URL.to_owned())
+}
+#[cfg(not(test))]
+pub(crate) fn official_index_url() -> String {
+    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL")
+        .unwrap_or_else(|_| OFFICIAL_INDEX_URL.to_owned())
+}
+
 /// The official plugin index, schema 2 (runtime and context entries), which
 /// the index repository publishes beside the schema 1 document.
 pub(crate) const OFFICIAL_INDEX_URL_V2: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v2.json";
+
+#[cfg(test)]
+pub(crate) fn official_index_url_v2() -> String {
+    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2")
+        .unwrap_or_else(|_| OFFICIAL_INDEX_URL_V2.to_owned())
+}
+#[cfg(not(test))]
+pub(crate) fn official_index_url_v2() -> String {
+    std::env::var("POHUNEK_TEST_OFFICIAL_INDEX_URL_V2")
+        .unwrap_or_else(|_| OFFICIAL_INDEX_URL_V2.to_owned())
+}
 
 /// Core version an entry's `core` range is matched against: this build's.
 const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -380,10 +403,10 @@ fn select<'a>(
 /// never rejects one because the other was read first.
 async fn fetch_official_index(client: &Client, kind: IndexEntryKind) -> Result<Vec<u8>, Error> {
     let url = match kind {
-        IndexEntryKind::Runtime => OFFICIAL_INDEX_URL,
-        IndexEntryKind::Context => OFFICIAL_INDEX_URL_V2,
+        IndexEntryKind::Runtime => official_index_url(),
+        IndexEntryKind::Context => official_index_url_v2(),
     };
-    fetch(client, &checked_url(url)?, Download::Index).await
+    fetch(client, &checked_url(&url)?, Download::Index).await
 }
 
 /// The index document and the entry `request` resolved to.

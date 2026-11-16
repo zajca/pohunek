@@ -106,7 +106,7 @@ struct Prepared {
     /// install.
     index: Option<VerifiedIndex>,
     /// Exact index bytes, stored alongside the marks so the stored copy
-    /// never stays below them (M1).
+    /// never stays below them .
     index_bytes: Option<Vec<u8>>,
 }
 
@@ -127,7 +127,7 @@ struct CommandsPrepared {
     /// install; only a context package authorized by the index has one.
     index: Option<VerifiedIndex>,
     /// Exact index bytes, stored alongside the marks so the stored copy
-    /// never stays below them (M1).
+    /// never stays below them .
     index_bytes: Option<Vec<u8>>,
 }
 
@@ -944,7 +944,10 @@ fn check_claim(
     )
     .map_err(|refusal| match refusal {
         ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
-        ClaimRefusal::Conflict => PackageErrorKind::RuntimeConflict,
+        ClaimRefusal::Conflict => {
+            warn!(runtime_id = %runtime_id, package = %package, "package_runtime_conflict");
+            PackageErrorKind::RuntimeConflict
+        }
     })
 }
 
@@ -1087,9 +1090,16 @@ fn prepare_archive(
             let catalog_state = registry
                 .catalog_state()
                 .map_err(|error| registry_kind(&error))?;
-            let index_state = registry
-                .index_state()
-                .map_err(|error| registry_kind(&error))?;
+            // A damaged/unreadable index state is `package_index_state_unreadable`,
+            // never `package_registry_failed` (fail-closed).
+            let index_state = registry.index_state().map_err(|error| match error {
+                RegistryError::Busy => PackageErrorKind::Busy,
+                RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
+                    PackageErrorKind::IndexStateUnreadable
+                }
+                RegistryError::Unsafe => PackageErrorKind::IndexStateUnreadable,
+                _ => PackageErrorKind::RegistryFailed,
+            })?;
             let candidate = prepare_indexed(
                 &IndexTrustInputs {
                     anchor,
@@ -1403,7 +1413,7 @@ struct Install {
     /// install.
     index: Option<VerifiedIndex>,
     /// Exact index bytes, stored alongside the marks so the stored copy
-    /// never stays below them (M1).
+    /// never stays below them .
     index_bytes: Option<Vec<u8>>,
     /// The integration the package declares; none for a package without a
     /// runtime.
@@ -1589,7 +1599,7 @@ fn install_package(
         registry
             .record_index(index)
             .map_err(|error| registry_kind(&error))?;
-        // M1: the stored copy follows the marks in the same install, so a
+        // the stored copy follows the marks in the same install, so a
         // staged-index install never leaves the stored copy below them.
         if let Some(index_bytes) = index_bytes.as_ref() {
             let schema_version =
@@ -1700,6 +1710,7 @@ impl PackageService {
     /// [`PackageErrorKind::IndexRollback`] for a sequence below the recorded
     /// high-water marks, and [`PackageErrorKind::IndexChannelMissing`] when
     /// no index channel is loaded.
+    #[allow(clippy::too_many_lines, reason = "apply + repair in one transaction")]
     pub async fn package_index_apply(
         &self,
         params: PluginIndexApplyParams,
@@ -1713,9 +1724,24 @@ impl PackageService {
             let catalog_state = registry
                 .catalog_state()
                 .map_err(|error| registry_kind(&error))?;
-            let index_state = registry
-                .index_state()
-                .map_err(|error| registry_kind(&error))?;
+            // A damaged/unreadable index state is `package_index_state_unreadable`,
+            // never `package_registry_failed` (fail-closed).
+            let index_state = registry.index_state().map_err(|error| match error {
+                RegistryError::Busy => PackageErrorKind::Busy,
+                RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
+                    PackageErrorKind::IndexStateUnreadable
+                }
+                RegistryError::Unsafe => PackageErrorKind::IndexStateUnreadable,
+                _ => PackageErrorKind::RegistryFailed,
+            });
+            let repair = params.repair_state;
+            let index_state = match index_state {
+                Ok(state) => state,
+                Err(PackageErrorKind::IndexStateUnreadable) if repair => {
+                    package::IndexVerifierState::default()
+                }
+                Err(error) => return Err(error),
+            };
             let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
             let bytes = read_regular_file(&params.index_path, max)
                 .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
@@ -1743,10 +1769,51 @@ impl PackageService {
                 });
             let stored_at = unix_now()?;
             // Marks first, like the install path: if record_index fails, the
-            // stored document must not become newer than the marks.
-            registry
-                .record_index(&verified)
-                .map_err(|error| registry_kind(&error))?;
+            // stored document must not become newer than the marks. When
+            // `repair_state` is set and the state was damaged, repair moves
+            // the file aside and re-derives marks as max(fetched, stored).
+            if repair {
+                if registry.index_state().is_err() {
+                    let stored_verified = registry.stored_index(schema_version).ok().flatten();
+                    let stored_verified = match stored_verified {
+                        Some(stored) => {
+                            let state = package::IndexVerifierState::default();
+                            trust::verify_index_for_apply(
+                                &stored.bytes,
+                                endorser,
+                                anchor,
+                                &catalog_state,
+                                &state,
+                                stored_at,
+                            )
+                            .ok()
+                        }
+                        None => None,
+                    };
+                    let empty_state = package::IndexVerifierState::default();
+                    let stored_ref = stored_verified
+                        .as_ref()
+                        .map(|verified| (verified, &empty_state));
+                    registry.repair_index_state(&verified, stored_ref).map_err(
+                        |error| match error {
+                            RegistryError::Corrupt | RegistryError::UnsupportedSchema => {
+                                PackageErrorKind::IndexStateUnreadable
+                            }
+                            RegistryError::Unsafe => PackageErrorKind::IndexStateUnreadable,
+                            RegistryError::Busy => PackageErrorKind::Busy,
+                            other => registry_kind(&other),
+                        },
+                    )?;
+                } else {
+                    registry
+                        .record_index(&verified)
+                        .map_err(|error| registry_kind(&error))?;
+                }
+            } else {
+                registry
+                    .record_index(&verified)
+                    .map_err(|error| registry_kind(&error))?;
+            }
             registry
                 .store_index(schema_version, &verified, &bytes, stored_at)
                 .map_err(|error| registry_kind(&error))?;

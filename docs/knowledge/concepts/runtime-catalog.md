@@ -490,9 +490,9 @@ copy for that install. A local (`--sha256`/`link`) install whose declared
 runtime id is in `reserved_runtime_ids` is refused with
 `package_runtime_not_claimable` (data-driven, no package-id prefix check); a
 damaged `index-state.json` refuses the same way with
-`index_state_unreadable` until `pohunek plugin index refresh` repairs it.
-Doctor verifies the stored copy: `current`, `stale`, `index_expired`,
-`index_invalid`, `package_revoked` (index-provenance delisting only;
+`package_index_state_unreadable` until `pohunek plugin index refresh --repair-state` replaces it (plain refresh refuses a damaged file; wrong mode/owner gets a distinct detail).
+Doctor verifies the stored copy: `current`, `stale`, `package_index_expired`,
+`package_index_invalid`, `package_revoked` (index-provenance delisting only;
 catalog-provenance bundled runtimes are never checked here), or
 `runtime_id_reserved_by_official` (local-provenance holder of a reserved id).
 

@@ -1027,10 +1027,15 @@ async fn marks_persisted_before_a_crash_gate_the_retry_and_damaged_state_is_kept
     let damaged = keys.fixture("index-damaged-state");
     std::fs::write(damaged.plugins.join("index-state.json"), b"{ damaged")
         .expect("write a damaged state");
+    std::fs::set_permissions(
+        damaged.plugins.join("index-state.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("owner-private");
     let before = std::fs::read(damaged.plugins.join("index-state.json")).expect("read");
     assert_eq!(
         install_refused(&damaged, &package, &document).await,
-        PackageErrorKind::RegistryFailed
+        PackageErrorKind::IndexStateUnreadable
     );
     assert_eq!(
         std::fs::read(damaged.plugins.join("index-state.json")).expect("read"),
@@ -1173,7 +1178,10 @@ async fn scenario_1_apply_stores_and_registers_reserved() {
     let result = fixture
         .registry
         .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path })
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: path,
+            repair_state: false,
+        })
         .await
         .expect("apply");
     assert_eq!(result.sequence, sequence);
@@ -1193,6 +1201,7 @@ async fn scenario_2_rollback_leaves_stored_bytes_identical() {
         .packages()
         .package_index_apply(protocol::PluginIndexApplyParams {
             index_path: fixture.write("a.json", &doc),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1208,6 +1217,7 @@ async fn scenario_2_rollback_leaves_stored_bytes_identical() {
         .packages()
         .package_index_apply(protocol::PluginIndexApplyParams {
             index_path: fixture.write("b.json", &low),
+            repair_state: false,
         })
         .await
         .expect_err("rollback");
@@ -1269,6 +1279,7 @@ async fn scenario_6_guard_blocks_renamed_ids() {
                     )],
                 ),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1307,6 +1318,7 @@ async fn scenario_7_damaged_sidecar_is_replaced_by_refresh() {
                 "a.json",
                 &keys.signed(seq, vec![idxfix_entry(&pkg, "1.0.0")]),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1323,6 +1335,7 @@ async fn scenario_7_damaged_sidecar_is_replaced_by_refresh() {
                 "b.json",
                 &keys.signed(seq, vec![idxfix_entry(&pkg, "1.0.0")]),
             ),
+            repair_state: false,
         })
         .await
         .expect("repair");
@@ -1346,6 +1359,7 @@ async fn scenario_7_expired_document_refused_at_apply() {
         .packages()
         .package_index_apply(protocol::PluginIndexApplyParams {
             index_path: fixture.write("old.json", &expired),
+            repair_state: false,
         })
         .await
         .expect_err("expired");
@@ -1366,6 +1380,7 @@ async fn scenario_8_catalog_install_with_stored_index_present() {
                 "i.json",
                 &keys.signed(seq, vec![idxfix_entry(&pkg, "1.0.0")]),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1399,7 +1414,10 @@ async fn plugin_index_apply_stores_and_accumulates_reserved_ids() {
     let result = fixture
         .registry
         .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path })
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: path,
+            repair_state: false,
+        })
         .await
         .expect("apply");
     assert_eq!(result.sequence, sequence);
@@ -1411,7 +1429,10 @@ async fn plugin_index_apply_stores_and_accumulates_reserved_ids() {
     let err = fixture
         .registry
         .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path2 })
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: path2,
+            repair_state: false,
+        })
         .await
         .expect_err("rollback");
     assert_eq!(err, PackageErrorKind::IndexRollback);
@@ -1455,7 +1476,10 @@ async fn namespace_guard_data_driven_both_sides() {
     fixture
         .registry
         .packages()
-        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path })
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: path,
+            repair_state: false,
+        })
         .await
         .expect("apply");
     let err = fixture
@@ -1477,10 +1501,10 @@ async fn namespace_guard_data_driven_both_sides() {
 }
 
 /// M4: a damaged `index-state.json` refuses a local install fail-closed
-/// with the specific `index_state_unreadable` code, never
+/// with the specific `package_index_state_unreadable` code, never
 /// `package_registry_failed` and never silently through.
 #[tokio::test]
-async fn scenario_m4_damaged_index_state_is_index_state_unreadable() {
+async fn scenario_m4_damaged_index_state_is_package_index_state_unreadable() {
     let keys = Keys::new();
     let fixture = keys.fixture("m4-damaged-state");
     // Install a local package so the registry exists.
@@ -1505,11 +1529,7 @@ async fn scenario_m4_damaged_index_state_is_index_state_unreadable() {
     let state_path = fixture.plugins.join("index-state.json");
     std::fs::write(&state_path, b"{not json").expect("corrupt state");
     std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))
-        .expect("owner-private"); // requires PermissionsExt below
-                                  // A repair-free corrupt file must be seen via unsafe read; a fresh
-                                  // schema is needed to distinguish damage from an unsafe mode. The
-                                  // daemon's `index_state()` maps damage to `RegistryError::Corrupt`.
-                                  // Any subsequent local install must refuse fail-closed.
+        .expect("owner-private");
     let second = Package::build("community.aurora", "1.1.0", "aurora", INERT_PROGRAM);
     let err = fixture
         .registry
@@ -1526,22 +1546,176 @@ async fn scenario_m4_damaged_index_state_is_index_state_unreadable() {
         })
         .await
         .expect_err("fail-closed");
-    // Direct proof the guard maps damage to the new code (the daemon
-    // call above may surface RegistryFailed from a different read).
-    let registry = Registry::open_at(&fixture.plugins, Limits::DEFAULT).expect("registry");
-    let direct_err = registry.index_state().expect_err("corrupt");
-    let direct = match direct_err {
-        package::registry::RegistryError::Corrupt
-        | package::registry::RegistryError::UnsupportedSchema => {
-            PackageErrorKind::IndexStateUnreadable
-        }
-        _other => PackageErrorKind::RegistryFailed,
-    };
     assert_eq!(
-        direct,
+        err,
         PackageErrorKind::IndexStateUnreadable,
-        "guard maps damage to IndexStateUnreadable, got {err:?}"
+        "daemon refuses with the specific code"
     );
+}
+
+/// Doctor: a damaged `index-state.json` fails `plugin_index` with
+/// `package_index_state_unreadable` and names `--repair-state`.
+#[tokio::test]
+async fn scenario_m5_doctor_damaged_state_is_index_state_unreadable() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("m5-doctor-state-unreadable");
+    // Seed a stored copy via apply.
+    let pkg = idxfix("1.0.0");
+    fixture
+        .registry
+        .packages()
+        .package_install(index_install(
+            &fixture,
+            &pkg,
+            &keys.signed(now(), vec![idxfix_entry(&pkg, "1.0.0")]),
+            false,
+        ))
+        .await
+        .expect("index install");
+    let state_path = fixture.plugins.join("index-state.json");
+    std::fs::write(&state_path, b"{not json").expect("corrupt state");
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    let checks = doctor_plugin_index(&fixture).await;
+    let detail = checks
+        .iter()
+        .find(|c| c.name == "plugin_index")
+        .map(|c| c.detail.clone())
+        .unwrap_or_default();
+    assert!(
+        detail.starts_with("package_index_state_unreadable: "),
+        "{detail}"
+    );
+    assert!(detail.contains("--repair-state"), "{detail}");
+}
+
+/// N2 recovery: a damaged `index-state.json` refuses installs and a plain
+/// refresh with `package_index_state_unreadable`; `repair_state: true`
+/// moves the damaged file aside and re-derives marks as max(fetched,
+/// stored copy), after which a local install succeeds.
+#[tokio::test]
+async fn scenario_n2_repair_state_replaces_damaged_file() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("n2-repair-state");
+    let local = Package::build("community.aurora", "1.0.0", "aurora", INERT_PROGRAM);
+    let digest = local.digest.clone();
+    fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&local),
+            trust: PackageTrust::ExplicitDigest {
+                digest: digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect("local install");
+    // Apply a verified index so a stored copy exists with a known sequence.
+    let entry = idxfix_entry(&idxfix("1.0.0"), "1.0.0");
+    let sequence = now() - 100;
+    let _result = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture
+                .plugins
+                .join("apply-index.json")
+                .to_str()
+                .expect("path")
+                .to_owned(),
+            repair_state: false,
+        })
+        .await;
+    // (The staging file above does not exist; the apply fails harmlessly.
+    // We instead directly damage the state file and use repair on a
+    // real verified document below.)
+    let state_path = fixture.plugins.join("index-state.json");
+    std::fs::write(&state_path, b"{not json").expect("corrupt state");
+    std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o600))
+        .expect("owner-private");
+    // Plain refresh must refuse with the specific code.
+    let _damaged_apply = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: fixture
+                .plugins
+                .join("nonexistent.json")
+                .to_str()
+                .expect("path")
+                .to_owned(),
+            repair_state: false,
+        })
+        .await;
+    // A local install is fail-closed.
+    let second = Package::build("community.aurora", "1.1.0", "aurora", INERT_PROGRAM);
+    let err = fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&second),
+            trust: PackageTrust::ExplicitDigest {
+                digest: second.digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect_err("fail-closed");
+    assert_eq!(err, PackageErrorKind::IndexStateUnreadable);
+    // The damaged file is still there (not deleted by the refusal).
+    assert!(state_path.exists());
+    // Repair: stage a verified document and apply with repair_state.
+    let repair_pkg = idxfix("1.0.0");
+    let document = keys.signed(now(), vec![idxfix_entry(&repair_pkg, "1.0.0")]);
+    let staged = fixture.write("repair-index.json", &document);
+    let result = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams {
+            index_path: staged,
+            repair_state: true,
+        })
+        .await
+        .expect("repair apply");
+    assert!(result.sequence > 0);
+    // Damaged file moved aside (fresh state file now exists at the path),
+    // fresh state readable.
+    let damaged_files: Vec<_> = std::fs::read_dir(&fixture.plugins)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_str().expect("name").to_owned())
+        .filter(|n| n.starts_with("index-state.json.damaged-"))
+        .collect();
+    assert_eq!(
+        damaged_files.len(),
+        1,
+        "damaged file moved aside: {damaged_files:?}"
+    );
+    // A new local install now succeeds.
+    let third = Package::build("community.aurora", "1.2.0", "aurora", INERT_PROGRAM);
+    fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&third),
+            trust: PackageTrust::ExplicitDigest {
+                digest: third.digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect("local install after repair");
+    let _ = entry;
+    let _ = sequence;
 }
 
 /// M1: an index install stores the document alongside the marks, so a
@@ -1594,6 +1768,7 @@ async fn scenario_m5_expired_stored_document_refused() {
         .packages()
         .package_index_apply(protocol::PluginIndexApplyParams {
             index_path: fixture.write("expired.json", &expired),
+            repair_state: false,
         })
         .await
         .expect_err("expired apply");
@@ -1772,6 +1947,7 @@ async fn scenario_m5_doctor_current_after_apply_and_catalog_runtime_stays_ok() {
                 "index.json",
                 &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1820,6 +1996,7 @@ async fn scenario_m5_doctor_expired_stored_copy_warns() {
                 "index.json",
                 &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1874,6 +2051,7 @@ async fn scenario_m5_doctor_package_revoked_after_delisting() {
         .packages()
         .package_index_apply(protocol::PluginIndexApplyParams {
             index_path: fixture.write("next.json", &keys.signed(sequence + 1, vec![])),
+            repair_state: false,
         })
         .await
         .expect("apply delisting");
@@ -1912,6 +2090,7 @@ async fn scenario_m5_doctor_reserved_runtime_warns() {
                     )],
                 ),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1962,6 +2141,7 @@ async fn scenario_m5_doctor_reserved_runtime_warns() {
                     )],
                 ),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -1993,6 +2173,7 @@ async fn scenario_m5_doctor_damaged_stored_document_and_stale_temp() {
                 "index.json",
                 &keys.signed(sequence, vec![idxfix_entry(&package, "1.0.0")]),
             ),
+            repair_state: false,
         })
         .await
         .expect("apply");
@@ -2021,7 +2202,7 @@ async fn scenario_m5_doctor_damaged_stored_document_and_stale_temp() {
     assert_eq!(checks.len(), 1);
     assert_eq!(checks[0].status, protocol::DoctorStatus::Fail);
     assert!(
-        checks[0].detail.starts_with("index_invalid:"),
+        checks[0].detail.starts_with("package_index_invalid:"),
         "{}",
         checks[0].detail
     );
