@@ -51,7 +51,7 @@ use package::revoked_digests::RevokedDigests;
 use package::{
     archive_digest, read_archive, read_archive_with_digest, IndexVerifierState, Limits, LocalTrust,
     LocalTrustError, PackageDigest, RootKey, VerifiedCatalog, VerifiedIndex, MAX_CATALOG_BYTES,
-    MAX_INDEX_BYTES,
+    MAX_INDEX_BYTES, OFFICIAL_RUNTIME_PACKAGE_PREFIX,
 };
 use protocol::{
     CommandInfo, PackageChangeResult, PackageDoctorResult, PackageErrorKind, PackageFinding,
@@ -59,7 +59,7 @@ use protocol::{
     PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
     PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
     PackageSelectionBlock, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
-    PackageUninstallResult, ProtocolError,
+    PackageUninstallResult, PluginIndexApplyParams, PluginIndexApplyResult, ProtocolError,
 };
 use tracing::warn;
 
@@ -540,7 +540,7 @@ impl PackageService {
         params: PackageLinkParams,
     ) -> Result<PackageInstallResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
-            let candidate = prepare_directory(&params.directory)?;
+            let candidate = prepare_directory(context, &params.directory)?;
             require_commands_opt_in(&candidate, params.accept_commands)?;
             let plan = InstallPlan {
                 enable: false,
@@ -1055,7 +1055,7 @@ fn prepare_archive(
     trust: &PackageTrust,
 ) -> Result<Candidate, PackageErrorKind> {
     match trust {
-        PackageTrust::ExplicitDigest { digest } => prepare_local(path, digest),
+        PackageTrust::ExplicitDigest { digest } => prepare_local(context, path, digest),
         PackageTrust::Catalog { catalog_path } => {
             let anchor = context.catalog_anchor()?;
             let state = context
@@ -1105,7 +1105,11 @@ fn prepare_archive(
 }
 
 /// Prepares an archive the owner trusts by its exact digest `pinned`.
-fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, PackageErrorKind> {
+fn prepare_local(
+    context: &Context,
+    path: &str,
+    pinned: &PackageDigest,
+) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = read_archive_file(path, &limits)?;
     let (digest, descriptor) = read_authorized(&bytes, pinned, &limits)?;
@@ -1129,6 +1133,10 @@ fn prepare_local(path: &str, pinned: &PackageDigest) -> Result<Candidate, Packag
             LocalTrustError::ReservedRuntime => PackageErrorKind::RuntimeNotClaimable,
             LocalTrustError::DigestMismatch => PackageErrorKind::ArchiveInvalid,
         })?;
+    // Data-driven namespace: refuse an official-namespaced local package only
+    // when the accumulated reserved ids cover its runtime id; before any
+    // verified index listed it, local trust stands alone (Pi --sha256 flow).
+    refuse_official_namespace(context, &identity.id, definition.runtime_id())?;
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
@@ -1322,7 +1330,7 @@ fn read_authorized(
 }
 
 /// Archives and validates a developer directory.
-fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
+fn prepare_directory(context: &Context, directory: &str) -> Result<Candidate, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let bytes = build_directory(directory, &limits)?;
     let archive = read_archive(&bytes, &limits).map_err(|error| {
@@ -1346,6 +1354,7 @@ fn prepare_directory(directory: &str) -> Result<Candidate, PackageErrorKind> {
             index: None,
         })));
     };
+    refuse_official_namespace(context, &identity.id, definition.runtime_id())?;
     Ok(Candidate::Runtime(Box::new(Prepared {
         bytes,
         digest,
@@ -1584,4 +1593,117 @@ fn install_package(
         commands,
         reloaded: true,
     })
+}
+
+/// Refuses a local (digest/link) package in the official runtime namespace
+/// when the accumulated reserved runtime ids cover its runtime id.
+///
+/// Only data drives this refusal: the documented Pi `--sha256` flow works
+/// until a verified official index has listed `pohunek.runtime.pi`, after
+/// which the id is reserved. The compiled floor (shell, codex, claude,
+/// hermes) is refused by `LocalTrust` independently of any stored index.
+fn refuse_official_namespace(
+    context: &Context,
+    package_id: &PackageId,
+    runtime_id: &protocol::RuntimeId,
+) -> Result<(), PackageErrorKind> {
+    let suffix = package_id
+        .as_str()
+        .strip_prefix(OFFICIAL_RUNTIME_PACKAGE_PREFIX);
+    let Some(suffix) = suffix else {
+        return Ok(());
+    };
+    if suffix != runtime_id.as_str() {
+        return Ok(());
+    }
+    let state = context
+        .store
+        .registry()
+        .index_state()
+        .map_err(|error| registry_kind(&error))?;
+    if state.reserved_runtime_ids.contains(runtime_id) {
+        warn!(
+            package = %package_id,
+            "a local package in the official namespace was refused: its runtime id is reserved by a recorded index"
+        );
+        Err(PackageErrorKind::NamespaceReserved)
+    } else {
+        Ok(())
+    }
+}
+
+impl PackageService {
+    /// Verifies, rolls-back-checks and stores a staged plugin index.
+    ///
+    /// Rollback is checked explicitly against the persisted marks before
+    /// `record_index` runs, because `record_index` silently returns the
+    /// current state for a below-mark document instead of an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageErrorKind::IndexInvalid`] for an unverifiable
+    /// document, [`PackageErrorKind::IndexExpired`] for an expired one,
+    /// [`PackageErrorKind::IndexRollback`] for a sequence below the recorded
+    /// high-water marks, and [`PackageErrorKind::IndexChannelMissing`] when
+    /// no index channel is loaded.
+    pub async fn package_index_apply(
+        &self,
+        params: PluginIndexApplyParams,
+    ) -> Result<PluginIndexApplyResult, PackageErrorKind> {
+        self.package_transaction(move |context, _retained| {
+            let (anchor, endorser) = context.index_endorser().map_err(|error| match error {
+                PackageErrorKind::TrustUnavailable | PackageErrorKind::TrustAnchorInvalid => {
+                    PackageErrorKind::IndexChannelMissing
+                }
+                other => other,
+            })?;
+            let registry = context.store.registry();
+            let catalog_state = registry
+                .catalog_state()
+                .map_err(|error| registry_kind(&error))?;
+            let index_state = registry
+                .index_state()
+                .map_err(|error| registry_kind(&error))?;
+            let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
+            let bytes = read_regular_file(&params.index_path, max)
+                .map_err(|_failure| PackageErrorKind::SourceUnreadable)?;
+            let verified = trust::verify_index_for_apply(
+                &bytes,
+                endorser,
+                anchor,
+                &catalog_state,
+                &index_state,
+                unix_now()?,
+            )?;
+            // Explicit rollback defence: record_index would silently no-op.
+            if index_state
+                .index_high_water
+                .is_some_and(|mark| verified.sequence() < mark)
+                || index_state
+                    .revocation_high_water
+                    .is_some_and(|mark| verified.revocation_sequence() < mark)
+            {
+                return Err(PackageErrorKind::IndexRollback);
+            }
+            let schema_version = package::parse_index_envelope(&bytes)
+                .map_or(package::INDEX_SCHEMA_VERSION, |envelope| {
+                    envelope.schema_version
+                });
+            let stored_at = unix_now()?;
+            registry
+                .store_index(schema_version, &verified, &bytes, stored_at)
+                .map_err(|error| registry_kind(&error))?;
+            registry
+                .record_index(&verified)
+                .map_err(|error| registry_kind(&error))?;
+            Ok(PluginIndexApplyResult {
+                sequence: verified.sequence(),
+                schema_version,
+                expires_at: verified.expires_at(),
+                entries: verified.entries().len() as u64,
+                stored_at,
+            })
+        })
+        .await
+    }
 }

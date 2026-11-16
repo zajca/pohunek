@@ -274,6 +274,8 @@ pub struct IndexVerifierState {
     pub revocation_high_water: Option<u64>,
     /// Key ids revoked by earlier documents.
     pub revoked_key_ids: BTreeSet<KeyId>,
+    /// Runtime ids every verified index entry reserved; accumulates, never shrinks.
+    pub reserved_runtime_ids: BTreeSet<RuntimeId>,
 }
 
 /// Which bounded collection exceeded its limit.

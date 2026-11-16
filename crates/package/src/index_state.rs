@@ -24,7 +24,10 @@ use std::io::ErrorKind;
 use pohunek_platform::filesystem::FsError;
 use serde::{Deserialize, Serialize};
 
+use protocol::RuntimeId;
+
 use crate::catalog::{KeyId, MAX_REVOKED_KEYS};
+use crate::index_store::MAX_RESERVED_RUNTIME_IDS;
 use crate::layout::FILE_MODE;
 use crate::plugin_index::{IndexVerifierState, VerifiedIndex};
 use crate::registry::{registry_fs, replace_failure, Registry, RegistryError};
@@ -36,8 +39,9 @@ const INDEX_STATE_NAME: &str = "index-state.json";
 /// [`INDEX_STATE_NAME`].
 const INDEX_STATE_TEMP_NAME: &str = "index-state.json.tmp";
 
-/// Schema version of the state file this crate reads and writes.
-const INDEX_STATE_SCHEMA: u32 = 1;
+/// Writes schema 2; reads schema 1 and 2.
+const INDEX_STATE_SCHEMA: u32 = 2;
+const INDEX_STATE_SCHEMA_V1: u32 = 1;
 
 /// Largest accepted state file: 16 KiB.
 ///
@@ -56,6 +60,8 @@ struct StateFile {
     index_high_water: Option<u64>,
     revocation_high_water: Option<u64>,
     revoked_key_ids: Vec<KeyId>,
+    #[serde(default)]
+    reserved_runtime_ids: Vec<String>,
 }
 
 impl Registry {
@@ -126,6 +132,20 @@ impl Registry {
         if merged.revoked_key_ids.len() > MAX_REVOKED_KEYS {
             return Err(RegistryError::TooManyRevokedKeys);
         }
+        let mut reserved: Vec<RuntimeId> = merged.reserved_runtime_ids.iter().cloned().collect();
+        for entry in verified.entries() {
+            if entry.kind() == crate::plugin_index::IndexEntryKind::Runtime {
+                if let Some(runtime) = entry.runtime_id.clone() {
+                    reserved.push(runtime);
+                }
+            }
+        }
+        reserved.sort();
+        reserved.dedup();
+        if reserved.len() > MAX_RESERVED_RUNTIME_IDS {
+            return Err(RegistryError::Corrupt);
+        }
+        merged.reserved_runtime_ids = reserved.into_iter().collect();
         if merged == current {
             return Ok(current);
         }
@@ -134,6 +154,11 @@ impl Registry {
             index_high_water: merged.index_high_water,
             revocation_high_water: merged.revocation_high_water,
             revoked_key_ids: merged.revoked_key_ids.iter().cloned().collect(),
+            reserved_runtime_ids: merged
+                .reserved_runtime_ids
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
         };
         let bytes = serde_json::to_vec(&file).map_err(|_cause| RegistryError::Corrupt)?;
         self.root
@@ -156,7 +181,7 @@ fn parse_state(bytes: &[u8]) -> Result<IndexVerifierState, RegistryError> {
         schema: u32,
     }
     let header: Header = serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
-    if header.schema != INDEX_STATE_SCHEMA {
+    if header.schema != INDEX_STATE_SCHEMA && header.schema != INDEX_STATE_SCHEMA_V1 {
         return Err(RegistryError::UnsupportedSchema);
     }
     let file: StateFile = serde_json::from_slice(bytes).map_err(|_cause| RegistryError::Corrupt)?;
@@ -164,12 +189,27 @@ fn parse_state(bytes: &[u8]) -> Result<IndexVerifierState, RegistryError> {
         .revoked_key_ids
         .windows(2)
         .all(|pair| pair[0] < pair[1]);
-    if file.revoked_key_ids.len() > MAX_REVOKED_KEYS || !ordered {
+    let reserved_ordered = file
+        .reserved_runtime_ids
+        .windows(2)
+        .all(|pair| pair[0] < pair[1]);
+    if file.revoked_key_ids.len() > MAX_REVOKED_KEYS
+        || !ordered
+        || file.reserved_runtime_ids.len() > MAX_RESERVED_RUNTIME_IDS
+        || !reserved_ordered
+    {
         return Err(RegistryError::Corrupt);
     }
+    let reserved: Result<std::collections::BTreeSet<RuntimeId>, _> = file
+        .reserved_runtime_ids
+        .iter()
+        .map(|text| RuntimeId::parse(text))
+        .collect();
+    let reserved = reserved.map_err(|_cause| RegistryError::Corrupt)?;
     Ok(IndexVerifierState {
         index_high_water: file.index_high_water,
         revocation_high_water: file.revocation_high_water,
         revoked_key_ids: file.revoked_key_ids.into_iter().collect(),
+        reserved_runtime_ids: reserved,
     })
 }

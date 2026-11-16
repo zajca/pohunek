@@ -358,7 +358,7 @@ fn an_unknown_schema_version_is_reported() {
     let registry = fixture.open();
     registry.record_index(&verified(3, 1, &[])).unwrap();
     let text = std::fs::read_to_string(state_file(&fixture)).unwrap();
-    let changed = text.replace("\"schema\":1", "\"schema\":2");
+    let changed = text.replace("\"schema\":2", "\"schema\":99");
     std::fs::write(state_file(&fixture), &changed).unwrap();
 
     assert_eq!(

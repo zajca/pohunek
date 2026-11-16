@@ -320,6 +320,37 @@ pub(super) fn host_platform() -> Result<String, PackageErrorKind> {
     package::host_platform().ok_or(PackageErrorKind::Incompatible)
 }
 
+/// Maps an `IndexError` to the `plugin.index.apply` error kind.
+pub(crate) fn index_apply_kind(error: package::IndexError) -> PackageErrorKind {
+    use package::IndexError as E;
+    match error {
+        E::Expired => PackageErrorKind::IndexExpired,
+        E::StaleSequence { .. } | E::StaleRevocation { .. } => PackageErrorKind::IndexRollback,
+        _ => PackageErrorKind::IndexInvalid,
+    }
+}
+
+/// Verifies a staged index for `plugin.index.apply`, mapping failures to the
+/// new codes. Callers compare the returned sequence against the persisted
+/// marks before storing (`record_index` silently returns current on a
+/// below-mark document).
+pub(super) fn verify_index_for_apply(
+    bytes: &[u8],
+    endorser: &RootKey,
+    anchor: &HostTrustAnchor,
+    catalog_state: &CatalogState,
+    state: &IndexVerifierState,
+    now: u64,
+) -> Result<VerifiedIndex, PackageErrorKind> {
+    let base_revoked: BTreeSet<KeyId> = anchor
+        .inputs
+        .revoked
+        .union(catalog_state.revoked_key_ids())
+        .cloned()
+        .collect();
+    verify_index(bytes, endorser, &base_revoked, state, now).map_err(index_apply_kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

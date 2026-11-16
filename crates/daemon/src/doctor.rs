@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hostcheck::{OverlayChecks, StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
+use package::registry::PackageSource;
 use protocol::{
     DoctorCheck, DoctorReport, DoctorStatus, IntegrationDoctorParams, IntegrationFindingCode,
     IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
@@ -72,6 +73,7 @@ pub(crate) async fn report(
     probe_budget: Duration,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
+    let doctor_paths = paths.clone();
     let listener_checks = hostcheck::overlay_checks::listener_checks(overlays);
     let overlay_diagnostics = overlays.diagnostics.to_vec();
     let overlays_from_file = overlays.from_file;
@@ -117,6 +119,7 @@ pub(crate) async fn report(
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
     checks.extend(index_channel_check(catalog_trust));
+    checks.push(plugin_index_check(&doctor_paths, catalog_trust));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
     checks.push(session_rights_check(worker_units, root_findings));
@@ -1118,6 +1121,149 @@ fn quarantine_warning(detail: &'static str) -> (DoctorCheck, DoctorCheck) {
 
 fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck {
     DoctorCheck::new(name, status, detail)
+}
+
+/// The check for the stored plugin index: verified bytes, freshness and
+/// accumulated reserved ids. Read-only; launching and running sessions are
+/// never affected by a stored-index fault (warning only), while a revoked or
+/// malformed stored document fails the check.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one doctor table branch per stored-index state"
+)]
+fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorCheck {
+    const CHECK: &str = "plugin_index";
+    let CatalogTrust::Loaded(anchor) = catalog_trust else {
+        return check(CHECK, DoctorStatus::Ok, "not_used");
+    };
+    let plugins_dir = paths.plugins_dir();
+    let Ok(Some(store)) = crate::agent::host::PackageStore::open_existing(&plugins_dir) else {
+        return check(CHECK, DoctorStatus::Ok, "not_used");
+    };
+    let registry = store.registry();
+    let Ok(state) = registry.state() else {
+        return check(CHECK, DoctorStatus::Fail, "index_invalid");
+    };
+    let has_official = state
+        .packages()
+        .iter()
+        .any(|r| r.source() == PackageSource::Official);
+    let stored = [1u64, 2u64]
+        .iter()
+        .filter_map(|schema| registry.stored_index(*schema).ok().flatten())
+        .max_by_key(|stored| stored.stored_at);
+    let Some(stored) = stored else {
+        return if has_official {
+            check(CHECK, DoctorStatus::Warn, "not_refreshed")
+        } else {
+            check(CHECK, DoctorStatus::Ok, "not_used")
+        };
+    };
+    if stored.bytes.len() > package::MAX_INDEX_BYTES {
+        return check(CHECK, DoctorStatus::Fail, "index_invalid");
+    }
+    let endorser = match anchor.index() {
+        crate::catalog_anchor::IndexTrust::Loaded(endorser) => endorser.as_ref(),
+        _ => return check(CHECK, DoctorStatus::Warn, "stale"),
+    };
+    let catalog_state = registry.catalog_state().ok();
+    let index_state = registry.index_state().ok();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let base: std::collections::BTreeSet<package::KeyId> = {
+        let mut set = std::collections::BTreeSet::new();
+        if let Some(state) = &catalog_state {
+            set.extend(state.revoked_key_ids().iter().cloned());
+        }
+        set
+    };
+    let verified = package::verify_index(
+        &stored.bytes,
+        endorser,
+        &base,
+        &index_state.clone().unwrap_or_default(),
+        now,
+    );
+    let verified = match verified {
+        Ok(v) => v,
+        Err(error) => {
+            return match error {
+                package::IndexError::Expired => check(CHECK, DoctorStatus::Warn, "index_expired"),
+                package::IndexError::StaleSequence { .. }
+                | package::IndexError::StaleRevocation { .. } => {
+                    check(CHECK, DoctorStatus::Warn, "stale")
+                }
+                _ => check(CHECK, DoctorStatus::Fail, "index_invalid"),
+            };
+        }
+    };
+    // Delisted: Official-origin installed digest no longer listed under its id.
+    let mut delisted: Option<(String, String)> = None;
+    for record in state.packages() {
+        if record.source() != PackageSource::Official {
+            continue;
+        }
+        let digest = record.digest();
+        let listed = verified
+            .entries()
+            .iter()
+            .any(|e| e.package_id == record.identity().id && e.digest == *digest);
+        if !listed {
+            delisted = Some((
+                record.identity().id.to_string(),
+                record.identity().version.to_string(),
+            ));
+            break;
+        }
+    }
+    if let Some((id, ver)) = delisted {
+        return check(
+            CHECK,
+            DoctorStatus::Fail,
+            &format!("package_revoked: {id}@{ver}"),
+        );
+    }
+    // Reserved: local (ExplicitDigest/Link) holding a reserved runtime id.
+    let reserved = index_state
+        .as_ref()
+        .map(|s| s.reserved_runtime_ids.clone())
+        .unwrap_or_default();
+    let mut reserved_hit: Option<(String, String)> = None;
+    for record in state.packages() {
+        if !matches!(
+            record.source(),
+            PackageSource::ExplicitDigest | PackageSource::Link
+        ) {
+            continue;
+        }
+        if let Some(suffix) = record
+            .identity()
+            .id
+            .as_str()
+            .strip_prefix(package::OFFICIAL_RUNTIME_PACKAGE_PREFIX)
+        {
+            if let Ok(runtime) = protocol::RuntimeId::parse(suffix) {
+                if reserved.contains(&runtime) {
+                    reserved_hit = Some((record.identity().id.to_string(), runtime.to_string()));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some((id, rt)) = reserved_hit {
+        return check(
+            CHECK,
+            DoctorStatus::Warn,
+            &format!("runtime_id_reserved_by_official: {id} runtime {rt}"),
+        );
+    }
+    let fresh = now.saturating_sub(stored.stored_at) <= 24 * 60 * 60;
+    if fresh {
+        check(CHECK, DoctorStatus::Ok, "current")
+    } else {
+        check(CHECK, DoctorStatus::Warn, "stale")
+    }
 }
 
 #[cfg(test)]

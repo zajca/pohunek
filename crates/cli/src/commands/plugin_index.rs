@@ -506,3 +506,65 @@ fn write_staged(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<Strin
             detail: "the staging path is not UTF-8".to_owned(),
         })
 }
+
+/// 24 hours in seconds: the refresh cadence of the stored plugin index.
+pub(crate) const STORED_INDEX_MAX_AGE: u64 = 24 * 60 * 60;
+
+/// Read the stored sidecar and return the freshest `stored_at`.
+///
+/// Returns `None` when there is no stored copy yet. The CLI reads the same
+/// file the daemon wrote; it is local-only and same-user.
+fn stored_at() -> Option<u64> {
+    let plugins = crate::paths::Paths::plugins_dir().ok()?;
+    let sidecar = plugins.join("index").join("stored.json");
+    let bytes = std::fs::read(&sidecar).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let mut max: Option<u64> = None;
+    for key in ["official-v1", "official-v2"] {
+        if let Some(v) = value.get(key).and_then(serde_json::Value::as_u64) {
+            max = Some(max.map_or(v, |m: u64| m.max(v)));
+        }
+    }
+    max
+}
+
+/// Fetch the official index document (v2 when `context`) and stage it for apply.
+pub(crate) async fn stage_official(
+    index_url: Option<&str>,
+    context: bool,
+) -> Result<StagedOfficial, Error> {
+    let client = client()?;
+    let bytes = if let Some(url) = index_url {
+        fetch(&client, &checked_url(url)?, Download::Index).await?
+    } else {
+        let kind = if context {
+            IndexEntryKind::Context
+        } else {
+            IndexEntryKind::Runtime
+        };
+        fetch_official_index(&client, kind).await?
+    };
+    let dir = tempfile::Builder::new()
+        .prefix(STAGING_PREFIX)
+        .tempdir()
+        .map_err(|e| staging_failed(&e))?;
+    let canonical = std::fs::canonicalize(dir.path()).map_err(|e| staging_failed(&e))?;
+    let index_path = write_staged(&canonical, STAGED_INDEX, &bytes)?;
+    Ok(StagedOfficial {
+        _dir: dir,
+        index_path,
+    })
+}
+
+/// A staged official index for `plugin.index.apply`.
+#[derive(Debug)]
+pub(crate) struct StagedOfficial {
+    _dir: TempDir,
+    pub(crate) index_path: String,
+}
+
+/// Whether the stored index is fresh enough to use without fetching.
+pub(crate) fn stored_is_fresh() -> bool {
+    let Some(at) = stored_at() else { return false };
+    unix_now().saturating_sub(at) <= STORED_INDEX_MAX_AGE
+}

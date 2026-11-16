@@ -111,6 +111,12 @@ pub(super) struct FeatureTables<'a> {
 ///
 /// `fixtures/features.txt` snapshots this table; a removal or rename fails the
 /// guard test.
+/// Names of the runtime features this daemon implements, in order.
+#[must_use]
+pub fn feature_names() -> Vec<String> {
+    RUNTIME_FEATURES.iter().map(|f| f.id.to_owned()).collect()
+}
+
 pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
     RuntimeFeature {
         id: "config-home-subdir-v1",

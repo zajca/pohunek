@@ -609,6 +609,7 @@ async fn handle_negotiated(
         method::PACKAGE_REMOVE_PROFILE => {
             package::handle_package_remove_profile(request, state).await
         }
+        method::PLUGIN_INDEX_APPLY => package::handle_plugin_index_apply(request, state).await,
         method::COMMAND_RUN => command::handle_command_run(request, state).await,
         method::HOST_INSPECT => {
             host::handle_host_inspect(request, &state.health, &state.sessions).await

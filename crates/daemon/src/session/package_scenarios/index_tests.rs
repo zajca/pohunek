@@ -1157,3 +1157,91 @@ async fn a_host_without_a_channel_refuses_index_installs_and_keeps_catalog_insta
         }
     }
 }
+
+#[tokio::test]
+async fn plugin_index_apply_stores_and_accumulates_reserved_ids() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("apply-stores");
+    let sequence = now();
+    let first = idxfix("1.0.0");
+    let document = keys.signed(sequence, vec![idxfix_entry(&first, "1.0.0")]);
+    let path = fixture.write("index.json", &document);
+    let result = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path })
+        .await
+        .expect("apply");
+    assert_eq!(result.sequence, sequence);
+    assert_eq!(result.schema_version, 1);
+    assert_eq!(result.entries, 1);
+    // Rollback refused and file unchanged
+    let low = keys.signed(sequence - 10, vec![idxfix_entry(&first, "1.0.0")]);
+    let path2 = fixture.write("index2.json", &low);
+    let err = fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path2 })
+        .await
+        .expect_err("rollback");
+    assert_eq!(err, PackageErrorKind::IndexRollback);
+}
+
+#[tokio::test]
+async fn namespace_guard_data_driven_both_sides() {
+    let keys = Keys::new();
+    let fixture = keys.fixture("namespace-guard");
+    let local = Package::build("pohunek.runtime.aurora", "1.0.0", "aurora", INERT_PROGRAM);
+    let digest = local.digest.clone();
+    // Before any stored index: --sha256 works
+    let installed = fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&local),
+            trust: PackageTrust::ExplicitDigest {
+                digest: digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect("before admission");
+    assert_eq!(installed.package.origin, PackageOrigin::ExplicitDigest);
+    // After stored index listing aurora, local reinstall is refused
+    let sequence = now();
+    let doc = keys.signed(
+        sequence,
+        vec![index_entry(
+            &local,
+            "pohunek.runtime.aurora",
+            "aurora",
+            "1.0.0",
+        )],
+    );
+    let path = fixture.write("index.json", &doc);
+    fixture
+        .registry
+        .packages()
+        .package_index_apply(protocol::PluginIndexApplyParams { index_path: path })
+        .await
+        .expect("apply");
+    let err = fixture
+        .registry
+        .packages()
+        .package_install(PackageInstallParams {
+            archive_path: fixture.write_archive(&local),
+            trust: PackageTrust::ExplicitDigest {
+                digest: digest.clone(),
+            },
+            enable: true,
+            select: true,
+            dry_run: false,
+            accept_commands: false,
+        })
+        .await
+        .expect_err("after admission");
+    assert_eq!(err, PackageErrorKind::NamespaceReserved);
+}

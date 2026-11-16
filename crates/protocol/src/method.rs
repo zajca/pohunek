@@ -21,11 +21,12 @@ use crate::{
     PackageDoctorResult, PackageInspectParams, PackageInspectResult, PackageInstallParams,
     PackageInstallResult, PackageLinkParams, PackageListResult, PackageRemoveProfileParams,
     PackageRemoveProfileResult, PackageSelectParams, PackageSetEnabledParams,
-    PackageUninstallParams, PackageUninstallResult, ProjectActionParams, ProjectActionResult,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectCandidatesParams,
-    ProjectCandidatesResult, ProjectInfo, ProjectListParams, ProjectPromptParams,
-    ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult, ProjectRenameParams,
-    ProjectShowParams, ProjectShowResult, SessionAdoptParams, SessionAdoptResult,
+    PackageUninstallParams, PackageUninstallResult, PluginIndexApplyParams, PluginIndexApplyResult,
+    ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectActionsResult,
+    ProjectAddParams, ProjectCandidatesParams, ProjectCandidatesResult, ProjectInfo,
+    ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
+    SessionAdoptParams, SessionAdoptResult,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
     SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionListParams,
@@ -698,6 +699,15 @@ method_table!(
     PackageRemoveProfileResult,
     "PackageRemoveProfileParams",
     "PackageRemoveProfileResult";
+
+    /// Verify and store a staged plugin index document (local-only).
+    PluginIndexApply,
+    PLUGIN_INDEX_APPLY,
+    "plugin.index.apply",
+    PluginIndexApplyParams,
+    PluginIndexApplyResult,
+    "PluginIndexApplyParams",
+    "PluginIndexApplyResult";
 
     /// Run one command a package declared, once, and return its stdout.
     CommandRun,
