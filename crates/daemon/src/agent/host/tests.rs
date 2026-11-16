@@ -12,8 +12,8 @@ use super::features::{FeatureGate, FeatureTables, GateRule, RuntimeFeature};
 use super::{
     check_pin, validate_launch_runtime, BuiltinSource, DefinitionError, DefinitionInvariant,
     DefinitionOrigin, DefinitionParts, HandlerId, Integration, LaunchPin, LaunchProgram,
-    RegistryError, RuntimeDefinition, RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust,
-    Spawn, RESERVED_RUNTIME_IDS,
+    ProbeEnvironment, RegistryError, RuntimeDefinition, RuntimeHost, RuntimeRegistry,
+    RuntimeSource, SourceTrust, Spawn, RESERVED_RUNTIME_IDS,
 };
 use crate::agent::{
     InputRules, NativeLaunchError, NativeReferenceError, NativeReferenceStrategy,
@@ -1129,7 +1129,13 @@ mod launch_validation {
         .expect("valid package definition");
         let dir = crate::test_support::scoped_dir("pohunek-launch-validation-");
         let acme = executable(&dir, "#!/bin/sh\necho 'acme 1.0.0'\n");
-        let error = validate_launch_runtime(&unknown, Spawn::Program(&acme), None)
+        let base = crate::runtime::environment::base_environment(
+            pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+            &crate::runtime::environment::EnvironmentSource::Process,
+        )
+        .expect("the default allowlist builds");
+        let environment = ProbeEnvironment::for_launch(&base, &[]);
+        let error = validate_launch_runtime(&unknown, Spawn::Program(&acme), &environment)
             .expect_err("unknown parser");
         assert_eq!(error.code, "agent_runtime_unsupported");
     }

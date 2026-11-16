@@ -9,7 +9,7 @@
 //! replaced on disk is probed again at once and an unchanged one at most once
 //! per configured lifetime.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,11 +25,12 @@ use crate::agent::host::{
 };
 use crate::agent::profile::options;
 use crate::agent::{which_executable, ProfileRegistry, ResolvedAgent, ValidatedLaunchProgram};
-use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
+use crate::bounded_run::{self, HomeScope, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 use crate::integration::Home;
 use crate::runtime::environment::effective_variable;
 use pohunek_worker_protocol::BaseEnv;
 
+pub(crate) mod dispatch;
 mod probe_cache;
 
 pub(crate) use probe_cache::{ProbeCache, ProbeRequest};
@@ -487,14 +488,8 @@ fn probe_definition(
 ) -> PlannedRuntime {
     match definition.version_probe_parser() {
         Some(_) => {
-            let launch_path = effective_variable(base_env, profile_env, SEARCH_PATH_VAR);
-            plan_versioned_runtime(
-                agent,
-                agent_base,
-                program,
-                definition,
-                launch_path.as_deref(),
-            )
+            let environment = ProbeEnvironment::for_launch(base_env, profile_env);
+            plan_versioned_runtime(agent, agent_base, program, definition, &environment)
         }
         None => (probe_runtime(agent, agent_base, program), None),
     }
@@ -546,7 +541,7 @@ fn plan_versioned_runtime(
     agent_base: RuntimeRef,
     binary: &str,
     definition: &RuntimeDefinition,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
 ) -> PlannedRuntime {
     let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
         return (
@@ -565,13 +560,49 @@ fn plan_versioned_runtime(
             None,
         );
     };
+    // A version-manager shim resolves to the executable the manager names,
+    // read-only and offline; the probe request runs against that file, while
+    // the entry keeps the launched link path. Nothing installed means the
+    // agent is present but unsupported, with no probe planned. Any other
+    // program probes under its own link path, so an `argv[0]` dispatcher
+    // behind a link reports the release its own name selects; a plain link
+    // to another executable probes the link itself.
+    let probe_program = match dispatch::classify(program.as_path()) {
+        dispatch::Dispatch::Direct => Some(program.as_path().to_path_buf()),
+        dispatch::Dispatch::Mise { manager, bin_name } => dispatch::resolve(
+            &manager,
+            &bin_name,
+            &environment.owner_locations,
+            environment.launch_path.as_deref(),
+            VERSION_PROBE_TIMEOUT,
+            &Instant::now,
+        )
+        .ok(),
+    };
+    let Some(probe_program) = probe_program else {
+        return (
+            AgentRuntime {
+                agent: agent.to_owned(),
+                agent_base: Some(agent_base),
+                available: true,
+                path: Some(program.as_path().display().to_string()),
+                version: None,
+                supported: Some(false),
+                config_home_id: None,
+                display_name: None,
+                audience: None,
+                options: Vec::new(),
+            },
+            None,
+        );
+    };
 
     let probe = VersionProbe::for_definition(definition).map(|probe| {
         (
             ProbeRequest::new(
-                program.as_path(),
+                &probe_program,
                 probe.0.args(),
-                launch_path,
+                environment.launch_path.as_deref(),
                 definition.launch_env(),
             ),
             probe.0.clone(),
@@ -602,14 +633,14 @@ fn probe_versioned_runtime(
     agent_base: RuntimeRef,
     binary: &str,
     definition: &RuntimeDefinition,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
 ) -> AgentRuntime {
     probed_entry(plan_versioned_runtime(
         agent,
         agent_base,
         binary,
         definition,
-        launch_path,
+        environment,
     ))
 }
 
@@ -632,6 +663,32 @@ fn probed_entry((runtime, probe): PlannedRuntime) -> AgentRuntime {
     runtimes.remove(0)
 }
 
+/// The environment a version probe runs in: the `PATH` the launched agent
+/// will see and the owner location variables a version-manager lookup
+/// resolves against.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeEnvironment {
+    /// The `PATH` the launched agent will see; the probe runs under it.
+    pub(crate) launch_path: Option<OsString>,
+    /// The owner location variables a version-manager lookup resolves
+    /// against, selected from the base environment and profile pairs the
+    /// launched agent will see.
+    pub(crate) owner_locations: dispatch::OwnerLocations,
+}
+
+impl ProbeEnvironment {
+    /// Builds the probe environment of one launch: the `PATH` the launched
+    /// agent will see, read from the daemon's base environment overridden by
+    /// the profile pairs, and the owner location variables selected from
+    /// those same two sources.
+    pub(crate) fn for_launch(base: &BaseEnv, profile_env: &[(String, String)]) -> Self {
+        Self {
+            launch_path: effective_variable(base, profile_env, SEARCH_PATH_VAR),
+            owner_locations: dispatch::OwnerLocations::from_launch(base, profile_env),
+        }
+    }
+}
+
 /// [`crate::agent::host::validate_launch_runtime`] for an already resolved definition.
 ///
 /// # Errors
@@ -641,24 +698,24 @@ fn probed_entry((runtime, probe): PlannedRuntime) -> AgentRuntime {
 /// `agent_runtime_unsupported` when the probe rejects an executable that
 /// exists or the definition names a parser this daemon does not provide.
 ///
-/// `launch_path` is the `PATH` the launched agent will see; the probe runs
-/// under it.
+/// `environment` carries the `PATH` the launched agent will see; the probe
+/// runs under it.
 pub(crate) fn validate_definition_launch(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_with_timeout(definition, spawn, launch_path, VERSION_PROBE_TIMEOUT)
+    validate_definition_launch_with_timeout(definition, spawn, environment, VERSION_PROBE_TIMEOUT)
 }
 
 /// Validate a launch definition using the caller's remaining version-probe budget.
 pub(crate) fn validate_definition_launch_with_timeout(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
     timeout: Duration,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_with_clock(definition, spawn, launch_path, timeout, &Instant::now)
+    validate_definition_launch_with_clock(definition, spawn, environment, timeout, &Instant::now)
 }
 
 /// [`validate_definition_launch_with_timeout`] reading the probe's deadline
@@ -666,17 +723,20 @@ pub(crate) fn validate_definition_launch_with_timeout(
 fn validate_definition_launch_with_clock(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
     timeout: Duration,
     now: &impl Fn() -> Instant,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    validate_definition_launch_detailed_with_clock(definition, spawn, launch_path, timeout, now)
+    validate_definition_launch_detailed_with_clock(definition, spawn, environment, timeout, now)
         .map_err(|failure| match failure {
             LaunchValidationFailure::Missing => {
                 ProtocolError::agent_binary_missing(reported_program(definition, spawn))
             }
             LaunchValidationFailure::Refused(refusal) => unsupported_version_error(refusal),
             LaunchValidationFailure::ProbeDeadline => probe_timed_out_error(),
+            LaunchValidationFailure::DispatchUnresolved => {
+                ProtocolError::agent_runtime_dispatch_unresolved()
+            }
             LaunchValidationFailure::Unsupported | LaunchValidationFailure::ProbeTimedOut => {
                 ProtocolError::agent_runtime_unsupported()
             }
@@ -730,6 +790,27 @@ pub(crate) enum LaunchValidationFailure {
     ProbeDeadline,
     /// The probe outran a budget shorter than [`VERSION_PROBE_TIMEOUT`].
     ProbeTimedOut,
+    /// The program is a version-manager shim whose manager names no
+    /// installed release of the agent, so the probe never ran. The version
+    /// check never installs or updates a tool.
+    DispatchUnresolved,
+}
+
+impl LaunchValidationFailure {
+    /// Maps a version-manager lookup failure onto a validation failure: an
+    /// empty install set reports no installed release, while a deadline
+    /// follows the shortened-budget rule and every other lookup failure
+    /// reads as a failed probe.
+    fn from_dispatch(failure: dispatch::DispatchFailure, shortened_budget: bool) -> Self {
+        match failure {
+            dispatch::DispatchFailure::Unresolved => Self::DispatchUnresolved,
+            dispatch::DispatchFailure::TimedOut if shortened_budget => Self::ProbeTimedOut,
+            dispatch::DispatchFailure::TimedOut => Self::ProbeDeadline,
+            dispatch::DispatchFailure::Invalid | dispatch::DispatchFailure::Unavailable => {
+                Self::Unsupported
+            }
+        }
+    }
 }
 
 /// Validate a launch definition and preserve whether its version probe timed out.
@@ -742,11 +823,11 @@ pub(crate) enum LaunchValidationFailure {
 pub(crate) fn validate_definition_launch_with_timeout_detailed(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
     timeout: Duration,
     clock: &ProbeClock,
 ) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
-    validate_definition_launch_detailed_with_clock(definition, spawn, launch_path, timeout, &|| {
+    validate_definition_launch_detailed_with_clock(definition, spawn, environment, timeout, &|| {
         clock.now()
     })
 }
@@ -756,7 +837,7 @@ pub(crate) fn validate_definition_launch_with_timeout_detailed(
 fn validate_definition_launch_detailed_with_clock(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
     timeout: Duration,
     now: &impl Fn() -> Instant,
 ) -> Result<Option<ValidatedLaunchProgram>, LaunchValidationFailure> {
@@ -776,7 +857,7 @@ fn validate_definition_launch_detailed_with_clock(
         };
     }
     let shortened_budget = timeout < VERSION_PROBE_TIMEOUT;
-    let timeout = timeout.min(VERSION_PROBE_TIMEOUT);
+    let mut timeout = timeout.min(VERSION_PROBE_TIMEOUT);
 
     let program =
         ValidatedLaunchProgram::resolve(binary).ok_or(LaunchValidationFailure::Missing)?;
@@ -784,10 +865,32 @@ fn validate_definition_launch_detailed_with_clock(
         return Err(LaunchValidationFailure::Unsupported);
     };
     let policy = probe.0;
+    // A version-manager shim dispatches on its own link name, so running
+    // the link reports the manager's own release. `mise which` names the
+    // installed executable the shim would run; that executable is probed in
+    // the private sandbox, and the recorded release is the one the manager
+    // named, while the launch keeps execing the shim link.
+    let probe_path = match dispatch::classify(program.as_path()) {
+        dispatch::Dispatch::Direct => program.as_path().to_path_buf(),
+        dispatch::Dispatch::Mise { manager, bin_name } => {
+            let lookup_started = now();
+            let installed = dispatch::resolve(
+                &manager,
+                &bin_name,
+                &environment.owner_locations,
+                environment.launch_path.as_deref(),
+                timeout,
+                now,
+            )
+            .map_err(|failure| LaunchValidationFailure::from_dispatch(failure, shortened_budget))?;
+            timeout = timeout.saturating_sub(now().saturating_duration_since(lookup_started));
+            installed
+        }
+    };
     let outcome = spawn_and_collect_probe(
-        program.as_path(),
+        &probe_path,
         policy,
-        launch_path,
+        environment.launch_path.as_deref(),
         definition.launch_env(),
         timeout,
         &[],
@@ -890,10 +993,12 @@ fn collect_probe(
         args,
         search_path: launch_path,
         env: launch_env,
+        home: HomeScope::Private,
         seeded_env,
         limits: RunLimits::new(timeout, VERSION_OUTPUT_LIMIT),
         stderr: StderrPolicy::Discard,
         stdin: None,
+        cwd: None,
     };
     match bounded_run::run(&spec, now, None) {
         RunOutcome::Exited(output) if output.status().success() => {
@@ -922,7 +1027,6 @@ fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBu
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -950,6 +1054,15 @@ mod tests {
             &crate::runtime::environment::EnvironmentSource::Process,
         )
         .expect("the default allowlist builds")
+    }
+
+    /// A probe environment for a launch with an explicit `PATH`: the base
+    /// environment plus that path, without a profile override.
+    fn probe_env(base: &BaseEnv, path: Option<&OsStr>) -> ProbeEnvironment {
+        ProbeEnvironment {
+            launch_path: path.map(OsStr::to_os_string),
+            owner_locations: dispatch::OwnerLocations::from_launch(base, &[]),
+        }
     }
 
     /// An empty profile registry (no host-config layer) for the base-kind tests.
@@ -1087,7 +1200,7 @@ strategy = "none"
             RuntimeRef::hermes(),
             binary,
             &hermes_definition(),
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
         )
     }
 
@@ -1187,7 +1300,7 @@ strategy = "none"
             RuntimeRef::hermes(),
             &program.display().to_string(),
             &definition,
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
         );
         assert!(runtime.available);
         assert_eq!(runtime.version, None);
@@ -1269,7 +1382,7 @@ strategy = "none"
             validate_definition_launch(
                 &definition,
                 Spawn::Program(binary),
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             )
         };
 
@@ -1476,7 +1589,7 @@ strategy = "none"
         let error = validate_definition_launch_with_clock(
             &definition,
             Spawn::Program(&binary),
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
             VERSION_PROBE_TIMEOUT,
             &clock,
         )
@@ -1497,7 +1610,7 @@ strategy = "none"
         let shortened = validate_definition_launch_detailed_with_clock(
             &definition,
             Spawn::Program(&binary),
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
             VERSION_PROBE_TIMEOUT / 2,
             &clock,
         );
@@ -1735,7 +1848,7 @@ strategy = "none"
             RuntimeRef::from_wire("tool"),
             &binary,
             &definition,
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
         );
         assert!(supported.available);
         assert_eq!(supported.version.as_deref(), Some("1.0.2"));
@@ -1743,7 +1856,7 @@ strategy = "none"
         let validated = validate_definition_launch(
             &definition,
             Spawn::Program(&binary),
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
         )
         .expect("a release inside the range launches")
         .expect("the probed executable is pinned");
@@ -1762,7 +1875,7 @@ strategy = "none"
                 RuntimeRef::from_wire("tool"),
                 &binary,
                 &definition,
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             );
             assert!(runtime.available, "{output:?}");
             assert_eq!(runtime.version.as_deref(), version, "{output:?}");
@@ -1770,7 +1883,7 @@ strategy = "none"
             let error = validate_definition_launch(
                 &definition,
                 Spawn::Program(&binary),
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             )
             .expect_err("a release outside the range is refused");
             assert_eq!(error.code, "agent_runtime_unsupported");
@@ -1791,7 +1904,7 @@ strategy = "none"
             RuntimeRef::from_wire("tool"),
             &binary,
             &definition,
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
         );
         assert_eq!(
             failing.supported,
@@ -1804,7 +1917,7 @@ strategy = "none"
             RuntimeRef::from_wire("tool"),
             &dir.join("missing").display().to_string(),
             &definition,
-            process_path().as_deref(),
+            &probe_env(&process_base(), process_path().as_deref()),
         );
         assert!(!missing.available);
         assert_eq!(missing.supported, None);
@@ -1848,7 +1961,7 @@ strategy = "none"
             RuntimeRef::from_wire("tool"),
             &fixture.tool.display().to_string(),
             definition,
-            Some(launch_path.as_os_str()),
+            &probe_env(&process_base(), Some(launch_path.as_os_str())),
         )
         .version
     }
@@ -1871,7 +1984,7 @@ strategy = "none"
             validate_definition_launch(
                 &definition,
                 Spawn::Program(&binary),
-                Some(fixture.in_range.as_os_str())
+                &probe_env(&process_base(), Some(fixture.in_range.as_os_str()))
             )
             .is_ok(),
             "an interpreter inside the range launches"
@@ -1879,7 +1992,7 @@ strategy = "none"
         let error = validate_definition_launch(
             &definition,
             Spawn::Program(&binary),
-            Some(fixture.out_of_range.as_os_str()),
+            &probe_env(&process_base(), Some(fixture.out_of_range.as_os_str())),
         )
         .expect_err("an interpreter outside the range is refused");
         assert_eq!(error.code, "agent_runtime_unsupported");
@@ -2017,7 +2130,7 @@ strategy = "none"
                 RuntimeRef::from_wire("tool"),
                 &binary,
                 &definition,
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             );
             assert_eq!(runtime.version.as_deref(), Some(version), "{line}");
             assert_eq!(runtime.supported, Some(true), "{line}");
@@ -2025,7 +2138,7 @@ strategy = "none"
                 validate_definition_launch(
                     &definition,
                     Spawn::Program(&binary),
-                    process_path().as_deref()
+                    &probe_env(&process_base(), process_path().as_deref())
                 )
                 .is_ok(),
                 "{line}"
@@ -2039,7 +2152,7 @@ strategy = "none"
                 RuntimeRef::from_wire("tool"),
                 &binary,
                 &below,
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             );
             assert_eq!(out_of_range.version.as_deref(), Some(version), "{line}");
             assert_eq!(out_of_range.supported, Some(false), "{line}");
@@ -2055,14 +2168,14 @@ strategy = "none"
                 RuntimeRef::from_wire("tool"),
                 &binary,
                 &definition,
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             );
             assert_eq!(runtime.version, None, "{banner:?}");
             assert_eq!(runtime.supported, Some(false), "{banner:?}");
             let error = validate_definition_launch(
                 &definition,
                 Spawn::Program(&binary),
-                process_path().as_deref(),
+                &probe_env(&process_base(), process_path().as_deref()),
             )
             .expect_err("an unreadable banner is refused");
             assert_eq!(error.code, "agent_runtime_unsupported");

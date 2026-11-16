@@ -76,8 +76,8 @@ use super::{
 };
 use crate::agent::host::{
     adopts, adopts_newer, validate_launch_runtime_with_timeout_detailed, BuiltinSource,
-    DefinitionError, DefinitionOrigin, LaunchPin, PackageSource, PackageStore, RuntimeDefinition,
-    RuntimeHost, Spawn,
+    DefinitionError, DefinitionOrigin, LaunchPin, PackageSource, PackageStore, ProbeEnvironment,
+    RuntimeDefinition, RuntimeHost, Spawn,
 };
 use crate::agent::{
     parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
@@ -90,7 +90,6 @@ use crate::capabilities::{
 use crate::catalog_anchor::CatalogTrust;
 use crate::detect::Manifest;
 use crate::procwatch::ProcessInspector;
-use crate::runtime::environment::effective_variable;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
 use crate::runtime::LaunchEnvironment;
 use crate::session::native_repair::repair_native_recovery;
@@ -1543,18 +1542,18 @@ enum Probe {
     BudgetExhausted,
 }
 
-/// Runs the version probe of `program` under `launch_path` for `definition`,
+/// Runs the version probe of `program` under `environment` for `definition`,
 /// as resume validates the program it relaunches, unless the same probe
 /// already has an outcome in `ledger` or the budget is spent.
 fn run_probe(
     definition: &RuntimeDefinition,
     program: &str,
-    launch_path: Option<&OsStr>,
+    environment: &ProbeEnvironment,
     ledger: &ProbeLedger,
 ) -> Probe {
     let key = ProbeKey {
         program: program.to_owned(),
-        launch_path: launch_path.map(OsStr::to_os_string),
+        launch_path: environment.launch_path.clone(),
         probed: probed_identity(definition),
     };
     if let Some(outcome) = ledger.outcomes.borrow().get(&key) {
@@ -1582,7 +1581,7 @@ fn run_probe(
     let result = validate_launch_runtime_with_timeout_detailed(
         definition,
         Spawn::Program(program),
-        launch_path,
+        environment,
         remaining,
         &ledger.clock,
     );
@@ -1591,6 +1590,10 @@ fn run_probe(
         // Only a probe the shortened budget cut short is budget exhaustion; a
         // probe that ran its full deadline is an executable that does not pass.
         Err(LaunchValidationFailure::ProbeTimedOut) => return Probe::BudgetExhausted,
+        Err(LaunchValidationFailure::DispatchUnresolved) => {
+            let error = ProtocolError::agent_runtime_dispatch_unresolved();
+            Err((error.code, error.msg))
+        }
         Err(LaunchValidationFailure::Missing) => {
             let error = ProtocolError::agent_binary_missing(&reported_program(definition, program));
             Err((error.code, error.msg))
@@ -2172,18 +2175,9 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
             ));
         }
     };
-    let launch_path = definition
-        .version_probe_parser()
-        .is_some()
-        .then(|| effective_variable(base, profile_env.as_slice(), "PATH"))
-        .flatten();
     let program = binding_program(binding, &definition);
-    match run_probe(
-        &definition,
-        &program,
-        launch_path.as_deref(),
-        judging.probes,
-    ) {
+    let environment = ProbeEnvironment::for_launch(base, profile_env.as_slice());
+    match run_probe(&definition, &program, &environment, judging.probes) {
         Probe::Supported => None,
         Probe::Refused { code, detail } => Some((
             Verdict::WouldLoseRecovery,

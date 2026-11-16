@@ -1076,6 +1076,23 @@ file under a home the probe does not see, needs a launcher program whose
 version command answers without it; set the profile's `program` to that
 launcher.
 
+### Version managers
+
+A profile `program` may be a version-manager shim: a symlink to the `mise`
+manager under the agent's name (as `mise` writes them). The daemon keeps the
+lexical link path so the manager dispatches on the link name, asks the manager
+read-only which installed executable the shim would run (`mise which`, offline
+with no auto-install, starting in `/` under its own deadline), and probes that
+executable in the private sandbox; the launch still execs the shim link. A shim
+with no installed release is refused with `agent_runtime_unsupported` and a
+`recover` hint to run the agent once in a login shell; the version check never
+installs or updates a tool. This covers the owner's global/system selection
+only: a project pin in any directory the lookup would otherwise walk through
+(including a project-local pin in the session working directory) does not
+change the probed release, while the launch may run the project's release. Other `argv[0]`
+dispatchers behind a symlink are probed through their link in the private
+sandbox and pass when they answer hermetically there.
+
 ## Declaring input readiness
 
 The `[input]` table may declare `ready`, the signal that shows the agent reads

@@ -304,6 +304,15 @@ pub(crate) enum Spawn<'a> {
     Program(&'a str),
 }
 
+/// What a version probe runs in: the `PATH` the launched agent will see and
+/// the owner location variables a version-manager lookup resolves against.
+///
+/// The daemon always knows all three where it validates a launch: the launch
+/// path is the daemon's base environment overridden by the profile. Profiles
+/// can override where installs and configuration live, so resolution of
+/// version-manager shims reads the same values the launched agent sees.
+pub(crate) use crate::capabilities::ProbeEnvironment;
+
 /// Runs the launch-time executable validation the definition declares.
 ///
 /// Every spawned program must resolve to an executable before anything is
@@ -321,29 +330,29 @@ pub(crate) enum Spawn<'a> {
 /// `agent_runtime_unsupported` when the probe rejects an executable that
 /// exists or the definition names a parser this daemon does not provide.
 ///
-/// `launch_path` is the `PATH` the launched agent will see (the daemon's base
-/// environment overridden by the profile); the probe runs under it so an
-/// interpreter script resolves the interpreter the launch will use.
+/// `environment` carries the `PATH` the launched agent will see; the probe
+/// runs under it so an interpreter script resolves the interpreter the
+/// launch will use.
 pub(crate) fn validate_launch_runtime(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&std::ffi::OsStr>,
+    environment: &ProbeEnvironment,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    crate::capabilities::validate_definition_launch(definition, spawn, launch_path)
+    crate::capabilities::validate_definition_launch(definition, spawn, environment)
 }
 
 /// Validate a launch runtime while preserving a shortened-budget timeout.
 pub(crate) fn validate_launch_runtime_with_timeout_detailed(
     definition: &RuntimeDefinition,
     spawn: Spawn<'_>,
-    launch_path: Option<&std::ffi::OsStr>,
+    environment: &ProbeEnvironment,
     timeout: std::time::Duration,
     clock: &crate::capabilities::ProbeClock,
 ) -> Result<Option<ValidatedLaunchProgram>, crate::capabilities::LaunchValidationFailure> {
     crate::capabilities::validate_definition_launch_with_timeout_detailed(
         definition,
         spawn,
-        launch_path,
+        environment,
         timeout,
         clock,
     )

@@ -37,7 +37,7 @@ use tracing::info;
 
 use crate::agent::host::PackageStore;
 use crate::api::ControlTransport;
-use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
+use crate::bounded_run::{self, HomeScope, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 
 /// Most package command runs the host executes at once.
 ///
@@ -171,10 +171,12 @@ impl PackageCommandService {
                     args: &args,
                     search_path: search_path.as_deref(),
                     env: &[],
+                    home: HomeScope::Private,
                     seeded_env: &[],
                     limits: RunLimits::new(Duration::from_millis(u64::from(timeout)), cap as usize),
                     stderr: StderrPolicy::Discard,
                     stdin: None,
+                    cwd: None,
                 };
                 let outcome = bounded_run::run(&spec, &Instant::now, Some(&cancel));
                 let elapsed = started.elapsed();

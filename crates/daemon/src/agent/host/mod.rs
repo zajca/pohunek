@@ -51,7 +51,8 @@ pub(crate) use launch::check_pin;
 pub use launch::LaunchPin;
 pub(crate) use launch::{
     adopts, adopts_newer, honors_frozen_launch, launch_command, relaunch_pin,
-    validate_launch_runtime, validate_launch_runtime_with_timeout_detailed, version_order, Spawn,
+    validate_launch_runtime, validate_launch_runtime_with_timeout_detailed, version_order,
+    ProbeEnvironment, Spawn,
 };
 pub use launch_env::{
     DescriptorLaunchEnv, GLUED_ENDINGS, LAUNCH_ENV_VALUES, LOCATION_WORDS, MAX_LAUNCH_ENV_ENTRIES,

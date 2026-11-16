@@ -317,7 +317,9 @@ preview a run shows before it asks, and with `--json` as one document whose
 `preview`. It asks nothing and changes nothing: no service, package, profile,
 hook or config file, and it takes no lock a run would wait for. Like a run's
 plan, it runs the agents' read-only queries: the version probes of the
-release daemon's detection and, for a marked Hermes home, `hermes --version`
+release daemon's detection (including the version-manager shim lookup, which
+asks `mise` read-only which installed executable a shim would run, offline
+with no auto-install) and, for a marked Hermes home, `hermes --version`
 and `hermes plugins list --json`, which tell whether it is a Hermes release the
 selected package supports and whether the plugin is enabled. A plan that
 blocks the run, such as an installed service of another version or a release

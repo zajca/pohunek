@@ -623,6 +623,26 @@ impl ProtocolError {
         )
     }
 
+    /// `agent_runtime_unsupported` for a version-manager shim whose manager
+    /// names no installed release of the agent, so the version probe never
+    /// ran.
+    ///
+    /// The version check never installs or updates a tool: only a run in the
+    /// user's own login shell lets the version manager install the release
+    /// the shim selects.
+    #[must_use]
+    pub fn agent_runtime_dispatch_unresolved() -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_runtime_unsupported",
+            "the version manager that provides the selected agent executable has no installed release of it",
+            Some(
+                "run the agent once in a login shell so its version manager installs it; the version check never installs or updates a tool"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/session_terminal_unavailable` error.
     #[must_use]
     pub fn session_terminal_unavailable() -> Self {
