@@ -4376,28 +4376,38 @@ async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_th
 /// A project pin above the lookup directory does not change the mise
 /// selection (issue #2383, case 11): the lookup starts in `/`, whose only
 /// ancestor is itself, so a `.tool-versions` naming an uninstalled release
-/// in the daemon's own temporary directory (the parent of the
-/// `pohunek-run-` sandboxes, where a shared `/tmp` would hold other users'
-/// files) never reaches the lookup. The fake mise honours such a pin the
-/// way real mise does, so with the sandbox cwd the lookup would fail; from
-/// `/` the inventory still reports the installed tool as supported through
-/// the shim.
+/// above the daemon's run sandboxes (the parent of the `pohunek-run-`
+/// directories, where a shared `/tmp` would hold other users' files)
+/// never reaches the lookup. The fake mise honours such a pin the way
+/// real mise does, so with the sandbox cwd the lookup would fail; from `/`
+/// the inventory still reports the installed tool as supported through the
+/// shim. The pin lives in a private lookup directory owned by this test
+/// (via a process-private TMPDIR), never in the shared temporary root.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_project_config_above_the_lookup_directory_does_not_change_the_mise_selection() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    // The daemon under test runs in-process and builds its run sandboxes
+    // in the process temporary directory. A process-private TMPDIR keeps
+    // the pin an ancestor of every sandbox cwd while isolating it from
+    // every other test: nothing creates a sandbox before the first probe,
+    // so the switch happens after the fixture files are written (their
+    // copies go through a tool that takes the process-environment lock,
+    // which does not re-enter). The guard lives until after
+    // `fixture.finish()`. Neither the fixture nor the harness takes
+    // `ProcessEnv::lock()` again, so holding it here cannot deadlock.
+    let lookup_base = pohunek_test_support::tempdir().expect("private lookup directory");
+    let ancestors = lookup_base.path().to_path_buf();
     let fixture = Fixture::start().await;
     let root = fixture.harness.env.root().to_path_buf();
     let home = fixture.harness.env.home().to_path_buf();
     let release = locked_release();
     let shim = write_fake_mise(&root, &home, &release);
     let mise_log = home.join("mise.log");
-    // The daemon builds its run sandboxes in the process temporary
-    // directory: a pin there is an ancestor of every sandbox cwd, the way
-    // a shared `/tmp` file is an ancestor of runs without an explicit
-    // lookup directory. The host directory layout is the subject of this
-    // scenario, so reading it is allowed.
-    // hermetic-allowed: #2383 the ancestor pin above the lookup directory is the case under test
-    let ancestors = std::env::temp_dir();
+    let mut process_env = ProcessEnv::lock();
+    process_env.set("TMPDIR", &ancestors);
     fs::write(ancestors.join(".tool-versions"), "codex 0.0.1\n")
         .expect("write the ancestor project pin");
     fixture.write_profile("mise-shim-pinned", Some(&shim));
@@ -4429,7 +4439,27 @@ async fn a_project_config_above_the_lookup_directory_does_not_change_the_mise_se
         "the lookup never ran online or installing: {log}"
     );
 
-    fs::remove_file(ancestors.join(".tool-versions")).expect("remove the ancestor pin");
+    // The probe of the manager-named executable ran in a sandbox below
+    // the private lookup directory: the agent logs its HOME on the
+    // `--version` line, which proves the pin sits above the sandboxes and
+    // the scenario is not vacuous.
+    let agent_log = root.join("agent-mise-agent.log");
+    let probe_home = wait_until("the pinned scenario's probe HOME", || async {
+        let log = fs::read_to_string(&agent_log).ok()?;
+        log.lines()
+            .find(|line| line.starts_with("--version home="))
+            .map(str::to_owned)
+    })
+    .await;
+    let probe_home = probe_home
+        .strip_prefix("--version home=")
+        .expect("the probe logged its HOME");
+    assert!(
+        Path::new(probe_home).starts_with(&ancestors) && probe_home.contains("pohunek-run-"),
+        "the probe ran in a sandbox below the ancestor pin: {probe_home} (pin: {})",
+        ancestors.display()
+    );
+
     fixture.finish().await;
 }
 
