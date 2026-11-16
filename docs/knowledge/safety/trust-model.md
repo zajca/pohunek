@@ -131,9 +131,11 @@ The assistant must:
   which fails and names a live session whose worker the daemon neither recorded
   nor can place by control group; until that session's worker is reattached, a
   caller no root attributes is refused as `unattributed_caller` instead of
-  getting owner rights. A recorded worker that is gone leaves nothing to place,
-  and a worker the daemon refuses to adopt still keeps its processes in their
-  session.
+  getting owner rights. A recorded worker that is gone, or recorded under another boot, leaves
+  nothing to place. A worker the daemon refuses to adopt keeps its processes in
+  their session when its identity is known; otherwise they keep owner rights,
+  the doctor warns, and removing the session retires the worker. The refusal
+  names the way out: restart the daemon job.
 - The parent link is attested for a process inside a session's tree: a
   `session.new` from there records that session as `spawned_by` and refuses
   markers that name another session (`origin_mismatch`). Only the owner moves a

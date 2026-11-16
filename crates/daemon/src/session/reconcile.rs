@@ -69,11 +69,18 @@ pub(super) const WORKER_GENERATION_NOT_ADVANCED: &str = "worker_generation_not_a
 /// a runtime it will not adopt still has its processes attributed to the
 /// session.
 fn with_observed_worker(mut record: SessionRecord, snapshot: &InspectSnapshot) -> SessionRecord {
-    record.worker_process = Some(crate::store::WorkerProcess {
+    record.worker_process = observed_worker(snapshot);
+    record
+}
+
+/// The process identity a worker reports in its snapshot, bound to the
+/// running boot.
+fn observed_worker(snapshot: &InspectSnapshot) -> Option<crate::store::WorkerProcess> {
+    Some(crate::store::WorkerProcess {
         pid: snapshot.worker_process.pid,
         start_identity: snapshot.worker_process.start_identity,
-    });
-    record
+        boot_identity: super::current_boot_id()?,
+    })
 }
 
 /// Whether the worker named by `worker_id` and `worker_instance_id` is not the
@@ -166,8 +173,13 @@ enum SocketEvidence {
     /// Exactly one authenticated worker answered on the session's socket.
     Worker(Box<DiscoveredWorker>),
     /// A socket answered but cannot be adopted (incompatible protocol or a
-    /// mismatched identity); its worker is left alive.
-    Unusable(RuntimeState, &'static str),
+    /// mismatched identity); its worker is left alive. The process identity
+    /// is that of the worker when it answered with a snapshot.
+    Unusable(
+        RuntimeState,
+        &'static str,
+        Option<crate::store::WorkerProcess>,
+    ),
     /// Several live workers claim the session.
     Multiple,
     /// The runtime root could not be enumerated, or the session's socket did
@@ -196,6 +208,9 @@ struct WorkerDiscovery {
     /// Runtime slots whose socket did not answer before the connect deadline,
     /// with the detail reported as unknown evidence.
     unresponsive: HashMap<String, String>,
+    /// The process identity of each answering worker startup refuses to
+    /// adopt, keyed by the runtime slot it answers in.
+    refused: HashMap<String, crate::store::WorkerProcess>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1290,7 +1305,9 @@ impl SessionRegistry {
                 SocketEvidence::Worker(Box::new(candidates.remove(0)))
             }
             [] => match self.inventory_state_for_slot(session_id).await {
-                Some((state, reason)) => SocketEvidence::Unusable(state, reason),
+                Some((state, reason)) => {
+                    SocketEvidence::Unusable(state, reason, discovered.refused.remove(session_id))
+                }
                 None => SocketEvidence::Absent,
             },
             _ => SocketEvidence::Multiple,
@@ -1474,7 +1491,11 @@ impl SessionRegistry {
                 if snapshot.session_id.as_str() != slot
                     || persisted_identity_mismatch(record, &snapshot)
                 {
-                    SocketEvidence::Unusable(RuntimeState::Conflict, IDENTITY_MISMATCH)
+                    SocketEvidence::Unusable(
+                        RuntimeState::Conflict,
+                        IDENTITY_MISMATCH,
+                        observed_worker(&snapshot),
+                    )
                 } else {
                     SocketEvidence::Worker(Box::new(DiscoveredWorker {
                         slot,
@@ -1488,10 +1509,10 @@ impl SessionRegistry {
                 // Same classification startup discovery applies to its inventory.
                 match classify_connect_error(&error) {
                     (RuntimeState::Incompatible, reason) => {
-                        SocketEvidence::Unusable(RuntimeState::Incompatible, reason)
+                        SocketEvidence::Unusable(RuntimeState::Incompatible, reason, None)
                     }
                     (RuntimeState::Lost, _) => SocketEvidence::Absent,
-                    _ => SocketEvidence::Unusable(RuntimeState::Conflict, IDENTITY_MISMATCH),
+                    _ => SocketEvidence::Unusable(RuntimeState::Conflict, IDENTITY_MISMATCH, None),
                 }
             }
         }
@@ -1546,6 +1567,9 @@ impl SessionRegistry {
             Ok(generation) => generation,
             Err(error) => {
                 tracing::debug!(session_id = %record.session_id, error = %error, "record names a malformed worker generation");
+                if let SocketEvidence::Worker(candidate) = &socket {
+                    record = with_observed_worker(record, &candidate.snapshot);
+                }
                 return !self
                     .insert_unavailable_record(record, RuntimeState::Conflict, IDENTITY_MISMATCH)
                     .await;
@@ -1744,9 +1768,12 @@ impl SessionRegistry {
             }
             TerminalJournalClassification::Absent => {}
         }
-        if let SocketEvidence::Unusable(state, reason) = socket {
+        if let SocketEvidence::Unusable(state, reason, worker) = socket {
             // A conflicting worker still answers there, so its end is watched.
             let watched = state == RuntimeState::Conflict;
+            if worker.is_some() {
+                record.worker_process = worker;
+            }
             self.mark_pending(record, state, reason, retry).await;
             return watched;
         }
@@ -3705,7 +3732,7 @@ impl SessionRegistry {
                 .map(pohunek_worker_protocol::WorkerInstanceId::as_str),
         ) {
             self.mark_pending(
-                record,
+                with_observed_worker(record, &snapshot),
                 RuntimeState::Conflict,
                 RUNTIME_IDENTITY_MISMATCH,
                 retry,
@@ -3918,6 +3945,7 @@ impl SessionRegistry {
         }
 
         let mut grouped = HashMap::<String, Vec<DiscoveredWorker>>::new();
+        let mut refused = HashMap::new();
         for candidate in candidates {
             let claimed = candidate.snapshot.session_id.to_string();
             let record = logical.get(claimed.as_str()).copied();
@@ -3934,17 +3962,7 @@ impl SessionRegistry {
             } else {
                 RuntimeInventoryStatus::Orphaned
             };
-            let reason = match status {
-                RuntimeInventoryStatus::Managed => None,
-                RuntimeInventoryStatus::Orphaned => Some("logical_session_missing".to_owned()),
-                RuntimeInventoryStatus::Conflict => Some("multiple_worker_candidates".to_owned()),
-                RuntimeInventoryStatus::Incompatible => {
-                    Some("worker_protocol_incompatible".to_owned())
-                }
-                RuntimeInventoryStatus::IdentityMismatch | RuntimeInventoryStatus::Unknown => {
-                    Some("runtime_identity_mismatch".to_owned())
-                }
-            };
+            let reason = inventory_reason(status);
             inventory.push(RuntimeInventoryEntry {
                 runtime_slot: candidate.slot.clone(),
                 claimed_session_id: Some(claimed.clone()),
@@ -3959,6 +3977,8 @@ impl SessionRegistry {
             });
             if status == RuntimeInventoryStatus::Managed {
                 grouped.entry(claimed).or_default().push(candidate);
+            } else if let Some(worker) = observed_worker(&candidate.snapshot) {
+                refused.insert(candidate.slot, worker);
             }
         }
         inventory.sort_by(|left, right| left.runtime_slot.cmp(&right.runtime_slot));
@@ -3966,6 +3986,7 @@ impl SessionRegistry {
             workers: grouped,
             inventory,
             unresponsive,
+            refused,
         })
     }
 
@@ -7226,6 +7247,19 @@ fn persisted_identity_mismatch(record: &SessionRecord, snapshot: &InspectSnapsho
             .as_deref()
             .zip(snapshot.worker_instance_id.as_ref())
             .is_some_and(|(expected, actual)| expected != actual.as_str())
+}
+
+/// The reason the inventory gives for an answering worker of `status`.
+fn inventory_reason(status: RuntimeInventoryStatus) -> Option<String> {
+    match status {
+        RuntimeInventoryStatus::Managed => None,
+        RuntimeInventoryStatus::Orphaned => Some("logical_session_missing".to_owned()),
+        RuntimeInventoryStatus::Conflict => Some("multiple_worker_candidates".to_owned()),
+        RuntimeInventoryStatus::Incompatible => Some("worker_protocol_incompatible".to_owned()),
+        RuntimeInventoryStatus::IdentityMismatch | RuntimeInventoryStatus::Unknown => {
+            Some("runtime_identity_mismatch".to_owned())
+        }
+    }
 }
 
 fn discovery_failure_entry(slot: String, error: &WorkerError) -> RuntimeInventoryEntry {
@@ -17862,6 +17896,8 @@ generation "$1"
                 worker.map(|(pid, start_identity)| crate::store::WorkerProcess {
                     pid,
                     start_identity,
+                    boot_identity: crate::session::current_boot_id()
+                        .expect("the host names its boot"),
                 });
             Store::new(root.join("data/metadata.jsonl"))
                 .record_session(&record)
@@ -17937,7 +17973,8 @@ generation "$1"
                 refused
                     .recover
                     .as_deref()
-                    .is_some_and(|hint| hint.contains("pohunek doctor")),
+                    .is_some_and(|hint| hint.contains("pohunek doctor")
+                        && hint.contains("pohunek service status")),
                 "{refused:?}"
             );
 
@@ -17993,6 +18030,119 @@ generation "$1"
             assert_eq!(check.status, protocol::DoctorStatus::Warn);
             assert!(check.detail.contains("s-9103"), "{}", check.detail);
             server_task.abort();
+        }
+
+        /// A record written before schema 22 names no worker. A live worker
+        /// that answers but does not match the record is refused, and the
+        /// identity it reported places its processes in the session, so the
+        /// owner's terminal is neither locked out nor given a stale placement.
+        #[tokio::test]
+        async fn a_pre_schema_22_record_whose_live_worker_is_refused_is_placed_through_the_observed_worker(
+        ) {
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, _worker_instance_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-9104", "worker-s-9104")
+                    .await;
+            persist_record(&fixture.root, "s-9104", Some("another-instance"));
+            drop(controller);
+            fixture.supervisor.script_job(
+                service_id("s-9104", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-9104").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            let session = SessionId("s-9104".to_owned());
+            let findings = fixture.registry.root_findings().await;
+            assert!(findings.unverified.is_empty());
+            assert!(findings.unplaced.is_empty(), "{findings:?}");
+            assert_eq!(findings.unadopted, vec![session.clone()]);
+            // The in-process worker is this process, so its identity is the
+            // one the snapshot reported and the stored record now holds.
+            let (class, keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Session(session));
+            assert!(keep);
+            let stored = Store::new(fixture.root.join("data/metadata.jsonl"))
+                .load_session("s-9104")
+                .expect("load")
+                .expect("the record stays");
+            assert!(stored.worker_process.is_some());
+            server_task.abort();
+        }
+
+        /// A refused runtime no worker identity is known for does not fault the
+        /// host: the owner keeps owner rights and the doctor names the session.
+        #[tokio::test]
+        async fn a_refused_runtime_without_any_worker_identity_leaves_the_owner_in_charge() {
+            let fixture = fixture_retrying(Arc::new(RetryInspector::default()));
+            let runtime_root = fixture.root.join("runtime/workers");
+            let (controller, worker_instance_id, _child_pid, server_task) =
+                spawn_initialized_worker(&fixture.root, &runtime_root, "s-9105", "worker-s-9105")
+                    .await;
+            persist_record(&fixture.root, "s-9105", Some(worker_instance_id.as_str()));
+            drop(controller);
+            let socket = runtime_root
+                .join("s-9105")
+                .join(pohunek_paths::WORKER_SOCKET_NAME);
+            std::fs::rename(&socket, socket.with_extension("hidden")).expect("hide the socket");
+            fixture.supervisor.script_job(
+                service_id("s-9105", TEST_GENERATION),
+                present(ServiceState::Running, None),
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-9105").await;
+            assert_eq!(runtime.state, RuntimeState::Conflict);
+            let findings = fixture.registry.root_findings().await;
+            assert!(findings.unverified.is_empty());
+            assert_eq!(findings.unplaced, vec![SessionId("s-9105".to_owned())]);
+            let (class, _keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Owner);
+            let check = crate::doctor::session_rights_check(false, &findings);
+            assert_eq!(check.status, protocol::DoctorStatus::Warn);
+            assert!(check.detail.contains("s-9105"), "{}", check.detail);
+            server_task.abort();
+        }
+
+        /// A worker identity recorded under another boot names no process: the
+        /// pid and start counter of a past boot could match an unrelated one.
+        #[tokio::test]
+        async fn a_worker_identity_recorded_under_another_boot_places_nothing() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let stand_in = StandInWorker::spawn();
+            let (pid, start_identity) = stand_in.identity();
+            let mut record = persist_record(&fixture.root, "s-9106", Some("runtime-s-9106"));
+            record.worker_process = Some(crate::store::WorkerProcess {
+                pid,
+                start_identity,
+                boot_identity: "a-boot-that-is-not-this-one".to_owned(),
+            });
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the record");
+            let id = service_id("s-9106", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_retire_unavailable(id);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let (class, _keep) = fixture.registry.classify_caller(&stand_in.peer()).await;
+            assert_ne!(
+                class,
+                crate::session::rights::CallerClass::Session(SessionId("s-9106".to_owned()))
+            );
         }
 
         #[tokio::test]

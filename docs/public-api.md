@@ -1187,7 +1187,8 @@ placement mode: `ancestry+cgroup` when the service manager runs each worker as a
 systemd user unit, otherwise `ancestry`. It is `fail` and names the sessions
 while a live session has no verified root process, and `warn` and names the
 sessions whose runtime the daemon does not adopt but whose recorded worker keeps
-attributing its processes to the session.
+attributing its processes to the session, and `warn` for the sessions whose
+refused runtime has no worker identity, whose processes keep owner rights.
 
 `daemon.doctor` adds one `placement_escape` check over the live sessions: `warn`
 naming the sessions and processes for an escape, `warn` for `unobservable`, `ok`

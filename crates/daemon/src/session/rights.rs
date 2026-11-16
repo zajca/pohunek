@@ -32,7 +32,7 @@ use protocol::{method, AgentActivity, ProtocolError, RuntimeRef, RuntimeState, S
 use tracing::warn;
 
 use super::native_attestation::{ControlPeer, PeerStanding};
-use super::{is_terminal, RuntimeHandle, SessionRegistry};
+use super::{is_terminal, runtime_error, RuntimeHandle, SessionRegistry};
 use crate::agent::profile::rights::{rights_of, ProfileRights};
 use crate::procwatch::{Pid, ProcessIdentity, ProcessInspector};
 use crate::store::DesiredState;
@@ -154,6 +154,9 @@ struct Roots {
     /// The sessions whose runtime the daemon refuses to adopt but whose
     /// recorded worker still places their processes.
     unadopted: Vec<SessionId>,
+    /// The sessions whose runtime the daemon refuses to adopt and whose worker
+    /// it holds no identity for, so their processes keep owner rights.
+    unplaced: Vec<SessionId>,
 }
 
 /// What the doctor reports about the roots of the live sessions.
@@ -164,6 +167,7 @@ pub(crate) struct RootFindings {
     /// Sessions with a runtime the daemon does not adopt, attributed through
     /// their recorded worker.
     pub(crate) unadopted: Vec<SessionId>,
+    pub(crate) unplaced: Vec<SessionId>,
 }
 
 impl Roots {
@@ -242,22 +246,59 @@ impl SessionRegistry {
         };
         if first_use {
             // The snapshot is stored at once, so a restart after a profile edit
-            // cannot widen the session.
-            if let Err(error) = self
-                .write_entry_record(id, |entry| {
-                    Self::session_record(id, entry, entry.desired_state, None)
-                })
+            // cannot widen the session. Only the rights field of the durable
+            // record is written, so a running stop's intent and an unpersisted
+            // classification stay as they are.
+            let held = self
+                .inner
+                .sessions
+                .lock()
                 .await
-            {
-                warn!(
-                    name: "session.rights.snapshot_unpersisted",
-                    session_id = %id.0,
-                    error = %error.msg,
-                    "the launch rights snapshot of a session could not be stored"
-                );
+                .get(id)
+                .and_then(|entry| entry.launch_rights.as_deref().map(ProfileRights::to_record));
+            if let Some(held) = held {
+                if let Err(error) = self.store_launch_rights(id, held).await {
+                    warn!(
+                        name: "session.rights.snapshot_unpersisted",
+                        session_id = %id.0,
+                        error = %error.msg,
+                        "the launch rights snapshot of a session could not be stored"
+                    );
+                }
             }
         }
         Some(rights)
+    }
+
+    /// Writes the launch rights of `id` into its durable record.
+    async fn store_launch_rights(
+        &self,
+        id: &SessionId,
+        rights: crate::store::LaunchRights,
+    ) -> Result<(), ProtocolError> {
+        let Some(store) = self.store_for_write()? else {
+            return Ok(());
+        };
+        let session_id = id.0.clone();
+        self.inner
+            .background
+            .spawn_blocking("set_launch_rights", move || {
+                store.set_launch_rights(&session_id, &rights)
+            })
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("launch rights write task panicked for {}", id.0),
+                )
+            })?
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to store the launch rights of {}: {error}", id.0),
+                )
+            })?;
+        Ok(())
     }
 
     /// The profile name the session `id` runs, if the registry holds it.
@@ -301,6 +342,7 @@ impl SessionRegistry {
             shell: HashSet::new(),
             unverified: Vec::new(),
             unadopted: Vec::new(),
+            unplaced: Vec::new(),
         };
         for (id, entry) in sessions.iter() {
             if is_terminal(entry.info.state) {
@@ -321,21 +363,19 @@ impl SessionRegistry {
                 roots.add(id, root);
             }
             // A runtime the daemon holds no worker for may still run
-            // processes: it is reconnecting, starting, or a live worker it
-            // refuses to adopt (`Conflict`, `Incompatible`). Without a
-            // recorded worker identity, and on a host whose control groups do
-            // not place the session, its processes cannot be attributed. A
-            // recorded worker that is gone is not a fault: its tree has
-            // nothing left to place.
+            // processes: it is reconnecting or starting. Without a recorded
+            // worker identity, and on a host whose control groups do not place
+            // the session, its processes cannot be attributed. A recorded
+            // worker that is gone is not a fault: its tree has nothing left to
+            // place. A refused runtime (`Conflict`, `Incompatible`) is placed
+            // through the worker identity the daemon observed or recorded; one
+            // without it is no fault either, so the owner keeps the documented
+            // recovery of removing the session.
             let bears_process = match &entry.runtime {
                 RuntimeHandle::Worker(_) => true,
-                RuntimeHandle::Unavailable(state) => matches!(
-                    state,
-                    RuntimeState::Starting
-                        | RuntimeState::Reconnecting
-                        | RuntimeState::Conflict
-                        | RuntimeState::Incompatible
-                ),
+                RuntimeHandle::Unavailable(state) => {
+                    matches!(state, RuntimeState::Starting | RuntimeState::Reconnecting)
+                }
             };
             if bears_process && !by_group && attested.iter().all(Option::is_none) {
                 roots.unverified.push(id.clone());
@@ -343,9 +383,12 @@ impl SessionRegistry {
             if matches!(
                 &entry.runtime,
                 RuntimeHandle::Unavailable(RuntimeState::Conflict | RuntimeState::Incompatible)
-            ) && entry.worker_root.is_some()
-            {
-                roots.unadopted.push(id.clone());
+            ) {
+                if entry.worker_root.is_some() {
+                    roots.unadopted.push(id.clone());
+                } else {
+                    roots.unplaced.push(id.clone());
+                }
             }
         }
         // A launch records its worker before the worker forks the PTY child,
@@ -373,6 +416,7 @@ impl SessionRegistry {
         RootFindings {
             unverified: roots.unverified,
             unadopted: roots.unadopted,
+            unplaced: roots.unplaced,
         }
     }
 

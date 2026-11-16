@@ -936,7 +936,7 @@ pub(crate) fn session_rights_check(
             SESSION_RIGHTS_CHECK,
             DoctorStatus::Fail,
             &format!(
-                "{} live session(s) have no verified root process ({}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends.",
+                "{} live session(s) have no verified root process ({}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends; if it stays stuck, restart the daemon job (`pohunek service status` names it; `systemctl --user restart <job>` or `launchctl kickstart -k <job>`), which reattaches every live worker.",
                 findings.unverified.len(),
                 named(&findings.unverified)
             ),
@@ -950,6 +950,17 @@ pub(crate) fn session_rights_check(
                 "{} session(s) run a worker the daemon does not adopt ({}); its processes keep that session's rights, and removing the session retires them.",
                 findings.unadopted.len(),
                 named(&findings.unadopted)
+            ),
+        );
+    }
+    if !findings.unplaced.is_empty() {
+        return check(
+            SESSION_RIGHTS_CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "{} session(s) run a worker the daemon does not adopt and holds no process identity for ({}); their processes keep owner rights, and removing the session retires them.",
+                findings.unplaced.len(),
+                named(&findings.unplaced)
             ),
         );
     }

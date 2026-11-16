@@ -2373,19 +2373,25 @@ that remain are cheap, free-by-default, or inherited:
   process of the session placed below the worker is attributed to it even
   before the session entry exists, whatever stale identities an earlier
   runtime of the same session left. The session entry keeps the worker beside
-  the PTY root, and the session record persists the worker's pid and start
-  identity. A restart that cannot reach a live worker, and a runtime the
-  daemon refuses to adopt (`Conflict`, `Incompatible`), still place the
-  worker's processes in their session from the record; a recorded worker that
-  is gone leaves nothing to place. Roots are matched by pid and start
+  the PTY root, and the session record persists the worker's pid, start
+  identity and the boot it counts from. A restart that cannot reach a live
+  worker, and a runtime the daemon refuses to adopt (`Conflict`,
+  `Incompatible`), still place the worker's processes in their session from
+  the record, or from the identity the refused worker reported when it
+  answered; a recorded worker that is gone, or recorded under another boot,
+  leaves nothing to place. A refused runtime no identity is known for keeps
+  owner rights, so removing the session stays possible; `pohunek doctor` warns
+  and names it. The launch rights a session takes at first use are written
+  into its durable record alone, so a stop intent or an unpersisted
+  classification is never overwritten. Roots are matched by pid and start
   identity together. A live session that holds no worker identity at all
   (a record written before schema 22 whose worker the daemon could not
   reattach) on a host without control-group placement is the fault state:
   `pohunek doctor` fails the `session_rights` check and names the session, and
   a caller no root attributes is `Unattributed` instead of `Owner` until the
   worker is reattached or the session ends. `Unattributed` carries a recovery
-  hint: run the request from a remote owner connection, or retry once the
-  worker reconnects.
+  hint: retry once the worker reconnects, or restart the daemon job
+  (`pohunek service status` names it), which reattaches every live worker.
 
   A `Session(X)` caller may mutate a session only when it is a descendant of
   X along `spawned_by` (children, their children, so `session rm --with-children`

@@ -340,3 +340,61 @@ async fn a_session_recorded_before_launch_rights_takes_the_file_once_and_never_w
 
     again.registry.stop(&id).await.expect("stop the session");
 }
+
+/// The first-use snapshot adds only the rights field to the durable record, so
+/// a stop intent committed meanwhile, and anything else the record holds that
+/// the in-memory entry does not, stays.
+#[tokio::test]
+async fn the_first_use_snapshot_writes_only_the_rights_and_keeps_a_committed_stop_intent() {
+    let store_path = temp_store_path("rights-first-use-keeps-intent");
+    let fixture = Fixture::with_store("rights-first-use-keeps-intent", store_path.clone());
+    fixture.write_profile(PROFILE, &profile_text("[\"narrow\"]"));
+    let id = create(&fixture).await;
+    strip_recorded_rights(&store_path, &id);
+
+    let restarted = fixture.reopen_with_workers().await;
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    // A stop commits its durable intent after the daemon adopted the session
+    // and before the first rights lookup.
+    let store = crate::store::Store::new(store_path.clone());
+    let mut record = store
+        .load_sessions()
+        .expect("load the sessions")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("the session is stored");
+    record.desired_state = crate::store::DesiredState::Stopped;
+    "2099-01-01T00:00:00Z".clone_into(&mut record.info.updated_at);
+    store.record_session(&record).expect("commit the intent");
+
+    restarted
+        .registry
+        .session_profile_rights(&id)
+        .await
+        .expect("the session holds rights");
+
+    let stored = store
+        .load_sessions()
+        .expect("load the sessions")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("the session is stored");
+    assert_eq!(stored.desired_state, crate::store::DesiredState::Stopped);
+    assert_eq!(stored.info.updated_at, "2099-01-01T00:00:00Z");
+    assert_eq!(
+        stored.launch_rights.map(|held| held.spawn_profiles),
+        Some(Some(vec!["narrow".to_owned()])),
+        "the snapshot is stored beside the intent"
+    );
+
+    restarted
+        .registry
+        .stop(&id)
+        .await
+        .expect("stop the session");
+}

@@ -1102,20 +1102,19 @@ async fn a_transition_that_captured_the_assigned_entry_keeps_the_reported_proven
     drop(sessions);
     // A concurrent live-state commit may make the transition retry.
     wait_until("the exit transition to commit", || async {
-        rig.registry
-            .record_exit(
-                rig.id(),
-                RuntimeExit {
-                    exit_code: Some(0),
-                    success: true,
-                },
-                false,
-                Some(&identity),
-                None,
-            )
-            .await
-            .expect("record the exit")
-            .then_some(())
+        Box::pin(rig.registry.record_exit(
+            rig.id(),
+            RuntimeExit {
+                exit_code: Some(0),
+                success: true,
+            },
+            false,
+            Some(&identity),
+            None,
+        ))
+        .await
+        .expect("record the exit")
+        .then_some(())
     })
     .await;
 

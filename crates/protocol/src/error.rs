@@ -730,7 +730,9 @@ impl ProtocolError {
     pub fn session_right_denied(reason: &'static str) -> Self {
         let recover = if reason == "unattributed_caller" {
             "`pohunek doctor` names the session with no verified root (check session_rights); \
-             retry once its worker reconnects, or run the request from a remote owner connection"
+             retry once its worker reconnects, or restart the daemon job (`pohunek service status` \
+             names it; `systemctl --user restart <job>` or `launchctl kickstart -k <job>`), which \
+             reattaches every live worker"
         } else {
             "ask the owner to run the request, or act on a session this session spawned"
         };

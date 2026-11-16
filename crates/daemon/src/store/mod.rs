@@ -818,11 +818,14 @@ pub struct SessionRecord {
     pub worker_process: Option<WorkerProcess>,
 }
 
-/// A process by id and start identity, so a recycled id never matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A process by id and start identity within one boot, so a recycled id never
+/// matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerProcess {
     pub pid: u32,
     pub start_identity: u64,
+    /// The boot the start identity counts from; it restarts at every boot.
+    pub boot_identity: String,
 }
 
 /// The `[rights]` a session was launched with.
@@ -1347,6 +1350,33 @@ impl Store {
         if let Some(recovery) = record.recovery.as_mut() {
             recovery.metadata.clone_from(metadata);
         }
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
+    }
+
+    /// Records the launch rights of one session's current record when it holds
+    /// none, and leaves every other field as persisted.
+    ///
+    /// The record is re-read under the write lock, so a stop intent, a
+    /// transaction, or a state persisted meanwhile is kept, and rights a
+    /// launch already recorded are never replaced. Returns whether the rights
+    /// were recorded; no record at all is a no-op success.
+    pub fn set_launch_rights(
+        &self,
+        session_id: &str,
+        rights: &LaunchRights,
+    ) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records.sessions.iter_mut().find(|entry| {
+            entry.record.session_id == session_id && entry.record.launch_rights.is_none()
+        }) else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        entry.edit().launch_rights = Some(rights.clone());
         Ok(self.write_entries(records, &snapshot)?.with_value(true))
     }
 

@@ -1064,7 +1064,7 @@ impl SessionRegistry {
                 preparing_record.worker_process = self
                     .launch_reservation(&id)
                     .and_then(|reservation| reservation.worker_root)
-                    .map(super::worker_process_record);
+                    .and_then(super::worker_process_record);
                 let _persisted = self
                     .insert_unavailable_record(
                         preparing_record,
@@ -1218,7 +1218,7 @@ impl SessionRegistry {
                         // The retry is scheduled whether or not the listing was
                         // committed.
                         preparing_record.worker_process =
-                            Some(super::worker_process_record(started.worker_root));
+                            super::worker_process_record(started.worker_root);
                         let _persisted = self
                             .insert_unavailable_record(
                                 preparing_record,

@@ -320,7 +320,7 @@ fn session_json_with(recovery: &Value) -> Value {
         "active_agent_origin": "reported",
         "create_request": {"id": "req-1", "fingerprint": "v1:0123456789abcdef"},
         "launch_rights": {"owner_equivalent": true, "spawn_profiles": ["worker"]},
-        "worker_process": {"pid": 4242, "start_identity": 987_654_321}
+        "worker_process": {"pid": 4242, "start_identity": 987_654_321, "boot_identity": "boot-a"}
     });
     record["info"]["background"] = background_json();
     record["info"]["output_force_closed"] = json!(true);
@@ -429,6 +429,7 @@ fn assert_every_field_is_reviewed(
     if let Some(WorkerProcess {
         pid: _,
         start_identity: _,
+        boot_identity: _,
     }) = worker_process
     {}
     if let Some(request) = create_request {
@@ -925,6 +926,7 @@ const ABSOLUTE_FREE: &[&str] = &[
     "session.info.background.items[].program",
     "session.native_identity_ordering.runtime_id",
     "session.create_request.id",
+    "session.worker_process.boot_identity",
     "session.create_request.fingerprint",
     "session.launch_rights.spawn_profiles[]",
     "session.runtime.worker_id",

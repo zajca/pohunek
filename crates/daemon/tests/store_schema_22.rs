@@ -74,8 +74,12 @@ fn recorded_launch_rights_load_and_survive_a_rewrite() {
     let rights = session.launch_rights.clone().expect("recorded rights");
     assert!(rights.owner_equivalent);
     assert_eq!(rights.spawn_profiles, Some(vec!["worker".to_owned()]));
-    let worker = session.worker_process.expect("recorded worker identity");
+    let worker = session
+        .worker_process
+        .clone()
+        .expect("recorded worker identity");
     assert_eq!((worker.pid, worker.start_identity), (4242, 987_654_321));
+    assert_eq!(worker.boot_identity, "boot-a");
     "2026-11-16T00:00:00Z".clone_into(&mut session.info.updated_at);
     store.record_session(&session).expect("rewrite the record");
 

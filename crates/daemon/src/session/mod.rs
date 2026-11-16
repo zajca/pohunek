@@ -1247,16 +1247,31 @@ pub(crate) struct RuntimeInventorySnapshot {
 static NEXT_ENTRY_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The persisted form of a worker process identity.
-fn worker_process_record(identity: ProcessIdentity) -> crate::store::WorkerProcess {
-    crate::store::WorkerProcess {
+///
+/// `None` when the host cannot name its boot, because an identity without a
+/// boot could be matched after a reboot.
+fn worker_process_record(identity: ProcessIdentity) -> Option<crate::store::WorkerProcess> {
+    Some(crate::store::WorkerProcess {
         pid: identity.pid,
         start_identity: identity.start_identity.get(),
-    }
+        boot_identity: current_boot_id()?,
+    })
 }
 
-/// The worker process identity a record persisted.
+/// The identity of the running boot, if the host names it.
+fn current_boot_id() -> Option<String> {
+    pohunek_platform::process::HostInspector::new()
+        .boot_identity()
+        .ok()
+        .map(|boot| boot.as_str().to_owned())
+}
+
+/// The worker process identity a record persisted, when it was recorded under
+/// the running boot. An identity of another boot, or of a host that cannot
+/// name its boot, names no process.
 fn recorded_worker_process(record: &SessionRecord) -> Option<ProcessIdentity> {
-    record.worker_process.map(|worker| ProcessIdentity {
+    let worker = record.worker_process.as_ref()?;
+    (current_boot_id().as_deref() == Some(worker.boot_identity.as_str())).then(|| ProcessIdentity {
         pid: worker.pid,
         start_identity: crate::procwatch::StartIdentity::new(worker.start_identity),
     })
@@ -2528,7 +2543,7 @@ impl SessionRegistry {
             active_agent_origin: active_agent_origin(entry),
             create_request: entry.create_request.clone(),
             launch_rights: entry.launch_rights.as_deref().map(ProfileRights::to_record),
-            worker_process: entry.worker_root.map(worker_process_record),
+            worker_process: entry.worker_root.and_then(worker_process_record),
         }
     }
 

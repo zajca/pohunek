@@ -366,6 +366,7 @@ session.transaction.phase
 session.transaction.previous_runtime_id
 session.transaction.previous_worker_id
 session.worker_process
+session.worker_process.boot_identity
 session.worker_process.pid
 session.worker_process.start_identity
 worktree
