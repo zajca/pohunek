@@ -1200,6 +1200,7 @@ impl SessionRegistry {
             create_request,
             root_process: Some(started.root_process),
             worker_root: Some(started.worker_root),
+            recorded_worker: super::RecordedWorker::Unrecorded,
             launch_rights: Some(Box::new(launch_rights)),
         };
         #[cfg(test)]

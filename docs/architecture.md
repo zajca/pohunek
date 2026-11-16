@@ -2391,7 +2391,9 @@ that remain are cheap, free-by-default, or inherited:
   a caller no root attributes is `Unattributed` instead of `Owner` until the
   worker is reattached or the session ends. `Unattributed` carries a recovery
   hint: retry once the worker reconnects, or restart the daemon job
-  (`pohunek service status` names it), which reattaches every live worker.
+  (`pohunek service status` names it; `systemctl --user restart <job>` or
+  `launchctl kickstart -k gui/$(id -u)/<label>`), which reattaches every live
+  worker.
 
   A `Session(X)` caller may mutate a session only when it is a descendant of
   X along `spawned_by` (children, their children, so `session rm --with-children`

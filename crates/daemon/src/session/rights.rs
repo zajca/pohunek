@@ -32,7 +32,7 @@ use protocol::{method, AgentActivity, ProtocolError, RuntimeRef, RuntimeState, S
 use tracing::warn;
 
 use super::native_attestation::{ControlPeer, PeerStanding};
-use super::{is_terminal, runtime_error, RuntimeHandle, SessionRegistry};
+use super::{is_terminal, runtime_error, RecordedWorker, RuntimeHandle, SessionRegistry};
 use crate::agent::profile::rights::{rights_of, ProfileRights};
 use crate::procwatch::{Pid, ProcessIdentity, ProcessInspector};
 use crate::store::DesiredState;
@@ -249,34 +249,36 @@ impl SessionRegistry {
             // cannot widen the session. Only the rights field of the durable
             // record is written, so a running stop's intent and an unpersisted
             // classification stay as they are.
-            let held = self
-                .inner
-                .sessions
-                .lock()
-                .await
-                .get(id)
-                .and_then(|entry| entry.launch_rights.as_deref().map(ProfileRights::to_record));
-            if let Some(held) = held {
-                if let Err(error) = self.store_launch_rights(id, held).await {
-                    warn!(
-                        name: "session.rights.snapshot_unpersisted",
-                        session_id = %id.0,
-                        error = %error.msg,
-                        "the launch rights snapshot of a session could not be stored"
-                    );
-                }
+            if let Err(error) = self.store_launch_rights(id).await {
+                warn!(
+                    name: "session.rights.snapshot_unpersisted",
+                    session_id = %id.0,
+                    error = %error.msg,
+                    "the launch rights snapshot of a session could not be stored"
+                );
             }
         }
         Some(rights)
     }
 
-    /// Writes the launch rights of `id` into its durable record.
-    async fn store_launch_rights(
-        &self,
-        id: &SessionId,
-        rights: crate::store::LaunchRights,
-    ) -> Result<(), ProtocolError> {
+    /// Writes the launch rights `id` holds into its durable record.
+    ///
+    /// `persist_lock` is held from before the rights are read until the write
+    /// returns, so a whole-record write built before the rights existed lands
+    /// before this one and cannot erase them afterwards.
+    async fn store_launch_rights(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let _persist = self.inner.persist_lock.lock().await;
         let Some(store) = self.store_for_write()? else {
+            return Ok(());
+        };
+        let Some(rights) = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|entry| entry.launch_rights.as_deref().map(ProfileRights::to_record))
+        else {
             return Ok(());
         };
         let session_id = id.0.clone();
@@ -366,8 +368,8 @@ impl SessionRegistry {
             // processes: it is reconnecting or starting. Without a recorded
             // worker identity, and on a host whose control groups do not place
             // the session, its processes cannot be attributed. A recorded
-            // worker that is gone is not a fault: its tree has nothing left to
-            // place. A refused runtime (`Conflict`, `Incompatible`) is placed
+            // worker that is gone, or was recorded under another boot, is not a
+            // fault: its tree has nothing left to place. A refused runtime (`Conflict`, `Incompatible`) is placed
             // through the worker identity the daemon observed or recorded; one
             // without it is no fault either, so the owner keeps the documented
             // recovery of removing the session.
@@ -377,7 +379,11 @@ impl SessionRegistry {
                     matches!(state, RuntimeState::Starting | RuntimeState::Reconnecting)
                 }
             };
-            if bears_process && !by_group && attested.iter().all(Option::is_none) {
+            if bears_process
+                && !by_group
+                && entry.recorded_worker == RecordedWorker::Unrecorded
+                && attested.iter().all(Option::is_none)
+            {
                 roots.unverified.push(id.clone());
             }
             if matches!(

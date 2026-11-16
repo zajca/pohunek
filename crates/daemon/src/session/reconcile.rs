@@ -4431,6 +4431,7 @@ impl SessionRegistry {
                 pid: worker_process.pid,
                 start_identity: crate::procwatch::StartIdentity::new(worker_process.start_identity),
             }),
+            recorded_worker: super::RecordedWorker::Unrecorded,
             launch_rights: record
                 .launch_rights
                 .as_ref()
@@ -4785,6 +4786,13 @@ impl SessionRegistry {
             create_request: record.create_request.clone(),
             root_process: None,
             worker_root: super::recorded_worker_process(&record),
+            recorded_worker: if record.worker_process.is_some()
+                && super::recorded_worker_process(&record).is_none()
+            {
+                super::RecordedWorker::OtherBoot
+            } else {
+                super::RecordedWorker::Unrecorded
+            },
             launch_rights: record
                 .launch_rights
                 .as_ref()
@@ -18138,11 +18146,15 @@ generation "$1"
                 .await
                 .expect("reconcile");
 
-            let (class, _keep) = fixture.registry.classify_caller(&stand_in.peer()).await;
-            assert_ne!(
-                class,
-                crate::session::rights::CallerClass::Session(SessionId("s-9106".to_owned()))
+            let runtime = runtime_of(&fixture.registry, "s-9106").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            assert!(
+                fixture.registry.root_findings().await.unverified.is_empty(),
+                "a worker of another boot is gone, not a missing root"
             );
+            let (class, keep) = fixture.registry.classify_caller(&stand_in.peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Owner);
+            assert!(keep);
         }
 
         #[tokio::test]

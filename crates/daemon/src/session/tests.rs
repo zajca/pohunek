@@ -4360,7 +4360,7 @@ async fn set_metadata_merges_deletes_updates_timestamp_and_emits_event() {
     registry.stop(&created.id).await.expect("stop the session");
 }
 
-fn armed_entry_record_hold(
+pub(super) fn armed_entry_record_hold(
     registry: &SessionRegistry,
 ) -> crate::runtime::lifecycle::tests::StartGate {
     let gate = crate::runtime::lifecycle::tests::StartGate {

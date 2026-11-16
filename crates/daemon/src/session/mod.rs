@@ -1229,6 +1229,8 @@ struct SessionEntry {
     /// the classifier places a caller below it in this session even before the
     /// PTY root is known.
     worker_root: Option<ProcessIdentity>,
+    /// What the record said about a worker `worker_root` does not name.
+    recorded_worker: RecordedWorker,
     /// The `[rights]` of the session's profile at launch. A record written
     /// before the field existed has none, and the session takes the profile
     /// file as it reads at its first use.
@@ -1245,6 +1247,16 @@ pub(crate) struct RuntimeInventorySnapshot {
 
 /// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
 static NEXT_ENTRY_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Whether a restored session's record named a worker its entry does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedWorker {
+    /// The record named none, or the entry carries the one it named.
+    Unrecorded,
+    /// The record named a worker of another boot, so the session's tree is
+    /// gone and nothing is left to place. This is not a missing root.
+    OtherBoot,
+}
 
 /// The persisted form of a worker process identity.
 ///
@@ -2318,11 +2330,10 @@ impl SessionRegistry {
             let entry = sessions
                 .get_mut(id)
                 .ok_or_else(|| session_not_found(&id.0))?;
-            let record = build(entry);
-            #[cfg(test)]
-            self.hold_entry_record_write().await;
-            record
+            build(entry)
         };
+        #[cfg(test)]
+        self.hold_entry_record_write().await;
         self.store_session_record(record).await
     }
 

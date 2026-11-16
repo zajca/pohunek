@@ -731,7 +731,7 @@ impl ProtocolError {
         let recover = if reason == "unattributed_caller" {
             "`pohunek doctor` names the session with no verified root (check session_rights); \
              retry once its worker reconnects, or restart the daemon job (`pohunek service status` \
-             names it; `systemctl --user restart <job>` or `launchctl kickstart -k <job>`), which \
+             names it; `systemctl --user restart <job>` or `launchctl kickstart -k gui/$(id -u)/<label>`), which \
              reattaches every live worker"
         } else {
             "ask the owner to run the request, or act on a session this session spawned"

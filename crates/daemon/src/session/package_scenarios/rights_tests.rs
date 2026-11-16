@@ -398,3 +398,75 @@ async fn the_first_use_snapshot_writes_only_the_rights_and_keeps_a_committed_sto
         .await
         .expect("stop the session");
 }
+
+/// A whole-record write built before the rights existed cannot land after the
+/// first-use write and erase the stored snapshot.
+#[tokio::test]
+async fn a_whole_record_write_built_before_the_first_use_snapshot_cannot_erase_it() {
+    let store_path = temp_store_path("rights-first-use-vs-record-write");
+    let fixture = Fixture::with_store("rights-first-use-vs-record-write", store_path.clone());
+    fixture.write_profile(PROFILE, &profile_text("[\"narrow\"]"));
+    let id = create(&fixture).await;
+    strip_recorded_rights(&store_path, &id);
+
+    let restarted = fixture.reopen_with_workers().await;
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+    let gate = crate::session::tests::armed_entry_record_hold(&restarted.registry);
+    let writer = {
+        let registry = restarted.registry.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            registry
+                .write_entry_record(&id, |entry| {
+                    crate::session::SessionRegistry::session_record(
+                        &id,
+                        entry,
+                        entry.desired_state,
+                        None,
+                    )
+                })
+                .await
+        })
+    };
+    gate.entered.notified().await;
+
+    let lookup = {
+        let registry = restarted.registry.clone();
+        let id = id.clone();
+        tokio::spawn(async move { registry.session_profile_rights(&id).await })
+    };
+    // The lookup holds its rights in memory and waits for the parked writer
+    // before it stores them; with no lock it would store them now.
+    for _ in 0..50 {
+        if stored_launch_rights(&store_path, &id).is_some() {
+            break;
+        }
+        // timing-allowed: #2005 the bounded poll is the window for an unserialized write
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    gate.release.notify_one();
+    writer
+        .await
+        .expect("writer task")
+        .expect("the record write lands");
+    lookup
+        .await
+        .expect("lookup task")
+        .expect("the session holds rights");
+
+    assert_eq!(
+        stored_launch_rights(&store_path, &id).map(|held| held.spawn_profiles),
+        Some(Some(vec!["narrow".to_owned()])),
+        "the snapshot outlives the earlier whole-record write"
+    );
+
+    restarted
+        .registry
+        .stop(&id)
+        .await
+        .expect("stop the session");
+}

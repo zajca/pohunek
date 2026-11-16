@@ -936,7 +936,7 @@ pub(crate) fn session_rights_check(
             SESSION_RIGHTS_CHECK,
             DoctorStatus::Fail,
             &format!(
-                "{} live session(s) have no verified root process ({}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends; if it stays stuck, restart the daemon job (`pohunek service status` names it; `systemctl --user restart <job>` or `launchctl kickstart -k <job>`), which reattaches every live worker.",
+                "{} live session(s) have no verified root process ({}); a caller outside every session tree is refused as unattributed_caller until the worker is reattached or the session ends; if it stays stuck, restart the daemon job (`pohunek service status` names it; `systemctl --user restart <job>` or `launchctl kickstart -k gui/$(id -u)/<label>`), which reattaches every live worker.",
                 findings.unverified.len(),
                 named(&findings.unverified)
             ),
