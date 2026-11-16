@@ -4394,7 +4394,9 @@ async fn a_project_config_above_the_lookup_directory_does_not_change_the_mise_se
     // The daemon builds its run sandboxes in the process temporary
     // directory: a pin there is an ancestor of every sandbox cwd, the way
     // a shared `/tmp` file is an ancestor of runs without an explicit
-    // lookup directory.
+    // lookup directory. The host directory layout is the subject of this
+    // scenario, so reading it is allowed.
+    // hermetic-allowed: #2383 the ancestor pin above the lookup directory is the case under test
     let ancestors = std::env::temp_dir();
     fs::write(ancestors.join(".tool-versions"), "codex 0.0.1\n")
         .expect("write the ancestor project pin");
