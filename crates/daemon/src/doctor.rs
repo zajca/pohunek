@@ -1226,14 +1226,22 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         }
     };
     // Delisted: index-origin installed digest no longer listed under its id.
-    // Catalog-origin (bundled codex/claude/hermes) records are never checked
-    // here: the release catalog is a separate document family.
+    // A version that another installed version of the same id has replaced
+    // as the selection is superseded, not delisted. Catalog-origin (bundled
+    // codex/claude/hermes) records are never checked here: the release
+    // catalog is a separate document family.
     let mut delisted: Option<(String, String)> = None;
     for record in state.packages() {
         if record.provenance() != PackageProvenance::Index {
             continue;
         }
         let digest = record.digest();
+        if state
+            .selected(&record.identity().id)
+            .is_some_and(|selected| selected != digest)
+        {
+            continue;
+        }
         let listed = verified
             .entries()
             .iter()

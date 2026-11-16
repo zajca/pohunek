@@ -502,8 +502,8 @@ state first, and keeps the damaged bytes as `index-state.json.damaged-<unix-ts>`
 with the same mode. A wrong mode or owner is never repaired.
 Doctor verifies the stored copy: `current`, `stale`, `package_index_expired`,
 `package_index_invalid`, `package_index_state_unreadable`, `not_refreshed` (an index-origin
-package and no stored copy), `package_revoked` (index-provenance delisting only;
-catalog-provenance bundled runtimes are never checked here), or
+package and no stored copy), `package_revoked` (index-provenance delisting only, and only
+for the selected version of an id; catalog-provenance bundled runtimes are never checked here), or
 `runtime_id_reserved_by_official` (local-provenance holder of a reserved id).
 
 **Install-time authorization.** `VerifiedIndex::authorize` takes the entry

@@ -144,6 +144,8 @@ export type { PackageTrust } from "./PackageTrust";
 export type { PackageUninstallParams } from "./PackageUninstallParams";
 export type { PackageUninstallResult } from "./PackageUninstallResult";
 export type { PackageVersion } from "./PackageVersion";
+export type { PluginIndexApplyParams } from "./PluginIndexApplyParams";
+export type { PluginIndexApplyResult } from "./PluginIndexApplyResult";
 export type { PrincipalId } from "./PrincipalId";
 export type { ProcessExit } from "./ProcessExit";
 export type { ProcessStartIdentity } from "./ProcessStartIdentity";

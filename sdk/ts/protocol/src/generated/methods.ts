@@ -47,6 +47,8 @@ import type {
   PackageSetEnabledParams,
   PackageUninstallParams,
   PackageUninstallResult,
+  PluginIndexApplyParams,
+  PluginIndexApplyResult,
   ProjectActionParams,
   ProjectActionResult,
   ProjectActionsParams,
@@ -141,6 +143,7 @@ export interface Methods {
   "package.select": { params: PackageSelectParams; output: PackageChangeResult };
   "package.set_enabled": { params: PackageSetEnabledParams; output: PackageChangeResult };
   "package.uninstall": { params: PackageUninstallParams; output: PackageUninstallResult };
+  "plugin.index.apply": { params: PluginIndexApplyParams; output: PluginIndexApplyResult };
   "project.action": { params: ProjectActionParams; output: ProjectActionResult };
   "project.actions": { params: ProjectActionsParams; output: ProjectActionsResult };
   "project.add": { params: ProjectAddParams; output: ProjectInfo };
@@ -208,6 +211,7 @@ export const METHOD_NAMES = [
   "package.select",
   "package.set_enabled",
   "package.uninstall",
+  "plugin.index.apply",
   "project.action",
   "project.actions",
   "project.add",

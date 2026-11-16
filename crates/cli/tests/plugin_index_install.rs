@@ -2153,6 +2153,47 @@ async fn delisting_an_installed_package_fails_doctor_and_keeps_it_serving() {
     assert_eq!(packages[0]["selected"], true);
 }
 
+/// A version that a newer install replaced as the selection stays installed
+/// and unlisted without failing doctor; only the selected digest counts as
+/// delisted.
+#[tokio::test]
+async fn a_superseded_unlisted_version_does_not_fail_doctor() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    let newer = rig.listing("0.2.0");
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.signed(vec![newer.entry()])),
+    );
+    rig.server.set(
+        &archive_path("0.2.0"),
+        Route::Body(newer.archive.bytes.clone()),
+    );
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    rig.refresh().await;
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "select",
+            PACKAGE_ID,
+            "--digest",
+            newer.archive.digest.as_str(),
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(rig.selected_versions().await, ["0.2.0"]);
+    assert_eq!(rig.install.packages().await.len(), 2);
+
+    let (code, status, detail) = rig.doctor_index().await;
+
+    assert_eq!(status, "ok", "{detail}");
+    assert_eq!(code, 0, "{detail}");
+}
+
 /// Contract scenario 6: an index that reserves the runtime id of a package
 /// installed earlier warns in doctor and leaves it serving, while a new local
 /// package, archive or directory, cannot claim the reserved id.
