@@ -2136,6 +2136,7 @@ async fn doctor_plugin_index(fixture: &Fixture) -> Vec<protocol::DoctorCheck> {
         &crate::session::rights::RootFindings::default(),
         &crate::capabilities::ProbeClock::default(),
         hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
+        Some(&package::registry::RetainedDigests::new()),
     )
     .await
     .expect("doctor report");

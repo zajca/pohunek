@@ -2153,45 +2153,81 @@ async fn delisting_an_installed_package_fails_doctor_and_keeps_it_serving() {
     assert_eq!(packages[0]["selected"], true);
 }
 
+impl Rig {
+    /// Installs 0.1.0, then installs and selects 0.2.0 while the index lists
+    /// only 0.2.0, so 0.1.0 stays installed, unselected and unlisted.
+    /// `before_newer` runs once 0.1.0 is installed and selected.
+    async fn supersede_first_version(&self, before_newer: impl AsyncFn(&Self)) {
+        self.publish(&[self.listing("0.1.0")]);
+        let (code, document) = self.install(PACKAGE_ID, &["--yes"]).await;
+        assert_eq!(code, 0, "{document}");
+        before_newer(self).await;
+        let newer = self.listing("0.2.0");
+        self.server.set(
+            INDEX_PATH,
+            Route::Body(self.keys.signed(vec![newer.entry()])),
+        );
+        self.server.set(
+            &archive_path("0.2.0"),
+            Route::Body(newer.archive.bytes.clone()),
+        );
+        let (code, document) = self.install(PACKAGE_ID, &["--yes"]).await;
+        assert_eq!(code, 0, "{document}");
+        self.refresh().await;
+        let (code, document) = self
+            .install
+            .json(&[
+                "plugin",
+                "select",
+                PACKAGE_ID,
+                "--digest",
+                newer.archive.digest.as_str(),
+            ])
+            .await;
+        assert_eq!(code, 0, "{document}");
+        assert_eq!(self.selected_versions().await, ["0.2.0"]);
+        assert_eq!(self.install.packages().await.len(), 2);
+    }
+}
+
 /// A version that a newer install replaced as the selection stays installed
-/// and unlisted without failing doctor; only the selected digest counts as
-/// delisted.
+/// and unlisted without failing doctor when nothing references it; only the
+/// selected digest fails as delisted.
 #[tokio::test]
 async fn a_superseded_unlisted_version_does_not_fail_doctor() {
     let rig = Rig::start().await;
-    rig.publish(&[rig.listing("0.1.0")]);
-    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
-    assert_eq!(code, 0, "{document}");
-    let newer = rig.listing("0.2.0");
-    rig.server.set(
-        INDEX_PATH,
-        Route::Body(rig.keys.signed(vec![newer.entry()])),
-    );
-    rig.server.set(
-        &archive_path("0.2.0"),
-        Route::Body(newer.archive.bytes.clone()),
-    );
-    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
-    assert_eq!(code, 0, "{document}");
-    rig.refresh().await;
-    let (code, document) = rig
-        .install
-        .json(&[
-            "plugin",
-            "select",
-            PACKAGE_ID,
-            "--digest",
-            newer.archive.digest.as_str(),
-        ])
-        .await;
-    assert_eq!(code, 0, "{document}");
-    assert_eq!(rig.selected_versions().await, ["0.2.0"]);
-    assert_eq!(rig.install.packages().await.len(), 2);
+    rig.supersede_first_version(async |_| {}).await;
 
     let (code, status, detail) = rig.doctor_index().await;
 
     assert_eq!(status, "ok", "{detail}");
     assert_eq!(code, 0, "{detail}");
+}
+
+/// An unselected unlisted version that a host profile still pins warns with
+/// `package_revoked` instead of disappearing from doctor, and does not fail
+/// the report.
+#[tokio::test]
+async fn an_unlisted_version_a_profile_still_pins_warns_in_doctor() {
+    let rig = Rig::start().await;
+    rig.supersede_first_version(async |rig| {
+        let (code, document) = rig
+            .install
+            .json(&["plugin", "profile", "create", "pinned", "--base", RUNTIME])
+            .await;
+        assert_eq!(code, 0, "{document}");
+    })
+    .await;
+
+    let (code, status, detail) = rig.doctor_index().await;
+
+    assert_eq!(status, "warn", "{detail}");
+    assert!(
+        detail.starts_with("package_revoked: pohunek.runtime.idxfix@0.1.0"),
+        "{detail}"
+    );
+    assert!(detail.contains("still referenced"), "{detail}");
+    assert_eq!(code, 0, "a warning does not fail doctor: {detail}");
 }
 
 /// Contract scenario 6: an index that reserves the runtime id of a package

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hostcheck::{OverlayChecks, StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
-use package::registry::PackageProvenance;
+use package::registry::{PackageProvenance, RetainedDigests};
 use protocol::{
     DoctorCheck, DoctorReport, DoctorStatus, IntegrationDoctorParams, IntegrationFindingCode,
     IntegrationInstallState, QuarantineReason, RuntimeId, MAX_CONTROL_LINE_BYTES,
@@ -71,6 +71,7 @@ pub(crate) async fn report(
     root_findings: &crate::session::rights::RootFindings,
     probe_clock: &ProbeClock,
     probe_budget: Duration,
+    referenced: Option<&RetainedDigests>,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let doctor_paths = paths.clone();
@@ -119,7 +120,7 @@ pub(crate) async fn report(
     checks.extend(governance_checks(governance.diagnose().await));
     checks.push(catalog_trust_check(catalog_trust));
     checks.extend(index_channel_check(catalog_trust));
-    checks.push(plugin_index_check(&doctor_paths, catalog_trust));
+    checks.push(plugin_index_check(&doctor_paths, catalog_trust, referenced));
     checks.push(rejected_lines_check(rejected_lines));
     checks.push(placement_check(placements));
     checks.push(session_rights_check(worker_units, root_findings));
@@ -1131,7 +1132,11 @@ fn check(name: &'static str, status: DoctorStatus, detail: &str) -> DoctorCheck 
     clippy::too_many_lines,
     reason = "one doctor table branch per stored-index state"
 )]
-fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorCheck {
+fn plugin_index_check(
+    paths: &Paths,
+    catalog_trust: &CatalogTrust,
+    referenced: Option<&RetainedDigests>,
+) -> DoctorCheck {
     const CHECK: &str = "plugin_index";
     const INVALID: &str = "package_index_invalid: run `pohunek plugin index refresh`";
     const STALE: &str = "stale: run `pohunek plugin index refresh`";
@@ -1226,39 +1231,54 @@ fn plugin_index_check(paths: &Paths, catalog_trust: &CatalogTrust) -> DoctorChec
         }
     };
     // Delisted: index-origin installed digest no longer listed under its id.
-    // A version that another installed version of the same id has replaced
-    // as the selection is superseded, not delisted. Catalog-origin (bundled
-    // codex/claude/hermes) records are never checked here: the release
-    // catalog is a separate document family.
-    let mut delisted: Option<(String, String)> = None;
+    // The index has no per-digest revocation, so an unlisted digest is the
+    // only withdrawal signal. The selected digest fails; an unselected one
+    // that a profile pin or a retained session still references warns; an
+    // unselected unreferenced one is superseded and not reported. When the
+    // referencing sessions cannot be listed, every unselected digest counts as
+    // referenced. Catalog-origin (bundled codex/claude/hermes) records are
+    // never checked here: the release catalog is a separate document family.
+    let mut failed: Option<(String, String)> = None;
+    let mut warned: Option<(String, String)> = None;
     for record in state.packages() {
         if record.provenance() != PackageProvenance::Index {
             continue;
         }
         let digest = record.digest();
-        if state
-            .selected(&record.identity().id)
-            .is_some_and(|selected| selected != digest)
-        {
-            continue;
-        }
         let listed = verified
             .entries()
             .iter()
             .any(|e| e.package_id == record.identity().id && e.digest == *digest);
-        if !listed {
-            delisted = Some((
-                record.identity().id.to_string(),
-                record.identity().version.to_string(),
-            ));
-            break;
+        if listed {
+            continue;
+        }
+        let named = (
+            record.identity().id.to_string(),
+            record.identity().version.to_string(),
+        );
+        let selected = state
+            .selected(&record.identity().id)
+            .is_none_or(|selected| selected == digest);
+        if selected {
+            failed.get_or_insert(named);
+        } else if referenced.is_none_or(|retained| retained.contains(digest)) {
+            warned.get_or_insert(named);
         }
     }
-    if let Some((id, ver)) = delisted {
+    if let Some((id, ver)) = failed {
         return check(
             CHECK,
             DoctorStatus::Fail,
             &format!("package_revoked: {id}@{ver}: run `pohunek plugin update {id}` or remove it"),
+        );
+    }
+    if let Some((id, ver)) = warned {
+        return check(
+            CHECK,
+            DoctorStatus::Warn,
+            &format!(
+                "package_revoked: {id}@{ver} is not selected but still referenced: remove the profile pin or end the session that uses it"
+            ),
         );
     }
     // Reserved: local (ExplicitDigest/Link) holding a reserved runtime id.
@@ -1456,6 +1476,7 @@ mod tests {
             &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
+            None,
         )
         .await
         .expect("doctor report");
@@ -1541,6 +1562,7 @@ mod tests {
             &crate::session::rights::RootFindings::default(),
             &ProbeClock::default(),
             hostcheck::AGENT_RUNTIME_PROBE_BUDGET,
+            None,
         )
         .await
         .expect("doctor report");
