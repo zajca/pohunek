@@ -4625,8 +4625,6 @@ async fn a_multicall_link_keeps_its_own_name_for_probe_and_launch() {
     let release = locked_release();
     let link = write_multicall_dispatcher(&home, &release);
     fixture.write_profile("multicall-codex", Some(&link));
-    let manager = home.join("multicall").join("tool");
-    fixture.write_profile("multicall-manager", Some(&manager));
 
     let entry = fixture.inventory_entry("multicall-codex").await;
     assert_eq!(entry["available"], true, "{entry}");
@@ -4670,6 +4668,12 @@ async fn a_multicall_link_keeps_its_own_name_for_probe_and_launch() {
         log.lines().any(|line| line == "launched as codex"),
         "the launch kept the link name: {log}"
     );
+
+    // The manager profile is written only after the link-name checks:
+    // both profiles share the dispatcher log, and probing the manager
+    // basename first would reorder its lines.
+    let manager = home.join("multicall").join("tool");
+    fixture.write_profile("multicall-manager", Some(&manager));
 
     let entry = fixture.inventory_entry("multicall-manager").await;
     assert_eq!(entry["available"], true, "{entry}");
