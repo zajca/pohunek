@@ -90,8 +90,20 @@ fn inspect_reports_the_owner_restricted_netbird_overview_as_its_own_error() {
     assert!(message.contains("daemon status: Connected"), "{message}");
     assert!(!message.contains("PeersRepr"), "{message}");
     let recover = document["err"]["recover"].as_str().expect("recover hint");
-    assert!(recover.contains("owns"), "{recover}");
-    assert!(recover.contains("0.83"), "{recover}");
+    assert!(
+        recover.contains("[netbird.static_peers.<name>]"),
+        "{recover}"
+    );
+    assert!(
+        recover.contains("pohunek host governance inspect local --json"),
+        "{recover}"
+    );
+    assert!(recover.contains("sudo netbird profile claim"), "{recover}");
+    assert!(
+        recover.contains("netbird profile list --show-owner"),
+        "{recover}"
+    );
+    assert!(!recover.contains("below"), "{recover}");
 }
 
 #[test]
@@ -103,6 +115,28 @@ fn discovery_reports_the_owner_restricted_netbird_overview_as_its_own_error() {
     let document: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("versioned JSON error");
     assert_eq!(document["err"]["code"], "netbird_state_restricted");
+    let recover = document["err"]["recover"].as_str().expect("recover hint");
+    assert!(
+        recover.contains("[netbird.static_peers.<name>]"),
+        "{recover}"
+    );
+    assert!(
+        recover.contains("pohunek host governance inspect local --json"),
+        "{recover}"
+    );
+    assert!(recover.contains("sudo netbird profile claim"), "{recover}");
+    assert!(
+        recover.contains("netbird profile list --show-owner"),
+        "{recover}"
+    );
+    assert!(!recover.contains("below"), "{recover}");
+    let message = document["err"]["msg"].as_str().expect("error message");
+    assert!(
+        message.contains(
+            "static peers are used only by `--host <name>` and never appear in discovery"
+        ),
+        "{message}"
+    );
 }
 
 #[test]

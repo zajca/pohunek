@@ -162,10 +162,10 @@ fn cli_check(diagnostic: &OverlayDiagnostic, from_file: bool) -> DoctorCheck {
             DoctorStatus::Warn,
             format!("the {id} CLI answered, but no {id} address resolved (not logged in or daemon down)"),
         ),
-        Some(OverlayError::StateRestricted { detail, .. }) => DoctorCheck::new(
+        Some(OverlayError::StateRestricted { detail, remedy, .. }) => DoctorCheck::new(
             name,
             DoctorStatus::Warn,
-            format!("the {id} CLI answered, but its detailed status is restricted to the owner of the {id} connection: {detail}; run pohunek as that account"),
+            format!("the {id} CLI answered, but its detailed status is restricted to the owner of the {id} connection: {detail}; {remedy}"),
         ),
         Some(OverlayError::StateUnavailable { detail, .. }) => DoctorCheck::new(
             name,
