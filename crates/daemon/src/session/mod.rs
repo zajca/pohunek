@@ -3665,12 +3665,23 @@ impl SessionRegistry {
         resolved: &ResolvedAgent,
         profile_env: &[(String, String)],
     ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-        let launch_path = self.probe_search_path(&resolved.definition, profile_env)?;
-        let program = host::validate_launch_runtime(
-            &resolved.definition,
-            resolved.spawn(),
-            launch_path.as_deref(),
-        )?;
+        // A runtime without a version probe is still resolved so a missing
+        // program fails before the target is bound; its environment only
+        // matters when a probe runs.
+        let Some(environment) = self.probe_environment(&resolved.definition, profile_env)? else {
+            // Floors still fail closed without a probed release: a runtime
+            // that reports no version cannot meet any `min_runtime`.
+            let program = host::validate_launch_runtime(
+                &resolved.definition,
+                resolved.spawn(),
+                &host::ProbeEnvironment::for_launch(&self.launch_base_environment()?, profile_env),
+            )?;
+            resolved
+                .check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
+            return Ok(program);
+        };
+        let program =
+            host::validate_launch_runtime(&resolved.definition, resolved.spawn(), &environment)?;
         resolved.check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
         Ok(program)
     }

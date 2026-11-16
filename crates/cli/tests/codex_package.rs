@@ -4134,6 +4134,251 @@ async fn a_wrapper_that_cannot_answer_the_version_probe_is_refused_with_wrapper_
     fixture.finish().await;
 }
 
+/// Writes a fake mise manager plus one installed `codex` below `home`.
+///
+/// `home/mise` is a shell script dispatching on its own basename like the
+/// real mise does (`MISE_BIN_NAME = filename(ARGV0)`): under the `mise`
+/// basename it answers `which <name>` from the install files below the
+/// lookup's `HOME` (offline, no install), and any other basename execs its
+/// install file the same way. The shim is `home/shims/codex -> ../mise`.
+/// Each profile's `program` is the absolute shim path. `home/mise.log`
+/// records one line per manager and shim invocation, so the scenario
+/// asserts the lookup ran offline under the fixture HOME and the launch
+/// execed the shim. Everything lives below the fixture `HOME` so every
+/// ancestor of the trust-checked lookup chain is owner-controlled.
+#[cfg(target_os = "linux")]
+fn write_fake_mise(root: &Path, home: &Path, release: &str) -> PathBuf {
+    let interpreter = root.join("fake-codex-sh");
+    if !interpreter.exists() {
+        copy_shell_image("/bin/sh", &interpreter)
+            .expect("copy the shell image for the fake mise interpreter");
+    }
+    let mise = home.join("mise");
+    write_executable(
+        &mise,
+        format!(
+            "#!{interpreter}\nlog='{log}'\nname=\"${{0##*/}}\"\nif [ \"$name\" = mise ]; then\n  if [ \"$1\" = which ]; then\n    printf 'which %s offline=%s auto=%s home=%s\\n' \"$2\" \"$MISE_OFFLINE\" \"$MISE_AUTO_INSTALL\" \"$HOME\" >> \"$log\"\n    target=\"$HOME/.local/share/fakemise/installs/$2\"\n    if [ -f \"$target\" ]; then\n      cat \"$target\"\n      exit 0\n    fi\n    echo \"$2 is not installed\" >&2\n    exit 1\n  fi\n  echo 'mise 2026.11.0 linux-x64 (fake)'\n  exit 0\nfi\nprintf 'shim %s %s home=%s\\n' \"$name\" \"$*\" \"$HOME\" >> \"$log\"\ntarget=\"$HOME/.local/share/fakemise/installs/$name\"\nexec \"$(cat \"$target\")\" \"$@\"\n",
+            interpreter = path_str(&interpreter),
+            log = home.join("mise.log").display(),
+        ),
+    )
+    .expect("write the fake mise manager");
+    // The installed tool reports the installed release through the real
+    // hook endpoint of its worker like a provider hook does. Its
+    // interpreter is a shell copy named for the provider, so the worker
+    // admits the process as the launch process of the claim by its
+    // executable name.
+    let agent = write_wrapper_agent(
+        root,
+        "mise-agent",
+        &format!("codex-cli {release}"),
+        "mise-conversation-0",
+    );
+    let installs = home.join(".local/share/fakemise/installs");
+    fs::create_dir_all(&installs).expect("create the fake installs directory");
+    fs::write(installs.join("codex"), agent.display().to_string())
+        .expect("write the fake install file");
+    let shims = home.join("shims");
+    fs::create_dir_all(&shims).expect("create the fake shims directory");
+    std::os::unix::fs::symlink("../mise", shims.join("codex")).expect("link the fake shim");
+    shims.join("codex")
+}
+
+/// Writes a `busybox`-style multicall dispatcher: it answers the package's
+/// probe only when linked under the `codex` basename, and prints the manager
+/// banner under any other name, so dispatching on the link name decides the
+/// installed release instead of the manager's own. Fixture directories live
+/// below the fixture `HOME` so every ancestor of the trust-checked lookup
+/// chain is owner-controlled.
+#[cfg(target_os = "linux")]
+fn write_multicall_dispatcher(home: &Path, release: &str) -> PathBuf {
+    let tool = home.join("multicall").join("tool");
+    fs::create_dir_all(tool.parent().expect("the multicall directory"))
+        .expect("create the multicall directory");
+    write_executable(
+        &tool,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nif [ \"$1\" = \"--version\" ]; then\n  if [ \"${{0##*/}}\" = codex ]; then\n    echo 'codex-cli {release}'\n    exit 0\n  fi\n  echo 'multicall 9.9.9 manager'\n  exit 0\nfi\nexec sleep 600\n",
+            log = home.join("multicall.log").display(),
+        ),
+    )
+    .expect("write the multicall dispatcher");
+    let link = home.join("dispatcher").join("codex");
+    fs::create_dir_all(link.parent().expect("the link directory"))
+        .expect("create the link directory");
+    std::os::unix::fs::symlink("../multicall/tool", &link).expect("link the dispatcher");
+    link
+}
+
+/// A version-manager shim dispatches on its own link name (issue #2383): a
+/// `codex` symlink to the fake `mise` manager resolves, the read-only offline
+/// lookup names the installed executable from the fixture `HOME`, the
+/// inventory reports the shim path with the installed release, the supported
+/// release launches and resumes, and `pohunek doctor` reports the profile
+/// ready. Removing the install leaves the shim unresolvable without touching
+/// the link, and the launch is refused with the shim guidance.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_mise_shim_probes_the_manager_named_executable_and_launches_through_the_shim() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let home = fixture.harness.env.home().to_path_buf();
+    let release = locked_release();
+    let shim = write_fake_mise(&root, &home, &release);
+    let mise_log = home.join("mise.log");
+    fixture.write_profile("mise-shim-ok", Some(&shim));
+
+    let entry = fixture.inventory_entry("mise-shim-ok").await;
+    assert_eq!(entry["available"], true, "{entry}");
+    assert_eq!(entry["path"], shim.display().to_string(), "{entry}");
+    assert_eq!(entry["version"], release, "{entry}");
+    assert_eq!(entry["supported"], true, "{entry}");
+
+    // The lookup ran the manager in manager mode, read-only and offline,
+    // with the fixture HOME; timing lines carry no assertions.
+    let log = wait_until(
+        "the offline mise lookup naming the installed tool",
+        || async {
+            let log = fs::read_to_string(&mise_log).ok()?;
+            log.lines()
+                .any(|line| {
+                    line.starts_with("which codex offline=1 auto=0 home=")
+                        && line.ends_with(&home.display().to_string())
+                })
+                .then_some(log)
+        },
+    )
+    .await;
+    assert!(
+        log.lines()
+            .all(|line| !line.contains("MISE_OFFLINE=0") && !line.contains("auto=1")),
+        "the lookup never ran online or installing: {log}"
+    );
+
+    let (code, launched) = fixture.launch("mise-shim-ok", "shimmed").await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    assert_eq!(launched["ok"]["agent_base"], "codex");
+    let reported = wait_until("the hook-reported native reference", || async {
+        let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+        assert_eq!(code, 0, "{inspected}");
+        inspected["ok"]["native_session_id"]
+            .is_string()
+            .then(|| inspected["ok"].clone())
+    })
+    .await;
+    assert_eq!(
+        reported["native_session_id"], "mise-conversation-0",
+        "{reported}"
+    );
+    fixture.stop(&id).await;
+    let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 0, "{resumed}");
+    fixture.stop(&id).await;
+
+    // A launch runs through the shim link (which reports its basename), even
+    // though the probe read the manager-named executable.
+    let log = wait_until("the launch argv arriving through the shim link", || async {
+        let log = fs::read_to_string(&mise_log).ok()?;
+        log.lines()
+            .any(|line| {
+                line.starts_with("shim codex") && line.contains(&format!("home={}", home.display()))
+            })
+            .then_some(log)
+    })
+    .await;
+    assert!(
+        log.lines().any(|line| line.starts_with("shim codex")),
+        "the shim execed the installed agent: {log}"
+    );
+
+    let doctor = fixture.harness.run(&["doctor", "--json"]).await;
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).expect("doctor JSON");
+    let check = doctor["ok"]["checks"]
+        .as_array()
+        .expect("doctor checks")
+        .iter()
+        .find(|check| check["name"] == "agent_profile_mise-shim-ok")
+        .unwrap_or_else(|| panic!("doctor reports mise-shim-ok: {doctor}"));
+    assert_eq!(check["status"], "ok", "{check}");
+
+    // Removing the install leaves the shim link in place but unresolvable:
+    // the inventory lists it as available-but-unsupported with no version,
+    // and the launch is refused with the shim install guidance.
+    fs::remove_file(home.join(".local/share/fakemise/installs/codex"))
+        .expect("remove the fake install");
+    let entry = fixture.inventory_entry("mise-shim-ok").await;
+    assert_eq!(entry["available"], true, "{entry}");
+    assert_eq!(entry["path"], shim.display().to_string(), "{entry}");
+    assert!(entry["version"].is_null(), "{entry}");
+    assert_eq!(entry["supported"], false, "{entry}");
+    let (code, refused) = fixture.launch("mise-shim-ok", "refused").await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_runtime_unsupported",
+        "{refused}"
+    );
+    let recover = refused["err"]["recover"].as_str().unwrap_or("");
+    assert!(
+        recover.contains("version manager") || recover.contains("version-manager"),
+        "the refusal names the version-manager shim: {refused}"
+    );
+    fixture.finish().await;
+}
+
+/// A `busybox`-style multicall dispatcher (issue #2383): the same file linked
+/// under the `codex` basename reports the installed release, and the launch
+/// keeps the link name, while the manager basename reports its own release
+/// and stays unsupported.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_multicall_link_keeps_its_own_name_for_probe_and_launch() {
+    let fixture = Fixture::start().await;
+    let home = fixture.harness.env.home().to_path_buf();
+    let release = locked_release();
+    let link = write_multicall_dispatcher(&home, &release);
+    fixture.write_profile("multicall-codex", Some(&link));
+    let manager = home.join("multicall").join("tool");
+    fixture.write_profile("multicall-manager", Some(&manager));
+
+    let entry = fixture.inventory_entry("multicall-codex").await;
+    assert_eq!(entry["available"], true, "{entry}");
+    assert_eq!(entry["version"], release, "{entry}");
+    assert_eq!(entry["supported"], true, "{entry}");
+    let (code, launched) = fixture.launch("multicall-codex", "linked").await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    fixture.stop(&id).await;
+
+    // The launch kept the link name: the log's first probe is under `codex`.
+    let log = wait_until("the probe running under the codex link name", || async {
+        let log = fs::read_to_string(home.join("multicall.log")).ok()?;
+        log.lines().any(|line| line == "--version").then_some(log)
+    })
+    .await;
+    assert!(
+        log.lines().next().is_some_and(|line| line == "--version"),
+        "the probe ran under the link name: {log}"
+    );
+
+    let entry = fixture.inventory_entry("multicall-manager").await;
+    assert_eq!(entry["available"], true, "{entry}");
+    assert_eq!(entry["supported"], false, "{entry}");
+    let (code, refused) = fixture.launch("multicall-manager", "refused").await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(
+        refused["err"]["code"], "agent_runtime_unsupported",
+        "{refused}"
+    );
+    fixture.finish().await;
+}
+
 /// The command that installs the official Codex package from an extracted
 /// release archive, as a recovery hint names it.
 const RELEASE_INSTALL_COMMAND: &str =

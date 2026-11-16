@@ -59,7 +59,7 @@ use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use tracing::{debug, warn};
 
-use crate::bounded_run::{self, RunLimits, RunOutcome, RunSpec, StderrPolicy};
+use crate::bounded_run::{self, HomeScope, RunLimits, RunOutcome, RunSpec, StderrPolicy};
 
 /// Longest a single git command of the predicate may run, within the total
 /// deadline. A command that takes longer is a stalled filesystem or network.
@@ -1185,6 +1185,7 @@ impl Git {
             args,
             search_path: None,
             env,
+            home: HomeScope::Private,
             seeded_env: &[],
             limits: RunLimits::new(GIT_COMMAND_TIMEOUT.min(remaining), GIT_STDOUT_CAP_BYTES),
             stderr: StderrPolicy::Discard,

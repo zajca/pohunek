@@ -351,6 +351,10 @@ fn configured_profile_result(
             DoctorStatus::Fail,
             "The configured runtime version was not checked because the doctor probe budget was exhausted.",
         ),
+        Err(RuntimeFailure::DispatchUnresolved) => (
+            DoctorStatus::Fail,
+            "The configured program is a version-manager shim with no installed release of the agent; run the agent once in a login shell so its version manager installs it. The version check never installs or updates a tool.",
+        ),
     };
     (status, Cow::Borrowed(detail))
 }
@@ -446,6 +450,10 @@ fn optional_runtime_result(
         Err(RuntimeFailure::ProbeBudget) => (
             DoctorStatus::Warn,
             "Optional provider version was not checked because the doctor probe budget was exhausted.",
+        ),
+        Err(RuntimeFailure::DispatchUnresolved) => (
+            DoctorStatus::Warn,
+            "The optional provider's program is a version-manager shim with no installed release of the agent; run the agent once in a login shell so its version manager installs it. The version check never installs or updates a tool.",
         ),
     };
     (status, Cow::Borrowed(detail))
@@ -650,6 +658,9 @@ enum RuntimeFailure {
     /// The probe ran to its full deadline without exiting.
     ProbeDeadline,
     ProbeBudget,
+    /// The program is a version-manager shim whose manager names no
+    /// installed release of the agent, so the probe never ran.
+    DispatchUnresolved,
 }
 
 /// Validate a profile using the same package and provider-version gates as launch.
@@ -667,8 +678,6 @@ fn profile_runtime_check(
         .profile
         .as_ref()
         .map_or(&[][..], |profile| profile.env.as_slice());
-    let launch_path =
-        crate::runtime::environment::effective_variable(base_env, profile_env, "PATH");
     if crate::agent::which_executable(agent.program()).is_none() {
         return Err(crate::agent::executable_refusal(agent.program()).map_or(
             RuntimeFailure::Executable,
@@ -683,10 +692,11 @@ fn profile_runtime_check(
     if agent.definition.version_probe_parser().is_some() && probe_timeout.is_zero() {
         return Err(RuntimeFailure::ProbeBudget);
     }
+    let environment = crate::agent::host::ProbeEnvironment::for_launch(base_env, profile_env);
     crate::agent::host::validate_launch_runtime_with_timeout_detailed(
         &agent.definition,
         agent.spawn(),
-        launch_path.as_deref(),
+        &environment,
         probe_timeout,
         probes.clock,
     )
@@ -703,6 +713,9 @@ fn profile_runtime_check(
         }
         crate::capabilities::LaunchValidationFailure::ProbeDeadline => {
             RuntimeFailure::ProbeDeadline
+        }
+        crate::capabilities::LaunchValidationFailure::DispatchUnresolved => {
+            RuntimeFailure::DispatchUnresolved
         }
         crate::capabilities::LaunchValidationFailure::Unsupported => RuntimeFailure::Version,
     })?;

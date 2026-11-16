@@ -3310,11 +3310,13 @@ async fn host_inspect_reprobes_when_the_program_or_its_launch_environment_change
     .await;
     let mut client = connect_unix(&socket).await;
 
-    // Cold: a symlink shares its target's probe, a different launch PATH does
-    // not share one, a failed probe counts as one run.
+    // Cold: a probe runs under the profile's own link path, so a symlink is
+    // probed separately from its target (`argv[0]` dispatchers answer under
+    // their link name); a different launch PATH does not share one either,
+    // and a failed probe counts as one run.
     let first = inspect(&mut client, Value::Null).await;
     assert_eq!(rig.calls("prog-a"), 1);
-    assert_eq!(rig.calls("prog-b"), 1);
+    assert_eq!(rig.calls("prog-b"), 2);
     assert_eq!(rig.calls("prog-d"), 2);
     assert_eq!(rig.calls("prog-f"), 1);
     assert_eq!(inventory_entry(&first, "p-link")["supported"], true);
@@ -3323,6 +3325,7 @@ async fn host_inspect_reprobes_when_the_program_or_its_launch_environment_change
     // Warm: nothing runs again, a failure is remembered too.
     inspect(&mut client, Value::Null).await;
     assert_eq!(rig.calls("prog-a"), 1);
+    assert_eq!(rig.calls("prog-b"), 2);
     assert_eq!(rig.calls("prog-d"), 2);
     assert_eq!(rig.calls("prog-f"), 1);
 
@@ -3337,10 +3340,11 @@ async fn host_inspect_reprobes_when_the_program_or_its_launch_environment_change
     std::os::unix::fs::symlink(&program_c, &link).expect("retarget the symlink");
     let retargeted = inspect(&mut client, Value::Null).await;
     assert_eq!(rig.calls("prog-c"), 1);
-    assert_eq!(rig.calls("prog-b"), 1);
+    assert_eq!(rig.calls("prog-b"), 2);
     assert_eq!(inventory_entry(&retargeted, "p-link")["supported"], false);
 
-    // A touched file is probed again and reports the same release.
+    // A touched file is probed again and reports the same release. The link
+    // still points at the other program, so only its own profile reprobes.
     std::fs::File::options()
         .write(true)
         .open(&program_b)
@@ -3348,7 +3352,7 @@ async fn host_inspect_reprobes_when_the_program_or_its_launch_environment_change
         .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
         .expect("touch the program");
     let touched = inspect(&mut client, Value::Null).await;
-    assert_eq!(rig.calls("prog-b"), 2);
+    assert_eq!(rig.calls("prog-b"), 3);
     assert_eq!(
         inventory_entry(&touched, "p-b")["version"],
         inventory_entry(&first, "p-b")["version"]
@@ -3359,7 +3363,7 @@ async fn host_inspect_reprobes_when_the_program_or_its_launch_environment_change
     rig.profile("p-b-twin", &program_b, "/bin");
     std::fs::remove_file(rig.agents.join("p-d.toml")).expect("remove a profile");
     let changed = inspect(&mut client, Value::Null).await;
-    assert_eq!(rig.calls("prog-b"), 2);
+    assert_eq!(rig.calls("prog-b"), 3);
     assert_eq!(rig.calls("prog-d"), 2);
     assert_eq!(inventory_entry(&changed, "p-b-twin")["supported"], true);
 

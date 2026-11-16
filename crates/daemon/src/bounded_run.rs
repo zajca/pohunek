@@ -75,6 +75,20 @@ pub(crate) enum StderrPolicy {
     LogTail,
 }
 
+/// Which owner-identity variables a run gets: the private sandbox ones or
+/// the owner locations the caller forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeScope {
+    /// The sandbox's private `HOME` and `XDG_*_HOME`: the child never sees
+    /// the owner's home, config home or settings.
+    Private,
+    /// The caller supplies the owner's location variables (`HOME`,
+    /// `XDG_*_HOME`, `MISE_*_DIR`) through [`RunSpec::env`]; the runner
+    /// sets none of its own. The sandbox cwd, `XDG_RUNTIME_DIR`, `TMPDIR`
+    /// and the locale still isolate the run.
+    Owner,
+}
+
 /// One run: the fixed program, arguments and environment, and the limits.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RunSpec<'a> {
@@ -84,9 +98,13 @@ pub(crate) struct RunSpec<'a> {
     pub(crate) args: &'a [String],
     /// The `PATH` the child sees, or none.
     pub(crate) search_path: Option<&'a OsStr>,
-    /// Fixed pairs set right after the environment is cleared. They never
-    /// name a variable the sandbox sets.
+    /// Fixed pairs set right after the environment is cleared. Under
+    /// [`HomeScope::Private`] they never name a variable the sandbox sets;
+    /// under [`HomeScope::Owner`] they carry the caller's location
+    /// variables instead of those sandbox ones.
     pub(crate) env: &'a [(String, String)],
+    /// Which owner-identity variables the child sees.
+    pub(crate) home: HomeScope,
     /// Variables set before the clear, so a caller can show that the ambient
     /// environment does not reach the child.
     pub(crate) seeded_env: &'a [(&'a str, &'a str)],
@@ -256,15 +274,20 @@ fn build_command(
     let mut command = Command::new(spec.program);
     command.envs(spec.seeded_env.iter().copied());
     command.env_clear().envs(spec.env.iter().cloned());
+    // Under `Owner` the caller's pairs supply the owner location
+    // variables, so the sandbox sets none of its own.
+    if spec.home == HomeScope::Private {
+        command
+            .env("HOME", &sandbox.home_path)
+            .env("XDG_CONFIG_HOME", &sandbox.xdg_config_path)
+            .env("XDG_CACHE_HOME", &sandbox.xdg_cache_path)
+            .env("XDG_DATA_HOME", &sandbox.xdg_data_path)
+            .env("XDG_STATE_HOME", &sandbox.xdg_state_path);
+    }
     command
         .current_dir(&sandbox.cwd_path)
         .env("LANG", RUN_LOCALE)
         .env("LC_ALL", RUN_LOCALE)
-        .env("HOME", &sandbox.home_path)
-        .env("XDG_CONFIG_HOME", &sandbox.xdg_config_path)
-        .env("XDG_CACHE_HOME", &sandbox.xdg_cache_path)
-        .env("XDG_DATA_HOME", &sandbox.xdg_data_path)
-        .env("XDG_STATE_HOME", &sandbox.xdg_state_path)
         .env("XDG_RUNTIME_DIR", &sandbox.xdg_runtime_path)
         .env("TMPDIR", &sandbox.tmp_path);
     command.args(spec.args);

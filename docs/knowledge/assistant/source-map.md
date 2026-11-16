@@ -582,6 +582,7 @@ Daemon, sessions, integrations, and project state:
   own configured-hook listing, `git_hooks_env_conflict`).
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/capabilities.rs`
+- `crates/daemon/src/capabilities/dispatch.rs`
 - `crates/daemon/src/integration/mod.rs`
 - `crates/daemon/src/integration/commit.rs`
 - `crates/daemon/src/integration/doctor.rs`

@@ -70,20 +70,29 @@ pub(crate) fn host_login_shell() -> String {
     resolve_login_shell(std::env::var("SHELL").ok())
 }
 
-/// A launch executable resolved and canonicalized before provider validation.
+/// A launch executable resolved before provider validation.
+///
+/// The path is the lexical one the trusted resolver returned: a symlink
+/// stays lexical, so `argv[0]` keeps the name the profile configured
+/// (version-manager shims and other `argv[0]` dispatchers behind a link
+/// dispatch on it). The worker's entrypoint freeze pins the canonical file
+/// identity at launch, so a link retarget past validation still fails closed.
 ///
 /// The private path invariant lets the session launch path consume the exact
 /// executable that was probed without consulting `PATH` a second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidatedLaunchProgram {
     path: PathBuf,
-    /// The release the launch probe read from this exact executable; `None`
-    /// for a program without a version probe.
+    /// The release the launch probe read. For a plain executable it comes
+    /// from the link file itself; for a version-manager shim it comes from
+    /// the installed executable the manager names, while `path` stays the
+    /// shim link the launch execs. `None` for a program without a version
+    /// probe.
     version: Option<ProbeVersion>,
 }
 
 impl ValidatedLaunchProgram {
-    /// Resolve one configured program and canonicalize its first executable match.
+    /// Resolve one configured program to its first trusted executable match.
     pub(crate) fn resolve(program: &str) -> Option<Self> {
         let path = executable_search_path();
         Self::resolve_with_path(program, path.as_deref())
@@ -91,19 +100,23 @@ impl ValidatedLaunchProgram {
 
     fn resolve_with_path(program: &str, path: Option<&OsStr>) -> Option<Self> {
         let candidate = resolve_program(program, path)?;
-        let canonical = candidate.canonicalize().ok()?;
-        (canonical.is_absolute() && canonical.to_str().is_some()).then_some(Self {
-            path: canonical,
+        (candidate.is_absolute() && candidate.to_str().is_some()).then_some(Self {
+            path: candidate,
             version: None,
         })
     }
 
-    /// The absolute canonical path used for both probing and launch.
+    /// The absolute lexical path used for both probing and launch. The
+    /// trusted resolver already validated the whole lookup chain, and the
+    /// worker pins the canonical file at launch.
     pub(crate) fn as_path(&self) -> &Path {
         &self.path
     }
 
-    /// Records the release the launch probe read from this executable.
+    /// Records the release the launch probe read: the probed executable's
+    /// release, which for a version-manager shim is the one the manager
+    /// named, not the link file's. `check_option_floors` judges floors
+    /// against this field.
     #[must_use]
     pub(crate) fn with_version(mut self, version: ProbeVersion) -> Self {
         self.version = Some(version);
@@ -565,9 +578,9 @@ mod tests {
 
     use super::host::launch_command;
     use super::{
-        build_pty_command, resolve_binary, resume_pty_command_from_launch, served_native_launch,
-        trusted_program, which_executable, LaunchCommand, LaunchOpts, NativeArgs,
-        NativeSessionLaunch, SessionRef, SessionRefKind, ValidatedLaunchProgram,
+        resolve_binary, resume_pty_command_from_launch, served_native_launch, trusted_program,
+        which_executable, LaunchCommand, LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef,
+        SessionRefKind, ValidatedLaunchProgram,
     };
 
     fn launch_opts(cwd: impl AsRef<Path>) -> LaunchOpts {
@@ -703,28 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn validated_program_pins_the_canonical_absolute_match() {
-        let bin = temp_dir("validated-absolute");
-        let hermes = write_executable(&bin, "hermes");
-        let validated = ValidatedLaunchProgram::resolve_with_path("hermes", Some(bin.as_os_str()))
-            .expect("resolve on an absolute PATH entry");
-        let expected = hermes.canonicalize().expect("canonical fixture");
-        assert_eq!(validated.as_path(), expected);
-        let by_absolute =
-            ValidatedLaunchProgram::resolve_with_path(hermes.to_str().expect("utf-8"), None)
-                .expect("an absolute program needs no PATH");
-        assert_eq!(by_absolute.as_path(), expected);
-
-        let cwd = temp_dir("validated-cwd");
-        let mut opts = launch_opts(&cwd);
-        opts.validated_program = Some(validated);
-        let command = build_pty_command("must-not-be-resolved", vec!["chat".to_owned()], &opts)
-            .expect("build from validated program");
-        assert_eq!(command.program, expected.display().to_string());
-        assert_eq!(command.args, vec!["chat"]);
-    }
-
-    #[test]
     fn an_unusable_first_candidate_does_not_shadow_a_later_one() {
         in_own_process(|| {
             use std::os::unix::fs::PermissionsExt as _;
@@ -745,10 +736,7 @@ mod tests {
             });
             assert_eq!(resolved.0.as_deref(), Some(usable.as_path()));
             assert_eq!(resolved.1, usable.display().to_string());
-            assert_eq!(
-                resolved.2.expect("validated").as_path(),
-                usable.canonicalize().expect("canonical")
-            );
+            assert_eq!(resolved.2.expect("validated").as_path(), usable);
         });
     }
 
