@@ -491,19 +491,10 @@ pub(crate) async fn stage_from_stored(request: &PackageRef) -> Result<Staged, Er
     stage_from_selection(&client, selection).await
 }
 
+/// Fetch the index and select the entry for `request`. One fetch.
 pub(crate) async fn stage(request: &PackageRef, index_url: Option<&str>) -> Result<Staged, Error> {
     let client = client()?;
-    let selection = match select_entry(&client, request, index_url).await {
-        Ok(s) => s,
-        Err(fetch_err) => {
-            // Fetch failed: fall back to the stored unexpired copy when it
-            // lists the package, else surface the fetch error (M2).
-            let Some(stored) = read_stored() else {
-                return Err(fetch_err);
-            };
-            select_from_bytes(&stored.bytes, request)?
-        }
-    };
+    let selection = select_entry(&client, request, index_url).await?;
     stage_from_selection(&client, selection).await
 }
 

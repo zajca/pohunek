@@ -1136,20 +1136,15 @@ async fn run_install_by_id(
         require_index_context_support(&mut client).await?;
     }
     // 24h cadence: a fresh stored copy is used without fetching. When the
-    // stored copy is stale or missing, refresh first; a failed refresh
-    // falls back to the unexpired stored copy inside stage itself (M2).
-    // The daemon verifies the staged bytes, so an unverified stored copy
-    // cannot install anything.
+    // stored copy is stale or missing, refresh first (one fetch); if that
+    // fails, fall back to the unexpired stored copy when it lists the
+    // package. The daemon verifies the staged bytes.
     if !plugin_index::stored_is_fresh() {
         let _ = refresh_now(&mut client, args.index_url.as_deref()).await;
     }
-    let staged = if plugin_index::stored_is_fresh() {
-        match plugin_index::stage_from_stored(&request).await {
-            Ok(staged) => staged,
-            Err(_) => plugin_index::stage(&request, args.index_url.as_deref()).await?,
-        }
-    } else {
-        plugin_index::stage(&request, args.index_url.as_deref()).await?
+    let staged = match plugin_index::stage_from_stored(&request).await {
+        Ok(staged) => staged,
+        Err(_) => plugin_index::stage(&request, args.index_url.as_deref()).await?,
     };
     let source = Source::Archive {
         path: staged.archive_path.clone(),

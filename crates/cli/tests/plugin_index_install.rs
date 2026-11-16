@@ -491,6 +491,26 @@ impl Rig {
         self.install.json(&arguments).await
     }
 
+    /// Delete the stored index copy so the next install must fetch.
+    ///
+    /// The CLI sidecar lives under `<XDG_STATE_HOME>/pohunek/plugins/index`
+    /// (`state_dir` already joins `pohunek`), so the helper must include it.
+    fn clear_stored(&self) {
+        let state_home = self.install.env.state_home();
+        let index_dir = state_home.join("pohunek").join("plugins").join("index");
+        let _ = fs::remove_dir_all(&index_dir);
+    }
+
+    /// Requests the test server saw (paths, in order).
+    fn request_count(&self) -> usize {
+        self.server.state.requests.lock().expect("requests").len()
+    }
+
+    /// Clear the server request history between checks.
+    fn clear_requests(&self) {
+        self.server.state.requests.lock().expect("requests").clear();
+    }
+
     fn staging_leftovers(&self) -> Vec<String> {
         fs::read_dir(self.install.env.tmp_dir())
             .expect("read the private TMPDIR")
@@ -700,14 +720,19 @@ async fn an_entry_url_or_redirect_to_a_refused_target_stops_before_the_request()
     listing.url = FOREIGN_URL.to_owned();
     rig.publish(std::slice::from_ref(&listing));
 
+    rig.clear_stored();
+    rig.clear_requests();
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_url_refused");
-    assert_eq!(rig.server.requests(), [INDEX_PATH]);
+    // Refresh (one fetch) + stage fetch (one fetch) = the refused fetch is
+    // counted once per caller that has no stored copy.
+    assert_eq!(rig.request_count(), 2, "{:?}", rig.server.requests());
 
     // A redirect of the index to a foreign host is refused before the hop.
     rig.server
         .set(INDEX_PATH, Route::Redirect(FOREIGN_URL.to_owned()));
+    rig.clear_stored();
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_url_refused");
@@ -719,6 +744,7 @@ async fn an_entry_url_or_redirect_to_a_refused_target_stops_before_the_request()
         &archive_path("0.1.0"),
         Route::Redirect(FOREIGN_URL.to_owned()),
     );
+    rig.clear_stored();
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_url_refused");
@@ -771,9 +797,18 @@ async fn a_chain_of_ten_redirects_is_followed_and_an_eleventh_hop_is_refused() {
     };
 
     chain(10);
+    rig.clear_stored();
+    // The second hop must be observed after refresh: requests are counted
+    // fresh between the two chains so the redirect limit is measured alone.
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 0, "{document}");
+    rig.clear_requests();
 
+    // The 11-hop case must be observed in the install fetch: clear the
+    // stored copy so `stage_from_stored` misses and the fetch (refresh +
+    // stage) runs and hits the redirect limit.
+    rig.clear_stored();
+    rig.clear_requests();
     chain(11);
     let (code, document) = rig.install(PACKAGE_ID, &["--yes", "--no-enable"]).await;
     assert_eq!(code, 1, "{document}");
@@ -907,6 +942,7 @@ async fn an_index_the_cli_cannot_use_is_reported_before_the_archive_is_requested
     let duplicated = valid.replacen('{', "{\"schema_version\":1,", 1);
     rig.server
         .set(INDEX_PATH, Route::Body(duplicated.into_bytes()));
+    rig.clear_stored();
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_invalid");
@@ -919,6 +955,7 @@ async fn an_index_the_cli_cannot_use_is_reported_before_the_archive_is_requested
                 .document(&rig.keys.key, now() - 8 * DAY, vec![listing.entry()]),
         ),
     );
+    rig.clear_stored();
     let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
     assert_eq!(code, 1, "{document}");
     assert_eq!(err_code(&document), "plugin_index_expired");
