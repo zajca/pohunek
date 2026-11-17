@@ -165,7 +165,10 @@ impl Kit {
                     let _ = child.wait();
                     panic!("pohunek-plugin-kit {args:?} hung past {HANG_GUARD:?}");
                 }
-                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+                None => {
+                    // timing-allowed: #1613 the kit child poll sleeps under HANG_GUARD.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
         }
     }
