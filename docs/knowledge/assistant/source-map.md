@@ -864,6 +864,10 @@ Workspace crates by role (every workspace crate has an entry in this map;
 - `crates/shape-guard/src/lib.rs` — dev-only persisted-shape guard helpers.
 - `crates/test-support/src/lib.rs` — test-only helpers: hermetic fixture roots
   and environments, binary resolution, bounded readiness waits.
+- `crates/plugin-kit/src/lib.rs` — `pohunek-plugin-kit`: `lint`, `build`,
+  `verify`, `detect-check`, `smoke` and `prove` for plugin repositories over
+  one package directory, on an isolated `--local-only` daemon reached through
+  a throwaway index (`isolated.rs`, `throwaway.rs`).
 
 Design inputs:
 
