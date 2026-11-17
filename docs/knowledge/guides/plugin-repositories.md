@@ -129,6 +129,16 @@ The same two commands run locally:
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
   lists the steps, the evidence fields and the exit statuses.
+- `cargo xtask plugin features-check [--index <file>]` fails when a required
+  runtime feature is missing from the registry
+  (`crates/daemon/src/agent/host/fixtures/features.txt`, the same snapshot
+  the append-only guard compares `RUNTIME_FEATURES` against). It collects
+  `requires` from `runtime-packages/*/runtime.toml` and from every `runtime`
+  entry of an index document (the archive each entry lists is fetched from
+  its `url`, verified against the entry's digest and read for its descriptor;
+  a context entry is skipped). Without `--index` the official index v2 is
+  fetched; a failed fetch prints a `warn` naming the URL and the check
+  continues, so it never fails on the network alone.
 
 ## Compatibility declaration
 

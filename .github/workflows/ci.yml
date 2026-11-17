@@ -1514,6 +1514,7 @@ jobs:
               - 'crates/xtask/src/package_evidence.rs'
               - 'crates/xtask/src/plugin.rs'
               - 'crates/xtask/src/plugin/build.rs'
+              - 'crates/xtask/src/plugin/features_check.rs'
               - 'crates/xtask/src/plugin/prove.rs'
               - 'crates/xtask/src/plugin_index.rs'
               - 'crates/xtask/src/plugin_index/admit.rs'
@@ -4278,6 +4279,12 @@ jobs:
 
       - name: docs check
         run: cargo xtask docs check
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: plugin features-check
+        timeout-minutes: 10
+        run: cargo xtask plugin features-check
         env:
           RUSTFLAGS: -D warnings
 

@@ -9,7 +9,9 @@
 // Rust guideline compliant 2026-11-06
 
 mod build;
+mod features_check;
 mod prove;
 
 pub(crate) use build::{build, BuildArgs};
+pub(crate) use features_check::{features_check, FeaturesCheckArgs};
 pub(crate) use prove::{prove, ProveArgs, Verdict};

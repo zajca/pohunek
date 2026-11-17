@@ -331,6 +331,11 @@ pub(crate) const SCANS: &[(&str, &[&str], &str)] = &[
         "shape check of every official compatibility lock",
     ),
     (
+        "crates/xtask/tests/plugin_features_check.rs",
+        &["runtime-packages", "crates/daemon/src/agent/host/fixtures"],
+        "the real registry snapshot and shipped package descriptors the real-tree scenario checks, run with the checkout as its working directory",
+    ),
+    (
         "crates/xtask/tests/test_artifact_lookup_guard.rs",
         &["crates"],
         "scan of every crate's Rust sources",

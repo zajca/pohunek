@@ -1055,4 +1055,28 @@ shell (the tag check, the artifact hand-off, the checksum check, the
 attestation, the publish). The workflow first runs for the first plugin
 release.
 
+`cargo xtask plugin features-check` is the feature-removal check of #1659
+D4: a runtime feature may be removed from the registry only when no package
+requires it anymore. It collects `requires` from `runtime-packages/*/runtime.toml`
+and from every `runtime` entry of an index document, whose archive is fetched
+from the entry's `url`, verified against the entry's digest and read for its
+descriptor (a digest mismatch fails; a context entry has no runtime descriptor
+and is skipped; the index signature is not verified, the check reads
+requirements and authorizes nothing). Without `--index <file>` the official
+index v2 is fetched; a failed fetch (of the index or of an entry archive)
+prints a `warn` line naming the URL and the check continues with the other
+sources, so it never fails on the network alone and never depends on it. The
+`plugin_features_check` scenarios of `xtask` cover the failure (missing
+feature naming the feature and the package), the digest mismatch, the skipped
+context entry and the warn-and-continue fetch against the real binary with
+`file://` fixture archives (honoured only for a `--index` document, never for
+a fetched official index), plus the real tree with an empty fixture index; the
+`docs` job of CI runs the check against the real tree and the official index.
+Exit statuses: `0` on a pass; `1` when a required feature is missing or when
+content is refused (a malformed index document, an archive whose digest
+differs from the entry, an archive over a size cap, or a descriptor whose
+identity the entry does not list); `2` on a refused invocation. A fetch that
+fails prints a `warn` line (plus a `::warning` run annotation on GitHub
+Actions) and the check continues, rc 0.
+
 After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.
