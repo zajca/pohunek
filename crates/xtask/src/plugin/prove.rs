@@ -215,6 +215,25 @@ fn fail(step: Step) -> impl Fn(String) -> Verdict {
     move |detail| Verdict { step, detail }
 }
 
+impl From<plugin_kit::Verdict> for Verdict {
+    /// Converts a kit proof verdict, matching on the step name so the
+    /// wrapper keeps the exact `xtask` evidence contract.
+    fn from(verdict: plugin_kit::Verdict) -> Self {
+        let step = match verdict.step_name() {
+            "digest" => Step::Digest,
+            "trust" => Step::Trust,
+            "host" => Step::Host,
+            "install" => Step::Install,
+            "inspect" => Step::Inspect,
+            _ => Step::Cleanup,
+        };
+        Self {
+            step,
+            detail: verdict.detail().to_owned(),
+        }
+    }
+}
+
 /// Runs the steps in order. The isolation root exists only after the digest
 /// step passed, and is removed on every path.
 fn run_steps(

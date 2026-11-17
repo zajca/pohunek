@@ -34,6 +34,7 @@ pohunek-paths = { workspace = true }
 base64 = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 portable-pty = { workspace = true }
+plugin-kit = { workspace = true }
 tempfile = { workspace = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4", default-features = false }

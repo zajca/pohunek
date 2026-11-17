@@ -250,6 +250,29 @@ impl Error for XtaskError {
     }
 }
 
+impl From<plugin_kit::Error> for XtaskError {
+    /// Converts a kit error so the `xtask plugin build` wrapper keeps its
+    /// exact contract, including exit codes, while the logic lives in the
+    /// kit crate.
+    fn from(error: plugin_kit::Error) -> Self {
+        match error {
+            plugin_kit::Error::Usage(message) => Self::Usage(message),
+            plugin_kit::Error::Io { path, source } => Self::Io { path, source },
+            plugin_kit::Error::UnsupportedFileType(path) => Self::UnsupportedFileType(path),
+            plugin_kit::Error::Json(error) => Self::Json(error),
+            plugin_kit::Error::Package(error) => Self::Package(error),
+            plugin_kit::Error::Catalog(error) => Self::Catalog(error),
+            plugin_kit::Error::Anchor(error) => Self::Anchor(error),
+            plugin_kit::Error::Index(error) => Self::Index(error),
+            plugin_kit::Error::OutputInsideInput(path) => Self::OutputInsideInput(path),
+            plugin_kit::Error::OutputIsSymlink(path) => Self::OutputIsSymlink(path),
+            plugin_kit::Error::InvalidPath(path) => Self::InvalidPath(path),
+            plugin_kit::Error::ChildExit { command, status } => Self::ChildExit { command, status },
+            plugin_kit::Error::Prove(verdict) => Self::Prove(verdict.into()),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct Manifest<'a> {
     pohunek_version: &'a str,
