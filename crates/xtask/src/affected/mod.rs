@@ -685,6 +685,10 @@ pub(crate) const LANE_NEUTRAL: &[LaneNeutral] = &[LaneNeutral {
             "its launch fixtures point at the bundle through pohunek-assistant",
         ),
         (
+            "pohunek-plugin-kit",
+            "depends on the bundle through the daemon",
+        ),
+        (
             "xtask",
             "depends on the bundle through the daemon and the CLI",
         ),
