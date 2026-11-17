@@ -1,0 +1,13 @@
+# Corpus of committed screens the detector must classify. Each case names a
+# screen file under `screens/`, the width it replays at, and the expected
+# activity name (`working`, `blocked`, `idle`, `unknown`).
+
+[[case]]
+screen = "idle_prompt.txt"
+width = 80
+expect = "idle"
+
+[[case]]
+screen = "blocked_input.txt"
+width = 80
+expect = "blocked"
