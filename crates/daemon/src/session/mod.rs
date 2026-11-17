@@ -3701,11 +3701,7 @@ impl SessionRegistry {
         // without a probed release: a runtime that reports no version cannot
         // meet any `min_runtime`.
         let base = self.launch_base_environment()?;
-        let environment = host::ProbeEnvironment::for_launch(&base, profile_env).map_err(
-            |incomplete| {
-                ProtocolError::agent_runtime_locations_unreadable(&incomplete.variable)
-            },
-        )?;
+        let environment = host::ProbeEnvironment::for_launch(&base, profile_env);
         let program =
             host::validate_launch_runtime(&resolved.definition, resolved.spawn(), &environment)?;
         resolved.check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;

@@ -957,11 +957,7 @@ impl SessionRegistry {
         // resolution the same way; its environment only matters when a
         // probe runs.
         let environment =
-            host::ProbeEnvironment::for_launch(&base_environment, profile.env.as_slice()).map_err(
-                |incomplete| {
-                    ProtocolError::agent_runtime_locations_unreadable(&incomplete.variable)
-                },
-            )?;
+            host::ProbeEnvironment::for_launch(&base_environment, profile.env.as_slice());
         let validated_program = host::validate_launch_runtime(
             &definition,
             host::Spawn::Program(&program),

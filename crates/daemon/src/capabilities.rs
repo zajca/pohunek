@@ -215,7 +215,7 @@ struct PendingProbe {
 
 /// [`host_capabilities`] against an explicit runtime registry.
 ///
-/// Version-manager lookups are memoized per inventory (see [`DispatchMemo`]),
+/// Version-manager lookups are memoized per inventory (see [`dispatch::LookupMemo`]),
 /// so profiles that share one shim name behind one install trigger one
 /// lookup, not one per profile.
 fn host_capabilities_for(
@@ -253,9 +253,15 @@ fn host_capabilities_for(
                 },
                 None,
             ),
-            LaunchProgram::Fixed(program) => {
-                probe_definition(agent, agent_base, definition, program, base_env, &[], &mut memo)
-            }
+            LaunchProgram::Fixed(program) => probe_definition(
+                agent,
+                agent_base,
+                definition,
+                program,
+                base_env,
+                &[],
+                &mut memo,
+            ),
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
         entry.config_home_id = config_home_id(profiles, definition, base_env, &[]);
@@ -498,25 +504,10 @@ fn probe_definition(
     memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
     match definition.version_probe_parser() {
-        Some(_) => match ProbeEnvironment::for_launch(base_env, profile_env) {
-            Ok(environment) => plan_versioned_runtime(
-                agent,
-                agent_base,
-                program,
-                definition,
-                &environment,
-                memo,
-            ),
-            // A lookup the locations cannot feed never probes: report the
-            // entry present but unsupported, as a failed probe does. The
-            // launch path refuses with `agent_runtime_unsupported` naming
-            // the variable, never its value.
-            Err(_incomplete) => ({
-                let mut runtime = probe_runtime(agent, agent_base, program);
-                runtime.supported = Some(false);
-                runtime
-            }, None),
-        },
+        Some(_) => {
+            let environment = ProbeEnvironment::for_launch(base_env, profile_env);
+            plan_versioned_runtime(agent, agent_base, program, definition, &environment, memo)
+        }
         None => (probe_runtime(agent, agent_base, program), None),
     }
 }
@@ -710,19 +701,11 @@ impl ProbeEnvironment {
     /// agent will see, read from the daemon's base environment overridden by
     /// the profile pairs, and the owner location variables selected from
     /// those same two sources.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first location variable with a non-UTF-8 value, naming
-    /// the variable but never its value.
-    pub(crate) fn for_launch(
-        base: &BaseEnv,
-        profile_env: &[(String, String)],
-    ) -> Result<Self, dispatch::IncompleteLocations> {
-        Ok(Self {
+    pub(crate) fn for_launch(base: &BaseEnv, profile_env: &[(String, String)]) -> Self {
+        Self {
             launch_path: effective_variable(base, profile_env, SEARCH_PATH_VAR),
-            owner_locations: dispatch::OwnerLocations::from_launch(base, profile_env)?,
-        })
+            owner_locations: dispatch::OwnerLocations::from_launch(base, profile_env),
+        }
     }
 }
 
@@ -838,12 +821,12 @@ impl LaunchValidationFailure {
     /// empty install set reports no installed release, while a deadline
     /// follows the shortened-budget rule and every other lookup failure
     /// reads as a failed probe.
-    fn from_dispatch(failure: &dispatch::DispatchFailure, shortened_budget: bool) -> Self {
+    fn from_dispatch(failure: dispatch::DispatchFailure, shortened_budget: bool) -> Self {
         match failure {
             dispatch::DispatchFailure::Unresolved => Self::DispatchUnresolved,
             dispatch::DispatchFailure::TimedOut if shortened_budget => Self::ProbeTimedOut,
             dispatch::DispatchFailure::TimedOut => Self::ProbeDeadline,
-            dispatch::DispatchFailure::Malformed | dispatch::DispatchFailure::Unavailable => {
+            dispatch::DispatchFailure::Invalid | dispatch::DispatchFailure::Unavailable => {
                 Self::Unsupported
             }
         }
@@ -919,7 +902,7 @@ fn validate_definition_launch_detailed_with_clock(
                 timeout,
                 now,
             )
-            .map_err(|failure| LaunchValidationFailure::from_dispatch(&failure, shortened_budget))?;
+            .map_err(|failure| LaunchValidationFailure::from_dispatch(failure, shortened_budget))?;
             timeout = timeout.saturating_sub(now().saturating_duration_since(lookup_started));
             installed
         }
@@ -1098,8 +1081,7 @@ mod tests {
     fn probe_env(base: &BaseEnv, path: Option<&OsStr>) -> ProbeEnvironment {
         ProbeEnvironment {
             launch_path: path.map(OsStr::to_os_string),
-            owner_locations: dispatch::OwnerLocations::from_launch(base, &[])
-                .expect("the fixture base is readable"),
+            owner_locations: dispatch::OwnerLocations::from_launch(base, &[]),
         }
     }
 

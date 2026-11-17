@@ -4794,8 +4794,9 @@ impl SessionRegistry {
             },
             recorded_worker: match recorded {
                 // An unreadable boot identity leaves the entry unrecorded:
-                // the session is unverified until the host names its boot
-                // again, so a transient read error cannot keep owner rights.
+                // the session is unverified until the runtime is settled
+                // (reattached or lost), so a transient read error cannot
+                // keep owner rights.
                 super::RecordedProcess::Current(_) | super::RecordedProcess::BootUnknown => {
                     super::RecordedWorker::Unrecorded
                 }
@@ -18003,8 +18004,8 @@ generation "$1"
 
         /// A host that cannot name its boot leaves the recorded worker
         /// unplaced instead of judging it stale: the session is unverified
-        /// and an outside caller is refused until the host names its boot
-        /// again.
+        /// and an outside caller is refused until the runtime is settled
+        /// (reattached or lost).
         #[tokio::test]
         async fn a_reconnecting_session_with_an_unreadable_boot_identity_is_unverified() {
             let fixture = fixture(Arc::new(RetryInspector::default()));

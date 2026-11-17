@@ -83,8 +83,8 @@ use crate::agent::{
     parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
     ReferenceExistence, RefusalPhase, ResolvedAgent, ValidatedLaunchProgram,
 };
-use crate::capabilities::ProbeClock;
 use crate::capabilities::dispatch::OwnerLocations;
+use crate::capabilities::ProbeClock;
 use crate::capabilities::{
     probe_timed_out_error, unsupported_version_error, LaunchValidationFailure,
 };
@@ -1551,8 +1551,8 @@ enum Probe {
 }
 
 /// Runs the version probe of `program` under `environment` for `definition`,
-/// as resume validates the program it relaunches, unless the same probe
-/// already has an outcome in `ledger` or the budget is spent.
+/// as resume validates the program it relaunches, unless the [`ProbeKey`] of
+/// the same probe already has an outcome in `ledger` or the budget is spent.
 fn run_probe(
     definition: &RuntimeDefinition,
     program: &str,
@@ -2185,21 +2185,7 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         }
     };
     let program = binding_program(binding, &definition);
-    let environment = match ProbeEnvironment::for_launch(base, profile_env.as_slice()) {
-        Ok(environment) => environment,
-        Err(incomplete) => {
-            let error =
-                ProtocolError::agent_runtime_locations_unreadable(&incomplete.variable);
-            return Some((
-                Verdict::WouldLoseRecovery,
-                error.code,
-                format!(
-                    "the agent the session launches from names an unreadable owner location variable {}; {}",
-                    incomplete.variable, error.msg
-                ),
-            ));
-        }
-    };
+    let environment = ProbeEnvironment::for_launch(base, profile_env.as_slice());
     match run_probe(&definition, &program, &environment, judging.probes) {
         Probe::Supported => None,
         Probe::Refused { code, detail } => Some((
@@ -2323,4 +2309,158 @@ fn judge_pin(candidate: &SessionRecord, profiles: &ProfileRegistry) -> Option<Ju
             error.code, error.msg
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::scoped_dir;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A fake `mise` answering `which` from its own data directory: the probe
+    /// resolves the shim through dispatch with the owner's locations as the
+    /// lookup environment, so one shim answers with a different install per
+    /// `MISE_DATA_DIR`.
+    struct MiseFixture {
+        _dir: crate::test_support::ScopedDir,
+        shim: PathBuf,
+        good: PathBuf,
+        bad: PathBuf,
+    }
+
+    impl MiseFixture {
+        fn install(dir: &crate::test_support::ScopedDir, name: &str, version: &str) -> PathBuf {
+            let install = dir.join(name);
+            std::fs::create_dir_all(&install).expect("install dir");
+            let binary = install.join("tool");
+            std::fs::write(
+                &binary,
+                format!("#!/bin/sh\necho 'Hermes Agent v{version} (fixture)'\n"),
+            )
+            .expect("install binary");
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .expect("install binary executable");
+            install
+        }
+
+        fn new() -> Self {
+            let dir = scoped_dir("pohunek-preflight-probe-");
+            let good = Self::install(&dir, "good", "0.20.0");
+            let bad = Self::install(&dir, "bad", "0.0.1");
+            let mise = dir.join("mise");
+            std::fs::write(
+                &mise,
+                format!(
+                    "#!/bin/sh\nif [ \"$MISE_DATA_DIR\" = \"{}\" ]; then\n  echo \"{}/tool\"\nelse\n  echo \"{}/tool\"\nfi\n",
+                    good.display(),
+                    good.display(),
+                    bad.display(),
+                ),
+            )
+            .expect("fake mise");
+            std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o755))
+                .expect("fake mise executable");
+            let shim = dir.join("tool");
+            std::os::unix::fs::symlink(&mise, &shim).expect("shim symlink");
+            Self {
+                _dir: dir,
+                shim,
+                good,
+                bad,
+            }
+        }
+    }
+
+    /// A package-served definition with the official Hermes version probe, so
+    /// the 0.20.0 install passes and the 0.0.1 install is refused.
+    fn hermes_like_definition() -> RuntimeDefinition {
+        let document = r#"schema = 1
+id = "acme.runtime.tool"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "tool"
+name = "Tool"
+program = "tool"
+args = []
+detect_manifest = "any"
+version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.20.0", below = "1.0.0", line = "Hermes Agent v{version} {annotation}" }
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = false
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "none"
+"#;
+        RuntimeDefinition::from_toml(
+            document,
+            |package| DefinitionOrigin::Package {
+                package,
+                digest: PackageDigest::parse(&format!("sha256:{}", "3".repeat(64)))
+                    .expect("digest"),
+            },
+            |_| Ok(Arc::new(crate::detect::generic_shell_manifest().clone())),
+        )
+        .expect("valid definition")
+    }
+
+    fn probe_base(data_dir: &Path) -> BaseEnv {
+        BaseEnv::new(BTreeMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("MISE_DATA_DIR".to_owned(), data_dir.display().to_string()),
+        ]))
+        .expect("base env")
+    }
+
+    fn probe_environment(base: &BaseEnv, shim: &Path) -> ProbeEnvironment {
+        // One probe per data directory, as two sessions launched from the same
+        // shim on the same `PATH` but with a different `MISE_DATA_DIR` see.
+        let mut search = std::ffi::OsString::from(shim.parent().expect("shim dir"));
+        search.push(":/usr/bin:/bin");
+        ProbeEnvironment {
+            launch_path: Some(search),
+            owner_locations: OwnerLocations::from_launch(base, &[]),
+        }
+    }
+
+    /// Two sessions behind the same shim and `PATH` but with a different
+    /// `MISE_DATA_DIR` get their own probe verdict: the owner locations are
+    /// part of the probe key, so the supported install does not answer for
+    /// the refused one.
+    #[test]
+    fn probes_with_different_owner_locations_do_not_share_a_verdict() {
+        let fixture = MiseFixture::new();
+        let definition = hermes_like_definition();
+        let program = fixture.shim.display().to_string();
+        let ledger = ProbeLedger::new(
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+            ProbeClock::default(),
+        );
+        let supported = probe_environment(&probe_base(&fixture.good), &fixture.shim);
+        let refused = probe_environment(&probe_base(&fixture.bad), &fixture.shim);
+        assert!(
+            matches!(
+                run_probe(&definition, &program, &supported, &ledger),
+                Probe::Supported
+            ),
+            "the install inside the supported range passes its own probe"
+        );
+        assert!(
+            matches!(
+                run_probe(&definition, &program, &refused, &ledger),
+                Probe::Refused { .. }
+            ),
+            "the install outside the supported range is refused, not answered from the shared probe"
+        );
+    }
 }
