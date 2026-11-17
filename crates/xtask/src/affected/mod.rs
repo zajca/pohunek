@@ -1569,6 +1569,10 @@ mod tests {
             },
             package("pohunek-netbird", "crates/netbird"),
             package("pohunek-test-support", "crates/test-support"),
+            Package {
+                bins: BTreeSet::from(["pohunek-plugin-kit".to_owned()]),
+                ..package("pohunek-plugin-kit", "crates/plugin-kit")
+            },
             package("xtask", "crates/xtask"),
             package("nested-fixture", "crates/xtask/tests/fixtures/nested"),
         ]
@@ -1915,7 +1919,8 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "selection: pohunek-cli, pohunek-daemon (named tests), xtask (named tests)"
+            "selection: pohunek-cli, pohunek-daemon (named tests), pohunek-plugin-kit \
+             (named tests), xtask (named tests)"
         );
         assert_eq!(
             lines[4],
@@ -1930,7 +1935,8 @@ mod tests {
         assert!(
             lines[6].starts_with(
                 "cargo t -E 'package(=pohunek-cli) | (package(=pohunek-daemon) and \
-                 ((binary(=supervised_lifecycle)))) | (package(=xtask) and ((binary(=hermetic_scan)"
+                 ((binary(=supervised_lifecycle)))) | (package(=pohunek-plugin-kit) and \
+                 ((binary(=kit)))) | (package(=xtask) and ((binary(=hermetic_scan)"
             ),
             "{report}"
         );
