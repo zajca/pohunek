@@ -3971,7 +3971,6 @@ dependencies = [
  "pohunek-cli",
  "pohunek-knowledge",
  "pohunek-package",
- "pohunek-paths",
  "pohunek-platform",
  "pohunek-plugin-kit",
  "pohunek-protocol",
