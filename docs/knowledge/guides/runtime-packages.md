@@ -581,7 +581,9 @@ hook_schema = "identity-subagent-v1"
 
 Core owns the schemas: `identity-v1` (identity, release, notification; only the
 PTY root itself, reporting in process while it runs the frozen launch
-entrypoint, may set or update the launch identity) and `identity-subagent-v1`
+entrypoint, may set or update the launch identity; only Hermes names it, and
+its worker verifies the claim against the entrypoint frozen at `Initialize`)
+and `identity-subagent-v1`
 (the same plus subagent start and stop, the subagent snapshot and, for Claude
 only, the prompt-accepted report; the launch identity comes from the earliest
 process named for the provider, or running a native-installer release image
@@ -1083,7 +1085,12 @@ manager under the agent's name (as `mise` writes them). The daemon keeps the
 lexical link path so the manager dispatches on the link name, asks the manager
 read-only which installed executable the shim would run (`mise which`, offline
 with no auto-install, starting in `/` under its own deadline), and probes that
-executable in the private sandbox; the launch still execs the shim link. A shim
+executable in the private sandbox; the launch still execs the shim link. An
+`identity-v1` runtime (Hermes) behind a shim fails closed with `ImageMismatch`:
+mise execs a different file than the frozen launch entrypoint, so the root's
+report cannot bind to it (see `identity-v1` above); Codex and Claude are
+unaffected because `identity-subagent-v1` binds reports to the launch process
+tree, not to the entrypoint file. A shim
 with no installed release is refused with `agent_runtime_unsupported` and a
 `recover` hint to run the agent once in a login shell; the version check never
 installs or updates a tool. This covers the owner's global/system selection

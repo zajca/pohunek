@@ -83,6 +83,7 @@ use crate::agent::{
     parse_head, NativeReferenceProvenance, Pin, ProfileRegistry, ReferenceCheckFailure,
     ReferenceExistence, RefusalPhase, ResolvedAgent, ValidatedLaunchProgram,
 };
+use crate::capabilities::dispatch::OwnerLocations;
 use crate::capabilities::ProbeClock;
 use crate::capabilities::{
     probe_timed_out_error, unsupported_version_error, LaunchValidationFailure,
@@ -1508,11 +1509,18 @@ struct ProbeLedger {
 type ProbeOutcome = Result<(), (String, String)>;
 
 /// What one probe ran against: the program as the launch names it, the `PATH`
-/// it runs under, and the executable of the package whose probe it is.
+/// it runs under, the owner locations a version-manager lookup reads, and
+/// the executable of the package whose probe it is.
+///
+/// The locations are part of the key because two profiles can share a shim
+/// and a `PATH` while naming different installs through different
+/// `MISE_*_DIR` values: sharing one outcome across them would judge the
+/// second session by the other profile's release.
 #[derive(PartialEq, Eq, Hash)]
 struct ProbeKey {
     program: String,
     launch_path: Option<OsString>,
+    owner_locations: OwnerLocations,
     probed: String,
 }
 
@@ -1543,8 +1551,8 @@ enum Probe {
 }
 
 /// Runs the version probe of `program` under `environment` for `definition`,
-/// as resume validates the program it relaunches, unless the same probe
-/// already has an outcome in `ledger` or the budget is spent.
+/// as resume validates the program it relaunches, unless the [`ProbeKey`] of
+/// the same probe already has an outcome in `ledger` or the budget is spent.
 fn run_probe(
     definition: &RuntimeDefinition,
     program: &str,
@@ -1554,6 +1562,7 @@ fn run_probe(
     let key = ProbeKey {
         program: program.to_owned(),
         launch_path: environment.launch_path.clone(),
+        owner_locations: environment.owner_locations.clone(),
         probed: probed_identity(definition),
     };
     if let Some(outcome) = ledger.outcomes.borrow().get(&key) {

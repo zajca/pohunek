@@ -214,6 +214,10 @@ struct PendingProbe {
 }
 
 /// [`host_capabilities`] against an explicit runtime registry.
+///
+/// Version-manager lookups are memoized per inventory (see [`dispatch::LookupMemo`]),
+/// so profiles that share one shim name behind one install trigger one
+/// lookup, not one per profile.
 fn host_capabilities_for(
     daemon_version: &str,
     profiles: &ProfileRegistry,
@@ -228,6 +232,7 @@ fn host_capabilities_for(
     let mut supported_agents = Vec::with_capacity(definitions.len());
     let mut runtimes = Vec::with_capacity(definitions.len());
     let mut pending = Vec::new();
+    let mut memo = dispatch::LookupMemo::default();
     for definition in definitions {
         let agent = definition.runtime_id().as_str();
         let agent_base = RuntimeRef::from(definition.runtime_id().clone());
@@ -248,9 +253,15 @@ fn host_capabilities_for(
                 },
                 None,
             ),
-            LaunchProgram::Fixed(program) => {
-                probe_definition(agent, agent_base, definition, program, base_env, &[])
-            }
+            LaunchProgram::Fixed(program) => probe_definition(
+                agent,
+                agent_base,
+                definition,
+                program,
+                base_env,
+                &[],
+                &mut memo,
+            ),
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
         entry.config_home_id = config_home_id(profiles, definition, base_env, &[]);
@@ -273,6 +284,7 @@ fn host_capabilities_for(
                 &profile.program,
                 base_env,
                 &profile.env,
+                &mut memo,
             ),
             (Ok(()), None) => probe_definition(
                 &agent.name,
@@ -281,6 +293,7 @@ fn host_capabilities_for(
                 agent.definition.program().as_str(),
                 base_env,
                 &[],
+                &mut memo,
             ),
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
@@ -478,6 +491,9 @@ fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
 type PlannedRuntime = (AgentRuntime, Option<(ProbeRequest, VersionProbePolicy)>);
 
 /// Probe `program` for `definition`, honouring its version-probe parser.
+///
+/// `memo` carries the version-manager answers of the inventory being
+/// planned, so two profiles behind one shim share one lookup.
 fn probe_definition(
     agent: &str,
     agent_base: RuntimeRef,
@@ -485,11 +501,12 @@ fn probe_definition(
     program: &str,
     base_env: &BaseEnv,
     profile_env: &[(String, String)],
+    memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
     match definition.version_probe_parser() {
         Some(_) => {
             let environment = ProbeEnvironment::for_launch(base_env, profile_env);
-            plan_versioned_runtime(agent, agent_base, program, definition, &environment)
+            plan_versioned_runtime(agent, agent_base, program, definition, &environment, memo)
         }
         None => (probe_runtime(agent, agent_base, program), None),
     }
@@ -542,6 +559,7 @@ fn plan_versioned_runtime(
     binary: &str,
     definition: &RuntimeDefinition,
     environment: &ProbeEnvironment,
+    memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
     let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
         return (
@@ -569,15 +587,16 @@ fn plan_versioned_runtime(
     // to another executable probes the link itself.
     let probe_program = match dispatch::classify(program.as_path()) {
         dispatch::Dispatch::Direct => Some(program.as_path().to_path_buf()),
-        dispatch::Dispatch::Mise { manager, bin_name } => dispatch::resolve(
-            &manager,
-            &bin_name,
-            &environment.owner_locations,
-            environment.launch_path.as_deref(),
-            VERSION_PROBE_TIMEOUT,
-            &Instant::now,
-        )
-        .ok(),
+        dispatch::Dispatch::Mise { manager, bin_name } => memo
+            .resolve(
+                &manager,
+                &bin_name,
+                &environment.owner_locations,
+                environment.launch_path.as_deref(),
+                VERSION_PROBE_TIMEOUT,
+                &Instant::now,
+            )
+            .ok(),
     };
     let Some(probe_program) = probe_program else {
         return (
@@ -641,6 +660,7 @@ fn probe_versioned_runtime(
         binary,
         definition,
         environment,
+        &mut dispatch::LookupMemo::default(),
     ))
 }
 
@@ -1835,6 +1855,7 @@ strategy = "none"
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).expect("set executable mode");
     }
+
     #[test]
     fn semver_probe_reports_and_validates_the_declared_range() {
         let dir = temp_agents_dir();
@@ -2019,6 +2040,7 @@ strategy = "none"
                 &binary,
                 base,
                 profile_env,
+                &mut dispatch::LookupMemo::default(),
             ))
             .supported
         };

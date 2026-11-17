@@ -13,7 +13,8 @@
 
 // Rust guideline compliant 2026-11-16
 
-use std::ffi::OsStr;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -103,11 +104,14 @@ pub(crate) fn classify(launch: &Path) -> Dispatch {
 }
 
 /// The owner location variables [`LOCATION_VARS`] of one launch environment.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct OwnerLocations(Vec<(String, String)>);
 
 impl OwnerLocations {
     /// Selects the location variables the launched agent will see.
+    ///
+    /// Every value is already UTF-8 here: [`BaseEnv`] holds `String` pairs
+    /// only (see [`BaseEnv::from_allowlist`]), so the conversion cannot fail.
     pub(crate) fn from_launch(base: &BaseEnv, profile_env: &[(String, String)]) -> Self {
         Self(
             LOCATION_VARS
@@ -121,7 +125,8 @@ impl OwnerLocations {
         )
     }
 
-    fn pairs(&self) -> &[(String, String)] {
+    /// The location pairs in `LOCATION_VARS` order, for lookups and cache keys.
+    pub(crate) fn pairs(&self) -> &[(String, String)] {
         &self.0
     }
 }
@@ -145,6 +150,56 @@ pub(crate) enum DispatchFailure {
     TimedOut,
     /// The lookup could not be set up, polled or read.
     Unavailable,
+}
+
+/// The probe path of one version-manager shim, resolved once per inventory.
+///
+/// Two profiles that share one `(manager, bin_name)` under the same owner
+/// locations and the same launch `PATH` resolve to the same installed
+/// executable: the second lookup would rerun a subprocess only to report
+/// the same answer. The memo makes the duplicate lookup free in both
+/// directions — a second refusal replays the same refusal, so an install
+/// that vanishes between two profiles of one inventory reports every
+/// affected profile the same way instead of racing the uninstall.
+#[derive(Debug, Default)]
+pub(crate) struct LookupMemo(HashMap<LookupKey, Result<PathBuf, DispatchFailure>>);
+
+/// What one version-manager lookup asks: the manager executable, the shim
+/// file name it is asked about, the owner locations the launched agent
+/// sees, and the launch `PATH` the lookup resolves under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LookupKey {
+    manager: PathBuf,
+    bin_name: String,
+    owner_locations: OwnerLocations,
+    launch_path: Option<OsString>,
+}
+
+impl LookupMemo {
+    /// The executable the manager names for `bin_name`, running the lookup
+    /// once per distinct key and replaying its answer afterwards.
+    pub(crate) fn resolve(
+        &mut self,
+        manager: &Path,
+        bin_name: &str,
+        locations: &OwnerLocations,
+        launch_path: Option<&OsStr>,
+        timeout: Duration,
+        now: &impl Fn() -> Instant,
+    ) -> Result<PathBuf, DispatchFailure> {
+        let key = LookupKey {
+            manager: manager.to_path_buf(),
+            bin_name: bin_name.to_owned(),
+            owner_locations: locations.clone(),
+            launch_path: launch_path.map(OsStr::to_os_string),
+        };
+        if let Some(answer) = self.0.get(&key) {
+            return answer.clone();
+        }
+        let answer = resolve(manager, bin_name, locations, launch_path, timeout, now);
+        self.0.insert(key, answer.clone());
+        answer
+    }
 }
 
 /// Asks mise which installed executable the shim `bin_name` would run.

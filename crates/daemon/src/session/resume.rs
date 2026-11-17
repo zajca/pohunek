@@ -851,24 +851,6 @@ impl SessionRegistry {
         self.launch_base_environment().unwrap_or_default()
     }
 
-    /// The version-probe environment of a launch of `definition`: the `PATH`
-    /// the agent launches under and the owner location variables a
-    /// version-manager lookup resolves against.
-    ///
-    /// Only a runtime with a version probe needs it, so any other definition
-    /// yields `None` without building the base environment.
-    pub(super) fn probe_environment(
-        &self,
-        definition: &RuntimeDefinition,
-        profile_env: &[(String, String)],
-    ) -> Result<Option<host::ProbeEnvironment>, ProtocolError> {
-        if definition.version_probe_parser().is_none() {
-            return Ok(None);
-        }
-        let base = self.launch_base_environment()?;
-        Ok(Some(host::ProbeEnvironment::for_launch(&base, profile_env)))
-    }
-
     /// The base environment a launch of this registry hands to the agent.
     pub(super) fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
         let lifecycle = self.lifecycle()?;
@@ -971,13 +953,11 @@ impl SessionRegistry {
         let profile = self.resolve_recovery_profile(binding, &definition, change)?;
         let base_environment = self.launch_base_environment()?;
         let program = binding_program(binding, &definition);
-        // A runtime without a version probe still validates the frozen
-        // program's resolution; only the probe reads the lookup.
-        let environment = self
-            .probe_environment(&definition, profile.env.as_slice())?
-            .unwrap_or_else(|| {
-                host::ProbeEnvironment::for_launch(&base_environment, profile.env.as_slice())
-            });
+        // A runtime without a version probe validates the frozen program's
+        // resolution the same way; its environment only matters when a
+        // probe runs.
+        let environment =
+            host::ProbeEnvironment::for_launch(&base_environment, profile.env.as_slice());
         let validated_program = host::validate_launch_runtime(
             &definition,
             host::Spawn::Program(&program),

@@ -79,7 +79,7 @@ fn observed_worker(snapshot: &InspectSnapshot) -> Option<crate::store::WorkerPro
     Some(crate::store::WorkerProcess {
         pid: snapshot.worker_process.pid,
         start_identity: snapshot.worker_process.start_identity,
-        boot_identity: super::current_boot_id()?,
+        boot_identity: super::host_boot_id()?,
     })
 }
 
@@ -4728,6 +4728,9 @@ impl SessionRegistry {
         let info = record.info.clone();
         let recorded_generation =
             super::Generation::from_record(&record.session_id, &record.runtime);
+        // The boot is read once so the worker-root placement and the
+        // other-boot judgement cannot disagree within one restore.
+        let recorded = super::recorded_worker_process(&record, self.current_boot_id().as_deref());
         let entry = SessionEntry {
             info,
             activity_revision: 0,
@@ -4785,13 +4788,19 @@ impl SessionRegistry {
             initial_input_owner: initial_input_owner(&record),
             create_request: record.create_request.clone(),
             root_process: None,
-            worker_root: super::recorded_worker_process(&record),
-            recorded_worker: if record.worker_process.is_some()
-                && super::recorded_worker_process(&record).is_none()
-            {
-                super::RecordedWorker::OtherBoot
-            } else {
-                super::RecordedWorker::Unrecorded
+            worker_root: match recorded {
+                super::RecordedProcess::Current(worker_root) => worker_root,
+                super::RecordedProcess::OtherBoot | super::RecordedProcess::BootUnknown => None,
+            },
+            recorded_worker: match recorded {
+                // An unreadable boot identity leaves the entry unrecorded:
+                // the session is unverified until the runtime is settled
+                // (reattached or lost), so a transient read error cannot
+                // keep owner rights.
+                super::RecordedProcess::Current(_) | super::RecordedProcess::BootUnknown => {
+                    super::RecordedWorker::Unrecorded
+                }
+                super::RecordedProcess::OtherBoot => super::RecordedWorker::OtherBoot,
             },
             launch_rights: record
                 .launch_rights
@@ -17906,8 +17915,7 @@ generation "$1"
                 worker.map(|(pid, start_identity)| crate::store::WorkerProcess {
                     pid,
                     start_identity,
-                    boot_identity: crate::session::current_boot_id()
-                        .expect("the host names its boot"),
+                    boot_identity: crate::session::host_boot_id().expect("the host names its boot"),
                 });
             Store::new(root.join("data/metadata.jsonl"))
                 .record_session(&record)
@@ -17992,6 +18000,42 @@ generation "$1"
             assert!(fixture.registry.root_findings().await.unverified.is_empty());
             let (class, _keep) = fixture.registry.classify_caller(&outside_peer()).await;
             assert_eq!(class, crate::session::rights::CallerClass::Owner);
+        }
+
+        /// A host that cannot name its boot leaves the recorded worker
+        /// unplaced instead of judging it stale: the session is unverified
+        /// and an outside caller is refused until the runtime is settled
+        /// (reattached or lost).
+        #[tokio::test]
+        async fn a_reconnecting_session_with_an_unreadable_boot_identity_is_unverified() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let gone = dead_worker_with_realistic_start();
+            let record = persist_record(&fixture.root, "s-9106", Some("runtime-s-9106"));
+            record_worker(&fixture.root, record, Some(gone));
+            write_live_journal(&fixture.root, "s-9106", gone, Some("runtime-s-9106"));
+            let id = service_id("s-9106", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+            fixture.supervisor.script_retire_unavailable(id.clone());
+            fixture
+                .registry
+                .inner
+                .boot_identity_blocked
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-9106").await;
+            assert_eq!(runtime.state, RuntimeState::Reconnecting);
+            let session = SessionId("s-9106".to_owned());
+            let findings = fixture.registry.root_findings().await;
+            assert_eq!(findings.unverified, vec![session]);
+            let (class, keep) = fixture.registry.classify_caller(&outside_peer()).await;
+            assert_eq!(class, crate::session::rights::CallerClass::Unattributed);
+            assert!(!keep, "the placement is made again on the next request");
         }
 
         /// A live worker the daemon refuses to adopt keeps attributing its
