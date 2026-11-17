@@ -23,9 +23,11 @@
 //!
 //! Exit statuses: `0` on a pass; `1` when a required feature is missing or
 //! when content is refused (a malformed index document, an archive whose
-//! digest differs from the entry, an archive over a size cap, an unreadable
-//! local file, or a descriptor whose identity differs from the entry);
-//! `2` on a refused invocation. Network: the official index and the archives
+//! digest differs from the entry, an archive over a size cap, or a descriptor
+//! whose identity differs from the entry); `2` on a refused invocation,
+//! including an unreadable or malformed file of the local tree (the
+//! snapshot, a local descriptor or the `--index` document) or a malformed
+//! local descriptor. Network: the official index and the archives
 //! its entries list are fetched with `curl`. A fetch that fails prints a
 //! `warn` line naming the URL (plus a `::warning` run annotation on GitHub
 //! Actions) and the check continues with the other sources; it never fails
@@ -65,12 +67,12 @@ const DESCRIPTOR_FILE: &str = "runtime.toml";
 const OFFICIAL_INDEX_URL: &str = "https://github.com/pohunekd/pohunek-plugin-index/releases/latest/download/official-index-v2.json";
 
 /// Bound for every file read from disk (the snapshot, local descriptors, a
-/// `--index` document, a `file://` entry archive): the index limit the
-/// package crate enforces.
+/// `--index` document): the index limit the package crate enforces.
 const MAX_INPUT_BYTES: u64 = MAX_INDEX_BYTES as u64;
 
-/// Bound for an entry archive fetched over the network: the archive limit the
-/// package crate's reader enforces.
+/// Bound for an entry archive: the archive limit the package crate's reader
+/// enforces, whether the archive is fetched over the network or read from
+/// a `file://` path.
 const MAX_ARCHIVE_BYTES: u64 = MAX_COMPRESSED_BYTES;
 
 /// Longest one fetch may take.
@@ -201,8 +203,17 @@ fn fetch(url: &str, max_bytes: u64, local_files: bool) -> Result<Vec<u8>, FetchF
             )));
         }
         let path = Path::new(path);
-        return read_input(path, MAX_ARCHIVE_BYTES)
-            .map_err(|error| FetchFailure::Warn(format!("cannot read `{url}`: {error}")));
+        // `read_input` reports an over-limit read as `Usage`: that is refused
+        // content like a curl exit 63 below. Any other read failure (a
+        // missing file, an unsupported file type) only makes the source
+        // unreachable, so it warns and skips like a lost transfer.
+        return match read_input(path, MAX_ARCHIVE_BYTES) {
+            Ok(bytes) => Ok(bytes),
+            Err(XtaskError::Usage(error)) => {
+                Err(FetchFailure::Fail(format!("cannot read `{url}`: {error}")))
+            }
+            Err(error) => Err(FetchFailure::Warn(format!("cannot read `{url}`: {error}"))),
+        };
     }
     if !url.starts_with("https://") {
         return Err(FetchFailure::Fail(format!(

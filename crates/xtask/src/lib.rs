@@ -1064,8 +1064,10 @@ enum PluginAction {
         no_enable: bool,
         /// Install this extra archive first through a digest trust, so the
         /// proof runs alongside another installed version of the same
-        /// package: a newer version leaves the proved version unselected,
-        /// which the flag checks must refuse.
+        /// package: any other version leaves the proved version unselected,
+        /// which the install check and the inspect digest check must refuse.
+        /// The archive must name the entry's package id; a foreign archive
+        /// is refused.
         #[arg(long, value_name = "FILE")]
         pre_install: Option<PathBuf>,
     },

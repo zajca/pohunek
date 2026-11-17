@@ -19,9 +19,11 @@
 //!   `[context]`-less descriptor at `digest`, a damaged assistant package at
 //!   `inspect`, a missing or exiting daemon at `host`;
 //! - a `--no-enable` install fails at `inspect` for being disabled, and a
-//!   proof alongside a newer installed version of the same package fails at
-//!   `install` on the default path and at `inspect` under `--no-enable` for
-//!   being unselected;
+//!   proof alongside another installed version of the same package fails at
+//!   `install` on the default path and at `inspect` under `--no-enable`,
+//!   where the digest check refuses the other, selected version;
+//! - a `--pre-install` archive with a foreign package id is refused at
+//!   `install`;
 //! - a proof that cannot run writes no evidence and does not replace an
 //!   existing one.
 
@@ -815,9 +817,49 @@ fn a_disabled_context_install_fails_at_inspect() {
     assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 
+/// A `--pre-install` archive with a foreign package id is refused at
+/// `install` before anything is installed: only another version of the
+/// proved package may stage the unselected state.
+#[test]
+fn a_foreign_pre_install_archive_is_refused_at_install() {
+    let plugin = Plugin::new();
+    let package = plugin.context_package("foreign-older", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "foreign-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let foreign = plugin.context_package("foreign-newer", "pohunek.context.other", "0.3.0");
+    let (pre_archive, _pre_digest) = plugin.build_as(
+        &foreign,
+        "foreign-newer-out",
+        "pohunek.context.other-0.3.0.tar.zst",
+    );
+    let evidence = plugin.path("foreign-pre-install-evidence.json");
+    let output = plugin.prove_with_pre_install(
+        &archive,
+        &entry,
+        &release_dir(),
+        &evidence,
+        &pre_archive,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "install");
+    assert_eq!(document["kind"], "context");
+    assert!(document["core_version"].is_string());
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
 /// A newer installed version of the same package leaves the proved context
 /// version unselected, so the proof must fail at `install` on the default
-/// path and at `inspect` under `--no-enable`. Each new version needs its
+/// path and at `inspect` under `--no-enable`, where the digest check refuses
+/// the other, selected version. Each new version needs its
 /// own one-entry trust, so the pre-installed archive carries its own entry
 /// and is installed through a digest trust.
 fn unselected_proof_setup(plugin: &Plugin) -> (PathBuf, PathBuf, PathBuf) {

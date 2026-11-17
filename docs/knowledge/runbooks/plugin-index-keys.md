@@ -204,9 +204,11 @@ names its step in the evidence:
    explicit agent name skips auto selection (the host reports no such agent),
    so the readback touches the installed package; a `prove --no-enable`
    install stages a disabled install the inspect predicate must refuse for
-   being disabled, and a `prove --pre-install` newer version leaves the
-   proved version unselected for the install check on the default path and
-   for the inspect predicate under `--no-enable`.
+   being disabled, and a `prove --pre-install` archive must name the entry's
+   package id: any other installed version of the same id leaves the
+   proved version unselected, so the install check refuses it on the default
+   path and the inspect digest check refuses the other, selected version
+   under `--no-enable` (the inspect `selected` check is defense in depth).
 6. `cleanup`: the daemon stops and the root is removed. A failure here is a
    failure of the proof, also when the earlier steps passed.
 

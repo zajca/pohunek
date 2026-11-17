@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::catalog::{archive_identity, hex, io_error, read_input};
+use crate::catalog::{archive_identity, archive_package, hex, io_error, read_input};
 use crate::isolated_host::{Host, Root};
 use crate::plugin_index::{document_bytes, entry_of, throwaway, write_new_document, ThrowawayArgs};
 use crate::XtaskError;
@@ -82,8 +82,9 @@ pub(crate) struct ProveArgs {
     /// must refuse it for being disabled.
     pub(crate) no_enable: bool,
     /// Install this extra archive first through a digest trust, so the
-    /// proof runs alongside another installed version: a newer version of
-    /// the same package leaves the proved version unselected.
+    /// proof runs alongside another installed version: any other version of
+    /// the same package leaves the proved version unselected. The archive
+    /// must name the entry's package id; a foreign archive is refused.
     pub(crate) pre_install: Option<PathBuf>,
 }
 
@@ -308,7 +309,7 @@ fn prove_in(
 
     let archive_path = write_archive(archive, root, ARCHIVE_FILE).map_err(fail(Step::Install))?;
     if let Some(pre_install) = &args.pre_install {
-        pre_install_archive(&mut host, pre_install).map_err(fail(Step::Install))?;
+        pre_install_archive(&mut host, entry, pre_install).map_err(fail(Step::Install))?;
     }
     install(&mut host, entry, &archive_path, &trust, args.no_enable)
         .map_err(fail(Step::Install))?;
@@ -371,11 +372,27 @@ fn write_archive(archive: &[u8], root: &Root, name: &str) -> Result<PathBuf, Str
 /// Step 4 setup: installs an extra archive through a digest trust, so the
 /// proof runs alongside another installed version of the same package. Only
 /// the proved version goes through the entry's index path; this install only
-/// stages the unselected state the `install` and `inspect` flag checks must
-/// refuse.
-fn pre_install_archive(host: &mut Host, archive: &Path) -> Result<(), String> {
+/// stages the unselected state the `install` check and the inspect digest
+/// check must refuse: any other installed version of the same id leaves the
+/// proved version unselected, so inspect reads back the other version. The
+/// archive must name the entry's package id.
+fn pre_install_archive(
+    host: &mut Host,
+    entry: &package::IndexEntry,
+    archive: &Path,
+) -> Result<(), String> {
     let bytes = fs::read(archive)
         .map_err(|error| format!("cannot read the pre-installed archive: {error}"))?;
+    let verified = read_archive(&bytes, &Limits::DEFAULT)
+        .map_err(|error| format!("the pre-installed archive is not a valid package: {error}"))?;
+    let (package_id, _version) =
+        archive_package(&verified, archive).map_err(|error| error.to_string())?;
+    if package_id != entry.package_id {
+        return Err(format!(
+            "the pre-installed archive names `{package_id}`, not the entry's `{}`",
+            entry.package_id
+        ));
+    }
     let digest = format!("sha256:{}", hex(&Sha256::digest(&bytes)));
     let stored = archive.to_string_lossy().into_owned();
     let output = host.cli(&[
@@ -452,9 +469,11 @@ fn install(
 /// session; a missing or damaged assistant package fails, and so does a
 /// prompt the daemon cannot compose.
 ///
-/// A `--no-enable` context install reaches this predicate disabled (but
-/// still selected), and a pre-installed newer version leaves the proved
-/// version unselected: both must fail here.
+/// A `--no-enable` install reaches this predicate disabled (but still
+/// selected), and any other installed version of the same id leaves the
+/// proved version unselected, so inspect reads back the other, selected
+/// version: the former must fail on the `enabled` check below, the latter
+/// on the `digest` check.
 fn check_inspected_context(
     entry: &package::IndexEntry,
     package: &serde_json::Value,
@@ -471,6 +490,9 @@ fn check_inspected_context(
     if package["enabled"] != true {
         return Err("the installed package is disabled".to_owned());
     }
+    // Defense in depth, unreachable through the public boundary: inspect
+    // returns the selected version of the id, so the digest check above
+    // already refused any other version.
     if package["selected"] != true {
         return Err("the installed package is not selected".to_owned());
     }
