@@ -19,9 +19,9 @@
 //! - the same tree with the feature present passes (exit 0);
 //! - an entry whose bytes differ from the entry's digest fails (exit 1);
 //! - an entry whose descriptor names another package id fails (exit 1);
-//! - a fetch failure warns on stderr and the check passes on the other
-//!   sources (exit 0), but a `file://` entry archive over the size cap is
-//!   refused content and fails (exit 1);
+//! - a `file://` entry archive over the size cap is refused content and fails
+//!   (exit 1), and an `--index` document that is not a valid index envelope
+//!   fails too (exit 1);
 //! - a context entry is skipped and never requires a feature;
 //! - the real tree (the real registry snapshot and `runtime-packages/` with
 //!   an empty fixture index) passes.
@@ -359,6 +359,34 @@ fn unreachable_archive_warns_and_passes_on_the_other_sources() {
     assert!(
         stderr.contains(PACKAGE_ID),
         "the warning names the package: {stderr:?}"
+    );
+}
+
+/// A readable `--index` document that is not a valid index envelope is
+/// refused content like a malformed fetched document: the check fails
+/// (exit 1) naming the refusal, instead of passing on the other sources.
+#[test]
+fn malformed_index_document_fails() {
+    let fixture = Fixture::new(REGISTRY_WITH);
+    fixture.local_package("clean", &format!("\"{PRESENT_FEATURE}\""));
+    let index = fixture.root().join("malformed.json");
+    fs::write(&index, b"{\"not\": \"an index\"}\n").expect("write the malformed index");
+    let output = fixture.check(&index);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        text(&index, &output.stdout, &output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("plugin index"),
+        "names the index refusal: {stderr:?}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a failure prints no report: {:?}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

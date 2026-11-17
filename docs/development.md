@@ -1075,9 +1075,11 @@ a fetched official index), plus the real tree with an empty fixture index; the
 Exit statuses: `0` on a pass; `1` when a required feature is missing or when
 content is refused (a malformed index document, an archive whose digest
 differs from the entry, an archive over a size cap, or a descriptor whose
-identity the entry does not list); `2` on a refused invocation, including an
-unreadable or malformed file of the local tree (the snapshot, a local
-descriptor or the `--index` document). A fetch that
+identity the entry does not list); `2` on a refused invocation: an unreadable
+or oversized local-tree file (the registry snapshot, a local descriptor, or
+the `--index` file) or a malformed snapshot or local descriptor. The content
+of the `--index` document is judged like fetched index content, so a malformed
+`--index` document exits 1. A fetch that
 fails prints a `warn` line (plus a `::warning` run annotation on GitHub
 Actions) and the check continues, rc 0.
 
