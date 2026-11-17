@@ -214,6 +214,10 @@ struct PendingProbe {
 }
 
 /// [`host_capabilities`] against an explicit runtime registry.
+///
+/// Version-manager lookups are memoized per inventory (see [`DispatchMemo`]),
+/// so profiles that share one shim name behind one install trigger one
+/// lookup, not one per profile.
 fn host_capabilities_for(
     daemon_version: &str,
     profiles: &ProfileRegistry,
@@ -228,6 +232,7 @@ fn host_capabilities_for(
     let mut supported_agents = Vec::with_capacity(definitions.len());
     let mut runtimes = Vec::with_capacity(definitions.len());
     let mut pending = Vec::new();
+    let mut memo = dispatch::LookupMemo::default();
     for definition in definitions {
         let agent = definition.runtime_id().as_str();
         let agent_base = RuntimeRef::from(definition.runtime_id().clone());
@@ -249,7 +254,7 @@ fn host_capabilities_for(
                 None,
             ),
             LaunchProgram::Fixed(program) => {
-                probe_definition(agent, agent_base, definition, program, base_env, &[])
+                probe_definition(agent, agent_base, definition, program, base_env, &[], &mut memo)
             }
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
@@ -273,6 +278,7 @@ fn host_capabilities_for(
                 &profile.program,
                 base_env,
                 &profile.env,
+                &mut memo,
             ),
             (Ok(()), None) => probe_definition(
                 &agent.name,
@@ -281,6 +287,7 @@ fn host_capabilities_for(
                 agent.definition.program().as_str(),
                 base_env,
                 &[],
+                &mut memo,
             ),
         };
         let entry = place_runtime(&mut runtimes, &mut pending, planned);
@@ -478,6 +485,9 @@ fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
 type PlannedRuntime = (AgentRuntime, Option<(ProbeRequest, VersionProbePolicy)>);
 
 /// Probe `program` for `definition`, honouring its version-probe parser.
+///
+/// `memo` carries the version-manager answers of the inventory being
+/// planned, so two profiles behind one shim share one lookup.
 fn probe_definition(
     agent: &str,
     agent_base: RuntimeRef,
@@ -485,12 +495,28 @@ fn probe_definition(
     program: &str,
     base_env: &BaseEnv,
     profile_env: &[(String, String)],
+    memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
     match definition.version_probe_parser() {
-        Some(_) => {
-            let environment = ProbeEnvironment::for_launch(base_env, profile_env);
-            plan_versioned_runtime(agent, agent_base, program, definition, &environment)
-        }
+        Some(_) => match ProbeEnvironment::for_launch(base_env, profile_env) {
+            Ok(environment) => plan_versioned_runtime(
+                agent,
+                agent_base,
+                program,
+                definition,
+                &environment,
+                memo,
+            ),
+            // A lookup the locations cannot feed never probes: report the
+            // entry present but unsupported, as a failed probe does. The
+            // launch path refuses with `agent_runtime_unsupported` naming
+            // the variable, never its value.
+            Err(_incomplete) => ({
+                let mut runtime = probe_runtime(agent, agent_base, program);
+                runtime.supported = Some(false);
+                runtime
+            }, None),
+        },
         None => (probe_runtime(agent, agent_base, program), None),
     }
 }
@@ -542,6 +568,7 @@ fn plan_versioned_runtime(
     binary: &str,
     definition: &RuntimeDefinition,
     environment: &ProbeEnvironment,
+    memo: &mut dispatch::LookupMemo,
 ) -> PlannedRuntime {
     let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
         return (
@@ -569,15 +596,16 @@ fn plan_versioned_runtime(
     // to another executable probes the link itself.
     let probe_program = match dispatch::classify(program.as_path()) {
         dispatch::Dispatch::Direct => Some(program.as_path().to_path_buf()),
-        dispatch::Dispatch::Mise { manager, bin_name } => dispatch::resolve(
-            &manager,
-            &bin_name,
-            &environment.owner_locations,
-            environment.launch_path.as_deref(),
-            VERSION_PROBE_TIMEOUT,
-            &Instant::now,
-        )
-        .ok(),
+        dispatch::Dispatch::Mise { manager, bin_name } => memo
+            .resolve(
+                &manager,
+                &bin_name,
+                &environment.owner_locations,
+                environment.launch_path.as_deref(),
+                VERSION_PROBE_TIMEOUT,
+                &Instant::now,
+            )
+            .ok(),
     };
     let Some(probe_program) = probe_program else {
         return (
@@ -641,6 +669,7 @@ fn probe_versioned_runtime(
         binary,
         definition,
         environment,
+        &mut dispatch::LookupMemo::default(),
     ))
 }
 
@@ -681,11 +710,19 @@ impl ProbeEnvironment {
     /// agent will see, read from the daemon's base environment overridden by
     /// the profile pairs, and the owner location variables selected from
     /// those same two sources.
-    pub(crate) fn for_launch(base: &BaseEnv, profile_env: &[(String, String)]) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns the first location variable with a non-UTF-8 value, naming
+    /// the variable but never its value.
+    pub(crate) fn for_launch(
+        base: &BaseEnv,
+        profile_env: &[(String, String)],
+    ) -> Result<Self, dispatch::IncompleteLocations> {
+        Ok(Self {
             launch_path: effective_variable(base, profile_env, SEARCH_PATH_VAR),
-            owner_locations: dispatch::OwnerLocations::from_launch(base, profile_env),
-        }
+            owner_locations: dispatch::OwnerLocations::from_launch(base, profile_env)?,
+        })
     }
 }
 
@@ -801,12 +838,12 @@ impl LaunchValidationFailure {
     /// empty install set reports no installed release, while a deadline
     /// follows the shortened-budget rule and every other lookup failure
     /// reads as a failed probe.
-    fn from_dispatch(failure: dispatch::DispatchFailure, shortened_budget: bool) -> Self {
+    fn from_dispatch(failure: &dispatch::DispatchFailure, shortened_budget: bool) -> Self {
         match failure {
             dispatch::DispatchFailure::Unresolved => Self::DispatchUnresolved,
             dispatch::DispatchFailure::TimedOut if shortened_budget => Self::ProbeTimedOut,
             dispatch::DispatchFailure::TimedOut => Self::ProbeDeadline,
-            dispatch::DispatchFailure::Invalid | dispatch::DispatchFailure::Unavailable => {
+            dispatch::DispatchFailure::Malformed | dispatch::DispatchFailure::Unavailable => {
                 Self::Unsupported
             }
         }
@@ -882,7 +919,7 @@ fn validate_definition_launch_detailed_with_clock(
                 timeout,
                 now,
             )
-            .map_err(|failure| LaunchValidationFailure::from_dispatch(failure, shortened_budget))?;
+            .map_err(|failure| LaunchValidationFailure::from_dispatch(&failure, shortened_budget))?;
             timeout = timeout.saturating_sub(now().saturating_duration_since(lookup_started));
             installed
         }
@@ -1061,7 +1098,8 @@ mod tests {
     fn probe_env(base: &BaseEnv, path: Option<&OsStr>) -> ProbeEnvironment {
         ProbeEnvironment {
             launch_path: path.map(OsStr::to_os_string),
-            owner_locations: dispatch::OwnerLocations::from_launch(base, &[]),
+            owner_locations: dispatch::OwnerLocations::from_launch(base, &[])
+                .expect("the fixture base is readable"),
         }
     }
 
@@ -1835,6 +1873,95 @@ strategy = "none"
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).expect("set executable mode");
     }
+
+    /// A fake mise install: a manager executable counting its `which` calls
+    /// in `tally`, a shim symlink dispatching on its own name, and the
+    /// installed executable the manager names. Two profiles that launch
+    /// through the same shim under the same locations must trigger one
+    /// lookup per inventory, not one per profile.
+    struct MiseFixture {
+        shim: PathBuf,
+        tally: PathBuf,
+        _root: crate::test_support::ScopedDir,
+    }
+
+    fn mise_fixture() -> MiseFixture {
+        let root = temp_agents_dir();
+        let tally = root.join("which-calls");
+        let installed = root.join("installed-tool");
+        // The Hermes probe grammar answers `Hermes Agent v…`: the fixture
+        // install reports a release inside the fixture range.
+        write_test_executable(
+            &installed,
+            "#!/bin/sh\necho 'Hermes Agent v0.20.0 (fixture)'\n",
+        );
+        // The tally path is baked into the script: the lookup runs with a
+        // cleared environment, so the test cannot hand the path over through
+        // a variable. `argv[0]` is the manager path (manager mode), which
+        // `dispatch` requires.
+        write_test_executable(
+            &root.join("mise"),
+            &format!(
+                "#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = \"which\" ]; then echo '{}'; else exit 1; fi\n",
+                tally.display(),
+                installed.display(),
+            ),
+        );
+        let shim = root.join("tool");
+        std::os::unix::fs::symlink(root.join("mise"), &shim).expect("shim symlink");
+        MiseFixture {
+            shim,
+            tally,
+            _root: root,
+        }
+    }
+
+    #[test]
+    fn two_profiles_behind_one_shim_share_one_version_manager_lookup() {
+        let mise = mise_fixture();
+        let dir = temp_agents_dir();
+        for profile in ["tool-alpha", "tool-beta"] {
+            std::fs::write(
+                dir.join(format!("{profile}.toml")),
+                format!(
+                    "base = \"hermes\"\n{}program = \"{}\"\n",
+                    official_profile_pin("hermes"),
+                    mise.shim.display(),
+                ),
+            )
+            .expect("write profile");
+        }
+        let caps = host_capabilities_for_uncached(
+            "0.0.0",
+            &ProfileRegistry::with_runtimes(Some(dir.clone()), official_host()),
+            &test_registry(),
+            &process_base(),
+        );
+        for profile in ["tool-alpha", "tool-beta"] {
+            let runtime = caps
+                .runtimes
+                .iter()
+                .find(|runtime| runtime.agent == profile)
+                .expect("profile runtime is probed");
+            assert!(runtime.available, "{profile} resolves as executable");
+            assert_eq!(
+                runtime.version.as_deref(),
+                Some("0.20.0"),
+                "{profile} probes the installed release"
+            );
+            assert_eq!(
+                runtime.supported,
+                Some(true),
+                "{profile} probes the installed 0.20.0"
+            );
+        }
+        let calls = std::fs::read_to_string(&mise.tally).expect("tally is written");
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "one inventory runs one lookup for a shared shim, not one per profile"
+        );
+    }
     #[test]
     fn semver_probe_reports_and_validates_the_declared_range() {
         let dir = temp_agents_dir();
@@ -2019,6 +2146,7 @@ strategy = "none"
                 &binary,
                 base,
                 profile_env,
+                &mut dispatch::LookupMemo::default(),
             ))
             .supported
         };

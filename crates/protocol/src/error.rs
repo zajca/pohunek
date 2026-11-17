@@ -657,6 +657,26 @@ impl ProtocolError {
         )
     }
 
+    /// `agent_runtime_unsupported` for a version-manager lookup refused
+    /// because an owner location variable has a value the daemon cannot
+    /// pass to the lookup.
+    ///
+    /// Names `variable`, never its value.
+    #[must_use]
+    pub fn agent_runtime_locations_unreadable(variable: &str) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "agent_runtime_unsupported",
+            format!(
+                "the version manager lookup cannot read the owner location variable {variable}, so the agent executable it would run cannot be named"
+            ),
+            Some(
+                "unset the location variable or give it a UTF-8 value, so the lookup and the launched agent see the same directories"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/session_terminal_unavailable` error.
     #[must_use]
     pub fn session_terminal_unavailable() -> Self {

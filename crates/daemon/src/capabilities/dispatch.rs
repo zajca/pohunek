@@ -13,7 +13,8 @@
 
 // Rust guideline compliant 2026-11-16
 
-use std::ffi::OsStr;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -103,25 +104,64 @@ pub(crate) fn classify(launch: &Path) -> Dispatch {
 }
 
 /// The owner location variables [`LOCATION_VARS`] of one launch environment.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The presence of every location variable is recorded alongside its value:
+/// a variable whose value is not UTF-8 refuses the lookup instead of silently
+/// falling back to the manager's own home lookup while the launched agent
+/// sees the original value.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct OwnerLocations(Vec<(String, String)>);
+
+/// Why an [`OwnerLocations`] cannot be used for a lookup: one location
+/// variable the launched agent sees has a value this process cannot pass to
+/// the lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncompleteLocations {
+    /// The name of the first location variable with a non-UTF-8 value; the
+    /// value itself is never recorded or reported.
+    pub(crate) variable: String,
+}
+
+impl std::fmt::Display for IncompleteLocations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the owner location variable {} has a value the lookup cannot read",
+            self.variable
+        )
+    }
+}
 
 impl OwnerLocations {
     /// Selects the location variables the launched agent will see.
-    pub(crate) fn from_launch(base: &BaseEnv, profile_env: &[(String, String)]) -> Self {
-        Self(
-            LOCATION_VARS
-                .iter()
-                .filter_map(|name| {
-                    effective_variable(base, profile_env, name)
-                        .and_then(|value| value.into_string().ok())
-                        .map(|value| ((*name).to_owned(), value))
-                })
-                .collect(),
-        )
+    ///
+    /// # Errors
+    ///
+    /// Returns the first variable whose value is not UTF-8, naming the
+    /// variable but never its value. The caller refuses the lookup: the
+    /// manager would otherwise run under its own fallback home while the
+    /// launched agent sees the original value.
+    pub(crate) fn from_launch(
+        base: &BaseEnv,
+        profile_env: &[(String, String)],
+    ) -> Result<Self, IncompleteLocations> {
+        let mut pairs = Vec::with_capacity(LOCATION_VARS.len());
+        for name in LOCATION_VARS {
+            let Some(value) = effective_variable(base, profile_env, name) else {
+                continue;
+            };
+            let Ok(value) = value.into_string() else {
+                return Err(IncompleteLocations {
+                    variable: name.to_owned(),
+                });
+            };
+            pairs.push((name.to_owned(), value));
+        }
+        Ok(Self(pairs))
     }
 
-    fn pairs(&self) -> &[(String, String)] {
+    /// The location pairs in `LOCATION_VARS` order, for lookups and cache keys.
+    pub(crate) fn pairs(&self) -> &[(String, String)] {
         &self.0
     }
 }
@@ -134,17 +174,67 @@ impl std::fmt::Debug for OwnerLocations {
 }
 
 /// Why a mise lookup did not name a probed executable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DispatchFailure {
     /// `mise which` exited non-zero: no installed release for the shim.
     Unresolved,
     /// Bad reply (not one absolute UTF-8 path), an untrusted or missing
     /// executable, or the reply names another mise shim (no recursion).
-    Invalid,
+    Malformed,
     /// The lookup outran its deadline.
     TimedOut,
     /// The lookup could not be set up, polled or read.
     Unavailable,
+}
+
+/// The probe path of one version-manager shim, resolved once per inventory.
+///
+/// Two profiles that share one `(manager, bin_name)` under the same owner
+/// locations and the same launch `PATH` resolve to the same installed
+/// executable: the second lookup would rerun a subprocess only to report
+/// the same answer. The memo makes the duplicate lookup free in both
+/// directions — a second refusal replays the same refusal, so an install
+/// that vanishes between two profiles of one inventory reports every
+/// affected profile the same way instead of racing the uninstall.
+#[derive(Debug, Default)]
+pub(crate) struct LookupMemo(HashMap<LookupKey, Result<PathBuf, DispatchFailure>>);
+
+/// What one version-manager lookup asks: the manager executable, the shim
+/// file name it is asked about, the owner locations the launched agent
+/// sees, and the launch `PATH` the lookup resolves under.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LookupKey {
+    manager: PathBuf,
+    bin_name: String,
+    owner_locations: OwnerLocations,
+    launch_path: Option<OsString>,
+}
+
+impl LookupMemo {
+    /// The executable the manager names for `bin_name`, running the lookup
+    /// once per distinct key and replaying its answer afterwards.
+    pub(crate) fn resolve(
+        &mut self,
+        manager: &Path,
+        bin_name: &str,
+        locations: &OwnerLocations,
+        launch_path: Option<&OsStr>,
+        timeout: Duration,
+        now: &impl Fn() -> Instant,
+    ) -> Result<PathBuf, DispatchFailure> {
+        let key = LookupKey {
+            manager: manager.to_path_buf(),
+            bin_name: bin_name.to_owned(),
+            owner_locations: locations.clone(),
+            launch_path: launch_path.map(OsStr::to_os_string),
+        };
+        if let Some(answer) = self.0.get(&key) {
+            return answer.clone();
+        }
+        let answer = resolve(manager, bin_name, locations, launch_path, timeout, now);
+        self.0.insert(key, answer.clone());
+        answer
+    }
 }
 
 /// Asks mise which installed executable the shim `bin_name` would run.
@@ -191,14 +281,14 @@ pub(crate) fn resolve(
             return Err(DispatchFailure::Unavailable)
         }
     };
-    let path = parse_which_output(&output).ok_or(DispatchFailure::Invalid)?;
+    let path = parse_which_output(&output).ok_or(DispatchFailure::Malformed)?;
     // The same trust rule a launch lookup applies, so the probe and the
     // launch agree on the executable. An absolute path needs no `PATH`.
     let resolved = shell_env::resolve_executable_in_path_value(path.as_os_str(), None)
-        .map_err(|_error| DispatchFailure::Invalid)?;
+        .map_err(|_error| DispatchFailure::Malformed)?;
     // No recursion: a lookup that names another mise shim is refused.
     if matches!(classify(&resolved), Dispatch::Mise { .. }) {
-        return Err(DispatchFailure::Invalid);
+        return Err(DispatchFailure::Malformed);
     }
     Ok(resolved)
 }
@@ -212,3 +302,4 @@ fn parse_which_output(output: &str) -> Option<PathBuf> {
     let path = PathBuf::from(line);
     (path.is_absolute() && path.to_str().is_some()).then_some(path)
 }
+

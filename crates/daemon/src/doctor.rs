@@ -355,6 +355,14 @@ fn configured_profile_result(
             DoctorStatus::Fail,
             "The configured program is a version-manager shim with no installed release of the agent; run the agent once in a login shell so its version manager installs it. The version check never installs or updates a tool.",
         ),
+        Err(RuntimeFailure::LocationsUnreadable(variable)) => {
+            return (
+                DoctorStatus::Fail,
+                Cow::Owned(format!(
+                    "The configured program is a version-manager shim whose owner location variable {variable} has a value the check cannot read, so the lookup is refused; unset it or give it a UTF-8 value so the lookup and the launched agent see the same directories."
+                )),
+            );
+        }
     };
     (status, Cow::Borrowed(detail))
 }
@@ -455,6 +463,14 @@ fn optional_runtime_result(
             DoctorStatus::Warn,
             "The optional provider's program is a version-manager shim with no installed release of the agent; run the agent once in a login shell so its version manager installs it. The version check never installs or updates a tool.",
         ),
+        Err(RuntimeFailure::LocationsUnreadable(variable)) => {
+            return (
+                DoctorStatus::Fail,
+                Cow::Owned(format!(
+                    "The optional provider's program is a version-manager shim whose owner location variable {variable} has a value the check cannot read, so the lookup is refused; unset it or give it a UTF-8 value so the lookup and the launched agent see the same directories."
+                )),
+            );
+        }
     };
     (status, Cow::Borrowed(detail))
 }
@@ -661,6 +677,10 @@ enum RuntimeFailure {
     /// The program is a version-manager shim whose manager names no
     /// installed release of the agent, so the probe never ran.
     DispatchUnresolved,
+    /// The version-manager lookup is refused: an owner location variable
+    /// has a value the daemon cannot read; names the variable, never its
+    /// value.
+    LocationsUnreadable(String),
 }
 
 /// Validate a profile using the same package and provider-version gates as launch.
@@ -692,7 +712,11 @@ fn profile_runtime_check(
     if agent.definition.version_probe_parser().is_some() && probe_timeout.is_zero() {
         return Err(RuntimeFailure::ProbeBudget);
     }
-    let environment = crate::agent::host::ProbeEnvironment::for_launch(base_env, profile_env);
+    let environment = match crate::agent::host::ProbeEnvironment::for_launch(base_env, profile_env)
+    {
+        Ok(environment) => environment,
+        Err(incomplete) => return Err(RuntimeFailure::LocationsUnreadable(incomplete.variable)),
+    };
     crate::agent::host::validate_launch_runtime_with_timeout_detailed(
         &agent.definition,
         agent.spawn(),

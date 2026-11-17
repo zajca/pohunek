@@ -84,6 +84,7 @@ use crate::agent::{
     ReferenceExistence, RefusalPhase, ResolvedAgent, ValidatedLaunchProgram,
 };
 use crate::capabilities::ProbeClock;
+use crate::capabilities::dispatch::OwnerLocations;
 use crate::capabilities::{
     probe_timed_out_error, unsupported_version_error, LaunchValidationFailure,
 };
@@ -1508,11 +1509,18 @@ struct ProbeLedger {
 type ProbeOutcome = Result<(), (String, String)>;
 
 /// What one probe ran against: the program as the launch names it, the `PATH`
-/// it runs under, and the executable of the package whose probe it is.
+/// it runs under, the owner locations a version-manager lookup reads, and
+/// the executable of the package whose probe it is.
+///
+/// The locations are part of the key because two profiles can share a shim
+/// and a `PATH` while naming different installs through different
+/// `MISE_*_DIR` values: sharing one outcome across them would judge the
+/// second session by the other profile's release.
 #[derive(PartialEq, Eq, Hash)]
 struct ProbeKey {
     program: String,
     launch_path: Option<OsString>,
+    owner_locations: OwnerLocations,
     probed: String,
 }
 
@@ -1554,6 +1562,7 @@ fn run_probe(
     let key = ProbeKey {
         program: program.to_owned(),
         launch_path: environment.launch_path.clone(),
+        owner_locations: environment.owner_locations.clone(),
         probed: probed_identity(definition),
     };
     if let Some(outcome) = ledger.outcomes.borrow().get(&key) {
@@ -2176,7 +2185,21 @@ fn judge_launch(candidate: &SessionRecord, judging: &Judging<'_>) -> Option<Judg
         }
     };
     let program = binding_program(binding, &definition);
-    let environment = ProbeEnvironment::for_launch(base, profile_env.as_slice());
+    let environment = match ProbeEnvironment::for_launch(base, profile_env.as_slice()) {
+        Ok(environment) => environment,
+        Err(incomplete) => {
+            let error =
+                ProtocolError::agent_runtime_locations_unreadable(&incomplete.variable);
+            return Some((
+                Verdict::WouldLoseRecovery,
+                error.code,
+                format!(
+                    "the agent the session launches from names an unreadable owner location variable {}; {}",
+                    incomplete.variable, error.msg
+                ),
+            ));
+        }
+    };
     match run_probe(&definition, &program, &environment, judging.probes) {
         Probe::Supported => None,
         Probe::Refused { code, detail } => Some((

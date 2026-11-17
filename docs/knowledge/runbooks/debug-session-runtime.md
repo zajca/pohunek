@@ -315,6 +315,10 @@ Interpret runtime states as follows:
   manager or launchd) could not be inspected, or could not retire the job of a
   worker generation that is proven ended; nothing was killed and
   reconciliation retries on its own (after 1 s, doubling to at most 60 s). A
+  session whose record names a worker of another boot is also `reconnecting`
+  with no verified root, because its tree is gone: that judgement lives in
+  memory only, so a second daemon restart names the session unverified
+  again until the runtime is settled. A
   session whose removal was interrupted (for example the daemon stopped mid
   `session rm`) also shows this reason while its removal waits for the job to
   be retired or its cleanup to succeed; the retry then finishes the removal

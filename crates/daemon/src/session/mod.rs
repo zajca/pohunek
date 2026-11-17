@@ -892,6 +892,10 @@ struct SessionRegistryInner {
     /// for a daemon that has not read the worker's journal yet.
     #[cfg(test)]
     worker_imports_blocked: AtomicBool,
+    /// Test hook that makes the host fail to name its boot, standing for a
+    /// transient boot-identity read error on restore.
+    #[cfg(test)]
+    boot_identity_blocked: AtomicBool,
     /// Owns the package lifecycle lock, the catalog trust and the package store.
     packages: Arc<crate::packages::PackageAuthority>,
     /// Serializes create, native recovery, stop, and remove per session, so
@@ -1266,27 +1270,51 @@ fn worker_process_record(identity: ProcessIdentity) -> Option<crate::store::Work
     Some(crate::store::WorkerProcess {
         pid: identity.pid,
         start_identity: identity.start_identity.get(),
-        boot_identity: current_boot_id()?,
+        boot_identity: host_boot_id()?,
     })
 }
 
 /// The identity of the running boot, if the host names it.
-fn current_boot_id() -> Option<String> {
+///
+/// `None` when the host cannot name its boot. Callers treat an unreadable
+/// boot as no placement: an identity without a boot could match after a
+/// reboot, so a transient read error must not pass for a stale record.
+fn host_boot_id() -> Option<String> {
     pohunek_platform::process::HostInspector::new()
         .boot_identity()
         .ok()
         .map(|boot| boot.as_str().to_owned())
 }
 
-/// The worker process identity a record persisted, when it was recorded under
-/// the running boot. An identity of another boot, or of a host that cannot
-/// name its boot, names no process.
-fn recorded_worker_process(record: &SessionRecord) -> Option<ProcessIdentity> {
-    let worker = record.worker_process.as_ref()?;
-    (current_boot_id().as_deref() == Some(worker.boot_identity.as_str())).then(|| ProcessIdentity {
-        pid: worker.pid,
-        start_identity: crate::procwatch::StartIdentity::new(worker.start_identity),
-    })
+/// The worker the record persisted, seen against the running boot.
+/// An identity of another boot names no process, and a host that cannot
+/// name its boot names none either: the comparison stays explicit so a
+/// transient boot-identity read error cannot pass for a stale record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedProcess {
+    /// The record named no worker, or the entry carries the one it named.
+    Current(Option<ProcessIdentity>),
+    /// The record named a worker of another boot; its tree is gone.
+    OtherBoot,
+    /// The host cannot name its boot, so no recorded worker is placed.
+    BootUnknown,
+}
+
+fn recorded_worker_process(record: &SessionRecord, current_boot: Option<&str>) -> RecordedProcess {
+    let Some(worker) = record.worker_process.as_ref() else {
+        return RecordedProcess::Current(None);
+    };
+    let Some(current) = current_boot else {
+        return RecordedProcess::BootUnknown;
+    };
+    if current == worker.boot_identity.as_str() {
+        RecordedProcess::Current(Some(ProcessIdentity {
+            pid: worker.pid,
+            start_identity: crate::procwatch::StartIdentity::new(worker.start_identity),
+        }))
+    } else {
+        RecordedProcess::OtherBoot
+    }
 }
 
 fn next_entry_incarnation() -> u64 {
@@ -2856,6 +2884,8 @@ impl SessionRegistry {
                 resume_writes_blocked: AtomicBool::new(false),
                 #[cfg(test)]
                 worker_imports_blocked: AtomicBool::new(false),
+                #[cfg(test)]
+                boot_identity_blocked: AtomicBool::new(false),
                 packages,
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
@@ -3665,21 +3695,17 @@ impl SessionRegistry {
         resolved: &ResolvedAgent,
         profile_env: &[(String, String)],
     ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-        // A runtime without a version probe is still resolved so a missing
-        // program fails before the target is bound; its environment only
-        // matters when a probe runs.
-        let Some(environment) = self.probe_environment(&resolved.definition, profile_env)? else {
-            // Floors still fail closed without a probed release: a runtime
-            // that reports no version cannot meet any `min_runtime`.
-            let program = host::validate_launch_runtime(
-                &resolved.definition,
-                resolved.spawn(),
-                &host::ProbeEnvironment::for_launch(&self.launch_base_environment()?, profile_env),
-            )?;
-            resolved
-                .check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
-            return Ok(program);
-        };
+        // A runtime without a version probe resolves the same way so a
+        // missing program fails before the target is bound; its environment
+        // only matters when a probe runs, so floors still fail closed
+        // without a probed release: a runtime that reports no version cannot
+        // meet any `min_runtime`.
+        let base = self.launch_base_environment()?;
+        let environment = host::ProbeEnvironment::for_launch(&base, profile_env).map_err(
+            |incomplete| {
+                ProtocolError::agent_runtime_locations_unreadable(&incomplete.variable)
+            },
+        )?;
         let program =
             host::validate_launch_runtime(&resolved.definition, resolved.spawn(), &environment)?;
         resolved.check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
@@ -4472,6 +4498,30 @@ impl SessionRegistry {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
+    }
+
+    /// The identity of the running boot, if the host names it.
+    ///
+    /// Tests arm [`SessionRegistryInner::boot_identity_blocked`] to stand
+    /// for a host that transiently cannot name its boot.
+    fn current_boot_id(&self) -> Option<String> {
+        if self.boot_identity_blocked() {
+            return None;
+        }
+        host_boot_id()
+    }
+
+    #[cfg(test)]
+    fn boot_identity_blocked(&self) -> bool {
+        self.inner
+            .boot_identity_blocked
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn boot_identity_blocked(&self) -> bool {
+        let _ = self;
+        false
     }
 
     /// Parks a worker metadata projection after it took its memory snapshot
