@@ -1404,3 +1404,161 @@ async fn trusted_checkout_args_of_a_choice_never_reach_an_untrusted_launch() {
     );
     rig.finish().await;
 }
+
+/// A version-manager install for the probe-location scenarios: answers
+/// `--version` with `fixture <version>` and sleeps as the launched agent.
+fn write_probe_install(dir: &Path, name: &str, version: &str) -> PathBuf {
+    let install = dir.join(name);
+    std::fs::create_dir_all(&install).expect("install dir");
+    let binary = install.join("tool");
+    std::fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fixture {version}'; exit 0; fi\n\
+             exec sleep 30\n"
+        ),
+    )
+    .expect("write the install");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+        .expect("make the install executable");
+    install
+}
+
+/// A fake `mise` answering `which tool` from its own data directory: the
+/// install under `good` when `MISE_DATA_DIR` names it, else the one under
+/// `bad`. Every `which` appends one line to `tally`, so the lookup count of
+/// one inventory is observed at the file. Other arguments run the install
+/// the data directory selects, so the shim also launches the agent.
+fn write_probe_mise(dir: &Path, good: &Path, bad: &Path, tally: &Path) -> PathBuf {
+    let mise = dir.join("mise");
+    std::fs::write(
+        &mise,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"which\" ]; then\n\
+             echo x >> '{}'\n\
+             if [ \"$MISE_DATA_DIR\" = \"{}\" ]; then echo \"{}/tool\"; else echo \"{}/tool\"; fi\n\
+             exit 0\n\
+             fi\n\
+             if [ \"$MISE_DATA_DIR\" = \"{}\" ]; then exec \"{}/tool\" \"$@\"; else exec \"{}/tool\" \"$@\"; fi\n",
+            tally.display(),
+            good.display(),
+            good.display(),
+            bad.display(),
+            good.display(),
+            good.display(),
+            bad.display(),
+        ),
+    )
+    .expect("write fake mise");
+    std::fs::set_permissions(&mise, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake mise executable");
+    let shim = dir.join("tool");
+    std::os::unix::fs::symlink(&mise, &shim).expect("shim symlink");
+    shim
+}
+
+/// A profile over the `pi` package at `digest` launching through `shim`
+/// with the version-manager data directory `data_dir`.
+fn shim_profile(digest: &package::PackageDigest, shim: &Path, data_dir: &Path) -> String {
+    format!(
+        "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{digest}\"\n\
+         program = \"{}\"\n[env]\nMISE_DATA_DIR = \"{}\"\n",
+        shim.display(),
+        data_dir.display(),
+    )
+}
+
+/// Row L3: two sessions behind one shim and `PATH` but with a different
+/// profile `[env]` `MISE_DATA_DIR` get their own probe verdict from the
+/// upgrade preflight: the install inside the probe range stays adoptable
+/// while the install outside it loses recovery, instead of one shared
+/// verdict answering for both.
+#[tokio::test]
+async fn preflight_probes_one_shim_per_owner_data_dir() {
+    let mut rig = OptionRig::start("agent-options-probe-locations", true).await;
+    let dummy = rig.socket.dir.join("unused-program");
+    let digest = install_package(&mut rig, probed_package(&dummy)).await;
+    let scope = rig.socket.dir.join("probe");
+    std::fs::create_dir(&scope).expect("probe scope");
+    let good = write_probe_install(&scope, "good", "2.0.0");
+    // The bad install reports a supported release while the session is
+    // created (`session.new` probes before it freezes the profile revision),
+    // then is replaced with an unsupported one: the profile and its frozen
+    // revision never change, only the world behind the probe does.
+    let bad = write_probe_install(&scope, "bad", "2.0.0");
+    let tally = scope.join("which-calls");
+    let shim = write_probe_mise(&scope, &good, &bad, &tally);
+    rig.write_profile("tool-good", &shim_profile(&digest, &shim, &good));
+    rig.write_profile("tool-bad", &shim_profile(&digest, &shim, &bad));
+    let mut ids = Vec::new();
+    for agent in ["tool-good", "tool-bad"] {
+        let (response, _cwd) = rig.create(agent).await;
+        let session: SessionInfo =
+            serde_json::from_value(ok_payload(response)).expect("the session info");
+        ids.push(session.id);
+    }
+    std::fs::write(
+        bad.join("tool"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fixture 0.0.1'; exit 0; fi\n\
+         exec sleep 30\n",
+    )
+    .expect("replace the bad install with an unsupported release");
+    for id in &ids {
+        rig.stop(id).await;
+    }
+    let good_judged = preflight_verdict(&rig, &ids[0]);
+    assert_eq!(
+        good_judged.verdict,
+        pohunek_service_config::preflight::Verdict::Adoptable,
+        "{good_judged:?}"
+    );
+    let bad_judged = preflight_verdict(&rig, &ids[1]);
+    assert_eq!(
+        bad_judged.verdict,
+        pohunek_service_config::preflight::Verdict::WouldLoseRecovery,
+        "{bad_judged:?}"
+    );
+    assert_eq!(
+        bad_judged.code, "agent_runtime_unsupported",
+        "{bad_judged:?}"
+    );
+    rig.finish().await;
+}
+
+/// Row L8: two profiles behind one shim under the same owner locations
+/// share one version-manager lookup per `host.inspect`: the tally holds
+/// one `mise which` call, not one per profile.
+#[tokio::test]
+async fn inspect_runs_one_lookup_for_a_shared_shim() {
+    let mut rig = OptionRig::start("agent-options-shared-lookup", true).await;
+    let dummy = rig.socket.dir.join("unused-program");
+    let digest = install_package(&mut rig, probed_package(&dummy)).await;
+    let scope = rig.socket.dir.join("probe");
+    std::fs::create_dir(&scope).expect("probe scope");
+    let good = write_probe_install(&scope, "good", "2.0.0");
+    let bad = write_probe_install(&scope, "bad", "0.0.1");
+    let tally = scope.join("which-calls");
+    let shim = write_probe_mise(&scope, &good, &bad, &tally);
+    for name in ["tool-alpha", "tool-beta"] {
+        rig.write_profile(name, &shim_profile(&digest, &shim, &good));
+    }
+    let _ = std::fs::remove_file(&tally);
+    let runtimes = rig.inspect_host().await;
+    for name in ["tool-alpha", "tool-beta"] {
+        let entry = runtimes
+            .iter()
+            .find(|entry| entry.agent == name)
+            .expect("the profile is inventoried");
+        assert!(entry.available, "{entry:?}");
+        assert_eq!(entry.version.as_deref(), Some("2.0.0"), "{entry:?}");
+        assert_eq!(entry.supported, Some(true), "{entry:?}");
+    }
+    let calls = std::fs::read_to_string(&tally).expect("tally is written");
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "one inventory runs one lookup for a shared shim, not one per profile"
+    );
+    rig.finish().await;
+}
