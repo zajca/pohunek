@@ -22,6 +22,8 @@
 //! - a `file://` entry archive over the size cap is refused content and fails
 //!   (exit 1), and an `--index` document that is not a valid index envelope
 //!   fails too (exit 1);
+//! - a fetch failure warns on stderr and the check passes on the other
+//!   sources (exit 0);
 //! - a context entry is skipped and never requires a feature;
 //! - the real tree (the real registry snapshot and `runtime-packages/` with
 //!   an empty fixture index) passes.
