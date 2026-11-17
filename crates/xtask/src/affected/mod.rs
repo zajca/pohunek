@@ -413,6 +413,11 @@ const RULES: &[Rule] = &[
         "official package sources listed by xtask's matrix check and upstream staging scenarios and built by its release and test-runtime scenarios, including the Claude package the claude_canary_capture test builds its capture tree from",
     ),
     rule(
+        Pattern::Dir("crates/daemon/src/agent/host/fixtures"),
+        Effect::Tests(&[readers("xtask", "binary(=plugin_features_check)")]),
+        "registry snapshots the feature-removal check reads as its registry",
+    ),
+    rule(
         Pattern::File("scripts/provision-hermes-compat"),
         Effect::Tests(&[readers(
             "xtask",

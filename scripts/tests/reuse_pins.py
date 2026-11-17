@@ -33,7 +33,7 @@ PINNED_BODY_HASHES = {
   "build-bins": "fe2f2655ee5dd89c177f8bd4bf72a4cb7b766ca5c133304d2a5611ff7bf3d983",
   "build-tests": "0c4b15a4ab9a7e5ad82bf21c6489e68f8e5cba2b51b8f15fa218b1e412c318fd",
   "darwin-check": "4a82af03b6684e8d7c970cd338a799007bbca51e5dfd7681c1e4ccdbfb62612b",
-  "docs": "06499e3f4e9ade20bfd77c7c4f55b0d1c8cdead3de485bcbb2be2b69528544b2",
+  "docs": "8bcc9f4b97574b58f126265bb747f9b13c0dca8a9fc9d9212f016dd94e16a188",
   "doctests": "7978d844ac8b29ecbbf12db1808456dbb830fb70431c85d7afa3eb8a1ba24326",
   "fast-tests": "bb8a335dd5ec94c10c91f9889eaaa5196254987b611ecea329858ac6e6289a8a",
   "feature-matrix": "7f1ff717444cbe6383a275855562cbdd49a1bd8836355baf6259063527b618aa",

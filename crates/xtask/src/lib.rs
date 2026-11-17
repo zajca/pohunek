@@ -510,7 +510,7 @@ where
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
         TopCommand::Index { action } => run_index(action),
-        TopCommand::Plugin { action } => run_plugin(action),
+        TopCommand::Plugin { action } => run_plugin(action, &root),
         TopCommand::Compat { action } => attestation::run(action, &root),
         TopCommand::Release { action } => release::run(action, &root),
         TopCommand::AgentSkill { action } => match action {
@@ -1069,6 +1069,22 @@ enum PluginAction {
         #[arg(long, value_name = "FILE")]
         pre_install: Option<PathBuf>,
     },
+    /// Fail when a required runtime feature is missing from the registry.
+    ///
+    /// Collects `requires` from `runtime-packages/*/runtime.toml` and from
+    /// every `runtime` entry of an index document: the archive each entry
+    /// lists is fetched from its `url`, verified against the entry's
+    /// digest, and its descriptor read (a digest mismatch fails; a fetch
+    /// failure warns and skips). A context entry has no runtime descriptor
+    /// and is skipped. With `--index <file>` the document is read from the
+    /// file (an entry `url` may be `file://`, for tests); without it the
+    /// official index is fetched, and a failed fetch warns instead of
+    /// failing, so the check never depends on the network.
+    FeaturesCheck {
+        /// Index document to read instead of fetching the official one.
+        #[arg(long, value_name = "FILE")]
+        index: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1479,11 +1495,18 @@ fn run_index_tooling(action: IndexAction) -> Result<(), XtaskError> {
     Ok(())
 }
 
-fn run_plugin(action: PluginAction) -> Result<(), XtaskError> {
+fn run_plugin(action: PluginAction, root: &Path) -> Result<(), XtaskError> {
     match action {
         PluginAction::Build { dir, output_dir } => {
             let built = plugin::build(&plugin::BuildArgs { dir, output_dir })?;
             println!("{}", built.line());
+        }
+        PluginAction::FeaturesCheck { index } => {
+            let report = plugin::features_check(&plugin::FeaturesCheckArgs {
+                root: root.to_path_buf(),
+                index,
+            })?;
+            println!("{report}");
         }
         PluginAction::Prove {
             archive,
