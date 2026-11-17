@@ -5309,8 +5309,8 @@ Public exports:
   stable overlay IDs and one non-zero daemon port per provider.
 - `OverlayTransport`: provider contract whose required typed identity resolver
   must match only the requested peer-ID or FQDN field; implementations cannot
-  inherit an untyped selector fallback. A provider fills `remedy` with a
-  bounded, non-secret operator action.
+  inherit an untyped selector fallback. A provider fills `remedy` of
+  `OverlayError::StateRestricted` with a bounded, non-secret operator action.
   `discover_snapshot` reads the visible peers and this machine's own identity in
   one pass; a provider that derives both from one state read overrides it, so
   discovery runs the provider once and the `local` record and the peers cannot

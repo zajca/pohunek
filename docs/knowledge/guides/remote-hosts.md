@@ -325,7 +325,9 @@ macOS-specific routing, bridging, or relay mode.
   daemon logs `overlay CLI missing; serving local-only and retrying` and binds as
   soon as the CLI is found. For a VPN that was not ready, wait one retry
   interval and look for `serving control protocol over overlay`.
-  - **NetBird 0.83 non-owner account.** Run `netbird profile list --show-owner`; then follow the static-peer or `netbird profile claim` path in the section above and read the `recover` text of `netbird_state_restricted`.
+  - **NetBird 0.83 non-owner account.** Run `netbird profile list --show-owner`;
+    then follow the static-peer or `netbird profile claim` path in the section
+    above and read the `recover` text of `netbird_state_restricted`.
 
 The future public team relay does not replace this direct overlay model and does
 not require NetBird. After host enrollment and transport work land, an enrolled
