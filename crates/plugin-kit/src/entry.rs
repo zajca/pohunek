@@ -1,11 +1,11 @@
 //! One entry file: the signed fields and the admission metadata.
 //!
-//! Moved from `xtask::plugin_index::build` unchanged apart from the error
-//! type and visibility: `[source]` is admission metadata that is validated
-//! here and never copied into the signed document, so no pull-request-
-//! controlled string reaches a shell or an API path unchecked. The tree
-//! reader (`read_tree`) stays in `xtask` with the index-host lane; the kit
-//! only reads the single entry file a `prove` invocation names.
+//! `[source]` is admission metadata that is validated here and never copied
+//! into the signed document, so no pull-request-controlled string reaches a
+//! shell or an API path unchecked. The same single-file reader also lives in
+//! `xtask::plugin_index::build` with the index-host lane (the tree reader
+//! `read_tree` stays there); the kit only reads the single entry file a
+//! `prove` invocation names.
 
 use std::path::Path;
 

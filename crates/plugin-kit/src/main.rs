@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use plugin_kit::{build, detect_check, lint, prove, smoke, verify, Error};
+use plugin_kit::{build, prove, smoke, verify, Error};
+#[cfg(feature = "daemon")]
+use plugin_kit::{detect_check, lint};
 
 /// Owner-side plugin kit for plugin repositories.
 #[derive(Debug, Parser)]
@@ -46,15 +48,17 @@ enum Command {
     },
     /// Check the archive matches the directory, twice built, and the digest.
     Verify {
-        /// Package directory the archive must rebuild from.
+        /// Package directory the archive must rebuild from. Without it,
+        /// the check only re-reads the archive with the default limits.
         #[arg(long)]
-        dir: PathBuf,
+        dir: Option<PathBuf>,
         /// Archive file to check.
         #[arg(long)]
         archive: PathBuf,
-        /// Expected `sha256:<64 hex>` digest of the archive bytes.
+        /// Expected `sha256:<64 hex>` digest of the archive bytes. Without
+        /// it, the digest is reported, not compared.
         #[arg(long)]
-        sha256: String,
+        sha256: Option<String>,
         /// Print the report as a single JSON document.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -92,11 +96,18 @@ enum Command {
     },
     /// Prove the package: build from the directory, then run the install
     /// path on an isolated daemon through a throwaway index. The runtime
-    /// program is never launched.
+    /// program is never launched. With `--archive` and `--entry`, prove
+    /// the admitted release asset against its real entry instead (#1618).
     Prove {
         /// Package directory to build and prove.
         #[arg(long)]
-        dir: PathBuf,
+        dir: Option<PathBuf>,
+        /// Package archive to prove against its entry.
+        #[arg(long, requires = "entry")]
+        archive: Option<PathBuf>,
+        /// Index entry file that lists exactly the archive.
+        #[arg(long, requires = "archive")]
+        entry: Option<PathBuf>,
         /// Release tree the isolated daemon copies its executables from.
         #[arg(long)]
         release_dir: PathBuf,
@@ -129,6 +140,7 @@ fn run() -> i32 {
 
 fn dispatch(command: Command) -> Result<(), Error> {
     match command {
+        #[cfg(feature = "daemon")]
         Command::Lint { dir, json } => {
             let report = lint::lint(&lint::LintArgs { dir })?;
             emit(json, &report.line(), &report)
@@ -154,10 +166,15 @@ fn dispatch(command: Command) -> Result<(), Error> {
             })?;
             emit(json, &report.line(), &report)
         }
+        #[cfg(feature = "daemon")]
         Command::DetectCheck { dir, corpus, json } => {
             let report =
                 detect_check::detect_check(&detect_check::DetectCheckArgs { dir, corpus })?;
             emit(json, &report.line(), &report)
+        }
+        #[cfg(not(feature = "daemon"))]
+        Command::DetectCheck { .. } | Command::Lint { .. } => {
+            unreachable!("daemon-gated subcommands need the daemon feature")
         }
         Command::Smoke {
             dir,
@@ -174,19 +191,37 @@ fn dispatch(command: Command) -> Result<(), Error> {
         }
         Command::Prove {
             dir,
+            archive,
+            entry,
             release_dir,
             evidence,
             no_enable,
             json,
-        } => {
-            let report = prove::prove_package(&prove::ProvePackageArgs {
-                dir,
-                release_dir,
-                evidence,
-                no_enable,
-            })?;
-            emit(json, &report.line(), &report)
-        }
+        } => match (dir, archive, entry) {
+            (Some(dir), None, None) => {
+                let report = prove::prove_package(&prove::ProvePackageArgs {
+                    dir,
+                    release_dir,
+                    evidence,
+                    no_enable,
+                })?;
+                emit(json, &report.line(), &report)
+            }
+            (None, Some(archive), Some(entry)) => {
+                let line = prove::prove_archive(&prove::ProveArgs {
+                    archive,
+                    entry,
+                    release_dir,
+                    evidence,
+                    no_enable,
+                    pre_install: None,
+                })?;
+                emit(json, &line, &serde_json::json!({ "line": line }))
+            }
+            _ => Err(Error::Usage(
+                "prove needs `--dir`, or `--archive` with `--entry`".to_owned(),
+            )),
+        },
     }
 }
 

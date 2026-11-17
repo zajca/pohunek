@@ -35,8 +35,9 @@ pub struct SmokeArgs {
     pub dir: PathBuf,
     /// Release tree the isolated daemon copies its executables from.
     pub release_dir: PathBuf,
-    /// Optional upstream `pohunek` executable to copy into the release tree
-    /// first, so the smoke runs against another release's client.
+    /// Upstream directory (or executable inside one) put in front of the
+    /// isolated daemon's `PATH`, so the runtime program resolves to the
+    /// locked upstream install there.
     pub upstream: Option<PathBuf>,
 }
 
@@ -156,8 +157,10 @@ fn smoke_in(
     }
     host.launch_local_only(root).map_err(Error::Usage)?;
 
-    let (activity, screen_lines) =
-        smoke_session(&mut host, &identity.runtime_id, archive, &digest)?;
+    let smoke = smoke_session(&mut host, &identity.runtime_id, archive, &digest);
+    let stop = host.stop().map_err(Error::Usage);
+    let (activity, screen_lines) = smoke?;
+    stop?;
     Ok(SmokeReport {
         package_id: identity.package_id.clone(),
         version: version.clone(),
@@ -222,17 +225,34 @@ fn smoke_session(
         .as_str()
         .ok_or_else(|| refuse("`pohunek session new` reported no session id"))?
         .to_owned();
-    let outcome = wait_for_screen(host, &session);
-    let _ = host
-        .cli(&["session", "stop", &session])
-        .map_err(Error::Usage)?;
-    let _ = host
-        .cli(&["session", "rm", &session])
-        .map_err(Error::Usage)?;
-    outcome
+    let wait = wait_for_screen(host, &session);
+    let cleanup = stop_session(host, &session);
+    let (activity, screen_lines) = wait?;
+    cleanup?;
+    Ok((activity, screen_lines))
 }
 
-/// Waits for the session's published activity to leave `unknown` through
+/// Stops and removes the smoke session: both are attempted, and a non-zero
+/// exit of either fails the smoke while the first error is kept.
+fn stop_session(host: &mut Host, session: &str) -> Result<(), Error> {
+    check_session_command(host, &["session", "stop", session])?;
+    check_session_command(host, &["session", "rm", session])
+}
+
+/// Runs one session cleanup command and fails on a non-zero exit.
+fn check_session_command(host: &mut Host, argv: &[&str]) -> Result<(), Error> {
+    let output = host.cli(argv).map_err(Error::Usage)?;
+    if output.code != Some(0) {
+        return Err(refuse(format!(
+            "`pohunek {}` exited {}",
+            argv.join(" "),
+            output
+                .code
+                .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
+        )));
+    }
+    Ok(())
+}
 /// `session list --json`, then requires a non-empty `session screen`.
 fn wait_for_screen(host: &mut Host, session: &str) -> Result<(AgentActivity, usize), Error> {
     let deadline = std::time::Instant::now() + SMOKE_DETECTION_TIMEOUT;

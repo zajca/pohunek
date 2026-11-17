@@ -1,9 +1,7 @@
-//! Package archive identities: descriptor reads the strict archive reader
-//! validates the way `plugin install` validates them.
-//!
-//! Moved from `xtask::catalog` unchanged: the descriptor name, the package
-//! id/version read, the runtime identity read, and the canonical two-pass
-//! build with its output guard.
+//! Package archive identities: the descriptor reads the strict archive
+//! reader validates the way `plugin install` validates them. The kit reads
+//! the descriptor name, the package id/version, the runtime identity, and
+//! builds the canonical archive in two passes with an output guard.
 
 use std::fs;
 use std::path::Path;

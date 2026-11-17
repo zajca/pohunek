@@ -20,12 +20,14 @@ const MAX_ARCHIVE_BYTES: u64 = MAX_COMPRESSED_BYTES;
 /// The inputs of a verify.
 #[derive(Debug)]
 pub struct VerifyArgs {
-    /// Package directory the archive must rebuild from.
-    pub dir: PathBuf,
+    /// Package directory the archive must rebuild from. Without it, the
+    /// check only re-reads the archive with the default limits.
+    pub dir: Option<PathBuf>,
     /// Archive file to check.
     pub archive: PathBuf,
-    /// Expected `sha256:<64 hex>` digest of the archive bytes.
-    pub sha256: String,
+    /// Expected `sha256:<64 hex>` digest of the archive bytes. Without it,
+    /// the digest is reported, not compared.
+    pub sha256: Option<String>,
 }
 
 /// What a passing verify reports.
@@ -53,22 +55,28 @@ impl VerifyReport {
 
 /// Verifies the archive against the directory and the digest.
 pub fn verify(args: &VerifyArgs) -> Result<VerifyReport, Error> {
-    let first = build_bytes(&args.dir, &Limits::DEFAULT)?;
-    let second = build_bytes(&args.dir, &Limits::DEFAULT)?;
-    if first != second {
-        return Err(refuse(
-            "package verify failed: two builds of the same directory differ",
-        ));
-    }
     let archive = read_input(&args.archive, MAX_ARCHIVE_BYTES)?;
-    if archive != first {
-        return Err(refuse(
-            "the archive differs from a fresh build of the package directory",
-        ));
+    // With a directory, two fresh builds must agree byte-for-byte with the
+    // archive; without one, the archive is only re-read below.
+    if let Some(dir) = &args.dir {
+        let first = build_bytes(dir, &Limits::DEFAULT)?;
+        let second = build_bytes(dir, &Limits::DEFAULT)?;
+        if first != second {
+            return Err(refuse(
+                "package verify failed: two builds of the same directory differ",
+            ));
+        }
+        if archive != first {
+            return Err(refuse(
+                "the archive differs from a fresh build of the package directory",
+            ));
+        }
     }
     let actual = format!("sha256:{}", hex(&Sha256::digest(&archive)));
-    if actual != args.sha256 {
-        return Err(refuse("the archive digest differs from `--sha256`"));
+    if let Some(expected) = &args.sha256 {
+        if &actual != expected {
+            return Err(refuse("the archive digest differs from `--sha256`"));
+        }
     }
     let verified = read_archive(&archive, &Limits::DEFAULT).map_err(Error::Package)?;
     let (package_id, version) = archive_package(&verified, &args.archive)?;

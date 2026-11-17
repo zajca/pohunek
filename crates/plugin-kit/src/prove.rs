@@ -1,13 +1,5 @@
 //! `prove`: a model-free install of one archive through the index path.
 //!
-//! Moved from `xtask::plugin::prove` with two boundary changes: the error is
-//! the kit [`Error`](crate::error::Error), and the entry comes from the kit
-//! [`entry`](crate::entry) module. The contract is unchanged: the archive must
-//! be the one the entry lists, a throwaway index lists exactly that entry, an
-//! isolated daemon trusts only the throwaway root, and the runtime program is
-//! never launched. Every outcome is written as evidence JSON; the exit status
-//! is 0 only for a pass.
-//!
 //! The proof checks that the archive is the one its entry lists, signs a
 //! throwaway index that lists exactly that entry, starts an isolated daemon
 //! that trusts only the throwaway root, installs the archive with the real CLI
@@ -188,6 +180,9 @@ struct Evidence<'a> {
     /// First line of `pohunekd --version`; null when the proof ended before
     /// `pohunekd --version` ran.
     core_version: Option<&'a str>,
+    /// SHA-256 of the kit binary that wrote this evidence (#1618): the
+    /// release proof workflow checks this digest against its own build.
+    kit_sha256: String,
     package_id: &'a str,
     version: &'a str,
     digest: &'a str,
@@ -226,7 +221,7 @@ pub fn prove_archive(args: &ProveArgs) -> Result<String, Error> {
         &entry,
         &args.evidence,
         |entry, archive, outcome, root| {
-            run_archive_steps(
+            run_package_steps(
                 root,
                 &args.release_dir,
                 entry,
@@ -249,12 +244,11 @@ pub fn prove_package(args: &ProvePackageArgs) -> Result<ProveReport, Error> {
         package::read_archive(&bytes, &package::Limits::DEFAULT).map_err(Error::Package)?;
     let (package_id, version) = archive_package(&verified, &args.dir)?;
     let digest = verified.digest().clone();
+    let runtime_id = archive_identity(&verified, &args.dir).map(|identity| identity.runtime_id)?;
     let entry = crate::entry::EntryFile {
         package_id: package_id.clone(),
         kind: None,
-        runtime_id: archive_identity(&verified, &args.dir)
-            .ok()
-            .map(|identity| identity.runtime_id),
+        runtime_id: Some(runtime_id),
         version: version.clone(),
         digest: digest.clone(),
         url: "https://localhost/kit-prove".to_owned(),
@@ -265,11 +259,11 @@ pub fn prove_package(args: &ProvePackageArgs) -> Result<ProveReport, Error> {
         source: crate::entry::Source::prove_placeholder(&version),
     }
     .signed_entry(package::INDEX_SCHEMA_VERSION)?;
-    let line = prove(
+    prove(
         &entry,
         &args.evidence,
         |entry, archive, outcome, root| {
-            run_archive_steps(
+            run_package_steps(
                 root,
                 &args.release_dir,
                 entry,
@@ -281,7 +275,6 @@ pub fn prove_package(args: &ProvePackageArgs) -> Result<ProveReport, Error> {
         },
         || Ok(bytes.clone()),
     )?;
-    let _ = line;
     Ok(ProveReport {
         package_id,
         version,
@@ -317,6 +310,7 @@ fn prove(
     let document = Evidence {
         schema: EVIDENCE_SCHEMA,
         core_version: outcome.core_version.as_deref(),
+        kit_sha256: kit_digest(),
         package_id: entry.package_id.as_str(),
         version: entry.version.as_str(),
         digest,
@@ -363,6 +357,20 @@ fn check_evidence_path(path: &Path) -> Result<(), Error> {
 
 fn fail(step: Step) -> impl Fn(String) -> Verdict {
     move |detail| Verdict { step, detail }
+}
+
+/// SHA-256 of the running kit binary, as `sha256:<64 hex>`: the release
+/// proof workflow (#1618) checks this digest against its own build.
+fn kit_digest() -> String {
+    match fs::read(current_exe()) {
+        Ok(bytes) => format!("sha256:{}", hex(&Sha256::digest(&bytes))),
+        Err(_) => "sha256:unavailable".to_owned(),
+    }
+}
+
+/// The running kit binary; empty when it cannot be named.
+fn current_exe() -> PathBuf {
+    std::env::current_exe().unwrap_or_default()
 }
 
 /// Runs the steps in order. The isolation root exists only after the digest
@@ -437,28 +445,7 @@ fn check_archive(entry: &package::IndexEntry, archive: &[u8]) -> Result<(), Stri
 }
 
 /// Steps 2 to 5; returns the running host for the cleanup step.
-fn run_archive_steps(
-    root: &Root,
-    release_dir: &Path,
-    entry: &package::IndexEntry,
-    archive: &[u8],
-    outcome: &mut Outcome,
-    no_enable: bool,
-    pre_install: Option<&Path>,
-) -> Result<Host, Verdict> {
-    prove_archived(
-        root,
-        release_dir,
-        entry,
-        archive,
-        outcome,
-        no_enable,
-        pre_install,
-    )
-}
-
-/// Steps 2 to 5; returns the running host for the cleanup step.
-fn prove_archived(
+fn run_package_steps(
     root: &Root,
     release_dir: &Path,
     entry: &package::IndexEntry,
@@ -480,7 +467,7 @@ fn prove_archived(
 
     let archive_path = write_archive(archive, root, ARCHIVE_FILE).map_err(fail(Step::Install))?;
     if let Some(pre_install) = pre_install {
-        pre_install_archive(&mut host, pre_install).map_err(fail(Step::Install))?;
+        pre_install_archive(&mut host, entry, pre_install).map_err(fail(Step::Install))?;
     }
     install(&mut host, entry, &archive_path, &trust, no_enable).map_err(fail(Step::Install))?;
     inspect(&mut host, entry).map_err(fail(Step::Inspect))?;
@@ -497,8 +484,15 @@ fn write_trust(entry: &package::IndexEntry, root: &Root) -> Result<PathBuf, Stri
     } else {
         package::INDEX_SCHEMA_VERSION
     };
+    // The entry may come from a schema 2 file while the trust signs schema
+    // 1: a schema 1 runtime entry carries no kind, so normalize it before
+    // the throwaway validates the kind/`runtime_id` pairing.
+    let mut entry = entry.clone();
+    if schema_version != package::INDEX_SCHEMA_VERSION_2 {
+        entry.kind = None;
+    }
     throwaway::write(&ThrowawayArgs {
-        entries: vec![entry.clone()],
+        entries: vec![entry],
         output: trust.clone(),
         schema_version,
     })
@@ -531,9 +525,23 @@ fn write_archive(archive: &[u8], root: &Root, name: &str) -> Result<PathBuf, Str
 /// the proved version goes through the entry's index path; this install only
 /// stages the unselected state the `install` and `inspect` flag checks must
 /// refuse.
-fn pre_install_archive(host: &mut Host, archive: &Path) -> Result<(), String> {
+fn pre_install_archive(
+    host: &mut Host,
+    entry: &package::IndexEntry,
+    archive: &Path,
+) -> Result<(), String> {
     let bytes = fs::read(archive)
         .map_err(|error| format!("cannot read the pre-installed archive: {error}"))?;
+    let verified = read_archive(&bytes, &Limits::DEFAULT)
+        .map_err(|error| format!("the pre-installed archive is not a valid package: {error}"))?;
+    let (package_id, _version) =
+        archive_package(&verified, archive).map_err(|error| error.to_string())?;
+    if package_id != entry.package_id {
+        return Err(format!(
+            "the pre-installed archive names `{package_id}`, not the entry's `{}`",
+            entry.package_id
+        ));
+    }
     let digest = format!("sha256:{}", hex(&Sha256::digest(&bytes)));
     let stored = archive.to_string_lossy().into_owned();
     let output = host.cli(&[

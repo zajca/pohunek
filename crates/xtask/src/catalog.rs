@@ -218,6 +218,10 @@ pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskEr
 
 /// The package id and version the `runtime.toml` of the verified archive read
 /// from `archive` declares.
+#[expect(
+    dead_code,
+    reason = "delegation target: prove reads the identity through plugin_kit::archive"
+)]
 pub(crate) fn archive_package(
     verified: &VerifiedArchive,
     archive: &Path,

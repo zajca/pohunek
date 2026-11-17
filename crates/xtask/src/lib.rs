@@ -16,7 +16,6 @@ mod hermes_skill;
 mod knowledge_log;
 pub use knowledge_log::{fold as fold_log, migrate as migrate_log, FoldSummary, MigrateSummary};
 mod canary_capture;
-mod isolated_host;
 mod package_affected;
 mod package_baseline;
 mod package_bump;
@@ -268,7 +267,7 @@ impl From<plugin_kit::Error> for XtaskError {
             plugin_kit::Error::OutputIsSymlink(path) => Self::OutputIsSymlink(path),
             plugin_kit::Error::InvalidPath(path) => Self::InvalidPath(path),
             plugin_kit::Error::ChildExit { command, status } => Self::ChildExit { command, status },
-            plugin_kit::Error::Prove(verdict) => Self::Prove(verdict.into()),
+            plugin_kit::Error::Prove(verdict) => Self::Prove(verdict),
         }
     }
 }

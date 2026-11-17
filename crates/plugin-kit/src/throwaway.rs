@@ -1,10 +1,9 @@
 //! `index throwaway`: a self-contained plugin index trust for proofs.
 //!
-//! Moved from `xtask::plugin_index::throwaway` with one boundary change: the
-//! entries come in as parsed [`IndexEntry`] values instead of an entries-tree
-//! path, so the kit never re-implements the index-host tree reader. The
-//! `xtask index throwaway` wrapper keeps reading its tree and delegates the
-//! signing here.
+//! The entries come in as parsed [`IndexEntry`] values instead of an
+//! entries-tree path, so the kit never re-implements the index-host tree
+//! reader. The `xtask index throwaway` wrapper keeps reading its entries
+//! tree through the index-host reader and delegates the signing here.
 //!
 //! A random root and a random index key exist only while [`write`] runs. The
 //! output holds an anchor that trusts only that root, a channel file naming it

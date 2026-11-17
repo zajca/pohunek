@@ -345,6 +345,10 @@ pub(super) fn index_entry(entry: EntryFile, schema_version: u64) -> Result<Index
 
 /// The signed entry of the single entry file `path` in a schema 2 document,
 /// checked like `index build` checks an entry of a tree.
+#[expect(
+    dead_code,
+    reason = "delegation target: the throwaway wrapper reads entries through plugin_kit::entry"
+)]
 pub(crate) fn entry_of(path: &Path) -> Result<IndexEntry, XtaskError> {
     index_entry(read_entry(path)?, INDEX_SCHEMA_VERSION_2)
 }

@@ -36,9 +36,9 @@ use serde_json::{json, Value};
 
 use self::records::{OutputPage, RecordScanner};
 use crate::claude_canary::CANARY_SCHEMA;
-use crate::isolated_host::{Host, Output, Root};
 use crate::release::{ANCHOR_FILE as RELEASE_ANCHOR_FILE, CATALOG_FILE, PACKAGES_DIR};
 use crate::XtaskError;
+use plugin_kit::isolated::{Host, Output, Root};
 
 /// Process exit code of a run that stopped at a driver step: the step ran out
 /// of time or the workdir is not trusted. The partial capture is written.

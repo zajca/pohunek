@@ -1,8 +1,6 @@
-//! Capped, symlink-safe file helpers shared by every kit command.
-//!
-//! Moved from `xtask::catalog` unchanged: no-follow reads with a byte cap, an
-//! exclusive document create that refuses symbolic links, and the canonical
-//! JSON document bytes.
+//! Capped, symlink-safe file helpers shared by every kit command: no-follow
+//! reads with a byte cap, an exclusive document create that refuses symbolic
+//! links, and the canonical JSON document bytes.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};

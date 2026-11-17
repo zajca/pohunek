@@ -29,6 +29,7 @@ use std::process::Output;
 use plugin_kit::isolated::{Host, Root};
 use plugin_kit::throwaway;
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::HANG_GUARD;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
@@ -73,20 +74,33 @@ fn fixture_dir() -> PathBuf {
     pohunek_test_support::manifest_dir().join("tests/fixtures/kit-package")
 }
 
+/// Release binaries the isolated daemon copies beside the kit binary; a
+/// change to any of them must re-run the kit suite (`BINARY_USES`).
+const POHUNEK_BIN: &str = "pohunek";
+const POHUNEKD_BIN: &str = "pohunekd";
+const SESSIOND_BIN: &str = "pohunek-sessiond";
+
 /// The directory holding the workspace binaries the isolated daemon copies.
+/// Each `with_file_name` names a release binary literally so the affected
+/// guard sees the run (`BINARY_USES`); a change to any of them re-runs the
+/// kit suite.
 fn release_dir() -> PathBuf {
-    let dir = pohunek_test_support::bin_exe("pohunek-plugin-kit")
-        .parent()
-        .expect("the kit binary has a directory")
-        .to_path_buf();
-    for name in ["pohunek", "pohunekd", "pohunek-sessiond"] {
-        assert!(
-            dir.join(name).is_file(),
-            "{} is missing; build it with `cargo build -p pohunek-cli -p pohunek-daemon -p pohunek-session-worker`",
-            dir.join(name).display()
-        );
+    let kit = pohunek_test_support::bin_exe("pohunek-plugin-kit");
+    for path in [
+        kit.with_file_name(POHUNEK_BIN),
+        kit.with_file_name(POHUNEKD_BIN),
+        kit.with_file_name(SESSIOND_BIN),
+    ] {
+        let name = path
+            .file_name()
+            .expect("a binary file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(path.is_file(), "{name} is missing; build it with `cargo build -p pohunek-cli -p pohunek-daemon -p pohunek-session-worker`");
     }
-    dir
+    kit.parent()
+        .expect("the kit binary has a directory")
+        .to_path_buf()
 }
 
 /// A hermetic environment with the checkout marker the kit inherits.
@@ -113,13 +127,47 @@ impl Kit {
         path
     }
 
+    /// Runs the kit binary with every wait bounded by `HANG_GUARD`: a hung
+    /// kit is killed and the failure names its stderr.
     fn kit(&self, args: &[&str]) -> Output {
-        self.env
+        use std::io::Read as _;
+        use std::process::Stdio;
+        use std::time::Instant;
+        let mut child = self
+            .env
             .command(pohunek_test_support::bin_exe("pohunek-plugin-kit"))
             .current_dir(self.env.cwd())
             .args(args)
-            .output()
-            .expect("run pohunek-plugin-kit")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run pohunek-plugin-kit");
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            match child.try_wait().expect("poll the kit") {
+                Some(status) => {
+                    let mut stdout = Vec::new();
+                    let mut stderr = Vec::new();
+                    if let Some(mut pipe) = child.stdout.take() {
+                        pipe.read_to_end(&mut stdout).expect("read stdout");
+                    }
+                    if let Some(mut pipe) = child.stderr.take() {
+                        pipe.read_to_end(&mut stderr).expect("read stderr");
+                    }
+                    return Output {
+                        status,
+                        stdout,
+                        stderr,
+                    };
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("pohunek-plugin-kit {args:?} hung past {HANG_GUARD:?}");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
     }
 
     /// A copy of the fixture package whose descriptor text has `from`
@@ -260,6 +308,19 @@ fn kit_lint_build_verify_and_detect_check_pass_on_fixture() {
         .expect("utf-8 stdout")
         .starts_with(&format!("plugin verify ok: {PACKAGE_ID} {VERSION} sha256:")));
 
+    // Without `--dir`, verify only re-reads the archive and reports its
+    // digest; without `--sha256`, the digest is compared against nothing.
+    let digest = digest_of(&archive);
+    let output = kit.kit(&["verify", "--archive", s(&archive)]);
+    assert!(
+        output.status.success(),
+        "verify without --dir failed: {}",
+        stderr_of(&output)
+    );
+    assert!(String::from_utf8(output.stdout)
+        .expect("utf-8 stdout")
+        .contains(digest.strip_prefix("sha256:").expect("a sha256 digest")));
+
     let output = kit.kit(&[
         "detect-check",
         "--dir",
@@ -336,6 +397,20 @@ fn kit_prove_passes_on_fixture() {
     assert_eq!(evidence["result"], "pass");
     assert_eq!(evidence["package_id"], PACKAGE_ID);
     assert!(evidence.get("failed_step").is_some_and(Value::is_null));
+    let kit_sha256 = evidence["kit_sha256"]
+        .as_str()
+        .expect("the evidence names the kit digest");
+    let digest = kit_sha256.strip_prefix("sha256:").expect("a sha256 digest");
+    assert_eq!(digest.len(), 64, "the kit digest is 64 hex chars");
+    assert!(
+        digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the kit digest is hex: {kit_sha256:?}"
+    );
+    assert_eq!(
+        kit_sha256,
+        &digest_of(&pohunek_test_support::bin_exe("pohunek-plugin-kit")),
+        "the evidence names the kit binary the test ran"
+    );
     assert!(kit.leftover_roots().is_empty(), "prove removes its root");
 }
 
@@ -512,20 +587,11 @@ fn kit_prove_no_enable_fails_with_evidence() {
 }
 
 #[test]
-fn kit_throwaway_accepts_the_unadmitted_runtime_id() {
+fn kit_smoke_accepts_the_unadmitted_runtime_id() {
     let kit = Kit::new();
     let package = kit.unadmitted_package("unadmitted");
     let release = release_dir();
-    let evidence = kit.path("prove.json");
-    let output = kit.kit(&[
-        "prove",
-        "--dir",
-        s(&package),
-        "--release-dir",
-        s(&release),
-        "--evidence",
-        s(&evidence),
-    ]);
+    let output = kit.kit(&["smoke", "--dir", s(&package), "--release-dir", s(&release)]);
     assert!(
         output.status.success(),
         "the throwaway anchor accepts {UNADMITTED_PACKAGE_ID}: {}",
@@ -534,40 +600,55 @@ fn kit_throwaway_accepts_the_unadmitted_runtime_id() {
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
     assert!(
         stdout.starts_with(&format!(
-            "plugin prove ok: {UNADMITTED_PACKAGE_ID} {VERSION} sha256:"
+            "plugin smoke ok: {UNADMITTED_PACKAGE_ID} {VERSION} idle "
         )),
-        "unexpected prove line: {stdout:?}"
+        "unexpected smoke line: {stdout:?}"
     );
-    assert_eq!(evidence_of(&evidence)["result"], "pass");
-    assert!(kit.leftover_roots().is_empty(), "prove removes its root");
+    assert!(kit.leftover_roots().is_empty(), "smoke removes its root");
 }
 
 #[test]
-fn kit_isolated_host_refuses_the_unadmitted_runtime_id() {
+fn kit_release_host_refuses_the_throwaway_index() {
     let kit = Kit::new();
     let package = kit.unadmitted_package("unadmitted");
     let archive = kit.build(&package, "out");
+    let digest = digest_of(&archive);
 
-    let root = Root::create().expect("the isolation root");
+    // The throwaway index lists the digest, exactly as a proof would sign
+    // it: the refusal must come from the host trusting the release anchor,
+    // not from the index omitting the archive.
     let trust = kit.dir("trust");
-    let written = throwaway::write(&throwaway::ThrowawayArgs {
-        entries: Vec::new(),
+    let entry = plugin_kit::entry::EntryFile {
+        package_id: UNADMITTED_PACKAGE_ID.parse().expect("package id"),
+        kind: None,
+        runtime_id: Some(UNADMITTED_RUNTIME_ID.parse().expect("runtime id")),
+        version: VERSION.parse().expect("version"),
+        digest: digest.parse().expect("digest"),
+        url: "https://localhost/kit-refusal".to_owned(),
+        platforms: vec![package::host_platform().expect("platform name")],
+        core: ">=0.0.0".to_owned(),
+        source: plugin_kit::entry::Source::prove_placeholder(&VERSION.parse().expect("version")),
+    }
+    .signed_entry(package::INDEX_SCHEMA_VERSION)
+    .expect("the entry signs");
+    throwaway::write(&throwaway::ThrowawayArgs {
+        entries: vec![entry],
         output: trust.clone(),
         schema_version: 1,
     })
-    .expect("the empty throwaway index");
-    assert_eq!(written.entries, 0);
+    .expect("the throwaway index lists the digest");
     let index = trust.join(package::OFFICIAL_INDEX_FILE_NAME);
-    assert!(
-        index.is_file(),
-        "throwaway writes the index beside the anchor"
-    );
+    assert!(index.is_file(), "throwaway writes the index");
 
+    // The host trusts the committed release anchor and channel, never the
+    // throwaway root: the throwaway-signed index is foreign to it.
+    let workspace = pohunek_test_support::workspace_root();
+    let root = Root::create_in(kit.env.tmp_dir()).expect("the isolation root");
     let mut host = Host::prepare(
         &root,
         &release_dir(),
-        &trust.join(throwaway::ANCHOR_FILE),
-        &trust.join(package::INDEX_CHANNEL_FILE_NAME),
+        &workspace.join("packaging/runtime-catalog-anchor.json"),
+        &workspace.join("packaging/plugin-index-channel.json"),
     )
     .expect("the isolated host");
     host.launch_local_only(&root)
@@ -587,7 +668,7 @@ fn kit_isolated_host_refuses_the_unadmitted_runtime_id() {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         stdout.contains("package_untrusted"),
-        "the trust layer refuses the unlisted digest: {stdout:?}"
+        "the release-anchored host refuses the throwaway index: {stdout:?}"
     );
     host.stop().expect("the daemon stops");
     root.remove().expect("the root is removed");

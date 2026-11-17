@@ -3,9 +3,7 @@
 //! The identity of the archive is read back from its own `runtime.toml`, so
 //! the file name never depends on a caller-supplied string, and the file is
 //! created exclusively: an existing archive is an error and is left unchanged.
-//!
-//! Moved from `xtask::plugin::build` unchanged apart from the error type, so
-//! the `xtask plugin build` wrapper keeps its exact contract by delegating
+//! The `xtask plugin build` wrapper keeps its exact contract by delegating
 //! here.
 
 use std::fs;

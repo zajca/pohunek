@@ -1,15 +1,11 @@
-//! The isolated daemon used by the kit `prove` and `smoke` commands.
+//! The isolated daemon the kit `prove` and `smoke` commands run on.
 //!
-//! Moved from `xtask::isolated_host` unchanged: the same root layout, the
-//! same cleared environment, the same `--local-only` launch, and the same
-//! bounded waits. Callers outside the kit (`xtask` canary capture, the Hermes
-//! package host) use this module through the kit crate.
-//!
-//! The root directory holds a private home, XDG directories, a copy of the
-//! release executables with the trust anchor and the index channel file beside
-//! the daemon, and the daemon's control socket. Every child process runs with
-//! a cleared environment, so nothing of the caller's `POHUNEK_*` variables,
-//! sockets or home directory reaches it.
+//! One private root holds a home, XDG directories, a copy of the release
+//! executables with the trust anchor and the index channel file beside the
+//! daemon, and the daemon's control socket. Every child process runs with a
+//! cleared environment, so nothing of the caller's `POHUNEK_*` variables,
+//! sockets or home directory reaches it. The `xtask` canary capture uses
+//! this module through the kit crate.
 
 // Rust guideline compliant 2026-11-06
 
@@ -183,6 +179,22 @@ impl Root {
             return Ok(root);
         }
         Err(last)
+    }
+
+    /// Creates a root below `parent`, after [`Root::check_session_parent`]
+    /// accepted it. There is no fallback parent: the caller names the
+    /// directory, so a scenario can keep the root inside its own temporary
+    /// directory and assert the cleanup from the outside.
+    pub fn create_in(parent: &Path) -> Result<Self, String> {
+        let parent = Self::check_session_parent(parent)?;
+        let temp = tempfile::Builder::new()
+            .prefix(ROOT_PREFIX)
+            .rand_bytes(ROOT_RANDOM_BYTES)
+            .tempdir_in(&parent)
+            .map_err(|error| format!("cannot create the isolation root: {error}"))?;
+        let root = Self { temp };
+        root.create_directories()?;
+        Ok(root)
     }
 
     /// Creates a root that runs agent sessions directly below `parent`, after

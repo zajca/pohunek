@@ -150,8 +150,10 @@ index write, and 2 for every other refusal:
 - `lint` loads the descriptor and the detection manifest through the same
   parser an install runs.
 - `build` writes the canonical archive like `xtask plugin build`.
-- `verify --archive <file> --sha256 <digest>` checks the archive rebuilds
-  from the directory, twice, and matches the digest.
+- `verify --archive <file> [--dir <package dir>] [--sha256 <digest>]`
+  checks the archive rebuilds from the directory, twice, and matches the
+  digest; without `--dir` it only re-reads the archive, without `--sha256`
+  it only reports the digest.
 - `detect-check --corpus <dir>` replays every committed screen of the
   corpus through the detector: `cases.toml` holds `[[case]]` tables with a
   `screen` file under `screens/`, a `width`, and the expected `working`,

@@ -192,12 +192,25 @@ pub(crate) struct BinaryUse {
     pub(crate) why: &'static str,
 }
 
-pub(crate) const BINARY_USES: &[BinaryUse] = &[BinaryUse {
-    binary: "pohunek",
-    readers: readers("pohunek-daemon", "binary(=supervised_lifecycle)"),
-    sources: &["crates/daemon/tests/supervised_lifecycle.rs"],
-    why: "the managed-CLI scenario runs the `pohunek` binary beside `pohunekd`",
-}];
+pub(crate) const BINARY_USES: &[BinaryUse] = &[
+    BinaryUse {
+        binary: "pohunek",
+        readers: readers("pohunek-daemon", "binary(=supervised_lifecycle)"),
+        sources: &["crates/daemon/tests/supervised_lifecycle.rs"],
+        why: "the managed-CLI scenario runs the `pohunek` binary beside `pohunekd`",
+    },
+    BinaryUse {
+        binary: "pohunek",
+        readers: readers("pohunek-plugin-kit", "binary(=kit)"),
+        sources: &["crates/plugin-kit/tests/kit.rs"],
+        why: "the kit smoke and prove scenarios drive the `pohunek` CLI on an isolated daemon",
+    },
+    // No entries for `pohunekd` and `pohunek-sessiond`: the kit depends on
+    // `pohunek-daemon`, which depends on `pohunek-session-worker`, so the
+    // Cargo reverse-dependency closure already selects the kit suite on a
+    // change to either. Only `pohunek` needs an entry, as no Cargo edge
+    // links the kit to `pohunek-cli`.
+];
 
 /// The workspace package that builds binary `name`.
 pub(crate) fn binary_owner<'a>(name: &str, packages: &'a [Package]) -> Option<&'a Package> {
@@ -515,6 +528,18 @@ const RULES: &[Rule] = &[
         Pattern::Dir("packaging"),
         Effect::Packages(&["pohunek-cli", "xtask"]),
         "daemon packaging tested by pohunek-cli; xtask embeds stage-archive's release files",
+    ),
+    // The kit refusal scenario anchors its release host on the same two
+    // files; a change to either must also run the kit suite.
+    rule(
+        Pattern::File("packaging/runtime-catalog-anchor.json"),
+        Effect::AlsoTests(&[readers("pohunek-plugin-kit", "binary(=kit)")]),
+        "release anchor read by the kit refusal scenario",
+    ),
+    rule(
+        Pattern::File("packaging/plugin-index-channel.json"),
+        Effect::AlsoTests(&[readers("pohunek-plugin-kit", "binary(=kit)")]),
+        "release channel read by the kit refusal scenario",
     ),
     rule(
         Pattern::File("compat/matrix.json"),

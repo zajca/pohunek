@@ -8,11 +8,13 @@
 
 pub mod archive;
 pub mod build;
+#[cfg(feature = "daemon")]
 pub mod detect_check;
 pub mod entry;
 pub mod error;
 pub mod files;
 pub mod isolated;
+#[cfg(feature = "daemon")]
 pub mod lint;
 pub mod prove;
 pub mod smoke;

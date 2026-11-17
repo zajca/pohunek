@@ -18,8 +18,7 @@
 //! The `expect` names are the [`AgentActivity`] wire names: `working`,
 //! `blocked`, `idle`, `unknown`.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use package::Limits;
@@ -111,11 +110,6 @@ pub fn detect_check(args: &DetectCheckArgs) -> Result<DetectCheckReport, Error> 
             ))
         })?;
     let config = DetectorConfig::for_definition(&definition);
-    let manifest = config
-        .manifest
-        .clone()
-        .unwrap_or_else(|| Arc::new(empty_manifest()));
-    let _ = manifest;
 
     let cases_path = args.corpus.join("cases.toml");
     let cases_bytes = read_input(&cases_path, MAX_CASES_BYTES)?;
@@ -224,23 +218,4 @@ fn activity_name(activity: AgentActivity) -> &'static str {
         AgentActivity::Idle => "idle",
         AgentActivity::Unknown => "unknown",
     }
-}
-
-/// An empty manifest for a config that names none. The package parser never
-/// produces a definition without a manifest, so this only fires when the
-/// corpus runner is pointed at a definition source that has none.
-fn empty_manifest() -> pohunek_daemon::detect::Manifest {
-    pohunek_daemon::detect::Manifest::parse_str("").expect("an empty manifest parses")
-}
-
-/// Reads one sibling file of the descriptor for the manifest loader.
-/// Unused after the lint moved to `definition_from_archive`; kept for the
-/// corpus runner that reads raw descriptor siblings.
-#[allow(
-    dead_code,
-    reason = "kept for the corpus runner that reads raw descriptor siblings"
-)]
-fn read_sibling(dir: &Path, name: &str, max_bytes: u64) -> Result<String, Error> {
-    let bytes = read_input(&dir.join(name), max_bytes)?;
-    String::from_utf8(bytes).map_err(|_cause| refuse(format!("package file `{name}` is not UTF-8")))
 }

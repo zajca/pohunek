@@ -18,7 +18,7 @@ mod sign;
 mod throwaway;
 
 pub(crate) use admit::{check_entry, CheckArgs, CheckStage};
-pub(crate) use build::{build, entry_of, print_source, BuildArgs};
+pub(crate) use build::{build, print_source, BuildArgs};
 pub(crate) use sign::{
     attach, message, verify_material, verify_whole, AttachArgs, VerifyIndexArgs, VerifyMaterialArgs,
 };
