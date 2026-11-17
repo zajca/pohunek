@@ -23,7 +23,6 @@ pohunek-daemon = { path = "../daemon" }
 pohunek-package = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-protocol = { workspace = true }
-pohunek-terminal = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

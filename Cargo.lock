@@ -1949,7 +1949,6 @@ dependencies = [
  "pohunek-package",
  "pohunek-paths",
  "pohunek-protocol",
- "pohunek-terminal",
  "pohunek-test-support",
  "rustix",
  "serde",
