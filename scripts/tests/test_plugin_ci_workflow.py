@@ -288,8 +288,6 @@ class PluginCiShellTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
 
     def test_the_version_bump_fails_on_a_changed_archive_without_a_bump(self):
-        (Path(tempfile.gettempdir()) / "x").exists()
-        root_files = ["dist/a.tar.zst", "previous/a.tar.zst", "plugin/package/runtime.toml"]
         gh = (
             "#!/bin/sh\n"
             "if [ \"$1 $2\" = \"release list\" ]; then echo v0.1.0; exit 0; fi\n"

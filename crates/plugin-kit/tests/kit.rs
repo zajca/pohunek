@@ -136,6 +136,12 @@ impl Kit {
         self.env.root().join(name)
     }
 
+    /// The cwd the harness gives the kit binary: the smoke script must
+    /// run in this directory, not in the isolated root.
+    fn cwd(&self) -> &Path {
+        self.env.cwd()
+    }
+
     fn dir(&self, name: &str) -> PathBuf {
         let path = self.path(name);
         fs::create_dir(&path).expect("create the directory");
@@ -484,10 +490,14 @@ fn kit_smoke_runs_the_script_against_the_live_session() {
     let script = kit.path("smoke-script.sh");
     fs::write(
         &script,
-        "#!/bin/sh\n\
-         set -eu\n\
-         echo \"a line on the script's own stdout\"\n\
-         pohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+        format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             echo \"a line on the script's own stdout\"\n\
+             pwd > \"{}\"\n\
+             pohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+            kit.path("script-cwd.txt").display()
+        ),
     )
     .expect("write the smoke script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
@@ -514,7 +524,92 @@ fn kit_smoke_runs_the_script_against_the_live_session() {
         "the script line is on the kit stderr: {}",
         stderr_of(&output)
     );
+    // The script ran in the smoke's own cwd (the directory the caller
+    // started the kit in: the workflow runs the smoke step from the
+    // plugin repository), not in the isolated root.
+    let script_cwd = PathBuf::from(
+        fs::read_to_string(kit.path("script-cwd.txt"))
+            .expect("the script recorded its cwd")
+            .trim(),
+    );
+    assert_eq!(
+        script_cwd,
+        kit.cwd(),
+        "the smoke script runs in the kit's own cwd"
+    );
+    assert_ne!(
+        script_cwd,
+        used_root(&document, &kit),
+        "the smoke script does not run inside the isolated root"
+    );
     used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_skips_the_script_when_the_screen_check_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    // A package whose program prints nothing the detector knows: the
+    // screen check times out, so the smoke must fail without starting
+    // the script, and still tear the root down.
+    let text = fs::read_to_string(fixture_dir().join("runtime.toml")).expect("read the fixture");
+    let text = text.replace(
+        "args = [\"-c\", \"echo ready; exec sleep 300\"]",
+        "args = [\"-c\", \"exec sleep 300\"]",
+    );
+    assert!(
+        text.contains("exec sleep 300"),
+        "the variant prints nothing"
+    );
+    let package = kit.dir("quiet-package");
+    fs::write(package.join("runtime.toml"), text).expect("write the variant");
+    fs::copy(
+        fixture_dir().join("detect.toml"),
+        package.join("detect.toml"),
+    )
+    .expect("copy the file");
+    for screen in ["idle_prompt.txt", "blocked_input.txt"] {
+        fs::copy(
+            fixture_dir().join("screens").join(screen),
+            package.join(screen),
+        )
+        .expect("copy the screen");
+    }
+    let untouched = kit.path("script-ran.txt");
+    let script = kit.path("smoke-quiet.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nset -eu\ntouch \"{}\"\n", untouched.display()),
+    )
+    .expect("write the smoke script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&package),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--json",
+    ]);
+    assert!(
+        !output.status.success(),
+        "smoke with an unknown screen passed: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("the detector stayed `unknown`"),
+        "the screen check failed first: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        !untouched.exists(),
+        "the script did not start after the failed check"
+    );
+    // `named_root` asserts the failed run removed its root.
+    named_root(&output);
 }
 
 #[test]
