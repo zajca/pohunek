@@ -13775,8 +13775,10 @@ fn backoff_scans_due(elapsed: u64) -> usize {
 }
 
 /// Asserts the paused clock stands at `expected` up to the timer wheel's
-/// millisecond rounding. A scan that is late parks the runtime and the clock
-/// jumps to the next periodic timer, at least half a poll further.
+/// millisecond rounding. With auto-advance inhibited, the clock moves only
+/// through `advance`; a scan that is not due by a tick stalls
+/// `wait_for_scans_started` until the inhibitor's real-time ceiling, and this
+/// assertion guards the explicit steps.
 fn assert_clock_not_jumped(expected: tokio::time::Instant, what: &str) {
     let now = tokio::time::Instant::now();
     assert!(
@@ -13788,7 +13790,10 @@ fn assert_clock_not_jumped(expected: tokio::time::Instant, what: &str) {
 
 /// Advances the paused clock one second at a time. A scan runs its process
 /// reads on a blocking thread, so a scan due at a tick is awaited by count
-/// rather than assumed finished after a number of yields.
+/// rather than assumed finished after a number of yields. Each step overshoots
+/// the tick by [`TIMER_TICK`], so a scan timer armed for the tick boundary is
+/// past its deadline once the clock lands: at the exact boundary the timer may
+/// not fire yet, and without auto-advance nothing would push the clock past it.
 async fn advance_settling(
     registry: &SessionRegistry,
     inspector: &MockInspector,
@@ -13797,8 +13802,8 @@ async fn advance_settling(
     seconds: u64,
 ) {
     for elapsed in from + 1..=from + seconds {
-        let tick_end = tokio::time::Instant::now() + Duration::from_secs(1);
-        tokio::time::advance(Duration::from_secs(1)).await;
+        let tick_end = tokio::time::Instant::now() + Duration::from_secs(1) + TIMER_TICK;
+        tokio::time::advance(Duration::from_secs(1) + TIMER_TICK).await;
         let due = sessions * backoff_scans_due(elapsed);
         wait_for_scans_started(inspector, due).await;
         settle_procwatch_scans(registry).await;
@@ -13819,6 +13824,12 @@ async fn quiet_sessions_with_a_stable_tree_are_scanned_at_the_backoff_rate_off_t
     })
     .await;
     inspector.count_scans_on_current_thread();
+    // From here the clock moves only through `advance`: the inhibitor keeps
+    // auto-advance from jumping the clock to the next periodic timer while a
+    // scan loop parked on a loaded host leaves the runtime idle, so the
+    // backoff math below observes scans through counts and signals, never
+    // through scheduler delay.
+    let _inhibitor = AutoAdvanceInhibitor::new();
     tokio::time::pause();
     settle_procwatch_scans(&registry).await;
     let (before, _, in_task_before) = inspector.descendant_scans();
@@ -13853,6 +13864,9 @@ async fn a_working_transition_rescans_a_backed_off_session_at_once() {
         (inspector.descendant_scans().0 >= 1).then_some(())
     })
     .await;
+    // The clock moves only through `advance` from here: see the first
+    // backoff test for why the inhibitor is required on a loaded host.
+    let _inhibitor = AutoAdvanceInhibitor::new();
     tokio::time::pause();
     settle_procwatch_scans(&registry).await;
     advance_settling(&registry, &inspector, 1, 0, BACKOFF_SETTLE_SECS).await;
@@ -13905,6 +13919,9 @@ async fn a_child_of_a_backed_off_session_is_observed_within_the_ceiling() {
         (inspector.descendant_scans().0 >= 1).then_some(())
     })
     .await;
+    // The clock moves only through `advance` from here: see the first
+    // backoff test for why the inhibitor is required on a loaded host.
+    let _inhibitor = AutoAdvanceInhibitor::new();
     tokio::time::pause();
     settle_procwatch_scans(&registry).await;
     advance_settling(&registry, &inspector, 1, 0, BACKOFF_SETTLE_SECS).await;
