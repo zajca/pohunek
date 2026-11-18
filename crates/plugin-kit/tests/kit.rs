@@ -664,9 +664,9 @@ fn kit_smoke_kills_the_background_child_of_the_script() {
     // The kit kills the script's process group after the script exits.
     // The background child's stdout and stderr are the kit's stderr, so
     // `output()` above returns only after every writer of that pipe has
-    // closed: the child has exited by then. A child that has exited but
-    // not yet been reaped is either absent from `/proc` or a zombie (`Z` in
-    // `/proc/<pid>/stat`), both of which count as gone. Without the kit's kill this scenario
+    // closed: the child has exited by then. An exited child is either
+    // reaped (absent from `/proc`) or a zombie (`Z` in
+    // `/proc/<pid>/stat`); both count as gone. Without the kit's kill this scenario
     // never returns: the open pipe keeps `output()` blocked until the
     // harness times the test out, so the revert fails by the timeout.
     assert!(

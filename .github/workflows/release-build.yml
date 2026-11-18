@@ -35,10 +35,6 @@ on:
         description: "`release` for a tag run, `rehearsal` for a CI run that never publishes"
         type: string
         required: true
-      version:
-        description: The release version X.Y.Z of the checkout (the workspace version)
-        type: string
-        required: true
       nightly:
         description: "`true` when the caller runs the nightly tier (schedule or a `tier=nightly` dispatch); the kit jobs run only on a tag release or the nightly tier"
         type: string

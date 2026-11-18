@@ -838,13 +838,40 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_the_workflows_are_reusable_and_nothing_else(self):
         for text, inputs in (
             (self.evidence, ["version", "commit", "mode", "targets", "scenarios_result", "nightly"]),
-            (self.build, ["mode", "version", "nightly"]),
+            (self.build, ["mode", "nightly"]),
             (self.scenarios, []),
         ):
             on_block = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
             self.assertEqual(re.findall(r"(?m)^  ([a-z_]+):$", on_block), ["workflow_call"])
             inputs_block = on_block.split("    inputs:\n", 1)[1].split("\n    outputs:", 1)[0] if "    inputs:\n" in on_block else ""
             self.assertEqual(re.findall(r"(?m)^      ([a-z_]+):\n        description:", inputs_block), inputs)
+
+    def test_every_required_reusable_input_is_passed_by_every_caller(self):
+        # GitHub refuses to start a run whose caller omits a required input,
+        # so every `uses:` of a local reusable workflow must pass each of its
+        # `required: true` inputs in `with:` (fix1c: `release-build.yml` once
+        # declared an unused required `version` that neither caller passed).
+        callers = {
+            "release-build.yml": ["ci.yml", "release.yml"],
+        }
+        caller_texts = {"ci.yml": self.ci, "release.yml": self.release}
+        for reusable, caller_files in callers.items():
+            build = self.texts[reusable]
+            inputs_block = build.split("    inputs:\n", 1)[1].split("\n    outputs:", 1)[0]
+            required = [
+                name for name in re.findall(r"(?m)^      ([a-z_]+):\n", inputs_block)
+                if re.search(rf"(?m)^      {name}:\n(?:        .*\n)*?        required: true\n", inputs_block)
+            ]
+            for caller_file in caller_files:
+                caller = caller_texts[caller_file]
+                for match in re.finditer(
+                    rf"(?m)^    uses: \./\.github/workflows/{re.escape(reusable)}\n(?:.*\n)*?^    with:\n((?: +.*\n)+)",
+                    caller,
+                ):
+                    with self.subTest(caller=f"{caller_file}:{reusable}"):
+                        self.assertTrue(match.group(1).strip(), "the caller passes a with: block")
+                        for name in required:
+                            self.assertRegex(match.group(1), rf"(?m)^ +{name}:")
 
     def test_every_job_declares_its_permissions(self):
         for file, text in self.texts.items():
