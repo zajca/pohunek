@@ -49,7 +49,8 @@ DOWNLOAD = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 ATTEST_ACTION = "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6"
 
 WRITER = "publish"
-OIDC_JOBS = ("attest", "attest-bundle")
+OIDC_JOBS = ("attest", "attest-kit", "attest-bundle")
+RELEASE_ATTEST_JOBS = ("attest", "attest-bundle")
 # The caller jobs that must grant the OIDC scopes so that a called workflow
 # may hold them. They run nothing themselves.
 RELEASE_CALLER = "evidence"
@@ -163,6 +164,7 @@ OIDC_LINES = [
     for pattern in (
         rf"    (name|runs-on|timeout-minutes): {_SCALAR}",
         r"    if: \$\{\{ inputs\.mode == 'release' \}\}",
+        r"    if: \$\{\{ inputs\.mode == 'rehearsal' && inputs\.nightly == 'true' \}\}",
         r"    needs: \[[a-z0-9, -]+\]",
         r"    (permissions|steps):",
         r"      contents: read",
@@ -231,12 +233,20 @@ OIDC_CHECK_SCRIPT = (
     "checksums=\"$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)\"",
     'test "$archives" = "$checksums"',
 )
+KIT_CHECK_SCRIPT = (
+    "set -euo pipefail",
+    'cd "$RUNNER_TEMP/attest-kit-assets"',
+    "sha256sum -c ./*.sha256",
+    "archives=\"$(find . -maxdepth 1 -type f -name '*.tar.zst' | wc -l)\"",
+    "checksums=\"$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)\"",
+    'test "$archives" = "$checksums"',
+)
 BUNDLE_CHECK_SCRIPT = (
     "set -euo pipefail",
     'cd "$RUNNER_TEMP/bundle"',
     "sha256sum -c release-inventory.sha256",
 )
-OIDC_SCRIPTS = {OIDC_CHECK_SCRIPT, BUNDLE_CHECK_SCRIPT}
+OIDC_SCRIPTS = {OIDC_CHECK_SCRIPT, KIT_CHECK_SCRIPT, BUNDLE_CHECK_SCRIPT}
 
 PUBLISH_SCRIPTS = {
     (
@@ -642,13 +652,21 @@ class OidcTests(ReleaseWorkflowFiles):
             self.assertFalse(OIDC_SCOPE.search(text.partition("\njobs:\n")[0]))
 
     def test_the_attest_jobs_run_in_release_mode_only_and_check_out_nothing(self):
-        for name in OIDC_JOBS:
+        for name in RELEASE_ATTEST_JOBS:
             block = self.evidence_jobs[name]
             with self.subTest(job=name):
                 self.assertIn("    if: ${{ inputs.mode == 'release' }}\n", block)
                 self.assertNotIn("checkout", block)
                 self.assertNotRegex(block, r"uses: \./")
                 self.assertEqual(set(USES.findall(block)) - OIDC_ACTIONS, set())
+        # The kit bundles ship from the nightly tier, which runs in
+        # rehearsal mode: the kit attest job runs only there (issue #1613).
+        attest_kit = self.evidence_jobs["attest-kit"]
+        self.assertIn("    if: ${{ inputs.mode == 'rehearsal' && inputs.nightly == 'true' }}\n", attest_kit)
+        self.assertNotIn("checkout", attest_kit)
+        self.assertNotRegex(attest_kit, r"uses: \./")
+        self.assertEqual(set(USES.findall(attest_kit)) - OIDC_ACTIONS, set())
+        self.assertEqual(needs_of(attest_kit), ["rows"])
 
     def test_the_attest_jobs_cover_the_producers_and_the_bundle(self):
         attest = self.evidence_jobs["attest"]
@@ -819,13 +837,14 @@ class SigningTests(ReleaseWorkflowFiles):
 class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_the_workflows_are_reusable_and_nothing_else(self):
         for text, inputs in (
-            (self.evidence, ["version", "commit", "mode", "targets", "scenarios_result"]),
-            (self.build, ["mode", "version"]),
+            (self.evidence, ["version", "commit", "mode", "targets", "scenarios_result", "nightly"]),
+            (self.build, ["mode", "version", "nightly"]),
             (self.scenarios, []),
         ):
             on_block = text.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
             self.assertEqual(re.findall(r"(?m)^  ([a-z_]+):$", on_block), ["workflow_call"])
-            self.assertEqual(re.findall(r"(?m)^      ([a-z_]+):\n        description:", on_block), inputs)
+            inputs_block = on_block.split("    inputs:\n", 1)[1].split("\n    outputs:", 1)[0] if "    inputs:\n" in on_block else ""
+            self.assertEqual(re.findall(r"(?m)^      ([a-z_]+):\n        description:", inputs_block), inputs)
 
     def test_every_job_declares_its_permissions(self):
         for file, text in self.texts.items():
@@ -838,6 +857,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         self.assertEqual(needs["plan"], [])
         self.assertEqual(needs["rows"], ["plan"])
         self.assertEqual(needs["attest"], ["rows"])
+        self.assertEqual(needs["attest-kit"], ["rows"])
         self.assertEqual(needs["assemble"], ["rows", "attest"])
         self.assertEqual(needs["assemble-rehearsal"], ["rows"])
         self.assertEqual(needs["smoke"], ["plan", "rows", "assemble", "assemble-rehearsal"])
@@ -851,7 +871,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             sorted(needs_of(verdict)), sorted(name for name in self.evidence_jobs if name != "verdict")
         )
         self.assertIn("    if: ${{ always() }}\n", verdict)
-        for name in ("plan", "rows", "attest", "assemble", "assemble-rehearsal", "attest-bundle", "smoke", "smoke-scenarios"):
+        for name in ("plan", "rows", "attest", "attest-kit", "assemble", "assemble-rehearsal", "attest-bundle", "smoke", "smoke-scenarios"):
             self.assertIn(f'"{name}"', verdict)
         self.assertIn('"skipped"', verdict)
 
@@ -1031,21 +1051,30 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
                 return "\n".join(script)
         self.fail("the verdict has no jobs-of-the-mode check")
 
-    def run_verdict_mode_script(self, results, mode, scenarios=""):
+    def run_verdict_mode_script(self, results, mode, scenarios="", nightly=""):
         needs = json.dumps({name: {"result": result} for name, result in results.items()})
         return subprocess.run(
             ["bash", "-c", self.verdict_mode_script()],
-            env={**os.environ, "NEEDS": needs, "MODE": mode, "SCENARIOS": scenarios},
+            env={**os.environ, "NEEDS": needs, "MODE": mode, "NIGHTLY": nightly, "SCENARIOS": scenarios},
             capture_output=True,
             text=True,
         )
 
     def test_the_verdict_fails_a_phase_that_failed_cancelled_or_was_skipped(self):
         success = {name: "success" for name in ("plan", "rows", "assemble-rehearsal", "smoke")}
-        skipped = {name: "skipped" for name in ("attest", "assemble", "attest-bundle", "smoke-scenarios")}
+        skipped = {name: "skipped" for name in ("attest", "attest-kit", "assemble", "attest-bundle", "smoke-scenarios")}
         passing_rehearsal = {**success, **skipped}
         with self.subTest(case="a passing rehearsal"):
             self.assertEqual(self.run_verdict_mode_script(passing_rehearsal, "rehearsal", "success").returncode, 0)
+        # The nightly tier rehearsal attests the kit bundles (issue #1613):
+        # a passing nightly rehearsal has attest-kit success, and a skipped
+        # attest-kit fails the verdict.
+        passing_nightly = {**passing_rehearsal, "attest-kit": "success"}
+        with self.subTest(case="a passing nightly rehearsal"):
+            self.assertEqual(self.run_verdict_mode_script(passing_nightly, "rehearsal", "success", "true").returncode, 0)
+        with self.subTest(case="nightly rehearsal with attest-kit skipped"):
+            verdict = self.run_verdict_mode_script(passing_rehearsal, "rehearsal", "success", "true")
+            self.assertNotEqual(verdict.returncode, 0, verdict.stdout)
         # Any result other than success of a required phase fails, whatever
         # the phase: the scenarios and the bundle smoke are both required.
         for result in ("failure", "cancelled", "skipped"):
@@ -1063,6 +1092,7 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
     def test_the_verdict_fails_a_release_phase_that_did_not_pass(self):
         release_success = {name: "success" for name in ("plan", "rows", "attest", "assemble", "attest-bundle", "smoke", "smoke-scenarios")}
         release_success["assemble-rehearsal"] = "skipped"
+        release_success["attest-kit"] = "skipped"
         with self.subTest(case="a passing release"):
             self.assertEqual(self.run_verdict_mode_script(release_success, "release").returncode, 0)
         # In a release the scenarios run here, so a skipped scenario job fails

@@ -35,6 +35,15 @@ on:
         description: "`release` for a tag run, `rehearsal` for a CI run that never publishes"
         type: string
         required: true
+      version:
+        description: The release version X.Y.Z of the checkout (the workspace version)
+        type: string
+        required: true
+      nightly:
+        description: "`true` when the caller runs the nightly tier (schedule or a `tier=nightly` dispatch); the kit jobs run only on a tag release or the nightly tier"
+        type: string
+        required: false
+        default: "false"
     outputs:
       version:
         description: The release version X.Y.Z of the checkout (the workspace version)
@@ -330,14 +339,16 @@ jobs:
   # artifacts. The macOS leg builds natively on macos-15 like the rehearsal
   # macOS job, not cross-compiled.
   #
-  # The jobs run on a tag release and on the scheduled nightly rehearsal,
-  # never on a pull request or push run: a rehearsal on any other event
-  # proves the release assembly only (ruling 4). Two jobs with literal
-  # runners instead of one matrix job: a job whose `runs-on` is an
-  # expression may not use the rust cache.
+  # The jobs run on a tag release and on the nightly tier (the schedule and
+  # a `tier=nightly` dispatch, passed as the `nightly` input because the
+  # caller's event is not visible inside a reusable workflow), never on a
+  # pull request or push run: a rehearsal on any other event proves the
+  # release assembly only (ruling 4). Two jobs with literal runners instead
+  # of one matrix job: a job whose `runs-on` is an expression may not use
+  # the rust cache.
   kit-linux:
     name: Build the plugin kit bundle for x86_64-unknown-linux-gnu
-    if: ${{ inputs.mode == 'release' || github.event_name == 'schedule' }}
+    if: ${{ inputs.mode == 'release' || inputs.nightly == 'true' }}
     needs: [meta]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -413,7 +424,7 @@ jobs:
 
   kit-macos:
     name: Build the plugin kit bundle for aarch64-apple-darwin
-    if: ${{ inputs.mode == 'release' || github.event_name == 'schedule' }}
+    if: ${{ inputs.mode == 'release' || inputs.nightly == 'true' }}
     needs: [meta]
     runs-on: macos-15
     timeout-minutes: 120

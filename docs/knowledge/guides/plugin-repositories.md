@@ -218,8 +218,10 @@ bundle `pohunek-plugin-kit-<X.Y.Z>-<target>.tar.zst` for
 `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`. The bundle holds
 `pohunek`, `pohunekd`, `pohunek-sessiond` and `pohunek-plugin-kit` plus the
 descriptor schema note; it carries no release MANIFEST and never enters the
-core release bundle. The bundle is attested with the other release assets,
-so a downloaded bundle verifies with the same signer workflow:
+core release bundle. A release bundle is attested with the other release
+assets; a nightly bundle is attested by the `attest-kit` job of
+`release-evidence.yml`, so a downloaded bundle verifies with the same signer
+workflow (a nightly with `--source-ref refs/heads/main`):
 
 ```sh
 gh attestation verify <bundle> --repo zajca/pohunek \
@@ -228,8 +230,12 @@ gh attestation verify <bundle> --repo zajca/pohunek \
 
 The `plugin-kit-publish` workflow publishes the bundles as releases of
 `pohunekd/pohunek-plugin-kit`: a core release tag `vX.Y.Z` becomes
-`core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
-`nightly-YYYYMMDD-<sha12>` (nightlies older than 30 days are pruned). Until
+`core-vX.Y.Z` once the tag release is published (never a draft or a
+prerelease), a scheduled nightly CI run becomes the prerelease
+`nightly-YYYYMMDD-<sha12>` (nightlies older than 30 days are pruned). The
+provenance of every published bundle verifies with `gh attestation verify`
+against the `release-evidence.yml` signer workflow before the publishing
+token is minted. Until
 the owner has created the kit repository, its GitHub App and the
 `plugin-kit-publish` environment, publication stays gated and the bundles
 only build.

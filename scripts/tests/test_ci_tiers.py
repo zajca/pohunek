@@ -215,9 +215,11 @@ SAME_REPOSITORY_PR = (
 MACOS_CALLED_JOBS = {
     "release-rehearsal-build": {
         "workflow": "release-build.yml",
-        # `kit-macos` carries its own schedule-or-release gate on top of the
+        # `kit-macos` carries its own release-or-nightly gate on top of the
         # caller filter: on a pull request it never runs, not even with
-        # `release_rehearsal=true` (ruling 4).
+        # `release_rehearsal=true` (ruling 4). The nightly tier passes
+        # `nightly: 'true'`, derived from the schedule or a `tier=nightly`
+        # dispatch — never from a pull request.
         "jobs": {"rehearsal-macos", "kit-macos"},
         "filter": "release_rehearsal",
     },

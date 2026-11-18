@@ -6,6 +6,17 @@ name: Publish the plugin kit bundles
 # becomes `core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
 # `nightly-YYYYMMDD-<sha12>`.
 #
+# Release path provenance (issue #1613, high-1): the workflow matches by
+# workflow *name*, so the job requires that the `HEAD_BRANCH` release exists
+# in `zajca/pohunek`, is published (not a draft and not a prerelease), and
+# that its tag commit equals `HEAD_SHA` — the same check `notify-tap.yml`
+# runs for the tap dispatch. It then runs `gh attestation verify` on each
+# bundle with the `release-evidence.yml` signer workflow before the token is
+# minted, plus the `path` and `head_repository` defense-in-depth checks.
+# Nightlies carry no release attestation, so the `attest-kit` job of
+# release-evidence.yml attests `build-kit-*` on the schedule and the publish
+# job verifies them with `--source-ref refs/heads/main`.
+#
 # The kit repository, its GitHub App, the `plugin-kit-publish` environment
 # and the `PLUGIN_KIT_*` variable/secret are owner-side setup (D3): until the
 # owner creates them, `vars.PLUGIN_KIT_APP_ID` is empty and this job skips
@@ -39,19 +50,29 @@ jobs:
     if: ${{ vars.PLUGIN_KIT_APP_ID != '' && github.event.workflow_run.conclusion == 'success' && ((github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'push') || (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'schedule')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # The default branch lands here even when the environment gates the
+    # token step, so the environment deployment policy must allow `main`.
+    environment: plugin-kit-publish
+    concurrency:
+      group: plugin-kit-publish
     permissions:
-      contents: read
       actions: read
+      attestations: read
     env:
       KIT_REPO: pohunekd/pohunek-plugin-kit
+      CORE_REPO: zajca/pohunek
       WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
       HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       RUN_ID: ${{ github.event.workflow_run.id }}
+      WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+      HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
     steps:
       - name: Select the release tag
         id: select
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ "$WORKFLOW_NAME" = Release ]; then
@@ -66,7 +87,45 @@ jobs:
                 exit 1
                 ;;
             esac
+            # The workflow matches by name, so tie the run to the real tag
+            # release: it must exist and be published (not a draft, not a
+            # prerelease), and its tag commit must equal the run's sha — the
+            # same check notify-tap.yml runs before the tap dispatch.
+            case "$WORKFLOW_PATH" in
+              .github/workflows/release.yml) ;;
+              *)
+                echo "::error::the Release run must come from release.yml, got: $WORKFLOW_PATH"
+                exit 1
+                ;;
+            esac
+            if [ "$HEAD_REPO" != "zajca/pohunek" ]; then
+              echo "::error::the Release run must come from zajca/pohunek, got: $HEAD_REPO"
+              exit 1
+            fi
+            info="$(gh release view "$HEAD_BRANCH" --repo "$CORE_REPO" --json isDraft,isPrerelease,tagCommit --jq '"\(.isDraft) \(.isPrerelease) \(.tagCommit.oid // "")"')"
+            case "$info" in
+              "false false $HEAD_SHA") ;;
+              "false true "*)
+                echo "$HEAD_BRANCH is a pre-release; the kit release follows published releases only"
+                exit 1
+                ;;
+              *)
+                echo "::error::release $HEAD_BRANCH is not published at $HEAD_SHA"
+                exit 1
+                ;;
+            esac
           elif [ "$WORKFLOW_NAME" = CI ]; then
+            case "$WORKFLOW_PATH" in
+              .github/workflows/ci.yml) ;;
+              *)
+                echo "::error::the CI run must come from ci.yml, got: $WORKFLOW_PATH"
+                exit 1
+                ;;
+            esac
+            if [ "$HEAD_REPO" != "zajca/pohunek" ]; then
+              echo "::error::the CI run must come from zajca/pohunek, got: $HEAD_REPO"
+              exit 1
+            fi
             day="$(date -u +%Y%m%d)"
             short="${HEAD_SHA:0:12}"
             case "$short" in
@@ -111,12 +170,6 @@ jobs:
           count="$(find . -maxdepth 1 -type f -name 'pohunek-plugin-kit-*.tar.zst' | wc -l)"
           test "$count" = 2 || { echo "::error::expected the gnu and darwin kit bundles, found $count"; exit 1; }
           version="$(for f in pohunek-plugin-kit-*.tar.zst; do basename "$f" .tar.zst; done | sed -n 's/^pohunek-plugin-kit-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-.*$/\1/p' | sort -u)"
-          case "$version" in
-            '' | *[!0-9.]* | *.*.*.*)
-              echo "::error::the kit bundles carry no single X.Y.Z version"
-              exit 1
-              ;;
-          esac
           if [ "$(printf '%s\n' "$version" | wc -l)" != 1 ]; then
             echo "::error::the kit bundles disagree on the version"
             exit 1
@@ -129,15 +182,43 @@ jobs:
               exit 1
               ;;
           esac
-          sha256sum -- ./*.tar.zst > SHA256SUMS
+          sha256sum -- *.tar.zst > SHA256SUMS
+
+      - name: Verify the bundle provenance
+        if: ${{ steps.select.outputs.prerelease != 'true' }}
+        shell: bash
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for bundle in pohunek-plugin-kit-*.tar.zst; do
+            gh attestation verify "$bundle" --repo "$CORE_REPO" \
+              --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+              --source-ref "refs/tags/$HEAD_BRANCH" --deny-self-hosted-runners
+          done
+
+      - name: Verify the nightly provenance
+        if: ${{ steps.select.outputs.prerelease == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for bundle in pohunek-plugin-kit-*.tar.zst; do
+            gh attestation verify "$bundle" --repo "$CORE_REPO" \
+              --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+              --source-ref refs/heads/main --deny-self-hosted-runners
+          done
 
       - name: Mint the kit repository token
         id: app
-        uses: peter-evans/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
-          app-id: ${{ vars.PLUGIN_KIT_APP_ID }}
+          client-id: ${{ vars.PLUGIN_KIT_APP_ID }}
           private-key: ${{ secrets.PLUGIN_KIT_APP_PRIVATE_KEY }}
-          repositories: pohunekd/pohunek-plugin-kit
+          owner: pohunekd
+          repositories: pohunek-plugin-kit
+          permission-contents: write
 
       - name: Publish the release
         shell: bash
@@ -157,9 +238,11 @@ jobs:
             notes="Plugin kit bundle of core release ${TAG#core-}."
           fi
           # A draft first, so a failed upload never publishes a partial release.
+          # The tag is created when the draft is published; the kit repository
+          # carries an initial commit (owner setup).
           # shellcheck disable=SC2086
-          gh release create "$TAG" --repo "$KIT_REPO" --draft --verify-tag \
-            --title "$TAG" --notes "$notes" $flags
+          gh release create "$TAG" --repo "$KIT_REPO" --draft \
+            --target main --title "$TAG" --notes "$notes" $flags
           gh release upload "$TAG" --repo "$KIT_REPO" dist/*.tar.zst dist/SHA256SUMS
           gh release edit "$TAG" --repo "$KIT_REPO" --draft=false
 
@@ -171,10 +254,13 @@ jobs:
         run: |
           set -euo pipefail
           cutoff="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          case "$cutoff" in
+            ????-??-??T??:??:??Z) ;;
+            *) echo "::error::unexpected cutoff date: $cutoff"; exit 1 ;;
+          esac
           gh release list --repo "$KIT_REPO" --limit 100 \
-            --json tagName,createdAt,isPrerelease \
-            --jq -r --arg cutoff "$cutoff" \
-            '.[] | select(.isPrerelease and (.tagName | startswith("nightly-")) and .createdAt < $cutoff) | .tagName' \
+            --json tagName,createdAt,isPrerelease --jq \
+            ".[] | select(.isPrerelease and (.tagName | startswith(\"nightly-\")) and .createdAt < \"$cutoff\") | .tagName" \
           | while IFS= read -r old; do
             [ -n "$old" ] || continue
             gh release delete "$old" --repo "$KIT_REPO" --yes --cleanup-tag

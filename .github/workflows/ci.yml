@@ -2320,6 +2320,11 @@ jobs:
       contents: read
     with:
       mode: rehearsal
+      # The schedule and a `tier=nightly` dispatch are the nightly tier:
+      # the kit jobs and the kit attest job run only then (issue #1613).
+      # A `tier=main` dispatch, a push or a pull request rehearses the
+      # release assembly only.
+      nightly: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) && 'true' || 'false' }}
 
   # The rehearsal's synthetic-archive smoke scenarios (issue #1259, D1/D2).
   # The scenarios read only this checkout, so the job waits for `changes`
@@ -2348,6 +2353,7 @@ jobs:
       version: ${{ needs.release-rehearsal-build.outputs.version }}
       commit: ${{ github.sha }}
       mode: rehearsal
+      nightly: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'nightly')) && 'true' || 'false' }}
       targets: x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-apple-darwin
       # The scenarios ran in this run, not in the called workflow (which runs
       # them in a release only). The verdict refuses a rehearsal whose external

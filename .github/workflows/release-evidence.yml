@@ -16,6 +16,10 @@ name: Release evidence
 #                     uv), runs the consumer out of process and emits
 #                     attestation-<runtime>-<target>.json
 #   attest            build provenance for every producer artifact (release only)
+#   attest-kit        build provenance for the kit bundles on the nightly
+#                     tier (schedule or a `tier=nightly` dispatch, passed as
+#                     the `nightly` input; rehearsal only — see the trust
+#                     model below)
 #   assemble          verifies provenance with `gh attestation verify`, then
 #                     `cargo xtask release assemble` signs the catalog with the
 #                     CI root key (release only; the environment `release`)
@@ -37,12 +41,14 @@ name: Release evidence
 #
 # Trust model. `rows`, `assemble*` and `smoke` run repository code
 # and hold a read-only token; none of them can create an attestation or write
-# to the repository. `attest` and `attest-bundle` are the only jobs with
-# `id-token: write` and `attestations: write`; they check out nothing, run no
-# repository or downloaded code, and are skipped in a rehearsal, so a CI run
-# never mints provenance that `gh attestation verify` would accept for a
-# throwaway-key bundle. Only `assemble` has the environment `release` (deployment
-# policy: tags `v*`) and reads CATALOG_SIGNING_KEY_CI, in its signing step.
+# to the repository. `attest`, `attest-kit` and `attest-bundle` are the only
+# jobs with `id-token: write` and `attestations: write`; they check out
+# nothing, run no repository or downloaded code, and `attest` is skipped in
+# a rehearsal while `attest-kit` runs only on the nightly tier, so a pull
+# request or push run never mints provenance that `gh attestation verify`
+# would accept for a throwaway-key bundle. Only `assemble` has the
+# environment `release` (deployment policy: tags `v*`) and reads
+# CATALOG_SIGNING_KEY_CI, in its signing step.
 # This workflow never creates or edits a GitHub Release.
 #
 # The calling job must grant `id-token: write` and `attestations: write` even
@@ -74,6 +80,11 @@ on:
         type: string
         required: false
         default: ""
+      nightly:
+        description: "`true` when the caller runs the nightly tier (schedule or a `tier=nightly` dispatch); the kit attest job runs only then"
+        type: string
+        required: false
+        default: "false"
     secrets:
       CATALOG_SIGNING_KEY_CI:
         description: CI root seed, used only by the release assembly job
@@ -338,6 +349,47 @@ jobs:
             ${{ runner.temp }}/attest-assets/*.tar.zst
             ${{ runner.temp }}/attest-assets/*.sha256
             ${{ runner.temp }}/attest-assets/*.json
+
+  # Nightly attestation of the plugin kit bundles (issue #1613). The
+  # scheduled nightly and a `tier=nightly` dispatch run this workflow in
+  # `rehearsal` mode, where `attest` is skipped because a throwaway key
+  # signs nothing. This job attests `build-kit-*` only, from the nightly
+  # run itself: no repository clone, no repository code, the same
+  # no-trust-model as `attest`. A pull request or push run never reaches it.
+  attest-kit:
+    name: Attest the kit bundles
+    if: ${{ inputs.mode == 'rehearsal' && inputs.nightly == 'true' }}
+    needs: [rows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the kit bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-kit-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-kit-assets
+
+      - name: Check the kit checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/attest-kit-assets"
+          sha256sum -c ./*.sha256
+          archives="$(find . -maxdepth 1 -type f -name '*.tar.zst' | wc -l)"
+          checksums="$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)"
+          test "$archives" = "$checksums"
+
+      - name: Attest the kit bundles
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/attest-kit-assets/*.tar.zst
+            ${{ runner.temp }}/attest-kit-assets/*.sha256
 
   # Release assembly: the only job that reads the signing secret, and only in
   # its signing step. The key is written to tmpfs and shredded by
@@ -681,7 +733,7 @@ jobs:
   verdict:
     name: Evidence verdict
     if: ${{ always() }}
-    needs: [plan, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke, smoke-scenarios]
+    needs: [plan, rows, attest, attest-kit, assemble, assemble-rehearsal, attest-bundle, smoke, smoke-scenarios]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -732,16 +784,19 @@ jobs:
         shell: bash
         env:
           MODE: ${{ inputs.mode }}
+          NIGHTLY: ${{ inputs.nightly }}
           SCENARIOS: ${{ inputs.scenarios_result }}
           NEEDS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" --arg scenarios "$SCENARIOS" '
+          printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" --arg nightly "$NIGHTLY" --arg scenarios "$SCENARIOS" '
             . as $needs
             | (if $mode == "release" then
-                 {success: ["plan","rows","attest","assemble","attest-bundle","smoke","smoke-scenarios"], skipped: ["assemble-rehearsal"]}
+                 {success: ["plan","rows","attest","assemble","attest-bundle","smoke","smoke-scenarios"], skipped: ["assemble-rehearsal","attest-kit"]}
+               elif $mode == "rehearsal" and $nightly == "true" then
+                 {success: ["plan","rows","assemble-rehearsal","smoke","attest-kit"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios"]}
                elif $mode == "rehearsal" then
-                 {success: ["plan","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios"]}
+                 {success: ["plan","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle","smoke-scenarios","attest-kit"]}
                else error("unknown mode") end) as $want
             | all($want.success[]; . as $n | $needs[$n].result == "success")
               and all($want.skipped[]; . as $n | $needs[$n].result == "skipped")

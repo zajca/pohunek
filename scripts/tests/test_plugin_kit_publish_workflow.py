@@ -6,11 +6,17 @@ repository `pohunekd/pohunek-plugin-kit` (issue #1613). The checks pin its
 security model:
 
 - the trigger is `workflow_run` on `CI` and `Release`, `completed` only;
-- one job only, holding exactly `contents: read` and `actions: read`;
+- one job only, holding exactly `actions: read` and `attestations: read`;
 - the job skips while the owner-side `PLUGIN_KIT_APP_ID` variable is empty
   (D3: the kit repository, its App and its secrets do not exist yet);
 - the job runs for a successful Release push run or a successful scheduled
   CI run only, never for a pull request or a push run;
+- the Release path requires that the `HEAD_BRANCH` release exists in
+  `zajca/pohunek`, is published (no draft, no prerelease), and that its tag
+  commit equals `HEAD_SHA` (high-1);
+- the job verifies the bundle provenance with `gh attestation verify`
+  before the App token is minted, with the `release-evidence.yml` signer
+  workflow; nightlies verify with `--source-ref refs/heads/main`;
 - the job checks out nothing and restores no cache;
 - Linux runs on `ubuntu-24.04`;
 - every third-party action is pinned to a full commit sha;
@@ -22,7 +28,8 @@ security model:
 
 The `run:` bodies of the tag selection and the bundle check also run
 against fixtures, so a shell regression fails here instead of at publish
-time.
+time. Fixtures fake `gh` and `date` on `PATH`; the bodies under test may
+call only those two plus the standard POSIX tools.
 """
 
 import os
@@ -67,7 +74,7 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         permissions = re.findall(r"(?m)^    permissions:\n(?:      \S+: \S+\n)+", self.jobs)
         self.assertEqual(len(permissions), 1, "exactly one job declares permissions")
         scopes = dict(re.findall(r"(?m)^      (\S+): (\S+)$", permissions[0]))
-        self.assertEqual(scopes, {"contents": "read", "actions": "read"})
+        self.assertEqual(scopes, {"actions": "read", "attestations": "read"})
 
     def test_the_job_is_gated_on_the_owner_side_app(self):
         condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", self.jobs)
@@ -85,6 +92,16 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/checkout", self.text)
         self.assertNotIn("rust-cache", self.text)
         self.assertNotIn("actions/cache", self.text)
+
+    def test_the_app_token_uses_the_first_party_action(self):
+        mint = self.text.partition("- name: Mint the kit repository token")[2]
+        self.assertIn("actions/create-github-app-token@", mint)
+        self.assertNotIn("peter-evans/", mint)
+        self.assertIn("client-id: ${{ vars.PLUGIN_KIT_APP_ID }}", mint)
+        self.assertIn("private-key: ${{ secrets.PLUGIN_KIT_APP_PRIVATE_KEY }}", mint)
+        self.assertIn("owner: pohunekd", mint)
+        self.assertIn("repositories: pohunek-plugin-kit", mint)
+        self.assertIn("permission-contents: write", mint)
 
     def test_no_secret_leaves_the_job_as_an_input(self):
         for use in USES.findall(self.text):
@@ -111,6 +128,28 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         self.assertIn("run-id: ${{ env.RUN_ID }}", self.text)
         self.assertIn("pattern: build-kit-*", self.text)
 
+    def test_the_release_path_is_pinned_to_the_tag_release(self):
+        # High-1: the workflow matches by name, so the run must be tied to
+        # the real published tag release in zajca/pohunek.
+        select = self.text.partition("- name: Select the release tag")[2].partition("- name: Download")[0]
+        self.assertIn(".github/workflows/release.yml", select)
+        self.assertIn('HEAD_REPO" != "zajca/pohunek"', select)
+        self.assertIn("gh release view", select)
+        self.assertIn("is not published at", select)
+        self.assertIn("is a pre-release", select)
+
+    def test_the_provenance_is_verified_before_the_token_is_minted(self):
+        bundle_verify = self.text.partition("- name: Verify the bundle provenance")[2]
+        mint_at = bundle_verify.index("- name: Mint the kit repository token")
+        verify = bundle_verify[:mint_at]
+        self.assertIn("gh attestation verify", verify)
+        self.assertIn("--signer-workflow \"zajca/pohunek/.github/workflows/release-evidence.yml\"", verify)
+        self.assertIn("--source-ref \"refs/tags/$HEAD_BRANCH\"", verify)
+        self.assertIn("--deny-self-hosted-runners", verify)
+        # Nightlies carry no release attestation: they verify against main.
+        self.assertIn('if: ${{ steps.select.outputs.prerelease == \'true\' }}', bundle_verify)
+        self.assertIn("--source-ref refs/heads/main", bundle_verify)
+
     def test_the_publish_is_draft_first(self):
         publish = self.text.partition("- name: Publish the release")[2]
         create = publish.index("gh release create")
@@ -120,14 +159,15 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         self.assertLess(upload, edit)
         self.assertIn("--draft", publish)
         self.assertIn("--draft=false", publish)
-        self.assertIn("--verify-tag", publish)
-        self.assertIn("dist/SHA256SUMS", publish)
+        self.assertNotIn("--verify-tag", publish)
+        self.assertIn("--target main", publish)
+        self.assertIn("dist/*.tar.zst dist/SHA256SUMS", publish)
         self.assertIn("--prerelease", publish)
 
     def test_the_prune_keeps_a_bounded_nightly_history(self):
         prune = self.text.partition("- name: Prune nightlies older than 30 days")[2]
         self.assertIn("30 days ago", prune)
-        self.assertIn('startswith("nightly-")', prune)
+        self.assertIn('startswith(\\"nightly-\\")', prune)
         self.assertIn("gh release delete", prune)
         self.assertIn("--cleanup-tag", prune)
         condition = re.search(r"(?m)^      - name: Prune nightlies older than 30 days\n        if: (.+)$", self.text)
@@ -138,6 +178,19 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
     def test_concurrent_publishes_are_serialized(self):
         self.assertIn("concurrency:", self.text.partition("\njobs:\n")[0])
         self.assertIn("group: plugin-kit-publish", self.text)
+
+
+FAKE_GH_RELEASE_VIEW = """\
+case "$*" in
+  *" --json isDraft,isPrerelease,tagCommit"*)
+    printf '%s' "$PLUGIN_KIT_VIEW"
+    ;;
+  *)
+    echo "unexpected gh call: $*" >&2
+    exit 99
+    ;;
+esac
+"""
 
 
 class PluginKitPublishShellTests(unittest.TestCase):
@@ -159,17 +212,39 @@ class PluginKitPublishShellTests(unittest.TestCase):
                 body.append(line)
         return "\n".join(body)
 
-    def run_select(self, env):
+    def run_select(self, env, view="false false deadbeef"):
         root = Path(tempfile.mkdtemp(prefix="plugin-kit-select-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         out = root / "GITHUB_OUTPUT"
         out.write_text("")
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(root), "GITHUB_OUTPUT": str(out), **env}
+        bindir = root / "bin"
+        bindir.mkdir()
+        (bindir / "gh").write_text("#!/bin/sh\n" + FAKE_GH_RELEASE_VIEW)
+        (bindir / "gh").chmod(0o755)
+        env = {
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "HOME": str(root),
+            "GITHUB_OUTPUT": str(out),
+            "GH_TOKEN": "fixture",
+            "CORE_REPO": "zajca/pohunek",
+            "WORKFLOW_PATH": ".github/workflows/release.yml",
+            "HEAD_REPO": "zajca/pohunek",
+            "PLUGIN_KIT_VIEW": view,
+            **env,
+        }
         completed = subprocess.run(
             ["bash", "-euo", "pipefail", "-c", self.step("Select the release tag")],
             cwd=root, env=env, capture_output=True, text=True, timeout=60,
         )
         return completed, out
+
+    def release_env(self, branch="v0.44.0", sha="394a7a440abc1234567890abcdef1234567890ab", **extra):
+        return {
+            "WORKFLOW_NAME": "Release",
+            "HEAD_BRANCH": branch,
+            "HEAD_SHA": sha,
+            **extra,
+        }
 
     def run_body(self, name, env, files=(), checksums=True):
         root = Path(tempfile.mkdtemp(prefix="plugin-kit-publish-"))
@@ -202,12 +277,9 @@ class PluginKitPublishShellTests(unittest.TestCase):
         return values
 
     def test_the_select_maps_a_release_tag(self):
+        sha = "394a7a440abc1234567890abcdef1234567890ab"
         completed, out = self.run_select(
-            {
-                "WORKFLOW_NAME": "Release",
-                "HEAD_BRANCH": "v0.44.0",
-                "HEAD_SHA": "394a7a440abc1234567890abcdef1234567890ab",
-            },
+            self.release_env(sha=sha), view=f"false false {sha}",
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(
@@ -217,20 +289,41 @@ class PluginKitPublishShellTests(unittest.TestCase):
     def test_the_select_refuses_a_non_tag_release_run(self):
         for branch in ("main", "v0.44", "0.44.0"):
             with self.subTest(branch=branch):
-                completed, _ = self.run_select(
-                    {
-                        "WORKFLOW_NAME": "Release",
-                        "HEAD_BRANCH": branch,
-                        "HEAD_SHA": "394a7a440abc1234567890abcdef1234567890ab",
-                    },
-                )
+                completed, _ = self.run_select(self.release_env(branch=branch))
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn("must come from a vX.Y.Z tag", completed.stdout)
+
+    def test_the_select_refuses_an_unpublished_release(self):
+        sha = "394a7a440abc1234567890abcdef1234567890ab"
+        for view, message in (
+            (f"true false {sha}", "is not published"),
+            (f"false true {sha}", "is a pre-release"),
+            (f"false false {'0' * 40}", "is not published"),
+        ):
+            with self.subTest(view=view):
+                completed, _ = self.run_select(self.release_env(sha=sha), view=view)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stdout + completed.stderr)
+
+    def test_the_select_refuses_a_wrong_release_workflow(self):
+        completed, _ = self.run_select(
+            {**self.release_env(), "WORKFLOW_PATH": ".github/workflows/ci.yml"},
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("must come from release.yml", completed.stdout)
+
+    def test_the_select_refuses_a_forked_release_run(self):
+        completed, _ = self.run_select(
+            {**self.release_env(), "HEAD_REPO": "someone/pohunek"},
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("must come from zajca/pohunek", completed.stdout)
 
     def test_the_select_maps_a_nightly_run(self):
         completed, out = self.run_select(
             {
                 "WORKFLOW_NAME": "CI",
+                "WORKFLOW_PATH": ".github/workflows/ci.yml",
                 "HEAD_BRANCH": "main",
                 "HEAD_SHA": "394a7a440abc1234567890abcdef1234567890ab",
             },
@@ -244,6 +337,7 @@ class PluginKitPublishShellTests(unittest.TestCase):
         completed, _ = self.run_select(
             {
                 "WORKFLOW_NAME": "CI",
+                "WORKFLOW_PATH": ".github/workflows/ci.yml",
                 "HEAD_BRANCH": "main",
                 "HEAD_SHA": "xyz",
             },
@@ -318,7 +412,7 @@ class PluginKitPublishShellTests(unittest.TestCase):
             files=files,
         )
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("no single X.Y.Z version", completed.stdout + completed.stderr)
+        self.assertIn("disagree on the version", completed.stdout + completed.stderr)
 
     def test_the_check_rejects_a_single_bundle(self):
         files = self.kit_files(("0.44.0", "x86_64-unknown-linux-gnu"))

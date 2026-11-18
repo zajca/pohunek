@@ -3,12 +3,14 @@
 - The release build ships the owner-side plugin kit bundle
   `pohunek-plugin-kit-<version>-<target>.tar.zst` for
   `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` (the `kit-linux` and
-  `kit-macos` jobs of `release-build.yml`, on tag releases and the scheduled
-  nightly rehearsal only, never on pull request or push runs). The bundle
+  `kit-macos` jobs of `release-build.yml`, on tag releases and the nightly
+  tier only — the schedule or a `tier=nightly` dispatch — never on pull
+  request or push runs). The bundle
   holds `pohunek`, `pohunekd`, `pohunek-sessiond` and `pohunek-plugin-kit`
   plus the descriptor schema note; it carries no release MANIFEST and never
   enters the release bundle. The `attest` job of `release-evidence.yml`
-  attests it with the other producer artifacts, so a downloaded bundle
+  attests it with the other producer artifacts in a release, and the
+  `attest-kit` job attests it on the nightly tier, so a downloaded bundle
   verifies with the same signer workflow identity as the existing release
   assets.
 - The new `plugin-kit-publish` workflow publishes the bundles as releases of
