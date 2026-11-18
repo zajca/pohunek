@@ -41,9 +41,6 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: plugin-kit-publish
-
 jobs:
   publish:
     name: Publish the kit bundle to the kit repository
@@ -102,18 +99,35 @@ jobs:
               echo "::error::the Release run must come from zajca/pohunek, got: $HEAD_REPO"
               exit 1
             fi
-            info="$(gh release view "$HEAD_BRANCH" --repo "$CORE_REPO" --json isDraft,isPrerelease,tagCommit --jq '"\(.isDraft) \(.isPrerelease) \(.tagCommit.oid // "")"')"
+            info="$(gh release view "$HEAD_BRANCH" --repo "$CORE_REPO" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')"
             case "$info" in
-              "false false $HEAD_SHA") ;;
-              "false true "*)
+              "false false") ;;
+              "false true")
                 echo "$HEAD_BRANCH is a pre-release; the kit release follows published releases only"
                 exit 1
                 ;;
               *)
-                echo "::error::release $HEAD_BRANCH is not published at $HEAD_SHA"
+                echo "::error::release $HEAD_BRANCH is not published"
                 exit 1
                 ;;
             esac
+            # Resolve the tag commit through the git ref namespace: a
+            # branch with the same name must not satisfy the check (H1).
+            # An annotated tag dereferences through its tag object.
+            ref="$(gh api "repos/$CORE_REPO/git/ref/tags/$HEAD_BRANCH" --jq '.object.sha')"
+            kind="$(gh api "repos/$CORE_REPO/git/ref/tags/$HEAD_BRANCH" --jq '.object.type')"
+            case "$kind" in
+              commit) tag_commit="$ref" ;;
+              tag) tag_commit="$(gh api "repos/$CORE_REPO/git/tags/$ref" --jq '.object.sha')" ;;
+              *)
+                echo "::error::tag $HEAD_BRANCH points at $kind, expected a commit"
+                exit 1
+                ;;
+            esac
+            if [ "$tag_commit" != "$HEAD_SHA" ]; then
+              echo "::error::release $HEAD_BRANCH points at $tag_commit, not $HEAD_SHA"
+              exit 1
+            fi
           elif [ "$WORKFLOW_NAME" = CI ]; then
             case "$WORKFLOW_PATH" in
               .github/workflows/ci.yml) ;;

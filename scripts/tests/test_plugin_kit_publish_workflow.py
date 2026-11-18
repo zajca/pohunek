@@ -76,17 +76,66 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         scopes = dict(re.findall(r"(?m)^      (\S+): (\S+)$", permissions[0]))
         self.assertEqual(scopes, {"actions": "read", "attestations": "read"})
 
-    def test_the_job_is_gated_on_the_owner_side_app(self):
+    EXPECTED_IF = (
+        "vars.PLUGIN_KIT_APP_ID != ''"
+        " && github.event.workflow_run.conclusion == 'success'"
+        " && ((github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'push')"
+        " || (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'schedule'))"
+    )
+
+    def job_if(self):
         condition = re.search(r"(?m)^    if: \$\{\{ (.+) \}\}$", self.jobs)
         self.assertIsNotNone(condition, "the publish job carries an if gate")
         assert condition is not None
-        expression = condition.group(1)
+        return condition.group(1)
+
+    def evaluate_if(self, expression, app, conclusion, name, event):
+        namespace = {
+            "vars": {"PLUGIN_KIT_APP_ID": app},
+            "github": {"event": {"workflow_run": {
+                "conclusion": conclusion, "name": name, "event": event,
+            }}},
+        }
+        python = re.sub(r"vars\.([A-Za-z_]+)", r"vars['\1']", expression)
+        python = re.sub(
+            r"github\.event\.workflow_run\.([a-z]+)",
+            r"github['event']['workflow_run']['\1']", python,
+        )
+        python = python.replace("&&", " and ").replace("||", " or ")
+        python = python.replace("!= ''", ".strip() != ''")
+        python = re.sub(r"== '(.*?)'", r"== '\1'", python)
+        return eval(python, {"__builtins__": {}}, namespace)  # noqa: S307 - fixture table
+
+    def test_the_job_is_gated_on_the_owner_side_app(self):
+        expression = self.job_if()
+        self.assertEqual(expression, self.EXPECTED_IF)
         self.assertIn("vars.PLUGIN_KIT_APP_ID != ''", expression)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", expression)
         self.assertIn("github.event.workflow_run.name == 'Release'", expression)
         self.assertIn("github.event.workflow_run.event == 'push'", expression)
         self.assertIn("github.event.workflow_run.name == 'CI'", expression)
         self.assertIn("github.event.workflow_run.event == 'schedule'", expression)
+
+    def test_the_job_gate_admits_only_successful_release_and_nightly_runs(self):
+        expression = self.job_if()
+        cases = (
+            # (app, conclusion, name, event, expected)
+            ("123", "success", "Release", "push", True),
+            ("123", "success", "CI", "schedule", True),
+            ("", "success", "Release", "push", False),
+            ("123", "failure", "Release", "push", False),
+            ("123", "success", "Release", "schedule", False),
+            ("123", "success", "CI", "push", False),
+            ("123", "success", "Release", "pull_request", False),
+            ("123", "success", "CI", "pull_request", False),
+            ("123", "success", "CI", "workflow_dispatch", False),
+        )
+        for app, conclusion, name, event, expected in cases:
+            with self.subTest(conclusion=conclusion, name=name, event=event):
+                self.assertEqual(
+                    bool(self.evaluate_if(expression, app, conclusion, name, event)),
+                    expected,
+                )
 
     def test_no_checkout_and_no_cache(self):
         self.assertNotIn("actions/checkout", self.text)
@@ -135,7 +184,7 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         self.assertIn(".github/workflows/release.yml", select)
         self.assertIn('HEAD_REPO" != "zajca/pohunek"', select)
         self.assertIn("gh release view", select)
-        self.assertIn("is not published at", select)
+        self.assertIn("is not published\"", select)
         self.assertIn("is a pre-release", select)
 
     def test_the_provenance_is_verified_before_the_token_is_minted(self):
@@ -170,20 +219,60 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         self.assertIn('startswith(\\"nightly-\\")', prune)
         self.assertIn("gh release delete", prune)
         self.assertIn("--cleanup-tag", prune)
+        # The cutoff is interpolated into the --jq string after
+        # format validation; an uninterpolated $cutoff reaches jq.
+        self.assertIn('.createdAt < \\"$cutoff\\")', prune)
+        self.assertNotIn("$cutoff-", prune.replace('\\"$cutoff\\"', ""))
         condition = re.search(r"(?m)^      - name: Prune nightlies older than 30 days\n        if: (.+)$", self.text)
         self.assertIsNotNone(condition, "the prune step runs for nightlies only")
         assert condition is not None
         self.assertIn("prerelease", condition.group(1))
 
     def test_concurrent_publishes_are_serialized(self):
-        self.assertIn("concurrency:", self.text.partition("\njobs:\n")[0])
-        self.assertIn("group: plugin-kit-publish", self.text)
+        header = self.text.partition("\njobs:\n")[0]
+        self.assertNotIn("concurrency:", header)
+        publish = self.jobs.partition("  publish:\n")[2]
+        self.assertIn("    concurrency:\n      group: plugin-kit-publish\n", publish)
+
+    def test_the_publish_runs_in_the_gated_environment(self):
+        publish = self.jobs.partition("  publish:\n")[2]
+        self.assertIn("    environment: plugin-kit-publish\n", publish)
 
 
 FAKE_GH_RELEASE_VIEW = """\
+# The gh 2.x `release view --json` fields (fix1b item 1): an unknown field
+# exits nonzero, so a workflow that asks for one fails instead of
+# publishing on empty data.
+if [ "$1 $2" = "release view" ]; then
+  shift 2
+  fields=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) fields="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  allowed=",apiUrl,assets,author,body,createdAt,databaseId,id,isDraft,isImmutable,isPrerelease,name,publishedAt,tagName,tarballUrl,targetCommitish,uploadUrl,url,zipballUrl,"
+  old="$IFS"; IFS=','; set -- $fields; IFS="$old"
+  for field in "$@"; do
+    case "$allowed" in
+      *",$field,"*) ;;
+      *) echo "Unknown JSON field: '$field'" >&2; exit 1 ;;
+    esac
+  done
+  printf '%s' "$PLUGIN_KIT_VIEW"
+  exit 0
+fi
 case "$*" in
-  *" --json isDraft,isPrerelease,tagCommit"*)
-    printf '%s' "$PLUGIN_KIT_VIEW"
+  *"api repos/"*"/git/ref/tags/"*)
+    case "$*" in
+      *"--jq ".object.sha*) printf '%s' "$PLUGIN_KIT_REF" ;;
+      *"--jq ".object.type*) printf '%s' "$PLUGIN_KIT_KIND" ;;
+      *) echo "unexpected gh api call: $*" >&2; exit 99 ;;
+    esac
+    ;;
+  *"api repos/"*"/git/tags/"*)
+    printf '%s' "$PLUGIN_KIT_TAG"
     ;;
   *)
     echo "unexpected gh call: $*" >&2
@@ -212,7 +301,7 @@ class PluginKitPublishShellTests(unittest.TestCase):
                 body.append(line)
         return "\n".join(body)
 
-    def run_select(self, env, view="false false deadbeef"):
+    def run_select(self, env, view="false false", ref="deadbeef", kind="commit", tag="deadbeef"):
         root = Path(tempfile.mkdtemp(prefix="plugin-kit-select-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         out = root / "GITHUB_OUTPUT"
@@ -230,6 +319,9 @@ class PluginKitPublishShellTests(unittest.TestCase):
             "WORKFLOW_PATH": ".github/workflows/release.yml",
             "HEAD_REPO": "zajca/pohunek",
             "PLUGIN_KIT_VIEW": view,
+            "PLUGIN_KIT_REF": ref,
+            "PLUGIN_KIT_KIND": kind,
+            "PLUGIN_KIT_TAG": tag,
             **env,
         }
         completed = subprocess.run(
@@ -279,7 +371,19 @@ class PluginKitPublishShellTests(unittest.TestCase):
     def test_the_select_maps_a_release_tag(self):
         sha = "394a7a440abc1234567890abcdef1234567890ab"
         completed, out = self.run_select(
-            self.release_env(sha=sha), view=f"false false {sha}",
+            self.release_env(sha=sha), view="false false", ref=sha,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.outputs(out), {"tag": "core-v0.44.0", "prerelease": "false"}
+        )
+
+    def test_the_select_maps_an_annotated_tag(self):
+        sha = "394a7a440abc1234567890abcdef1234567890ab"
+        tag_object = "aaaaaaaabbbbccccddddeeeeffff000011112222"
+        completed, out = self.run_select(
+            self.release_env(sha=sha), view="false false", ref=tag_object,
+            kind="tag", tag=sha,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(
@@ -296,14 +400,21 @@ class PluginKitPublishShellTests(unittest.TestCase):
     def test_the_select_refuses_an_unpublished_release(self):
         sha = "394a7a440abc1234567890abcdef1234567890ab"
         for view, message in (
-            (f"true false {sha}", "is not published"),
-            (f"false true {sha}", "is a pre-release"),
-            (f"false false {'0' * 40}", "is not published"),
+            ("true false", "is not published"),
+            ("false true", "is a pre-release"),
         ):
             with self.subTest(view=view):
-                completed, _ = self.run_select(self.release_env(sha=sha), view=view)
+                completed, _ = self.run_select(self.release_env(sha=sha), view=view, ref=sha)
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(message, completed.stdout + completed.stderr)
+
+    def test_the_select_refuses_a_tag_commit_mismatch(self):
+        sha = "394a7a440abc1234567890abcdef1234567890ab"
+        completed, _ = self.run_select(
+            self.release_env(sha=sha), view="false false", ref="0" * 40,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("points at", completed.stdout + completed.stderr)
 
     def test_the_select_refuses_a_wrong_release_workflow(self):
         completed, _ = self.run_select(
