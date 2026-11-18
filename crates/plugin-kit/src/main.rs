@@ -96,8 +96,11 @@ enum Command {
         #[arg(long)]
         upstream: Option<PathBuf>,
         /// Smoke script: a plugin-owned executable run once inside the
-        /// live isolated root after the generic smoke checks pass.
-        /// Without it, the smoke stops after the screen check.
+        /// live isolated root after every generic smoke check passed.
+        /// Without it, the smoke stops after the screen check. A bare
+        /// `pohunek` in the script reaches the isolated daemon through
+        /// the isolated `XDG_RUNTIME_DIR`; the script's stdout and stderr
+        /// both go to the kit's stderr.
         #[arg(long)]
         script: Option<PathBuf>,
         /// Print the report as a single JSON document.

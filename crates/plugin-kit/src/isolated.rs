@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::io::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -88,13 +89,19 @@ const _: () = assert!(
 );
 
 /// Socket path below the root: `XDG_RUNTIME_DIR` plus the application
-/// directory and socket file the daemon appends to it.
+/// directory and socket file the daemon appends to it. Bare `pohunek`
+/// commands reach the isolated daemon through this directory: the CLI
+/// resolves the socket from the runtime directory, never from the socket
+/// variable below. The variable stays exported only as information for
+/// hook-style clients that read it from a session payload.
 const SOCKET_RELATIVE_PATH: &str = "xdg-runtime/pohunek/daemon.sock";
 
 /// Environment variable naming the isolated daemon's control socket for a
-/// smoke script: the handshake variable the daemon injects into session
-/// payloads (`protocol::ENV_SOCKET_PATH`), so scripted `pohunek`
-/// commands read it and reach the isolated daemon instead of the owner's.
+/// smoke script: informational only, for hook-style clients that read the
+/// socket path from the environment. A bare `pohunek` in the script
+/// reaches the isolated daemon through the isolated `XDG_RUNTIME_DIR`,
+/// not through this variable (the CLI resolves the socket from the
+/// runtime directory).
 const SOCKET_ENV_VAR: &str = protocol::ENV_SOCKET_PATH;
 
 /// Environment variable handing the smoke script the live session id the
@@ -581,15 +588,22 @@ impl Host {
     }
 
     /// Runs `script`, a plugin-owned executable from the plugin repository,
-    /// with the isolated socket and the live session id exported: the
-    /// socket path under `POHUNEK_SOCKET_PATH`, the session id under
-    /// `POHUNEK_SMOKE_SESSION`. The origin pair the CLI would otherwise
-    /// inherit (`POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID`) is deliberately
-    /// absent, so the script's `pohunek` commands connect as an owner with
-    /// an explicit id, not as the live session. The script inherits the
-    /// smoke's own stdout and stderr unchanged, and runs in the smoke's
-    /// own cwd: the caller starts the kit in the plugin repository, and
-    /// the kit never changes its cwd.
+    /// with the live session id exported under `POHUNEK_SMOKE_SESSION`. The
+    /// script reaches the isolated daemon through the isolated
+    /// `XDG_RUNTIME_DIR`: a bare `pohunek` on the script's `PATH` (the
+    /// isolated prefix, holding the release executables, comes first)
+    /// resolves its socket from that directory, so only the isolated
+    /// daemon's sessions answer. `POHUNEK_SOCKET_PATH` is exported only
+    /// as information for hook-style clients, not as routing. The origin
+    /// pair the CLI would otherwise inherit
+    /// (`POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID`) is deliberately absent,
+    /// so the script connects as an owner with an explicit id, not as
+    /// the live session. The script's stdout and stderr both go to the
+    /// kit's stderr unchanged, so `--json` stdout stays one JSON document.
+    /// The script runs in the smoke's own cwd: the caller starts the kit
+    /// in the plugin repository, and the kit never changes its cwd. After
+    /// the script exits, its process group is killed on every path, so no
+    /// backgrounded child survives the run.
     ///
     /// # Errors
     ///
@@ -599,21 +613,47 @@ impl Host {
     pub fn run_script(&mut self, script: &Path, session: &str) -> Result<ExitStatus, String> {
         require_safe_executable(script, &script.display().to_string())?;
         let socket = self.root.join(SOCKET_RELATIVE_PATH);
+        let mut script_path = vec![self.prefix.clone().into_os_string()];
+        script_path.extend(std::env::split_paths(&self.script_path()).map(PathBuf::into_os_string));
+        let script_path = std::env::join_paths(script_path)
+            .map_err(|error| format!("cannot join the smoke script `PATH`: {error}"))?;
         let extra = [
             (OsString::from(SOCKET_ENV_VAR), socket.into_os_string()),
             (OsString::from(SESSION_ENV_VAR), OsString::from(session)),
+            (OsString::from("PATH"), script_path),
         ];
+        let stderr = std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map(Stdio::from)
+            .map_err(|error| format!("cannot duplicate stderr for the smoke script: {error}"))?;
         let mut child = Command::new(script)
             .env_clear()
             .envs(self.environment.iter().cloned())
             .envs(extra.iter().cloned())
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
+            .stdout(stderr)
             .stderr(Stdio::inherit())
             .process_group(0)
             .spawn()
             .map_err(|error| format!("cannot start the smoke script: {error}"))?;
-        wait_for_exit(&mut child, "the smoke script")
+        let status = wait_for_exit(&mut child, "the smoke script");
+        // No backgrounded child outlives the run: `ESRCH` (nothing left)
+        // is the normal path, anything else is ignored too because the
+        // script already exited and there is nothing left to report.
+        if let Ok(pid) = i32::try_from(child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        status
+    }
+
+    /// The `PATH` every child except a smoke script runs with.
+    fn script_path(&self) -> OsString {
+        self.environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
     }
 
     /// Runs `program`, an executable outside the prefix, with `arguments` in

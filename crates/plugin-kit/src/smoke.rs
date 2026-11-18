@@ -247,7 +247,12 @@ fn smoke_session(
         .ok_or_else(|| refuse("`pohunek session new` reported no session id"))?
         .to_owned();
     let wait = wait_for_screen(host, &session);
-    let scripted = script.map(|script| run_script(host, script, &session));
+    // The script runs only after every generic smoke check passed: a
+    // failed wait never starts it, and teardown still happens below.
+    let scripted = match (&wait, script) {
+        (Ok(_), Some(script)) => Some(run_script(host, script, &session)),
+        _ => None,
+    };
     let cleanup = stop_session(host, &session);
     let (activity, screen_lines) = wait?;
     if let Some(scripted) = scripted {
@@ -259,11 +264,16 @@ fn smoke_session(
 
 /// Runs the plugin-owned smoke script inside the live isolated root after
 /// the generic smoke checks passed, against the live session id exported
-/// under `POHUNEK_SMOKE_SESSION`. The inherited origin pair stays absent,
-/// so the script's `pohunek` commands connect as an owner with an explicit
-/// session id. The script runs in the smoke's own cwd with its stdout and
-/// stderr inherited unchanged. A non-zero script exit fails the smoke
-/// with an error naming the script and the exit code.
+/// under `POHUNEK_SMOKE_SESSION`. The script reaches the isolated daemon
+/// through the isolated `XDG_RUNTIME_DIR`: a bare `pohunek` on its `PATH`
+/// resolves its socket there, so only the isolated daemon's sessions
+/// answer. `POHUNEK_SOCKET_PATH` is exported only as information for
+/// hook-style clients. The inherited origin pair stays absent, so the
+/// script connects as an owner with an explicit session id. The script
+/// runs in the smoke's own cwd with its stdout and stderr both going to
+/// the kit's stderr unchanged, so `--json` stdout stays one JSON document.
+/// A non-zero script exit fails the smoke with an error naming the script
+/// and the exit code.
 fn run_script(host: &mut Host, script: &Path, session: &str) -> Result<(), Error> {
     let status = host.run_script(script, session).map_err(Error::Usage)?;
     if status.success() {

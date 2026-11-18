@@ -486,11 +486,8 @@ fn kit_smoke_runs_the_script_against_the_live_session() {
         &script,
         "#!/bin/sh\n\
          set -eu\n\
-         test -n \"${POHUNEK_SOCKET_PATH:-}\" || exit 9\n\
-         [ -S \"$POHUNEK_SOCKET_PATH\" ] || exit 8\n\
-         test -n \"${POHUNEK_SMOKE_SESSION:-}\" || exit 7\n\
-         prefix=$(dirname \"$POHUNEK_SOCKET_PATH\" | sed 's|/xdg-runtime/pohunek$||')\n\
-         \"$prefix/prefix/pohunek\" session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+         echo \"a line on the script's own stdout\"\n\
+         pohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
     )
     .expect("write the smoke script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
@@ -509,6 +506,70 @@ fn kit_smoke_runs_the_script_against_the_live_session() {
         "smoke with a script failed: {}",
         stderr_of(&output)
     );
+    // The script's stdout line went to the kit's stderr, so the kit's
+    // stdout stays the single JSON document the smoke promises.
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert!(
+        stderr_of(&output).contains("a line on the script's own stdout"),
+        "the script line is on the kit stderr: {}",
+        stderr_of(&output)
+    );
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_kills_the_background_child_of_the_script() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let pids = kit.path("pids.txt");
+    let script = kit.path("smoke-background.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\n( echo $$ > \"{}\"\n  exec sleep 300 ) &\npohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+            pids.display()
+        ),
+    )
+    .expect("write the smoke script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke with a backgrounding script failed: {}",
+        stderr_of(&output)
+    );
+    let backgrounded: i32 = fs::read_to_string(&pids)
+        .expect("the script recorded its background child")
+        .trim()
+        .parse()
+        .expect("the recorded pid parses");
+    let deadline = std::time::Instant::now() + HANG_GUARD;
+    loop {
+        let gone = std::process::Command::new("kill")
+            .args(["-0", &backgrounded.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_or(true, |status| !status.success());
+        if gone || std::time::Instant::now() >= deadline {
+            assert!(
+                gone,
+                "the script's background child is gone after the smoke"
+            );
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
     used_root(&document, &kit);
 }
