@@ -337,7 +337,11 @@ impl Plugin {
         self.xtask(&refs)
     }
 
-    /// Proof roots left in `TMPDIR`.
+    /// Proof roots left in the kit's `TMPDIR`: only the directory this test
+    /// gave the kit. The kit falls back to its short system parent when
+    /// the temp root is too long for a socket path; that fallback case is
+    /// covered in `crates/plugin-kit/tests/kit.rs` instead, so parallel
+    /// tests never see each other's roots here.
     fn leftover_roots(&self) -> Vec<String> {
         fs::read_dir(self.env.tmp_dir())
             .expect("read TMPDIR")
@@ -863,6 +867,51 @@ fn a_foreign_pre_install_archive_is_refused_at_install() {
     assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
 }
 
+/// A `--pre-install` file over the input cap is refused before it is
+/// decoded: the capped read bounds a caller-controlled file.
+#[test]
+fn an_oversized_pre_install_archive_is_refused_before_it_is_decoded() {
+    use std::io::Write as _;
+    let plugin = Plugin::new();
+    let package = plugin.context_package("oversized-older", "pohunek.context.fixture", "0.2.0");
+    let (archive, digest) =
+        plugin.build_as(&package, "built", "pohunek.context.fixture-0.2.0.tar.zst");
+    let entry = plugin.context_entry(
+        "oversized-context-entry.toml",
+        "pohunek.context.fixture",
+        &digest,
+        "0.2.0",
+    );
+    let oversized = plugin.path("oversized-pre-install.tar.zst");
+    let mut file = fs::File::create(&oversized).expect("create the oversized pre-install");
+    file.write_all(&vec![
+        0u8;
+        package::Limits::DEFAULT.max_compressed_bytes as usize
+            + 1
+    ])
+    .expect("write over the input cap");
+    let evidence = plugin.path("oversized-pre-install-evidence.json");
+    let output = plugin.prove_with_pre_install(
+        &archive,
+        &entry,
+        &release_dir(),
+        &evidence,
+        &oversized,
+        false,
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let limit = package::Limits::DEFAULT.max_compressed_bytes;
+    assert!(
+        stderr_of(&output).contains(&format!("is larger than the {limit}-byte limit")),
+        "the refusal names the input cap: {}",
+        stderr_of(&output)
+    );
+    let document = evidence_of(&evidence);
+    assert_eq!(document["result"], "fail");
+    assert_eq!(document["failed_step"], "install");
+    assert_eq!(plugin.leftover_roots(), Vec::<String>::new());
+}
+
 /// A newer installed version of the same package leaves the proved context
 /// version unselected, so the proof must fail at `install` on the default
 /// path and at `inspect` under `--no-enable`, where the digest check refuses
@@ -972,9 +1021,8 @@ fn a_runtime_id_the_index_never_authorizes_fails_at_install() {
     let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     assert!(
-        stderr_of(&output).contains("package_runtime_not_claimable")
-            || stderr_of(&output).contains("the pre-installed archive names"),
-        "neither the install-step refusal nor the pre-install conflict names the fixture: {}",
+        stderr_of(&output).contains("package_runtime_not_claimable"),
+        "the install-step refusal names the fixture: {}",
         stderr_of(&output)
     );
     let document = evidence_of(&evidence);
