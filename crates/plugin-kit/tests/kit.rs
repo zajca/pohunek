@@ -527,7 +527,7 @@ fn kit_smoke_kills_the_background_child_of_the_script() {
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\nset -eu\n( echo $$ > \"{}\"\n  exec sleep 300 ) &\npohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+            "#!/bin/sh\nset -eu\n( exec sleep 300 ) &\necho $! > \"{}\"\npohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
             pids.display()
         ),
     )
@@ -553,23 +553,21 @@ fn kit_smoke_kills_the_background_child_of_the_script() {
         .trim()
         .parse()
         .expect("the recorded pid parses");
-    let deadline = std::time::Instant::now() + HANG_GUARD;
-    loop {
-        let gone = std::process::Command::new("kill")
-            .args(["-0", &backgrounded.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_or(true, |status| !status.success());
-        if gone || std::time::Instant::now() >= deadline {
-            assert!(
-                gone,
-                "the script's background child is gone after the smoke"
-            );
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    // The kit kills the script's process group after the script exits:
+    // a short grace covers the kill, then the background pid must be
+    // gone. Without the kill this fails instead of waiting out the
+    // child's lifetime.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let gone = std::process::Command::new("kill")
+        .args(["-0", &backgrounded.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| !status.success());
+    assert!(
+        gone,
+        "the script's background child is gone after the smoke"
+    );
     let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
     used_root(&document, &kit);
 }
