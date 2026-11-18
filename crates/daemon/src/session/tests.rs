@@ -24367,6 +24367,91 @@ async fn initial_input_observation_ends_at_every_wait_outcome() {
     );
 }
 
+/// An initial-input timeout while the agent waits on a dialog names the
+/// blocked state and tells the caller to retry without `--input`; a
+/// slow-start timeout keeps the startup-grace hint instead. The refused
+/// session is rolled back, so the message never names its removed id.
+#[tokio::test]
+async fn initial_input_timeout_names_blocked_state_instead_of_the_startup_grace() {
+    for (tag, activity, blocked) in [
+        ("wt-timeout-blocked", Some(AgentActivity::Blocked), true),
+        ("wt-timeout-slow", Some(AgentActivity::Working), false),
+        ("wt-timeout-silent", None, false),
+    ] {
+        let daemon = RestartableDaemon::new(tag);
+        let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+            initial_input_startup_grace: Duration::ZERO,
+            ..daemon.config.clone()
+        });
+        let create_gate = hold_initial_input(&registry);
+        let outcome_gate = hold_initial_input_outcome(&registry);
+        let creating = tokio::spawn({
+            let registry = registry.clone();
+            let params = SessionNewParams {
+                input: Some("go".to_owned()),
+                ..daemon.params(&format!("feat/{tag}"))
+            };
+            async move { registry.create(params).await }
+        });
+        create_gate.entered.notified().await;
+        let session_id = {
+            let mut sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.values_mut().next().expect("committed session");
+            entry.default_detector_config.input_readiness =
+                crate::agent::host::InputReadiness::ManifestIdle;
+            entry.info.activity = activity;
+            entry.info.id.clone()
+        };
+        let removed_id = session_id.0.clone();
+        create_gate.release.notify_one();
+        outcome_gate.entered.notified().await;
+        outcome_gate.release.notify_one();
+        let error = creating
+            .await
+            .expect("create task joins")
+            .expect_err("the strict wait times out without readiness");
+        assert_eq!(error.code, "session_input_not_ready", "{tag}: error code");
+        if blocked {
+            assert!(
+                error.msg.contains("(last activity: blocked)"),
+                "{tag}: the message names the blocked state: {}",
+                error.msg
+            );
+            assert!(
+                !error.msg.contains(&removed_id),
+                "{tag}: the message names no removed session id: {}",
+                error.msg
+            );
+            assert!(
+                error.msg.contains("without --input"),
+                "{tag}: the message tells the caller to retry without --input: {}",
+                error.msg
+            );
+            assert!(
+                error.msg.contains("`pohunek attach <session-id>`"),
+                "{tag}: the message points at the dialog of the new session: {}",
+                error.msg
+            );
+            assert!(
+                !error.msg.contains("startup_grace"),
+                "{tag}: the message suggests no grace increase: {}",
+                error.msg
+            );
+        } else {
+            assert!(
+                error.msg.contains("raise input.initial_startup_grace_ms"),
+                "{tag}: the slow start keeps the grace hint: {}",
+                error.msg
+            );
+            assert!(
+                !error.msg.contains("pohunek attach"),
+                "{tag}: the slow start suggests no dialog answer: {}",
+                error.msg
+            );
+        }
+    }
+}
+
 /// A `ScreenIdle` create whose wait ends by daemon shutdown is refused even
 /// when its readiness turns true after that outcome was decided.
 #[tokio::test]

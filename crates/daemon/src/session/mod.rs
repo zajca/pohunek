@@ -4961,14 +4961,20 @@ impl SessionRegistry {
         match (strict, outcome) {
             (_, InitialInputWait::Ready) | (false, _) => Ok(()),
             (true, InitialInputWait::TimedOut) => {
-                let activity = self.current_activity_label(session_id).await;
-                Err(runtime_error(
-                    "session_input_not_ready",
+                let activity = self.current_activity(session_id).await;
+                let message = if activity == Some(AgentActivity::Blocked) {
+                    "the agent waits on a dialog that needs an answer (last activity: blocked); nothing was sent and the session was not kept, start the session without --input, answer the agent's dialog in it (`pohunek attach <session-id>`) and then send the input".to_owned()
+                } else {
+                    let label = activity.map_or_else(
+                        || "none".to_owned(),
+                        |activity| format!("{activity:?}").to_lowercase(),
+                    );
                     format!(
-                        "agent did not show an editable prompt within {} ms (last activity: {activity}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
+                        "agent did not show an editable prompt within {} ms (last activity: {label}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
                         grace.as_millis()
-                    ),
-                ))
+                    )
+                };
+                Err(runtime_error("session_input_not_ready", message))
             }
             (true, InitialInputWait::ShutDown) => Err(runtime_error(
                 "session_input_not_ready",
@@ -5006,15 +5012,6 @@ impl SessionRegistry {
         tokio::time::timeout(grace, wait)
             .await
             .unwrap_or(InitialInputWait::TimedOut)
-    }
-
-    /// The last reported activity of session `id` as a lowercase word, for
-    /// the readiness error message.
-    async fn current_activity_label(&self, id: &SessionId) -> String {
-        self.current_activity(id).await.map_or_else(
-            || "none".to_owned(),
-            |activity| format!("{activity:?}").to_lowercase(),
-        )
     }
 
     /// Roll back a session whose initial `--input` could not be delivered or
