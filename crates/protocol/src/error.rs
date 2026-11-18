@@ -143,7 +143,7 @@ pub struct ProtocolError {
     /// when a built-in runtime serves it), and only a client that installs,
     /// links, enables, selects or binds a package can receive it. New members
     /// stay decodable for every peer in the protocol window: `details` has
-    /// ignored unknown members since v0.39.0 and the oldest accepted peer
+    /// ignored unknown members since v0.38.1 and the oldest accepted peer
     /// speaks protocol 5 (first shipped in v0.41.0). It is boxed so the error
     /// type stays small in every `Result` that carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

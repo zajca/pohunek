@@ -2681,16 +2681,16 @@ Relaxing a type protects only clients of the release that ships it: a client
 of an earlier release is still strict for it, and no client advertises
 capabilities in the request envelope, so there is nothing to negotiate and no
 protocol bump. A field may therefore be added to a relaxed type only when one
-of two cases holds:
+of these cases holds:
 
 - after the next `PROTOCOL_VERSION` bump, where the previous-version adapter's
   downgrade strips the field for N-1 peers, which include the strict clients;
 - when only clients of the shipping release or later can receive it, as with
   `ProtocolError.details`, which only `command_failed` sends and only a
-  `command.run` caller receives.
+  `command.run` caller receives;
 - when the relaxation predates the oldest release in the window: a new member
   of such a type stays decodable for every peer the daemon accepts. For
-  example, `ProtocolError.details` ignores unknown members since v0.39.0
+  example, `ProtocolError.details` ignores unknown members since v0.38.1
   while the window starts at protocol 5 (first shipped in v0.41.0), so a new
   `details` member is safe without a bump.
 
