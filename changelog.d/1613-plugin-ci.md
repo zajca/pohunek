@@ -9,5 +9,9 @@ is built from: `release` (the kit from `core-tag`, smoked against that tag's
 attested daemon archive), `previous-minor` (the kit from the newest release of
 the previous minor) and `nightly` (the kit from `main`); the optional
 `smoke-script` runs inside the generic smoke on the same live isolated
-root, with `POHUNEK_SOCKET_PATH` and `POHUNEK_SMOKE_SESSION` exported.
+root after every generic check passed: bare `pohunek` reaches the isolated
+daemon through the isolated `XDG_RUNTIME_DIR` (the isolated prefix is first
+on the script's `PATH`), with `POHUNEK_SMOKE_SESSION` exporting the live
+session id (`POHUNEK_SOCKET_PATH` is only information for hook-style
+clients).
 ([#1613](https://github.com/zajca/pohunek/issues/1613))
