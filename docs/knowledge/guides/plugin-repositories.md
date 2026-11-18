@@ -171,7 +171,8 @@ index write, and 2 for every other refusal:
   `--archive <file> --entry <entry.toml>` instead of `--dir` it proves the
   admitted release asset against its real entry. `--json` reports the used
   isolation root alongside the line, so a scenario can assert the root is
-  gone.
+  gone; a failed run names its already-removed root on stderr as
+  `isolation root: <path>` (`None` before the root exists names none).
 
 ## Compatibility declaration
 

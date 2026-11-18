@@ -95,6 +95,7 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
     let identity = archive_identity(&verified, &args.dir)?;
 
     let root = Root::create().map_err(Error::Usage)?;
+    let path = root.path().to_path_buf();
     let outcome = smoke_in(
         &root,
         &args.release_dir,
@@ -104,8 +105,16 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
         &version,
     );
     let removal = root.remove().map_err(Error::Usage);
-    let report = outcome?;
-    removal?;
+    // Every failure past this point names the used isolation root: the
+    // removal ran on every path, so the root it names is always gone.
+    let report = outcome.map_err(|error| Error::Smoke {
+        root: path.clone(),
+        error: Box::new(error),
+    })?;
+    removal.map_err(|error| Error::Smoke {
+        root: path,
+        error: Box::new(error),
+    })?;
     Ok(report)
 }
 

@@ -74,6 +74,10 @@ pub enum Error {
     /// A plugin proof ran and failed at a step; its evidence was written.
     #[error("{0}")]
     Prove(#[from] crate::prove::Verdict),
+    /// A smoke ran on an isolation root and failed; the root it names was
+    /// already removed. The wrapper exists only to carry the path.
+    #[error("{error}")]
+    Smoke { root: PathBuf, error: Box<Error> },
 }
 
 impl Error {
@@ -89,6 +93,7 @@ impl Error {
             }),
             Self::Index(_) => INDEX_REFUSED_EXIT_CODE,
             Self::Prove(_) => PROVE_FAILED_EXIT_CODE,
+            Self::Smoke { error, .. } => error.exit_code(),
             _ => FAILURE_EXIT_CODE,
         }
     }

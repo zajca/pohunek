@@ -4,6 +4,10 @@
 //! stdout lines a CI log greps for, with `--json` switching the report to a
 //! single JSON document. The process exit status is 0 for a pass, 1 for a
 //! failed proof or a refused index write, and 2 for every other refusal.
+//!
+//! A failed `prove` or `smoke` that already ran on an isolation root names
+//! it on stderr as `isolation root: <path>`: the root is removed before
+//! the report, so the line always names a directory that is gone.
 
 use std::path::PathBuf;
 
@@ -132,6 +136,14 @@ fn run() -> i32 {
     match dispatch(cli.command) {
         Ok(()) => 0,
         Err(error) => {
+            if let Error::Prove(verdict) = &error {
+                if let Some(root) = verdict.root() {
+                    eprintln!("isolation root: {}", root.display());
+                }
+            }
+            if let Error::Smoke { root, .. } = &error {
+                eprintln!("isolation root: {}", root.display());
+            }
             eprintln!("pohunek-plugin-kit: {error}");
             error.exit_code()
         }

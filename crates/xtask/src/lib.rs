@@ -268,6 +268,9 @@ impl From<plugin_kit::Error> for XtaskError {
             plugin_kit::Error::InvalidPath(path) => Self::InvalidPath(path),
             plugin_kit::Error::ChildExit { command, status } => Self::ChildExit { command, status },
             plugin_kit::Error::Prove(verdict) => Self::Prove(verdict),
+            // The kit smoke wrapper only carries the used root for the
+            // kit's own stderr line; `xtask` converts the inner error.
+            plugin_kit::Error::Smoke { error, .. } => Self::from(*error),
         }
     }
 }

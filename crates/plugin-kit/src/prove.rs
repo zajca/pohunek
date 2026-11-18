@@ -165,11 +165,14 @@ pub struct ArchiveReport {
     pub root: PathBuf,
 }
 
-/// A failed proof: the step that failed and why. Its exit status is 1.
+/// A failed proof: the step that failed, why, and the used isolation root
+/// (`None` when the proof ended before the root existed, so the kit names
+/// no root it never used). Its exit status is 1.
 #[derive(Debug)]
 pub struct Verdict {
     step: Step,
     detail: String,
+    root: Option<PathBuf>,
 }
 
 impl Verdict {
@@ -177,6 +180,13 @@ impl Verdict {
     #[must_use]
     pub fn step_name(&self) -> &'static str {
         self.step.name()
+    }
+
+    /// Isolation root the failed proof ran in, removed on every path.
+    /// `None` when the proof ended before the root existed.
+    #[must_use]
+    pub fn root(&self) -> Option<&std::path::Path> {
+        self.root.as_deref()
     }
 
     /// Why the step failed.
@@ -395,7 +405,19 @@ fn check_evidence_path(path: &Path) -> Result<(), Error> {
 }
 
 fn fail(step: Step) -> impl Fn(String) -> Verdict {
-    move |detail| Verdict { step, detail }
+    move |detail| Verdict {
+        step,
+        detail,
+        root: None,
+    }
+}
+
+/// Names the isolation root on a failed verdict that already ran on one.
+fn named_root(root: PathBuf) -> impl Fn(Verdict) -> Verdict {
+    move |failure| Verdict {
+        root: Some(root.clone()),
+        ..failure
+    }
 }
 
 /// SHA-256 of the running kit binary, as `sha256:<64 hex>`: the release
@@ -438,13 +460,13 @@ fn run_steps(
                 .stop()
                 .map_err(fail(Step::Cleanup))
                 .and(root.remove().map_err(fail(Step::Cleanup)));
-            (result, path)
+            (result.map_err(named_root(path.clone())), path)
         }
         Err(failure) => {
             // The original failure is the verdict; a removal problem on top
             // of it only costs a temporary directory.
             let _ = root.remove();
-            (Err(failure), path)
+            (Err(named_root(path.clone())(failure)), path)
         }
     }
 }

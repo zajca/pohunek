@@ -48,29 +48,6 @@ const UNADMITTED_RUNTIME_ID: &str = "x";
 const ABSENT_DIGEST: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Prefix of the directory a proof creates in `TMPDIR`.
-const PROOF_ROOT_PREFIX: &str = "pohunek-prove-";
-
-/// Serializes the scenarios that create isolation roots: they share the
-/// short temporary parent, so one scenario's leftover check must not see
-/// another's live root. The lock is a file under the temporary root, so it
-/// serializes across the runner's processes too, not just threads.
-struct RootsGuard {
-    _lock: nix::fcntl::Flock<std::fs::File>,
-}
-
-fn roots_lock() -> RootsGuard {
-    let path = pohunek_test_support::temp_root().join("pohunek-kit-roots.lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&path)
-        .expect("open the roots lock");
-    let lock =
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).expect("lock the roots");
-    RootsGuard { _lock: lock }
-}
-
 fn s(path: &Path) -> &str {
     path.to_str().expect("utf-8 path")
 }
@@ -130,9 +107,10 @@ struct Kit {
     /// The kit names its roots `pohunek-prove-` plus 8 random characters,
     /// and the nested worker socket paths fit only below a parent this
     /// short; a deeper parent (like the `TestEnv` tmp directory) would
-    /// push the kit onto its `/tmp` fallback. The base is shared with the
-    /// other tests, but the root names are unique and every scenario
-    /// asserts its own root is gone.
+    /// push the kit onto its `/tmp` fallback. The base is shared with
+    /// the other tests, but the root names are unique: every scenario
+    /// asserts only the root its own run names, so a foreign temporary
+    /// directory never fails a scenario.
     root_parent: PathBuf,
 }
 
@@ -331,23 +309,6 @@ impl Kit {
         );
         archive
     }
-
-    /// Proof roots left in `TMPDIR`.
-    /// Isolation roots left behind under the short parent: empty when
-    /// every run cleaned up. The short parent never sees the `/tmp`
-    /// fallback, so every named root is one the kit actually used.
-    fn leftover_roots(&self) -> Vec<String> {
-        fs::read_dir(&self.root_parent)
-            .expect("read the root parent")
-            .map(|item| {
-                item.expect("entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .filter(|name| name.starts_with(PROOF_ROOT_PREFIX))
-            .collect()
-    }
 }
 
 fn evidence_of(path: &Path) -> Value {
@@ -359,9 +320,21 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// The isolation root a failed run names on its stderr. The root is
+/// removed before the report, so the named directory must already be
+/// gone: the scenario owns this name and no foreign root can fail it.
+fn named_root(output: &Output) -> PathBuf {
+    let line = stderr_of(output)
+        .lines()
+        .find_map(|line| line.strip_prefix("isolation root: ").map(str::to_owned))
+        .expect("the failure names its isolation root");
+    let root = PathBuf::from(line);
+    assert!(!root.exists(), "a failed run removes its root");
+    root
+}
+
 #[test]
 fn kit_lint_build_verify_and_detect_check_pass_on_fixture() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let package = fixture_dir();
 
@@ -433,16 +406,10 @@ fn kit_lint_build_verify_and_detect_check_pass_on_fixture() {
         String::from_utf8(output.stdout).expect("utf-8 stdout"),
         format!("plugin detect-check ok: {PACKAGE_ID} 2 cases\n")
     );
-
-    assert!(
-        kit.leftover_roots().is_empty(),
-        "lint/build/verify/detect-check leave no roots"
-    );
 }
 
 #[test]
 fn kit_smoke_passes_on_fixture() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let output = kit.kit(&[
@@ -472,12 +439,10 @@ fn kit_smoke_passes_on_fixture() {
         "the smoke stays under the short parent: {root:?}"
     );
     assert!(!Path::new(root).exists(), "smoke removes its root");
-    assert!(kit.leftover_roots().is_empty(), "smoke removes its root");
 }
 
 #[test]
 fn kit_prove_passes_on_fixture() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let evidence = kit.path("prove.json");
@@ -529,12 +494,10 @@ fn kit_prove_passes_on_fixture() {
         &digest_of(&pohunek_test_support::bin_exe("pohunek-plugin-kit")),
         "the evidence names the kit binary the test ran"
     );
-    assert!(kit.leftover_roots().is_empty(), "prove removes its root");
 }
 
 #[test]
 fn kit_prove_archive_proves_the_entry_asset() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let archive = kit.build(&fixture_dir(), "out");
@@ -578,7 +541,6 @@ fn kit_prove_archive_proves_the_entry_asset() {
         evidence["kit_sha256"].as_str(),
         Some(digest_of(&pohunek_test_support::bin_exe("pohunek-plugin-kit")).as_str())
     );
-    assert!(kit.leftover_roots().is_empty(), "prove removes its root");
 
     let output = kit.kit(&[
         "prove",
@@ -608,7 +570,6 @@ fn kit_prove_archive_proves_the_entry_asset() {
 
 #[test]
 fn kit_build_refuses_to_replace_the_archive() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let archive = kit.build(&fixture_dir(), "out");
     let before = digest_of(&archive);
@@ -635,7 +596,6 @@ fn kit_build_refuses_to_replace_the_archive() {
 
 #[test]
 fn kit_lint_refuses_a_broken_descriptor() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let package = kit.variant("broken", PACKAGE_ID, PACKAGE_ID);
     fs::write(package.join("runtime.toml"), "NOT TOML [[[\n").expect("break the descriptor");
@@ -655,7 +615,6 @@ fn kit_lint_refuses_a_broken_descriptor() {
 
 #[test]
 fn kit_verify_refuses_a_wrong_digest() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let archive = kit.build(&fixture_dir(), "out");
     let output = kit.kit(&[
@@ -682,7 +641,6 @@ fn kit_verify_refuses_a_wrong_digest() {
 
 #[test]
 fn kit_detect_check_refuses_a_mismatched_case() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let corpus = kit.dir("corpus");
     let screens = corpus.join("screens");
@@ -719,7 +677,6 @@ fn kit_detect_check_refuses_a_mismatched_case() {
 
 #[test]
 fn kit_smoke_refuses_a_missing_upstream() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let missing = kit.path("does-not-exist");
@@ -743,15 +700,72 @@ fn kit_smoke_refuses_a_missing_upstream() {
         "the refusal names --upstream: {}",
         stderr_of(&output)
     );
+    // The root exists before the upstream resolves, so the failure
+    // names the used root and the root is already gone.
+    named_root(&output);
+}
+
+#[test]
+fn kit_smoke_failure_names_its_isolation_root() {
+    let kit = Kit::new();
+    // An empty release tree: the build passes, the root exists, then the
+    // isolated host has no executables to copy.
+    let empty = kit.dir("empty-release");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&empty),
+    ]);
     assert!(
-        kit.leftover_roots().is_empty(),
-        "a refused smoke leaves no root"
+        !output.status.success(),
+        "an empty release fails the smoke: {}",
+        stderr_of(&output)
     );
+    named_root(&output);
+}
+
+#[test]
+fn kit_scenarios_ignore_a_foreign_proof_root() {
+    let kit = Kit::new();
+    // A foreign temporary directory beside the real roots: no scenario
+    // may trip over it, and the kit never cleans roots it did not use.
+    let foreign = kit.root_parent.join("pohunek-prove-foreign");
+    fs::create_dir_all(&foreign).expect("the foreign root");
+    fs::write(foreign.join("marker"), "foreign").expect("mark the foreign root");
+    let release = release_dir();
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke failed beside a foreign root: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    let root = document["root"].as_str().expect("the used root");
+    assert_ne!(
+        root,
+        foreign.to_string_lossy(),
+        "the smoke used its own root"
+    );
+    assert!(!Path::new(root).exists(), "smoke removes its root");
+    assert_eq!(
+        fs::read_to_string(foreign.join("marker")).expect("the marker survives"),
+        "foreign",
+        "the kit leaves foreign roots alone"
+    );
+    fs::remove_dir_all(&foreign).expect("remove the foreign root");
 }
 
 #[test]
 fn kit_prove_no_enable_fails_with_evidence() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let evidence = kit.path("prove.json");
@@ -778,15 +792,11 @@ fn kit_prove_no_enable_fails_with_evidence() {
         evidence["failed_step"].is_string(),
         "the evidence names the failed step: {evidence}"
     );
-    assert!(
-        kit.leftover_roots().is_empty(),
-        "a failed proof removes its root"
-    );
+    named_root(&output);
 }
 
 #[test]
 fn kit_smoke_accepts_the_unadmitted_runtime_id() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let package = kit.unadmitted_package("unadmitted");
     let release = release_dir();
@@ -803,12 +813,10 @@ fn kit_smoke_accepts_the_unadmitted_runtime_id() {
         )),
         "unexpected smoke line: {stdout:?}"
     );
-    assert!(kit.leftover_roots().is_empty(), "smoke removes its root");
 }
 
 #[test]
 fn kit_release_host_refuses_the_throwaway_index() {
-    let _roots = roots_lock();
     let kit = Kit::new();
     let package = kit.unadmitted_package("unadmitted");
     let archive = kit.build(&package, "out");
@@ -872,8 +880,4 @@ fn kit_release_host_refuses_the_throwaway_index() {
     );
     host.stop().expect("the daemon stops");
     root.remove().expect("the root is removed");
-    assert!(
-        kit.leftover_roots().is_empty(),
-        "the refused install leaves no root"
-    );
 }
