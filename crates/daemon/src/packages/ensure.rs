@@ -979,7 +979,7 @@ fn apply(
         let result = bind_profile(&context, &profiles, &retained, &params).map_err(|error| {
             EnsureError::Bind {
                 profile: bind.name.clone(),
-                code: ProtocolError::from(error.kind_ref()).code,
+                code: ProtocolError::from(error.kind()).code,
             }
         })?;
         if result.status != PackageBindStatus::Bound {
@@ -2403,7 +2403,7 @@ fn claim_refusal(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageEr
         prepared.authority,
     )
     .err()
-    .map(|error| error.kind_ref())
+    .map(|error| error.kind())
 }
 
 /// [`refuse_damaged`] for the installed root of the release package `prepared`.
@@ -2704,7 +2704,7 @@ fn disabled_state(
     match context.store.read_definition(digest, record.identity()) {
         Ok(_definition) => match prove_loadable(context, digest) {
             Ok(_definition) => DisabledState::Enableable,
-            Err(error) => DisabledState::Claimed(error.kind_ref()),
+            Err(error) => DisabledState::Claimed(error.kind()),
         },
         // A missing root cannot name its runtime, so the runtime the release
         // lists for the package stands for it: restoring the root does not help
@@ -3412,7 +3412,7 @@ fn kind_error(kind: PackageErrorKind) -> EnsureError {
 
 /// [`kind_error`] for work that already carries a conflict holder.
 fn error_error(error: &PackageError) -> EnsureError {
-    EnsureError::Registry(ProtocolError::from(error.kind_ref()).code)
+    EnsureError::Registry(ProtocolError::from(error.kind()).code)
 }
 
 /// The error of a package store whose runtime host cannot be built.

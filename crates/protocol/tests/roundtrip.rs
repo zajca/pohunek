@@ -6114,7 +6114,7 @@ struct StrictV037Error {
 
 #[test]
 fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
-    use protocol::{CommandErrorKind, ErrorDetails, PackageErrorKind, ProcessExit};
+    use protocol::{CommandErrorKind, ErrorDetails, PackageErrorKind, PackageId, ProcessExit};
 
     // Every error other than `command_failed` serializes without the key, so a
     // strict decoder that predates `details` still reads it.
@@ -6174,6 +6174,30 @@ fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
             source_ref: None,
             holder: None,
         }))
+    );
+
+    // A runtime-id conflict with a holder carries exactly that fact; without
+    // a holder (a built-in runtime serves the id) there is no `details` key.
+    let holder = PackageId::parse("pohunek.runtime.holder").expect("package id");
+    let conflict = ProtocolError::package_runtime_conflict(Some(&holder));
+    let value = serde_json::to_value(&conflict).expect("serialize");
+    assert_eq!(
+        value["details"],
+        serde_json::json!({ "holder": "pohunek.runtime.holder" })
+    );
+    assert_eq!(
+        serde_json::from_value::<ProtocolError>(value).expect("round trip"),
+        conflict
+    );
+    let builtin = ProtocolError::package_runtime_conflict(None);
+    let value = serde_json::to_value(&builtin).expect("serialize");
+    assert!(
+        value.get("details").is_none(),
+        "no details without a holder"
+    );
+    assert_eq!(
+        serde_json::from_value::<ProtocolError>(value).expect("round trip"),
+        builtin
     );
 }
 

@@ -4463,7 +4463,7 @@ Fields:
 | `code` | string | yes | Stable machine-readable code. Treat the set as open. |
 | `msg` | string | yes | Human-readable, non-secret diagnostic. |
 | `recover` | string | no | Optional recovery hint. |
-| `details` | object | no | Typed facts a caller reads instead of parsing `msg`. `command_failed` carries `process_exit`, `session_request_in_progress` and `session_request_conflict` carry `session_id`, and `fetch_ref_commit_mismatch` carries `expected_commit`, `fetched_commit` and `source_ref`, and `package_runtime_conflict` carries `holder`, the installed package id that serves the runtime id (absent when a built-in runtime serves it). Decoders ignore members and kinds they do not know. No older client sees the key, so a client that can send `fetch_ref` or a keyed `session.new` already decodes `details`. |
+| `details` | object | no | Typed facts a caller reads instead of parsing `msg`. `command_failed` carries `process_exit`, `session_request_in_progress` and `session_request_conflict` carry `session_id`, and `fetch_ref_commit_mismatch` carries `expected_commit`, `fetched_commit` and `source_ref`, and `package_runtime_conflict` carries `holder`, the installed package id that serves the runtime id (absent when a built-in runtime serves it; no `details` key then). Decoders ignore members and kinds they do not know. A new `details` member stays decodable for every peer in the protocol window: `details` has ignored unknown members since v0.39.0 and the oldest accepted peer speaks protocol 5 (first shipped in v0.41.0). |
 
 Classes:
 

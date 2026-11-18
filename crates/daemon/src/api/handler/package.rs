@@ -241,7 +241,7 @@ pub(super) async fn handle_plugin_index_apply(request: &Request, state: &DaemonS
         return response;
     }
     match parse_params::<PluginIndexApplyParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state.sessions.packages().package_index_apply(params).await,
         ),

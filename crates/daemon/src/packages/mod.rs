@@ -458,7 +458,7 @@ impl PackageService {
         T: Send + 'static,
         F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageError> + Send + 'static,
     {
-        let context = self.authority.context().map_err(PackageError::kind)?;
+        let context = self.authority.context().map_err(PackageError::of)?;
         let sessions = self.sessions.clone();
         let authority = Arc::clone(&self.authority);
         self.sessions
@@ -469,7 +469,7 @@ impl PackageService {
                     .await
                     .map_err(|error| {
                         warn!(%error, "the sessions that pin packages cannot be listed");
-                        PackageError::kind(PackageErrorKind::RegistryFailed)
+                        PackageError::of(PackageErrorKind::RegistryFailed)
                     })?;
                 let uncertain = retained.is_uncertain();
                 let outcome = blocking_error(move || work(&context, &retained)).await;
@@ -482,7 +482,7 @@ impl PackageService {
                 outcome
             })
             .await
-            .map_err(|_join_error| PackageError::kind(PackageErrorKind::RegistryFailed))?
+            .map_err(|_join_error| PackageError::of(PackageErrorKind::RegistryFailed))?
     }
 
     /// Runs `work` under the exclusive lifecycle lock with the agents of the
@@ -764,7 +764,7 @@ where
         .await
         .map_err(|error| {
             warn!(%error, "a package task failed");
-            PackageError::kind(PackageErrorKind::RegistryFailed)
+            PackageError::of(PackageErrorKind::RegistryFailed)
         })?
 }
 
@@ -946,9 +946,8 @@ fn inspect_one(
 ///
 /// [`PackageErrorKind`] stays code-only so every existing mapping and table
 /// keeps matching on it; the holder rides beside it from `check_claim` to the
-/// wire error. A holder is present only on
-/// [`PackageErrorKind::RuntimeConflict`, and absent (a built-in runtime serves
-/// the id) is represented the same way a missing holder is: `None`.
+/// wire error. A holder is present only on [`PackageErrorKind::RuntimeConflict`];
+/// `None` there means a built-in runtime serves the id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageError {
     kind: PackageErrorKind,
@@ -957,14 +956,14 @@ pub struct PackageError {
 
 impl PackageError {
     /// The failure of `kind` with no holder.
-    fn kind(kind: PackageErrorKind) -> Self {
+    fn of(kind: PackageErrorKind) -> Self {
         Self { kind, holder: None }
     }
 
     /// The stable wire kind; the holder is dropped: only the wire error
     /// carries it.
     #[must_use]
-    pub(crate) fn kind_ref(&self) -> PackageErrorKind {
+    pub(crate) fn kind(&self) -> PackageErrorKind {
         self.kind
     }
 
@@ -996,7 +995,7 @@ impl PartialEq<PackageError> for PackageErrorKind {
 
 impl From<PackageErrorKind> for PackageError {
     fn from(kind: PackageErrorKind) -> Self {
-        Self::kind(kind)
+        Self::of(kind)
     }
 }
 
@@ -1012,7 +1011,7 @@ fn check_claim(
     let served_by = runtimes.served_by(runtime_id);
     decide_claim(runtime_id, package, authority, served_by.as_ref()).map_err(
         |refusal| match refusal {
-            ClaimRefusal::NotClaimable => PackageError::kind(PackageErrorKind::RuntimeNotClaimable),
+            ClaimRefusal::NotClaimable => PackageError::of(PackageErrorKind::RuntimeNotClaimable),
             ClaimRefusal::Conflict { holder } => {
                 // The wire error carries the holder in `details`; the log
                 // names what the operator has to remove.
@@ -1785,7 +1784,7 @@ impl PackageService {
     pub async fn package_index_apply(
         &self,
         params: PluginIndexApplyParams,
-    ) -> Result<PluginIndexApplyResult, PackageErrorKind> {
+    ) -> Result<PluginIndexApplyResult, PackageError> {
         self.package_transaction(move |context, _retained| {
             let (anchor, endorser) = context.index_endorser().map_err(|error| match error {
                 PackageErrorKind::TrustUnavailable => PackageErrorKind::IndexChannelMissing,
@@ -1865,16 +1864,14 @@ impl PackageService {
             registry
                 .store_index(schema_version, &verified, &bytes, stored_at)
                 .map_err(|error| registry_kind(&error))?;
-            Ok::<PluginIndexApplyResult, PackageErrorKind>(PluginIndexApplyResult {
+            Ok(PluginIndexApplyResult {
                 sequence: verified.sequence(),
                 schema_version,
                 expires_at: verified.expires_at(),
                 entries: verified.entries().len() as u64,
                 stored_at,
             })
-            .map_err(PackageError::from)
         })
         .await
-        .map_err(|error| error.kind_ref())
     }
 }

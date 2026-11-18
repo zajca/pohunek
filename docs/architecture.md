@@ -2688,6 +2688,11 @@ of two cases holds:
 - when only clients of the shipping release or later can receive it, as with
   `ProtocolError.details`, which only `command_failed` sends and only a
   `command.run` caller receives.
+- when the relaxation predates the oldest release in the window: a new member
+  of such a type stays decodable for every peer the daemon accepts. For
+  example, `ProtocolError.details` ignores unknown members since v0.39.0
+  while the window starts at protocol 5 (first shipped in v0.41.0), so a new
+  `details` member is safe without a bump.
 
 A release adds no field to a type whose tolerance ships in the same release,
 the same shape as the 0.38 rule above. A new field must also be safe to ignore;

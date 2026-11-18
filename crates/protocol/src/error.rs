@@ -141,9 +141,11 @@ pub struct ProtocolError {
     /// client that sent `fetch_ref` can receive it. `package_runtime_conflict`
     /// carries `holder`, the id of the package that serves the runtime id (absent
     /// when a built-in runtime serves it), and only a client that installs,
-    /// links, enables, selects or binds a package can receive it. No older client sees the
-    /// key. It is boxed so the error type stays small in every `Result` that
-    /// carries it.
+    /// links, enables, selects or binds a package can receive it. New members
+    /// stay decodable for every peer in the protocol window: `details` has
+    /// ignored unknown members since v0.39.0 and the oldest accepted peer
+    /// speaks protocol 5 (first shipped in v0.41.0). It is boxed so the error
+    /// type stays small in every `Result` that carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub details: Option<Box<ErrorDetails>>,
@@ -1670,23 +1672,20 @@ impl ProtocolError {
     ///
     /// Raised when an install, link, enable, select or bind would serve a
     /// runtime id another package already serves, or a built-in runtime
-    /// serves. The message and recovery hint match
-    /// [`PackageErrorKind::RuntimeConflict`](crate::PackageErrorKind); the
-    /// holder package id travels in [`ErrorDetails::holder`] and is absent
-    /// when a built-in runtime serves the id. Code is stable:
+    /// serves. The holder package id travels in [`ErrorDetails::holder`]
+    /// and is absent when a built-in runtime serves the id, in which case
+    /// there is no `details` key at all. Code is stable:
     /// `package_runtime_conflict`.
     #[must_use]
     pub fn package_runtime_conflict(holder: Option<&PackageId>) -> Self {
-        Self::new(
-            ErrorClass::Runtime,
-            "package_runtime_conflict",
-            "another package or a built-in runtime serves the runtime id",
-            Some("disable or uninstall the package that serves the runtime id".to_owned()),
-        )
-        .with_details(ErrorDetails {
-            holder: holder.cloned(),
-            ..ErrorDetails::default()
-        })
+        let error = Self::from(crate::PackageErrorKind::RuntimeConflict);
+        match holder {
+            Some(holder) => error.with_details(ErrorDetails {
+                holder: Some(holder.clone()),
+                ..ErrorDetails::default()
+            }),
+            None => error,
+        }
     }
 
     /// The `daemon/session_new_request_id_unsupported` error a client raises

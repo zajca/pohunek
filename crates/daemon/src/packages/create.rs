@@ -148,7 +148,7 @@ fn create_profile(
         .map_err(|error| bind_kind(name, error))?;
     let target = match resolve_target(context, &params.base, None, retained) {
         Ok(target) => Some(target),
-        Err(error) if error.kind_ref() == PackageErrorKind::ProfileBaseBuiltin => None,
+        Err(error) if error.kind() == PackageErrorKind::ProfileBaseBuiltin => None,
         Err(error) => return Err(error),
     };
     let definition = match &target {
