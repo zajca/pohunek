@@ -770,7 +770,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_incompatible` | `runtime` | The package does not support this core version or platform. |
 | `package_descriptor_invalid` | `runtime` | The package's runtime descriptor is not a valid runtime definition. |
 | `package_runtime_not_claimable` | `runtime` | The package claims a runtime id it may not serve. A local (`--sha256`/`link`) package declaring an id the verified stored official index has reserved is also refused with this code; an unreadable `index-state.json` refuses with `package_index_state_unreadable` instead. |
-| `package_runtime_conflict` | `runtime` | Another package or a built-in runtime serves the runtime id. |
+| `package_runtime_conflict` | `runtime` | Another package or a built-in runtime serves the runtime id. `details.holder` names the installed package that holds it, and is absent when a built-in runtime serves it. |
 | `package_not_installed` | `runtime` | The digest is not installed. |
 | `package_identity_installed` | `runtime` | The package id and version are installed from another archive. |
 | `package_identity_conflict` | `runtime` | The digest is installed under another package identity. |
@@ -4463,7 +4463,7 @@ Fields:
 | `code` | string | yes | Stable machine-readable code. Treat the set as open. |
 | `msg` | string | yes | Human-readable, non-secret diagnostic. |
 | `recover` | string | no | Optional recovery hint. |
-| `details` | object | no | Typed facts a caller reads instead of parsing `msg`. `command_failed` carries `process_exit`, `session_request_in_progress` and `session_request_conflict` carry `session_id`, and `fetch_ref_commit_mismatch` carries `expected_commit`, `fetched_commit` and `source_ref`. Decoders ignore members and kinds they do not know. No older client sees the key, so a client that can send `fetch_ref` or a keyed `session.new` already decodes `details`. |
+| `details` | object | no | Typed facts a caller reads instead of parsing `msg`. `command_failed` carries `process_exit`, `session_request_in_progress` and `session_request_conflict` carry `session_id`, and `fetch_ref_commit_mismatch` carries `expected_commit`, `fetched_commit` and `source_ref`, and `package_runtime_conflict` carries `holder`, the installed package id that serves the runtime id (absent when a built-in runtime serves it; no `details` key then). Decoders ignore members and kinds they do not know. A new `details` member stays decodable for every peer in the protocol window: `details` has ignored unknown members since v0.38.1 and the oldest accepted peer speaks protocol 5 (first shipped in v0.41.0). |
 
 Classes:
 

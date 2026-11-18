@@ -30,7 +30,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use super::test_fixture::{Fixture, Package, HOST_STATE_COMMAND, INERT_PROGRAM, PACKAGE, RUNTIME};
 use crate::agent::host::{ContextError, PackageRejection};
 use crate::catalog_anchor::{CatalogTrust, IndexChannelFault, IndexTrust};
-use crate::packages::HostTrustAnchor;
+use crate::packages::{HostTrustAnchor, PackageError};
 
 /// One day in seconds.
 const DAY: u64 = 24 * 60 * 60;
@@ -305,6 +305,7 @@ async fn install_refused(
         .package_install(index_install(fixture, package, document, false))
         .await
         .expect_err("the install is refused")
+        .kind()
 }
 
 /// Asserts that a refused install left neither a package nor index marks.
@@ -1363,7 +1364,7 @@ async fn scenario_7_expired_document_refused_at_apply() {
         })
         .await
         .expect_err("expired");
-    assert!(matches!(err, PackageErrorKind::IndexExpired), "{err:?}");
+    assert!(err == PackageErrorKind::IndexExpired, "{err:?}");
 }
 
 #[tokio::test]
@@ -1605,6 +1606,7 @@ async fn install_local(fixture: &Fixture, package: &Package) -> Result<(), Packa
         })
         .await
         .map(|_report| ())
+        .map_err(|error| error.kind())
 }
 
 /// `plugin.index.apply` of `document`, with or without `repair_state`.
@@ -1612,7 +1614,7 @@ async fn apply_document(
     fixture: &Fixture,
     document: &[u8],
     repair_state: bool,
-) -> Result<protocol::PluginIndexApplyResult, PackageErrorKind> {
+) -> Result<protocol::PluginIndexApplyResult, PackageError> {
     fixture
         .registry
         .packages()

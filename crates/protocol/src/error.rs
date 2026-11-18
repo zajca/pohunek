@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent_options::AgentOptionUnavailable,
-    runtime_id::RuntimeId,
+    runtime_id::{PackageId, RuntimeId},
     session::SessionId,
     version::{ProtocolVersion, ProtocolVersionRange},
 };
@@ -138,9 +138,14 @@ pub struct ProtocolError {
     /// `session_request_conflict` carry the session id, and only a client that
     /// sent a `client_request_id` can receive them. `fetch_ref_commit_mismatch`
     /// carries `expected_commit`, `fetched_commit` and `source_ref`, and only a
-    /// client that sent `fetch_ref` can receive it. No older client sees the
-    /// key. It is boxed so the error type stays small in every `Result` that
-    /// carries it.
+    /// client that sent `fetch_ref` can receive it. `package_runtime_conflict`
+    /// carries `holder`, the id of the package that serves the runtime id (absent
+    /// when a built-in runtime serves it), and only a client that installs,
+    /// links, enables, selects or binds a package can receive it. New members
+    /// stay decodable for every peer in the protocol window: `details` has
+    /// ignored unknown members since v0.38.1 and the oldest accepted peer
+    /// speaks protocol 5 (first shipped in v0.41.0). It is boxed so the error
+    /// type stays small in every `Result` that carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub details: Option<Box<ErrorDetails>>,
@@ -176,6 +181,12 @@ pub struct ErrorDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub source_ref: Option<String>,
+    /// The package that serves the runtime id on `package_runtime_conflict`.
+    /// Absent when a built-in runtime serves the id; a package id only, never
+    /// archive or catalog content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub holder: Option<PackageId>,
 }
 
 /// How a process ended abnormally: exactly one of the fields is set.
@@ -1655,6 +1666,26 @@ impl ProtocolError {
             session_id: Some(session_id.clone()),
             ..ErrorDetails::default()
         })
+    }
+
+    /// The canonical `runtime/package_runtime_conflict` error.
+    ///
+    /// Raised when an install, link, enable, select or bind would serve a
+    /// runtime id another package already serves, or a built-in runtime
+    /// serves. The holder package id travels in [`ErrorDetails::holder`]
+    /// and is absent when a built-in runtime serves the id, in which case
+    /// there is no `details` key at all. Code is stable:
+    /// `package_runtime_conflict`.
+    #[must_use]
+    pub fn package_runtime_conflict(holder: Option<&PackageId>) -> Self {
+        let error = Self::from(crate::PackageErrorKind::RuntimeConflict);
+        match holder {
+            Some(holder) => error.with_details(ErrorDetails {
+                holder: Some(holder.clone()),
+                ..ErrorDetails::default()
+            }),
+            None => error,
+        }
     }
 
     /// The `daemon/session_new_request_id_unsupported` error a client raises

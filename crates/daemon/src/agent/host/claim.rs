@@ -31,12 +31,13 @@ pub enum ServedBy {
 }
 
 /// Why a package may not claim a runtime id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimRefusal {
     /// The host never lets this package serve the id.
     NotClaimable,
-    /// Something else already serves the id.
-    Conflict,
+    /// Something else already serves the id: the package id that holds it,
+    /// or nothing when a built-in runtime serves it.
+    Conflict { holder: Option<PackageId> },
 }
 
 /// Whether the host reserves `runtime_id` as the shell or one of the official
@@ -75,8 +76,10 @@ pub fn decide_claim(
     match served_by {
         None => Ok(()),
         Some(ServedBy::Builtin) if is_reserved(runtime_id) => Ok(()),
-        Some(ServedBy::Builtin) => Err(ClaimRefusal::Conflict),
-        Some(ServedBy::Package(other)) if other != package => Err(ClaimRefusal::Conflict),
+        Some(ServedBy::Builtin) => Err(ClaimRefusal::Conflict { holder: None }),
+        Some(ServedBy::Package(other)) if other != package => Err(ClaimRefusal::Conflict {
+            holder: Some(other.clone()),
+        }),
         Some(ServedBy::Package(_same)) => Ok(()),
     }
 }
@@ -142,7 +145,9 @@ mod tests {
             );
             assert_eq!(
                 decide_claim(&id, &own, Authority::Official, Some(&other)),
-                Err(ClaimRefusal::Conflict)
+                Err(ClaimRefusal::Conflict {
+                    holder: Some(package("acme.runtime.other"))
+                })
             );
             assert_eq!(
                 decide_claim(&id, &own, Authority::Official, Some(&same)),
@@ -157,11 +162,13 @@ mod tests {
             assert_eq!(decide_claim(&id, &own, authority, Some(&same)), Ok(()));
             assert_eq!(
                 decide_claim(&id, &own, authority, Some(&other)),
-                Err(ClaimRefusal::Conflict)
+                Err(ClaimRefusal::Conflict {
+                    holder: Some(package("acme.runtime.other"))
+                })
             );
             assert_eq!(
                 decide_claim(&id, &own, authority, Some(&builtin)),
-                Err(ClaimRefusal::Conflict)
+                Err(ClaimRefusal::Conflict { holder: None })
             );
         }
     }
