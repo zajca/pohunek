@@ -13775,8 +13775,10 @@ fn backoff_scans_due(elapsed: u64) -> usize {
 }
 
 /// Asserts the paused clock stands at `expected` up to the timer wheel's
-/// millisecond rounding. A scan that is late parks the runtime and the clock
-/// jumps to the next periodic timer, at least half a poll further.
+/// millisecond rounding. With auto-advance inhibited, the clock moves only
+/// through `advance`; a scan that is not due by a tick stalls
+/// `wait_for_scans_started` until the inhibitor's real-time ceiling, and this
+/// assertion guards the explicit steps.
 fn assert_clock_not_jumped(expected: tokio::time::Instant, what: &str) {
     let now = tokio::time::Instant::now();
     assert!(

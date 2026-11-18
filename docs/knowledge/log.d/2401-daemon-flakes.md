@@ -4,9 +4,10 @@
   The paused clock sections run under `AutoAdvanceInhibitor`, so the clock
   moves only through explicit `advance`, and each `advance_settling` step
   overshoots the tick by `TIMER_TICK`, so a scan timer armed for the tick
-  boundary fires without relying on auto-advance. Executor-thread and
-  off-rate scans are still detected through the scan counts and the
-  executor-thread counter, not through timing.
+  boundary fires without relying on auto-advance. Too-frequent scans fail
+  the count bound, executor-thread scans fail the executor-thread counter,
+  and scans slower than the backoff stall the paused clock and fail the
+  due-scan hang guard.
 - #2018: not reproduced (15/15 local stress iterations green); the
   best-effort `rollback_failed_initial_input` design stands, and the
   leftover-session instrumentation from #2331 already on this head waits for
