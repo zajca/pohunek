@@ -39,16 +39,23 @@ const DOCUMENT_MODE: u32 = 0o644;
 /// Mode of the runtime directory: the daemon requires an owner-only one.
 const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
 
-/// Prefix of the isolation root's directory name; short because the control
-/// socket path below the root must fit the platform limit.
-const ROOT_PREFIX: &str = "pohunek-prove-";
+/// Prefix of the isolation root's directory name.
+///
+/// Budget: the longest worker socket below the root is the root plus 76
+/// bytes (`xdg-runtime/pohunek/workers/`, a 28-byte session id, and the
+/// 18-byte staged bind name with its separators). macOS allows 102 bytes
+/// of socket path, so below the 12-byte `/private/tmp` parent the name
+/// holds at most 13 bytes: `pk-` plus 6 random characters (9 bytes) leaves
+/// 4 bytes of margin. Linux allows 106 bytes, so the same name fits its
+/// `/tmp` fallback with wider margin.
+pub const ROOT_PREFIX: &str = "pk-";
 
 /// Random characters `tempfile` appends to the root's name.
-const ROOT_RANDOM_BYTES: usize = 8;
+pub const ROOT_RANDOM_BYTES: usize = 6;
 
 /// System-owned short parent tried when `$TMPDIR` is too long for a socket
 /// path (macOS `$TMPDIR` is).
-const SHORT_TEMP_PARENT: &str = "/tmp";
+pub const SHORT_TEMP_PARENT: &str = "/tmp";
 
 /// Socket path below the root: `XDG_RUNTIME_DIR` plus the application
 /// directory and socket file the daemon appends to it.
@@ -234,6 +241,16 @@ impl Root {
     /// platform limit, with the daemon's own path resolution and the longest
     /// worker session ID.
     fn check_root_sockets(root: &Path) -> Result<(), String> {
+        let platform = pohunek_paths::Platform::current().map_err(|error| error.to_string())?;
+        Self::check_root_sockets_for(root, platform)
+    }
+
+    /// The platform-parameterized socket check: the unit test names the
+    /// macOS limit on Linux, where no Mac socket can bind.
+    fn check_root_sockets_for(
+        root: &Path,
+        platform: pohunek_paths::Platform,
+    ) -> Result<(), String> {
         let display = root.display().to_string();
         let environment = root_environment(root);
         let variable = |name: &str| {
@@ -255,7 +272,6 @@ impl Root {
                 "`{display}` is too long for the session sockets below it ({error}); choose a shorter directory"
             )
         };
-        let platform = pohunek_paths::Platform::current().map_err(|error| error.to_string())?;
         let paths = pohunek_paths::BasePaths::resolve_for(
             platform,
             rustix::process::geteuid().as_raw(),
@@ -723,4 +739,21 @@ fn require_safe_executable(path: &Path, name: &str) -> Result<(), String> {
         return refuse("has unsafe permissions");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The longest root name below the short parent fits the macOS worker
+    /// socket: the random tail has a fixed length, so `0` stands for every
+    /// name `tempfile` can pick. Runs on Linux; it checks the computed
+    /// length against the macOS limit, it binds no Mac socket.
+    #[test]
+    fn longest_root_name_fits_the_macos_worker_socket() {
+        let root = Path::new(SHORT_TEMP_PARENT)
+            .join(format!("{ROOT_PREFIX}{}", "0".repeat(ROOT_RANDOM_BYTES)));
+        Root::check_root_sockets_for(&root, pohunek_paths::Platform::MacOs)
+            .expect("the short parent holds the longest root name on macOS");
+    }
 }

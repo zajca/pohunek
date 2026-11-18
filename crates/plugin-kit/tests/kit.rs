@@ -104,13 +104,13 @@ fn release_dir() -> PathBuf {
 struct Kit {
     env: TestEnv,
     /// Parent for the kit's isolation roots: the temporary root itself.
-    /// The kit names its roots `pohunek-prove-` plus 8 random characters,
-    /// and the nested worker socket paths fit only below a parent this
-    /// short; a deeper parent (like the `TestEnv` tmp directory) would
-    /// push the kit onto its `/tmp` fallback. The base is shared with
-    /// the other tests, but the root names are unique: every scenario
-    /// asserts only the root its own run names, so a foreign temporary
-    /// directory never fails a scenario.
+    /// The kit names its roots `pk-` plus 6 random characters, and the
+    /// nested worker socket paths fit only below a parent this short; a
+    /// deeper parent (like the `TestEnv` tmp directory) pushes the kit
+    /// onto its short fallback instead. The base is shared with the other
+    /// tests, but the root names are unique: every scenario asserts only
+    /// the root its own run names, so a foreign temporary directory never
+    /// fails a scenario.
     root_parent: PathBuf,
 }
 
@@ -122,6 +122,14 @@ impl Kit {
         fs::write(marker, "").expect("marker");
         let root_parent = pohunek_test_support::temp_root();
         Self { env, root_parent }
+    }
+
+    /// The kit with its `TMPDIR` below a long directory: the socket check
+    /// rejects the temp root and the kit falls back to its short parent.
+    fn with_long_tmpdir(name: &str) -> Self {
+        let mut kit = Self::new();
+        kit.root_parent = kit.dir(name);
+        kit
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -320,6 +328,22 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// The isolation root a passing run names in its `--json` document: the
+/// kit legitimately puts it below the temp root or below its short
+/// fallback when the temp root is too long for a socket path. Either way
+/// the run removes it before the report.
+fn used_root(document: &Value, kit: &Kit) -> PathBuf {
+    let root = PathBuf::from(document["root"].as_str().expect("the used root"));
+    assert!(
+        root.starts_with(&kit.root_parent)
+            || root.starts_with(plugin_kit::isolated::SHORT_TEMP_PARENT),
+        "the run used its temp root or the short fallback: {}",
+        root.display()
+    );
+    assert!(!root.exists(), "the run removed its root");
+    root
+}
+
 /// The isolation root a failed run names on its stderr. The root is
 /// removed before the report, so the named directory must already be
 /// gone: the scenario owns this name and no foreign root can fail it.
@@ -433,12 +457,7 @@ fn kit_smoke_passes_on_fixture() {
         document["screen_lines"].as_u64().unwrap_or(0) > 0,
         "the smoke saw a non-empty screen: {document:?}"
     );
-    let root = document["root"].as_str().expect("the used root");
-    assert!(
-        Path::new(root).starts_with(&kit.root_parent),
-        "the smoke stays under the short parent: {root:?}"
-    );
-    assert!(!Path::new(root).exists(), "smoke removes its root");
+    used_root(&document, &kit);
 }
 
 #[test]
@@ -470,12 +489,7 @@ fn kit_prove_passes_on_fixture() {
             .is_some_and(|digest| digest.starts_with("sha256:")),
         "the report names the archive digest: {document:?}"
     );
-    let root = document["root"].as_str().expect("the used root");
-    assert!(
-        Path::new(root).starts_with(&kit.root_parent),
-        "the proof stays under the short parent: {root:?}"
-    );
-    assert!(!Path::new(root).exists(), "prove removes its root");
+    used_root(&document, &kit);
     let evidence = evidence_of(&evidence);
     assert_eq!(evidence["result"], "pass");
     assert_eq!(evidence["package_id"], PACKAGE_ID);
@@ -528,12 +542,7 @@ fn kit_prove_archive_proves_the_entry_asset() {
         line.starts_with(&format!("plugin prove ok: {PACKAGE_ID} {VERSION} sha256:")),
         "unexpected prove line: {line:?}"
     );
-    let root = document["root"].as_str().expect("the used root");
-    assert!(
-        Path::new(root).starts_with(&kit.root_parent),
-        "the proof stays under the short parent: {root:?}"
-    );
-    assert!(!Path::new(root).exists(), "prove removes its root");
+    used_root(&document, &kit);
     let evidence = evidence_of(&evidence);
     assert_eq!(evidence["result"], "pass");
     assert_eq!(evidence["package_id"], PACKAGE_ID);
@@ -731,7 +740,9 @@ fn kit_scenarios_ignore_a_foreign_proof_root() {
     let kit = Kit::new();
     // A foreign temporary directory beside the real roots: no scenario
     // may trip over it, and the kit never cleans roots it did not use.
-    let foreign = kit.root_parent.join("pohunek-prove-foreign");
+    let foreign = kit
+        .root_parent
+        .join(format!("{}foreign", plugin_kit::isolated::ROOT_PREFIX));
     fs::create_dir_all(&foreign).expect("the foreign root");
     fs::write(foreign.join("marker"), "foreign").expect("mark the foreign root");
     let release = release_dir();
@@ -749,19 +760,51 @@ fn kit_scenarios_ignore_a_foreign_proof_root() {
         stderr_of(&output)
     );
     let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
-    let root = document["root"].as_str().expect("the used root");
+    let root = used_root(&document, &kit);
     assert_ne!(
-        root,
-        foreign.to_string_lossy(),
+        root.as_os_str(),
+        foreign.as_os_str(),
         "the smoke used its own root"
     );
-    assert!(!Path::new(root).exists(), "smoke removes its root");
     assert_eq!(
         fs::read_to_string(foreign.join("marker")).expect("the marker survives"),
         "foreign",
         "the kit leaves foreign roots alone"
     );
     fs::remove_dir_all(&foreign).expect("remove the foreign root");
+}
+
+#[test]
+fn kit_falls_back_to_the_short_parent_on_a_long_temp_root() {
+    // A temp root too long for a socket path: the kit rejects it and
+    // names a removed fallback root instead of failing the run.
+    let kit = Kit::with_long_tmpdir(&"t".repeat(48));
+    let release = release_dir();
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke failed on a long temp root: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    let root = used_root(&document, &kit);
+    assert!(
+        !root.starts_with(&kit.root_parent),
+        "the long temp root holds no kit root: {}",
+        root.display()
+    );
+    assert!(
+        root.starts_with(plugin_kit::isolated::SHORT_TEMP_PARENT),
+        "the fallback is the short parent: {}",
+        root.display()
+    );
 }
 
 #[test]
