@@ -1,0 +1,181 @@
+name: Publish the plugin kit bundles
+
+# Publishes the attested kit bundles (`build-kit-*` artifacts of the Release
+# and nightly CI runs) as releases of the kit repository
+# `pohunekd/pohunek-plugin-kit` (issue #1613): the core release tag `vX.Y.Z`
+# becomes `core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
+# `nightly-YYYYMMDD-<sha12>`.
+#
+# The kit repository, its GitHub App, the `plugin-kit-publish` environment
+# and the `PLUGIN_KIT_*` variable/secret are owner-side setup (D3): until the
+# owner creates them, `vars.PLUGIN_KIT_APP_ID` is empty and this job skips
+# without touching anything. The bundle and its attestation are always built;
+# only publication is gated.
+#
+# The job checks out nothing and runs no code from this repository or from a
+# bundle: it only downloads the `build-kit-*` artifacts of the finished run,
+# checks their checksums, mints a one-hour App token, and drives `gh release`
+# in the kit repository. The attestation stays the one the `attest` job of
+# release-evidence.yml recorded: the published bytes are identical, so the
+# digest it covers does not change.
+#
+# Nightly prereleases older than 30 days are deleted after a nightly
+# publish, so the kit repository keeps a bounded nightly history.
+# Linux jobs are pinned to ubuntu-24.04 (#1731), never ubuntu-latest.
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: plugin-kit-publish
+
+jobs:
+  publish:
+    name: Publish the kit bundle to the kit repository
+    if: ${{ vars.PLUGIN_KIT_APP_ID != '' && github.event.workflow_run.conclusion == 'success' && ((github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'push') || (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'schedule')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      KIT_REPO: pohunekd/pohunek-plugin-kit
+      WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      - name: Select the release tag
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$WORKFLOW_NAME" = Release ]; then
+            case "$HEAD_BRANCH" in
+              v[0-9]*.[0-9]*.[0-9]*)
+                version="${HEAD_BRANCH#v}"
+                echo "tag=core-v$version" >> "$GITHUB_OUTPUT"
+                echo "prerelease=false" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "::error::the Release run must come from a vX.Y.Z tag, got: $HEAD_BRANCH"
+                exit 1
+                ;;
+            esac
+          elif [ "$WORKFLOW_NAME" = CI ]; then
+            day="$(date -u +%Y%m%d)"
+            short="${HEAD_SHA:0:12}"
+            case "$short" in
+              ????????????)
+                case "$short" in
+                  *[!0-9a-f]*) fail=1 ;;
+                  *) fail=0 ;;
+                esac
+                ;;
+              *)
+                fail=1
+                ;;
+            esac
+            if [ "$fail" = 1 ]; then
+              echo "::error::the CI run must carry a commit sha, got: $HEAD_SHA"
+              exit 1
+            fi
+            echo "tag=nightly-$day-$short" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::unexpected workflow run: $WORKFLOW_NAME"
+            exit 1
+          fi
+
+      - name: Download the kit bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-kit-*
+          merge-multiple: true
+          path: dist
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Check the bundle checksums and version
+        shell: bash
+        env:
+          TAG: ${{ steps.select.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c ./*.sha256
+          count="$(find . -maxdepth 1 -type f -name 'pohunek-plugin-kit-*.tar.zst' | wc -l)"
+          test "$count" = 2 || { echo "::error::expected the gnu and darwin kit bundles, found $count"; exit 1; }
+          version="$(for f in pohunek-plugin-kit-*.tar.zst; do basename "$f" .tar.zst; done | sed -n 's/^pohunek-plugin-kit-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-.*$/\1/p' | sort -u)"
+          case "$version" in
+            '' | *[!0-9.]* | *.*.*.*)
+              echo "::error::the kit bundles carry no single X.Y.Z version"
+              exit 1
+              ;;
+          esac
+          if [ "$(printf '%s\n' "$version" | wc -l)" != 1 ]; then
+            echo "::error::the kit bundles disagree on the version"
+            exit 1
+          fi
+          case "$TAG" in
+            core-v"$version") ;;
+            nightly-*) ;;
+            *)
+              echo "::error::tag $TAG does not match the bundle version $version"
+              exit 1
+              ;;
+          esac
+          sha256sum -- ./*.tar.zst > SHA256SUMS
+
+      - name: Mint the kit repository token
+        id: app
+        uses: peter-evans/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ vars.PLUGIN_KIT_APP_ID }}
+          private-key: ${{ secrets.PLUGIN_KIT_APP_PRIVATE_KEY }}
+          repositories: pohunekd/pohunek-plugin-kit
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+          PRERELEASE: ${{ steps.select.outputs.prerelease }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = true ]; then
+            flags="--prerelease"
+            notes="Nightly plugin kit bundle built by zajca/pohunek $WORKFLOW_NAME run $RUN_ID."
+          else
+            flags=""
+            notes="Plugin kit bundle of core release ${TAG#core-}."
+          fi
+          # A draft first, so a failed upload never publishes a partial release.
+          # shellcheck disable=SC2086
+          gh release create "$TAG" --repo "$KIT_REPO" --draft --verify-tag \
+            --title "$TAG" --notes "$notes" $flags
+          gh release upload "$TAG" --repo "$KIT_REPO" dist/*.tar.zst dist/SHA256SUMS
+          gh release edit "$TAG" --repo "$KIT_REPO" --draft=false
+
+      - name: Prune nightlies older than 30 days
+        if: ${{ steps.select.outputs.prerelease == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          gh release list --repo "$KIT_REPO" --limit 100 \
+            --json tagName,createdAt,isPrerelease \
+            --jq -r --arg cutoff "$cutoff" \
+            '.[] | select(.isPrerelease and (.tagName | startswith("nightly-")) and .createdAt < $cutoff) | .tagName' \
+          | while IFS= read -r old; do
+            [ -n "$old" ] || continue
+            gh release delete "$old" --repo "$KIT_REPO" --yes --cleanup-tag
+          done

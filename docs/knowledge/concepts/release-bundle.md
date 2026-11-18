@@ -157,6 +157,9 @@ build and evidence workflows with `mode: release`; evidence calls the scenarios.
 
 Producers upload workflow artifacts only: `build-<component>-<target>`,
 `package-archives`, `sdk-release-assets` and the macOS `macos-signed-<component>`.
+The kit jobs additionally upload `build-kit-<target>`; the attest job attests
+those bundles with the other producer artifacts, but no release job downloads
+them, so they are never a release input or asset.
 The package job also uploads `package-evidence`, the builder evidence of every
 archive (`cargo xtask package build --evidence-dir`); no release job downloads
 it, so it is never a release input or asset.

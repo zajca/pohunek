@@ -1,0 +1,86 @@
+#!/bin/sh
+# Assemble the staging directory of one plugin kit bundle archive.
+#
+# usage: stage-kit-bundle <version> <target> <bindir> <output-dir>
+#
+# <bindir> holds the built binaries: pohunek, pohunekd, pohunek-sessiond and
+# pohunek-plugin-kit. The staging directory <output-dir>/<name> is created
+# fresh, and the archive name `pohunek-plugin-kit-<version>-<target>` is
+# printed on stdout. Run from the repository root.
+#
+# The bundle is not a release archive: it carries no MANIFEST, no completions,
+# no offline docs and no trust anchor. It carries the four binaries plus
+# `descriptor-schema.txt`, the descriptor schema note (schema value, runtime
+# API value, descriptor path and digest domain) that matches the constants in
+# crates/daemon/src/agent/host/definition.rs, so the bundle contents alone
+# name the descriptor schema the kit build accepts. The job stages this
+# directory, then writes the deterministic `.tar.zst` with
+# `packaging/archive-kit` (single-frame zstd, same shape as the runtime
+# package archives; the bundle is not a release archive, so it carries no
+# MANIFEST and `packaging/write-manifest` does not accept it).
+
+set -eu
+
+fail() {
+    printf 'stage-kit-bundle: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 4 ] || fail "usage: stage-kit-bundle <version> <target> <bindir> <output-dir>"
+version=$1
+target=$2
+bindir=$3
+output=$4
+
+case $version in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) fail "version must be X.Y.Z: $version" ;;
+esac
+case $version in
+    *[!0-9.]*) fail "version must be X.Y.Z: $version" ;;
+esac
+case $target in
+    '' | *[!a-z0-9_-]*) fail "target must be a lowercase target triple: $target" ;;
+esac
+[ -d "$bindir" ] || fail "not a directory: $bindir"
+[ -d "$output" ] || mkdir -p "$output" || fail "not a directory: $output"
+
+definition=crates/daemon/src/agent/host/definition.rs
+[ -f "$definition" ] || fail "descriptor schema source is missing: $definition (run from the repository root)"
+
+name="pohunek-plugin-kit-$version-$target"
+staging="$output/$name"
+rm -rf -- "$staging"
+mkdir -p "$staging"
+
+for binary in pohunek pohunekd pohunek-sessiond pohunek-plugin-kit; do
+    [ -f "$bindir/$binary" ] || fail "built binary is missing: $bindir/$binary"
+    cp "$bindir/$binary" "$staging/$binary"
+done
+
+schema=$(grep -E '^pub const SUPPORTED_SCHEMA: u32 = ' "$definition" | sed 's/.*= //;s/;//') \
+    || fail "cannot read SUPPORTED_SCHEMA from $definition"
+runtime_api=$(grep -E '^pub const SUPPORTED_RUNTIME_API: u32 = ' "$definition" | sed 's/.*= //;s/;//') \
+    || fail "cannot read SUPPORTED_RUNTIME_API from $definition"
+domain=$(grep -E '^const DESCRIPTOR_DIGEST_DOMAIN: &str = ' "$definition" | sed 's/.*= //;s/;//;s/"//g') \
+    || fail "cannot read DESCRIPTOR_DIGEST_DOMAIN from $definition"
+case $schema in
+    '' | *[!0-9]*) fail "unexpected SUPPORTED_SCHEMA in $definition: $schema" ;;
+esac
+case $runtime_api in
+    '' | *[!0-9]*) fail "unexpected SUPPORTED_RUNTIME_API in $definition: $runtime_api" ;;
+esac
+case $domain in
+    '') fail "unexpected DESCRIPTOR_DIGEST_DOMAIN in $definition" ;;
+esac
+
+{
+    printf 'descriptor schema enforced by pohunek-plugin-kit lint\n'
+    printf 'schema %s\n' "$schema"
+    printf 'runtime_api %s\n' "$runtime_api"
+    printf 'descriptor_path runtime.toml\n'
+    printf 'digest_domain %s\n' "$domain"
+} > "$staging/descriptor-schema.txt"
+chmod 0644 "$staging/descriptor-schema.txt"
+
+printf '%s\n' "$name"

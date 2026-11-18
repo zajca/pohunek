@@ -1,17 +1,23 @@
 name: Release build
 
 # Reusable producer half of the release: the Linux CLI and daemon
-# archives, the official runtime package archives and the TypeScript SDK
-# tarballs, all from the exact commit of the calling run. Called by
-# release.yml (mode `release`, a tag) and by ci.yml (mode `rehearsal`, the
-# PR-time proof of the whole assembly).
+# archives, the plugin kit bundles, the official runtime package archives
+# and the TypeScript SDK tarballs, all from the exact commit of the calling
+# run. Called by release.yml (mode `release`, a tag) and by ci.yml (mode
+# `rehearsal`, the PR-time proof of the whole assembly).
 #
 # This workflow only produces workflow artifacts. It holds a read-only token,
 # no secret and no environment, and it never creates or touches a GitHub
-# Release; publication is the single `publish` job of release.yml.
+# Release; publication of the release bundle is the single `publish` job of
+# release.yml, publication of the kit bundles is the plugin-kit-publish
+# workflow (issue #1613).
 #
 # Artifacts (names are the contract with release-evidence.yml):
 #   build-<component>-<target>  the archive and its .sha256
+#   build-kit-<target>          the plugin kit bundle and its .sha256 (the
+#                               attest job covers `build-*`, so the bundle is
+#                               attested with the other producer artifacts;
+#                               it never enters the release bundle)
 #   package-archives            every runtime-packages/* archive and .sha256
 #   sdk-release-assets          the SDK tarballs and their .sha256
 #
@@ -312,6 +318,176 @@ jobs:
           path: |
             dist/pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz
             dist/pohunek-daemon-${{ needs.meta.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          overwrite: true
+
+  # The owner-side plugin kit bundles (issue #1613): `pohunek`, `pohunekd`,
+  # `pohunek-sessiond` and `pohunek-plugin-kit` plus the descriptor schema
+  # note, as one deterministic `.tar.zst` per target. The bundle is not a
+  # release archive: it carries no MANIFEST, so it never enters the release
+  # bundle assembled from `build-cli-*` and `build-daemon-*` (ruling 2); the
+  # attest job downloads `build-*` and attests it with the other producer
+  # artifacts. The macOS leg builds natively on macos-15 like the rehearsal
+  # macOS job, not cross-compiled.
+  #
+  # The jobs run on a tag release and on the scheduled nightly rehearsal,
+  # never on a pull request or push run: a rehearsal on any other event
+  # proves the release assembly only (ruling 4). Two jobs with literal
+  # runners instead of one matrix job: a job whose `runs-on` is an
+  # expression may not use the rust cache.
+  kit-linux:
+    name: Build the plugin kit bundle for x86_64-unknown-linux-gnu
+    if: ${{ inputs.mode == 'release' || github.event_name == 'schedule' }}
+    needs: [meta]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-kit-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the kit binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$TARGET" \
+            -p pohunek-cli \
+            -p pohunek-daemon \
+            -p pohunek-session-worker \
+            -p pohunek-plugin-kit \
+            --bin pohunek \
+            --bin pohunekd \
+            --bin pohunek-sessiond \
+            --bin pohunek-plugin-kit
+
+      - name: Stage and archive the kit bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Archives are stamped with the commit time, so rebuilding the same
+          # commit yields the same archive bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          bindir="target/$TARGET/release"
+          packaging/check-no-embedded-knowledge docs/knowledge/assistant/system.md \
+            "$bindir/pohunek" \
+            "$bindir/pohunekd" \
+            "$bindir/pohunek-sessiond" \
+            "$bindir/pohunek-plugin-kit"
+          mkdir -p dist stage
+          name="$(packaging/stage-kit-bundle "$VERSION" "$TARGET" "$bindir" stage)"
+          if [ "$name" != "pohunek-plugin-kit-$VERSION-$TARGET" ]; then
+            echo "::error::staged bundle $name does not match the kit name"
+            exit 1
+          fi
+          packaging/archive-kit stage "$name" dist
+
+      # A rerun of the job replaces the uploads of its failed attempt.
+      - name: Upload the kit bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-kit-${{ env.TARGET }}
+          path: |
+            dist/pohunek-plugin-kit-${{ needs.meta.outputs.version }}-${{ env.TARGET }}.tar.zst
+            dist/pohunek-plugin-kit-${{ needs.meta.outputs.version }}-${{ env.TARGET }}.tar.zst.sha256
+          if-no-files-found: error
+          overwrite: true
+
+  kit-macos:
+    name: Build the plugin kit bundle for aarch64-apple-darwin
+    if: ${{ inputs.mode == 'release' || github.event_name == 'schedule' }}
+    needs: [meta]
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: -D warnings
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-kit-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the kit binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$TARGET" \
+            -p pohunek-cli \
+            -p pohunek-daemon \
+            -p pohunek-session-worker \
+            -p pohunek-plugin-kit \
+            --bin pohunek \
+            --bin pohunekd \
+            --bin pohunek-sessiond \
+            --bin pohunek-plugin-kit
+
+      - name: Stage and archive the kit bundle
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Archives are stamped with the commit time, so rebuilding the same
+          # commit yields the same archive bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          bindir="target/$TARGET/release"
+          packaging/check-no-embedded-knowledge docs/knowledge/assistant/system.md \
+            "$bindir/pohunek" \
+            "$bindir/pohunekd" \
+            "$bindir/pohunek-sessiond" \
+            "$bindir/pohunek-plugin-kit"
+          mkdir -p dist stage
+          name="$(packaging/stage-kit-bundle "$VERSION" "$TARGET" "$bindir" stage)"
+          if [ "$name" != "pohunek-plugin-kit-$VERSION-$TARGET" ]; then
+            echo "::error::staged bundle $name does not match the kit name"
+            exit 1
+          fi
+          packaging/archive-kit stage "$name" dist
+
+      # A rerun of the job replaces the uploads of its failed attempt.
+      - name: Upload the kit bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-kit-${{ env.TARGET }}
+          path: |
+            dist/pohunek-plugin-kit-${{ needs.meta.outputs.version }}-${{ env.TARGET }}.tar.zst
+            dist/pohunek-plugin-kit-${{ needs.meta.outputs.version }}-${{ env.TARGET }}.tar.zst.sha256
           if-no-files-found: error
           overwrite: true
 

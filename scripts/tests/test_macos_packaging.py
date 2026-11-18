@@ -28,6 +28,8 @@ SCRIPTS = [
     ROOT / "packaging" / "verify-archive",
     ROOT / "packaging" / "archive",
     ROOT / "packaging" / "stage-archive",
+    ROOT / "packaging" / "archive-kit",
+    ROOT / "packaging" / "stage-kit-bundle",
     ROOT / "packaging" / "write-manifest",
     ROOT / "scripts" / "acceptance" / "macos-package-install",
 ]

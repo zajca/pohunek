@@ -357,10 +357,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download the Linux archives
+      # Only the release archives enter the bundle: the kit bundles
+      # (`build-kit-*`, issue #1613) are attested with the other producer
+      # artifacts but travel to the kit repository, never here.
+      - name: Download the Linux cli archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: build-*
+          pattern: build-cli-*
+          path: ${{ runner.temp }}/dl/build
+
+      - name: Download the Linux daemon archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-daemon-*
           path: ${{ runner.temp }}/dl/build
 
       - name: Download the macOS archives
@@ -445,10 +454,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download the Linux archives
+      # Only the release archives enter the rehearsal bundle: the kit
+      # bundles (`build-kit-*`, issue #1613) are attested with the other
+      # producer artifacts but travel to the kit repository, never here.
+      - name: Download the Linux cli archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: build-*
+          pattern: build-cli-*
+          path: ${{ runner.temp }}/dl/build
+
+      - name: Download the Linux daemon archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-daemon-*
           path: ${{ runner.temp }}/dl/build
 
       - name: Download the macOS archives

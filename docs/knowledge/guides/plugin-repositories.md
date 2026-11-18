@@ -148,7 +148,7 @@ The same two commands run locally:
   the same id leaves the proved version unselected, so the install check
   refuses it on the default path and the inspect digest check refuses the
   other, selected version under `--no-enable` (the inspect `selected`
-  check is defense in depth). The evidence of a
+  check is defense in depth)). The evidence of a
   context proof carries
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
@@ -210,6 +210,29 @@ index write, and 2 for every other refusal:
   `isolation root: <path>`: the kit has removed the root unless the
   failure is the removal itself. A refusal before the root exists, or the
   failure to write the evidence after the run, names no root.
+
+## Kit bundle
+
+Every core release and every nightly also ships the owner-side plugin kit
+bundle `pohunek-plugin-kit-<X.Y.Z>-<target>.tar.zst` for
+`x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`. The bundle holds
+`pohunek`, `pohunekd`, `pohunek-sessiond` and `pohunek-plugin-kit` plus the
+descriptor schema note; it carries no release MANIFEST and never enters the
+core release bundle. The bundle is attested with the other release assets,
+so a downloaded bundle verifies with the same signer workflow:
+
+```sh
+gh attestation verify <bundle> --repo zajca/pohunek \
+  --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml"
+```
+
+The `plugin-kit-publish` workflow publishes the bundles as releases of
+`pohunekd/pohunek-plugin-kit`: a core release tag `vX.Y.Z` becomes
+`core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
+`nightly-YYYYMMDD-<sha12>` (nightlies older than 30 days are pruned). Until
+the owner has created the kit repository, its GitHub App and the
+`plugin-kit-publish` environment, publication stays gated and the bundles
+only build.
 
 ## Compatibility declaration
 
