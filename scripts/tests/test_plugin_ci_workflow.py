@@ -6,9 +6,9 @@ single job with a read-only token. The checks pin its security model:
 
 - one job only, holding exactly `contents: read` and no other scope;
 - no secret is minted or forwarded (the read-only `github.token` reaches
-  only the `gh` CLI through the environment, never a secret input);
+  only the `gh` steps through the environment, never a secret input);
 - no step restores a cache;
-- Linux runs on `ubuntu-24.04`, never `ubuntu-latest`;
+- Linux runs on `ubuntu-24.04`, macOS on the pinned `macos-15` label;
 - every third-party action is pinned to a full commit sha;
 - the trigger is `workflow_call` with the documented inputs and defaults;
 - the matrix runs every row of `rows` against every target of `platforms`;
@@ -17,10 +17,19 @@ single job with a read-only token. The checks pin its security model:
   minor with a version compare, never a lexical one;
 - detect-check runs only when `corpus-dir` is set;
 - the optional `smoke-script` runs inside the generic smoke, on the same
-  live isolated root, with its socket path and its session id exported.
+  live isolated root, with the isolated daemon on `PATH` and the live
+  session id exported.
+
+The `run:` bodies of the path check and the version-bump check also run
+against fixtures (with a fake `gh` on `PATH`), so a shell regression
+fails here instead of in a caller repository.
 """
 
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -101,7 +110,7 @@ class PluginCiWorkflowTests(unittest.TestCase):
             self.assertNotIn("actions/cache", action)
 
     def test_linux_runs_on_the_pinned_runner(self):
-        self.assertIn("runs-on: ubuntu-24.04", self.text)
+        self.assertIn("ubuntu-24.04", self.text)
         self.assertIsNone(re.search(r"(?m)^[^#\n]*ubuntu-latest", self.text))
 
     def test_the_matrix_runs_every_row_against_every_platform(self):
@@ -124,11 +133,190 @@ class PluginCiWorkflowTests(unittest.TestCase):
     def test_detect_check_runs_only_with_a_corpus(self):
         self.assertIn("if: inputs.corpus-dir != ''", self.text)
 
-    def test_the_smoke_script_runs_inside_the_smoke_with_its_socket(self):
+    def test_the_smoke_script_runs_inside_the_smoke_with_its_session(self):
         smoke = self.text.partition("Smoke the package and the smoke script")[2]
         self.assertIn("--script", smoke)
         self.assertIn('SMOKE_SCRIPT', smoke)
+        self.assertIn("working-directory: plugin", smoke)
+        header = self.text.partition("\njobs:\n")[0]
+        self.assertIn('POHUNEK_SMOKE_SESSION', header)
         self.assertNotIn("POHUNEK_SOCKET", smoke)
+
+    def test_the_platform_maps_to_a_runner(self):
+        self.assertIn("matrix.platform == 'aarch64-apple-darwin'", self.text)
+        self.assertIn("'macos-15'", self.text)
+
+    def test_the_inputs_are_validated_before_use(self):
+        validate = self.text.partition("Validate the inputs")[2]
+        self.assertIn("core-tag must be vX.Y.Z", validate)
+        self.assertIn("platforms holds only", validate)
+        self.assertIn("unknown row", validate)
+
+    def test_the_release_archive_keeps_the_release_layout(self):
+        self.assertIn("--strip-components=1", self.text)
+
+    def test_the_token_reaches_only_the_gh_steps(self):
+        body = self.text.partition("\njobs:\n")[2]
+        job_env = body.partition("steps:")[0]
+        self.assertNotIn("GH_TOKEN", job_env)
+        self.assertEqual(body.count("GH_TOKEN: ${{ github.token }}"), 3)
+
+    def test_the_upstream_install_contract_is_documented(self):
+        header = self.text.partition("\njobs:\n")[0]
+        self.assertIn("UPSTREAM_BIN", header)
+        smoke = self.text.partition("Smoke the package and the smoke script")[2]
+        self.assertIn('export UPSTREAM_BIN=', smoke)
+        self.assertIn('left $UPSTREAM_BIN empty', smoke)
+
+    def test_the_version_bump_check_tells_absent_from_error(self):
+        check = self.text.partition("Check the version bump")[2]
+        self.assertIn("gh release view", check)
+        self.assertIn("needs no baseline", check)
+
+
+class PluginCiShellTests(unittest.TestCase):
+    """The path-check and version-bump `run:` bodies against fixtures."""
+
+    @classmethod
+    def step(cls, name):
+        lines = WORKFLOW.read_text().splitlines()
+        start = next(i for i, line in enumerate(lines) if line.strip() == f"- name: {name}")
+        run_at = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+        indent = len(lines[run_at]) - len(lines[run_at].lstrip()) + 2
+        body = []
+        for line in lines[run_at + 1:]:
+            if line.strip() == "" or len(line) - len(line.lstrip()) >= indent:
+                body.append(line[indent:] if len(line) >= indent else "")
+            elif line.strip().startswith("-"):
+                break
+            else:
+                body.append(line)
+        return "\n".join(body)
+
+    def run_body(self, name, env, files=(), gh=None):
+        root = Path(tempfile.mkdtemp(prefix="plugin-ci-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for relative in files:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture")
+        if gh is not None:
+            bindir = root / "bin"
+            bindir.mkdir(exist_ok=True)
+            fake = bindir / "gh"
+            fake.write_text(gh)
+            fake.chmod(0o755)
+            env = dict(env, PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(root), **env}
+        try:
+            completed = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", self.step(name)],
+                cwd=root, env=env, capture_output=True, text=True, timeout=60,
+            )
+        except TypeError:
+            completed = subprocess.run(
+                ["bash", "-c", self.step(name)],
+                cwd=root, env=env, capture_output=True, text=True, timeout=60,
+            )
+        return completed
+
+    def test_the_path_check_accepts_the_defaults(self):
+        completed = self.run_body(
+            "Set up the package inputs",
+            {"PACKAGE_DIR": "package", "CORPUS_DIR": "", "UPSTREAM_INSTALL": "", "SMOKE_SCRIPT": ""},
+            files=["plugin/package/x"],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_path_check_rejects_an_empty_package_dir(self):
+        completed = self.run_body(
+            "Set up the package inputs",
+            {"PACKAGE_DIR": "", "CORPUS_DIR": "", "UPSTREAM_INSTALL": "", "SMOKE_SCRIPT": ""},
+            files=["plugin/package/x"],
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("PACKAGE_DIR must be a path below the repository root", completed.stderr)
+
+    def test_the_path_check_runs_the_set_inputs(self):
+        completed = self.run_body(
+            "Set up the package inputs",
+            {"PACKAGE_DIR": "package", "CORPUS_DIR": "corpus", "UPSTREAM_INSTALL": "install.sh", "SMOKE_SCRIPT": "smoke.sh"},
+            files=["plugin/package/x", "plugin/corpus/cases.toml", "plugin/install.sh", "plugin/smoke.sh"],
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_version_bump_passes_without_a_previous_release(self):
+        gh = "#!/bin/sh\nif [ \"$1 $2\" = \"release list\" ]; then exit 0; fi\nexit 1\n"
+        completed = self.run_body(
+            "Check the version bump",
+            {"PACKAGE_DIR": "package", "GITHUB_REPOSITORY": "owner/repo"},
+            files=["dist/a.tar.zst", "plugin/package/runtime.toml"],
+            gh=gh,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("the first release sets the version", completed.stdout)
+
+    def test_the_version_bump_passes_without_a_baseline_asset(self):
+        gh = (
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = \"release list\" ]; then echo v0.1.0; exit 0; fi\n"
+            "if [ \"$1 $2\" = \"release view\" ]; then echo other.txt; exit 0; fi\n"
+            "exit 1\n"
+        )
+        completed = self.run_body(
+            "Check the version bump",
+            {"PACKAGE_DIR": "package", "GITHUB_REPOSITORY": "owner/repo"},
+            files=["dist/a.tar.zst", "plugin/package/runtime.toml"],
+            gh=gh,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("needs no baseline", completed.stdout)
+
+    def test_the_version_bump_fails_on_a_failed_download(self):
+        gh = (
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = \"release list\" ]; then echo v0.1.0; exit 0; fi\n"
+            "if [ \"$1 $2\" = \"release view\" ]; then echo a.tar.zst; exit 0; fi\n"
+            "echo network down >&2; exit 1\n"
+        )
+        completed = self.run_body(
+            "Check the version bump",
+            {"PACKAGE_DIR": "package", "GITHUB_REPOSITORY": "owner/repo"},
+            files=["dist/a.tar.zst", "plugin/package/runtime.toml"],
+            gh=gh,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+
+    def test_the_version_bump_fails_on_a_changed_archive_without_a_bump(self):
+        (Path(tempfile.gettempdir()) / "x").exists()
+        root_files = ["dist/a.tar.zst", "previous/a.tar.zst", "plugin/package/runtime.toml"]
+        gh = (
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = \"release list\" ]; then echo v0.1.0; exit 0; fi\n"
+            "if [ \"$1 $2\" = \"release view\" ]; then echo a.tar.zst; exit 0; fi\n"
+            "exit 0\n"
+        )
+        root = Path(tempfile.mkdtemp(prefix="plugin-ci-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "dist").mkdir()
+        (root / "previous").mkdir()
+        (root / "plugin" / "package").mkdir(parents=True)
+        (root / "dist" / "a.tar.zst").write_bytes(b"new")
+        (root / "previous" / "a.tar.zst").write_bytes(b"old")
+        (root / "plugin" / "package" / "runtime.toml").write_text('version = "0.1.0"\n')
+        bindir = root / "bin"
+        bindir.mkdir()
+        fake = bindir / "gh"
+        fake.write_text(gh)
+        fake.chmod(0o755)
+        env = {"PATH": str(bindir) + os.pathsep + "/usr/bin:/bin", "HOME": str(root),
+               "PACKAGE_DIR": "package", "GITHUB_REPOSITORY": "owner/repo"}
+        completed = subprocess.run(
+            ["bash", "-c", self.step("Check the version bump")],
+            cwd=root, env=env, capture_output=True, text=True, timeout=60,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("but version is still 0.1.0", completed.stderr)
 
 
 if __name__ == "__main__":
