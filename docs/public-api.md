@@ -4565,8 +4565,9 @@ is not bounded; it blocks like a real terminal until the agent reads.
 not written and the session was not kept, so the create can be retried once the
 agent can accept input. The message names the grace and the last observed
 activity; a `blocked` activity means the agent waits on a dialog that needs an
-operator answer, so the message names the blocked state and points at answering
-it in the session (for example `pohunek attach <session-id>`) instead of
+operator answer, so the message names the blocked state and says the session
+was not kept: start the session without `--input`, answer the agent's dialog
+in it (`pohunek attach <session-id>`) and then send the input, instead of
 suggesting a longer grace, which a merely slow start keeps.
 
 `session_input_interrupted` means SIGINT or SIGTERM interrupted a waited CLI

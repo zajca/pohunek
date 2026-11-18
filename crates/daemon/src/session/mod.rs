@@ -4963,10 +4963,7 @@ impl SessionRegistry {
             (true, InitialInputWait::TimedOut) => {
                 let activity = self.current_activity(session_id).await;
                 let message = if activity == Some(AgentActivity::Blocked) {
-                    format!(
-                        "the agent waits on a dialog that needs an answer (last activity: blocked); nothing was sent, answer the agent's dialog in the session (for example `pohunek attach {id}`) instead of waiting longer",
-                        id = session_id.0,
-                    )
+                    "the agent waits on a dialog that needs an answer (last activity: blocked); nothing was sent and the session was not kept, start the session without --input, answer the agent's dialog in it (`pohunek attach <session-id>`) and then send the input".to_owned()
                 } else {
                     let label = activity.map_or_else(
                         || "none".to_owned(),

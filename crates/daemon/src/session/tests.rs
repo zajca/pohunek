@@ -24368,8 +24368,9 @@ async fn initial_input_observation_ends_at_every_wait_outcome() {
 }
 
 /// An initial-input timeout while the agent waits on a dialog names the
-/// blocked state and points at attach; a slow-start timeout keeps the
-/// startup-grace hint instead.
+/// blocked state and tells the caller to retry without `--input`; a
+/// slow-start timeout keeps the startup-grace hint instead. The refused
+/// session is rolled back, so the message never names its removed id.
 #[tokio::test]
 async fn initial_input_timeout_names_blocked_state_instead_of_the_startup_grace() {
     for (tag, activity, blocked) in [
@@ -24401,6 +24402,7 @@ async fn initial_input_timeout_names_blocked_state_instead_of_the_startup_grace(
             entry.info.activity = activity;
             entry.info.id.clone()
         };
+        let removed_id = session_id.0.clone();
         create_gate.release.notify_one();
         outcome_gate.entered.notified().await;
         outcome_gate.release.notify_one();
@@ -24416,10 +24418,18 @@ async fn initial_input_timeout_names_blocked_state_instead_of_the_startup_grace(
                 error.msg
             );
             assert!(
-                error
-                    .msg
-                    .contains(&format!("pohunek attach {}", session_id.0)),
-                "{tag}: the message points at the session dialog: {}",
+                !error.msg.contains(&removed_id),
+                "{tag}: the message names no removed session id: {}",
+                error.msg
+            );
+            assert!(
+                error.msg.contains("without --input"),
+                "{tag}: the message tells the caller to retry without --input: {}",
+                error.msg
+            );
+            assert!(
+                error.msg.contains("`pohunek attach <session-id>`"),
+                "{tag}: the message points at the dialog of the new session: {}",
                 error.msg
             );
             assert!(
