@@ -328,6 +328,13 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// The short fallback parent as the platform resolves it: on macOS `/tmp`
+/// is a symbolic link to `/private/tmp`, while the kit reports the
+/// canonical root it created.
+fn short_fallback() -> PathBuf {
+    fs::canonicalize(plugin_kit::isolated::SHORT_TEMP_PARENT).expect("the short parent resolves")
+}
+
 /// The isolation root a passing run names in its `--json` document: the
 /// kit legitimately puts it below the temp root or below its short
 /// fallback when the temp root is too long for a socket path. Either way
@@ -335,8 +342,7 @@ fn stderr_of(output: &Output) -> String {
 fn used_root(document: &Value, kit: &Kit) -> PathBuf {
     let root = PathBuf::from(document["root"].as_str().expect("the used root"));
     assert!(
-        root.starts_with(&kit.root_parent)
-            || root.starts_with(plugin_kit::isolated::SHORT_TEMP_PARENT),
+        root.starts_with(&kit.root_parent) || root.starts_with(short_fallback()),
         "the run used its temp root or the short fallback: {}",
         root.display()
     );
@@ -801,7 +807,7 @@ fn kit_falls_back_to_the_short_parent_on_a_long_temp_root() {
         root.display()
     );
     assert!(
-        root.starts_with(plugin_kit::isolated::SHORT_TEMP_PARENT),
+        root.starts_with(short_fallback()),
         "the fallback is the short parent: {}",
         root.display()
     );
@@ -892,9 +898,11 @@ fn kit_release_host_refuses_the_throwaway_index() {
     assert!(index.is_file(), "throwaway writes the index");
 
     // The host trusts the committed release anchor and channel, never the
-    // throwaway root: the throwaway-signed index is foreign to it.
+    // throwaway root: the throwaway-signed index is foreign to it. The
+    // root sits below the short temp root itself: below the deeper test
+    // `tmp` directory its staged worker socket would exceed the limit.
     let workspace = pohunek_test_support::workspace_root();
-    let root = Root::create_in(kit.env.tmp_dir()).expect("the isolation root");
+    let root = Root::create_in(&kit.root_parent).expect("the isolation root");
     let mut host = Host::prepare(
         &root,
         &release_dir(),
