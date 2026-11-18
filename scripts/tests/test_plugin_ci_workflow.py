@@ -208,17 +208,36 @@ class PluginCiShellTests(unittest.TestCase):
             fake.chmod(0o755)
             env = dict(env, PATH=str(bindir) + os.pathsep + os.environ["PATH"])
         env = {"PATH": "/usr/bin:/bin", "HOME": str(root), **env}
-        try:
-            completed = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", self.step(name)],
-                cwd=root, env=env, capture_output=True, text=True, timeout=60,
-            )
-        except TypeError:
-            completed = subprocess.run(
-                ["bash", "-c", self.step(name)],
-                cwd=root, env=env, capture_output=True, text=True, timeout=60,
-            )
+        completed = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", self.step(name)],
+            cwd=root, env=env, capture_output=True, text=True, timeout=60,
+        )
         return completed
+
+    def test_the_core_tag_check_accepts_a_plain_tag(self):
+        completed = self.run_body(
+            "Validate the inputs",
+            {"CORE_TAG": "v0.44.0", "PLATFORM": "x86_64-unknown-linux-gnu", "ROW": "release"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_core_tag_check_rejects_a_newline_payload(self):
+        completed = self.run_body(
+            "Validate the inputs",
+            {"CORE_TAG": "v0.44.0\nBASH_ENV=/x", "PLATFORM": "x86_64-unknown-linux-gnu", "ROW": "release"},
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("core-tag must be vX.Y.Z", completed.stderr)
+
+    def test_the_core_tag_check_rejects_a_suffixed_tag(self):
+        for tag in ("v1x.2.3-evil", "v0.44.0/../../heads/main"):
+            with self.subTest(tag=tag):
+                completed = self.run_body(
+                    "Validate the inputs",
+                    {"CORE_TAG": tag, "PLATFORM": "x86_64-unknown-linux-gnu", "ROW": "release"},
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("core-tag must be vX.Y.Z", completed.stderr)
 
     def test_the_path_check_accepts_the_defaults(self):
         completed = self.run_body(
@@ -286,6 +305,7 @@ class PluginCiShellTests(unittest.TestCase):
             gh=gh,
         )
         self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("network down", completed.stderr)
 
     def test_the_version_bump_fails_on_a_changed_archive_without_a_bump(self):
         gh = (

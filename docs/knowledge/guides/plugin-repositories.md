@@ -81,7 +81,7 @@ It calls the reusable
 | Input | Meaning |
 |---|---|
 | `core-tag` (required) | The core release tag the `release` row builds the kit from; it equals the tag in the caller's `uses:`. The workflow checks out that tag only, never a branch or a commit sha. |
-| `rows` (default `["release", "nightly"]`) | JSON list of rows to run: `release` (the kit from `core-tag`, smoked against that tag's attested daemon archive), `previous-minor` (the kit from the newest release of the previous minor) and `nightly` (the kit from `main`). |
+| `rows` (default `["release", "nightly"]`) | JSON list of rows to run: `release` (the kit from `core-tag`, smoked against that tag's attested daemon archive), `previous-minor` (the kit from the newest release of the previous minor, usable from core 0.45) and `nightly` (the kit from `main`). |
 | `platforms` (default `["x86_64-unknown-linux-gnu"]`) | JSON list of Rust target triples to smoke against: exactly `x86_64-unknown-linux-gnu` (Linux, runs on `ubuntu-24.04`) or `aarch64-apple-darwin` (macOS, runs on the pinned `macos-15` label). Any other value fails the job. The `release` row fetches the attested daemon archive per target; other rows build the daemon binaries from their own ref. |
 | `package-dir` (default `package`) | The package directory, a path below the repository root. |
 | `corpus-dir` (default empty) | The detection corpus directory, a path below the repository root holding `cases.toml`; empty skips `detect-check`. |
@@ -144,10 +144,10 @@ The same two commands run locally:
   descriptor that carries a `[runtime]` table or no `[context]` table
   (a `prove --no-enable` install stages a disabled install the inspect
   predicate must refuse for being disabled, and a `prove --pre-install`
-  archive must name the entry's package id: any otherwise identified archive
-  is refused (a staged newer version must carry the same id; a
-  context package's foreign id is the same refusal), so the install check and the
-  inspect `selected` check refuse the pre-installed archive (the inspect
+  archive must name the entry's package id: any other installed version of
+  the same id leaves the proved version unselected, so the install check
+  refuses it on the default path and the inspect digest check refuses the
+  other, selected version under `--no-enable` (the inspect `selected`
   check is defense in depth). The evidence of a
   context proof carries
   `"kind": "context"`. The

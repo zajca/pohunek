@@ -15,8 +15,7 @@
 # smokes against that tag's attested daemon archive, `nightly` builds from
 # `main`, and `previous-minor` builds from the newest release of the previous
 # minor (usable from core 0.45: only then does the previous minor's source
-# tree hold `crates/plugin-kit`, and only its own published daemon archive
-# can smoke the `release` row). The `nightly` and `previous-minor` rows build
+# tree hold `crates/plugin-kit`). The `nightly` and `previous-minor` rows build
 # the daemon binaries from their own ref instead. It never writes to
 # the plugin index: admission is a pull request to
 # the index repository (docs/knowledge/guides/plugin-repositories.md,
@@ -98,10 +97,10 @@ jobs:
           ROW: ${{ matrix.row }}
         run: |
           set -euo pipefail
-          case "$CORE_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "core-tag must be vX.Y.Z: $CORE_TAG" >&2; exit 1 ;;
-          esac
+          if [[ ! "$CORE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "core-tag must be vX.Y.Z: $CORE_TAG" >&2
+            exit 1
+          fi
           case "$PLATFORM" in
             x86_64-unknown-linux-gnu | aarch64-apple-darwin) ;;
             *) echo "platforms holds only x86_64-unknown-linux-gnu or aarch64-apple-darwin: $PLATFORM" >&2; exit 1 ;;
@@ -249,7 +248,7 @@ jobs:
           cmp build-one/*.tar.zst build-two/*.tar.zst
           mkdir -p dist
           cp build-one/*.tar.zst dist/
-          (cd dist && sha256sum -- *.tar.zst > SHA256SUMS)
+          (cd dist && shasum -a 256 -- *.tar.zst > SHA256SUMS)
 
       - name: Verify the archive
         timeout-minutes: 10
@@ -259,7 +258,7 @@ jobs:
           set -euo pipefail
           archive="$(echo dist/*.tar.zst)"
           test -f "$archive"
-          core/target/debug/pohunek-plugin-kit verify --dir "plugin/$PACKAGE_DIR" --archive "$archive" --sha256 "$(sha256sum "$archive" | cut -d' ' -f1 | sed 's/^/sha256:/')"
+          core/target/debug/pohunek-plugin-kit verify --dir "plugin/$PACKAGE_DIR" --archive "$archive" --sha256 "$(shasum -a 256 "$archive" | cut -d' ' -f1 | sed 's/^/sha256:/')"
 
       - name: Detect-check the corpus
         if: inputs.corpus-dir != ''
@@ -316,7 +315,7 @@ jobs:
           archive="$(echo dist/*.tar.zst)"
           name="$(basename "$archive")"
           assets="$(gh release view "$previous" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
-          if ! printf '%s\n' "$assets" | grep -qx "$name"; then
+          if ! printf '%s\n' "$assets" | grep -qxF -- "$name"; then
             echo "no $name in $previous: the version check needs no baseline"
             exit 0
           fi

@@ -883,13 +883,12 @@ fn an_oversized_pre_install_archive_is_refused_before_it_is_decoded() {
         "0.2.0",
     );
     let oversized = plugin.path("oversized-pre-install.tar.zst");
+    let over_cap = usize::try_from(package::Limits::DEFAULT.max_compressed_bytes)
+        .expect("the pre-install input cap fits in a usize")
+        + 1;
     let mut file = fs::File::create(&oversized).expect("create the oversized pre-install");
-    file.write_all(&vec![
-        0u8;
-        package::Limits::DEFAULT.max_compressed_bytes as usize
-            + 1
-    ])
-    .expect("write over the input cap");
+    file.write_all(&vec![0u8; over_cap])
+        .expect("write over the input cap");
     let evidence = plugin.path("oversized-pre-install-evidence.json");
     let output = plugin.prove_with_pre_install(
         &archive,

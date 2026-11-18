@@ -638,9 +638,12 @@ impl Host {
             .spawn()
             .map_err(|error| format!("cannot start the smoke script: {error}"))?;
         let status = wait_for_exit(&mut child, "the smoke script");
-        // No backgrounded child outlives the run: `ESRCH` (nothing left)
-        // is the normal path, anything else is ignored too because the
-        // script already exited and there is nothing left to report.
+        // No backgrounded child outlives the run. The script is already
+        // reaped here, so a fully exited group whose pgid the kernel has
+        // meanwhile handed to an unrelated new group would take the
+        // SIGKILL instead. That needs a pid wrap inside this tiny window,
+        // and `ESRCH` (nothing left) is the normal path, so the race is
+        // accepted: an error from the kill carries no report either way.
         if let Ok(pid) = i32::try_from(child.id()) {
             let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
         }

@@ -356,6 +356,19 @@ fn used_root(document: &Value, kit: &Kit) -> PathBuf {
     root
 }
 
+/// Whether the background pid the smoke script recorded is gone: absent
+/// from `/proc`, or a zombie (`Z` as the state after the `comm` field in
+/// `/proc/<pid>/stat`). A process the kit group-killed stays a zombie
+/// until its parent is reaped, so the zombie state counts as gone too.
+fn background_child_is_gone(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    let end = stat.iter().rposition(|byte| *byte == b')');
+    let Some(end) = end else { return false };
+    stat.get(end + 2..end + 3) == Some(&b"Z"[..])
+}
+
 /// The isolation root a failed run names on its stderr. The run names the
 /// root exactly once; the named directory must already be gone unless the
 /// removal itself is the failure. The scenario owns this name and no
@@ -559,8 +572,8 @@ fn kit_smoke_skips_the_script_when_the_screen_check_fails() {
         "args = [\"-c\", \"exec sleep 300\"]",
     );
     assert!(
-        text.contains("exec sleep 300"),
-        "the variant prints nothing"
+        !text.contains("echo ready"),
+        "the variant prints nothing the detector knows"
     );
     let package = kit.dir("quiet-package");
     fs::write(package.join("runtime.toml"), text).expect("write the variant");
@@ -648,19 +661,16 @@ fn kit_smoke_kills_the_background_child_of_the_script() {
         .trim()
         .parse()
         .expect("the recorded pid parses");
-    // The kit kills the script's process group after the script exits:
-    // a short grace covers the kill, then the background pid must be
-    // gone. Without the kill this fails instead of waiting out the
-    // child's lifetime.
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    let gone = std::process::Command::new("kill")
-        .args(["-0", &backgrounded.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_or(true, |status| !status.success());
+    // The kit kills the script's process group after the script exits.
+    // The background child's stdout and stderr are the kit's stderr, so
+    // `output()` above returns only after every writer of that pipe has
+    // closed: the child has exited by then. A reaped-then-exited child is
+    // either absent from `/proc` or a zombie (`Z` in `/proc/<pid>/stat`),
+    // both of which count as gone. Without the kit's kill this scenario
+    // never returns: the open pipe keeps `output()` blocked until the
+    // harness times the test out, so the revert fails by the timeout.
     assert!(
-        gone,
+        background_child_is_gone(backgrounded),
         "the script's background child is gone after the smoke"
     );
     let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
