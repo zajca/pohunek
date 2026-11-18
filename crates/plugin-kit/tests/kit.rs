@@ -350,16 +350,26 @@ fn used_root(document: &Value, kit: &Kit) -> PathBuf {
     root
 }
 
-/// The isolation root a failed run names on its stderr. The root is
-/// removed before the report, so the named directory must already be
-/// gone: the scenario owns this name and no foreign root can fail it.
+/// The isolation root a failed run names on its stderr. The run names the
+/// root exactly once; the named directory must already be gone unless the
+/// removal itself is the failure. The scenario owns this name and no
+/// foreign root can fail it.
 fn named_root(output: &Output) -> PathBuf {
-    let line = stderr_of(output)
+    let mut named: Vec<String> = stderr_of(output)
         .lines()
-        .find_map(|line| line.strip_prefix("isolation root: ").map(str::to_owned))
-        .expect("the failure names its isolation root");
-    let root = PathBuf::from(line);
-    assert!(!root.exists(), "a failed run removes its root");
+        .filter_map(|line| line.strip_prefix("isolation root: ").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "the failure names its isolation root exactly once: {}",
+        stderr_of(output)
+    );
+    let root = PathBuf::from(named.pop().expect("one named root"));
+    assert!(
+        !root.exists(),
+        "a failed run removes its root before the report"
+    );
     root
 }
 
@@ -464,6 +474,72 @@ fn kit_smoke_passes_on_fixture() {
         "the smoke saw a non-empty screen: {document:?}"
     );
     used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_runs_the_script_against_the_live_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-script.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\n\
+         set -eu\n\
+         test -n \"${POHUNEK_SOCKET_PATH:-}\" || exit 9\n\
+         [ -S \"$POHUNEK_SOCKET_PATH\" ] || exit 8\n\
+         test -n \"${POHUNEK_SMOKE_SESSION:-}\" || exit 7\n\
+         prefix=$(dirname \"$POHUNEK_SOCKET_PATH\" | sed 's|/xdg-runtime/pohunek$||')\n\
+         \"$prefix/prefix/pohunek\" session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+    )
+    .expect("write the smoke script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke with a script failed: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_refuses_a_failing_script() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-fail.sh");
+    fs::write(&script, "#!/bin/sh\nexit 3\n").expect("write the failing script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a failing script must fail the smoke"
+    );
+    assert!(
+        stderr_of(&output).contains(&format!("the smoke script `{}` exited 3", script.display())),
+        "the error names the script and its exit: {}",
+        stderr_of(&output)
+    );
+    named_root(&output);
 }
 
 #[test]

@@ -5,9 +5,10 @@
 //! single JSON document. The process exit status is 0 for a pass, 1 for a
 //! failed proof or a refused index write, and 2 for every other refusal.
 //!
-//! A failed `prove` or `smoke` that already ran on an isolation root names
-//! it on stderr as `isolation root: <path>`: the root is removed before
-//! the report, so the line always names a directory that is gone.
+//! A failed `prove` or `smoke` that ran on an isolation root names it on
+//! stderr as `isolation root: <path>`: the kit has removed the root unless
+//! the failure is the removal itself. A refusal before the root exists, or
+//! the failure to write the evidence after the run, names no root.
 
 use std::path::PathBuf;
 
@@ -94,6 +95,11 @@ enum Command {
         /// the locked upstream install there.
         #[arg(long)]
         upstream: Option<PathBuf>,
+        /// Smoke script: a plugin-owned executable run once inside the
+        /// live isolated root after the generic smoke checks pass.
+        /// Without it, the smoke stops after the screen check.
+        #[arg(long)]
+        script: Option<PathBuf>,
         /// Print the report as a single JSON document.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -192,12 +198,14 @@ fn dispatch(command: Command) -> Result<(), Error> {
             dir,
             release_dir,
             upstream,
+            script,
             json,
         } => {
             let report = smoke::smoke(&smoke::SmokeArgs {
                 dir,
                 release_dir,
                 upstream,
+                script,
             })?;
             emit(json, &report.line(), &report)
         }

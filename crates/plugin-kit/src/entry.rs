@@ -89,6 +89,15 @@ impl Source {
         }
     }
 
+    /// The `key=value` lines `--print-source` prints.
+    #[must_use]
+    pub fn lines(&self) -> String {
+        format!(
+            "repo={}\nrepo_id={}\ntag={}\ncommit={}\nbuilt_with={}\n",
+            self.repo, self.repo_id, self.tag, self.commit, self.built_with
+        )
+    }
+
     /// Checks the fields against the entry they belong to.
     ///
     /// `repo` is `owner/name` over the characters GitHub allows, `repo_id` is

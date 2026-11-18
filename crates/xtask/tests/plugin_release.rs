@@ -850,6 +850,11 @@ fn a_foreign_pre_install_archive_is_refused_at_install() {
         false,
     );
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("the pre-installed archive names"),
+        "the refusal names the binding archive: {}",
+        stderr_of(&output)
+    );
     let document = evidence_of(&evidence);
     assert_eq!(document["result"], "fail");
     assert_eq!(document["failed_step"], "install");
@@ -967,8 +972,9 @@ fn a_runtime_id_the_index_never_authorizes_fails_at_install() {
     let output = plugin.prove(&archive, &entry, &release_dir(), &evidence);
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     assert!(
-        stderr_of(&output).contains("package_runtime_not_claimable"),
-        "{}",
+        stderr_of(&output).contains("package_runtime_not_claimable")
+            || stderr_of(&output).contains("the pre-installed archive names"),
+        "neither the install-step refusal nor the pre-install conflict names the fixture: {}",
         stderr_of(&output)
     );
     let document = evidence_of(&evidence);

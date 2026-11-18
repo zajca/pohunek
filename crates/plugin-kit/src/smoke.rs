@@ -39,6 +39,10 @@ pub struct SmokeArgs {
     /// isolated daemon's `PATH`, so the runtime program resolves to the
     /// locked upstream install there.
     pub upstream: Option<PathBuf>,
+    /// Smoke script: a plugin-owned executable from the plugin repository,
+    /// run once inside the live isolated root after the generic smoke
+    /// checks pass.
+    pub script: Option<PathBuf>,
 }
 
 /// What a passing smoke reports.
@@ -100,13 +104,15 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
         &root,
         &args.release_dir,
         args.upstream.as_deref(),
+        args.script.as_deref(),
         &bytes,
         &identity,
         &version,
     );
     let removal = root.remove().map_err(Error::Usage);
-    // Every failure past this point names the used isolation root: the
-    // removal ran on every path, so the root it names is always gone.
+    // Every failure past this point names the used isolation root. The
+    // removal ran on every path, so the named root is gone unless the
+    // removal itself is the failure.
     let report = outcome.map_err(|error| Error::Smoke {
         root: path.clone(),
         error: Box::new(error),
@@ -125,6 +131,7 @@ fn smoke_in(
     root: &Root,
     release_dir: &Path,
     upstream: Option<&Path>,
+    script: Option<&Path>,
     archive: &[u8],
     identity: &crate::archive::Identity,
     version: &protocol::PackageVersion,
@@ -168,7 +175,7 @@ fn smoke_in(
     }
     host.launch_local_only(root).map_err(Error::Usage)?;
 
-    let smoke = smoke_session(&mut host, &identity.runtime_id, archive, &digest);
+    let smoke = smoke_session(&mut host, &identity.runtime_id, archive, &digest, script);
     let stop = host.stop().map_err(Error::Usage);
     let (activity, screen_lines) = smoke?;
     stop?;
@@ -183,13 +190,15 @@ fn smoke_in(
 
 /// Installs the archive under the throwaway trust, starts one session on the
 /// installed runtime, waits for the published activity to leave `unknown`,
-/// requires a non-empty screen, then stops and removes the session. The
-/// generic smoke stops after the screen check: no full agent run.
+/// requires a non-empty screen, then runs the smoke script (when one is
+/// given) against that live session, and stops and removes the session.
+/// The generic smoke stops after the screen check: no full agent run.
 fn smoke_session(
     host: &mut Host,
     runtime_id: &protocol::RuntimeId,
     archive: &[u8],
     digest: &package::PackageDigest,
+    script: Option<&Path>,
 ) -> Result<(AgentActivity, usize), Error> {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = host.root().join("archives");
@@ -238,10 +247,35 @@ fn smoke_session(
         .ok_or_else(|| refuse("`pohunek session new` reported no session id"))?
         .to_owned();
     let wait = wait_for_screen(host, &session);
+    let scripted = script.map(|script| run_script(host, script, &session));
     let cleanup = stop_session(host, &session);
     let (activity, screen_lines) = wait?;
+    if let Some(scripted) = scripted {
+        scripted?;
+    }
     cleanup?;
     Ok((activity, screen_lines))
+}
+
+/// Runs the plugin-owned smoke script inside the live isolated root after
+/// the generic smoke checks passed, against the live session id exported
+/// under `POHUNEK_SMOKE_SESSION`. The inherited origin pair stays absent,
+/// so the script's `pohunek` commands connect as an owner with an explicit
+/// session id. The script runs in the smoke's own cwd with its stdout and
+/// stderr inherited unchanged. A non-zero script exit fails the smoke
+/// with an error naming the script and the exit code.
+fn run_script(host: &mut Host, script: &Path, session: &str) -> Result<(), Error> {
+    let status = host.run_script(script, session).map_err(Error::Usage)?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(refuse(format!(
+        "the smoke script `{}` exited {}",
+        script.display(),
+        status
+            .code()
+            .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
+    )))
 }
 
 /// Stops and removes the smoke session: both run and a non-zero exit of

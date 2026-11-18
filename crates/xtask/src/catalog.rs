@@ -18,7 +18,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +30,7 @@ use package::{
     PackageDigest, Release, RootKey, TrustAnchor, VerifiedArchive, VerifiedCatalog,
     CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
 };
-use protocol::{PackageId, PackageVersion, RuntimeId};
+use protocol::{PackageId, PackageVersion};
 use serde::Deserialize;
 
 use crate::catalog_key::{read_public_key, read_signing_key};
@@ -82,34 +82,10 @@ pub(crate) fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError
 }
 
 /// Reads the regular file at `path`, at most `max_bytes`, without following a
-/// final symbolic link.
+/// final symbolic link. The reader is the kit's: one capped no-follow reader
+/// for every caller.
 pub(crate) fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, XtaskError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).bits())
-        .open(path)
-        .map_err(io_error(path))?;
-    let metadata = file.metadata().map_err(io_error(path))?;
-    if !metadata.is_file() {
-        return Err(XtaskError::UnsupportedFileType(path.to_path_buf()));
-    }
-    if metadata.len() > max_bytes {
-        return Err(XtaskError::Usage(format!(
-            "`{}` is larger than the {max_bytes}-byte limit",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(io_error(path))?;
-    if u64::try_from(bytes.len()).map_or(true, |read| read > max_bytes) {
-        return Err(XtaskError::Usage(format!(
-            "`{}` is larger than the {max_bytes}-byte limit",
-            path.display()
-        )));
-    }
-    Ok(bytes)
+    plugin_kit::files::read_input(path, max_bytes).map_err(XtaskError::from)
 }
 
 /// Writes `bytes` to `output`, refusing a symbolic link.
@@ -150,89 +126,35 @@ fn pretty_with_newline<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, XtaskE
     Ok(bytes)
 }
 
-/// Identity and runtime API a package descriptor declares.
-pub(crate) struct Identity {
-    pub(crate) package_id: PackageId,
-    pub(crate) version: PackageVersion,
-    pub(crate) runtime_id: RuntimeId,
-    pub(crate) runtime_api: u32,
-}
+/// Identity and runtime API a package descriptor declares. The reader is
+/// the kit's: one descriptor reader for every caller.
+pub(crate) type Identity = plugin_kit::archive::Identity;
 
 /// Reads the package id and version from the `runtime.toml` bytes `descriptor`.
 ///
 /// Every package kind declares them, including a context package that serves
-/// no runtime.
+/// no runtime. The reader is the kit's: one descriptor reader for every
+/// caller.
 pub(crate) fn descriptor_package(
     descriptor: &[u8],
 ) -> Result<(PackageId, PackageVersion, toml::Table), XtaskError> {
-    let invalid = |reason: &str| {
-        XtaskError::Usage(format!("package descriptor `{DESCRIPTOR_PATH}` {reason}"))
-    };
-    let text = std::str::from_utf8(descriptor).map_err(|_cause| invalid("is not UTF-8"))?;
-    let table: toml::Table = text
-        .parse()
-        .map_err(|_cause| invalid("is not valid TOML"))?;
-    let string = |value: Option<&toml::Value>, what: &str| {
-        value
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| invalid(&format!("has no string `{what}`")))
-    };
-    let package_id = PackageId::parse(&string(table.get("id"), "id")?)
-        .map_err(|_cause| invalid("has an invalid package `id`"))?;
-    let version = PackageVersion::parse(&string(table.get("version"), "version")?)
-        .map_err(|_cause| invalid("has an invalid `version`"))?;
-    Ok((package_id, version, table))
+    plugin_kit::archive::descriptor_package(descriptor).map_err(XtaskError::from)
 }
 
 /// Reads the identity and runtime API from the `runtime.toml` bytes `descriptor`.
+/// The reader is the kit's: one descriptor reader for every caller.
 pub(crate) fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
-    let invalid = |reason: &str| {
-        XtaskError::Usage(format!("package descriptor `{DESCRIPTOR_PATH}` {reason}"))
-    };
-    let (package_id, version, table) = descriptor_package(descriptor)?;
-    let runtime_api = table
-        .get("runtime_api")
-        .and_then(toml::Value::as_integer)
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value >= 1)
-        .ok_or_else(|| invalid("has no positive integer `runtime_api`"))?;
-    let runtime = table
-        .get("runtime")
-        .and_then(toml::Value::as_table)
-        .ok_or_else(|| invalid("has no `[runtime]` table"))?;
-    let runtime_id = RuntimeId::parse(
-        runtime
-            .get("id")
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| invalid("has no string `runtime.id`"))?,
-    )
-    .map_err(|_cause| invalid("has an invalid `runtime.id`"))?;
-    Ok(Identity {
-        package_id,
-        version,
-        runtime_id,
-        runtime_api,
-    })
+    plugin_kit::archive::descriptor_identity(descriptor).map_err(XtaskError::from)
 }
 
 /// The identity the `runtime.toml` of the verified archive read from
-/// `archive` declares.
+/// `archive` declares. The reader is the kit's: one descriptor reader for
+/// every caller.
 pub(crate) fn archive_identity(
     verified: &VerifiedArchive,
     archive: &Path,
 ) -> Result<Identity, XtaskError> {
-    let descriptor = verified
-        .entries()
-        .iter()
-        .find(|entry| entry.path == DESCRIPTOR_PATH)
-        .ok_or_else(|| {
-            XtaskError::Usage(format!(
-                "package archive `{}` has no `{DESCRIPTOR_PATH}`",
-                archive.display()
-            ))
-        })?;
-    descriptor_identity(&descriptor.contents)
+    plugin_kit::archive::archive_identity(verified, archive).map_err(XtaskError::from)
 }
 
 /// The catalog entry of the package archive at `archive`, listed for

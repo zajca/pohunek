@@ -23,9 +23,10 @@ use package::{
 };
 use semver::{Comparator, Op, Version};
 
-use super::build::{index_entry, read_tree, EntryFile};
+use super::build::read_tree;
 use crate::catalog::unix_now;
 use crate::XtaskError;
+use plugin_kit::entry::EntryFile;
 
 /// First core release that carries the index verifier. An entry's core range
 /// must not admit anything below it.
@@ -196,7 +197,11 @@ fn schema(added: &EntryFile, existing_root: &Path) -> Result<String, XtaskError>
 
     let merged: Vec<IndexEntry> = existing
         .into_iter()
-        .map(|other| index_entry(other, INDEX_SCHEMA_VERSION_2))
+        .map(|other| {
+            other
+                .signed_entry(INDEX_SCHEMA_VERSION_2)
+                .map_err(XtaskError::from)
+        })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .chain(std::iter::once(entry))

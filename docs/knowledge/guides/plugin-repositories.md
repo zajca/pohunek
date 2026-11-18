@@ -74,14 +74,33 @@ A plugin repository created from the template holds:
 
 ## Required CI
 
-The template's CI is required on every pull request and is not edited away:
+The template's CI is required on every pull request and is not edited away.
+It calls the reusable
+`zajca/pohunek/.github/workflows/plugin-ci.yml@<core tag>`:
+
+| Input | Meaning |
+|---|---|
+| `core-tag` (required) | The core release tag the `release` row builds the kit from; it equals the tag in the caller's `uses:`. The workflow checks out that tag only, never a branch or a commit sha. |
+| `rows` (default `["release", "nightly"]`) | JSON list of rows to run: `release` (the kit from `core-tag`, smoked against that tag's attested daemon archive), `previous-minor` (the kit from the newest release of the previous minor) and `nightly` (the kit from `main`). |
+| `platforms` (default `["x86_64-unknown-linux-gnu"]`) | JSON list of Rust target triples to smoke against; the daemon archive is fetched per target. |
+| `package-dir` (default `package`) | The package directory, a path below the repository root. |
+| `corpus-dir` (default empty) | The detection corpus directory, a path below the repository root holding `cases.toml`; empty skips `detect-check`. |
+| `upstream-install` (default empty) | A script, a path below the repository root, that installs the locked upstream; empty skips the upstream install the smoke puts on `PATH`. |
+| `smoke-script` (default empty) | An executable, a path below the repository root, run once by the generic smoke after its screen check, inside the same live isolated root: the socket path under `POHUNEK_SOCKET_PATH`, the live session id under `POHUNEK_SMOKE_SESSION`, the isolated environment, the repository root as cwd; a non-zero exit fails the smoke; empty skips it. |
+
+Every row and target runs one job with `contents: read`, no secret and no
+cache restore on `ubuntu-24.04`:
 
 - lint of the descriptor or manifest against the core schema and the runtime
   features it requires;
-- a reproducible double build of the archive, then verification;
-- a smoke run of the built package against the core release and the nightly
-  core, from the plugin kit, in an isolated root;
-- the screen detection corpus for a runtime package;
+- a reproducible double build of the archive with a byte compare, then
+  verification;
+- the screen detection corpus for a runtime package (only when `corpus-dir`
+  is set);
+- a smoke run of the built package from the plugin kit, in an isolated root:
+  the generic smoke stops after the screen check and runs the optional
+  `smoke-script` on the same live isolated root, so the plugin's own input
+  and hook-event checks see the exact host the generic smoke passed on;
 - a version-bump check, so a changed archive carries a new version.
 
 A release is published on a version tag `vX.Y.Z` by the template's release
@@ -124,7 +143,11 @@ The same two commands run locally:
   descriptor that carries a `[runtime]` table or no `[context]` table
   (a `prove --no-enable` install stages a disabled install the inspect
   predicate must refuse for being disabled, and a `prove --pre-install`
-  newer version leaves the proved version unselected). The evidence of a
+  archive must differ from the entry's identity: any other version
+  already installed is a conflict unless its package id differs (a
+  context package always conflicts), so the install check and the
+  inspect `selected` check refuse the pre-installed archive (the inspect
+  check is defense in depth). The evidence of a
   context proof carries
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
@@ -158,21 +181,28 @@ index write, and 2 for every other refusal:
   corpus through the detector: `cases.toml` holds `[[case]]` tables with a
   `screen` file under `screens/`, a `width`, and the expected `working`,
   `blocked`, `idle` or `unknown` activity.
-- `smoke --release-dir <dir> [--upstream <path>]` installs the built
-  package on an isolated daemon through a throwaway index, starts it, waits
-  for detection past `unknown`, and requires a non-empty screen; then it
-  stops and removes the session. The generic smoke stops after the screen
-  check: no full agent run. `--upstream` puts a directory (or the directory
-  of an executable) in front of the isolated daemon's `PATH`, so the runtime
-  program resolves to the locked upstream install there.
+- `smoke --release-dir <dir> [--upstream <path>] [--script <path>]`
+  installs the built package on an isolated daemon through a throwaway
+  index, starts it, waits for detection past `unknown`, and requires a
+  non-empty screen; then it stops and removes the session. The generic
+  smoke stops after the screen check: no full agent run. `--upstream` puts
+  a directory (or the directory of an executable) in front of the isolated
+  daemon's `PATH`, so the runtime program resolves to the locked upstream
+  install there. `--script` runs a plugin-owned executable once after the
+  screen check, inside the same live isolated root, with the socket path
+  under `POHUNEK_SOCKET_PATH`, the live session id under
+  `POHUNEK_SMOKE_SESSION`, the isolated environment and the kit's own cwd;
+  a non-zero exit fails the smoke naming the script and the exit code.
 - `prove --release-dir <dir> --evidence <file> [--no-enable]` runs the same
   install path as `xtask plugin prove` from the package directory and writes
   the verdict as evidence JSON, plus the kit digest (`kit_sha256`); with
   `--archive <file> --entry <entry.toml>` instead of `--dir` it proves the
   admitted release asset against its real entry. `--json` reports the used
   isolation root alongside the line, so a scenario can assert the root is
-  gone; a failed run names its already-removed root on stderr as
-  `isolation root: <path>` (`None` before the root exists names none).
+  gone; a failed run names its isolation root on stderr as
+  `isolation root: <path>`: the kit has removed the root unless the
+  failure is the removal itself. A refusal before the root exists, or the
+  failure to write the evidence after the run, names no root.
 
 ## Compatibility declaration
 

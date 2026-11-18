@@ -182,8 +182,10 @@ impl Verdict {
         self.step.name()
     }
 
-    /// Isolation root the failed proof ran in, removed on every path.
-    /// `None` when the proof ended before the root existed.
+    /// Isolation root the failed proof ran in. It is removed on every path
+    /// unless the removal itself is the failure. `None` when the proof
+    /// ended before the root existed, or when the run finished and only the
+    /// evidence write failed.
     #[must_use]
     pub fn root(&self) -> Option<&std::path::Path> {
         self.root.as_deref()
@@ -601,7 +603,9 @@ fn pre_install_archive(
     entry: &package::IndexEntry,
     archive: &Path,
 ) -> Result<(), String> {
-    let bytes = fs::read(archive)
+    // A capped no-follow read like every other input read: the file is
+    // caller-controlled, so it must not grow the proof without a bound.
+    let bytes = read_input(archive, Limits::DEFAULT.max_compressed_bytes)
         .map_err(|error| format!("cannot read the pre-installed archive: {error}"))?;
     let verified = read_archive(&bytes, &Limits::DEFAULT)
         .map_err(|error| format!("the pre-installed archive is not a valid package: {error}"))?;
