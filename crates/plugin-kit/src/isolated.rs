@@ -13,10 +13,11 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::io::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -88,8 +89,27 @@ const _: () = assert!(
 );
 
 /// Socket path below the root: `XDG_RUNTIME_DIR` plus the application
-/// directory and socket file the daemon appends to it.
+/// directory and socket file the daemon appends to it. Bare `pohunek`
+/// commands reach the isolated daemon through this directory: the CLI
+/// resolves the socket from the runtime directory, never from the socket
+/// variable below. The variable stays exported only as information for
+/// hook-style clients that read it from a session payload.
 const SOCKET_RELATIVE_PATH: &str = "xdg-runtime/pohunek/daemon.sock";
+
+/// Environment variable naming the isolated daemon's control socket for a
+/// smoke script: informational only, for hook-style clients that read the
+/// socket path from the environment. A bare `pohunek` in the script
+/// reaches the isolated daemon through the isolated `XDG_RUNTIME_DIR`,
+/// not through this variable (the CLI resolves the socket from the
+/// runtime directory).
+const SOCKET_ENV_VAR: &str = protocol::ENV_SOCKET_PATH;
+
+/// Environment variable handing the smoke script the live session id the
+/// generic smoke passed on: a kit-owned name, not the handshake variable.
+/// The origin pair (`POHUNEK_SESSION_ID` / `POHUNEK_DAEMON_ID`) stays
+/// absent, so the script's `pohunek` commands connect as an owner with an
+/// explicit session id, never as the session.
+const SESSION_ENV_VAR: &str = "POHUNEK_SMOKE_SESSION";
 
 /// Prefix of a session root's directory name: a root that runs sessions
 /// nests worker sockets deeper than the daemon socket.
@@ -567,6 +587,78 @@ impl Host {
         self.run_program("pohunek", arguments)
     }
 
+    /// Runs `script`, a plugin-owned executable from the plugin repository,
+    /// with the live session id exported under `POHUNEK_SMOKE_SESSION`. The
+    /// script reaches the isolated daemon through the isolated
+    /// `XDG_RUNTIME_DIR`: a bare `pohunek` on the script's `PATH` (the
+    /// isolated prefix, holding the release executables, comes first)
+    /// resolves its socket from that directory, so only the isolated
+    /// daemon's sessions answer. `POHUNEK_SOCKET_PATH` is exported only
+    /// as information for hook-style clients, not as routing. The origin
+    /// pair the CLI would otherwise inherit
+    /// (`POHUNEK_SESSION_ID`/`POHUNEK_DAEMON_ID`) is deliberately absent,
+    /// so the script connects as an owner with an explicit id, not as
+    /// the live session. The script's stdout and stderr both go to the
+    /// kit's stderr unchanged, so `--json` stdout stays one JSON document.
+    /// The script runs in the smoke's own cwd: the caller starts the kit
+    /// in the plugin repository, and the kit never changes its cwd. After
+    /// the script exits, its process group is killed on every path, so no
+    /// backgrounded child survives the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the script is missing, a symbolic link, not
+    /// a regular file or not executable (the same bar as a release
+    /// executable), or when it does not finish within [`COMMAND_TIMEOUT`].
+    pub fn run_script(&mut self, script: &Path, session: &str) -> Result<ExitStatus, String> {
+        require_safe_executable(script, &script.display().to_string())?;
+        let socket = self.root.join(SOCKET_RELATIVE_PATH);
+        let mut script_path = vec![self.prefix.clone().into_os_string()];
+        script_path.extend(std::env::split_paths(&self.script_path()).map(PathBuf::into_os_string));
+        let script_path = std::env::join_paths(script_path)
+            .map_err(|error| format!("cannot join the smoke script `PATH`: {error}"))?;
+        let extra = [
+            (OsString::from(SOCKET_ENV_VAR), socket.into_os_string()),
+            (OsString::from(SESSION_ENV_VAR), OsString::from(session)),
+            (OsString::from("PATH"), script_path),
+        ];
+        let stderr = std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map(Stdio::from)
+            .map_err(|error| format!("cannot duplicate stderr for the smoke script: {error}"))?;
+        let mut child = Command::new(script)
+            .env_clear()
+            .envs(self.environment.iter().cloned())
+            .envs(extra.iter().cloned())
+            .stdin(Stdio::null())
+            .stdout(stderr)
+            .stderr(Stdio::inherit())
+            .process_group(0)
+            .spawn()
+            .map_err(|error| format!("cannot start the smoke script: {error}"))?;
+        let status = wait_for_exit(&mut child, "the smoke script");
+        // No backgrounded child outlives the run. The script is already
+        // reaped here, so a fully exited group whose pgid the kernel has
+        // meanwhile handed to an unrelated new group would take the
+        // SIGKILL instead. That needs a pid wrap inside this tiny window,
+        // and `ESRCH` (nothing left) is the normal path, so the race is
+        // accepted: an error from the kill carries no report either way.
+        if let Ok(pid) = i32::try_from(child.id()) {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        status
+    }
+
+    /// The `PATH` every child except a smoke script runs with.
+    fn script_path(&self) -> OsString {
+        self.environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    }
+
     /// Runs `program`, an executable outside the prefix, with `arguments` in
     /// the isolated environment plus `extra_environment`.
     pub fn run_external(
@@ -610,23 +702,7 @@ impl Host {
             .process_group(0)
             .spawn()
             .map_err(|error| format!("cannot start `{program}`: {error}"))?;
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
-                Ok(None) => {
-                    end_group(&mut child);
-                    return Err(format!(
-                        "`{program}` did not finish within {COMMAND_TIMEOUT:?}"
-                    ));
-                }
-                Err(error) => {
-                    end_group(&mut child);
-                    return Err(format!("cannot wait for `{program}`: {error}"));
-                }
-            }
-        };
+        let status = wait_for_exit(&mut child, &format!("`{program}`"))?;
         let mut stdout = Vec::new();
         File::open(&output_path)
             .and_then(|file| file.take(OUTPUT_LIMIT_BYTES + 1).read_to_end(&mut stdout))
@@ -732,6 +808,27 @@ impl Drop for Host {
             // The daemon leads its own process group, so this also ends any
             // worker it started. It may have exited already.
             end_group(&mut daemon);
+        }
+    }
+}
+
+/// Waits for `child` until it exits or [`COMMAND_TIMEOUT`] passes, then
+/// reaps its process group on a timeout or a wait error. Returns the exit
+/// status; `what` names the child in the timeout and wait errors.
+fn wait_for_exit(child: &mut Child, what: &str) -> Result<ExitStatus, String> {
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
+            Ok(None) => {
+                end_group(child);
+                return Err(format!("{what} did not finish within {COMMAND_TIMEOUT:?}"));
+            }
+            Err(error) => {
+                end_group(child);
+                return Err(format!("cannot wait for {what}: {error}"));
+            }
         }
     }
 }

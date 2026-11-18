@@ -4,7 +4,8 @@
 //! Every entry file is parsed with `deny_unknown_fields`; its `[source]` table
 //! is admission metadata that is validated here and never copied into the
 //! signed document, so no pull-request-controlled string reaches a shell or an
-//! API path unchecked.
+//! API path unchecked. The single-file reader lives in the kit crate
+//! ([`plugin_kit::entry`]); this module keeps only the tree walk.
 
 // Rust guideline compliant 2026-11-06
 
@@ -14,11 +15,10 @@ use std::path::{Path, PathBuf};
 
 use package::{
     check_index_body, parse_index_envelope, IndexBody, IndexEntry, IndexEntryKind, IndexEnvelope,
-    IndexKeyRecord, PackageDigest, SignedRevocations, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
+    IndexKeyRecord, SignedRevocations, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
     MAX_INDEX_BYTES, MAX_INDEX_KEY_RECORDS, OFFICIAL_SCOPE,
 };
-use protocol::{PackageId, PackageVersion, RuntimeId};
-use serde::Deserialize;
+use plugin_kit::entry::EntryFile;
 
 use super::{document_bytes, write_new_document, MAX_REVOCATIONS_FILE_BYTES};
 use crate::catalog::{io_error, read_input};
@@ -31,48 +31,11 @@ const OFFICIAL_DIR: &str = "official";
 /// be empty.
 const KEEP_FILE: &str = ".gitkeep";
 
-/// Extension of an entry file.
+/// Extension of an entry file, as the kit reader requires it.
 const ENTRY_EXTENSION: &str = "toml";
-
-/// Largest accepted entry file. An entry is under 1 KiB; 16 KiB leaves room
-/// for comments without admitting an arbitrary file into the parser.
-const MAX_ENTRY_FILE_BYTES: u64 = 16 * 1024;
 
 /// Largest accepted `--key-record` file. A record is about 700 bytes.
 const MAX_KEY_RECORD_FILE_BYTES: u64 = 16 * 1024;
-
-/// Length of a git commit id in lowercase hex.
-const COMMIT_HEX_LEN: usize = 40;
-
-/// One entry file: the signed fields and the admission metadata.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct EntryFile {
-    pub(super) package_id: PackageId,
-    /// `runtime` (the default) or `context`.
-    #[serde(default)]
-    pub(super) kind: Option<IndexEntryKind>,
-    /// The runtime a `runtime` entry provides; a `context` entry has none.
-    #[serde(default)]
-    pub(super) runtime_id: Option<RuntimeId>,
-    pub(super) version: PackageVersion,
-    pub(super) digest: PackageDigest,
-    pub(super) url: String,
-    pub(super) platforms: Vec<String>,
-    pub(super) core: String,
-    source: Source,
-}
-
-/// Where an entry's package was built from; checked at admission, not signed.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Source {
-    repo: String,
-    repo_id: u64,
-    tag: String,
-    commit: String,
-    built_with: String,
-}
 
 /// The inputs of `index build`.
 pub(crate) struct BuildArgs {
@@ -91,75 +54,10 @@ fn refuse(reason: String) -> XtaskError {
     XtaskError::Usage(reason)
 }
 
-/// Whether `text` is one or more characters from `allowed`.
-fn all_of(text: &str, allowed: impl Fn(char) -> bool) -> bool {
-    !text.is_empty() && text.chars().all(allowed)
-}
-
-impl Source {
-    /// Checks the fields against the entry they belong to.
-    ///
-    /// `repo` is `owner/name` over the characters GitHub allows, `repo_id` is
-    /// a GitHub repository id (never 0), `tag` is `v` plus the entry version,
-    /// `commit` is 40 lowercase hex digits and `built_with` is a release tag
-    /// `vX.Y.Z`. A commit sha in `built_with` is refused: it could name a
-    /// commit of a fork network instead of a release of this repository.
-    fn validate(&self, version: &PackageVersion) -> Result<(), XtaskError> {
-        let repo_ok = self.repo.split_once('/').is_some_and(|(owner, name)| {
-            all_of(owner, |c| c.is_ascii_alphanumeric() || c == '-')
-                // An owner never starts with `-`, which a command line would read as an option.
-                && !owner.starts_with('-')
-                && all_of(name, |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-                // `.` and `..` match the character class but name no
-                // repository and would change an API path.
-                && name != "."
-                && name != ".."
-        });
-        if !repo_ok {
-            return Err(refuse(
-                "[source] repo must be `owner/name` of letters, digits, `-`, `.` and `_`".into(),
-            ));
-        }
-        if self.repo_id == 0 {
-            return Err(refuse("[source] repo_id must be greater than 0".into()));
-        }
-        if self.tag != format!("v{}", version.as_str()) {
-            return Err(refuse(
-                "[source] tag must be `v` followed by the entry version".into(),
-            ));
-        }
-        if self.commit.len() != COMMIT_HEX_LEN
-            || !self
-                .commit
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(refuse(
-                "[source] commit must be 40 lowercase hex characters".into(),
-            ));
-        }
-        let built_with_ok = self.built_with.strip_prefix('v').is_some_and(|numbers| {
-            let parts: Vec<&str> = numbers.split('.').collect();
-            parts.len() == 3
-                && parts
-                    .iter()
-                    .all(|part| all_of(part, |c| c.is_ascii_digit()))
-        });
-        if !built_with_ok {
-            return Err(refuse(
-                "[source] built_with must be a release tag `vX.Y.Z`".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// The `key=value` lines `--print-source` prints.
-    fn lines(&self) -> String {
-        format!(
-            "repo={}\nrepo_id={}\ntag={}\ncommit={}\nbuilt_with={}\n",
-            self.repo, self.repo_id, self.tag, self.commit, self.built_with
-        )
-    }
+/// The shared entry reader error as an `XtaskError`: the kit and `xtask`
+/// print the same refusal text.
+fn kit_error(error: plugin_kit::Error) -> XtaskError {
+    XtaskError::from(error)
 }
 
 /// The names of the directory `path`, sorted, each with its type.
@@ -251,7 +149,9 @@ pub(super) fn read_tree(root: &Path) -> Result<Vec<EntryFile>, XtaskError> {
                         kind_of(file_type)
                     ))
                 })?;
-            let entry = read_entry(&path)?;
+            // The single-file reader is the kit's: one reader parses and
+            // validates an entry file for every caller.
+            let entry = plugin_kit::entry::read_entry_file(&path).map_err(kit_error)?;
             if entry.package_id.as_str() != package_dir {
                 return Err(refuse(format!(
                     "`{}` declares package_id `{}`, but its directory is `{package_dir}`",
@@ -275,95 +175,18 @@ pub(super) fn read_tree(root: &Path) -> Result<Vec<EntryFile>, XtaskError> {
     Ok(entries)
 }
 
-/// Parses and validates one entry file.
-fn read_entry(path: &Path) -> Result<EntryFile, XtaskError> {
-    let bytes = read_input(path, MAX_ENTRY_FILE_BYTES)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|_cause| refuse(format!("`{}` is not UTF-8", path.display())))?;
-    let entry: EntryFile = toml::from_str(text).map_err(|error| {
-        refuse(format!(
-            "`{}` is not a valid entry file: {}",
-            path.display(),
-            error.message()
-        ))
-    })?;
-    entry
-        .source
-        .validate(&entry.version)
-        .map_err(|error| refuse(format!("`{}`: {error}", path.display())))?;
-    match (entry.kind(), &entry.runtime_id) {
-        (IndexEntryKind::Runtime, Some(_)) | (IndexEntryKind::Context, None) => {}
-        (IndexEntryKind::Runtime, None) => {
-            return Err(refuse(format!(
-                "`{}`: a runtime entry needs a runtime_id",
-                path.display()
-            )));
-        }
-        (IndexEntryKind::Context, Some(_)) => {
-            return Err(refuse(format!(
-                "`{}`: a context entry has no runtime_id",
-                path.display()
-            )));
-        }
-    }
-    Ok(entry)
-}
-
-impl EntryFile {
-    /// What the entry authorizes; `runtime` when the file names no kind.
-    pub(super) fn kind(&self) -> IndexEntryKind {
-        self.kind.unwrap_or(IndexEntryKind::Runtime)
-    }
-}
-
-/// The signed entry of an entry file in a document of `schema_version`;
-/// `[source]` stays behind. A schema 1 entry has no `kind`.
-///
-/// # Errors
-///
-/// Returns a usage error for a context entry in a schema 1 document, which
-/// cannot express it.
-pub(super) fn index_entry(entry: EntryFile, schema_version: u64) -> Result<IndexEntry, XtaskError> {
-    let kind = entry.kind();
-    if schema_version == INDEX_SCHEMA_VERSION && kind == IndexEntryKind::Context {
-        return Err(refuse(format!(
-            "`{}` is a context entry, which a schema {INDEX_SCHEMA_VERSION} index cannot list; build with --schema-version {INDEX_SCHEMA_VERSION_2}",
-            entry.package_id
-        )));
-    }
-    Ok(IndexEntry {
-        package_id: entry.package_id,
-        kind: (schema_version == INDEX_SCHEMA_VERSION_2).then_some(kind),
-        runtime_id: entry.runtime_id,
-        version: entry.version,
-        digest: entry.digest,
-        url: entry.url,
-        platforms: entry.platforms,
-        core: entry.core,
-    })
-}
-
-/// The signed entry of the single entry file `path` in a schema 2 document,
-/// checked like `index build` checks an entry of a tree.
-#[expect(
-    dead_code,
-    reason = "`xtask plugin prove` reads its entry through `plugin_kit::entry`; removed with the index-host follow-up"
-)]
-pub(crate) fn entry_of(path: &Path) -> Result<IndexEntry, XtaskError> {
-    index_entry(read_entry(path)?, INDEX_SCHEMA_VERSION_2)
-}
-
 /// The signed entries of the tree at `root`, in `(package_id, version)` order,
 /// each checked like `index build` checks it, as entries of a document of
 /// `schema_version`. A schema 1 document lists the runtime entries only: it
 /// cannot express a context entry, so the tree's context entries stay out.
+/// The signed form comes from the kit's reader.
 pub(super) fn entries_of(root: &Path, schema_version: u64) -> Result<Vec<IndexEntry>, XtaskError> {
     read_tree(root)?
         .into_iter()
         .filter(|entry| {
             schema_version != INDEX_SCHEMA_VERSION || entry.kind() == IndexEntryKind::Runtime
         })
-        .map(|entry| index_entry(entry, schema_version))
+        .map(|entry| entry.signed_entry(schema_version).map_err(kit_error))
         .collect()
 }
 

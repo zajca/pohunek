@@ -74,14 +74,34 @@ A plugin repository created from the template holds:
 
 ## Required CI
 
-The template's CI is required on every pull request and is not edited away:
+The template's CI is required on every pull request and is not edited away.
+It calls the reusable
+`zajca/pohunek/.github/workflows/plugin-ci.yml@<core tag>`:
+
+| Input | Meaning |
+|---|---|
+| `core-tag` (required) | The core release tag the `release` row builds the kit from; it equals the tag in the caller's `uses:`. The workflow checks out that tag only, never a branch or a commit sha. |
+| `rows` (default `["release", "nightly"]`) | JSON list of rows to run: `release` (the kit from `core-tag`, smoked against that tag's attested daemon archive), `previous-minor` (the kit from the newest release of the previous minor, usable from core 0.45) and `nightly` (the kit from `main`). |
+| `platforms` (default `["x86_64-unknown-linux-gnu"]`) | JSON list of Rust target triples to smoke against: exactly `x86_64-unknown-linux-gnu` (Linux, runs on `ubuntu-24.04`) or `aarch64-apple-darwin` (macOS, runs on the pinned `macos-15` label). Any other value fails the job. The `release` row fetches the attested daemon archive per target; other rows build the daemon binaries from their own ref. |
+| `package-dir` (default `package`) | The package directory, a path below the repository root. |
+| `corpus-dir` (default empty) | The detection corpus directory, a path below the repository root holding `cases.toml`; empty skips `detect-check`. |
+| `upstream-install` (default empty) | A script, a path below the repository root, that installs the locked upstream into `$UPSTREAM_BIN` (an absolute directory the workflow creates and exports); the script must leave the directory existing and non-empty; empty skips the upstream install the smoke puts on `PATH`. |
+| `smoke-script` (default empty) | An executable, a path below the repository root, run once by the generic smoke after every generic check passed, inside the same live isolated root: bare `pohunek` reaches the isolated daemon through the isolated `XDG_RUNTIME_DIR` (the isolated prefix is first on the script's `PATH`), the live session id is under `POHUNEK_SMOKE_SESSION` (`POHUNEK_SOCKET_PATH` is exported only as information for hook-style clients), the isolated environment, the repository root as cwd (the smoke step runs with the plugin repository as its working directory); a non-zero exit fails the smoke; empty skips it. |
+
+Every row and target runs one job with `contents: read`, no secret and no
+cache restore (Linux on `ubuntu-24.04`, macOS on the pinned `macos-15` label):
 
 - lint of the descriptor or manifest against the core schema and the runtime
   features it requires;
-- a reproducible double build of the archive, then verification;
-- a smoke run of the built package against the core release and the nightly
-  core, from the plugin kit, in an isolated root;
-- the screen detection corpus for a runtime package;
+- a reproducible double build of the archive with a byte compare, then
+  verification;
+- the screen detection corpus for a runtime package (only when `corpus-dir`
+  is set);
+- a smoke run of the built package from the plugin kit, in an isolated root:
+  the generic smoke stops after the screen check and runs the optional
+  `smoke-script` on the same live isolated root only after every generic
+  check passed, so the plugin's own input
+  and hook-event checks see the exact host the generic smoke passed on;
 - a version-bump check, so a changed archive carries a new version.
 
 A release is published on a version tag `vX.Y.Z` by the template's release
@@ -124,7 +144,11 @@ The same two commands run locally:
   descriptor that carries a `[runtime]` table or no `[context]` table
   (a `prove --no-enable` install stages a disabled install the inspect
   predicate must refuse for being disabled, and a `prove --pre-install`
-  newer version leaves the proved version unselected). The evidence of a
+  archive must name the entry's package id: any other installed version of
+  the same id leaves the proved version unselected, so the install check
+  refuses it on the default path and the inspect digest check refuses the
+  other, selected version under `--no-enable` (the inspect `selected`
+  check is defense in depth). The evidence of a
   context proof carries
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
@@ -158,21 +182,34 @@ index write, and 2 for every other refusal:
   corpus through the detector: `cases.toml` holds `[[case]]` tables with a
   `screen` file under `screens/`, a `width`, and the expected `working`,
   `blocked`, `idle` or `unknown` activity.
-- `smoke --release-dir <dir> [--upstream <path>]` installs the built
-  package on an isolated daemon through a throwaway index, starts it, waits
-  for detection past `unknown`, and requires a non-empty screen; then it
-  stops and removes the session. The generic smoke stops after the screen
-  check: no full agent run. `--upstream` puts a directory (or the directory
-  of an executable) in front of the isolated daemon's `PATH`, so the runtime
-  program resolves to the locked upstream install there.
+- `smoke --release-dir <dir> [--upstream <path>] [--script <path>]`
+  installs the built package on an isolated daemon through a throwaway
+  index, starts it, waits for detection past `unknown`, and requires a
+  non-empty screen; then it stops and removes the session. The generic
+  smoke stops after the screen check: no full agent run. `--upstream` puts
+  a directory (or the directory of an executable) in front of the isolated
+  daemon's `PATH`, so the runtime program resolves to the locked upstream
+  install there. `--script` runs a plugin-owned executable once after every
+  generic check passed, inside the same live isolated root: a bare `pohunek`
+  reaches the isolated daemon through the isolated `XDG_RUNTIME_DIR` (the
+  isolated prefix holding `pohunek` is first on the script's `PATH`), the
+  live session id is under `POHUNEK_SMOKE_SESSION` (`POHUNEK_SOCKET_PATH` is
+  exported only as information for hook-style clients), and its stdout and
+  stderr both go to the kit's stderr, so `--json` stdout stays one JSON
+  document. The script runs in the kit's own cwd (the plugin repository the
+  caller starts the kit in), its process group is killed after it exits on
+  every path, and a non-zero exit fails the smoke naming the script and the
+  exit code.
 - `prove --release-dir <dir> --evidence <file> [--no-enable]` runs the same
   install path as `xtask plugin prove` from the package directory and writes
   the verdict as evidence JSON, plus the kit digest (`kit_sha256`); with
   `--archive <file> --entry <entry.toml>` instead of `--dir` it proves the
   admitted release asset against its real entry. `--json` reports the used
   isolation root alongside the line, so a scenario can assert the root is
-  gone; a failed run names its already-removed root on stderr as
-  `isolation root: <path>` (`None` before the root exists names none).
+  gone; a failed run names its isolation root on stderr as
+  `isolation root: <path>`: the kit has removed the root unless the
+  failure is the removal itself. A refusal before the root exists, or the
+  failure to write the evidence after the run, names no root.
 
 ## Compatibility declaration
 

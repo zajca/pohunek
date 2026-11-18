@@ -1069,9 +1069,11 @@ prints a `warn` line naming the URL and the check continues with the other
 sources, so it never fails on the network alone and never depends on it. The
 `plugin_features_check` scenarios of `xtask` cover the failure (missing
 feature naming the feature and the package), the digest mismatch, the skipped
-context entry and the warn-and-continue fetch against the real binary with
-`file://` fixture archives (honoured only for a `--index` document, never for
-a fetched official index), plus the real tree with an empty fixture index; the
+context entry, the descriptor identity the entry does not list, a malformed
+fetched document, an oversized file archive, and the warn-and-continue fetch
+against the real binary with `file://` fixture archives (honoured only for a
+`--index` document, never for a fetched official index), plus the real tree
+with an empty fixture index; the
 `docs` job of CI runs the check against the real tree and the official index.
 Exit statuses: `0` on a pass; `1` when a required feature is missing or when
 content is refused (a malformed index document, an archive whose digest

@@ -1,0 +1,332 @@
+# Reusable CI workflow of a plugin repository. A plugin repository calls it
+# from a workflow that runs on a pull request and on a version tag:
+#
+#   jobs:
+#     ci:
+#       uses: zajca/pohunek/.github/workflows/plugin-ci.yml@<core tag>
+#       with:
+#         core-tag: <the core tag of the `uses:` line>
+#       permissions: { contents: read }
+#
+# It lints, double-builds, verifies, detect-checks, smokes and version-bump
+# checks the package of `package-dir` on every row of `rows` for every target
+# of `platforms`, in one job per row and target. Rows pin the core the kit is
+# built from: `release` builds the kit from `zajca/pohunek` at `core-tag` and
+# smokes against that tag's attested daemon archive, `nightly` builds from
+# `main`, and `previous-minor` builds from the newest release of the previous
+# minor (usable from core 0.45: only then does the previous minor's source
+# tree hold `crates/plugin-kit`). The `nightly` and `previous-minor` rows build
+# the daemon binaries from their own ref instead. It never writes to
+# the plugin index: admission is a pull request to
+# the index repository (docs/knowledge/guides/plugin-repositories.md,
+# "Admission through the index").
+
+name: plugin-ci
+
+on:
+  workflow_call:
+    inputs:
+      core-tag:
+        description: Core release tag (vX.Y.Z) the `release` row builds the kit from; equals the tag in the caller's `uses:`.
+        required: true
+        type: string
+      rows:
+        description: JSON list of rows to run (`release`, `previous-minor`, `nightly`).
+        required: false
+        type: string
+        default: '["release", "nightly"]'
+      platforms:
+        description: "JSON list of Rust target triples to smoke against: exactly `x86_64-unknown-linux-gnu` (Linux, runs on `ubuntu-24.04`) or `aarch64-apple-darwin` (macOS, runs on `macos-15`)."
+        required: false
+        type: string
+        default: '["x86_64-unknown-linux-gnu"]'
+      package-dir:
+        description: Package directory in the plugin repository, relative to its root.
+        required: false
+        type: string
+        default: package
+      corpus-dir:
+        description: Detection corpus directory in the plugin repository, relative to its root. Empty skips detect-check.
+        required: false
+        type: string
+        default: ''
+      upstream-install:
+        description: Script in the plugin repository, relative to its root, that installs the locked upstream into `$UPSTREAM_BIN` (an absolute directory the workflow creates and exports); the script must leave the directory existing and non-empty. Empty skips the upstream install.
+        required: false
+        type: string
+        default: ''
+      smoke-script:
+        description: "Executable in the plugin repository, relative to its root, run once by the generic smoke after its screen check, inside the same live isolated root: the isolated `XDG_RUNTIME_DIR` routes its bare `pohunek` commands to the isolated daemon, the live session id is under `POHUNEK_SMOKE_SESSION` (and `POHUNEK_SOCKET_PATH` only informs hook-style clients), the isolated prefix holding `pohunek` is first on PATH, cwd is the plugin repository. A non-zero exit fails the smoke. Empty skips it."
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+jobs:
+  check:
+    name: plugin ci
+    strategy:
+      fail-fast: false
+      matrix:
+        row: ${{ fromJson(inputs.rows) }}
+        platform: ${{ fromJson(inputs.platforms) }}
+    # Runs on ubuntu-24.04 (#1731) for `x86_64-unknown-linux-gnu`, on the
+    # pinned macos-15 label for `aarch64-apple-darwin`; any other platform
+    # fails the job instead of running binaries it cannot execute.
+    runs-on: ${{ matrix.platform == 'aarch64-apple-darwin' && 'macos-15' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    # The build runs code from crates.io and from the plugin repository, so
+    # it holds no token that could sign or publish.
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the plugin repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: plugin
+          persist-credentials: false
+
+      # Only a tag (`release`), `main` (`nightly`) or a resolved release tag
+      # (`previous-minor`) names the core the kit is built from: a branch or
+      # a bare commit sha never does.
+      - name: Validate the inputs
+        env:
+          CORE_TAG: ${{ inputs.core-tag }}
+          PLATFORM: ${{ matrix.platform }}
+          ROW: ${{ matrix.row }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CORE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "core-tag must be vX.Y.Z: $CORE_TAG" >&2
+            exit 1
+          fi
+          case "$PLATFORM" in
+            x86_64-unknown-linux-gnu | aarch64-apple-darwin) ;;
+            *) echo "platforms holds only x86_64-unknown-linux-gnu or aarch64-apple-darwin: $PLATFORM" >&2; exit 1 ;;
+          esac
+          case "$ROW" in
+            release | previous-minor | nightly) ;;
+            *) echo "unknown row: $ROW (want release, previous-minor or nightly)" >&2; exit 1 ;;
+          esac
+
+      - name: Resolve the core ref of the row
+        env:
+          CORE_TAG: ${{ inputs.core-tag }}
+          ROW: ${{ matrix.row }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$ROW" in
+            release) ref="refs/tags/$CORE_TAG" ;;
+            nightly) ref="refs/heads/main" ;;
+            previous-minor) ref="" ;;
+            *) echo "unknown row: $ROW (want release, previous-minor or nightly)" >&2; exit 1 ;;
+          esac
+          # The previous-minor row builds from the newest release of the
+          # previous minor: the greatest release tag below the core tag
+          # whose minor line differs from the core tag's own.
+          if [ "$ROW" = previous-minor ]; then
+            minor_of() { printf '%s' "$1" | sed -E 's/^v([0-9]+)\.([0-9]+)\.[0-9]+$/\1.\2/'; }
+            core_minor="$(minor_of "$CORE_TAG")"
+            # Every stable tag on another minor line, ordered so the core
+            # tag itself marks the boundary: the last tag before it is the
+            # newest release of the previous minor, however many newer
+            # minors exist. `sort -V` compares versions, so `v0.9.0` sorts
+            # below `v0.44.0`, which a lexical compare would get wrong.
+            tag="$(gh release list --repo zajca/pohunek --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | while IFS= read -r candidate; do [ "$(minor_of "$candidate")" != "$core_minor" ] && printf '%s\n' "$candidate"; done | { printf '%s\n' "$CORE_TAG"; cat; } | sort -Vu | awk -v tag="$CORE_TAG" '$0 == tag { exit } { line = $0 } END { print line }')"
+            [ -n "$tag" ] || { echo "no release of a previous minor below $CORE_TAG" >&2; exit 1; }
+            ref="refs/tags/$tag"
+          fi
+          printf 'ref=%s\n' "$ref" >>"$GITHUB_ENV"
+
+      - name: Check out the core ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: zajca/pohunek
+          ref: ${{ env.ref }}
+          path: core
+          persist-credentials: false
+
+      # Installs the channel the checked-out core pins in its rust-toolchain.toml.
+      - name: Install the pinned Rust toolchain
+        uses: ./core/.github/actions/setup-rust
+
+      # No cache is restored in this job (the rule of release-evidence.yml).
+      - name: Build the kit
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          (cd core && cargo build --locked -p pohunek-plugin-kit --features daemon)
+          test -x core/target/debug/pohunek-plugin-kit
+
+      - name: Set up the package inputs
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          CORPUS_DIR: ${{ inputs.corpus-dir }}
+          UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
+          SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+        run: |
+          set -euo pipefail
+          # Every input but `package-dir` is optional: an empty value
+          # skips its check instead of failing it.
+          case "$PACKAGE_DIR" in
+            "" | /* | .. | ../* | */.. | */../*) echo "PACKAGE_DIR must be a path below the repository root" >&2; exit 1 ;;
+          esac
+          for input in CORPUS_DIR UPSTREAM_INSTALL SMOKE_SCRIPT; do
+            eval "value=\${$input:-}"
+            [ -n "$value" ] || continue
+            case "$value" in
+              /* | .. | ../* | */.. | */../*) echo "$input must be a path below the repository root" >&2; exit 1 ;;
+            esac
+          done
+          test -d "plugin/$PACKAGE_DIR"
+          test -z "${CORPUS_DIR:-}" || test -f "plugin/$CORPUS_DIR/cases.toml"
+          test -z "${UPSTREAM_INSTALL:-}" || test -f "plugin/$UPSTREAM_INSTALL"
+          test -z "${SMOKE_SCRIPT:-}" || test -f "plugin/$SMOKE_SCRIPT"
+
+      # The `release` row smokes against the attested daemon archive of the
+      # core tag: the provenance check is the one
+      # `scripts/release-workflow/verify-provenance` runs, against the
+      # release-evidence workflow of the core repository for the tag commit.
+      # The archive unpacks into a versioned subdirectory, so the strip
+      # keeps the release layout the smoke reads: `pohunek`, `pohunekd`
+      # and `pohunek-sessiond` beside each other.
+      - name: Fetch the attested daemon archive of the core tag
+        if: matrix.row == 'release'
+        timeout-minutes: 10
+        env:
+          CORE_TAG: ${{ inputs.core-tag }}
+          PLATFORM: ${{ matrix.platform }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${CORE_TAG#v}"
+          case "$version" in
+            *[^0-9.]* | "" | *..* | .* | *.) echo "core-tag is not vX.Y.Z: $CORE_TAG" >&2; exit 1 ;;
+          esac
+          asset="pohunek-daemon-$version-$PLATFORM.tar.gz"
+          mkdir -p daemon-archive
+          gh release download "$CORE_TAG" --repo zajca/pohunek --pattern "$asset" --dir daemon-archive
+          commit="$(gh api "repos/zajca/pohunek/commits/$CORE_TAG" --jq .sha)"
+          gh attestation verify "daemon-archive/$asset" --repo zajca/pohunek \
+            --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+            --signer-digest "$commit" --source-ref "refs/tags/$CORE_TAG" --source-digest "$commit" \
+            --deny-self-hosted-runners
+          mkdir -p release-dir
+          tar -xzf "daemon-archive/$asset" -C release-dir --strip-components=1 --no-same-owner
+
+      # Only this row's own ref builds the daemon binaries: the `release`
+      # row instead verifies that tag's published, attested archive.
+      - name: Build the daemon binaries of a row that is not `release`
+        if: matrix.row != 'release'
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          (cd core && cargo build --locked -p pohunek-cli -p pohunek-daemon -p pohunek-session-worker)
+          mkdir -p release-dir
+          cp core/target/debug/pohunek core/target/debug/pohunekd core/target/debug/pohunek-sessiond release-dir/
+
+      - name: Lint the package
+        timeout-minutes: 10
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: |
+          set -euo pipefail
+          core/target/debug/pohunek-plugin-kit lint --dir "plugin/$PACKAGE_DIR"
+
+      # A reproducible double build: the same inputs must produce the same
+      # bytes twice, so the release the index admits is the archive CI saw.
+      - name: Build the archive twice and compare the bytes
+        timeout-minutes: 20
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: |
+          set -euo pipefail
+          core/target/debug/pohunek-plugin-kit build --dir "plugin/$PACKAGE_DIR" --output-dir build-one
+          core/target/debug/pohunek-plugin-kit build --dir "plugin/$PACKAGE_DIR" --output-dir build-two
+          cmp build-one/*.tar.zst build-two/*.tar.zst
+          mkdir -p dist
+          cp build-one/*.tar.zst dist/
+          (cd dist && shasum -a 256 -- *.tar.zst > SHA256SUMS)
+
+      - name: Verify the archive
+        timeout-minutes: 10
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+        run: |
+          set -euo pipefail
+          archive="$(echo dist/*.tar.zst)"
+          test -f "$archive"
+          core/target/debug/pohunek-plugin-kit verify --dir "plugin/$PACKAGE_DIR" --archive "$archive" --sha256 "$(shasum -a 256 "$archive" | cut -d' ' -f1 | sed 's/^/sha256:/')"
+
+      - name: Detect-check the corpus
+        if: inputs.corpus-dir != ''
+        timeout-minutes: 10
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          CORPUS_DIR: ${{ inputs.corpus-dir }}
+        run: |
+          set -euo pipefail
+          core/target/debug/pohunek-plugin-kit detect-check --dir "plugin/$PACKAGE_DIR" --corpus "plugin/$CORPUS_DIR"
+
+      # The generic smoke stops after the screen check; the optional
+      # `smoke-script` runs inside it, on the same live isolated root, only
+      # after every generic check passed, with the isolated `XDG_RUNTIME_DIR`
+      # routing bare `pohunek` and the live session id exported for it, so
+      # the plugin's own input and hook-event checks see the exact host the
+      # generic smoke passed on (planner ruling).
+      - name: Smoke the package and the smoke script
+        timeout-minutes: 30
+        working-directory: plugin
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
+          SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+        run: |
+          set -euo pipefail
+          args=(--dir "$PACKAGE_DIR" --release-dir ../release-dir --json)
+          if [ -n "${UPSTREAM_INSTALL:-}" ]; then
+            export UPSTREAM_BIN="$GITHUB_WORKSPACE/upstream-bin"
+            mkdir -p "$UPSTREAM_BIN"
+            bash "$UPSTREAM_INSTALL"
+            [ -n "$(ls -A "$UPSTREAM_BIN")" ] || { echo "upstream-install left $UPSTREAM_BIN empty" >&2; exit 1; }
+            args+=(--upstream "$UPSTREAM_BIN")
+          fi
+          if [ -n "${SMOKE_SCRIPT:-}" ]; then
+            args+=(--script "$SMOKE_SCRIPT")
+          fi
+          ../core/target/debug/pohunek-plugin-kit smoke "${args[@]}"
+
+      # A changed archive digest against the latest release of the caller
+      # repository requires a new `version` in the descriptor.
+      - name: Check the version bump
+        timeout-minutes: 10
+        env:
+          PACKAGE_DIR: ${{ inputs.package-dir }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          previous="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          if [ -z "$previous" ]; then
+            echo "no previous release: the first release sets the version"
+            exit 0
+          fi
+          archive="$(echo dist/*.tar.zst)"
+          name="$(basename "$archive")"
+          assets="$(gh release view "$previous" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          if ! printf '%s\n' "$assets" | grep -qxF -- "$name"; then
+            echo "no $name in $previous: the version check needs no baseline"
+            exit 0
+          fi
+          gh release download "$previous" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir previous --clobber
+          if cmp -s "$archive" "previous/$name"; then
+            echo "archive unchanged since $previous: no version bump required"
+          else
+            version="$(grep -E '^version *= *"' "plugin/$PACKAGE_DIR/runtime.toml" | head -n 1 | cut -d'"' -f2)"
+            previous_version="${previous#v}"
+            if [ "$version" = "$previous_version" ]; then
+              echo "archive changed since $previous but version is still $version" >&2
+              exit 1
+            fi
+          fi

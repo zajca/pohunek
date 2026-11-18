@@ -136,6 +136,12 @@ impl Kit {
         self.env.root().join(name)
     }
 
+    /// The cwd the harness gives the kit binary: the smoke script must
+    /// run in this directory, not in the isolated root.
+    fn cwd(&self) -> &Path {
+        self.env.cwd()
+    }
+
     fn dir(&self, name: &str) -> PathBuf {
         let path = self.path(name);
         fs::create_dir(&path).expect("create the directory");
@@ -350,16 +356,39 @@ fn used_root(document: &Value, kit: &Kit) -> PathBuf {
     root
 }
 
-/// The isolation root a failed run names on its stderr. The root is
-/// removed before the report, so the named directory must already be
-/// gone: the scenario owns this name and no foreign root can fail it.
+/// Whether the background pid the smoke script recorded is gone: absent
+/// from `/proc`, or a zombie (`Z` as the state after the `comm` field in
+/// `/proc/<pid>/stat`). A process the kit group-killed stays a zombie
+/// until its parent is reaped, so the zombie state counts as gone too.
+fn background_child_is_gone(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    let end = stat.iter().rposition(|byte| *byte == b')');
+    let Some(end) = end else { return false };
+    stat.get(end + 2..end + 3) == Some(&b"Z"[..])
+}
+
+/// The isolation root a failed run names on its stderr. The run names the
+/// root exactly once; the named directory must already be gone unless the
+/// removal itself is the failure. The scenario owns this name and no
+/// foreign root can fail it.
 fn named_root(output: &Output) -> PathBuf {
-    let line = stderr_of(output)
+    let mut named: Vec<String> = stderr_of(output)
         .lines()
-        .find_map(|line| line.strip_prefix("isolation root: ").map(str::to_owned))
-        .expect("the failure names its isolation root");
-    let root = PathBuf::from(line);
-    assert!(!root.exists(), "a failed run removes its root");
+        .filter_map(|line| line.strip_prefix("isolation root: ").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "the failure names its isolation root exactly once: {}",
+        stderr_of(output)
+    );
+    let root = PathBuf::from(named.pop().expect("one named root"));
+    assert!(
+        !root.exists(),
+        "a failed run removes its root before the report"
+    );
     root
 }
 
@@ -464,6 +493,217 @@ fn kit_smoke_passes_on_fixture() {
         "the smoke saw a non-empty screen: {document:?}"
     );
     used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_runs_the_script_against_the_live_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-script.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             echo \"a line on the script's own stdout\"\n\
+             pwd > \"{}\"\n\
+             pohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+            kit.path("script-cwd.txt").display()
+        ),
+    )
+    .expect("write the smoke script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke with a script failed: {}",
+        stderr_of(&output)
+    );
+    // The script's stdout line went to the kit's stderr, so the kit's
+    // stdout stays the single JSON document the smoke promises.
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert!(
+        stderr_of(&output).contains("a line on the script's own stdout"),
+        "the script line is on the kit stderr: {}",
+        stderr_of(&output)
+    );
+    // The script ran in the smoke's own cwd (the directory the caller
+    // started the kit in: the workflow runs the smoke step from the
+    // plugin repository), not in the isolated root.
+    let script_cwd = PathBuf::from(
+        fs::read_to_string(kit.path("script-cwd.txt"))
+            .expect("the script recorded its cwd")
+            .trim(),
+    );
+    assert_eq!(
+        script_cwd,
+        kit.cwd(),
+        "the smoke script runs in the kit's own cwd"
+    );
+    assert_ne!(
+        script_cwd,
+        used_root(&document, &kit),
+        "the smoke script does not run inside the isolated root"
+    );
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_skips_the_script_when_the_screen_check_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    // A package whose program prints nothing the detector knows: the
+    // screen check times out, so the smoke must fail without starting
+    // the script, and still tear the root down.
+    let text = fs::read_to_string(fixture_dir().join("runtime.toml")).expect("read the fixture");
+    let text = text.replace(
+        "args = [\"-c\", \"echo ready; exec sleep 300\"]",
+        "args = [\"-c\", \"exec sleep 300\"]",
+    );
+    assert!(
+        !text.contains("echo ready"),
+        "the variant prints nothing the detector knows"
+    );
+    let package = kit.dir("quiet-package");
+    fs::write(package.join("runtime.toml"), text).expect("write the variant");
+    fs::copy(
+        fixture_dir().join("detect.toml"),
+        package.join("detect.toml"),
+    )
+    .expect("copy the file");
+    for screen in ["idle_prompt.txt", "blocked_input.txt"] {
+        fs::copy(
+            fixture_dir().join("screens").join(screen),
+            package.join(screen),
+        )
+        .expect("copy the screen");
+    }
+    let untouched = kit.path("script-ran.txt");
+    let script = kit.path("smoke-quiet.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\nset -eu\ntouch \"{}\"\n", untouched.display()),
+    )
+    .expect("write the smoke script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&package),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--json",
+    ]);
+    assert!(
+        !output.status.success(),
+        "smoke with an unknown screen passed: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("the detector stayed `unknown`"),
+        "the screen check failed first: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        !untouched.exists(),
+        "the script did not start after the failed check"
+    );
+    // `named_root` asserts the failed run removed its root.
+    named_root(&output);
+}
+
+#[test]
+fn kit_smoke_kills_the_background_child_of_the_script() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let pids = kit.path("pids.txt");
+    let script = kit.path("smoke-background.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\n( exec sleep 300 ) &\necho $! > \"{}\"\npohunek session screen \"$POHUNEK_SMOKE_SESSION\" --json | grep -q ready\n",
+            pids.display()
+        ),
+    )
+    .expect("write the smoke script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke with a backgrounding script failed: {}",
+        stderr_of(&output)
+    );
+    let backgrounded: i32 = fs::read_to_string(&pids)
+        .expect("the script recorded its background child")
+        .trim()
+        .parse()
+        .expect("the recorded pid parses");
+    // The kit kills the script's process group after the script exits.
+    // The background child's stdout and stderr are the kit's stderr, so
+    // `output()` above returns only after every writer of that pipe has
+    // closed: the child has exited by then. A reaped-then-exited child is
+    // either absent from `/proc` or a zombie (`Z` in `/proc/<pid>/stat`),
+    // both of which count as gone. Without the kit's kill this scenario
+    // never returns: the open pipe keeps `output()` blocked until the
+    // harness times the test out, so the revert fails by the timeout.
+    assert!(
+        background_child_is_gone(backgrounded),
+        "the script's background child is gone after the smoke"
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_refuses_a_failing_script() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-fail.sh");
+    fs::write(&script, "#!/bin/sh\nexit 3\n").expect("write the failing script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a failing script must fail the smoke"
+    );
+    assert!(
+        stderr_of(&output).contains(&format!("the smoke script `{}` exited 3", script.display())),
+        "the error names the script and its exit: {}",
+        stderr_of(&output)
+    );
+    named_root(&output);
 }
 
 #[test]

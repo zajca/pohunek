@@ -74,8 +74,9 @@ pub enum Error {
     /// A plugin proof ran and failed at a step; its evidence was written.
     #[error("{0}")]
     Prove(#[from] crate::prove::Verdict),
-    /// A smoke ran on an isolation root and failed; the root it names was
-    /// already removed. The wrapper exists only to carry the path.
+    /// A smoke ran on an isolation root and failed. The wrapper exists only
+    /// to carry the path: the kit has removed the root unless the failure
+    /// is the removal itself.
     #[error("{error}")]
     Smoke { root: PathBuf, error: Box<Error> },
 }
