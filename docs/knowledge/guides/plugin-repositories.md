@@ -167,7 +167,11 @@ index write, and 2 for every other refusal:
   program resolves to the locked upstream install there.
 - `prove --release-dir <dir> --evidence <file> [--no-enable]` runs the same
   install path as `xtask plugin prove` from the package directory and writes
-  the verdict as evidence JSON, plus the kit digest.
+  the verdict as evidence JSON, plus the kit digest (`kit_sha256`); with
+  `--archive <file> --entry <entry.toml>` instead of `--dir` it proves the
+  admitted release asset against its real entry. `--json` reports the used
+  isolation root alongside the line, so a scenario can assert the root is
+  gone.
 
 ## Compatibility declaration
 

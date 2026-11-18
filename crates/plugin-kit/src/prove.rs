@@ -6,6 +6,14 @@
 //! and inspects the result. The runtime program of the package is never
 //! launched. Every outcome is written as evidence JSON; the exit status is 0
 //! only for a pass.
+//!
+//! The kit binary proves two shapes: `--dir` builds the archive from the
+//! package directory first ([`prove_package`]), while `--archive --entry`
+//! proves an admitted release asset against its real entry ([`prove_archive`],
+//! used by the release proof workflow in #1618). Both write the kit's own
+//! digest as `kit_sha256` in the evidence; the `xtask plugin prove` wrapper
+//! keeps the `xtask` CLI, flags, exit codes and evidence JSON: its evidence
+//! has no kit digest, exactly the documented keys.
 
 // Rust guideline compliant 2026-11-06
 
@@ -93,6 +101,9 @@ pub struct ProveArgs {
     /// proof runs alongside another installed version: a newer version of
     /// the same package leaves the proved version unselected.
     pub pre_install: Option<PathBuf>,
+    /// SHA-256 of the kit binary that runs the proof, filled by the kit's
+    /// own CLI only (`xtask plugin prove` evidence has no kit digest).
+    pub kit_sha256: Option<String>,
 }
 
 /// The inputs of a proof of one package directory.
@@ -112,6 +123,9 @@ pub struct ProvePackageArgs {
     /// Install the package disabled (it stays selected), so `inspect`
     /// must refuse it for being disabled.
     pub no_enable: bool,
+    /// SHA-256 of the kit binary that runs the proof, filled by the kit's
+    /// own CLI only (`xtask plugin prove` evidence has no kit digest).
+    pub kit_sha256: Option<String>,
 }
 
 /// What a passing package proof reports.
@@ -123,6 +137,8 @@ pub struct ProveReport {
     pub version: protocol::PackageVersion,
     /// Digest of the proved archive bytes.
     pub digest: package::PackageDigest,
+    /// Isolation root the proof ran in, removed before the report.
+    pub root: PathBuf,
 }
 
 impl ProveReport {
@@ -137,6 +153,16 @@ impl ProveReport {
             self.digest.as_str()
         )
     }
+}
+
+/// What a passing archive proof reports: the stdout line and the removed
+/// isolation root it ran in.
+#[derive(Debug)]
+pub struct ArchiveReport {
+    /// The single stdout line of a passing proof.
+    pub line: String,
+    /// Isolation root the proof ran in, removed before the report.
+    pub root: PathBuf,
 }
 
 /// A failed proof: the step that failed and why. Its exit status is 1.
@@ -181,8 +207,10 @@ struct Evidence<'a> {
     /// `pohunekd --version` ran.
     core_version: Option<&'a str>,
     /// SHA-256 of the kit binary that wrote this evidence (#1618): the
-    /// release proof workflow checks this digest against its own build.
-    kit_sha256: String,
+    /// release proof workflow checks this digest against its own build. The
+    /// kit CLI fills it; the `xtask plugin prove` wrapper leaves it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kit_sha256: Option<&'a str>,
     package_id: &'a str,
     version: &'a str,
     digest: &'a str,
@@ -215,11 +243,12 @@ struct Outcome {
 /// host reports no such agent).
 ///
 /// The runtime program of the package is never launched.
-pub fn prove_archive(args: &ProveArgs) -> Result<String, Error> {
+pub fn prove_archive(args: &ProveArgs) -> Result<ArchiveReport, Error> {
     let entry = entry_of(&args.entry)?;
-    prove(
+    let root = prove(
         &entry,
         &args.evidence,
+        args.kit_sha256.as_deref(),
         |entry, archive, outcome, root| {
             run_package_steps(
                 root,
@@ -232,7 +261,16 @@ pub fn prove_archive(args: &ProveArgs) -> Result<String, Error> {
             )
         },
         || read_input(&args.archive, Limits::DEFAULT.max_compressed_bytes),
-    )
+    )?;
+    Ok(ArchiveReport {
+        line: format!(
+            "plugin prove ok: {} {} {}",
+            entry.package_id,
+            entry.version,
+            entry.digest.as_str()
+        ),
+        root,
+    })
 }
 
 /// Proves the package directory and writes the evidence, plus the kit digest
@@ -259,9 +297,10 @@ pub fn prove_package(args: &ProvePackageArgs) -> Result<ProveReport, Error> {
         source: crate::entry::Source::prove_placeholder(&version),
     }
     .signed_entry(package::INDEX_SCHEMA_VERSION)?;
-    prove(
+    let root = prove(
         &entry,
         &args.evidence,
+        args.kit_sha256.as_deref(),
         |entry, archive, outcome, root| {
             run_package_steps(
                 root,
@@ -279,6 +318,7 @@ pub fn prove_package(args: &ProvePackageArgs) -> Result<ProveReport, Error> {
         package_id,
         version,
         digest,
+        root,
     })
 }
 
@@ -287,9 +327,10 @@ pub fn prove_package(args: &ProvePackageArgs) -> Result<ProveReport, Error> {
 fn prove(
     entry: &package::IndexEntry,
     path: &Path,
+    kit_sha256: Option<&str>,
     run: impl FnOnce(&package::IndexEntry, &[u8], &mut Outcome, &Root) -> Result<Host, Verdict>,
     archive: impl FnOnce() -> Result<Vec<u8>, Error>,
-) -> Result<String, Error> {
+) -> Result<PathBuf, Error> {
     let is_context = entry.kind() == package::IndexEntryKind::Context;
     let platform = host_platform().ok_or_else(|| {
         Error::Usage("this platform has no plugin index platform name".to_owned())
@@ -301,7 +342,8 @@ fn prove(
         core_version: None,
         failure: None,
     };
-    if let Err(failure) = run_steps(entry, &archive, &mut outcome, run) {
+    let (result, root) = run_steps(entry, &archive, &mut outcome, run);
+    if let Err(failure) = result {
         outcome.failure = Some(failure);
     }
 
@@ -310,7 +352,7 @@ fn prove(
     let document = Evidence {
         schema: EVIDENCE_SCHEMA,
         core_version: outcome.core_version.as_deref(),
-        kit_sha256: kit_digest(),
+        kit_sha256,
         package_id: entry.package_id.as_str(),
         version: entry.version.as_str(),
         digest,
@@ -326,10 +368,7 @@ fn prove(
     write_new_document(path, &document_bytes(&document)?)?;
     match outcome.failure {
         Some(failure) => Err(Error::Prove(failure)),
-        None => Ok(format!(
-            "plugin prove ok: {} {} {digest}",
-            entry.package_id, entry.version
-        )),
+        None => Ok(root),
     }
 }
 
@@ -361,41 +400,51 @@ fn fail(step: Step) -> impl Fn(String) -> Verdict {
 
 /// SHA-256 of the running kit binary, as `sha256:<64 hex>`: the release
 /// proof workflow (#1618) checks this digest against its own build.
-fn kit_digest() -> String {
-    match fs::read(current_exe()) {
-        Ok(bytes) => format!("sha256:{}", hex(&Sha256::digest(&bytes))),
-        Err(_) => "sha256:unavailable".to_owned(),
-    }
-}
-
-/// The running kit binary; empty when it cannot be named.
-fn current_exe() -> PathBuf {
-    std::env::current_exe().unwrap_or_default()
+///
+/// # Errors
+///
+/// Returns a usage error when the binary cannot be read: the attestation
+/// must not pass while its digest is unknown.
+pub fn kit_digest() -> Result<String, Error> {
+    let path = std::env::current_exe()
+        .map_err(|error| Error::Usage(format!("cannot name the running kit binary: {error}")))?;
+    let bytes = fs::read(&path).map_err(crate::files::io_error(&path))?;
+    Ok(format!("sha256:{}", hex(&Sha256::digest(&bytes))))
 }
 
 /// Runs the steps in order. The isolation root exists only after the digest
-/// step passed, and is removed on every path.
+/// step passed, and is removed on every path. Returns the outcome and the
+/// root path: the root is gone on every path, so the caller can name it in
+/// its report and the scenario can assert it is gone.
 fn run_steps(
     entry: &package::IndexEntry,
     archive: &[u8],
     outcome: &mut Outcome,
     run: impl FnOnce(&package::IndexEntry, &[u8], &mut Outcome, &Root) -> Result<Host, Verdict>,
-) -> Result<(), Verdict> {
-    check_archive(entry, archive).map_err(fail(Step::Digest))?;
-
-    let root = Root::create().map_err(fail(Step::Trust))?;
+) -> (Result<(), Verdict>, PathBuf) {
+    if let Err(detail) = check_archive(entry, archive) {
+        return (Err(fail(Step::Digest)(detail)), PathBuf::new());
+    }
+    let root = match Root::create() {
+        Ok(root) => root,
+        Err(detail) => return (Err(fail(Step::Trust)(detail)), PathBuf::new()),
+    };
+    let path = root.path().to_path_buf();
     let result = run(entry, archive, outcome, &root);
     match result {
         Ok(host) => {
             // A pass needs a clean stop and a removed root.
-            host.stop().map_err(fail(Step::Cleanup))?;
-            root.remove().map_err(fail(Step::Cleanup))
+            let result = host
+                .stop()
+                .map_err(fail(Step::Cleanup))
+                .and(root.remove().map_err(fail(Step::Cleanup)));
+            (result, path)
         }
         Err(failure) => {
             // The original failure is the verdict; a removal problem on top
             // of it only costs a temporary directory.
             let _ = root.remove();
-            Err(failure)
+            (Err(failure), path)
         }
     }
 }

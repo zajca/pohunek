@@ -197,31 +197,42 @@ fn dispatch(command: Command) -> Result<(), Error> {
             evidence,
             no_enable,
             json,
-        } => match (dir, archive, entry) {
-            (Some(dir), None, None) => {
-                let report = prove::prove_package(&prove::ProvePackageArgs {
-                    dir,
-                    release_dir,
-                    evidence,
-                    no_enable,
-                })?;
-                emit(json, &report.line(), &report)
+        } => {
+            // The digest is computed before any isolation root exists: a
+            // proof must not pass while its attestation digest is unknown.
+            let kit_sha256 = prove::kit_digest()?;
+            match (dir, archive, entry) {
+                (Some(dir), None, None) => {
+                    let report = prove::prove_package(&prove::ProvePackageArgs {
+                        dir,
+                        release_dir,
+                        evidence,
+                        no_enable,
+                        kit_sha256: Some(kit_sha256),
+                    })?;
+                    emit(json, &report.line(), &report)
+                }
+                (None, Some(archive), Some(entry)) => {
+                    let report = prove::prove_archive(&prove::ProveArgs {
+                        archive,
+                        entry,
+                        release_dir,
+                        evidence,
+                        no_enable,
+                        pre_install: None,
+                        kit_sha256: Some(kit_sha256),
+                    })?;
+                    emit(
+                        json,
+                        &report.line,
+                        &serde_json::json!({ "line": report.line, "root": report.root }),
+                    )
+                }
+                _ => Err(Error::Usage(
+                    "prove needs `--dir`, or `--archive` with `--entry`".to_owned(),
+                )),
             }
-            (None, Some(archive), Some(entry)) => {
-                let line = prove::prove_archive(&prove::ProveArgs {
-                    archive,
-                    entry,
-                    release_dir,
-                    evidence,
-                    no_enable,
-                    pre_install: None,
-                })?;
-                emit(json, &line, &serde_json::json!({ "line": line }))
-            }
-            _ => Err(Error::Usage(
-                "prove needs `--dir`, or `--archive` with `--entry`".to_owned(),
-            )),
-        },
+        }
     }
 }
 

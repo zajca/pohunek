@@ -52,6 +52,8 @@ pub struct SmokeReport {
     pub activity: AgentActivity,
     /// Non-empty screen lines the smoke saw.
     pub screen_lines: usize,
+    /// Isolation root the smoke ran in, removed before the report.
+    pub root: PathBuf,
 }
 
 impl SmokeReport {
@@ -166,6 +168,7 @@ fn smoke_in(
         version: version.clone(),
         activity,
         screen_lines,
+        root: root.path().to_path_buf(),
     })
 }
 
@@ -232,11 +235,11 @@ fn smoke_session(
     Ok((activity, screen_lines))
 }
 
-/// Stops and removes the smoke session: both are attempted, and a non-zero
-/// exit of either fails the smoke while the first error is kept.
+/// Stops and removes the smoke session: both run and a non-zero exit of
+/// either fails the smoke while the first error is kept.
 fn stop_session(host: &mut Host, session: &str) -> Result<(), Error> {
-    check_session_command(host, &["session", "stop", session])?;
-    check_session_command(host, &["session", "rm", session])
+    check_session_command(host, &["session", "stop", session])
+        .and(check_session_command(host, &["session", "rm", session]))
 }
 
 /// Runs one session cleanup command and fails on a non-zero exit.

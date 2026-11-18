@@ -51,6 +51,26 @@ const ABSENT_DIGEST: &str =
 /// Prefix of the directory a proof creates in `TMPDIR`.
 const PROOF_ROOT_PREFIX: &str = "pohunek-prove-";
 
+/// Serializes the scenarios that create isolation roots: they share the
+/// short temporary parent, so one scenario's leftover check must not see
+/// another's live root. The lock is a file under the temporary root, so it
+/// serializes across the runner's processes too, not just threads.
+struct RootsGuard {
+    _lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+fn roots_lock() -> RootsGuard {
+    let path = pohunek_test_support::temp_root().join("pohunek-kit-roots.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&path)
+        .expect("open the roots lock");
+    let lock =
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).expect("lock the roots");
+    RootsGuard { _lock: lock }
+}
+
 fn s(path: &Path) -> &str {
     path.to_str().expect("utf-8 path")
 }
@@ -106,6 +126,14 @@ fn release_dir() -> PathBuf {
 /// A hermetic environment with the checkout marker the kit inherits.
 struct Kit {
     env: TestEnv,
+    /// Parent for the kit's isolation roots: the temporary root itself.
+    /// The kit names its roots `pohunek-prove-` plus 8 random characters,
+    /// and the nested worker socket paths fit only below a parent this
+    /// short; a deeper parent (like the `TestEnv` tmp directory) would
+    /// push the kit onto its `/tmp` fallback. The base is shared with the
+    /// other tests, but the root names are unique and every scenario
+    /// asserts its own root is gone.
+    root_parent: PathBuf,
 }
 
 impl Kit {
@@ -114,7 +142,8 @@ impl Kit {
         let marker = env.cwd().join("crates/xtask/Cargo.toml");
         fs::create_dir_all(marker.parent().expect("parent")).expect("mkdir");
         fs::write(marker, "").expect("marker");
-        Self { env }
+        let root_parent = pohunek_test_support::temp_root();
+        Self { env, root_parent }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -128,31 +157,55 @@ impl Kit {
     }
 
     /// Runs the kit binary with every wait bounded by `HANG_GUARD`: a hung
-    /// kit is killed and the failure names its stderr.
+    /// kit is killed and the failure names its stderr. Both pipes drain on
+    /// reader threads, so a kit that writes more than the pipe buffer
+    /// cannot block on output.
     fn kit(&self, args: &[&str]) -> Output {
         use std::io::Read as _;
         use std::process::Stdio;
+        use std::sync::mpsc;
         use std::time::Instant;
         let mut child = self
             .env
             .command(pohunek_test_support::bin_exe("pohunek-plugin-kit"))
             .current_dir(self.env.cwd())
+            .env("TMPDIR", &self.root_parent)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("run pohunek-plugin-kit");
+        let (sender, receiver) = mpsc::channel();
+        let mut stdout = child.stdout.take();
+        let mut stderr = child.stderr.take();
+        let stdout_sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            if let Some(mut pipe) = stdout.take() {
+                let _ = pipe.read_to_end(&mut output);
+            }
+            let _ = stdout_sender.send(("stdout", output));
+        });
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            if let Some(mut pipe) = stderr.take() {
+                let _ = pipe.read_to_end(&mut output);
+            }
+            let _ = sender.send(("stderr", output));
+        });
         let deadline = Instant::now() + HANG_GUARD;
         loop {
             match child.try_wait().expect("poll the kit") {
                 Some(status) => {
+                    let _ = child.wait();
                     let mut stdout = Vec::new();
                     let mut stderr = Vec::new();
-                    if let Some(mut pipe) = child.stdout.take() {
-                        pipe.read_to_end(&mut stdout).expect("read stdout");
-                    }
-                    if let Some(mut pipe) = child.stderr.take() {
-                        pipe.read_to_end(&mut stderr).expect("read stderr");
+                    for (name, output) in receiver {
+                        if name == "stdout" {
+                            stdout = output;
+                        } else {
+                            stderr = output;
+                        }
                     }
                     return Output {
                         status,
@@ -163,7 +216,16 @@ impl Kit {
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("pohunek-plugin-kit {args:?} hung past {HANG_GUARD:?}");
+                    let mut stderr = Vec::new();
+                    for (name, output) in receiver {
+                        if name == "stderr" {
+                            stderr = output;
+                        }
+                    }
+                    panic!(
+                        "pohunek-plugin-kit {args:?} hung past {HANG_GUARD:?}: {}",
+                        String::from_utf8_lossy(&stderr)
+                    );
                 }
                 None => {
                     // timing-allowed: #1613 the kit child poll sleeps under HANG_GUARD.
@@ -194,7 +256,34 @@ impl Kit {
         dir
     }
 
-    /// A copy of the fixture package renamed to the unadmitted
+    /// An entry file for `archive` with the given identity.
+    fn entry(&self, name: &str, digest: &str) -> PathBuf {
+        self.entry_as(name, PACKAGE_ID, digest, VERSION)
+    }
+
+    /// An entry file for an archive with the given identity.
+    fn entry_as(&self, name: &str, package_id: &str, digest: &str, version: &str) -> PathBuf {
+        let text = format!(
+            "package_id = \"{package_id}\"\n\
+             runtime_id = \"kitfixture\"\n\
+             version = \"{version}\"\n\
+             digest = \"{digest}\"\n\
+             url = \"https://localhost/kit-scenario\"\n\
+             platforms = [\"{}\"]\n\
+             core = \">=0.0.0\"\n\n\
+             [source]\n\
+             repo = \"local/prove\"\n\
+             repo_id = 1\n\
+             tag = \"v{version}\"\n\
+             commit = \"0000000000000000000000000000000000000000\"\n\
+             built_with = \"v0.0.0\"\n",
+            package::host_platform().expect("this platform has an index platform name")
+        );
+        let path = self.path(name);
+        fs::write(&path, text).expect("write the entry");
+        path
+    }
+
     /// `pohunek.runtime.x` identity.
     fn unadmitted_package(&self, name: &str) -> PathBuf {
         let dir = self.dir(name);
@@ -244,9 +333,12 @@ impl Kit {
     }
 
     /// Proof roots left in `TMPDIR`.
+    /// Isolation roots left behind under the short parent: empty when
+    /// every run cleaned up. The short parent never sees the `/tmp`
+    /// fallback, so every named root is one the kit actually used.
     fn leftover_roots(&self) -> Vec<String> {
-        fs::read_dir(self.env.tmp_dir())
-            .expect("read TMPDIR")
+        fs::read_dir(&self.root_parent)
+            .expect("read the root parent")
             .map(|item| {
                 item.expect("entry")
                     .file_name()
@@ -269,6 +361,7 @@ fn stderr_of(output: &Output) -> String {
 
 #[test]
 fn kit_lint_build_verify_and_detect_check_pass_on_fixture() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let package = fixture_dir();
 
@@ -349,6 +442,7 @@ fn kit_lint_build_verify_and_detect_check_pass_on_fixture() {
 
 #[test]
 fn kit_smoke_passes_on_fixture() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let output = kit.kit(&[
@@ -357,23 +451,33 @@ fn kit_smoke_passes_on_fixture() {
         s(&fixture_dir()),
         "--release-dir",
         s(&release),
+        "--json",
     ]);
     assert!(
         output.status.success(),
         "smoke failed: {}",
         stderr_of(&output)
     );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(document["package_id"].as_str(), Some(PACKAGE_ID));
+    assert_eq!(document["version"].as_str(), Some(VERSION));
+    assert_eq!(document["activity"].as_str(), Some("idle"));
     assert!(
-        stdout.starts_with(&format!("plugin smoke ok: {PACKAGE_ID} {VERSION} idle ")),
-        "unexpected smoke line: {stdout:?}"
+        document["screen_lines"].as_u64().unwrap_or(0) > 0,
+        "the smoke saw a non-empty screen: {document:?}"
     );
-    assert!(stdout.trim_end().ends_with("screen lines"));
+    let root = document["root"].as_str().expect("the used root");
+    assert!(
+        Path::new(root).starts_with(&kit.root_parent),
+        "the smoke stays under the short parent: {root:?}"
+    );
+    assert!(!Path::new(root).exists(), "smoke removes its root");
     assert!(kit.leftover_roots().is_empty(), "smoke removes its root");
 }
 
 #[test]
 fn kit_prove_passes_on_fixture() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let evidence = kit.path("prove.json");
@@ -385,17 +489,28 @@ fn kit_prove_passes_on_fixture() {
         s(&release),
         "--evidence",
         s(&evidence),
+        "--json",
     ]);
     assert!(
         output.status.success(),
         "prove failed: {}",
         stderr_of(&output)
     );
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(document["package_id"].as_str(), Some(PACKAGE_ID));
+    assert_eq!(document["version"].as_str(), Some(VERSION));
     assert!(
-        stdout.starts_with(&format!("plugin prove ok: {PACKAGE_ID} {VERSION} sha256:")),
-        "unexpected prove line: {stdout:?}"
+        document["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "the report names the archive digest: {document:?}"
     );
+    let root = document["root"].as_str().expect("the used root");
+    assert!(
+        Path::new(root).starts_with(&kit.root_parent),
+        "the proof stays under the short parent: {root:?}"
+    );
+    assert!(!Path::new(root).exists(), "prove removes its root");
     let evidence = evidence_of(&evidence);
     assert_eq!(evidence["result"], "pass");
     assert_eq!(evidence["package_id"], PACKAGE_ID);
@@ -418,7 +533,82 @@ fn kit_prove_passes_on_fixture() {
 }
 
 #[test]
+fn kit_prove_archive_proves_the_entry_asset() {
+    let _roots = roots_lock();
+    let kit = Kit::new();
+    let release = release_dir();
+    let archive = kit.build(&fixture_dir(), "out");
+    let digest = digest_of(&archive);
+    let entry = kit.entry("entry.toml", &digest);
+
+    let evidence = kit.path("prove-archive.json");
+    let output = kit.kit(&[
+        "prove",
+        "--archive",
+        s(&archive),
+        "--entry",
+        s(&entry),
+        "--release-dir",
+        s(&release),
+        "--evidence",
+        s(&evidence),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "prove --archive failed: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    let line = document["line"].as_str().expect("the line");
+    assert!(
+        line.starts_with(&format!("plugin prove ok: {PACKAGE_ID} {VERSION} sha256:")),
+        "unexpected prove line: {line:?}"
+    );
+    let root = document["root"].as_str().expect("the used root");
+    assert!(
+        Path::new(root).starts_with(&kit.root_parent),
+        "the proof stays under the short parent: {root:?}"
+    );
+    assert!(!Path::new(root).exists(), "prove removes its root");
+    let evidence = evidence_of(&evidence);
+    assert_eq!(evidence["result"], "pass");
+    assert_eq!(evidence["package_id"], PACKAGE_ID);
+    assert_eq!(
+        evidence["kit_sha256"].as_str(),
+        Some(digest_of(&pohunek_test_support::bin_exe("pohunek-plugin-kit")).as_str())
+    );
+    assert!(kit.leftover_roots().is_empty(), "prove removes its root");
+
+    let output = kit.kit(&[
+        "prove",
+        "--dir",
+        s(&fixture_dir()),
+        "--archive",
+        s(&archive),
+        "--entry",
+        s(&entry),
+        "--release-dir",
+        s(&release),
+        "--evidence",
+        s(&kit.path("prove-clash.json")),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("prove needs `--dir`, or `--archive` with `--entry`"),
+        "the refusal names the modes: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn kit_build_refuses_to_replace_the_archive() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let archive = kit.build(&fixture_dir(), "out");
     let before = digest_of(&archive);
@@ -445,6 +635,7 @@ fn kit_build_refuses_to_replace_the_archive() {
 
 #[test]
 fn kit_lint_refuses_a_broken_descriptor() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let package = kit.variant("broken", PACKAGE_ID, PACKAGE_ID);
     fs::write(package.join("runtime.toml"), "NOT TOML [[[\n").expect("break the descriptor");
@@ -464,6 +655,7 @@ fn kit_lint_refuses_a_broken_descriptor() {
 
 #[test]
 fn kit_verify_refuses_a_wrong_digest() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let archive = kit.build(&fixture_dir(), "out");
     let output = kit.kit(&[
@@ -490,6 +682,7 @@ fn kit_verify_refuses_a_wrong_digest() {
 
 #[test]
 fn kit_detect_check_refuses_a_mismatched_case() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let corpus = kit.dir("corpus");
     let screens = corpus.join("screens");
@@ -526,6 +719,7 @@ fn kit_detect_check_refuses_a_mismatched_case() {
 
 #[test]
 fn kit_smoke_refuses_a_missing_upstream() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let missing = kit.path("does-not-exist");
@@ -557,6 +751,7 @@ fn kit_smoke_refuses_a_missing_upstream() {
 
 #[test]
 fn kit_prove_no_enable_fails_with_evidence() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let release = release_dir();
     let evidence = kit.path("prove.json");
@@ -591,6 +786,7 @@ fn kit_prove_no_enable_fails_with_evidence() {
 
 #[test]
 fn kit_smoke_accepts_the_unadmitted_runtime_id() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let package = kit.unadmitted_package("unadmitted");
     let release = release_dir();
@@ -612,6 +808,7 @@ fn kit_smoke_accepts_the_unadmitted_runtime_id() {
 
 #[test]
 fn kit_release_host_refuses_the_throwaway_index() {
+    let _roots = roots_lock();
     let kit = Kit::new();
     let package = kit.unadmitted_package("unadmitted");
     let archive = kit.build(&package, "out");

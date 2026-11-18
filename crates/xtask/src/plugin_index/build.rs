@@ -347,7 +347,7 @@ pub(super) fn index_entry(entry: EntryFile, schema_version: u64) -> Result<Index
 /// checked like `index build` checks an entry of a tree.
 #[expect(
     dead_code,
-    reason = "delegation target: the throwaway wrapper reads entries through plugin_kit::entry"
+    reason = "`xtask plugin prove` reads its entry through `plugin_kit::entry`; removed with the index-host follow-up"
 )]
 pub(crate) fn entry_of(path: &Path) -> Result<IndexEntry, XtaskError> {
     index_entry(read_entry(path)?, INDEX_SCHEMA_VERSION_2)

@@ -1,10 +1,8 @@
 //! `plugin prove`: a model-free install of one archive through the index path.
 //!
-//! The proof engine lives in the kit crate
-//! ([`plugin_kit::prove_archive`]); this module keeps the `xtask` argument
-//! shape and the evidence contract, and converts the kit error into the
-//! `xtask` one so the CLI, flags, exit codes and evidence JSON stay
-//! unchanged.
+//! The proof engine lives in the kit crate ([`plugin_kit::prove_archive`]);
+//! this module keeps the `xtask` argument shape and the evidence contract
+//! and converts the kit error into the `xtask` one.
 
 // Rust guideline compliant 2026-11-06
 
@@ -30,6 +28,8 @@ pub(crate) struct ProveArgs {
 pub(crate) type Verdict = plugin_kit::Verdict;
 
 /// Proves the archive and writes the evidence through the kit proof engine.
+/// The evidence stays the `xtask` one: no kit digest, exactly the
+/// documented keys.
 pub(crate) fn prove(args: &ProveArgs) -> Result<String, crate::XtaskError> {
     plugin_kit::prove_archive(&plugin_kit::ProveArgs {
         archive: args.archive.clone(),
@@ -38,6 +38,8 @@ pub(crate) fn prove(args: &ProveArgs) -> Result<String, crate::XtaskError> {
         evidence: args.evidence.clone(),
         no_enable: args.no_enable,
         pre_install: args.pre_install.clone(),
+        kit_sha256: None,
     })
+    .map(|report| report.line)
     .map_err(crate::XtaskError::from)
 }

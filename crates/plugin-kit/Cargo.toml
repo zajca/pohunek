@@ -18,7 +18,7 @@ path = "src/lib.rs"
 [features]
 # The daemon-backed loaders `lint` and `detect-check` run through: only this
 # feature pulls `pohunek-daemon`, so the `xtask` library build stays
-# daemon-free (M1). The kit binary enables it by default; `xtask` disables
+# daemon-free. The kit binary enables it by default; `xtask` disables
 # default features on its kit dependency.
 default = ["daemon"]
 daemon = ["dep:pohunek-daemon"]

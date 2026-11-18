@@ -556,7 +556,6 @@ fn the_fixture_proves_in_isolation_and_leaves_nothing() {
             "core_version",
             "digest",
             "failed_step",
-            "kit_sha256",
             "package_id",
             "platform",
             "result",
@@ -567,23 +566,6 @@ fn the_fixture_proves_in_isolation_and_leaves_nothing() {
     assert_eq!(document["schema"], 1);
     assert_eq!(document["result"], "pass");
     assert!(document["failed_step"].is_null());
-    let kit_sha256 = document["kit_sha256"]
-        .as_str()
-        .expect("the evidence names the kit digest");
-    let kit_digest = kit_sha256.strip_prefix("sha256:").expect("a sha256 digest");
-    assert_eq!(kit_digest.len(), 64, "the kit digest is 64 hex chars");
-    assert!(
-        kit_digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "the kit digest is hex: {kit_sha256:?}"
-    );
-    assert_eq!(
-        kit_digest,
-        &hex(&Sha256::digest(
-            fs::read(pohunek_test_support::bin_exe("xtask"))
-                .expect("read the xtask binary the proof ran in")
-        )),
-        "the evidence names the binary the proof ran in"
-    );
     assert_eq!(document["package_id"], PACKAGE_ID);
     assert_eq!(document["version"], VERSION);
     assert_eq!(document["digest"], digest);

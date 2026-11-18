@@ -24,5 +24,5 @@ pub mod verify;
 pub use build::{build, BuildArgs, Built, ARCHIVE_SUFFIX};
 pub use entry::{entry_of, read_entry_file};
 pub use error::{Error, FAILURE_EXIT_CODE, INDEX_REFUSED_EXIT_CODE, PROVE_FAILED_EXIT_CODE};
-pub use prove::{prove_archive, prove_package, ProveArgs, ProveReport, Verdict};
+pub use prove::{kit_digest, prove_archive, prove_package, ProveArgs, ProveReport, Verdict};
 pub use smoke::{smoke, SmokeArgs, SmokeReport};

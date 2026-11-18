@@ -223,3 +223,11 @@ file that exists); a refused invocation writes no evidence. The runtime program
 of the package is never launched, so no model runs. A runtime id an index never
 authorizes (`codex`, `claude`, `hermes`, `pi`, `shell`) fails at `install` with
 `package_runtime_not_claimable`.
+
+The kit binary (`pohunek-plugin-kit prove --release-dir <dir> --evidence <file>`)
+adds `"kit_sha256":"sha256:<64 hex>"` to the evidence: the digest of the kit
+binary that ran the proof, checked by the release proof workflow against its
+own build (#1618). `--dir` builds the archive from the package directory
+first; `--archive` with `--entry` proves the admitted release asset against
+its real entry instead. `xtask plugin prove` evidence has no `kit_sha256`:
+exactly the keys above.
