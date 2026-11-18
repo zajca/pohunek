@@ -25,7 +25,8 @@ workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScrip
 | `crates/overlay-tailscale` | Tailscale status parsing, peer selection, bind validation, and overlay adapter. |
 | `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
-| `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
+| `crates/xtask` | Workspace automation: docs build/check, TS type generation. `plugin build` is a thin wrapper over the kit crate. |
+| `crates/plugin-kit` | `pohunek-plugin-kit`: owner-side plugin kit for plugin repositories: `lint`, `build`, `verify`, `detect-check`, `smoke` and `prove` over one package directory, sharing the isolated-daemon host the `xtask` wrappers use. |
 | `crates/assistant` | Assistant launch orchestration: selects a runtime, reads the knowledge bundle from the assistant context package and sends a launch snapshot (launch metadata only), and calls `session.new` over ordinary protocol requests. |
 | `crates/logging` | Bounded owner-private JSON-lines file logging with rotation shared by the processes of one family. |
 | `crates/platform` | Narrow operating-system contracts shared by the daemon and the session worker: process facts and kernel peer identity. |

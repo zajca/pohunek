@@ -77,6 +77,7 @@ const MEMBERS: &[(&str, &str, &[&str], &[&str])] = &[
     ),
     ("crates/session-worker", "pohunek-session-worker", &[], &[]),
     ("crates/cli", "pohunek-cli", &["pohunek-daemon"], &[]),
+    ("crates/plugin-kit", "pohunek-plugin-kit", &[], &[]),
     ("crates/xtask", "xtask", &["pohunek-knowledge"], &[]),
     ("crates/relay", "pohunek-relay", &[], &["pohunek-netbird"]),
     (
@@ -130,6 +131,15 @@ impl Repo {
             repo.write(&format!("{dir}/src/lib.rs"), "pub fn f() {}\n");
         }
         repo.write("crates/cli/src/bin/pohunek.rs", "fn main() {}\n");
+        repo.write("crates/daemon/src/bin/pohunekd.rs", "fn main() {}\n");
+        repo.write(
+            "crates/session-worker/src/bin/pohunek-sessiond.rs",
+            "fn main() {}\n",
+        );
+        repo.write(
+            "crates/plugin-kit/src/bin/pohunek-plugin-kit.rs",
+            "fn main() {}\n",
+        );
         for (krate, _) in VENDORED {
             for version in VENDORED_VERSIONS {
                 let dir = format!("vendor/{krate}-{version}");
@@ -417,17 +427,19 @@ fn a_library_change_selects_its_reverse_dependencies_transitively() {
     let repo = Repo::new();
     repo.change(&["crates/protocol/src/lib.rs"]);
     let selection = repo.select();
-    assert_eq!(
-        packages(&selection),
-        whole(&[
-            "pohunek-protocol",
-            "pohunek-client",
-            "pohunek-knowledge",
-            "pohunek-daemon",
-            "pohunek-cli",
-            "xtask",
-        ])
-    );
+    let mut expected = whole(&[
+        "pohunek-protocol",
+        "pohunek-client",
+        "pohunek-knowledge",
+        "pohunek-daemon",
+        "pohunek-cli",
+        "xtask",
+    ]);
+    // Rebuilding `pohunek` also selects the kit test that runs the CLI
+    // binary (the BINARY_USES edge).
+    expected.push(("pohunek-plugin-kit".to_owned(), "binary(=kit)".to_owned()));
+    expected.sort();
+    assert_eq!(packages(&selection), expected);
     assert_eq!(
         reasons(&selection, "pohunek-cli"),
         ["depends on pohunek-daemon"]
@@ -459,6 +471,9 @@ fn a_dependency_only_lockfile_change_selects_the_members_resolving_the_crate() {
     assert_eq!(selection["mode"], "packages", "{selection:#}");
     let mut expected = whole(&["pohunek-client", "pohunek-daemon", "pohunek-cli"]);
     expected.push(("xtask".to_owned(), "binary(=dependency_policy)".to_owned()));
+    // Rebuilding `pohunek` also selects the kit test that runs the CLI
+    // binary (the BINARY_USES edge).
+    expected.push(("pohunek-plugin-kit".to_owned(), "binary(=kit)".to_owned()));
     expected.sort();
     assert_eq!(packages(&selection), expected);
     let client = reasons(&selection, "pohunek-client").join("; ");
@@ -476,6 +491,9 @@ fn a_lockfile_change_rebuilding_the_cli_selects_the_daemon_test_that_runs_it() {
         "pohunek-daemon".to_owned(),
         "binary(=supervised_lifecycle)".to_owned(),
     ));
+    // Rebuilding `pohunek` also selects the kit test that runs the CLI
+    // binary (the BINARY_USES edge).
+    expected.push(("pohunek-plugin-kit".to_owned(), "binary(=kit)".to_owned()));
     expected.push(("xtask".to_owned(), "binary(=dependency_policy)".to_owned()));
     expected.sort();
     assert_eq!(packages(&selection), expected);
@@ -636,10 +654,12 @@ fn a_mapped_runtime_edge_selects_only_the_tests_it_names() {
 
     let repo = Repo::new();
     repo.change(&["compat/codex/subagent-hooks.json"]);
-    assert_eq!(
-        packages(&repo.select()),
-        whole(&["pohunek-daemon", "pohunek-cli", "xtask"])
-    );
+    let mut expected = whole(&["pohunek-daemon", "pohunek-cli", "xtask"]);
+    // Rebuilding `pohunek` also selects the kit test that runs the CLI
+    // binary (the BINARY_USES edge).
+    expected.push(("pohunek-plugin-kit".to_owned(), "binary(=kit)".to_owned()));
+    expected.sort();
+    assert_eq!(packages(&repo.select()), expected);
 }
 
 #[test]
@@ -1014,12 +1034,14 @@ fn a_gate_receipt_change_selects_the_receipt_guard_the_cli_package_and_the_scrip
     assert_eq!(selection["mode"], "packages", "{selection:#}");
     let mut expected = whole(&["pohunek-cli"]);
     // Selecting pohunek-cli also selects the daemon test that runs the CLI
-    // binary (the BINARY_USES edge); the scanners live in `all_packages`,
-    // which the assertion below compares against the full package selection.
+    // binary and the kit test that runs it (the BINARY_USES edges); the
+    // scanners live in `all_packages`, which the assertion below compares
+    // against the full package selection.
     expected.push((
         "pohunek-daemon".to_owned(),
         "binary(=supervised_lifecycle)".to_owned(),
     ));
+    expected.push(("pohunek-plugin-kit".to_owned(), "binary(=kit)".to_owned()));
     expected.push((
         "pohunek-session-worker".to_owned(),
         "test(=server::receipt_guard_tests::receipt_class_one_matches_the_injected_session_environment)"
@@ -1095,6 +1117,25 @@ fn a_cli_change_selects_the_daemon_test_that_runs_the_cli_binary() {
     );
     assert!(
         reasons(&selection, "pohunek-daemon")
+            .iter()
+            .any(|reason| reason.starts_with("the `pohunek` binary of pohunek-cli")),
+        "{selection}"
+    );
+}
+
+#[test]
+fn a_cli_change_selects_the_kit_test_that_runs_the_cli_binary() {
+    let repo = Repo::new();
+    repo.change(&["crates/cli/src/lib.rs"]);
+    let selection = repo.select();
+    assert_eq!(selection["mode"], "packages");
+    assert!(
+        packages(&selection)
+            .contains(&("pohunek-plugin-kit".to_owned(), "binary(=kit)".to_owned())),
+        "{selection}"
+    );
+    assert!(
+        reasons(&selection, "pohunek-plugin-kit")
             .iter()
             .any(|reason| reason.starts_with("the `pohunek` binary of pohunek-cli")),
         "{selection}"

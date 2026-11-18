@@ -1,10 +1,11 @@
-//! The isolated daemon used by `plugin prove` and the Claude canary.
+//! The isolated daemon the kit `prove` and `smoke` commands run on.
 //!
-//! The root directory holds a private home, XDG directories, a copy of the
-//! release executables with the trust anchor and the index channel file beside
-//! the daemon, and the daemon's control socket. Every child process runs with
-//! a cleared environment, so nothing of the caller's `POHUNEK_*` variables,
-//! sockets or home directory reaches it.
+//! One private root holds a home, XDG directories, a copy of the release
+//! executables with the trust anchor and the index channel file beside the
+//! daemon, and the daemon's control socket. Every child process runs with a
+//! cleared environment, so nothing of the caller's `POHUNEK_*` variables,
+//! sockets or home directory reaches it. The `xtask` canary capture uses
+//! this module through the kit crate.
 
 // Rust guideline compliant 2026-11-06
 
@@ -38,16 +39,53 @@ const DOCUMENT_MODE: u32 = 0o644;
 /// Mode of the runtime directory: the daemon requires an owner-only one.
 const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
 
-/// Prefix of the isolation root's directory name; short because the control
-/// socket path below the root must fit the platform limit.
-const ROOT_PREFIX: &str = "pohunek-prove-";
+/// Prefix of the isolation root's directory name.
+///
+/// Budget: the longest socket below the root is the staged worker path,
+/// the root plus [`WORKER_SOCKET_TAIL_BYTES`] bytes. macOS allows 103
+/// path bytes, so below the 12-byte `/private/tmp` parent the name holds
+/// at most 14 bytes: `pk-` plus 6 random characters (9 bytes) leaves 5
+/// bytes of margin. Linux allows 107, so the same name fits its
+/// `/tmp` fallback with wider margin.
+pub const ROOT_PREFIX: &str = "pk-";
 
 /// Random characters `tempfile` appends to the root's name.
-const ROOT_RANDOM_BYTES: usize = 8;
+pub const ROOT_RANDOM_BYTES: usize = 6;
 
 /// System-owned short parent tried when `$TMPDIR` is too long for a socket
 /// path (macOS `$TMPDIR` is).
-const SHORT_TEMP_PARENT: &str = "/tmp";
+pub const SHORT_TEMP_PARENT: &str = "/tmp";
+
+/// Short parent as macOS resolves it: `/tmp` is a symbolic link to
+/// `/private/tmp`, so a fallback root lands below this canonical parent.
+const MACOS_SHORT_TEMP_PARENT: &str = "/private/tmp";
+
+/// Bytes the longest socket below a root adds to the root's path: the
+/// staged worker bind (`xdg-runtime/<app>/workers/<session id>/.s<hex>`),
+/// the longest of the daemon and worker paths the daemon validates.
+const WORKER_SOCKET_TAIL_BYTES: usize = 1
+    + RUNTIME_DIRECTORY.len()
+    + 1
+    + pohunek_paths::APP_DIR.len()
+    + 1
+    + pohunek_paths::WORKERS_SUBDIR.len()
+    + 1
+    + pohunek_paths::MAX_WORKER_SESSION_ID_BYTES
+    + 1
+    + pohunek_paths::STAGED_SOCKET_PREFIX.len()
+    + pohunek_paths::STAGED_SOCKET_SUFFIX_CHARS;
+
+/// Every fallback root must leave room for the longest socket on macOS:
+/// the check runs on every platform at compile time, so a longer prefix
+/// fails the build instead of macOS CI.
+const _: () = assert!(
+    MACOS_SHORT_TEMP_PARENT.len()
+        + 1
+        + ROOT_PREFIX.len()
+        + ROOT_RANDOM_BYTES
+        + WORKER_SOCKET_TAIL_BYTES
+        <= pohunek_paths::DARWIN_SOCKET_PATH_MAX_BYTES
+);
 
 /// Socket path below the root: `XDG_RUNTIME_DIR` plus the application
 /// directory and socket file the daemon appends to it.
@@ -95,11 +133,11 @@ const HOME_PLACEHOLDER: &str = "<USER_HOME>";
 const CHILD_PATH: &str = "/usr/bin:/bin";
 
 /// The daemon flag that keeps the remote control listener off.
-pub(crate) const LOCAL_ONLY_FLAG: &str = "--local-only";
+pub const LOCAL_ONLY_FLAG: &str = "--local-only";
 
 /// What the daemon logs, before it accepts connections, when
 /// [`LOCAL_ONLY_FLAG`] is in force.
-pub(crate) const LOCAL_ONLY_LOG_LINE: &str = "remote control listener disabled by --local-only";
+pub const LOCAL_ONLY_LOG_LINE: &str = "remote control listener disabled by --local-only";
 
 /// UTF-8 locale of every child; macOS ships no `C.UTF-8`.
 const CHILD_LOCALE: &str = if cfg!(target_os = "macos") {
@@ -130,21 +168,23 @@ const HOME_DIRECTORIES: [&str; 5] = ["home", "xdg-config", "xdg-cache", "xdg-dat
 /// The isolation root, removed with its contents when [`Root::remove`] runs or
 /// the value drops.
 #[derive(Debug)]
-pub(crate) struct Root {
+pub struct Root {
     temp: TempDir,
 }
 
 impl Root {
     /// Creates the root with its private directories below a canonical parent
-    /// whose control socket path fits the platform limit.
-    pub(crate) fn create() -> Result<Self, String> {
+    /// whose daemon and worker socket paths fit the platform limit. A deep
+    /// `TMPDIR` falls back to the short system parent, so an isolated host
+    /// always runs where its session workers can bind.
+    pub fn create() -> Result<Self, String> {
         let candidates = [std::env::temp_dir(), PathBuf::from(SHORT_TEMP_PARENT)];
         let mut last = String::from("no temporary directory is available");
         for parent in candidates {
-            let parent = match fs::canonicalize(&parent) {
+            let parent = match Self::check_session_parent(&parent) {
                 Ok(parent) => parent,
                 Err(error) => {
-                    last = format!("cannot resolve `{}`: {error}", parent.display());
+                    last = error;
                     continue;
                 }
             };
@@ -159,6 +199,13 @@ impl Root {
                     continue;
                 }
             };
+            // The parent check used the shorter session placeholder; the
+            // proof prefix is longer, so validate the real paths too and
+            // fall back to the short parent when they do not fit.
+            if let Err(error) = Self::check_root_sockets(temp.path()) {
+                last = error;
+                continue;
+            }
             if temp.path().join(SOCKET_RELATIVE_PATH).as_os_str().len() >= SOCKET_PATH_MAX_BYTES {
                 "the daemon socket path would exceed the platform limit; set TMPDIR to a shorter directory"
                     .clone_into(&mut last);
@@ -171,10 +218,29 @@ impl Root {
         Err(last)
     }
 
+    /// Creates a root below `parent`, after [`Root::check_session_parent`]
+    /// accepted it. There is no fallback parent: the caller names the
+    /// directory, so a scenario can keep the root inside its own temporary
+    /// directory and assert the cleanup from the outside. The parent check
+    /// used the shorter session placeholder, so the real root is rechecked
+    /// too; its name differs from the placeholder.
+    pub fn create_in(parent: &Path) -> Result<Self, String> {
+        let parent = Self::check_session_parent(parent)?;
+        let temp = tempfile::Builder::new()
+            .prefix(ROOT_PREFIX)
+            .rand_bytes(ROOT_RANDOM_BYTES)
+            .tempdir_in(&parent)
+            .map_err(|error| format!("cannot create the isolation root: {error}"))?;
+        Self::check_root_sockets(temp.path())?;
+        let root = Self { temp };
+        root.create_directories()?;
+        Ok(root)
+    }
+
     /// Creates a root that runs agent sessions directly below `parent`, after
     /// [`Root::check_session_parent`] accepted it. There is no fallback
     /// parent: the caller names the directory.
-    pub(crate) fn create_for_sessions(parent: &Path) -> Result<Self, String> {
+    pub fn create_for_sessions(parent: &Path) -> Result<Self, String> {
         let parent = Self::check_session_parent(parent)?;
         let temp = tempfile::Builder::new()
             .prefix(SESSION_ROOT_PREFIX)
@@ -192,7 +258,7 @@ impl Root {
     /// and the longest worker socket of the longest session ID validated with
     /// its staged bind name, as the daemon does before it spawns a worker.
     /// Returns the canonical parent; nothing is created.
-    pub(crate) fn check_session_parent(parent: &Path) -> Result<PathBuf, String> {
+    pub fn check_session_parent(parent: &Path) -> Result<PathBuf, String> {
         let parent = fs::canonicalize(parent)
             .map_err(|error| format!("cannot resolve `{}`: {error}", parent.display()))?;
         // A placeholder of the root's name length stands for the random name.
@@ -200,8 +266,17 @@ impl Root {
             "{SESSION_ROOT_PREFIX}{}",
             "0".repeat(SESSION_ROOT_RANDOM_BYTES)
         );
-        let root = parent.join(name);
-        let environment = root_environment(&root);
+        Self::check_root_sockets(&parent.join(name))?;
+        Ok(parent)
+    }
+
+    /// Checks that the daemon and worker socket paths below `root` fit the
+    /// platform limit, with the daemon's own path resolution and the longest
+    /// worker session ID.
+    fn check_root_sockets(root: &Path) -> Result<(), String> {
+        let platform = pohunek_paths::Platform::current().map_err(|error| error.to_string())?;
+        let display = root.display().to_string();
+        let environment = root_environment(root);
         let variable = |name: &str| {
             environment
                 .iter()
@@ -218,11 +293,9 @@ impl Root {
         };
         let too_long = |error: &dyn std::fmt::Display| {
             format!(
-                "`{}` is too long for the session sockets below it ({error}); choose a shorter directory",
-                parent.display()
+                "`{display}` is too long for the session sockets below it ({error}); choose a shorter directory"
             )
         };
-        let platform = pohunek_paths::Platform::current().map_err(|error| error.to_string())?;
         let paths = pohunek_paths::BasePaths::resolve_for(
             platform,
             rustix::process::geteuid().as_raw(),
@@ -239,7 +312,7 @@ impl Root {
         );
         match pohunek_paths::worker_socket_path(&paths.worker_runtime_root(), &session_id, platform)
         {
-            Ok(Some(_socket)) => Ok(parent),
+            Ok(Some(_socket)) => Ok(()),
             Ok(None) => Err(format!(
                 "`{session_id}` is not a worker session ID; the socket check cannot run"
             )),
@@ -262,22 +335,25 @@ impl Root {
     }
 
     /// The root directory.
-    pub(crate) fn path(&self) -> &Path {
+    #[must_use]
+    pub fn path(&self) -> &Path {
         self.temp.path()
     }
 
     /// The isolated `XDG_CONFIG_HOME`.
-    pub(crate) fn config_home(&self) -> PathBuf {
+    #[must_use]
+    pub fn config_home(&self) -> PathBuf {
         self.path().join("xdg-config")
     }
 
     /// The file the daemon's combined output is written to.
-    pub(crate) fn daemon_log(&self) -> PathBuf {
+    #[must_use]
+    pub fn daemon_log(&self) -> PathBuf {
         self.path().join(DAEMON_LOG_FILE)
     }
 
     /// Removes the root and its contents.
-    pub(crate) fn remove(self) -> Result<(), String> {
+    pub fn remove(self) -> Result<(), String> {
         self.temp
             .close()
             .map_err(|error| format!("cannot remove the isolation root: {error}"))
@@ -319,15 +395,16 @@ fn root_environment(root: &Path) -> Vec<(OsString, OsString)> {
 }
 
 /// What a finished CLI command left.
-pub(crate) struct Output {
-    pub(crate) code: Option<i32>,
-    pub(crate) stdout: Vec<u8>,
+#[derive(Debug)]
+pub struct Output {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
 }
 
 /// A running copy of the release daemon and the CLI copy that talks to it.
 /// Dropping it ends the daemon's whole process group.
 #[derive(Debug)]
-pub(crate) struct Host {
+pub struct Host {
     root: PathBuf,
     prefix: PathBuf,
     environment: Vec<(OsString, OsString)>,
@@ -339,7 +416,7 @@ impl Host {
     /// Copies the release executables from `release_dir` into the prefix
     /// below `root` and puts `anchor` and `channel` beside the daemon. No
     /// process runs yet.
-    pub(crate) fn prepare(
+    pub fn prepare(
         root: &Root,
         release_dir: &Path,
         anchor: &Path,
@@ -383,12 +460,52 @@ impl Host {
         })
     }
 
+    /// Puts `upstream` in front of the `PATH` every child of this host sees,
+    /// the way an installed upstream's directory stands in front of the
+    /// daemon's own `PATH`: the daemon resolves the runtime program through
+    /// `executable_search_path`, so it finds an upstream program there
+    /// first. Accepts a directory or an executable inside one (its parent
+    /// directory is used); refuses anything else.
+    pub fn prepend_path(&mut self, upstream: &Path) -> Result<(), String> {
+        let resolved = fs::canonicalize(upstream)
+            .map_err(|error| format!("cannot resolve `--upstream`: {error}"))?;
+        let dir = if resolved.is_dir() {
+            resolved
+        } else if resolved.is_file() {
+            resolved
+                .parent()
+                .map(Path::to_path_buf)
+                .ok_or_else(|| format!("`--upstream` `{}` has no parent", resolved.display()))?
+        } else {
+            return Err(format!(
+                "`--upstream` `{}` is neither a directory nor a file",
+                resolved.display()
+            ));
+        };
+        let path = self
+            .environment
+            .iter()
+            .find(|(key, _)| key == "PATH")
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        let mut dirs = vec![dir.into_os_string()];
+        dirs.extend(std::env::split_paths(&path).map(PathBuf::into_os_string));
+        let joined: OsString = std::env::join_paths(dirs)
+            .map_err(|error| format!("cannot join the upstream `PATH`: {error}"))?;
+        for (key, value) in &mut self.environment {
+            if key == "PATH" {
+                value.clone_from(&joined);
+            }
+        }
+        Ok(())
+    }
+
     /// Starts the daemon of the prefix with `--local-only`, waits until it
     /// accepts connections and requires its log to confirm that the remote
     /// control listener is off: on a host with an overlay, the daemon would
     /// otherwise try to serve the control protocol on the host's overlay
     /// address.
-    pub(crate) fn launch_local_only(&mut self, root: &Root) -> Result<(), String> {
+    pub fn launch_local_only(&mut self, root: &Root) -> Result<(), String> {
         self.launch_with(root, &[LOCAL_ONLY_FLAG])?;
         let log = fs::read_to_string(root.path().join(DAEMON_LOG_FILE))
             .map_err(|error| format!("cannot read the daemon log: {error}"))?;
@@ -430,7 +547,7 @@ impl Host {
     }
 
     /// Runs `pohunekd --version` and returns its first output line.
-    pub(crate) fn core_version(&mut self) -> Result<String, String> {
+    pub fn core_version(&mut self) -> Result<String, String> {
         let output = self.run_program("pohunekd", &["--version"])?;
         let text = String::from_utf8_lossy(&output.stdout);
         match (output.code, text.lines().next()) {
@@ -439,14 +556,20 @@ impl Host {
         }
     }
 
+    /// The isolation root this host runs in.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Runs the installed `pohunek` with `arguments`.
-    pub(crate) fn cli(&mut self, arguments: &[&str]) -> Result<Output, String> {
+    pub fn cli(&mut self, arguments: &[&str]) -> Result<Output, String> {
         self.run_program("pohunek", arguments)
     }
 
     /// Runs `program`, an executable outside the prefix, with `arguments` in
     /// the isolated environment plus `extra_environment`.
-    pub(crate) fn run_external(
+    pub fn run_external(
         &mut self,
         program: &Path,
         arguments: &[&str],
@@ -551,7 +674,7 @@ impl Host {
 
     /// Signals the daemon with SIGTERM and requires a successful exit within
     /// [`STOP_TIMEOUT`].
-    pub(crate) fn stop(mut self) -> Result<(), String> {
+    pub fn stop(mut self) -> Result<(), String> {
         let Some(mut daemon) = self.daemon.take() else {
             return Ok(());
         };

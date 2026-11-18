@@ -192,12 +192,25 @@ pub(crate) struct BinaryUse {
     pub(crate) why: &'static str,
 }
 
-pub(crate) const BINARY_USES: &[BinaryUse] = &[BinaryUse {
-    binary: "pohunek",
-    readers: readers("pohunek-daemon", "binary(=supervised_lifecycle)"),
-    sources: &["crates/daemon/tests/supervised_lifecycle.rs"],
-    why: "the managed-CLI scenario runs the `pohunek` binary beside `pohunekd`",
-}];
+pub(crate) const BINARY_USES: &[BinaryUse] = &[
+    BinaryUse {
+        binary: "pohunek",
+        readers: readers("pohunek-daemon", "binary(=supervised_lifecycle)"),
+        sources: &["crates/daemon/tests/supervised_lifecycle.rs"],
+        why: "the managed-CLI scenario runs the `pohunek` binary beside `pohunekd`",
+    },
+    BinaryUse {
+        binary: "pohunek",
+        readers: readers("pohunek-plugin-kit", "binary(=kit)"),
+        sources: &["crates/plugin-kit/tests/kit.rs"],
+        why: "the kit smoke and prove scenarios drive the `pohunek` CLI on an isolated daemon",
+    },
+    // No entries for `pohunekd` and `pohunek-sessiond`: the kit depends on
+    // `pohunek-daemon`, which depends on `pohunek-session-worker`, so the
+    // Cargo reverse-dependency closure already selects the kit suite on a
+    // change to either. Only `pohunek` needs an entry, as no Cargo edge
+    // links the kit to `pohunek-cli`.
+];
 
 /// The workspace package that builds binary `name`.
 pub(crate) fn binary_owner<'a>(name: &str, packages: &'a [Package]) -> Option<&'a Package> {
@@ -516,6 +529,18 @@ const RULES: &[Rule] = &[
         Effect::Packages(&["pohunek-cli", "xtask"]),
         "daemon packaging tested by pohunek-cli; xtask embeds stage-archive's release files",
     ),
+    // The kit refusal scenario anchors its release host on the same two
+    // files; a change to either must also run the kit suite.
+    rule(
+        Pattern::File("packaging/runtime-catalog-anchor.json"),
+        Effect::AlsoTests(&[readers("pohunek-plugin-kit", "binary(=kit)")]),
+        "release anchor read by the kit refusal scenario",
+    ),
+    rule(
+        Pattern::File("packaging/plugin-index-channel.json"),
+        Effect::AlsoTests(&[readers("pohunek-plugin-kit", "binary(=kit)")]),
+        "release channel read by the kit refusal scenario",
+    ),
     rule(
         Pattern::File("compat/matrix.json"),
         Effect::Packages(&["xtask", "pohunek-cli"]),
@@ -683,6 +708,10 @@ pub(crate) const LANE_NEUTRAL: &[LaneNeutral] = &[LaneNeutral {
         (
             "pohunek-cli",
             "its launch fixtures point at the bundle through pohunek-assistant",
+        ),
+        (
+            "pohunek-plugin-kit",
+            "depends on the bundle through the daemon",
         ),
         (
             "xtask",
@@ -1540,6 +1569,10 @@ mod tests {
             },
             package("pohunek-netbird", "crates/netbird"),
             package("pohunek-test-support", "crates/test-support"),
+            Package {
+                bins: BTreeSet::from(["pohunek-plugin-kit".to_owned()]),
+                ..package("pohunek-plugin-kit", "crates/plugin-kit")
+            },
             package("xtask", "crates/xtask"),
             package("nested-fixture", "crates/xtask/tests/fixtures/nested"),
         ]
@@ -1886,7 +1919,8 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "selection: pohunek-cli, pohunek-daemon (named tests), xtask (named tests)"
+            "selection: pohunek-cli, pohunek-daemon (named tests), pohunek-plugin-kit \
+             (named tests), xtask (named tests)"
         );
         assert_eq!(
             lines[4],
@@ -1901,7 +1935,8 @@ mod tests {
         assert!(
             lines[6].starts_with(
                 "cargo t -E 'package(=pohunek-cli) | (package(=pohunek-daemon) and \
-                 ((binary(=supervised_lifecycle)))) | (package(=xtask) and ((binary(=hermetic_scan)"
+                 ((binary(=supervised_lifecycle)))) | (package(=pohunek-plugin-kit) and \
+                 ((binary(=kit)))) | (package(=xtask) and ((binary(=hermetic_scan)"
             ),
             "{report}"
         );

@@ -31,6 +31,7 @@ members = [
     "crates/assistant",
     "crates/daemon",
     "crates/cli",
+    "crates/plugin-kit",
 ]
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
@@ -68,6 +69,7 @@ pohunek-service-config = { path = "crates/service-config" }
 pohunek-protocol = { path = "crates/protocol" }
 pohunek-terminal = { path = "crates/terminal" }
 pohunek-test-support = { path = "crates/test-support" }
+plugin-kit = { package = "pohunek-plugin-kit", path = "crates/plugin-kit", default-features = false }
 # Dev-dependency only: the persisted-shape guard tests (never a normal dependency).
 pohunek-shape-guard = { path = "crates/shape-guard" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }

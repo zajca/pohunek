@@ -140,6 +140,40 @@ The same two commands run locally:
   fetched; a failed fetch prints a `warn` naming the URL and the check
   continues, so it never fails on the network alone.
 
+The `pohunek-plugin-kit` binary (`crates/plugin-kit`) offers the same
+operations for plugin repositories directly, one package directory at a time;
+every subcommand takes `--dir <package dir>` and reports through a
+`plugin <command> ok: ...` stdout line (`--json` switches to a single JSON
+document). Exit status is 0 for a pass, 1 for a failed proof or a refused
+index write, and 2 for every other refusal:
+
+- `lint` loads the descriptor and the detection manifest through the same
+  parser an install runs.
+- `build` writes the canonical archive like `xtask plugin build`.
+- `verify --archive <file> [--dir <package dir>] [--sha256 <digest>]`
+  checks the archive rebuilds from the directory, twice, and matches the
+  digest; without `--dir` it only re-reads the archive, without `--sha256`
+  it only reports the digest.
+- `detect-check --corpus <dir>` replays every committed screen of the
+  corpus through the detector: `cases.toml` holds `[[case]]` tables with a
+  `screen` file under `screens/`, a `width`, and the expected `working`,
+  `blocked`, `idle` or `unknown` activity.
+- `smoke --release-dir <dir> [--upstream <path>]` installs the built
+  package on an isolated daemon through a throwaway index, starts it, waits
+  for detection past `unknown`, and requires a non-empty screen; then it
+  stops and removes the session. The generic smoke stops after the screen
+  check: no full agent run. `--upstream` puts a directory (or the directory
+  of an executable) in front of the isolated daemon's `PATH`, so the runtime
+  program resolves to the locked upstream install there.
+- `prove --release-dir <dir> --evidence <file> [--no-enable]` runs the same
+  install path as `xtask plugin prove` from the package directory and writes
+  the verdict as evidence JSON, plus the kit digest (`kit_sha256`); with
+  `--archive <file> --entry <entry.toml>` instead of `--dir` it proves the
+  admitted release asset against its real entry. `--json` reports the used
+  isolation root alongside the line, so a scenario can assert the root is
+  gone; a failed run names its already-removed root on stderr as
+  `isolation root: <path>` (`None` before the root exists names none).
+
 ## Compatibility declaration
 
 A plugin declares what it needs from core, and core refuses an install that

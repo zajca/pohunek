@@ -1,0 +1,50 @@
+[package]
+name = "pohunek-plugin-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Owner-side plugin kit: lint, build, verify, detect-check, smoke and prove for plugin repositories."
+
+[[bin]]
+name = "pohunek-plugin-kit"
+path = "src/main.rs"
+required-features = ["daemon"]
+
+[lib]
+name = "plugin_kit"
+path = "src/lib.rs"
+
+[features]
+# The daemon-backed loaders `lint` and `detect-check` run through: only this
+# feature pulls `pohunek-daemon`, so the `xtask` library build stays
+# daemon-free. The kit binary enables it by default; `xtask` disables
+# default features on its kit dependency.
+default = ["daemon"]
+daemon = ["dep:pohunek-daemon"]
+
+[dependencies]
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+getrandom = { workspace = true }
+nix = { workspace = true, features = ["process", "signal"] }
+pohunek-daemon = { path = "../daemon", optional = true }
+pohunek-package = { workspace = true }
+pohunek-paths = { workspace = true }
+pohunek-protocol = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+pohunek-test-support = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

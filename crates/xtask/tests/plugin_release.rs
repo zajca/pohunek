@@ -48,8 +48,10 @@ const VERSION: &str = "0.1.0";
 /// File name `plugin build` gives the fixture archive.
 const ARCHIVE_NAME: &str = "pohunek.runtime.kitfixture-0.1.0.tar.zst";
 
-/// Prefix of the directory a proof creates in `TMPDIR`.
-const PROOF_ROOT_PREFIX: &str = "pohunek-prove-";
+/// Prefix of the directory a proof creates in `TMPDIR`: the kit's own
+/// root prefix, so the leftover scan sees the roots the kit engine
+/// creates for `xtask plugin prove`.
+const PROOF_ROOT_PREFIX: &str = plugin_kit::isolated::ROOT_PREFIX;
 
 /// Core range every core version satisfies.
 const ANY_CORE: &str = ">=0.0.0";

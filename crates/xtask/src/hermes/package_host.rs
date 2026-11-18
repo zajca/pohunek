@@ -32,9 +32,9 @@ use super::{
     EXPECTED_RUNTIME_ID, PROCESS_POLL_INTERVAL,
 };
 use crate::catalog::{archive_identity, read_input};
-use crate::isolated_host::{LOCAL_ONLY_FLAG, LOCAL_ONLY_LOG_LINE};
 use crate::throwaway_trust::{self, write_public, CoreRelease, Trust};
 use crate::XtaskError;
+use plugin_kit::isolated::{LOCAL_ONLY_FLAG, LOCAL_ONLY_LOG_LINE};
 
 /// The release executables the gate installs, by file name in `--bin-dir`.
 pub(super) const BINARIES: [&str; 3] = ["pohunek", "pohunekd", "pohunek-sessiond"];
