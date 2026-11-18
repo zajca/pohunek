@@ -305,6 +305,7 @@ async fn install_refused(
         .package_install(index_install(fixture, package, document, false))
         .await
         .expect_err("the install is refused")
+        .kind_ref()
 }
 
 /// Asserts that a refused install left neither a package nor index marks.
@@ -1605,6 +1606,7 @@ async fn install_local(fixture: &Fixture, package: &Package) -> Result<(), Packa
         })
         .await
         .map(|_report| ())
+        .map_err(|error| error.kind_ref())
 }
 
 /// `plugin.index.apply` of `document`, with or without `repair_state`.

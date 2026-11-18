@@ -52,7 +52,7 @@ use super::source::read_regular_file;
 use super::trust;
 use super::{
     check_claim, commit_install, ensure_selectable, prepare_official, prove_loadable, read_state,
-    unix_now, Context, HostTrustAnchor, InstallPlan, Prepared,
+    unix_now, Context, HostTrustAnchor, InstallPlan, PackageError, Prepared,
 };
 use crate::agent::host::{
     decide_claim, is_reserved, version_order, Authority, PackageRejection, PackageStore,
@@ -976,10 +976,10 @@ fn apply(
             digest: Some(bind.digest.clone()),
             dry_run: false,
         };
-        let result = bind_profile(&context, &profiles, &retained, &params).map_err(|kind| {
+        let result = bind_profile(&context, &profiles, &retained, &params).map_err(|error| {
             EnsureError::Bind {
                 profile: bind.name.clone(),
-                code: ProtocolError::from(kind).code,
+                code: ProtocolError::from(error.kind_ref()).code,
             }
         })?;
         if result.status != PackageBindStatus::Bound {
@@ -2403,6 +2403,7 @@ fn claim_refusal(plan: &PlanInputs<'_>, prepared: &Prepared) -> Option<PackageEr
         prepared.authority,
     )
     .err()
+    .map(|error| error.kind_ref())
 }
 
 /// [`refuse_damaged`] for the installed root of the release package `prepared`.
@@ -2469,7 +2470,7 @@ fn install(
             },
             &retained,
         )
-        .map_err(kind_error)?;
+        .map_err(|error| error_error(&error))?;
         if result.status != PackageInstallStatus::Installed {
             return Err(EnsureError::Registry(
                 "the release package was not newly installed".to_owned(),
@@ -2489,7 +2490,7 @@ fn install(
             },
             &retained,
         )
-        .map_err(kind_error)?;
+        .map_err(|error| error_error(&error))?;
         if result.status != PackageInstallStatus::RootRestored {
             return Err(EnsureError::Registry(
                 "the release package root was not restored".to_owned(),
@@ -2497,7 +2498,7 @@ fn install(
         }
     }
     if !record.enabled() {
-        prove_loadable(context, &digest).map_err(kind_error)?;
+        prove_loadable(context, &digest).map_err(|error| error_error(&error))?;
         context
             .store
             .registry()
@@ -2506,7 +2507,7 @@ fn install(
     }
     if state.selected(&record.identity().id) != Some(&digest) {
         ensure_selectable(context, &retained, &digest, &declared_by(&definition))
-            .map_err(kind_error)?;
+            .map_err(|error| error_error(&error))?;
         context
             .store
             .registry()
@@ -2703,7 +2704,7 @@ fn disabled_state(
     match context.store.read_definition(digest, record.identity()) {
         Ok(_definition) => match prove_loadable(context, digest) {
             Ok(_definition) => DisabledState::Enableable,
-            Err(kind) => DisabledState::Claimed(kind),
+            Err(error) => DisabledState::Claimed(error.kind_ref()),
         },
         // A missing root cannot name its runtime, so the runtime the release
         // lists for the package stands for it: restoring the root does not help
@@ -3407,6 +3408,11 @@ fn catalog_bytes_limit() -> u64 {
 /// The error of a package step that failed with `kind`.
 fn kind_error(kind: PackageErrorKind) -> EnsureError {
     EnsureError::Registry(ProtocolError::from(kind).code)
+}
+
+/// [`kind_error`] for work that already carries a conflict holder.
+fn error_error(error: &PackageError) -> EnsureError {
+    EnsureError::Registry(ProtocolError::from(error.kind_ref()).code)
 }
 
 /// The error of a package store whose runtime host cannot be built.

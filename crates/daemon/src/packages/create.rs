@@ -28,7 +28,7 @@ use toml_edit::{DocumentMut, Table};
 use tracing::warn;
 
 use super::bind::{bind_kind, ensure_coexists, resolve_target, unusable, Target};
-use super::{read_state, Context, PackageService, RetainedPins};
+use super::{read_state, Context, PackageError, PackageService, RetainedPins};
 use crate::agent::host::{ConfigHome, RuntimeDefinition};
 use crate::agent::{
     compose_preset, compose_profile, credential_arg_problem, credential_literal_problem,
@@ -61,7 +61,7 @@ impl PackageService {
     pub async fn package_create_profile(
         &self,
         params: PackageCreateProfileParams,
-    ) -> Result<PackageCreateProfileResult, PackageErrorKind> {
+    ) -> Result<PackageCreateProfileResult, PackageError> {
         let profiles = self.sessions.profiles().clone();
         // A replaced profile's old pin is not a reference to compare the new
         // pin with.
@@ -86,7 +86,7 @@ impl PackageService {
     pub async fn package_create_preset(
         &self,
         params: PackageCreatePresetParams,
-    ) -> Result<PackageCreateProfileResult, PackageErrorKind> {
+    ) -> Result<PackageCreateProfileResult, PackageError> {
         let profiles = self.sessions.profiles().clone();
         let replaced = params.replace.is_some().then(|| params.profile.clone());
         self.package_transaction_excluding(replaced, move |_context, _retained| {
@@ -122,10 +122,11 @@ fn home_is_plain(home: &str) -> bool {
 fn home_entry(
     config_home: Option<&ConfigHome>,
     home: &str,
-) -> Result<(String, String), PackageErrorKind> {
-    let declared = config_home.ok_or(PackageErrorKind::ProfileHomeUnsupported)?;
+) -> Result<(String, String), PackageError> {
+    let declared =
+        config_home.ok_or_else(|| PackageError::from(PackageErrorKind::ProfileHomeUnsupported))?;
     if declared.subdir().is_some() || !home_is_plain(home) {
-        return Err(PackageErrorKind::ProfileHomeInvalid);
+        return Err(PackageError::from(PackageErrorKind::ProfileHomeInvalid));
     }
     Ok((declared.env().to_owned(), home.to_owned()))
 }
@@ -137,7 +138,7 @@ fn create_profile(
     profiles: &ProfileRegistry,
     retained: &RetainedPins,
     params: &PackageCreateProfileParams,
-) -> Result<PackageCreateProfileResult, PackageErrorKind> {
+) -> Result<PackageCreateProfileResult, PackageError> {
     let name = params.profile.as_str();
     if let Err(error) = validate_name("agent", name) {
         return Err(unusable(name, &error.msg));
@@ -147,8 +148,8 @@ fn create_profile(
         .map_err(|error| bind_kind(name, error))?;
     let target = match resolve_target(context, &params.base, None, retained) {
         Ok(target) => Some(target),
-        Err(PackageErrorKind::ProfileBaseBuiltin) => None,
-        Err(kind) => return Err(kind),
+        Err(error) if error.kind_ref() == PackageErrorKind::ProfileBaseBuiltin => None,
+        Err(error) => return Err(error),
     };
     let definition = match &target {
         Some(target) => Some(Arc::new(
@@ -158,7 +159,7 @@ fn create_profile(
                     &target.inspected.info.digest,
                     &target.inspected.info.package,
                 )
-                .map_err(|_rejection| PackageErrorKind::ProfileTargetInvalid)?,
+                .map_err(|_rejection| PackageError::from(PackageErrorKind::ProfileTargetInvalid))?,
         )),
         None => None,
     };
@@ -179,7 +180,8 @@ fn create_profile(
     };
     let text = carry_rights(dir.as_ref(), name, compose_profile(&spec))?;
     if let Some(pin) = &pin {
-        ensure_coexists(context, &read_state(context)?, retained.gate(), &pin.digest)?;
+        let state = read_state(context)?;
+        ensure_coexists(context, &state, retained.gate(), &pin.digest)?;
     }
     let validated = match &definition {
         Some(definition) => profiles.validate_candidate(name, &text, definition),
@@ -222,7 +224,7 @@ fn create_profile(
 fn create_preset(
     profiles: &ProfileRegistry,
     params: &PackageCreatePresetParams,
-) -> Result<PackageCreateProfileResult, PackageErrorKind> {
+) -> Result<PackageCreateProfileResult, PackageError> {
     let name = params.profile.as_str();
     if let Err(error) = validate_name("agent", name) {
         return Err(unusable(name, &error.msg));
@@ -273,7 +275,7 @@ fn create_preset(
 fn existing_rights(
     dir: Option<&BindDir>,
     name: &str,
-) -> Result<Option<toml_edit::Item>, PackageErrorKind> {
+) -> Result<Option<toml_edit::Item>, PackageError> {
     let Some(dir) = dir else {
         return Ok(None);
     };
@@ -295,11 +297,7 @@ fn existing_rights(
 ///
 /// A profile definition carries no rights of its own, so a replacement never
 /// widens what the owner wrote for the profile it replaces.
-fn carry_rights(
-    dir: Option<&BindDir>,
-    name: &str,
-    text: String,
-) -> Result<String, PackageErrorKind> {
+fn carry_rights(dir: Option<&BindDir>, name: &str, text: String) -> Result<String, PackageError> {
     let Some(rights) = existing_rights(dir, name)? else {
         return Ok(text);
     };
@@ -312,7 +310,7 @@ fn carry_rights(
 
 /// Refuses a preset over a profile file that holds a `[rights]` table: a
 /// preset takes its parent's rights and could not keep that table.
-fn refuse_preset_over_rights(dir: Option<&BindDir>, name: &str) -> Result<(), PackageErrorKind> {
+fn refuse_preset_over_rights(dir: Option<&BindDir>, name: &str) -> Result<(), PackageError> {
     if existing_rights(dir, name)?.is_some() {
         return Err(unusable(
             name,
@@ -327,7 +325,7 @@ fn refuse_preset_over_rights(dir: Option<&BindDir>, name: &str) -> Result<(), Pa
 /// The text must be TOML whose only root key is `options`, a table; its
 /// tables are validated later with the load rules of the composed profile.
 /// Diagnostics never quote the text.
-fn options_table(name: &str, text: &str) -> Result<Table, PackageErrorKind> {
+fn options_table(name: &str, text: &str) -> Result<Table, PackageError> {
     if u64::try_from(text.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
         return Err(unusable(name, "the options text is too large"));
     }
@@ -355,7 +353,7 @@ fn write_file(
     replace: Option<&ProfileDigest>,
     dry_run: bool,
     text: &str,
-) -> Result<(PackageCreateProfileStatus, Option<ProfileDigest>), PackageErrorKind> {
+) -> Result<(PackageCreateProfileStatus, Option<ProfileDigest>), PackageError> {
     let existing = match dir {
         Some(dir) => dir
             .read_existing(name)
@@ -371,7 +369,7 @@ fn write_file(
         PackageCreateProfileStatus::Created
     };
     if !dry_run {
-        let dir = dir.ok_or(PackageErrorKind::RegistryFailed)?;
+        let dir = dir.ok_or_else(|| PackageError::from(PackageErrorKind::RegistryFailed))?;
         publish(dir, name, existing.as_ref(), text)?;
     }
     Ok((status, previous))
@@ -389,7 +387,7 @@ fn checked_home(
     params: &PackageCreateProfileParams,
     definition: Option<&RuntimeDefinition>,
     name: &str,
-) -> Result<Option<(String, String)>, PackageErrorKind> {
+) -> Result<Option<(String, String)>, PackageError> {
     let home = params
         .home
         .as_deref()
@@ -401,23 +399,29 @@ fn checked_home(
         .is_some_and(|home| credential_literal_problem(home).is_some())
     {
         warn!(%name, "the home path of a new profile looks like a credential");
-        return Err(PackageErrorKind::ProfileCredentialLiteral);
+        return Err(PackageError::from(
+            PackageErrorKind::ProfileCredentialLiteral,
+        ));
     }
     for (index, slot) in params.secret_env.iter().enumerate() {
         if credential_literal_problem(slot).is_some() {
             warn!(%name, index, "a secret_env slot of a new profile looks like a credential");
-            return Err(PackageErrorKind::ProfileCredentialLiteral);
+            return Err(PackageError::from(
+                PackageErrorKind::ProfileCredentialLiteral,
+            ));
         }
         // A slot that is not a plain variable name is refused here, so the
         // launch rules never echo it.
         if env_name_problem(slot).is_some() {
             warn!(%name, index, "a secret_env slot of a new profile is not a variable name");
-            return Err(PackageErrorKind::ProfileUnusable);
+            return Err(PackageError::from(PackageErrorKind::ProfileUnusable));
         }
     }
     if let Some(index) = credential_arg_problem(&params.args) {
         warn!(%name, index, "an argument of a new profile looks like a credential");
-        return Err(PackageErrorKind::ProfileCredentialLiteral);
+        return Err(PackageError::from(
+            PackageErrorKind::ProfileCredentialLiteral,
+        ));
     }
     Ok(home)
 }
@@ -427,18 +431,18 @@ fn checked_home(
 fn previous_digest(
     existing: Option<&ProfileFile>,
     replace: Option<&ProfileDigest>,
-) -> Result<Option<ProfileDigest>, PackageErrorKind> {
+) -> Result<Option<ProfileDigest>, PackageError> {
     match (existing, replace) {
-        (Some(_), None) => Err(PackageErrorKind::ProfileExists),
+        (Some(_), None) => Err(PackageError::from(PackageErrorKind::ProfileExists)),
         (Some(file), Some(expected)) => {
             let current = file_digest(file.text().as_bytes());
             if &current == expected {
                 Ok(Some(current))
             } else {
-                Err(PackageErrorKind::ProfileDigestMismatch)
+                Err(PackageError::from(PackageErrorKind::ProfileDigestMismatch))
             }
         }
-        (None, Some(_)) => Err(PackageErrorKind::ProfileNotFound),
+        (None, Some(_)) => Err(PackageError::from(PackageErrorKind::ProfileNotFound)),
         (None, None) => Ok(None),
     }
 }
@@ -449,11 +453,11 @@ fn publish(
     name: &str,
     existing: Option<&ProfileFile>,
     text: &str,
-) -> Result<(), PackageErrorKind> {
+) -> Result<(), PackageError> {
     dir.remove_stale_temporaries();
     match existing {
         Some(file) => dir.publish(name, file, text).map_err(|error| match error {
-            BindError::Changed => PackageErrorKind::ProfileDigestMismatch,
+            BindError::Changed => PackageError::from(PackageErrorKind::ProfileDigestMismatch),
             other => bind_kind(name, other),
         }),
         None => dir

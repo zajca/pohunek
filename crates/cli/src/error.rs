@@ -918,11 +918,15 @@ pub(crate) fn hermes_error_code(error: &crate::hermes_integration::error::Error)
 /// [`render`] writes it to stderr.
 pub(crate) fn human_error_text(err: &CliError) -> String {
     let mut text = format!("pohunek: {err}\n");
-    if let Some(exit) = err
-        .to_protocol_error()
+    let protocol = err.to_protocol_error();
+    if let Some(holder) = protocol
         .details
-        .and_then(|details| details.process_exit)
+        .as_ref()
+        .and_then(|details| details.holder.as_ref())
     {
+        let _ = writeln!(text, "the runtime id is served by package {holder}");
+    }
+    if let Some(exit) = protocol.details.and_then(|details| details.process_exit) {
         match (exit.exit_code, exit.signal) {
             (Some(code), _) => {
                 let _ = writeln!(text, "the program exited with status {code}");

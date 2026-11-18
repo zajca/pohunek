@@ -19,7 +19,8 @@ use tracing::warn;
 use super::revocation;
 use super::selection::{conflict, differs, integration_of};
 use super::{
-    inspect_record, prove_loadable, read_state, Context, Inspected, PackageService, RetainedPins,
+    inspect_record, prove_loadable, read_state, Context, Inspected, PackageError, PackageService,
+    RetainedPins,
 };
 use crate::agent::host::ServedBy;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ impl PackageService {
     pub async fn package_bind_profile(
         &self,
         params: PackageBindProfileParams,
-    ) -> Result<PackageBindProfileResult, PackageErrorKind> {
+    ) -> Result<PackageBindProfileResult, PackageError> {
         let profiles = self.sessions.profiles().clone();
         // The pin being replaced is not a reference to compare the new pin with.
         let replaced = Some(params.profile.clone());
@@ -59,29 +60,29 @@ pub(super) struct Target {
 }
 
 /// The error kind of a profile that could not be read or rewritten.
-pub(super) fn bind_kind(profile: &str, error: BindError) -> PackageErrorKind {
+pub(super) fn bind_kind(profile: &str, error: BindError) -> PackageError {
     match error {
-        BindError::NotFound => PackageErrorKind::ProfileNotFound,
+        BindError::NotFound => PackageError::from(PackageErrorKind::ProfileNotFound),
         BindError::Unusable(detail) => {
             warn!(%profile, %detail, "an agent profile cannot be rewritten");
-            PackageErrorKind::ProfileUnusable
+            PackageError::from(PackageErrorKind::ProfileUnusable)
         }
         BindError::Changed => {
             warn!(%profile, "an agent profile changed while it was being rewritten");
-            PackageErrorKind::ProfileChanged
+            PackageError::from(PackageErrorKind::ProfileChanged)
         }
         BindError::Failed(reason) => {
             warn!(%profile, %reason, "an agent profile could not be rewritten");
-            PackageErrorKind::RegistryFailed
+            PackageError::from(PackageErrorKind::RegistryFailed)
         }
-        BindError::Exists => PackageErrorKind::ProfileExists,
-        BindError::DirUnsafe => PackageErrorKind::ProfileDirUnsafe,
+        BindError::Exists => PackageError::from(PackageErrorKind::ProfileExists),
+        BindError::DirUnsafe => PackageError::from(PackageErrorKind::ProfileDirUnsafe),
     }
 }
 
-pub(super) fn unusable(profile: &str, detail: &str) -> PackageErrorKind {
+pub(super) fn unusable(profile: &str, detail: &str) -> PackageError {
     warn!(%profile, %detail, "an agent profile cannot be rewritten");
-    PackageErrorKind::ProfileUnusable
+    PackageError::from(PackageErrorKind::ProfileUnusable)
 }
 
 /// Picks and proves the package `base` is pinned to.
@@ -94,11 +95,11 @@ pub(super) fn resolve_target(
     base: &RuntimeId,
     digest: Option<&PackageDigest>,
     retained: &RetainedPins,
-) -> Result<Target, PackageErrorKind> {
+) -> Result<Target, PackageError> {
     if matches!(context.runtimes.served_by(base), Some(ServedBy::Builtin)) {
-        return Err(PackageErrorKind::ProfileBaseBuiltin);
+        return Err(PackageErrorKind::ProfileBaseBuiltin.into());
     }
-    let state = read_state(context)?;
+    let state = read_state(context).map_err(PackageError::from)?;
     let report = context.runtimes.package_report();
     let revoked = revocation::revoked_set(context).ok();
     let mut serving: Vec<Inspected> = state
@@ -111,20 +112,21 @@ pub(super) fn resolve_target(
         let index = serving
             .iter()
             .position(|inspected| &inspected.info.digest == digest)
-            .ok_or(PackageErrorKind::ProfileTargetInvalid)?;
+            .ok_or_else(|| PackageError::from(PackageErrorKind::ProfileTargetInvalid))?;
         serving.swap_remove(index)
     } else {
         serving.retain(|inspected| inspected.info.selected && inspected.info.enabled);
         match serving.len() {
             1 => serving.swap_remove(0),
-            _ => return Err(PackageErrorKind::ProfileTargetInvalid),
+            _ => return Err(PackageErrorKind::ProfileTargetInvalid.into()),
         }
     };
     if chosen.info.fault.is_some() {
-        return Err(PackageErrorKind::ProfileTargetInvalid);
+        return Err(PackageErrorKind::ProfileTargetInvalid.into());
     }
     prove_loadable(context, &chosen.info.digest)?;
-    super::revocation::require_not_revoked(context, &state, &chosen.info.digest)?;
+    super::revocation::require_not_revoked(context, &state, &chosen.info.digest)
+        .map_err(PackageError::from)?;
     let runtime = chosen
         .runtime
         .clone()
@@ -183,7 +185,7 @@ pub(super) fn bind_profile(
     profiles: &ProfileRegistry,
     retained: &RetainedPins,
     params: &PackageBindProfileParams,
-) -> Result<PackageBindProfileResult, PackageErrorKind> {
+) -> Result<PackageBindProfileResult, PackageError> {
     let name = params.profile.as_str();
     let dir = profiles
         .open_for_bind()
@@ -208,7 +210,7 @@ pub(super) fn bind_profile(
             ExpectedPin::Pinned { digest } => head.pin().is_some_and(|pin| &pin.digest == digest),
         };
         if !holds {
-            return Err(PackageErrorKind::ProfilePinChanged);
+            return Err(PackageErrorKind::ProfilePinChanged.into());
         }
     }
     let target = resolve_target(context, &head.base, params.digest.as_ref(), retained)?;
@@ -232,7 +234,8 @@ pub(super) fn bind_profile(
     if head.pin().as_ref() == Some(&pin) {
         return Ok(result(PackageBindStatus::Unchanged, false, true));
     }
-    ensure_coexists(context, &read_state(context)?, retained.gate(), &pin.digest)?;
+    let state = read_state(context).map_err(PackageError::from)?;
+    ensure_coexists(context, &state, retained.gate(), &pin.digest).map_err(PackageError::from)?;
     let rewritten = apply_pin(file.text(), &pin).map_err(|detail| unusable(name, &detail))?;
     // The candidate must resolve against the target exactly as a launch of it
     // would (size bound, structure, resume overrides against the
@@ -241,7 +244,7 @@ pub(super) fn bind_profile(
     let definition = context
         .store
         .read_definition(&pin.digest, &target.inspected.info.package)
-        .map_err(|_rejection| PackageErrorKind::ProfileTargetInvalid)?;
+        .map_err(|_rejection| PackageError::from(PackageErrorKind::ProfileTargetInvalid))?;
     profiles
         .validate_candidate(name, &rewritten, &Arc::new(definition))
         .map_err(|error| unusable(name, &error.msg))?;

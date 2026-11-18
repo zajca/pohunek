@@ -6172,6 +6172,7 @@ fn error_details_appear_only_on_command_failed_and_stay_forward_compatible() {
             expected_commit: None,
             fetched_commit: None,
             source_ref: None,
+            holder: None,
         }))
     );
 }

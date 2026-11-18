@@ -261,6 +261,50 @@ impl Keys {
         self.document_living(schema, signer, sequence, INDEX_LIFETIME, entries)
     }
 
+    /// An index document of `schema` at `sequence` whose embedded revocation
+    /// list is at `revocation_sequence` and revokes nothing. The index entries
+    /// stay fixed while only the revocation mark moves, so a stored copy of an
+    /// earlier document falls below the revocation high-water mark alone.
+    fn document_with_revocations(
+        &self,
+        schema: u64,
+        sequence: u64,
+        revocation_sequence: u64,
+        entries: Vec<IndexEntry>,
+    ) -> Vec<u8> {
+        let body = IndexBody {
+            schema_version: schema,
+            scope: "official".to_owned(),
+            sequence,
+            expires_at: sequence + INDEX_LIFETIME,
+            entries,
+        };
+        let message = index_signing_message(&body).expect("index message");
+        let revocations = RevocationBody {
+            schema_version: INDEX_SCHEMA_VERSION,
+            sequence: revocation_sequence,
+            revoked_key_ids: Vec::new(),
+        };
+        let revocation_message = revocation_signing_message(&revocations).expect("revocations");
+        serde_json::to_vec(&IndexEnvelope {
+            schema_version: schema,
+            index: body,
+            key_records: vec![self.record(&self.key)],
+            signatures: vec![CatalogSignature {
+                key_id: key_id(&self.key),
+                signature: hex(&self.key.sign(&message).to_bytes()),
+            }],
+            revocations: SignedRevocations {
+                signature: CatalogSignature {
+                    key_id: key_id(&self.root),
+                    signature: hex(&self.root.sign(&revocation_message).to_bytes()),
+                },
+                revocations,
+            },
+        })
+        .expect("serialize the index")
+    }
+
     /// A schema 1 document signed by K, current as of now, that expires
     /// `lifetime` seconds after its sequence.
     fn signed_living(&self, lifetime: u64, entries: Vec<IndexEntry>) -> Vec<u8> {
@@ -763,6 +807,15 @@ impl Rig {
         let (code, document) = self.install.json(&["session", "rm", &session]).await;
         assert_eq!(code, 0, "{document}");
         true
+    }
+
+    /// The `revocation_high_water` mark the daemon persisted.
+    fn revocation_high_water(&self) -> u64 {
+        let bytes = fs::read(self.plugins_dir().join("index-state.json")).expect("read the state");
+        let state: Value = serde_json::from_slice(&bytes).expect("the state is JSON");
+        state["revocation_high_water"]
+            .as_u64()
+            .expect("a revocation high-water mark")
     }
 
     /// The `index_high_water` mark the daemon persisted.
@@ -2468,4 +2521,170 @@ async fn a_sha256_update_works_on_a_host_without_the_index_channel() {
         .collect();
     assert_eq!(selected.len(), 1, "{selected:?}");
     assert_eq!(selected[0]["package"]["version"], "0.2.0");
+}
+
+/// A second package serving an installed runtime id is refused, and the
+/// refusal names the holding package in both human and JSON output: the wire
+/// `package_runtime_conflict` carries the holder's id in `details.holder`.
+#[tokio::test]
+async fn a_runtime_conflict_names_the_holding_package() {
+    const HOLDER_ID: &str = "pohunek.runtime.duelholder";
+    const CHALLENGER_ID: &str = "pohunek.runtime.duelchallenger";
+    const RUNTIME_ID: &str = "idxduel";
+    let rig = Rig::start().await;
+    let holder = archive_of(HOLDER_ID, RUNTIME_ID, "0.1.0");
+    let holder_file = rig.install.write("holder.tar.zst", &holder.bytes);
+    let holder_path = holder_file.to_str().expect("utf-8 path").to_owned();
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            &holder_path,
+            "--sha256",
+            holder.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+
+    let challenger = archive_of(CHALLENGER_ID, RUNTIME_ID, "0.2.0");
+    let challenger_file = rig.install.write("challenger.tar.zst", &challenger.bytes);
+    let challenger_path = challenger_file.to_str().expect("utf-8 path").to_owned();
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            &challenger_path,
+            "--sha256",
+            challenger.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_ne!(code, 0, "the challenger is refused: {document}");
+    assert_eq!(
+        err_code(&document),
+        "package_runtime_conflict",
+        "{document}"
+    );
+    assert_eq!(
+        document["err"]["details"]["holder"], HOLDER_ID,
+        "{document}"
+    );
+
+    let output = rig
+        .install
+        .run_with_env(
+            &[
+                "plugin",
+                "install",
+                &challenger_path,
+                "--sha256",
+                challenger.digest.as_str(),
+                "--yes",
+            ],
+            &[],
+        )
+        .await;
+    assert!(!output.status.success(), "the challenger is refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(HOLDER_ID),
+        "human output names the holder: {stderr}"
+    );
+}
+
+/// A schema 1 install that moves only the revocation mark leaves the stored
+/// schema 2 copy below it; the context install then refreshes instead of
+/// staging a document the daemon would refuse.
+#[tokio::test]
+async fn a_context_install_refreshes_a_stored_copy_below_the_revocation_mark() {
+    let rig = Rig::start().await;
+    let sequence = now();
+    let runtime = rig.listing("0.1.0");
+    rig.server.set(
+        &archive_path("0.1.0"),
+        Route::Body(runtime.archive.bytes.clone()),
+    );
+    let context = context_archive("0.3.0");
+    rig.server
+        .set(&archive_path("0.3.0"), Route::Body(context.bytes.clone()));
+    let v1_entries = vec![runtime.entry()];
+    let v2_entries = vec![
+        runtime_entry_of_kind(&runtime),
+        rig.context_entry(&context, "0.3.0"),
+    ];
+    // Both schemas share one index sequence and revocation sequence 1.
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.document_with_revocations(
+            INDEX_SCHEMA_VERSION,
+            sequence,
+            1,
+            v1_entries.clone(),
+        )),
+    );
+    rig.server.set(
+        INDEX_PATH_V2,
+        Route::Body(rig.keys.document_with_revocations(
+            INDEX_SCHEMA_VERSION_2,
+            sequence,
+            1,
+            v2_entries.clone(),
+        )),
+    );
+    let refreshed = rig
+        .run(&["plugin", "index", "refresh"], &rig.official_urls())
+        .await;
+    assert_eq!(refreshed.code, 0, "{}", refreshed.document);
+    let run = rig
+        .run(
+            &["plugin", "install", CONTEXT_PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+
+    // The schema 1 document moves to revocation sequence 2 at the same index
+    // sequence; installing the runtime package raises only the revocation
+    // mark while the stored schema 2 copy stays at revocation sequence 1.
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.document_with_revocations(
+            INDEX_SCHEMA_VERSION,
+            sequence,
+            2,
+            v1_entries,
+        )),
+    );
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    assert_eq!(rig.index_high_water(), sequence);
+    assert_eq!(rig.revocation_high_water(), 2);
+
+    // The refreshed schema 2 copy carries revocation sequence 2 as well.
+    rig.server.set(
+        INDEX_PATH_V2,
+        Route::Body(rig.keys.document_with_revocations(
+            INDEX_SCHEMA_VERSION_2,
+            sequence,
+            2,
+            v2_entries,
+        )),
+    );
+    rig.clear_requests();
+
+    let run = rig
+        .run(
+            &["plugin", "install", CONTEXT_PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+
+    assert_eq!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert_eq!(
+        rig.server.requests(),
+        vec![INDEX_PATH_V2.to_owned(), archive_path("0.3.0")]
+    );
 }

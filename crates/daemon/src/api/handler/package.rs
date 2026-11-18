@@ -18,6 +18,7 @@ use protocol::{
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
 use super::{ControlTransport, DaemonState};
+use crate::packages::PackageError;
 
 /// Refuses a request that did not arrive on the local control socket.
 fn require_local(request: &Request, state: &DaemonState) -> Result<(), Response> {
@@ -38,6 +39,18 @@ fn respond<T: serde::Serialize>(
     match result {
         Ok(value) => ok_value(request, &value),
         Err(kind) => error_value(request, ProtocolError::from(kind)),
+    }
+}
+
+/// Serializes a lifecycle result or maps its failure — including a
+/// runtime-id conflict holder — to the wire error.
+fn respond_error<T: serde::Serialize>(
+    request: &Request,
+    result: Result<T, PackageError>,
+) -> Response {
+    match result {
+        Ok(value) => ok_value(request, &value),
+        Err(error) => error_value(request, error.into_protocol()),
     }
 }
 
@@ -87,7 +100,7 @@ pub(super) async fn handle_package_install(request: &Request, state: &DaemonStat
         return response;
     }
     match parse_params::<PackageInstallParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state.sessions.packages().package_install(params).await,
         ),
@@ -100,7 +113,7 @@ pub(super) async fn handle_package_link(request: &Request, state: &DaemonState) 
         return response;
     }
     match parse_params::<PackageLinkParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state.sessions.packages().package_link(params).await,
         ),
@@ -113,7 +126,7 @@ pub(super) async fn handle_package_set_enabled(request: &Request, state: &Daemon
         return response;
     }
     match parse_params::<PackageSetEnabledParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state.sessions.packages().package_set_enabled(params).await,
         ),
@@ -126,7 +139,7 @@ pub(super) async fn handle_package_select(request: &Request, state: &DaemonState
         return response;
     }
     match parse_params::<PackageSelectParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state.sessions.packages().package_select(params).await,
         ),
@@ -155,7 +168,7 @@ pub(super) async fn handle_package_bind_profile(
         return response;
     }
     match parse_params::<PackageBindProfileParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state.sessions.packages().package_bind_profile(params).await,
         ),
@@ -171,7 +184,7 @@ pub(super) async fn handle_package_create_preset(
         return response;
     }
     match parse_params::<PackageCreatePresetParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state
                 .sessions
@@ -211,7 +224,7 @@ pub(super) async fn handle_package_create_profile(
         return response;
     }
     match parse_params::<PackageCreateProfileParams>(request) {
-        Ok(params) => respond(
+        Ok(params) => respond_error(
             request,
             state
                 .sessions

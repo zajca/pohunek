@@ -439,10 +439,10 @@ impl PackageService {
     /// The task computes the retained set, runs the blocking work and
     /// reloads, so a caller that stops waiting cannot release the authority
     /// while the change is still in flight.
-    async fn package_transaction<T, F>(&self, work: F) -> Result<T, PackageErrorKind>
+    async fn package_transaction<T, F>(&self, work: F) -> Result<T, PackageError>
     where
         T: Send + 'static,
-        F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageErrorKind> + Send + 'static,
+        F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageError> + Send + 'static,
     {
         self.package_transaction_excluding(None, work).await
     }
@@ -453,12 +453,12 @@ impl PackageService {
         &self,
         profile: Option<String>,
         work: F,
-    ) -> Result<T, PackageErrorKind>
+    ) -> Result<T, PackageError>
     where
         T: Send + 'static,
-        F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageErrorKind> + Send + 'static,
+        F: FnOnce(&Context, &RetainedPins) -> Result<T, PackageError> + Send + 'static,
     {
-        let context = self.authority.context()?;
+        let context = self.authority.context().map_err(PackageError::kind)?;
         let sessions = self.sessions.clone();
         let authority = Arc::clone(&self.authority);
         self.sessions
@@ -469,10 +469,10 @@ impl PackageService {
                     .await
                     .map_err(|error| {
                         warn!(%error, "the sessions that pin packages cannot be listed");
-                        PackageErrorKind::RegistryFailed
+                        PackageError::kind(PackageErrorKind::RegistryFailed)
                     })?;
                 let uncertain = retained.is_uncertain();
-                let outcome = blocking(move || work(&context, &retained)).await;
+                let outcome = blocking_error(move || work(&context, &retained)).await;
                 if uncertain && outcome.is_err() {
                     warn_refused_under_uncertainty("a package change");
                 }
@@ -482,7 +482,7 @@ impl PackageService {
                 outcome
             })
             .await
-            .map_err(|_join_error| PackageErrorKind::RegistryFailed)?
+            .map_err(|_join_error| PackageError::kind(PackageErrorKind::RegistryFailed))?
     }
 
     /// Runs `work` under the exclusive lifecycle lock with the agents of the
@@ -522,7 +522,7 @@ impl PackageService {
     pub async fn package_install(
         &self,
         params: PackageInstallParams,
-    ) -> Result<PackageInstallResult, PackageErrorKind> {
+    ) -> Result<PackageInstallResult, PackageError> {
         self.package_transaction(move |context, retained| {
             let candidate = prepare_archive(context, &params.archive_path, &params.trust)?;
             require_commands_opt_in(&candidate, params.accept_commands)?;
@@ -547,7 +547,7 @@ impl PackageService {
     pub async fn package_link(
         &self,
         params: PackageLinkParams,
-    ) -> Result<PackageInstallResult, PackageErrorKind> {
+    ) -> Result<PackageInstallResult, PackageError> {
         self.package_transaction(move |context, retained| {
             let candidate = prepare_directory(context, &params.directory)?;
             require_commands_opt_in(&candidate, params.accept_commands)?;
@@ -572,7 +572,7 @@ impl PackageService {
     pub async fn package_set_enabled(
         &self,
         params: PackageSetEnabledParams,
-    ) -> Result<PackageChangeResult, PackageErrorKind> {
+    ) -> Result<PackageChangeResult, PackageError> {
         self.package_transaction(move |context, retained| {
             if params.enabled {
                 prove_loadable(context, &params.digest)?;
@@ -606,7 +606,7 @@ impl PackageService {
     pub async fn package_select(
         &self,
         params: PackageSelectParams,
-    ) -> Result<PackageChangeResult, PackageErrorKind> {
+    ) -> Result<PackageChangeResult, PackageError> {
         self.package_transaction(move |context, retained| {
             let integration = prove_loadable(context, &params.digest)?
                 .as_ref()
@@ -751,6 +751,20 @@ where
         .map_err(|error| {
             warn!(%error, "a package task failed");
             PackageErrorKind::RegistryFailed
+        })?
+}
+
+/// [`blocking`] for work that already carries a conflict holder.
+async fn blocking_error<T, F>(operation: F) -> Result<T, PackageError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, PackageError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            warn!(%error, "a package task failed");
+            PackageError::kind(PackageErrorKind::RegistryFailed)
         })?
 }
 
@@ -927,6 +941,65 @@ fn inspect_one(
     inspect_record(context, state, record, retained, report, revoked.as_ref())
 }
 
+/// A package lifecycle failure: the stable wire kind plus, for a runtime-id
+/// conflict, the id of the package that holds the runtime id.
+///
+/// [`PackageErrorKind`] stays code-only so every existing mapping and table
+/// keeps matching on it; the holder rides beside it from `check_claim` to the
+/// wire error. A holder is present only on
+/// [`PackageErrorKind::RuntimeConflict`, and absent (a built-in runtime serves
+/// the id) is represented the same way a missing holder is: `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageError {
+    kind: PackageErrorKind,
+    holder: Option<PackageId>,
+}
+
+impl PackageError {
+    /// The failure of `kind` with no holder.
+    fn kind(kind: PackageErrorKind) -> Self {
+        Self { kind, holder: None }
+    }
+
+    /// The stable wire kind; the holder is dropped: only the wire error
+    /// carries it.
+    #[must_use]
+    pub(crate) fn kind_ref(&self) -> PackageErrorKind {
+        self.kind
+    }
+
+    /// The wire error: the kind's code, message and hint, plus the holder on
+    /// a runtime-id conflict.
+    #[must_use]
+    pub fn into_protocol(self) -> ProtocolError {
+        if self.kind == PackageErrorKind::RuntimeConflict {
+            ProtocolError::package_runtime_conflict(self.holder.as_ref())
+        } else {
+            ProtocolError::from(self.kind)
+        }
+    }
+}
+
+/// Equality by stable wire kind: the holder rides only on the wire error,
+/// so two package errors name the same failure when their kinds match.
+impl PartialEq<PackageErrorKind> for PackageError {
+    fn eq(&self, other: &PackageErrorKind) -> bool {
+        self.kind == *other
+    }
+}
+
+impl PartialEq<PackageError> for PackageErrorKind {
+    fn eq(&self, other: &PackageError) -> bool {
+        *self == other.kind
+    }
+}
+
+impl From<PackageErrorKind> for PackageError {
+    fn from(kind: PackageErrorKind) -> Self {
+        Self::kind(kind)
+    }
+}
+
 /// Applies the runtime-id claim rules to `definition` against the runtimes
 /// served right now.
 fn check_claim(
@@ -934,22 +1007,25 @@ fn check_claim(
     definition: &RuntimeDefinition,
     package: &PackageId,
     authority: Authority,
-) -> Result<(), PackageErrorKind> {
+) -> Result<(), PackageError> {
     let runtime_id = definition.runtime_id();
     let served_by = runtimes.served_by(runtime_id);
     decide_claim(runtime_id, package, authority, served_by.as_ref()).map_err(
         |refusal| match refusal {
-            ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
-            ClaimRefusal::Conflict => {
-                // The wire error carries a code only; the log names the holder the
-                // operator has to remove.
+            ClaimRefusal::NotClaimable => PackageError::kind(PackageErrorKind::RuntimeNotClaimable),
+            ClaimRefusal::Conflict { holder } => {
+                // The wire error carries the holder in `details`; the log
+                // names what the operator has to remove.
                 warn!(
                     runtime_id = %runtime_id,
                     package = %package,
                     served_by = ?served_by,
                     "package_runtime_conflict: remove the package that serves the runtime id"
                 );
-                PackageErrorKind::RuntimeConflict
+                PackageError {
+                    kind: PackageErrorKind::RuntimeConflict,
+                    holder,
+                }
             }
         },
     )
@@ -964,7 +1040,7 @@ fn check_claim(
 fn prove_loadable(
     context: &Context,
     digest: &PackageDigest,
-) -> Result<Option<RuntimeDefinition>, PackageErrorKind> {
+) -> Result<Option<RuntimeDefinition>, PackageError> {
     let state = read_state(context)?;
     let record = state
         .package(digest)
@@ -999,11 +1075,11 @@ fn ensure_selectable(
     retained: &RetainedPins,
     digest: &PackageDigest,
     integration: &Integration,
-) -> Result<(), PackageErrorKind> {
-    let state = read_state(context)?;
+) -> Result<(), PackageError> {
+    let state = read_state(context).map_err(PackageError::from)?;
     let record = state
         .package(digest)
-        .ok_or(PackageErrorKind::NotInstalled)?;
+        .ok_or_else(|| PackageError::from(PackageErrorKind::NotInstalled))?;
     let id = &record.identity().id;
     if state.selected(id) == Some(digest) {
         return Ok(());
@@ -1016,7 +1092,9 @@ fn ensure_selectable(
                 retained = %blocking,
                 "a package is not selected: its integration is not compatible with a retained version"
             );
-            Err(PackageErrorKind::IntegrationIncompatible)
+            Err(PackageError::from(
+                PackageErrorKind::IntegrationIncompatible,
+            ))
         }
     }
 }
@@ -1026,15 +1104,15 @@ fn reload_and_describe(
     context: &Context,
     digest: &PackageDigest,
     retained: &RetainedPins,
-) -> Result<PackageChangeResult, PackageErrorKind> {
+) -> Result<PackageChangeResult, PackageError> {
     let report = context.runtimes.reload().map_err(|error| {
         warn!(%error, "the runtime registry was not rebuilt after a package change");
-        PackageErrorKind::ReloadFailed
+        PackageError::from(PackageErrorKind::ReloadFailed)
     })?;
-    let state = read_state(context)?;
+    let state = read_state(context).map_err(PackageError::from)?;
     let record = state
         .package(digest)
-        .ok_or(PackageErrorKind::NotInstalled)?;
+        .ok_or_else(|| PackageError::from(PackageErrorKind::NotInstalled))?;
     let info = inspect_one(context, &state, record, retained, &report).info;
     Ok(PackageChangeResult {
         package: info,
@@ -1426,7 +1504,7 @@ fn commit_candidate(
     candidate: Candidate,
     plan: InstallPlan,
     retained: &RetainedPins,
-) -> Result<PackageInstallResult, PackageErrorKind> {
+) -> Result<PackageInstallResult, PackageError> {
     match candidate {
         Candidate::Runtime(prepared) => commit_install(context, *prepared, plan, retained),
         Candidate::Commands(prepared) => install_package(
@@ -1457,7 +1535,7 @@ fn commit_install(
     prepared: Prepared,
     plan: InstallPlan,
     retained: &RetainedPins,
-) -> Result<PackageInstallResult, PackageErrorKind> {
+) -> Result<PackageInstallResult, PackageError> {
     check_claim(
         &context.runtimes,
         &prepared.definition,
@@ -1517,7 +1595,7 @@ fn install_package(
     install: Install,
     plan: InstallPlan,
     retained: &RetainedPins,
-) -> Result<PackageInstallResult, PackageErrorKind> {
+) -> Result<PackageInstallResult, PackageError> {
     let Install {
         bytes,
         digest,
@@ -1531,13 +1609,13 @@ fn install_package(
         runtime,
         commands,
     } = install;
-    let now = unix_now()?;
+    let now = unix_now().map_err(PackageError::from)?;
     // A package whose integration is incompatible with a retained version is
     // installed without being selected, so the install itself never fails on
     // it and the selected version keeps serving.
     let held_back = conflict(
         context,
-        &read_state(context)?,
+        &read_state(context).map_err(PackageError::from)?,
         retained.gate(),
         (&digest, &identity.id),
         &integration,
@@ -1586,7 +1664,7 @@ fn install_package(
     if let Some(catalog) = catalog.as_ref() {
         registry
             .record_catalog(catalog)
-            .map_err(|error| registry_kind(&error))?;
+            .map_err(|error| PackageError::from(registry_kind(&error)))?;
     }
     // The index marks and revocations are persisted for the same reason and
     // before the install too: they only tighten, so a crash after this write
@@ -1595,7 +1673,7 @@ fn install_package(
     if let Some(index) = index.as_ref() {
         registry
             .record_index(index)
-            .map_err(|error| index_state_kind(&error))?;
+            .map_err(|error| PackageError::from(index_state_kind(&error)))?;
         // The stored copy follows the marks in the same install. A failed
         // write leaves the marks raised and the copy absent or older, which
         // the next refresh and doctor report; it never fails the install.
@@ -1625,11 +1703,11 @@ fn install_package(
         InstallStatus::Installed => PackageInstallStatus::Installed,
         InstallStatus::AlreadyInstalled => PackageInstallStatus::AlreadyInstalled,
         InstallStatus::RootRestored => PackageInstallStatus::RootRestored,
-        _ => return Err(PackageErrorKind::RegistryFailed),
+        _ => return Err(PackageError::from(PackageErrorKind::RegistryFailed)),
     };
     let reloaded = context.runtimes.reload().map_err(|error| {
         warn!(%error, "the runtime registry was not rebuilt after an install");
-        PackageErrorKind::ReloadFailed
+        PackageError::from(PackageErrorKind::ReloadFailed)
     })?;
     if status == PackageInstallStatus::Installed {
         refuse_loader_rejection(context, &digest, &reloaded)?;
@@ -1637,7 +1715,7 @@ fn install_package(
     let state = read_state(context)?;
     let record = state
         .package(&digest)
-        .ok_or(PackageErrorKind::NotInstalled)?;
+        .ok_or_else(|| PackageError::from(PackageErrorKind::NotInstalled))?;
     let inspected = inspect_one(context, &state, record, retained, &reloaded);
     Ok(PackageInstallResult {
         status,
@@ -1749,7 +1827,7 @@ impl PackageService {
                     package::registry::Registry::state_of_documents(&stored_verified)
                         .map_err(|error| registry_kind(&error))?
                 }
-                Err(error) => return Err(index_state_kind(&error)),
+                Err(error) => return Err(PackageError::from(index_state_kind(&error))),
             };
             let max = u64::try_from(MAX_INDEX_BYTES).unwrap_or(u64::MAX);
             let bytes = read_regular_file(&params.index_path, max)
@@ -1770,7 +1848,7 @@ impl PackageService {
                     .revocation_high_water
                     .is_some_and(|mark| verified.revocation_sequence() < mark)
             {
-                return Err(PackageErrorKind::IndexRollback);
+                return Err(PackageError::from(PackageErrorKind::IndexRollback));
             }
             let schema_version = package::parse_index_envelope(&bytes)
                 .map_or(package::INDEX_SCHEMA_VERSION, |envelope| {
@@ -1787,14 +1865,16 @@ impl PackageService {
             registry
                 .store_index(schema_version, &verified, &bytes, stored_at)
                 .map_err(|error| registry_kind(&error))?;
-            Ok(PluginIndexApplyResult {
+            Ok::<PluginIndexApplyResult, PackageErrorKind>(PluginIndexApplyResult {
                 sequence: verified.sequence(),
                 schema_version,
                 expires_at: verified.expires_at(),
                 entries: verified.entries().len() as u64,
                 stored_at,
             })
+            .map_err(PackageError::from)
         })
         .await
+        .map_err(|error| error.kind_ref())
     }
 }

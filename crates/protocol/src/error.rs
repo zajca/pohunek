@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent_options::AgentOptionUnavailable,
-    runtime_id::RuntimeId,
+    runtime_id::{PackageId, RuntimeId},
     session::SessionId,
     version::{ProtocolVersion, ProtocolVersionRange},
 };
@@ -138,7 +138,10 @@ pub struct ProtocolError {
     /// `session_request_conflict` carry the session id, and only a client that
     /// sent a `client_request_id` can receive them. `fetch_ref_commit_mismatch`
     /// carries `expected_commit`, `fetched_commit` and `source_ref`, and only a
-    /// client that sent `fetch_ref` can receive it. No older client sees the
+    /// client that sent `fetch_ref` can receive it. `package_runtime_conflict`
+    /// carries `holder`, the id of the package that serves the runtime id (absent
+    /// when a built-in runtime serves it), and only a client that installs,
+    /// links, enables, selects or binds a package can receive it. No older client sees the
     /// key. It is boxed so the error type stays small in every `Result` that
     /// carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +179,12 @@ pub struct ErrorDetails {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub source_ref: Option<String>,
+    /// The package that serves the runtime id on `package_runtime_conflict`.
+    /// Absent when a built-in runtime serves the id; a package id only, never
+    /// archive or catalog content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub holder: Option<PackageId>,
 }
 
 /// How a process ended abnormally: exactly one of the fields is set.
@@ -1653,6 +1662,29 @@ impl ProtocolError {
         )
         .with_details(ErrorDetails {
             session_id: Some(session_id.clone()),
+            ..ErrorDetails::default()
+        })
+    }
+
+    /// The canonical `runtime/package_runtime_conflict` error.
+    ///
+    /// Raised when an install, link, enable, select or bind would serve a
+    /// runtime id another package already serves, or a built-in runtime
+    /// serves. The message and recovery hint match
+    /// [`PackageErrorKind::RuntimeConflict`](crate::PackageErrorKind); the
+    /// holder package id travels in [`ErrorDetails::holder`] and is absent
+    /// when a built-in runtime serves the id. Code is stable:
+    /// `package_runtime_conflict`.
+    #[must_use]
+    pub fn package_runtime_conflict(holder: Option<&PackageId>) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "package_runtime_conflict",
+            "another package or a built-in runtime serves the runtime id",
+            Some("disable or uninstall the package that serves the runtime id".to_owned()),
+        )
+        .with_details(ErrorDetails {
+            holder: holder.cloned(),
             ..ErrorDetails::default()
         })
     }

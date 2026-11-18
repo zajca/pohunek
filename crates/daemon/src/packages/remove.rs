@@ -65,16 +65,16 @@ fn remove_profile(
     let dir = match profiles.open_for_bind() {
         Ok(dir) => dir,
         Err(BindError::NotFound) => return Err(no_profile_file(profiles, name)),
-        Err(error) => return Err(bind_kind(name, error)),
+        Err(error) => return Err(bind_kind(name, error).kind_ref()),
     };
     let file = match dir.read(name) {
         Ok(file) => file,
         Err(BindError::NotFound) => return Err(no_profile_file(profiles, name)),
-        Err(error) => return Err(bind_kind(name, error)),
+        Err(error) => return Err(bind_kind(name, error).kind_ref()),
     };
     if !dir
         .is_stored_name(name)
-        .map_err(|error| bind_kind(name, error))?
+        .map_err(|error| bind_kind(name, error).kind_ref())?
     {
         warn!(%name, "the name opens a profile stored under another spelling, so nothing is removed");
         return Err(PackageErrorKind::ProfileNotFound);
@@ -106,7 +106,7 @@ fn remove_profile(
             warn!(%name, "the agent profile changed before its removal and was left as found");
             PackageErrorKind::ProfileDigestMismatch
         }
-        other => bind_kind(name, other),
+        other => bind_kind(name, other).kind_ref(),
     })?;
     Ok(PackageRemoveProfileResult {
         profile: name.to_owned(),
