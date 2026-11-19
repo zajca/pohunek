@@ -2227,7 +2227,12 @@ async fn wait_for_attach_reconnect(
             Ok(AttachReconnectDecision::Retry) => {}
             Err(err) => match reconnect_decision_from_error(&err) {
                 AttachReconnectDecision::Retry => {}
-                AttachReconnectDecision::Finish => return Ok(false),
+                AttachReconnectDecision::Finish => {
+                    if is_session_ended_refusal(&err) {
+                        print_session_removed_ended(target);
+                    }
+                    return Ok(false);
+                }
                 AttachReconnectDecision::Reattach => return Ok(true),
                 AttachReconnectDecision::Fail => return Err(err),
             },
@@ -2319,10 +2324,7 @@ async fn confirm_session_ended(
         }
         Err(error) => {
             if is_session_ended_refusal(&error) {
-                eprintln!(
-                    "[pohunek] session {} removed; attach ended",
-                    target.session_id,
-                );
+                print_session_removed_ended(target);
                 Ok(true)
             } else if matches!(
                 reconnect_decision_from_error(&error),
@@ -2340,16 +2342,28 @@ async fn confirm_session_ended(
     }
 }
 
+/// One line for every attach path that ends because the session is gone:
+/// the R3 confirm and the R2 reconnect probe share it.
+fn print_session_removed_ended(target: &Target) {
+    eprintln!(
+        "[pohunek] session {} removed; attach ended",
+        target.session_id,
+    );
+}
+
 fn reconnect_decision_from_error(err: &CliError) -> AttachReconnectDecision {
     match err {
         CliError::DaemonUnreachable { .. } => AttachReconnectDecision::Retry,
-        CliError::Protocol(source)
-            if matches!(
-                source.code.as_str(),
-                "session_not_found" | "session_not_running"
-            ) =>
-        {
+        CliError::Protocol(source) if source.code.as_str() == "session_not_running" => {
             AttachReconnectDecision::Retry
+        }
+        CliError::Protocol(source) if source.code.as_str() == "session_not_found" => {
+            // The daemon binds its control socket only after it has loaded
+            // and reconciled its durable sessions, so a restarted daemon
+            // cannot answer `session_not_found` for a session that still
+            // exists. The session is gone for good: end the attach at once
+            // instead of retrying until the window expires.
+            AttachReconnectDecision::Finish
         }
         CliError::Client(source)
             if matches!(
@@ -4017,15 +4031,20 @@ mod tests {
             AttachReconnectDecision::Finish
         );
 
+        // A `session_not_found` from the reconnect probe is permanent: the
+        // daemon binds its socket only after loading and reconciling its
+        // durable sessions, so a restarted daemon cannot miss a session
+        // that still exists. The attach ends at once instead of retrying
+        // until the window expires.
         let missing = protocol::ProtocolError::new(
             protocol::ErrorClass::Runtime,
             "session_not_found",
-            "session vanished during restart",
+            "session removed while the attach waited to reconnect",
             None,
         );
         assert_eq!(
             reconnect_decision_from_error(&CliError::Protocol(missing)),
-            AttachReconnectDecision::Retry
+            AttachReconnectDecision::Finish
         );
     }
 
