@@ -83,7 +83,7 @@ It calls the reusable
 | `core-tag` (required) | The core release tag the `release` row builds the kit from; it equals the tag in the caller's `uses:`. The workflow checks out that tag only, never a branch or a commit sha. |
 | `rows` (default `["release", "nightly"]`) | JSON list of rows to run: `release` (the kit from `core-tag`, smoked against that tag's attested daemon archive), `previous-minor` (the kit from the newest release of the previous minor, usable from core 0.45) and `nightly` (the kit from `main`). |
 | `platforms` (default `["x86_64-unknown-linux-gnu"]`) | JSON list of Rust target triples to smoke against: exactly `x86_64-unknown-linux-gnu` (Linux, runs on `ubuntu-24.04`) or `aarch64-apple-darwin` (macOS, runs on the pinned `macos-15` label). Any other value fails the job. The `release` row fetches the attested daemon archive per target; other rows build the daemon binaries from their own ref. |
-| `package-dir` (default `package`) | The package directory, a path below the repository root. |
+| `package-dir` (default `package`) | The package directory, a path below the repository root. A package submitted to the official index (`pohunekd/pohunek-plugin-index`) must live in `package/`: index admission rebuilds the archive from the `package` directory and refuses any other layout. Other repositories may set `package-dir` freely. |
 | `corpus-dir` (default empty) | The detection corpus directory, a path below the repository root holding `cases.toml`; empty skips `detect-check`. |
 | `upstream-install` (default empty) | A script, a path below the repository root, that installs the locked upstream into `$UPSTREAM_BIN` (an absolute directory the workflow creates and exports); the script must leave the directory existing and non-empty; empty skips the upstream install the smoke puts on `PATH`. |
 | `smoke-script` (default empty) | An executable, a path below the repository root, run once by the generic smoke after every generic check passed, inside the same live isolated root: bare `pohunek` reaches the isolated daemon through the isolated `XDG_RUNTIME_DIR` (the isolated prefix is first on the script's `PATH`), the live session id is under `POHUNEK_SMOKE_SESSION` (`POHUNEK_SOCKET_PATH` is exported only as information for hook-style clients), the isolated environment, the repository root as cwd (the smoke step runs with the plugin repository as its working directory); a non-zero exit fails the smoke; empty skips it. |
@@ -116,7 +116,7 @@ workflow, which calls the reusable
 | Input | Meaning |
 |---|---|
 | `core-tag` (required) | The core release tag whose `xtask` builds the archive; it equals the tag in the caller's `uses:`. The workflow checks out that tag only, never a branch or a commit sha. |
-| `package-dir` (default `package`) | The package directory, a path below the repository root. |
+| `package-dir` (default `package`) | The package directory, a path below the repository root. A package submitted to the official index (`pohunekd/pohunek-plugin-index`) must live in `package/`: index admission rebuilds the archive from the `package` directory and refuses any other layout. Other repositories may set `package-dir` freely. |
 
 The workflow builds the archive with `cargo xtask plugin build` of that core
 tag in a job with read-only permissions, and requires the pushed tag to equal
@@ -148,14 +148,14 @@ The same two commands run locally:
   for the explicit `--agent prove-assistant` name, which skips auto selection
   (the host reports no such agent), so the readback touches the installed
   package; --print-prompt starts no session). The digest step refuses a
-  descriptor that carries a `[runtime]` table or no `[context]` table
-  (a `prove --no-enable` install stages a disabled install the inspect
+  descriptor that carries a `[runtime]` table or no `[context]` table.
+  A `prove --no-enable` install stages a disabled install the inspect
   predicate must refuse for being disabled, and a `prove --pre-install`
   archive must name the entry's package id: any other installed version of
   the same id leaves the proved version unselected, so the install check
   refuses it on the default path and the inspect digest check refuses the
   other, selected version under `--no-enable` (the inspect `selected`
-  check is defense in depth)). The evidence of a
+  check is defense in depth). The evidence of a
   context proof carries
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
