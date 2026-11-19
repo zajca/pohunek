@@ -190,6 +190,7 @@ async fn prepare() -> PreparedLaunch {
             no_snapshot: false,
             auto_started_daemon: false,
             request_id: None,
+            workdir: None,
         },
         ConnectionOptions {
             origin_source: OriginSource::Omitted,

@@ -10,7 +10,7 @@
 
 use super::*;
 
-use protocol::{BranchSource, OnDiverged, SessionNewResult, WorktreeSource};
+use protocol::{BranchSource, OnDiverged, WorktreeSource};
 
 /// The branch every scenario starts a session on.
 const BRANCH: &str = "feat";

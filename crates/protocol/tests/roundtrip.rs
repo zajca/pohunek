@@ -153,6 +153,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         exit_code,
         agent_options: std::collections::BTreeMap::new(),
         skip_repo_hooks: false,
+        initial_input: None,
     }
 }
 

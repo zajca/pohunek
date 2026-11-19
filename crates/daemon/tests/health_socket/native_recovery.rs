@@ -331,32 +331,38 @@ impl ClaudeRig {
 
     /// Stops the daemon and starts a new one over the same store, profiles and
     /// socket path, as a daemon restart does.
+    ///
+    /// Boxed: the rig holds the session registry, whose future grew past
+    /// the `large_futures` limit with the deferred initial prompt state.
     async fn restarted(self) -> Self {
-        let Self {
-            socket,
-            control,
-            shutdown,
-            server,
-            ..
-        } = self;
-        drop(control);
-        let _ = shutdown.send(());
-        server.await.expect("control server stops");
-        let (shutdown, server, worker_home) = respawn_server_serving_official_runtimes(
-            &socket,
-            "0.0.0",
-            self.registry_config.clone(),
-        )
-        .await;
-        let control = connect(&socket).await;
-        Self {
-            socket,
-            control,
-            shutdown,
-            server,
-            worker_state_root: worker_home.join("state/pohunek/workers"),
-            ..self
-        }
+        Box::pin(async move {
+            let Self {
+                socket,
+                control,
+                shutdown,
+                server,
+                ..
+            } = self;
+            drop(control);
+            let _ = shutdown.send(());
+            server.await.expect("control server stops");
+            let (shutdown, server, worker_home) = respawn_server_serving_official_runtimes(
+                &socket,
+                "0.0.0",
+                self.registry_config.clone(),
+            )
+            .await;
+            let control = connect(&socket).await;
+            Self {
+                socket,
+                control,
+                shutdown,
+                server,
+                worker_state_root: worker_home.join("state/pohunek/workers"),
+                ..self
+            }
+        })
+        .await
     }
 
     /// Stops the daemon and leaves the sessions as they are.
@@ -386,24 +392,29 @@ impl ClaudeRig {
     }
 }
 
+/// Boxed: the rig holds the session registry, whose future grew past the
+/// `large_futures` limit with the deferred initial prompt state.
 async fn assert_conversation_switch(source: &str, selected: &str) {
-    let mut rig = ClaudeRig::new(&format!("claude-{source}-recovery")).await;
-    rig.transcript(LAUNCH);
-    rig.transcript(selected);
-    rig.report("startup", LAUNCH).await;
-    rig.report(source, selected).await;
-    let id = rig.session.id.clone();
-    rig.stop(&id).await;
-    let resumed = rig.resume().await;
-    let argv = read_file_until(&rig.argv_log, b"--resume").await;
-    rig.finish(None).await;
+    Box::pin(async move {
+        let mut rig = ClaudeRig::new(&format!("claude-{source}-recovery")).await;
+        rig.transcript(LAUNCH);
+        rig.transcript(selected);
+        rig.report("startup", LAUNCH).await;
+        rig.report(source, selected).await;
+        let id = rig.session.id.clone();
+        rig.stop(&id).await;
+        let resumed = rig.resume().await;
+        let argv = read_file_until(&rig.argv_log, b"--resume").await;
+        rig.finish(None).await;
 
-    assert!(resumed.is_ok(), "verified Claude conversation is resumable");
-    assert!(
-        String::from_utf8_lossy(&argv).contains(&format!("--resume {selected}")),
-        "recovery must launch the selected Claude conversation; argv log: {}",
-        String::from_utf8_lossy(&argv)
-    );
+        assert!(resumed.is_ok(), "verified Claude conversation is resumable");
+        assert!(
+            String::from_utf8_lossy(&argv).contains(&format!("--resume {selected}")),
+            "recovery must launch the selected Claude conversation; argv log: {}",
+            String::from_utf8_lossy(&argv)
+        );
+    })
+    .await;
 }
 
 /// A session created by reference outside every repository keeps holding the

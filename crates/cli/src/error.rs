@@ -173,6 +173,18 @@ pub(crate) enum CliError {
         cwd: PathBuf,
     },
 
+    /// The local assistant working directory (`<data_dir>/assistant`) exists
+    /// but cannot be used: it is not a directory owned by the invoking user,
+    /// it is group- or other-writable, or it is a symlink. The launcher never
+    /// chmods or replaces a path it did not create.
+    #[error("assistant working directory '{}' is unusable: {reason}", path.display())]
+    AssistantWorkdirUnusable {
+        /// The offending path.
+        path: PathBuf,
+        /// Payload-free explanation of what is wrong with the path.
+        reason: String,
+    },
+
     /// The host's daemon predates `session new --input-ack-timeout-ms` and
     /// would drop it, so the outcome of the acknowledgement could not be known.
     #[error(
@@ -552,6 +564,17 @@ impl CliError {
                 "remote_cwd_not_absolute",
                 self.to_string(),
                 Some("pass an absolute --cwd path that exists on that host".to_owned()),
+            ),
+            CliError::AssistantWorkdirUnusable { .. } => ProtocolError::new(
+                ErrorClass::Configuration,
+                "assistant_workdir_unusable",
+                self.to_string(),
+                Some(
+                    "remove the path yourself, or point XDG_DATA_HOME at an \
+                     owner-controlled directory; the launcher never removes or \
+                     repairs a path it did not create"
+                        .to_owned(),
+                ),
             ),
             CliError::SessionNewInputAckUnsupported { .. } => ProtocolError::new(
                 ErrorClass::Configuration,

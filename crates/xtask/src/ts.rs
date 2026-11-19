@@ -747,6 +747,7 @@ fn session_minimal() -> SessionInfo {
         exit_code: None,
         agent_options: std::collections::BTreeMap::new(),
         skip_repo_hooks: false,
+        initial_input: None,
     }
 }
 
@@ -869,6 +870,7 @@ fn session_full() -> SessionInfo {
         exit_code: Some(SUCCESS_EXIT_CODE),
         agent_options: std::collections::BTreeMap::new(),
         skip_repo_hooks: true,
+        initial_input: None,
     }
 }
 

@@ -293,6 +293,7 @@ fn session_info() -> SessionInfo {
         activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
+        initial_input: None,
         name: None,
         id: SessionId(SESSION.to_owned()),
         external: Some(false),

@@ -891,6 +891,7 @@ impl SessionRegistry {
         let preparing_info = SessionInfo {
             blocked_kind: None,
             attention_isolated_by: None,
+            initial_input: None,
             activity_epoch: None,
             activity_revision: None,
             id: id.clone(),
@@ -1097,6 +1098,7 @@ impl SessionRegistry {
         let mut info = SessionInfo {
             blocked_kind: None,
             attention_isolated_by: None,
+            initial_input: None,
             activity_epoch: None,
             activity_revision: None,
             id: id.clone(),
@@ -1197,6 +1199,7 @@ impl SessionRegistry {
             reference_launch,
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
+            deferred_initial_input: None,
             create_request,
             root_process: Some(started.root_process),
             worker_root: Some(started.worker_root),
@@ -1288,7 +1291,8 @@ impl SessionRegistry {
         entry: SessionEntry,
     ) -> Result<BTreeMap<String, String>, ProtocolError> {
         let committed = Self::session_record(id, &entry, DesiredState::Running, None);
-        self.write_record_and_install(id, committed, entry).await
+        // Boxed so the entry does not widen the futures of the callers.
+        Box::pin(self.write_record_and_install(id, committed, entry)).await
     }
 
     async fn stop_uncommitted_runtime(&self, id: &SessionId, runtime: &RuntimeHandle) {

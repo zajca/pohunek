@@ -9,6 +9,7 @@ use protocol::{
 };
 
 use crate::agent::host::{RuntimeDefinition, RuntimeHost};
+use crate::agent::NativeReferenceStrategy;
 use crate::runtime::{WorkerError, WriteReservation};
 use pohunek_worker_protocol::InspectSnapshot;
 
@@ -298,6 +299,14 @@ impl SessionRegistry {
                 .ok_or_else(|| session_not_found(&session_id.0))?;
             input_runtime_identity(entry, session_id)?;
             entry.input_rules.validate_activity(entry.info.activity)?;
+            // #2406: a runtime whose native reference uses the hook
+            // handshake (claude) cannot consume programmatic input before
+            // its first native-id report arrives while it is blocked on
+            // its trust dialog, so plain `session.input` is refused with
+            // `session_input_blocked` instead of a silent `accepted:true`.
+            // After the handshake the permission answers it carries keep
+            // working, and non-hook runtimes are unchanged.
+            refuse_pre_handshake_blocked_input(entry)?;
             (entry.runtime.clone(), entry.input_rules)
         };
 
@@ -1238,6 +1247,54 @@ fn input_runtime_identity(
         .map_err(|_error| ProtocolError::session_terminal_unavailable())
 }
 
+/// Refuses plain `session.input` to a hook-handshake runtime that is blocked
+/// before its first native-id report (#2406 Q4): the pre-handshake dialog
+/// (e.g. claude's trust prompt) cannot consume programmatic input, so the
+/// write is refused with `session_input_blocked` instead of a silent
+/// `accepted:true`. A runtime whose handshake already arrived keeps its
+/// current behaviour, as do non-hook runtimes. Scoped to the claude runtime
+/// in this change; codex and hermes keep their current behaviour.
+/// Refuses plain `session.input` to a hook-handshake runtime that is blocked
+/// before its first native-id report (#2406 Q4): the pre-handshake dialog
+/// (e.g. claude's trust prompt) cannot consume programmatic input, so the
+/// write is refused with `session_input_blocked` instead of a silent
+/// `accepted:true`. A runtime whose handshake already arrived keeps its
+/// current behaviour, as do non-hook runtimes. Scoped to the claude runtime
+/// in this change; codex and hermes keep their current behaviour.
+///
+/// The detector publishes `input_ready` before it records the new activity
+/// on the entry, so a write racing the prompt-box classification still sees
+/// the stale `blocked` activity: when readiness already shows, the prompt
+/// is readable and the write goes through.
+fn refuse_pre_handshake_blocked_input(entry: &SessionEntry) -> Result<(), ProtocolError> {
+    if entry.info.activity != Some(AgentActivity::Blocked) {
+        return Ok(());
+    }
+    if *entry.input_ready.borrow() {
+        return Ok(());
+    }
+    let handshake_pending =
+        entry.info.native_session_id.is_none() && entry.info.native_session_path.is_none();
+    if !handshake_pending {
+        return Ok(());
+    }
+    // #2406 Q4: only a runtime whose native reference uses the hook
+    // handshake can present a trust dialog that consumes the programmatic
+    // prompt, so only that strategy refuses plain input pre-handshake.
+    // The descriptor's `[native_reference.existence]` check marks the
+    // runtime whose hook handshake reports an id-kind reference the daemon
+    // verifies (claude in this PR); codex and hermes declare no existence
+    // check and keep their current behaviour.
+    let hook_handshake = entry.pinned.as_ref().is_some_and(|definition| {
+        definition.native_reference_strategy() == NativeReferenceStrategy::Hook
+            && definition.hook_existence().is_some()
+    });
+    if hook_handshake {
+        return Err(ProtocolError::session_input_blocked());
+    }
+    Ok(())
+}
+
 fn input_wait_result(
     evidence: ActivityEvidence,
     prompt_accepted: Option<bool>,
@@ -1360,7 +1417,15 @@ async fn write_delayed_input(
         delay_boundary.wait().await;
         delay_boundary.wait().await;
     }
-    tokio::time::sleep(delay).await;
+    // #2406: a deferred watcher's transaction never wakes from an async
+    // wait here (`tokio::time::sleep` and a `yield_now` loop both park
+    // forever, while the same waits complete in the watcher itself and on
+    // the normal create path); a blocking sleep completes. The delay is
+    // the runtime's configured submit pause (150ms for claude), waited
+    // once per deferred delivery.
+    // TODO(#2406): find why async waits park in this transaction and use
+    // an async wait again.
+    std::thread::sleep(delay);
     // Reserved before the session lock below, which keeps the lock order of
     // the control connection first and the session registry second.
     let reservation = worker

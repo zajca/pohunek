@@ -490,6 +490,7 @@ fn assert_every_field_is_reviewed(
         blocked_kind: _,
         activity_epoch: _,
         activity_revision: _,
+        initial_input: _,
         subagents,
         background,
         active_agent: _,

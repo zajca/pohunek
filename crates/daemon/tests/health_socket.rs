@@ -13,6 +13,8 @@ mod agent_options;
 mod agent_presets;
 // The daemon's unit tests share this view; it keeps `session.remove`
 // independent of the test host's processes whose markers cannot be read.
+#[path = "health_socket/attach_detach_pump.rs"]
+mod attach_detach_pump;
 #[path = "health_socket/branch_source.rs"]
 mod branch_source;
 #[path = "health_socket/connection_shutdown.rs"]
@@ -69,11 +71,11 @@ use protocol::{
     ProjectInfo, ProjectShowResult, ProjectWorktree, ReportSequence, Request as ProtocolRequest,
     Response, RuntimeId, RuntimeRef, SessionAttachParams, SessionAttachResult, SessionDetachParams,
     SessionDetachResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
-    SessionRemoveTreeParams, SessionRemoveTreeResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionState, SessionStopResult,
-    SessionTreeKeepReason, SessionWarningKind, StateSource, TerminalDimensions,
+    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionRemoveResult, SessionRemoveTreeParams, SessionRemoveTreeResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, SessionTreeKeepReason, SessionWarningKind, StateSource, TerminalDimensions,
     WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
 };
 use serde_json::Value;
@@ -603,20 +605,33 @@ fn worker_backed_registry(
 /// [`worker_backed_registry`] whose agent children start from `environment`.
 fn worker_backed_registry_in(
     socket: &std::path::Path,
-    mut config: SessionRegistryConfig,
+    config: SessionRegistryConfig,
     environment: EnvironmentSource,
 ) -> (SessionRegistry, tempfile::TempDir) {
     // Short, because the worker nests its control socket below it.
     let worker_home_dir =
         pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
-    let worker_home = worker_home_dir.path().to_path_buf();
+    let registry = registry_in_worker_home(socket, config, environment, worker_home_dir.path());
+    (registry, worker_home_dir)
+}
+
+/// [`worker_backed_registry_in`] over a caller-owned worker home, which
+/// survives a server restart so the next daemon can discover the live
+/// worker (a `#2406` keep restart-drop test holds the guard while both
+/// servers run in turn).
+fn registry_in_worker_home(
+    socket: &std::path::Path,
+    mut config: SessionRegistryConfig,
+    environment: EnvironmentSource,
+    worker_home: &std::path::Path,
+) -> SessionRegistry {
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: worker_home.join("runtime"),
         state_home: worker_home.join("state"),
         data_home: worker_home.join("data"),
         config_home: worker_home.join("config"),
         cache_home: worker_home.join("cache"),
-        home: worker_home.clone(),
+        home: worker_home.to_path_buf(),
         daemon_socket: socket.to_path_buf(),
     };
     config.socket_path = Some(socket.to_path_buf());
@@ -629,13 +644,12 @@ fn worker_backed_registry_in(
     );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
     let inspector = Arc::new(readable_host::ReadableHost::new());
-    let registry = if config.plugins_dir.is_some() {
+    if config.plugins_dir.is_some() {
         SessionRegistry::new_production_with_inspector(config, launcher, inspector)
             .expect("package-backed registry opens the plugin root")
     } else {
         SessionRegistry::new_with_launcher_and_inspector(config, launcher, inspector)
-    };
-    (registry, worker_home_dir)
+    }
 }
 
 /// Spawn the control server with a custom shell command.
@@ -657,7 +671,16 @@ async fn spawn_server_with_config(
         .clone()
         .map(|dir| (dir, config.event_retention));
     let (registry, worker_home_dir) = worker_backed_registry(socket, config);
-    serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
+    let worker_home = worker_home_dir.path().to_path_buf();
+    serve_registry(
+        socket,
+        version,
+        event_log_dir,
+        registry,
+        worker_home,
+        Some(worker_home_dir),
+    )
+    .await
 }
 
 /// [`spawn_server_with_config`] over a plugin root next to `socket` that holds
@@ -731,6 +754,42 @@ async fn serve_official_runtimes(
     tokio::task::JoinHandle<()>,
     std::path::PathBuf,
 ) {
+    let worker_home_dir =
+        pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
+    let worker_home = worker_home_dir.path().to_path_buf();
+    let served = serve_official_runtimes_at(
+        socket,
+        version,
+        config,
+        environment,
+        install,
+        &worker_home,
+        Some(worker_home_dir),
+    )
+    .await;
+    (served.shutdown, served.handle, served.worker_home)
+}
+
+/// [`serve_official_runtimes`] over a caller-owned worker home. The caller
+/// holds the home across a restart so the next daemon discovers the live
+/// worker; the server task installs no guard for it.
+///
+/// The registry stays caller-owned (`ServedRegistry`): the server task only
+/// serves it, so a restart can shut the serving registry down (releasing
+/// the worker controller lease) before the next daemon reconciles.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test helper mirrors serve_official_runtimes plus the worker home"
+)]
+async fn serve_official_runtimes_at(
+    socket: &std::path::Path,
+    version: &str,
+    config: SessionRegistryConfig,
+    environment: EnvironmentSource,
+    install: bool,
+    worker_home: &std::path::Path,
+    worker_home_guard: Option<tempfile::TempDir>,
+) -> ServedRegistry {
     let dir = socket.parent().expect("test socket has an isolated parent");
     let catalog = official_runtimes::OfficialCatalog::new();
     let config = catalog.configure(config, dir.join("plugins"));
@@ -738,7 +797,7 @@ async fn serve_official_runtimes(
         .event_log_dir
         .clone()
         .map(|dir| (dir, config.event_retention));
-    let (registry, worker_home_dir) = worker_backed_registry_in(socket, config, environment);
+    let registry = registry_in_worker_home(socket, config, environment, worker_home);
     if install {
         catalog.install(&registry, dir).await;
     } else {
@@ -747,7 +806,33 @@ async fn serve_official_runtimes(
             .await
             .expect("startup reconciles the sessions of the earlier daemon");
     }
-    serve_registry(socket, version, event_log_dir, registry, worker_home_dir).await
+    let (shutdown, handle, worker_home) = serve_registry(
+        socket,
+        version,
+        event_log_dir,
+        registry.clone(),
+        worker_home.to_path_buf(),
+        worker_home_guard,
+    )
+    .await;
+    ServedRegistry {
+        registry,
+        shutdown,
+        handle,
+        worker_home,
+    }
+}
+
+/// A served [`SessionRegistry`] the test still owns: stopping the server
+/// ends the accept loop, while dropping the registry closes the worker
+/// connections (releasing the controller lease). Field moves are banned
+/// so restarts drop the whole value at once.
+struct ServedRegistry {
+    registry: SessionRegistry,
+    shutdown: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+    #[allow(dead_code, reason = "served worker home path for debugging")]
+    worker_home: std::path::PathBuf,
 }
 
 /// Serves `registry` on `socket` with a notification inbox, and the event log
@@ -757,13 +842,14 @@ async fn serve_registry(
     version: &str,
     event_log_dir: Option<(PathBuf, pohunek_service_config::EventRetention)>,
     registry: SessionRegistry,
-    worker_home_dir: tempfile::TempDir,
+    worker_home_path: std::path::PathBuf,
+    worker_home_guard: Option<tempfile::TempDir>,
 ) -> (
     oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
     std::path::PathBuf,
 ) {
-    let worker_home = worker_home_dir.path().to_path_buf();
+    let worker_home = worker_home_path;
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
     // The production daemon always runs the debounce coordinator next to the
@@ -803,7 +889,7 @@ async fn serve_registry(
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
         // Removed after the server and its registry are gone.
-        let _worker_home_dir = worker_home_dir;
+        let _worker_home_guard = worker_home_guard;
         server
             .serve(
                 pohunek_daemon::api::ConnectionTasks::new(
@@ -3664,7 +3750,10 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
 }
 
 #[tokio::test]
-async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input() {
+async fn claude_stub_session_publishes_screen_blocked_and_refuses_plain_input() {
+    // #2406 Q4: a claude session blocked on its pre-handshake dialog refuses
+    // plain `session.input` with `session_input_blocked` instead of a silent
+    // `accepted:true`; answering the dialog needs `pohunek attach`.
     if !pohunek_test_support::process_env::in_own_process() {
         return;
     }
@@ -3714,13 +3803,33 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     assert_eq!(streamed.payload()["activity"], Value::from("blocked"));
     assert_eq!(streamed.payload()["source"], Value::from("screen"));
 
-    let input = input_session(&mut control, &created.id, "hello Claude").await;
-    assert!(input.accepted);
-    let bytes = read_file_until(&input_log, b"hello Claude").await;
-    assert_eq!(bytes, b"hello Claude");
+    let request = Request::make(
+        "session-input-refused",
+        method::SESSION_INPUT,
+        serde_json::to_value(&SessionInputParams {
+            session_id: created.id.clone(),
+            text: "hello Claude".to_owned(),
+            wait: None,
+        })
+        .expect("input params"),
+    );
+    let error = err_payload(exchange(&mut control, &request).await);
+    assert_eq!(error.code, "session_input_blocked");
+    assert!(
+        error
+            .recover
+            .as_deref()
+            .is_some_and(|hint| hint.contains("session.attach")),
+        "the refusal names session.attach: {error:?}"
+    );
+    let captured = std::fs::read(&input_log).unwrap_or_default();
+    assert!(
+        captured.is_empty(),
+        "the refused input never reached the stub"
+    );
 
     let stop_req = Request::make(
-        "session-stop-claude-stub",
+        "session-stop-claude-stub-refused",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
     );
@@ -4086,6 +4195,492 @@ with open({received:?}, "wb") as capture:
     let _ = handle.await;
 }
 
+/// #2406 section 1 rows 3 and 4: the fake agent stands in for Claude's
+/// per-directory trust store. On the first launch from a dedicated cwd it
+/// draws the recorded folder-trust dialog, which the owner answers once; the
+/// stub writes the answer into the session cwd, so later launches from the
+/// same directory skip the dialog (rows 3+4: the answer persists per
+/// directory, a second user never re-answers). `cwd: None` blocks again
+/// (revert proof: the directory carries the answer, not the daemon).
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "#2406 section 1: two full launch cycles plus the cwd:None revert arm in one scenario."
+)]
+async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
+    let socket = temp_socket("claude-trust-cache");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-trust-cache.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudetrustcache", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir.clone()),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        ..support::hermetic_registry_config()
+    };
+    // The launcher dedication: a private cwd like `<data_dir>/assistant`.
+    let dedicated = socket.dir.join("assistant");
+    std::fs::create_dir(&dedicated).expect("create the dedicated workdir");
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+
+    // First launch from the dedicated cwd: the dialog blocks, the owner
+    // answers once (the manager's onboarding answer), the stub persists it
+    // into the session cwd, and the prompt delivers at once behind it.
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-claude-trust-cache",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
+    let mut params = session_params_in(dedicated.clone());
+    "claudetrustcache".clone_into(&mut params.agent);
+    params.input = Some("first launch".to_owned());
+    let first = tokio::spawn({
+        let socket = socket.path.clone();
+        async move {
+            let mut control = connect(&socket).await;
+            let response = create_session_with_params(&mut control, params).await;
+            (control, response)
+        }
+    });
+    let first_id =
+        wait_for_any_agent_state(&mut subscriber, AgentActivity::Blocked, StateSource::Screen)
+            .await;
+    assert!(!first.is_finished(), "the input waits behind the dialog");
+    std::fs::write(&gate, b"go").expect("answer the trust dialog");
+    wait_for_agent_state_event(
+        &mut subscriber,
+        &first_id,
+        AgentActivity::Idle,
+        StateSource::Screen,
+    )
+    .await;
+    let (mut control, response) = wait::guard("the first session to be created", first)
+        .await
+        .expect("join the first create call");
+    let created: SessionInfo =
+        serde_json::from_value(ok_payload(response)).expect("first session info");
+    assert_eq!(created.id, first_id);
+    read_file_until(&log, b"first launch").await;
+
+    let stop_req = Request::make(
+        "claude-trust-cache-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    // Second launch from the same cwd: the stub reads the persisted answer
+    // from the session cwd and skips the dialog, so the prompt renders at
+    // once on the normal path. A `cwd: None` launch would block instead (see
+    // the revert proof below: the directory carries the answer, not the
+    // daemon).
+    let mut params = session_params_in(dedicated.clone());
+    "claudetrustcache".clone_into(&mut params.agent);
+    params.input = Some("second launch".to_owned());
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("second session info");
+    read_file_until(&log, b"second launch").await;
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert_eq!(
+        steps.matches("dialog").count(),
+        1,
+        "the second launch from the same cwd sees no second dialog: {steps:?}"
+    );
+
+    let second_id = created.id.clone();
+    let stop_req = Request::make(
+        "claude-trust-cache-stop-2",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    drop(control);
+
+    // Revert proof: `cwd: None` blocks again because no directory carries
+    // the trust answer (the real defect behind the onboarding loop). The
+    // create call waits behind the dialog exactly like the first launch did.
+    let log_none = socket.dir.join("stub-none.log");
+    let gate_none = socket.dir.join("gate-none");
+    let script_none = socket.dir.join("claude-trust-none.py");
+    write_claude_trust_stub(&script_none, &log_none, &gate_none);
+    write_claude_profile(&agents_dir, "claudetrustnone", &script_none);
+    let mut params = session_params(&socket);
+    params.cwd = None;
+    "claudetrustnone".clone_into(&mut params.agent);
+    params.input = Some("third launch".to_owned());
+    let third = tokio::spawn({
+        let socket = socket.path.clone();
+        async move {
+            let mut control = connect(&socket).await;
+            create_session_with_params(&mut control, params).await
+        }
+    });
+    let third_id =
+        wait_for_any_agent_state(&mut subscriber, AgentActivity::Blocked, StateSource::Screen)
+            .await;
+    assert_ne!(third_id, second_id, "the third launch is its own session");
+    assert!(
+        !third.is_finished(),
+        "`cwd: None` waits behind the dialog again"
+    );
+    std::fs::write(&gate_none, b"go").expect("answer the third dialog");
+    wait_for_agent_state_event(
+        &mut subscriber,
+        &third_id,
+        AgentActivity::Idle,
+        StateSource::Screen,
+    )
+    .await;
+    let response = wait::guard("the third session to be created", third)
+        .await
+        .expect("join the third create call");
+    let created: SessionInfo =
+        serde_json::from_value(ok_payload(response)).expect("third session info");
+    assert_eq!(created.id, third_id);
+    read_file_until(&log_none, b"third launch").await;
+    let steps = String::from_utf8(std::fs::read(&log_none).expect("read the third stub log"))
+        .expect("the third stub log is text");
+    assert!(
+        steps.lines().next() == Some("dialog"),
+        "a launch with no directory answer draws the dialog: {steps:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// #2406 row 1: a `session.new --input` whose grace expires while the claude
+/// trust dialog holds the screen keeps the session instead of rolling it
+/// back. The call returns `Ok` with `prompt_delivered=false` and a pending
+/// `initial_input` marker; opening the gate renders the prompt box and the
+/// deferred prompt arrives exactly once.
+#[tokio::test]
+async fn claude_blocked_dialog_keeps_the_session_and_defers_the_prompt() {
+    let socket = temp_socket("claude-keep");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeep", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make("subscribe-claude-keep", method::SUBSCRIBE, Value::Null);
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
+
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeep".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    // The dialog classifies as blocked quickly; the grace (8s) then expires
+    // while it still holds the screen, so the call returns the kept session
+    // instead of `session_input_not_ready`.
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    assert_eq!(created.prompt_delivered, Some(false));
+    assert_eq!(
+        created
+            .session
+            .initial_input
+            .as_ref()
+            .map(|initial| initial.state),
+        Some(protocol::SessionInitialInputState::Pending),
+        "the kept session reports a pending initial_input: {created:?}"
+    );
+    // The dialog still holds the screen: nothing reached the stub yet.
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert!(
+        !steps.contains("input:"),
+        "nothing is sent while the dialog holds the screen: {steps:?}"
+    );
+
+    // Answering the dialog renders the prompt box; the deferred prompt
+    // follows exactly once through the normal `input_ready` trigger.
+    std::fs::write(&gate, b"go").expect("open the gate");
+    read_file_until(&log, b"hello Claude").await;
+    wait_for_agent_state_event(
+        &mut subscriber,
+        &created.session.id,
+        AgentActivity::Idle,
+        StateSource::Screen,
+    )
+    .await;
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert_eq!(
+        steps.matches("hello Claude").count(),
+        1,
+        "the deferred prompt is delivered exactly once: {steps:?}"
+    );
+
+    // The write lands before the watcher records the marker, so poll for
+    // the delivered state instead of asserting a single inspect.
+    let control = tokio::sync::Mutex::new(control);
+    wait_until("the deferred prompt to record delivered", || async {
+        let mut control = control.lock().await;
+        let shown = inspect_session(&mut control, &created.session.id).await;
+        (shown
+            .initial_input
+            .as_ref()
+            .is_some_and(|initial| initial.state == protocol::SessionInitialInputState::Delivered))
+        .then_some(())
+    })
+    .await;
+    let mut control = control.into_inner();
+
+    let stop_req = Request::make(
+        "claude-keep-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.session.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// #2406 row 3: stopping a kept session before readiness discards the
+/// deferred prompt and records `dropped(session_stopped)`; the prompt never
+/// reaches the agent.
+#[tokio::test]
+async fn claude_kept_session_stop_discards_the_deferred_prompt() {
+    let socket = temp_socket("claude-keep-stop");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-stop.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeepstop", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeepstop".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    assert_eq!(
+        created
+            .session
+            .initial_input
+            .as_ref()
+            .map(|initial| initial.state),
+        Some(protocol::SessionInitialInputState::Pending)
+    );
+
+    let stop_req = Request::make(
+        "claude-keep-stop-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.session.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown
+            .initial_input
+            .as_ref()
+            .map(|initial| (initial.state, initial.reason)),
+        Some((
+            protocol::SessionInitialInputState::Dropped,
+            Some(protocol::SessionInitialInputDrop::SessionStopped)
+        )),
+        "stop records the discard reason: {shown:?}"
+    );
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert!(
+        !steps.contains("hello Claude"),
+        "the discarded prompt never reaches the agent: {steps:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// #2406 row 5: a daemon restart while a kept create holds its prompt in
+/// memory drops the deferred text (it was never persisted) and records
+/// `dropped(daemon_restart)`; the session runs on without it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart scenario owns both daemons and their shutdown inline"
+)]
+#[tokio::test]
+async fn claude_kept_session_restart_drops_the_deferred_prompt() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("pohunek_daemon::session::reconcile=debug,pohunek_daemon::session=debug")
+        .try_init();
+    let socket = temp_socket("claude-keep-restart");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-restart.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeeprestart", &script);
+    let config = || SessionRegistryConfig {
+        agents_dir: Some(agents_dir.clone()),
+        store_path: Some(socket.dir.join("metadata.jsonl")),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        // timing-allowed: #2406 the restart must outlast the worker lease.
+        worker_connect_deadline: std::time::Duration::from_secs(30),
+        ..support::hermetic_registry_config()
+    };
+    // A caller-owned worker home: it survives the restart below so the new
+    // daemon discovers the live worker instead of losing the session.
+    let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-kr-")
+        .expect("create the restart worker home");
+    let worker_home = worker_home_guard.path().to_path_buf();
+    let first = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        true,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeeprestart".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    // The dialog classifies as blocked quickly; the grace (8s) then expires
+    // while it still holds the screen, so the call returns the kept session
+    // instead of `session_input_not_ready`.
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    assert_eq!(
+        created
+            .session
+            .initial_input
+            .as_ref()
+            .map(|initial| initial.state),
+        Some(protocol::SessionInitialInputState::Pending),
+        "the kept session reports a pending initial_input: {created:?}"
+    );
+    // The keep persists the deferred marker before `session.new` returns,
+    // but assert the durable line carries it: the restart must adopt the
+    // deferred marker, never a still-delivering one.
+    wait_until("the deferred marker to reach the durable store", || {
+        let path = socket.dir.join("metadata.jsonl");
+        let id = created.session.id.0.clone();
+        async move {
+            let text = std::fs::read_to_string(&path).expect("read the durable store");
+            text.lines()
+                .any(|line| line.contains(&id) && line.contains("initial_input_deferred"))
+                .then_some(())
+        }
+    })
+    .await;
+    // The registry stays caller-owned while the server task only serves
+    // it, so the restart below shuts the serving registry down (closing
+    // its worker connection and releasing the controller lease) before
+    // the new daemon reconciles: the production stop path.
+    drop(control);
+    let ServedRegistry {
+        registry: first_registry,
+        shutdown: first_shutdown,
+        handle: first_handle,
+        ..
+    } = first;
+    let _ = first_shutdown.send(());
+    let _ = first_handle.await;
+    // Only dropping the last serving handle closes the daemon side of the
+    // worker control connection; `registry.shutdown()` alone stops tasks
+    // but leaves connections open. The worker then still answers
+    // `ControllerBusy` until its 5s lease recheck notices the quiet peer;
+    // discovery already waits that window out (`connect_discovered_worker`
+    // retries `ControllerBusy` until `worker_connect_deadline`), so the
+    // restart below reconciles at once and adopts the live worker.
+    drop(first_registry);
+    let second = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        false,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown
+            .initial_input
+            .as_ref()
+            .map(|initial| (initial.state, initial.reason)),
+        Some((
+            protocol::SessionInitialInputState::Dropped,
+            Some(protocol::SessionInitialInputDrop::DaemonRestart)
+        )),
+        "restart records the discard reason: {shown:?}"
+    );
+    assert_eq!(
+        shown.state,
+        SessionState::Running,
+        "the session runs on without its deferred prompt: {shown:?}"
+    );
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert!(
+        !steps.contains("hello Claude"),
+        "the dropped prompt never reaches the agent: {steps:?}"
+    );
+
+    drop(control);
+    let ServedRegistry {
+        registry: second_registry,
+        shutdown: second_shutdown,
+        handle: second_handle,
+        ..
+    } = second;
+    let _ = second_shutdown.send(());
+    let _ = second_handle.await;
+    drop(second_registry);
+}
+
 /// Waits for an `agent_state` event with `activity` from `source` and returns
 /// the session it concerns.
 async fn wait_for_any_agent_state(
@@ -4120,6 +4715,19 @@ async fn wait_for_any_agent_state(
 /// Writes a Claude stub that draws the recorded folder-trust dialog, logs what
 /// it sees to `log` in order (`dialog`, `gate`, `box`, `input:<bytes>`), waits
 /// for the file `gate` to exist, then draws the prompt box.
+/// Distinct marker only the fake agent writes into the session cwd: the
+/// test-internal stand-in for Claude's `projects.<cwd>
+/// .hasTrustDialogAccepted` record (`docs/knowledge/guides/claude-package.md`).
+/// Real Claude writes its record to its config dir; the stub must not reuse the
+/// real key, so the marker name cannot collide with it.
+const TRUST_ANSWER_MARKER: &str = ".fake-trust-accepted";
+
+fn trust_stub_answer_probe() -> String {
+    format!(
+        "import os\nTRUST_ANSWER = os.path.join(os.getcwd(), {TRUST_ANSWER_MARKER:?})\n",
+    )
+}
+
 fn write_claude_trust_stub(script: &Path, log: &Path, gate: &Path) {
     let trust = std::fs::read_to_string(
         pohunek_test_support::workspace_root().join("compat/claude/screens/trust.txt"),
@@ -4146,14 +4754,21 @@ log = open({log:?}, "ab", buffering=0)
 def note(text):
     log.write(text + b"\n")
 
+{probe}
+if os.path.exists(TRUST_ANSWER):
+    note(b"cached")
+else:
+    os.write(1, b"\x1b[?2004h")
+    os.write(1, b"{trust}")
+    note(b"dialog")
+    while not os.path.exists({gate:?}):
+        ready, _, _ = select.select([0], [], [], 0.05)
+        if ready:
+            note(b"input:" + os.read(0, 4096))
+    note(b"gate")
+    with open(TRUST_ANSWER, "w") as accepted:
+        accepted.write("answered\n")
 os.write(1, b"\x1b[?2004h")
-os.write(1, b"{trust}")
-note(b"dialog")
-while not os.path.exists({gate:?}):
-    ready, _, _ = select.select([0], [], [], 0.05)
-    if ready:
-        note(b"input:" + os.read(0, 4096))
-note(b"gate")
 os.write(1, b"{prompt}")
 note(b"box")
 while True:
@@ -4164,6 +4779,7 @@ while True:
 "#,
             log = log.display().to_string(),
             gate = gate.display().to_string(),
+            probe = trust_stub_answer_probe(),
             trust = hex(&trust_screen),
             prompt = hex(CLAUDE_PROMPT_BOX_SCREEN),
         ),
@@ -4228,6 +4844,10 @@ async fn claude_initial_input_waits_behind_the_trust_dialog_until_the_prompt_box
     let created: SessionInfo =
         serde_json::from_value(ok_payload(response)).expect("claude session info");
     assert_eq!(created.id, id);
+    assert!(
+        created.initial_input.is_none(),
+        "a prompt delivered on the normal path leaves no deferred marker: {created:?}"
+    );
 
     read_file_until(&log, b"hello Claude").await;
     let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))

@@ -653,6 +653,7 @@ fn launch_params(requested: Option<&str>) -> LaunchParams {
         no_snapshot: true,
         auto_started_daemon: false,
         request_id: None,
+        workdir: None,
     }
 }
 

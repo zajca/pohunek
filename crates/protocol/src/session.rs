@@ -3143,6 +3143,83 @@ impl SessionCapabilityRefusals {
     }
 }
 
+/// Pending initial input of a kept `session.new` create.
+///
+/// Set only on `session.list` and `session.inspect` responses (and on the
+/// `SessionInfo` flattened into `SessionNewResult`) for a session whose
+/// initial-input wait timed out while the agent was `blocked`: the session
+/// is kept, the prompt text is held in daemon memory (never persisted at
+/// rest), and the same readiness signal the normal initial-input path uses
+/// delivers it exactly once. Absent for sessions created without initial
+/// input. Computed live; stored records and events never carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInitialInput.ts"))]
+pub struct SessionInitialInput {
+    /// Lifecycle of the deferred prompt.
+    pub state: SessionInitialInputState,
+    /// Why a non-delivered prompt will never arrive. Present only when
+    /// `state` is not `delivered`: the daemon dropped the held text on
+    /// restart, or discarded it because the session stopped or exited
+    /// before readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub reason: Option<SessionInitialInputDrop>,
+}
+
+impl SessionInitialInput {
+    /// A still-pending deferred prompt.
+    #[must_use]
+    pub const fn pending() -> Self {
+        Self {
+            state: SessionInitialInputState::Pending,
+            reason: None,
+        }
+    }
+}
+
+/// Lifecycle of a deferred initial prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInitialInputState.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum SessionInitialInputState {
+    /// The prompt is held and delivered once readiness shows.
+    Pending,
+    /// The prompt was delivered through the readiness trigger.
+    Delivered,
+    /// The held prompt was dropped or discarded; `reason` names why.
+    Dropped,
+    /// A value a newer daemon sent that this build does not know.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(SessionInitialInputState);
+
+/// Why a deferred initial prompt never arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionInitialInputDrop.ts"))]
+#[serde(rename_all = "snake_case", remote = "Self")]
+pub enum SessionInitialInputDrop {
+    /// The daemon restarted while the text was held in memory.
+    DaemonRestart,
+    /// The session stopped before readiness.
+    SessionStopped,
+    /// The session exited before readiness.
+    SessionExited,
+    /// A value a newer daemon sent that this build does not know.
+    #[doc(hidden)]
+    #[serde(rename = "unknown", skip_deserializing)]
+    #[cfg_attr(feature = "ts", ts(skip))]
+    Unknown,
+}
+
+crate::tolerant_enum!(SessionInitialInputDrop);
+
 /// The latest placement escape check of a live session.
 ///
 /// A runtime that declares `[placement]` is checked by its worker: a process
@@ -3451,6 +3528,13 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub attention_isolated_by: Option<SessionId>,
+    /// Deferred initial prompt of a kept `session.new` create (see
+    /// [`SessionInitialInput`]). Absent for sessions created without
+    /// initial input. Computed live on list/inspect/new responses;
+    /// stored records and events never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub initial_input: Option<SessionInitialInput>,
     /// Creation timestamp in the daemon's wire timestamp format.
     pub created_at: String,
     /// Last update timestamp in the daemon's wire timestamp format.
@@ -4396,6 +4480,7 @@ mod tests {
             activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
+            initial_input: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities::default(),

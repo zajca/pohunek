@@ -610,11 +610,27 @@ pub struct SessionTransaction {
 /// the daemon's memory and the session must not run without it.
 pub const INITIAL_INPUT_PHASE: &str = "initial_input";
 
+/// Phase of a kept create whose initial input timed out while blocked
+/// (#2406): the session runs, the prompt text is held in daemon memory,
+/// and the first `input_ready` after the keep delivers it exactly once.
+/// Free text like [`INITIAL_INPUT_PHASE`], so persisting it needs no store
+/// schema bump. A marker of another instance (or none) after a restart
+/// means the held text is gone: it stays dropped with a recorded reason
+/// and is never delivered.
+pub const DEFERRED_INITIAL_INPUT_PHASE: &str = "initial_input_deferred";
+
 impl SessionTransaction {
     /// Whether this is a committed create still delivering its initial input.
     #[must_use]
     pub fn is_initial_input(&self) -> bool {
         self.kind == TransactionKind::Create && self.phase == INITIAL_INPUT_PHASE
+    }
+
+    /// Whether this is a kept create holding a deferred initial prompt in
+    /// daemon memory (#2406 Q1/Q2).
+    #[must_use]
+    pub fn is_deferred_initial_input(&self) -> bool {
+        self.kind == TransactionKind::Create && self.phase == DEFERRED_INITIAL_INPUT_PHASE
     }
 }
 
@@ -1291,8 +1307,9 @@ impl Store {
         }
     }
 
-    /// Clears the `create/initial_input` transaction of one session's
-    /// current record and leaves every other field as persisted.
+    /// Clears the `create/initial_input` (or `create/initial_input_deferred`)
+    /// transaction of one session's current record and leaves every other
+    /// field as persisted.
     ///
     /// The record is re-read under the write lock, so a state a concurrent
     /// stop, removal, or exit persisted is kept. Returns whether a marker was
@@ -1310,11 +1327,54 @@ impl Store {
                     .record
                     .transaction
                     .as_ref()
-                    .is_some_and(SessionTransaction::is_initial_input)
+                    .is_some_and(|transaction| {
+                        transaction.is_initial_input() || transaction.is_deferred_initial_input()
+                    })
         }) else {
             return Ok(StoreMutation::Synced(false));
         };
         entry.edit().transaction = None;
+        Ok(self.write_entries(records, &snapshot)?.with_value(true))
+    }
+
+    /// Rewrites a session's `create/initial_input` marker into the kept
+    /// `create/initial_input_deferred` marker (#2406 Q1/Q2), owned by
+    /// `daemon_instance_id`, and leaves every other field as persisted.
+    ///
+    /// The record is re-read under the write lock, so a state a concurrent
+    /// stop, removal, or exit persisted is kept. Only a record that still
+    /// carries the delivering `initial_input` marker is rewritten; a record
+    /// without it, or no record at all, is a no-op success.
+    pub fn mark_initial_input_deferred(
+        &self,
+        session_id: &str,
+        daemon_instance_id: &str,
+    ) -> io::Result<StoreMutation<bool>> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = self.snapshot()?;
+        let mut records = snapshot.records.clone();
+        let Some(entry) = records.sessions.iter_mut().find(|entry| {
+            entry.record.session_id == session_id
+                && entry
+                    .record
+                    .transaction
+                    .as_ref()
+                    .is_some_and(SessionTransaction::is_initial_input)
+        }) else {
+            return Ok(StoreMutation::Synced(false));
+        };
+        let edited = entry.edit();
+        edited.transaction = Some(SessionTransaction {
+            id: format!("create-{session_id}"),
+            kind: TransactionKind::Create,
+            phase: DEFERRED_INITIAL_INPUT_PHASE.to_owned(),
+            previous_worker_id: None,
+            previous_worker_instance_id: None,
+            daemon_instance_id: Some(daemon_instance_id.to_owned()),
+        });
         Ok(self.write_entries(records, &snapshot)?.with_value(true))
     }
 
@@ -2119,14 +2179,12 @@ fn fs_error_to_io(error: FsError) -> io::Error {
 /// its record before that clearing must not bring the marker back, or a
 /// restart would roll back a session that already received its input.
 fn keep_initial_input_settled(existing: &SessionRecord, replacement: &mut SessionRecord) {
-    let reintroduced = replacement
+    let reintroduced = replacement.transaction.as_ref().is_some_and(|transaction| {
+        transaction.is_initial_input() || transaction.is_deferred_initial_input()
+    }) && existing
         .transaction
         .as_ref()
-        .is_some_and(SessionTransaction::is_initial_input)
-        && existing
-            .transaction
-            .as_ref()
-            .is_none_or(|transaction| transaction.kind != TransactionKind::Create);
+        .is_none_or(|transaction| transaction.kind != TransactionKind::Create);
     if reintroduced {
         replacement.transaction = None;
     }
