@@ -957,7 +957,8 @@ impl Driver<'_> {
         theme_answered: bool,
         picker_records: usize,
     ) -> Result<FirstScreen, StepFailure> {
-        let deadline = Instant::now() + self.args.first_screen_timeout;
+        let budget = self.args.first_screen_timeout;
+        let deadline = Instant::now() + budget;
         loop {
             self.read_records(session)?;
             let activity = self.activity(session)?;
@@ -1012,7 +1013,7 @@ impl Driver<'_> {
                 {
                     return Ok(FirstScreen::Prompt);
                 }
-                return Err(self.timed_out_first_screen());
+                return Err(Self::timed_out_after("wait for the first screen", budget));
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -1083,18 +1084,14 @@ impl Driver<'_> {
     }
 
     fn timed_out(&self, step: &str) -> StepFailure {
-        StepFailure::Stopped(format!(
-            "step `{step}` timed out after {}s",
-            self.args.step_timeout.as_secs()
-        ))
+        Self::timed_out_after(step, self.args.step_timeout)
     }
 
-    /// The first-screen wait stops the run with its own budget named: the
-    /// earlier screen is not the step the scenario tests.
-    fn timed_out_first_screen(&self) -> StepFailure {
+    /// The step stopped the run with the budget that bounded it named.
+    fn timed_out_after(step: &str, budget: Duration) -> StepFailure {
         StepFailure::Stopped(format!(
-            "step `wait for the first screen` timed out after {}s",
-            self.args.first_screen_timeout.as_secs()
+            "step `{step}` timed out after {}s",
+            budget.as_secs()
         ))
     }
 
