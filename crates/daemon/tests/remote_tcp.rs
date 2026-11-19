@@ -2798,7 +2798,7 @@ async fn bind_refuses_non_unicast_targets_whatever_the_provider_says() {
     }
 }
 
-/// Daemon log lines captured in memory, shared by the keepalive scenarios.
+/// Daemon log lines captured in memory, shared by the socket-option scenarios.
 static CAPTURED_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// Appends what the daemon logs to [`CAPTURED_LOG`].
@@ -2842,8 +2842,8 @@ fn captured_log_lines(needle: &str) -> Vec<String> {
 }
 
 /// Connects a client to `addr` and returns the daemon's log line about that
-/// connection's keepalive, found by the client's own address.
-async fn keepalive_log_for_new_connection(
+/// connection carrying `message`, found by the client's own address.
+async fn daemon_log_for_new_connection(
     addr: SocketAddr,
     message: &str,
 ) -> (Framed<TcpStream, LinesCodec>, String) {
@@ -2853,14 +2853,14 @@ async fn keepalive_log_for_new_connection(
         .local_addr()
         .expect("the client socket has a local address");
     let peer_field = format!("peer={peer}");
-    let line =
-        pohunek_test_support::wait::wait_until("the keepalive log line of the client", || {
-            let found = captured_log_lines(&peer_field)
-                .into_iter()
-                .find(|line| line.contains(message));
-            async move { found }
-        })
-        .await;
+    let label = format!("the daemon log line {message:?} of the client");
+    let line = pohunek_test_support::wait::wait_until(&label, || {
+        let found = captured_log_lines(&peer_field)
+            .into_iter()
+            .find(|line| line.contains(message));
+        async move { found }
+    })
+    .await;
     (client, line)
 }
 
@@ -2871,7 +2871,7 @@ async fn remote_keepalive_applies_the_documented_defaults() {
     let (addr, _socket, shutdown, handle) =
         spawn_dual_servers("keepalive-default", "0.0.0", shell_config()).await;
 
-    let (_client, line) = keepalive_log_for_new_connection(addr, "remote keepalive applied").await;
+    let (_client, line) = daemon_log_for_new_connection(addr, "remote keepalive applied").await;
 
     for field in [
         "keepalive.enabled=true",
@@ -2900,7 +2900,7 @@ async fn remote_keepalive_applies_the_configured_values() {
     let (addr, _socket, shutdown, handle) =
         spawn_dual_servers("keepalive-configured", "0.0.0", config).await;
 
-    let (_client, line) = keepalive_log_for_new_connection(addr, "remote keepalive applied").await;
+    let (_client, line) = daemon_log_for_new_connection(addr, "remote keepalive applied").await;
 
     for field in [
         "keepalive.enabled=true",
@@ -2923,7 +2923,7 @@ async fn remote_nodelay_is_applied_on_each_accepted_connection() {
         spawn_dual_servers("nodelay-applied", "0.0.0", shell_config()).await;
 
     let (mut client, line) =
-        keepalive_log_for_new_connection(addr, "remote TCP_NODELAY applied").await;
+        daemon_log_for_new_connection(addr, "remote TCP_NODELAY applied").await;
 
     assert!(
         line.contains("nodelay.enabled=true"),
@@ -2957,7 +2957,7 @@ async fn remote_keepalive_setup_failure_keeps_serving_the_connection() {
         spawn_dual_servers("keepalive-failure", "0.0.0", config).await;
 
     let (mut client, line) =
-        keepalive_log_for_new_connection(addr, "remote keepalive setup failed").await;
+        daemon_log_for_new_connection(addr, "remote keepalive setup failed").await;
 
     assert!(line.contains("WARN"), "the failure is a warning: {line}");
     assert!(
