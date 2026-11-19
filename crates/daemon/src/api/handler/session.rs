@@ -15,6 +15,7 @@ use protocol::{
     SessionSetMetadataParams, SessionWaitParams, SessionWaitTurnParams,
 };
 
+use super::audit;
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
 use super::{ControlTransport, DaemonState};
 use crate::session::{
@@ -247,22 +248,42 @@ pub(super) async fn handle_session_remove_tree(
 }
 
 /// `session.retention.sweep`: run one retention sweep now.
+///
+/// Refusals for callers the daemon cannot place (`Unknown`,
+/// `Unattributed`) apply to `dry_run` too: a refused caller learns nothing
+/// about the host's sessions, not even their count.
 pub(super) async fn handle_session_retention_sweep(
     request: &Request,
-    sessions: &SessionRegistry,
+    state: &DaemonState,
     caller: &CallerClass,
 ) -> Response {
     let params = match parse_optional_params::<SessionRetentionParams>(request) {
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    // Only a managed session's own caller is subtree-limited: the owner's
-    // shell and every other class sweep with owner rights.
+    // Owner callers sweep with owner rights: the local owner socket, the
+    // overlay, and a `shell` runtime session no session spawned. A managed
+    // session sweeps only its own strict subtree; callers the daemon cannot
+    // place are refused, with the same audit line the owner-only gate
+    // writes.
     let subtree = match caller {
+        CallerClass::Owner | CallerClass::OwnerShell(_) => None,
         CallerClass::Session(id) => Some(id),
-        _ => None,
+        CallerClass::Unknown | CallerClass::Unattributed => {
+            let reason = match caller {
+                CallerClass::Unknown => "unknown_caller",
+                _ => "unattributed_caller",
+            };
+            let target = request
+                .params()
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            audit::record_rights_refusal(request, state, caller, target, reason);
+            return error_value(request, ProtocolError::session_right_denied(reason));
+        }
     };
-    match sessions.sweep_retention_as(&params, subtree).await {
+    match state.sessions.sweep_retention_as(&params, subtree).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }

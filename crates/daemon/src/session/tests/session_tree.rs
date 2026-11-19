@@ -12,9 +12,8 @@ use protocol::{
     SessionTreeOutcome, SpawnedBy, MAX_RETENTION_SELECTOR_IDS, MAX_SESSION_REMOVE_TREE_SESSIONS,
 };
 
-/// Create a finished child of `parent`, optionally on its own worktree.
-/// Create a finished child of `parent`, optionally on its own worktree, on
-/// the `agent` profile so the registry under test can be a fixture whose
+/// Create a finished child of `parent` on the `agent` profile, optionally
+/// on its own worktree: the registry under test can be a fixture whose
 /// host serves only named profiles.
 async fn exited_child_on(
     registry: &crate::session::SessionRegistry,
@@ -53,6 +52,8 @@ async fn exited_child_on(
     registry.inspect(&id).await.expect("child listed")
 }
 
+/// Create a finished child of `parent` on the default `shell` profile,
+/// optionally on its own worktree.
 async fn exited_child(
     registry: &crate::session::SessionRegistry,
     parent: &SessionId,
@@ -172,12 +173,12 @@ async fn sweep_with_session_ids_removes_only_the_named_sessions() {
     assert_eq!(remaining, expected);
 }
 
-/// An adopt parked inside a `remove_tree` cascade is refused with
-/// `tree_removal_in_progress`, then succeeds once the cascade released
-/// its registration: the dirty child below survives the cascade, so the
-/// same adopt runs before and after it. The pre-root gate parks the
-/// cascade deterministically; both adopts run owner-side, under the same
-/// persist and sessions locks the cascade's registration guards.
+/// An adopt of a session inside a parked `remove_tree` cascade is refused
+/// with `tree_removal_in_progress`, then succeeds once the cascade
+/// released its registration: the dirty child below survives the cascade,
+/// so the same adopt runs before and after it. The pre-root gate parks the
+/// cascade deterministically while it holds the `removing_roots`
+/// registration; both adopts run owner-side.
 #[tokio::test]
 async fn adopt_during_a_cascade_is_refused_then_succeeds_after_it() {
     let (registry, data_dir, _worktree_root) = retention_registry("adopt-during-cascade");
@@ -249,10 +250,9 @@ async fn adopt_during_a_cascade_is_refused_then_succeeds_after_it() {
 /// A sweep from a `Session(X)` caller removes only X's descendants: the
 /// aged outsider survives the sweep even without a selector, and a named
 /// id outside the subtree is not examined and not reported, like an
-/// unknown id. `state` carries the wire request's session peer (a child of
-/// the parked launch's worker stdout proves, still mid-launch exactly as in
-/// `package_scenarios::rights_tests`), while the second request runs
-/// unattested, so the boundary the handler decides on is exercised.
+/// unknown id. The sweep request carries the parked launch's worker as its
+/// peer; an owner state without a peer removes the outsider, while an
+/// unattested connection is refused with `session_right_denied`.
 #[expect(
     clippy::too_many_lines,
     reason = "the handler-boundary scenario keeps park, create, age and both sweeps in one place"
@@ -338,39 +338,48 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
 
     let child = exited_child_on(&registry, &caller.id, "rights-exiter", None).await;
     let outsider = exited_session_on(&registry, "rights-exiter", None).await;
+    let grandchild = exited_child_on(&registry, &child.id, "rights-exiter", None).await;
     age_finished(&registry, &child.id).await;
     age_finished(&registry, &outsider.id).await;
+    age_finished(&registry, &grandchild.id).await;
 
-    let serve = |peer: Option<std::sync::Arc<crate::session::ControlPeer>>| {
-        let state = DaemonState::new(
+    let serve = |state: DaemonState, params: SessionRetentionParams| async move {
+        let request = Request::new(
+            "sweep-session-caller",
+            protocol::method::SESSION_RETENTION_SWEEP,
+            serde_json::to_value(params).expect("sweep params serialize"),
+        )
+        .expect("valid request");
+        crate::api::handle_request(&request, &state).await
+    };
+    let state_for = |peer: Option<std::sync::Arc<crate::session::ControlPeer>>| {
+        DaemonState::new(
             HealthInfo::new("test"),
             registry.clone(),
             std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
             crate::test_support::overlay_registry(),
             crate::api::OverlaySource::Default,
         )
-        .with_control_peer(peer);
-        async move {
-            let request = Request::new(
-                "sweep-session-caller",
-                protocol::method::SESSION_RETENTION_SWEEP,
-                serde_json::to_value(SessionRetentionParams::default())
-                    .expect("sweep params serialize"),
-            )
-            .expect("valid request");
-            crate::api::handle_request(&request, &state)
-                .await
-                .into_result()
-                .expect("the sweep answers")
-        }
+        .with_control_peer(peer)
     };
 
-    let result = serve(Some(std::sync::Arc::clone(&peer))).await;
-    assert_eq!(result["examined"], 1, "{result}");
-    assert_eq!(result["removed"], 1, "{result}");
+    let result = serve(
+        state_for(Some(std::sync::Arc::clone(&peer))),
+        SessionRetentionParams::default(),
+    )
+    .await
+    .into_result()
+    .expect("the sweep answers");
+    assert_eq!(result["examined"], 2, "{result}");
+    assert_eq!(result["removed"], 2, "{result}");
     assert_eq!(
         result["sessions"][0]["session_id"].as_str(),
         Some(child.id.0.as_str()),
+        "{result}"
+    );
+    assert_eq!(
+        result["sessions"][1]["session_id"].as_str(),
+        Some(grandchild.id.0.as_str()),
         "{result}"
     );
     assert!(
@@ -378,11 +387,79 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
         "the outsider survives a session caller's sweep"
     );
 
-    let result = serve(None).await;
+    // With a `session_ids` selector the caller's subtree still applies:
+    // the caller itself and the named outsider survive, so a fresh
+    // grandchild below a surviving child proves the selector path removes
+    // inside the subtree.
+    let grandchild = exited_child_on(&registry, &caller.id, "rights-exiter", None).await;
+    age_finished(&registry, &grandchild.id).await;
+    let named = serve(
+        state_for(Some(std::sync::Arc::clone(&peer))),
+        SessionRetentionParams {
+            session_ids: Some(vec![outsider.id.clone(), grandchild.id.clone()]),
+            ..SessionRetentionParams::default()
+        },
+    )
+    .await
+    .into_result()
+    .expect("the named sweep answers");
+    assert_eq!(named["examined"], 1, "{named}");
+    assert_eq!(named["removed"], 1, "{named}");
+    assert_eq!(
+        named["sessions"][0]["session_id"].as_str(),
+        Some(grandchild.id.0.as_str()),
+        "{named}"
+    );
+    assert!(
+        !named.to_string().contains(outsider.id.0.as_str()),
+        "the outsider id is not reported: {named}"
+    );
+    assert!(
+        session_ids(&registry).await.contains(&outsider.id.0),
+        "the outsider survives a named sweep by the session caller"
+    );
+
+    // A `spawned_by` selector pointing outside the caller's tree selects
+    // nothing under the subtree filter.
+    let by_parent = serve(
+        state_for(Some(std::sync::Arc::clone(&peer))),
+        SessionRetentionParams {
+            spawned_by: Some(outsider.id.clone()),
+            ..SessionRetentionParams::default()
+        },
+    )
+    .await
+    .into_result()
+    .expect("the spawned_by sweep answers");
+    assert_eq!(by_parent["examined"], 0, "{by_parent}");
+
+    // The owner state (no peer, so the socket is attested) still sweeps
+    // with owner rights and removes the outsider.
+    let owner = DaemonState::new(
+        HealthInfo::new("test"),
+        registry.clone(),
+        std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
+        crate::test_support::overlay_registry(),
+        crate::api::OverlaySource::Default,
+    );
+    let result = serve(owner, SessionRetentionParams::default())
+        .await
+        .into_result()
+        .expect("the owner sweep answers");
     assert_eq!(result["removed"], 1, "{result}");
     assert!(
         !session_ids(&registry).await.contains(&outsider.id.0),
-        "an unattested sweep still removes the outsider"
+        "an owner sweep removes the outsider"
+    );
+
+    // An unattested connection carries no class the sweep trusts: it is
+    // refused and removes nothing.
+    let unattested = serve(state_for(None), SessionRetentionParams::default()).await;
+    let error = unattested.into_result().expect_err("refused");
+    assert_eq!(error.code.as_str(), "session_right_denied", "{error:?}");
+    assert!(
+        error.msg.contains("unknown_caller"),
+        "the refusal names the caller class: {error:?}"
     );
     registry.stop(&caller.id).await.expect("stop the caller");
 }

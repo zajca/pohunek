@@ -301,7 +301,11 @@ caller profile's `[rights] spawn_profiles` is `spawn_profile_not_allowed`.
 `session.adopt`, `package.create_profile`, `package.create_preset`,
 `package.remove_profile` and `package.bind_profile` are owner only
 (`owner_only`); `session.resume` of a descendant needs a profile its caller's
-`spawn_profiles` allows. A target the daemon does not
+`spawn_profiles` allows. `session.retention.sweep` from a `Session(X)` caller
+sweeps only that session's own subtree (a named id outside it is not examined
+and not reported, like an unknown id); `Owner`, `OwnerShell` and remote overlay
+callers sweep with owner rights, while `Unknown` and `Unattributed` callers are
+refused with `unknown_caller` / `unattributed_caller` even for `dry_run`. A target the daemon does not
 hold keeps its own `session_not_found`. Callers outside every session tree, in a
 `shell` runtime session that no session spawned, and remote overlay connections keep owner rights; a shell a session spawned has the rights of its own tree. A
 process that leaves the tree keeps owner rights too; see the Security Model of
