@@ -959,8 +959,14 @@ impl Driver<'_> {
                 return Ok(FirstScreen::Login);
             }
             // After the answer the picker stays until Claude redraws; the
-            // wait goes on for the screen that follows it.
-            if !theme_answered && self.screen_rules.theme_picker.matches(&detection) {
+            // wait goes on for the screen that follows it. The login scenario
+            // sends its key once the session awaits owner action, the state in
+            // which only an attach may answer the dialog; every other scenario
+            // refuses the picker as soon as it shows.
+            if !theme_answered
+                && self.screen_rules.theme_picker.matches(&detection)
+                && (scenario != Scenario::LoginScreen || activity.as_deref() == Some("blocked"))
+            {
                 return Ok(FirstScreen::Theme);
             }
             // A startup `state=idle` can precede first-run screens, so in the login
@@ -1006,8 +1012,10 @@ impl Driver<'_> {
     /// default, the one input the login scenario sends. The picker emits no
     /// program-status record (the 7501 contract has none for first-run
     /// dialogs), so the row's read point stays the login method list. The
-    /// screen is checked once more right before the key: Enter on the
-    /// folder-trust dialog would trust the directory.
+    /// key is written through `pohunek attach` because the daemon refuses
+    /// `session input` while the dialog blocks the session. The screen is
+    /// checked once more right before the key: Enter on the folder-trust
+    /// dialog would trust the directory.
     ///
     /// Returns how many records precede the picker the key answered. The
     /// worker retains output bytes before its screen shows them and the
@@ -1027,17 +1035,21 @@ impl Driver<'_> {
         }
         self.read_records(session)?;
         let picker_records = session.records.len();
-        let what = "accept the theme picker's default";
-        let (code, document) = self.cli_document(
-            &["session", "input", session.id.as_str(), "", "--json"],
-            what,
-        )?;
-        if code == Some(0) {
+        // `session.input` is refused while the dialog blocks the session; the
+        // owner path is an attach whose standard input carries the key and then
+        // ends, which detaches again.
+        let output = self
+            .host
+            .cli_with_input(&["attach", session.id.as_str()], b"\r")
+            .map_err(XtaskError::Usage)?;
+        if output.code == Some(0) {
             Ok(picker_records)
         } else {
             Err(StepFailure::Refused(format!(
-                "cannot {what}: {}",
-                document["err"]
+                "cannot accept the theme picker's default: `pohunek attach` exited {}",
+                output
+                    .code
+                    .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
             )))
         }
     }

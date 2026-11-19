@@ -587,6 +587,18 @@ impl Host {
         self.run_program("pohunek", arguments)
     }
 
+    /// Runs the installed `pohunek` with `arguments` and `input` as its
+    /// standard input, which reaches end of file after the last byte.
+    pub fn cli_with_input(&mut self, arguments: &[&str], input: &[u8]) -> Result<Output, String> {
+        let input_path = self.root.join(format!("command-{}.in", self.commands));
+        fs::write(&input_path, input)
+            .map_err(|error| format!("cannot write the command input file: {error}"))?;
+        let stdin = File::open(&input_path)
+            .map_err(|error| format!("cannot open the command input file: {error}"))?;
+        let executable = self.prefix.join("pohunek");
+        self.run_executable(&executable, "pohunek", arguments, &[], Stdio::from(stdin))
+    }
+
     /// Runs `script`, a plugin-owned executable from the plugin repository,
     /// with the live session id exported under `POHUNEK_SMOKE_SESSION`. The
     /// script reaches the isolated daemon through the isolated
@@ -671,12 +683,12 @@ impl Host {
             || program.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        self.run_executable(program, &label, arguments, extra_environment)
+        self.run_executable(program, &label, arguments, extra_environment, Stdio::null())
     }
 
     fn run_program(&mut self, program: &str, arguments: &[&str]) -> Result<Output, String> {
         let executable = self.prefix.join(program);
-        self.run_executable(&executable, program, arguments, &[])
+        self.run_executable(&executable, program, arguments, &[], Stdio::null())
     }
 
     fn run_executable(
@@ -685,6 +697,7 @@ impl Host {
         program: &str,
         arguments: &[&str],
         extra_environment: &[(OsString, OsString)],
+        stdin: Stdio,
     ) -> Result<Output, String> {
         let output_path = self.root.join(format!("command-{}.out", self.commands));
         self.commands += 1;
@@ -696,7 +709,7 @@ impl Host {
             .env_clear()
             .envs(self.environment.iter().cloned())
             .envs(extra_environment.iter().cloned())
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(output)
             .stderr(Stdio::null())
             .process_group(0)

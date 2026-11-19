@@ -116,8 +116,10 @@ not created.
 An empty config home first shows Claude's first-run theme picker (the
 package's `theme_picker` rule), then the login method list. The OSC 7501
 contract has no record for either first-run dialog, so the `login_screen`
-row reads at the login method list: the capture answers the theme picker
-with Enter (its default) and then waits for the login screen. It checks the
+row reads at the login method list: once the session's activity is
+`blocked` at the picker, the capture answers it with Enter (its default)
+through `pohunek attach` (the daemon refuses `session input` while the
+dialog blocks the session) and then waits for the login screen. It checks the
 screen again right before the key and stops with exit 4 if the folder-trust
 dialog is showing, since Enter there would trust the directory. A record
 written before the picker stays in the row's `records` and never becomes
