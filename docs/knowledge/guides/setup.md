@@ -108,7 +108,9 @@ waiter slot of its in-flight `session.wait_turn` within
 `idle + interval x count`, 60 s by default, instead of at the wait's deadline.
 The two times are whole seconds written in milliseconds, each in
 `1000..=600000`, and the count is in `1..=10`; a violation makes the daemon
-refuse startup with the named configuration error. The installer omits a key
+refuse startup with the named configuration error. Every accepted overlay
+connection also has `TCP_NODELAY` set, so small daemon replies leave
+without waiting for the previous ACK. The installer omits a key
 that equals its default, and the same defaults apply to a daemon started
 without `service.toml`. The Unix control socket is unaffected.
 The `[hooks] stderr_tail_bytes = 4096` key is the number of bytes of a failing

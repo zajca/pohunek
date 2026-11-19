@@ -28,6 +28,7 @@ mod connections;
 mod handler;
 mod hangup;
 mod keepalive;
+mod nodelay;
 
 pub use self::connections::ConnectionTasks;
 use self::connections::{Connection, ConnectionState};
@@ -522,7 +523,9 @@ impl RemoteServer {
     /// Each accepted connection gets the TCP keepalive of
     /// [`SessionRegistry::remote_keepalive`](crate::session::SessionRegistry::remote_keepalive),
     /// so a peer that vanishes without closing the connection fails its read
-    /// and releases the slot of an in-flight wait.
+    /// and releases the slot of an in-flight wait. Each connection also gets
+    /// `TCP_NODELAY`, so small replies leave without waiting for the previous
+    /// ACK (Nagle would space them into RTT-sized bursts on a real link).
     pub async fn serve(
         self,
         connections: ConnectionTasks,
@@ -542,6 +545,7 @@ impl RemoteServer {
                         Ok((stream, peer)) => {
                             info!(peer = %peer, "remote control connection accepted");
                             keepalive::apply(&stream, peer, keepalive);
+                            nodelay::apply(&stream, peer);
                             let state = state.clone().with_remote_peer(peer);
                             connections.spawn(Some(peer.to_string()), |connection| async move {
                                 if let Err(err) =

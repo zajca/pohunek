@@ -2914,6 +2914,28 @@ async fn remote_keepalive_applies_the_configured_values() {
     let _ = handle.await;
 }
 
+/// Every accepted overlay connection disables Nagle, so small daemon replies
+/// leave without waiting for the previous ACK.
+#[tokio::test]
+async fn remote_nodelay_is_applied_on_each_accepted_connection() {
+    capture_daemon_log();
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("nodelay-applied", "0.0.0", shell_config()).await;
+
+    let (mut client, line) =
+        keepalive_log_for_new_connection(addr, "remote TCP_NODELAY applied").await;
+
+    assert!(
+        line.contains("nodelay.enabled=true"),
+        "expected nodelay.enabled=true in: {line}"
+    );
+    let health = Request::make("health", method::DAEMON_HEALTH, Value::Null);
+    let payload = ok_payload(exchange(&mut client, &health).await);
+    assert_eq!(payload["daemon_version"], "0.0.0");
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// A socket-option error is logged with the peer and the errno and does not
 /// stop the daemon from serving the connection.
 ///
