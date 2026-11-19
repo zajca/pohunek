@@ -184,6 +184,10 @@ pub(super) const RUNTIME_FEATURES: &[RuntimeFeature] = &[
         id: PROGRAM_STATUS_STALENESS_FEATURE,
         since: "0.43.0",
     },
+    RuntimeFeature {
+        id: "prompt-arg-dash-paste-v1",
+        since: "0.44.0",
+    },
 ];
 
 /// Descriptor rules owned by [`RUNTIME_FEATURES`].

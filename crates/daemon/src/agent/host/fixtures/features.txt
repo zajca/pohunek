@@ -16,3 +16,4 @@ version-probe-open-range-v1 0.42.0
 detect-composer-absent-v1 0.42.0
 agent-skill-v1 0.42.0
 program-status-staleness-v1 0.43.0
+prompt-arg-dash-paste-v1 0.44.0

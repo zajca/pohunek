@@ -1506,7 +1506,12 @@ pub(super) fn plan_initial_input_delivery(
     mut command: LaunchCommand,
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
-    if resolved.profile.is_none() && resolved.definition.prompt_arg() {
+    // A prompt that starts with `-` would be read as an option by an agent CLI
+    // that parses flags after positionals, so it is pasted after readiness.
+    let dash_prompt = initial_input
+        .as_deref()
+        .is_some_and(|input| input.starts_with('-'));
+    if resolved.profile.is_none() && resolved.definition.prompt_arg() && !dash_prompt {
         let prompt_in_argv = initial_input.is_some();
         if let Some(input) = initial_input {
             command.args.push(input);

@@ -122,6 +122,7 @@ The features this core implements:
 | `version-probe-open-range-v1` | 0.42.0 | `version_probe` with `min` and no `below` |
 | `detect-composer-absent-v1` | 0.42.0 | detection manifest rule matcher `composer_absent` (no descriptor key; enforced against the manifest the descriptor names) |
 | `agent-skill-v1` | 0.42.0 | `[agent_skill]` |
+| `prompt-arg-dash-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the dash rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -345,6 +346,22 @@ it changes its digest. A session pinned to the earlier digest resumes
 without the name until it is adopted. A core older than 0.39 refuses the
 descriptor with `runtime_feature_unsupported` (0.38) or `descriptor_invalid`
 (0.37).
+
+## First prompt delivery
+
+With `[runtime] prompt_arg = true`, the first prompt of `session.new` is
+appended to the launch arguments as the last argv element, unless the prompt
+starts with `-`. A prompt that starts with `-` is never an argv token: the core
+launches the agent without it and pastes it after readiness, the same way it
+delivers the first prompt of a runtime with `prompt_arg = false`, so an agent
+that parses options after positionals cannot read it as a flag. Text that does
+not start with `-` keeps its argv delivery. A session launched through a
+profile always pastes its first prompt.
+
+A package that sets `prompt_arg = true` and relies on this rule lists
+`requires = ["prompt-arg-dash-paste-v1"]`, so a core without the rule refuses
+the package instead of passing a dash prompt as a flag. A package that does not
+list it still gets the rule on this core.
 
 ## Trusted checkout arguments
 
