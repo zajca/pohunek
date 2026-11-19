@@ -2,9 +2,9 @@
 //! to a subset, with every selection rule unchanged outside it.
 
 use super::{
-    age_lost, age_terminal, apply_sweep_policy, exited_session, external_session_fixture,
-    init_git_repo, params, past_ttl, retention_registry, retention_registry_with_unusable_log_dir,
-    session_ids, uuid_like, HANG_GUARD,
+    age_lost, age_terminal, apply_sweep_policy, exited_session, exited_session_on,
+    external_session_fixture, init_git_repo, params, past_ttl, retention_registry,
+    retention_registry_with_unusable_log_dir, session_ids, uuid_like, HANG_GUARD,
 };
 use crate::procwatch::ProcessInspector;
 use protocol::{
@@ -13,9 +13,13 @@ use protocol::{
 };
 
 /// Create a finished child of `parent`, optionally on its own worktree.
-async fn exited_child(
+/// Create a finished child of `parent`, optionally on its own worktree, on
+/// the `agent` profile so the registry under test can be a fixture whose
+/// host serves only named profiles.
+async fn exited_child_on(
     registry: &crate::session::SessionRegistry,
     parent: &SessionId,
+    agent: &str,
     repo: Option<&std::path::PathBuf>,
 ) -> protocol::SessionInfo {
     let create = match repo {
@@ -23,9 +27,13 @@ async fn exited_child(
             cwd: None,
             repo: Some(repo.clone()),
             branch: Some(format!("feat/{}", uuid_like())),
+            agent: agent.to_owned(),
             ..params()
         },
-        None => params(),
+        None => protocol::SessionNewParams {
+            agent: agent.to_owned(),
+            ..params()
+        },
     };
     let outcome = registry
         .create_outcome_spawned_by(
@@ -43,6 +51,14 @@ async fn exited_child(
         .await
         .expect("child session exits");
     registry.inspect(&id).await.expect("child listed")
+}
+
+async fn exited_child(
+    registry: &crate::session::SessionRegistry,
+    parent: &SessionId,
+    repo: Option<&std::path::PathBuf>,
+) -> protocol::SessionInfo {
+    exited_child_on(registry, parent, "shell", repo).await
 }
 
 /// Backdate a finished session so the terminal TTL selects it.
@@ -233,53 +249,142 @@ async fn adopt_during_a_cascade_is_refused_then_succeeds_after_it() {
 /// A sweep from a `Session(X)` caller removes only X's descendants: the
 /// aged outsider survives the sweep even without a selector, and a named
 /// id outside the subtree is not examined and not reported, like an
-/// unknown id.
+/// unknown id. `state` carries the wire request's session peer (a child of
+/// the parked launch's worker stdout proves, still mid-launch exactly as in
+/// `package_scenarios::rights_tests`), while the second request runs
+/// unattested, so the boundary the handler decides on is exercised.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the handler-boundary scenario keeps park, create, age and both sweeps in one place"
+)]
 #[tokio::test]
 async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
-    let (registry, data_dir, _worktree_root) = retention_registry("sweep-session-caller");
-    apply_sweep_policy(&registry, &data_dir).await;
+    use crate::api::{DaemonState, HealthInfo};
+    use crate::session::package_scenarios::Fixture;
+    use protocol::Request;
 
-    let caller = registry.create(params()).await.expect("create caller");
-    let child = exited_child(&registry, &caller.id, None).await;
-    let outsider = exited_session(&registry, None).await;
+    let store_path = super::temp_store_path("sweep-session-caller");
+    let fixture = Fixture::with_store_and_policy(
+        "sweep-session-caller",
+        store_path.clone(),
+        crate::session::tests::sweep_policy(),
+    );
+    let registry = fixture.registry.clone();
+    let _data_dir = store_path.parent().expect("store parent").to_path_buf();
+
+    // The caller is a package runtime (the fixture package's `pi` runtime)
+    // so the `shell`-base rule cannot lift it to owner rights: without the
+    // package base the peer would classify as `OwnerShell` and the sweep
+    // would take owner rights, exactly what the first assertion guards.
+    let package = crate::session::package_scenarios::Package::pi();
+    let archive = fixture.write_archive(&package);
+    fixture
+        .registry
+        .packages()
+        .package_install(crate::session::package_scenarios::explicit(
+            &archive, &package, true, true,
+        ))
+        .await
+        .expect("install the fixture package");
+    fixture.write_profile(
+        "rights-caller",
+        &format!(
+            "base = \"pi\"\npackage = \"acme.runtime.pi\"\ndigest = \"{}\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n",
+            package.digest
+        ),
+    );
+    fixture.write_profile(
+        "rights-exiter",
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n",
+    );
+    let gate = registry.hold_next_launch_commit();
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .create(protocol::SessionNewParams {
+                    agent: "rights-caller".to_owned(),
+                    cwd: Some(crate::session::tests::temp_dir("sweep-session-caller-cwd")),
+                    input: Some("exit 0".to_owned()),
+                    ..params()
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(super::HANG_GUARD, gate.entered.notified())
+        .await
+        .expect("the launch parks before its entry is installed");
+    let launching = registry.launching_for_test();
+    let [launching] = launching.as_slice() else {
+        panic!("one launch is in flight: {launching:?}");
+    };
+    let caller_id = launching.clone();
+    let worker = registry
+        .launch_worker_for_test(&caller_id)
+        .expect("the launch recorded its worker before the PTY child ran");
+    let peer = std::sync::Arc::new(crate::session::ControlPeer::for_test(worker));
+    let caller_class = registry.classify_caller(&peer).await.0;
+    assert_eq!(
+        caller_class,
+        crate::session::rights::CallerClass::Session(caller_id.clone()),
+        "the parked worker places the caller in its session"
+    );
+    gate.release.notify_one();
+    let caller = creating
+        .await
+        .expect("create task joins")
+        .expect("the caller launches");
+    assert_eq!(caller.id, caller_id);
+
+    let child = exited_child_on(&registry, &caller.id, "rights-exiter", None).await;
+    let outsider = exited_session_on(&registry, "rights-exiter", None).await;
     age_finished(&registry, &child.id).await;
     age_finished(&registry, &outsider.id).await;
-    let caller = &caller.id;
 
-    let result = registry
-        .sweep_retention_as(&SessionRetentionParams::default(), Some(caller))
-        .await
-        .expect("session-caller sweep");
+    let serve = |peer: Option<std::sync::Arc<crate::session::ControlPeer>>| {
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            registry.clone(),
+            std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
+            crate::test_support::overlay_registry(),
+            crate::api::OverlaySource::Default,
+        )
+        .with_control_peer(peer);
+        async move {
+            let request = Request::new(
+                "sweep-session-caller",
+                protocol::method::SESSION_RETENTION_SWEEP,
+                serde_json::to_value(SessionRetentionParams::default())
+                    .expect("sweep params serialize"),
+            )
+            .expect("valid request");
+            crate::api::handle_request(&request, &state)
+                .await
+                .into_result()
+                .expect("the sweep answers")
+        }
+    };
 
-    assert_eq!(result.examined, 1, "{result:?}");
-    assert_eq!(result.removed, 1, "{result:?}");
-    assert!(
-        result
-            .sessions
-            .iter()
-            .all(|candidate| candidate.session_id == child.id),
-        "{result:?}"
+    let result = serve(Some(std::sync::Arc::clone(&peer))).await;
+    assert_eq!(result["examined"], 1, "{result}");
+    assert_eq!(result["removed"], 1, "{result}");
+    assert_eq!(
+        result["sessions"][0]["session_id"].as_str(),
+        Some(child.id.0.as_str()),
+        "{result}"
     );
     assert!(
         session_ids(&registry).await.contains(&outsider.id.0),
-        "the outsider survives"
+        "the outsider survives a session caller's sweep"
     );
 
-    let selected = registry
-        .sweep_retention_as(
-            &SessionRetentionParams {
-                dry_run: true,
-                limit: None,
-                spawned_by: None,
-                session_ids: Some(vec![outsider.id.clone()]),
-            },
-            Some(caller),
-        )
-        .await
-        .expect("named outsider sweep");
-
-    assert_eq!(selected.examined, 0, "{selected:?}");
-    assert!(selected.sessions.is_empty(), "{selected:?}");
+    let result = serve(None).await;
+    assert_eq!(result["removed"], 1, "{result}");
+    assert!(
+        !session_ids(&registry).await.contains(&outsider.id.0),
+        "an unattested sweep still removes the outsider"
+    );
+    registry.stop(&caller.id).await.expect("stop the caller");
 }
 
 #[tokio::test]

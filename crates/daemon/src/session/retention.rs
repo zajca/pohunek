@@ -110,6 +110,13 @@ impl SessionRegistry {
             .clone()
     }
 
+    /// The mutable retention policy, for tests that inject the operator's
+    /// policy without a policy file.
+    #[cfg(test)]
+    pub(crate) fn retention_policy_mut(&self) -> &std::sync::RwLock<SessionRetentionPolicy> {
+        &self.inner.retention.policy
+    }
+
     /// Loads the durable retention policy into the registry.
     ///
     /// A missing document yields the documented default. Call this once at

@@ -28,19 +28,19 @@ any = [{ contains = "ready" }]
 "#;
 
 /// Package id of the default fixture package.
-pub(super) const PACKAGE: &str = "acme.runtime.pi";
+pub(crate) const PACKAGE: &str = "acme.runtime.pi";
 
 /// Runtime id of the default fixture package.
-pub(super) const RUNTIME: &str = "pi";
+pub(crate) const RUNTIME: &str = "pi";
 
 /// Program of a fixture package that is never launched.
-pub(super) const INERT_PROGRAM: &str = "/bin/sh";
+pub(crate) const INERT_PROGRAM: &str = "/bin/sh";
 
 /// A real package archive.
 #[derive(Clone)]
-pub(super) struct Package {
-    pub(super) bytes: Vec<u8>,
-    pub(super) digest: PackageDigest,
+pub(crate) struct Package {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) digest: PackageDigest,
 }
 
 impl Package {
@@ -99,7 +99,7 @@ impl Package {
     }
 
     /// The default package at 1.0.0.
-    pub(super) fn pi() -> Self {
+    pub(crate) fn pi() -> Self {
         Self::build(PACKAGE, "1.0.0", RUNTIME, INERT_PROGRAM)
     }
 
@@ -246,7 +246,7 @@ pub(super) fn files(document: String) -> Vec<ArchiveEntry> {
 }
 
 /// Parameters of an explicit-digest install of `package` from `path`.
-pub(super) fn explicit(
+pub(crate) fn explicit(
     path: &str,
     package: &Package,
     enable: bool,
@@ -265,13 +265,13 @@ pub(super) fn explicit(
 }
 
 /// A plugin root, a host serving it and a session registry over the host.
-pub(super) struct Fixture {
+pub(crate) struct Fixture {
     pub(super) dir: PathBuf,
     pub(super) plugins: PathBuf,
     /// The agents directory the registry loads host profiles from.
     pub(super) agents: PathBuf,
     pub(super) host: RuntimeHost,
-    pub(super) registry: SessionRegistry,
+    pub(crate) registry: SessionRegistry,
     store_path: Option<PathBuf>,
 }
 
@@ -302,8 +302,26 @@ impl Fixture {
     }
 
     /// A fixture whose registry persists sessions to `store_path`.
-    pub(super) fn with_store(tag: &str, store_path: PathBuf) -> Self {
+    pub(crate) fn with_store(tag: &str, store_path: PathBuf) -> Self {
         Self::build(tag, CatalogTrust::Absent, Some(store_path))
+    }
+
+    /// A fixture whose registry persists sessions to `store_path`. The
+    /// retention policy is injected from `policy`, the way the operator's
+    /// private file would load it.
+    pub(crate) fn with_store_and_policy(
+        tag: &str,
+        store_path: PathBuf,
+        policy: protocol::SessionRetentionPolicy,
+    ) -> Self {
+        let dir = crate::session::tests::temp_dir(tag);
+        let fixture = Self::at(dir, CatalogTrust::Absent, Some(store_path), None);
+        *fixture
+            .registry
+            .retention_policy_mut()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        fixture
     }
 
     /// A second daemon over the plugin root, agents directory and session
@@ -422,7 +440,7 @@ impl Fixture {
     }
 
     /// Writes the host profile `name` with `text`, owner-private.
-    pub(super) fn write_profile(&self, name: &str, text: &str) -> PathBuf {
+    pub(crate) fn write_profile(&self, name: &str, text: &str) -> PathBuf {
         let path = self.agents.join(format!("{name}.toml"));
         fs::write(&path, text).expect("write the profile");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
@@ -430,7 +448,7 @@ impl Fixture {
     }
 
     /// Writes the archive of `package` and returns its path.
-    pub(super) fn write_archive(&self, package: &Package) -> String {
+    pub(crate) fn write_archive(&self, package: &Package) -> String {
         self.write(
             &format!("{}.tar.zst", package.digest.as_str().replace(':', "-")),
             &package.bytes,
