@@ -26,7 +26,10 @@ use crate::worktree::canonical_or_original;
 /// [`DEFAULT_HEAD_BYTES`], so this bounds the bytes a scan reads.
 const DEFAULT_MAX_FILES: usize = 5_000;
 
-/// Most directory entries the scan lists in each history tree.
+/// Most directory entries the scan lists in each history tree. One
+/// directory listing keeps at most this many entries (the newest names
+/// first) and the deadline is checked while listing; a cut listing counts
+/// against the bound and is reported, never silent.
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 
 /// Most directories the scan enters in each history tree.
@@ -60,7 +63,9 @@ const DEFAULT_TEMP_ROOTS: &[&str] = &[
 pub struct CandidateConfig {
     /// Most history files read.
     pub max_files: usize,
-    /// Most directory entries listed in each history tree.
+    /// Most directory entries listed in each history tree. One directory
+    /// listing keeps at most the remaining count, the newest names first;
+    /// a cut listing is reported as [`CandidateLimit::Entries`].
     pub max_entries: usize,
     /// Most directories entered in each history tree.
     pub max_directories: usize,

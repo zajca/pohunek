@@ -1208,11 +1208,28 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
 
 /// The entries of `dir`, a directory of a walk over `root`, newest name first
 /// when `newest_first`. A directory that vanished yields nothing; one that
-/// cannot be listed yields nothing and marks the walk `incomplete`.
+/// cannot be listed yields nothing and marks the walk `incomplete`. The
+/// listing is unbounded: every entry of the directory is collected and,
+/// when `newest_first`, sorted newest name first.
 fn list_walked_directory(
     root: &TranscriptRoot,
     dir: &Path,
     newest_first: bool,
+    incomplete: &mut bool,
+) -> Option<Box<dyn Iterator<Item = io::Result<fs::DirEntry>>>> {
+    list_walked_directory_bounded(root, dir, newest_first, None, None, incomplete)
+}
+
+/// The bounded form of [`list_walked_directory`]; see it for the contract.
+/// `budget` caps the entries collected from this one directory (keeping the
+/// newest names first when `newest_first`); `deadline` aborts the listing
+/// once it has passed. Either cut sets `incomplete`.
+fn list_walked_directory_bounded(
+    root: &TranscriptRoot,
+    dir: &Path,
+    newest_first: bool,
+    budget: Option<usize>,
+    deadline: Option<std::time::Instant>,
     incomplete: &mut bool,
 ) -> Option<Box<dyn Iterator<Item = io::Result<fs::DirEntry>>>> {
     let entries = match fs::read_dir(dir) {
@@ -1229,7 +1246,7 @@ fn list_walked_directory(
         }
     };
     Some(if newest_first {
-        newest_name_first(entries)
+        newest_name_first_bounded(entries, budget, deadline, incomplete)
     } else {
         Box::new(entries)
     })
@@ -1237,10 +1254,90 @@ fn list_walked_directory(
 
 /// `entries` with the highest names first and listing errors last, so a walk
 /// that ends at a bound has visited the newest entries of a date-sharded tree.
-fn newest_name_first(entries: fs::ReadDir) -> Box<dyn Iterator<Item = io::Result<fs::DirEntry>>> {
-    let (mut listed, failed): (Vec<_>, Vec<_>) = entries.partition(Result::is_ok);
-    listed.sort_by_key(|entry| std::cmp::Reverse(entry.as_ref().ok().map(fs::DirEntry::file_name)));
+/// The listing stops at `budget` kept entries and at `deadline`; either cut
+/// sets `incomplete`. Kept entries are the top-`budget` newest names seen up
+/// to the cut (listing errors, which are not files, are kept separately);
+/// collecting and sorting the whole directory would defeat the per-directory
+/// bound, so memory stays `O(budget)` regardless of directory size. The walk
+/// therefore aborts the listing at the deadline instead of scanning the rest
+/// of the directory, and reports the partial top set as incomplete.
+fn newest_name_first_bounded(
+    entries: fs::ReadDir,
+    budget: Option<usize>,
+    deadline: Option<std::time::Instant>,
+    incomplete: &mut bool,
+) -> Box<dyn Iterator<Item = io::Result<fs::DirEntry>>> {
+    // With no budget and no deadline the listing is fully collected and sorted.
+    if budget.is_none() && deadline.is_none() {
+        let (mut listed, failed): (Vec<_>, Vec<_>) = entries.partition(Result::is_ok);
+        listed.sort_by_key(|entry| {
+            std::cmp::Reverse(entry.as_ref().ok().map(fs::DirEntry::file_name))
+        });
+        return Box::new(listed.into_iter().chain(failed));
+    }
+    let budget = budget.unwrap_or(usize::MAX);
+    // A min-heap on the name keeps the newest `budget` entries: each
+    // replacement costs O(log budget).
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<NamedEntry>> =
+        std::collections::BinaryHeap::new();
+    let mut failed: Vec<io::Result<fs::DirEntry>> = Vec::new();
+    let mut cut = false;
+    for entry in entries {
+        if deadline.is_some_and(|at| std::time::Instant::now() >= at) {
+            cut = true;
+            break;
+        }
+        match entry {
+            Ok(found) => {
+                let kept = NamedEntry(found.file_name(), found);
+                if heap.len() < budget {
+                    heap.push(std::cmp::Reverse(kept));
+                } else {
+                    cut = true;
+                    if let Some(mut smallest) = heap.peek_mut() {
+                        if kept.0 > smallest.0 .0 {
+                            *smallest = std::cmp::Reverse(kept);
+                        }
+                    }
+                }
+            }
+            Err(err) => failed.push(Err(err)),
+        }
+    }
+    if cut {
+        *incomplete = true;
+    }
+    // Ascending in `Reverse` is newest name first.
+    let listed: Vec<io::Result<fs::DirEntry>> = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse(NamedEntry(_, found))| Ok(found))
+        .collect();
     Box::new(listed.into_iter().chain(failed))
+}
+
+/// A directory entry ordered by its name alone (names are unique within one
+/// directory).
+struct NamedEntry(std::ffi::OsString, fs::DirEntry);
+
+impl PartialEq for NamedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for NamedEntry {}
+
+impl PartialOrd for NamedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NamedEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
 }
 
 /// Whether `path` is known not to be a directory: missing, or something else.
@@ -1888,10 +1985,71 @@ mod scan_tests {
     use tokio_util::sync::CancellationToken;
 
     use super::watch::RootScan;
-    use super::{ScanLimits, TranscriptIndex, TranscriptRoot, SCAN_LIMITS};
+    use super::{
+        list_walked_directory_bounded, ScanLimits, TranscriptIndex, TranscriptRoot, SCAN_LIMITS,
+    };
     use crate::agent::host::{HeadPaths, TranscriptParser};
 
+    fn list_root(path: &Path) -> TranscriptRoot {
+        root(path)
+    }
+
     const GENEROUS: ScanLimits = SCAN_LIMITS;
+
+    #[test]
+    fn bounded_listing_keeps_newest_names_within_budget_and_marks_incomplete() {
+        let dir = pohunek_test_support::tempdir().expect("fixture directory");
+        let base = dir.path();
+        for name in ["a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl", "e.jsonl"] {
+            std::fs::write(base.join(name), "{}").expect("write fixture");
+        }
+        let root = list_root(base);
+        let mut incomplete = false;
+        let entries =
+            list_walked_directory_bounded(&root, base, true, Some(2), None, &mut incomplete)
+                .expect("listing");
+        let names: Vec<_> = entries
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("name")
+            })
+            .collect();
+        assert!(names.len() <= 2, "at most the budget, got {names:?}");
+        assert_eq!(names.len(), 2, "the budget is kept, got {names:?}");
+        assert_eq!(names[0], "e.jsonl", "newest name first, got {names:?}");
+        assert!(
+            names.contains(&"d.jsonl".to_owned()),
+            "top set, got {names:?}"
+        );
+        assert!(incomplete, "a cut listing marks incomplete");
+    }
+
+    #[test]
+    fn bounded_listing_with_passed_deadline_marks_incomplete() {
+        let dir = pohunek_test_support::tempdir().expect("fixture directory");
+        let base = dir.path();
+        for name in ["a.jsonl", "b.jsonl"] {
+            std::fs::write(base.join(name), "{}").expect("write fixture");
+        }
+        let root = list_root(base);
+        let mut incomplete = false;
+        let passed = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        let _entries = list_walked_directory_bounded(
+            &root,
+            base,
+            true,
+            Some(10),
+            Some(passed),
+            &mut incomplete,
+        )
+        .expect("listing");
+        assert!(incomplete, "a passed deadline marks incomplete");
+    }
 
     fn write_transcript(path: &Path, session_id: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");

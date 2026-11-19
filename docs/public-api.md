@@ -3696,7 +3696,18 @@ exit; procwatch remains the Codex release backstop.
   record is kept, returned or logged, and no message body is interpreted. A
   value that is not an absolute path of plain components is skipped.
 - **No symlink is followed** below a history root: a linked directory is not
-  entered and a linked file is not opened.
+  entered and a linked file is not opened. Files are opened relative to
+  directory fds with `O_NOFOLLOW` on every component below the history root;
+  the root itself is opened by its canonical path. An intermediate directory
+  below the root replaced by a symlink between the walk and the read is
+  refused.
+- **Bounded listings.** One directory listing keeps at most the remaining
+  entry budget, the newest names first, and the deadline is checked while
+  listing; a cut listing ends the walk with the entries kept and is named in
+  `limits_reached` (`entries` or `time`), never a silent partial result.
+  The entries kept are the newest names among those collected up to the
+  budget: a full collect-and-sort of an oversized directory would defeat
+  the bound, so the walk keeps a bounded top set and reports the cut.
 - **Resolution.** Each working directory resolves to its repository once; the
   main checkout and every linked worktree collapse to one candidate keyed by the
   git common dir. `origin` is the `origin` remote URL with any userinfo

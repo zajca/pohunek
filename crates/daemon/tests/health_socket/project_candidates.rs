@@ -692,3 +692,53 @@ async fn history_directory_budget_counts_only_directories_the_walk_enters() {
     );
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn a_directory_bigger_than_the_entry_budget_is_cut_and_reported() {
+    // The budget is far below the number of entries in one directory. The
+    // newest kept entries of the cut listing are still visited and `entries`
+    // is reported. The listing bound itself and the fd-relative open are
+    // guarded by the module tests in `crates/daemon/src/external/`.
+    let mut rig = Rig::start_with("pcand-bigdir", |config| {
+        config.candidates.max_entries = 2;
+    })
+    .await;
+    let home = rig.home_dir();
+    let work = home.join("work");
+    let path = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
+    for (index, name) in ["a", "b", "c", "d", "e", "f", "g", "h"]
+        .into_iter()
+        .enumerate()
+    {
+        let repo = make_repo(&rig.home, &work.join(name), None);
+        let file = write_claude(
+            &home,
+            "-bulk",
+            &format!("s{index}"),
+            &[claude_user(&path(&repo))],
+        );
+        let age = Duration::from_secs(3600 * (8 - u64::try_from(index).expect("small index")));
+        touch(&file, SystemTime::now() - age);
+    }
+    let result = rig
+        .candidates(serde_json::json!({ "sources": ["history"] }))
+        .await;
+    assert_eq!(
+        result["limits_reached"],
+        serde_json::json!(["entries"]),
+        "a listing cut by the budget must be reported: {result}"
+    );
+    let found = roots(&result);
+    assert!(
+        found.len() <= 2,
+        "the listing keeps no more than the budget: {result}"
+    );
+    // The newest history files (`s7`, `s6`) survive the cut and are read;
+    // the cut must not discard the whole directory.
+    assert!(
+        found.iter().any(|root| root.ends_with("h")),
+        "the newest history file of a cut directory is still a candidate: {result}"
+    );
+    assert_documented_shape(&result);
+    rig.finish().await;
+}

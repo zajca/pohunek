@@ -13,17 +13,20 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use protocol::{CandidateLimit, RuntimeRef};
 use serde_json::Value;
 use tracing::debug;
 
-use super::{is_jsonl_path, list_walked_directory, observed_roots, string_at, TranscriptRoot};
+use super::{
+    is_jsonl_path, list_walked_directory_bounded, observed_roots, string_at, TranscriptRoot,
+};
 use crate::agent::host::{HeadKeyPath, TranscriptParser};
 use crate::integration::ConfigHomes;
 use crate::project::candidates::CandidateConfig;
@@ -61,6 +64,8 @@ struct Found {
     modified: SystemTime,
     /// Index into the scan's roots.
     root: usize,
+    /// The canonical history root `path` lies below; the read is anchored here.
+    base: Arc<Path>,
 }
 
 /// Walks the history trees `homes` declares and reads the working directory of
@@ -105,7 +110,7 @@ pub(crate) fn scan(
             break;
         }
         let root = &roots[file.root];
-        match read_cwd(&file.path, root.head_paths.cwd(), config) {
+        match read_cwd(&file.base, &file.path, root.head_paths.cwd(), config) {
             Ok(Head::Cwd(cwd)) => scan.records.push(HistoryRecord {
                 agent: root.agent_base.clone(),
                 cwd,
@@ -144,14 +149,22 @@ fn walk(
     let Ok(base) = fs::canonicalize(&root.path) else {
         return;
     };
-    let mut incomplete = false;
+    let root_base: Arc<Path> = Arc::from(base.as_path());
     let mut stack = vec![(base, 0_u8)];
     while let Some((dir, depth)) = stack.pop() {
         if Instant::now() >= deadline {
             limits.insert(CandidateLimit::Time);
             return;
         }
-        let Some(entries) = list_walked_directory(root, &dir, true, &mut incomplete) else {
+        let mut cut = false;
+        let Some(entries) = list_walked_directory_bounded(
+            root,
+            &dir,
+            true,
+            Some(*entries_left),
+            Some(deadline),
+            &mut cut,
+        ) else {
             continue;
         };
         let mut subdirectories = Vec::new();
@@ -159,6 +172,10 @@ fn walk(
         for entry in entries {
             if *entries_left == 0 {
                 limits.insert(CandidateLimit::Entries);
+                return;
+            }
+            if Instant::now() >= deadline {
+                limits.insert(CandidateLimit::Time);
                 return;
             }
             *entries_left -= 1;
@@ -183,6 +200,7 @@ fn walk(
                     path,
                     modified,
                     root: index,
+                    base: Arc::clone(&root_base),
                 });
             }
         }
@@ -209,6 +227,17 @@ fn walk(
                 .rev()
                 .map(|child| (child, depth.saturating_add(1))),
         );
+        if cut {
+            // The kept entries above were visited; the listing beyond them
+            // was not. Report the cut, then end the walk: the budget spent
+            // on this tree is gone.
+            if Instant::now() >= deadline {
+                limits.insert(CandidateLimit::Time);
+            } else {
+                limits.insert(CandidateLimit::Entries);
+            }
+            return;
+        }
     }
 }
 
@@ -223,24 +252,28 @@ enum Head {
     Cut,
 }
 
-/// Reads the working directory from the head of the history file at `path`.
+/// Reads the working directory from the head of the history file at `path`,
+/// which lies below the canonical history root `base`.
 ///
 /// At most `config.head_bytes` bytes and `config.max_records` records are
-/// read. The file is opened without following a symlink and must be a regular
-/// file. The first record that carries a valid working directory wins: its
-/// top-level `cwd` key, or, for the first record only, the `cwd_path` the
-/// runtime declares.
+/// read. The file is opened relative to a directory fd of `base`,
+/// `O_NOFOLLOW` on every component below it, and must be a regular file, so
+/// an intermediate directory swapped for a symlink between the walk and this
+/// read is refused. The first record that carries a valid working directory wins:
+/// its top-level `cwd` key, or, for the first record only, the `cwd_path`
+/// the runtime declares.
 fn read_cwd(
+    base: &Path,
     path: &Path,
     declared: Option<&HeadKeyPath>,
     config: &CandidateConfig,
 ) -> io::Result<Head> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Ok(Head::None);
+    let file = open_history_file(base, path)?;
+    {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(Head::None);
+        }
     }
     let limit = u64::try_from(config.head_bytes).unwrap_or(u64::MAX);
     let mut head = Vec::new();
@@ -273,6 +306,59 @@ fn read_cwd(
     Ok(Head::None)
 }
 
+/// Opens the history file at `path`, which must lie below the canonical
+/// history root `base`, relative to directory fds. The root is opened once by
+/// path (it may be a link in a dotfiles setup, and no ancestor above it needs
+/// read permission); every component below it, including the file itself, is
+/// opened with `openat` and `O_NOFOLLOW`, so a directory swapped for a
+/// symlink after the walk is not followed.
+fn open_history_file(base: &Path, path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let relative = path
+        .strip_prefix(base)
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => components.push(name),
+            Component::CurDir => {}
+            Component::RootDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "history path is not plain below its root",
+                ));
+            }
+        }
+    }
+    let Some((file_name, directories)) = components.split_last() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no history file name",
+        ));
+    };
+    let mut cursor = rustix::fs::open(
+        base,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    for name in directories {
+        cursor = open_dir_at(&cursor, name)?;
+    }
+    let flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+    let handle =
+        rustix::fs::openat(&cursor, *file_name, flags, Mode::empty()).map_err(io::Error::from)?;
+    Ok(std::fs::File::from(handle))
+}
+
+/// Opens the directory `name` below `parent` with `O_NOFOLLOW`.
+fn open_dir_at(parent: &OwnedFd, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    rustix::fs::openat(parent, name, flags, Mode::empty()).map_err(io::Error::from)
+}
+
 /// `text` as a working directory, or `None` unless it is an absolute path of
 /// plain components within [`MAX_CWD_BYTES`] and without a NUL byte.
 fn validated_cwd(text: &str) -> Option<PathBuf> {
@@ -285,4 +371,93 @@ fn validated_cwd(text: &str) -> Option<PathBuf> {
             .components()
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)));
     plain.then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Restores a directory's mode on drop so the tempdir can be removed even
+    /// when an assertion fails.
+    struct Restore(PathBuf);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn read_cwd_refuses_an_intermediate_symlink_component() {
+        let dir = pohunek_test_support::tempdir().expect("fixture directory");
+        let base = dir.path();
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("create real directory");
+        std::fs::write(real.join("inside.jsonl"), "{\"cwd\":\"/work\"}\n")
+            .expect("write history file");
+        // An intermediate component that is a symlink towards the real tree.
+        let link = base.join("linked");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink intermediate directory");
+        let config = CandidateConfig::default();
+        let result = read_cwd(base, &link.join("inside.jsonl"), None, &config);
+        assert!(
+            result.is_err(),
+            "an intermediate symlink must be refused, got {result:?}"
+        );
+        let plain = read_cwd(base, &real.join("inside.jsonl"), None, &config);
+        assert_eq!(
+            plain.expect("a plain path below the root is read"),
+            Head::Cwd(PathBuf::from("/work"))
+        );
+    }
+
+    #[test]
+    fn read_cwd_refuses_a_path_outside_its_root() {
+        let dir = pohunek_test_support::tempdir().expect("fixture directory");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::write(dir.path().join("outside.jsonl"), "{\"cwd\":\"/work\"}\n")
+            .expect("write history file");
+        let result = read_cwd(
+            &root,
+            &dir.path().join("outside.jsonl"),
+            None,
+            &CandidateConfig::default(),
+        );
+        assert!(result.is_err(), "a path outside the root is refused");
+    }
+
+    #[test]
+    fn read_cwd_needs_no_read_permission_above_the_root() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: permission checks do not apply to root");
+            return;
+        }
+        let dir = pohunek_test_support::tempdir().expect("fixture directory");
+        let outer = dir.path().join("outer");
+        let root = outer.join("history");
+        std::fs::create_dir_all(root.join("proj")).expect("create the tree");
+        std::fs::write(root.join("proj/s.jsonl"), "{\"cwd\":\"/work\"}\n")
+            .expect("write history file");
+        let _restore = Restore(outer.clone());
+        // Search without read permission on the ancestor above the history root.
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o300))
+            .expect("restrict the ancestor");
+        assert!(
+            std::fs::read_dir(&outer).is_err(),
+            "the ancestor must not be listable for the test to prove anything"
+        );
+        let result = read_cwd(
+            &root,
+            &root.join("proj/s.jsonl"),
+            None,
+            &CandidateConfig::default(),
+        );
+        assert_eq!(
+            result.expect("a search-only ancestor does not block the read"),
+            Head::Cwd(PathBuf::from("/work"))
+        );
+    }
 }
