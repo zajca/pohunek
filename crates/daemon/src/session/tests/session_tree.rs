@@ -388,15 +388,15 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
     );
 
     // With a `session_ids` selector the caller's subtree still applies:
-    // the caller itself and the named outsider survive, so a fresh
-    // grandchild below a surviving child proves the selector path removes
-    // inside the subtree.
-    let grandchild = exited_child_on(&registry, &caller.id, "rights-exiter", None).await;
-    age_finished(&registry, &grandchild.id).await;
+    // both the caller and the named outsider survive, so a fresh aged
+    // child of the caller proves the selector path removes inside the
+    // subtree.
+    let second_child = exited_child_on(&registry, &caller.id, "rights-exiter", None).await;
+    age_finished(&registry, &second_child.id).await;
     let named = serve(
         state_for(Some(std::sync::Arc::clone(&peer))),
         SessionRetentionParams {
-            session_ids: Some(vec![outsider.id.clone(), grandchild.id.clone()]),
+            session_ids: Some(vec![outsider.id.clone(), second_child.id.clone()]),
             ..SessionRetentionParams::default()
         },
     )
@@ -407,7 +407,7 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
     assert_eq!(named["removed"], 1, "{named}");
     assert_eq!(
         named["sessions"][0]["session_id"].as_str(),
-        Some(grandchild.id.0.as_str()),
+        Some(second_child.id.0.as_str()),
         "{named}"
     );
     assert!(
@@ -420,7 +420,11 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
     );
 
     // A `spawned_by` selector pointing outside the caller's tree selects
-    // nothing under the subtree filter.
+    // nothing under the subtree filter. The outsider holds an aged
+    // terminal child of its own, so an `examined == 0` answer proves the
+    // filter ran, not that the outsider is childless.
+    let outsider_child = exited_child_on(&registry, &outsider.id, "rights-exiter", None).await;
+    age_finished(&registry, &outsider_child.id).await;
     let by_parent = serve(
         state_for(Some(std::sync::Arc::clone(&peer))),
         SessionRetentionParams {
@@ -432,6 +436,37 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
     .into_result()
     .expect("the spawned_by sweep answers");
     assert_eq!(by_parent["examined"], 0, "{by_parent}");
+    assert!(
+        !by_parent.to_string().contains(outsider_child.id.0.as_str()),
+        "the outsider child id is not reported: {by_parent}"
+    );
+    assert!(
+        session_ids(&registry).await.contains(&outsider_child.id.0),
+        "the outsider child survives a spawned_by sweep by the session caller"
+    );
+
+    // An unattested connection carries no class the sweep trusts: it is
+    // refused and removes nothing, with default params and with
+    // `dry_run: true`.
+    for params in [
+        SessionRetentionParams::default(),
+        SessionRetentionParams {
+            dry_run: true,
+            ..SessionRetentionParams::default()
+        },
+    ] {
+        let unattested = serve(state_for(None), params).await;
+        let error = unattested.into_result().expect_err("refused");
+        assert_eq!(error.code.as_str(), "session_right_denied", "{error:?}");
+        assert!(
+            error.msg.contains("unknown_caller"),
+            "the refusal names the caller class: {error:?}"
+        );
+        assert!(
+            session_ids(&registry).await.contains(&outsider.id.0),
+            "the outsider survives a refused sweep"
+        );
+    }
 
     // The owner state (no peer, so the socket is attested) still sweeps
     // with owner rights and removes the outsider.
@@ -446,20 +481,14 @@ async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
         .await
         .into_result()
         .expect("the owner sweep answers");
-    assert_eq!(result["removed"], 1, "{result}");
+    assert_eq!(result["removed"], 2, "{result}");
     assert!(
         !session_ids(&registry).await.contains(&outsider.id.0),
         "an owner sweep removes the outsider"
     );
-
-    // An unattested connection carries no class the sweep trusts: it is
-    // refused and removes nothing.
-    let unattested = serve(state_for(None), SessionRetentionParams::default()).await;
-    let error = unattested.into_result().expect_err("refused");
-    assert_eq!(error.code.as_str(), "session_right_denied", "{error:?}");
     assert!(
-        error.msg.contains("unknown_caller"),
-        "the refusal names the caller class: {error:?}"
+        !session_ids(&registry).await.contains(&outsider_child.id.0),
+        "an owner sweep removes the outsider child"
     );
     registry.stop(&caller.id).await.expect("stop the caller");
 }
