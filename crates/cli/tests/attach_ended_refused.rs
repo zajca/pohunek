@@ -1,5 +1,5 @@
-//! Binary-level scenario for an attach whose session ends between the
-//! reconnect probe and the re-attach.
+//! Binary-level scenarios for an attach whose session ends around the
+//! reconnect path.
 //!
 //! The fixture daemon mimics the `session stop` race of zajca/pohunek#1184
 //! case d: it answers the first `session.inspect` after the stream died with
@@ -10,6 +10,10 @@
 //! sequence the client has already sent — the state gate is the fixture's
 //! own mutex, so the probe=Running then attach=refused interleaving holds
 //! on every run with no timing involved.
+//!
+//! A second scenario covers the first attach: a target that is already gone
+//! is refused with `session_not_found`, and the client must surface that
+//! refusal unchanged (non-zero exit) instead of reporting an ended session.
 
 #![cfg(unix)]
 
@@ -59,6 +63,9 @@ struct Fixture {
     stream: Arc<Mutex<Option<UnixStream>>>,
     /// The client sent `session.detach` after reading the stream EOF.
     detached: Arc<Mutex<bool>>,
+    /// Refuse the first `session.attach` instead of minting a stream token:
+    /// models a first attach to a missing session (H1 guard scenario).
+    refuse_first_attach: bool,
 }
 
 impl Clone for Fixture {
@@ -68,6 +75,7 @@ impl Clone for Fixture {
             attaches: Arc::clone(&self.attaches),
             stream: Arc::clone(&self.stream),
             detached: Arc::clone(&self.detached),
+            refuse_first_attach: self.refuse_first_attach,
         }
     }
 }
@@ -104,7 +112,12 @@ impl Drop for CliProcess {
 
 /// Starts a real `pohunek attach` against the fixture daemon on a PTY and
 /// returns its exit status, combined output, and the fixture record.
-fn refused_reattach_scenario() -> (bool, String, Fixture) {
+///
+/// When `refuse_first_attach` is set, the fixture refuses the first
+/// `session.attach` with `session_not_found` and the client must exit
+/// non-zero with that code; otherwise the fixture drives the full
+/// refused-reattach sequence.
+fn refused_reattach_scenario(refuse_first_attach: bool) -> (bool, String, Fixture) {
     let env = TestEnv::new().expect("create the hermetic test environment");
     let root = env.root().to_path_buf();
     for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -124,7 +137,10 @@ fn refused_reattach_scenario() -> (bool, String, Fixture) {
     .expect("make the config directory owner-private");
     let socket = root.join("run/pohunek/daemon.sock");
 
-    let fixture = Fixture::default();
+    let fixture = Fixture {
+        refuse_first_attach,
+        ..Fixture::default()
+    };
     serve_fixture_daemon(&socket, &fixture);
 
     let pair = native_pty_system()
@@ -155,42 +171,45 @@ fn refused_reattach_scenario() -> (bool, String, Fixture) {
     let _env = env;
     let mut reader = pair.master.try_clone_reader().expect("pty reader");
     let output = Arc::new(Mutex::new(Vec::new()));
-    {
-        let output = Arc::clone(&output);
-        thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
-                output
-                    .lock()
-                    .expect("output lock")
-                    .extend_from_slice(&buffer[..read]);
+    // The reader is joined after the child exits, before the output is
+    // asserted: the child writes the ended message and then exits, and
+    // nothing orders a detached reader's last chunk before the exit poll.
+    let output_writer = Arc::clone(&output);
+    let reader_thread = thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = reader.read(&mut buffer) {
+            if read == 0 {
+                break;
             }
-        });
-    };
-
-    // The client attaches and opens the subscription before the reconnect
-    // path is armed; wait for that round-trip to settle so the kill is not
-    // raced with setup.
-    poll_until("the fixture to serve the attach and subscription", || {
-        fixture
-            .methods()
-            .iter()
-            .any(|method| method == protocol::method::SUBSCRIBE)
-            .then_some(())
+            output_writer
+                .lock()
+                .expect("output lock")
+                .extend_from_slice(&buffer[..read]);
+        }
     });
-    // The stop kills the raw stream while the session is still listed as
-    // running; the client reads EOF on its next read.
-    fixture
-        .stream
-        .lock()
-        .expect("stream lock")
-        .take()
-        .expect("the attach stream is open")
-        .shutdown(std::net::Shutdown::Both)
-        .expect("kill the attach stream");
+
+    if !refuse_first_attach {
+        // The client attaches and opens the subscription before the
+        // reconnect path is armed; wait for that round-trip to settle so the
+        // kill is not raced with setup.
+        poll_until("the fixture to serve the attach and subscription", || {
+            fixture
+                .methods()
+                .iter()
+                .any(|method| method == protocol::method::SUBSCRIBE)
+                .then_some(())
+        });
+        // The stop kills the raw stream while the session is still listed as
+        // running; the client reads EOF on its next read.
+        fixture
+            .stream
+            .lock()
+            .expect("stream lock")
+            .take()
+            .expect("the attach stream is open")
+            .shutdown(std::net::Shutdown::Both)
+            .expect("kill the attach stream");
+    }
 
     // The client must end on its own once the stop commits: the failed run
     // without the fix still ends (with exit 1 after the refusing re-attach),
@@ -201,6 +220,7 @@ fn refused_reattach_scenario() -> (bool, String, Fixture) {
     });
     let exited_zero = status.success();
     drop(cli);
+    reader_thread.join().expect("join the pty reader");
     let bytes = output.lock().expect("output lock").clone();
     (
         exited_zero,
@@ -269,6 +289,21 @@ fn result_for(request: &Request, fixture: &Fixture) -> Response {
             }),
         ),
         protocol::method::SESSION_ATTACH => {
+            if fixture.refuse_first_attach {
+                // A first attach to a missing session: the refusal must
+                // surface unchanged, never as an ended session.
+                return Response::err(
+                    PROTOCOL_VERSION,
+                    request.id(),
+                    ProtocolError::new(
+                        ErrorClass::Runtime,
+                        "session_not_found",
+                        format!("session not found: {SESSION_ID}"),
+                        None,
+                    ),
+                )
+                .expect("valid fixture response");
+            }
             let mut attaches = fixture.attaches.lock().expect("attaches lock");
             *attaches += 1;
             if *attaches == 1 {
@@ -356,7 +391,7 @@ fn session(state: &str) -> Value {
 
 #[test]
 fn an_attach_whose_session_ends_between_probe_and_reattach_exits_zero() {
-    let (exited_zero, output, fixture) = refused_reattach_scenario();
+    let (exited_zero, output, fixture) = refused_reattach_scenario(false);
 
     assert!(
         exited_zero,
@@ -371,13 +406,42 @@ fn an_attach_whose_session_ends_between_probe_and_reattach_exits_zero() {
         "no daemon error is reported for an ended session: {output:?}"
     );
     let methods = fixture.methods();
+    let tail: Vec<&str> = methods
+        .iter()
+        .skip_while(|method| *method != protocol::method::SESSION_DETACH)
+        .skip(1)
+        .map(String::as_str)
+        .collect();
+    // After the stream EOF the client detaches, probes (running), re-attaches
+    // (refused), and confirms the end (stopped): no other request may run in
+    // between. Probe-inspect counts alone cannot prove the confirming inspect,
+    // because the status snapshot and the status updater inspect earlier.
+    assert_eq!(
+        tail,
+        [
+            protocol::method::SESSION_INSPECT,
+            protocol::method::SESSION_ATTACH,
+            protocol::method::SESSION_INSPECT,
+        ],
+        "the refused re-attach is confirmed by a fresh inspect: {methods:?}"
+    );
+}
+
+#[test]
+fn a_first_attach_to_a_missing_session_still_fails_with_session_not_found() {
+    let (exited_zero, output, _fixture) = refused_reattach_scenario(true);
+
     assert!(
-        methods
-            .iter()
-            .filter(|method| *method == protocol::method::SESSION_INSPECT)
-            .count()
-            >= 3,
-        "the refusal is confirmed by a fresh inspect: {methods:?}"
+        !exited_zero,
+        "a first attach to a missing session still fails: {output:?}"
+    );
+    assert!(
+        !output.contains("attach ended"),
+        "a first attach never reports an ended session: {output:?}"
+    );
+    assert!(
+        output.contains("session_not_found"),
+        "the refusal surfaces unchanged: {output:?}"
     );
 }
 
