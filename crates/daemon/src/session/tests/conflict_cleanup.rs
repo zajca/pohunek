@@ -1247,11 +1247,18 @@ async fn a_stop_racing_a_reconnected_worker_returns_busy_and_clears_the_intent()
         crate::runtime::Worker::connect_discovered(&socket_path, registry.daemon_instance_id())
             .await
             .expect("reconnect the worker");
-    {
-        let mut sessions = registry.inner.sessions.lock().await;
-        let entry = sessions.get_mut(&id).expect("session entry");
-        entry.runtime = crate::session::RuntimeHandle::Worker(reconnected);
-    };
+    // The watcher's reconnect installs the handle after it wrote the durable
+    // record, so that write lands over the committed stop intent.
+    let adopted = registry
+        .adopt_reconnected_worker(&id, &escalation.expected, reconnected)
+        .await;
+    assert!(
+        matches!(
+            adopted,
+            crate::session::RuntimeTransitionOutcome::Applied(_)
+        ),
+        "the reconnect is adopted: {adopted:?}"
+    );
 
     let error = escalation
         .end_unresponsive_worker()

@@ -8753,10 +8753,10 @@ impl SessionRegistry {
         attempted_desired_state: DesiredState,
         attempted_transaction_id: &str,
         expected_runtime: Option<&RuntimeWatchIdentity>,
-    ) {
+    ) -> bool {
         let mut sessions = self.inner.sessions.lock().await;
         let Some(entry) = sessions.get_mut(id) else {
-            return;
+            return false;
         };
         let runtime_matches = expected_runtime.map_or_else(
             || RuntimeWatchIdentity::from_info(&entry.info).is_none(),
@@ -8775,7 +8775,9 @@ impl SessionRegistry {
             entry.stop_transaction_id = None;
             entry.desired_state = previous_desired_state;
             entry.procwatch_rescan.request();
+            return true;
         }
+        false
     }
 
     async fn ensure_session_running(&self, id: &SessionId) -> Result<(), ProtocolError> {

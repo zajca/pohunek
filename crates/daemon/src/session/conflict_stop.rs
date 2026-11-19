@@ -301,14 +301,15 @@ impl SessionRegistry {
         match outcome {
             Ok(()) => Ok(()),
             Err(ReleaseFailure::NotStopped(error)) => {
-                self.rollback_stop_intent(
-                    id,
-                    committed.previous_desired_state,
-                    DesiredState::Stopped,
-                    transaction_id,
-                    stop_runtime,
-                )
-                .await;
+                let rolled_back = self
+                    .rollback_stop_intent(
+                        id,
+                        committed.previous_desired_state,
+                        DesiredState::Stopped,
+                        transaction_id,
+                        stop_runtime,
+                    )
+                    .await;
                 // Conditional on the intent still being the durable record, so
                 // a classification the watch committed meanwhile is never
                 // undone.
@@ -316,11 +317,29 @@ impl SessionRegistry {
                     .write_session_record_if_current(*committed.intent, *committed.previous)
                     .await
                 {
-                    warn!(
-                        session_id = %id.0,
-                        error = %rollback,
-                        "the stop intent of a failed stop was not rolled back"
-                    );
+                    // A reconnect that wrote its record over the intent leaves
+                    // the conditional write stale; the entry, rolled back under
+                    // the lifecycle lock, is then the record to persist.
+                    if rolled_back && rollback.code == "session_record_commit_stale" {
+                        if let Err(error) = self
+                            .write_entry_record(id, |entry| {
+                                Self::session_record(id, entry, entry.desired_state, None)
+                            })
+                            .await
+                        {
+                            warn!(
+                                session_id = %id.0,
+                                error = %error,
+                                "the rolled-back stop state was not persisted"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            session_id = %id.0,
+                            error = %rollback,
+                            "the stop intent of a failed stop was not rolled back"
+                        );
+                    }
                 }
                 self.schedule_supervision_retry(id);
                 Err(error)
