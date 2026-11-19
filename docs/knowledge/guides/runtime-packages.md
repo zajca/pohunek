@@ -368,7 +368,8 @@ The pasted prompt is written once the runtime shows readiness (see
 `bracketed_paste` readiness, a silent agent gets the prompt when the startup
 grace ends, whether or not it reads input yet. For a client that sends
 `extended_input_ready_wait` (the current CLI and SDK) the non-strict wait
-lasts up to the host grace, and a client without it keeps the compat bound
+lasts up to the longer of the host grace and the runtime's `[input]`
+`startup_grace_ms`, and a client without it keeps the compat bound
 (500 ms). So a runtime with `prompt_arg = true` declares a strict readiness
 rule (`[input] ready = "screen_idle"` or `"manifest_idle"`), under which
 `session.new` fails with `session_input_not_ready` and rolls back when
