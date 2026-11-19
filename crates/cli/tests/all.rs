@@ -14,6 +14,8 @@
 mod agent_skill;
 #[path = "assistant.rs"]
 mod assistant;
+#[path = "attach_ended_refused.rs"]
+mod attach_ended_refused;
 #[path = "attach_menu_keys.rs"]
 mod attach_menu_keys;
 #[path = "attach_stream_input.rs"]

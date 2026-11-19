@@ -593,7 +593,13 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
     let mut reconnect = AttachReconnectBudget::default();
 
     loop {
-        let end = run_attach_once(
+        // A refused re-attach after a `Reattach` probe is the only path that
+        // reaches a request error here: `run_attach_once` maps every raw
+        // stream outcome to `AttachStreamEnd`, and every other request runs on
+        // the menu or subscription connections, which never return here. See
+        // `is_session_ended_refusal` for why the refusal is confirmed instead
+        // of propagated.
+        let end = match run_attach_once(
             host,
             paths,
             target,
@@ -601,7 +607,17 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             origin_daemon_id.clone(),
             origin_worker_id.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(end) => end,
+            Err(error) if is_session_ended_refusal(&error) => {
+                if confirm_session_ended(host, paths, target).await? {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if let AttachStreamEnd::SessionRemoved { worktrees_failed } = end {
             if worktrees_failed > 0 {
                 eprintln!(
@@ -2233,6 +2249,71 @@ fn reconnect_decision_from_state(state: SessionState) -> AttachReconnectDecision
         SessionState::Starting => AttachReconnectDecision::Retry,
         SessionState::Stopped | SessionState::Done | SessionState::Failed => {
             AttachReconnectDecision::Finish
+        }
+    }
+}
+
+/// A `session.attach` refusal that proves the session ended after the probe
+/// saw it running: the daemon refuses exactly the re-attach of a session
+/// that is gone (`session_not_found`, from the entry lookup) or terminal
+/// (`session_not_running`, from the running-state check), both of which can
+/// only follow a `Reattach` probe decision when the stop or exit committed
+/// between the two RPCs.
+fn is_session_ended_refusal(err: &CliError) -> bool {
+    matches!(err, CliError::Protocol(source) if matches!(source.code.as_str(), "session_not_found" | "session_not_running"))
+}
+
+/// One authoritative post-refusal inspect on the registry that refused the
+/// re-attach. Returns true when attach must end with exit 0: the session is
+/// gone or terminal, so it will never produce output again.
+async fn confirm_session_ended(
+    host: &PinnedHost,
+    paths: &Paths,
+    target: &Target,
+) -> Result<bool, CliError> {
+    let mut client = Client::connect_pinned(host, paths).await?;
+    let request = build_inspect_request(target)?;
+    match client.request(&request).await {
+        Ok(result) => {
+            let session: SessionInfo = protocol::tolerant::from_value(result)?;
+            match reconnect_decision_from_state(session.state) {
+                AttachReconnectDecision::Finish => {
+                    let state = match session.state {
+                        SessionState::Stopped => "stopped",
+                        SessionState::Done => "done",
+                        SessionState::Failed => "failed",
+                        SessionState::Running | SessionState::Starting => {
+                            unreachable!("terminal states map to Finish")
+                        }
+                    };
+                    eprintln!(
+                        "[pohunek] session {} {state}; attach ended",
+                        target.session_id,
+                    );
+                    Ok(true)
+                }
+                AttachReconnectDecision::Reattach
+                | AttachReconnectDecision::Retry
+                | AttachReconnectDecision::Fail => Ok(false),
+            }
+        }
+        Err(error) => {
+            if is_session_ended_refusal(&error) {
+                eprintln!(
+                    "[pohunek] session {} removed; attach ended",
+                    target.session_id,
+                );
+                Ok(true)
+            } else if matches!(
+                reconnect_decision_from_error(&error),
+                AttachReconnectDecision::Retry
+            ) {
+                // The daemon went away mid-confirm: rejoin the normal
+                // reconnect budget loop instead of failing the attach.
+                Ok(false)
+            } else {
+                Err(error)
+            }
         }
     }
 }
