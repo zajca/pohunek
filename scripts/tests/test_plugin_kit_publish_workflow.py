@@ -13,7 +13,7 @@ security model:
   CI run only, never for a pull request or a push run;
 - the Release path requires that the `HEAD_BRANCH` release exists in
   `zajca/pohunek`, is published (no draft, no prerelease), and that its tag
-  commit equals `HEAD_SHA` (high-1);
+  commit equals `HEAD_SHA`;
 - the job verifies the bundle provenance with `gh attestation verify`
   before the App token is minted, with the `release-evidence.yml` signer
   workflow; nightlies verify with `--source-ref refs/heads/main`;
@@ -298,17 +298,20 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         bindir.mkdir()
         (bindir / "gh").write_text("#!/bin/sh\n" + FAKE_GH_ATTESTATION_VERIFY)
         (bindir / "gh").chmod(0o755)
+        call_log = root / "gh-calls.log"
+        call_log.write_text("")
         env = {
             "PATH": f"{bindir}:/usr/bin:/bin",
             "HOME": str(root),
             "CORE_REPO": "zajca/pohunek",
+            "GH_CALL_LOG": str(call_log),
             **env,
         }
         completed = subprocess.run(
             ["bash", "-euo", "pipefail", "-c", body],
             cwd=root, env=env, capture_output=True, text=True, timeout=60,
         )
-        return completed
+        return completed, call_log
 
     def test_the_verify_steps_authenticate_gh(self):
         files = [
@@ -320,11 +323,33 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
                 self.assertIn("GH_TOKEN: ${{ github.token }}", step["env"])
                 # The run below inherits the step's own env, so it proves
                 # the step authenticates gh on its own.
-                completed = self.run_verify(step["name"], {}, files)
+                completed, call_log = self.run_verify(step["name"], {}, files)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
-                # variable gets the empty string, which gh refuses (exit 4)
-                # instead of verifying nothing.
-                refused = self.run_verify(
+                # The security property is that every uploaded bundle is
+                # verified against the pinned signer workflow and ref, so
+                # the test checks each gh call's full argv, not just that
+                # the flags appear somewhere in the script.
+                calls = call_log.read_text().splitlines()
+                expected_ref = (
+                    "refs/tags/v0.44.0"
+                    if step["name"] == "Verify the bundle provenance"
+                    else "refs/heads/main"
+                )
+                expected = [
+                    " ".join([
+                        "attestation", "verify", bundle,
+                        "--repo", "zajca/pohunek",
+                        "--signer-workflow", "zajca/pohunek/.github/workflows/release-evidence.yml",
+                        "--source-ref", expected_ref,
+                        "--deny-self-hosted-runners",
+                    ])
+                    for bundle in sorted(files)
+                ]
+                self.assertEqual(calls, expected)
+                # An unset secret or variable gives the step an empty
+                # `GH_TOKEN`, which gh refuses (exit 4) instead of
+                # verifying nothing.
+                refused, _ = self.run_verify(
                     step["name"], {"GH_TOKEN": ""}, files
                 )
                 self.assertEqual(refused.returncode, 4)
@@ -380,7 +405,7 @@ if [ "$1 $2" = "attestation verify" ]; then
     echo "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable" >&2
     exit 4
   fi
-  printf 'verified: %s\n' "$3"
+  printf '%s\n' "$*" >> "${GH_CALL_LOG:?the verify harness sets GH_CALL_LOG}"
   exit 0
 fi
 """

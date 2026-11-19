@@ -879,14 +879,26 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             ]
             for caller_file in caller_files:
                 caller = caller_texts[caller_file]
-                for match in re.finditer(
-                    rf"(?m)^    uses: \./\.github/workflows/{re.escape(reusable)}\n(?:.*\n)*?^    with:\n((?: +.*\n)+)",
-                    caller,
-                ):
-                    with self.subTest(caller=f"{caller_file}:{reusable}"):
-                        self.assertTrue(match.group(1).strip(), "the caller passes a with: block")
-                        for name in required:
-                            self.assertRegex(match.group(1), rf"(?m)^ +{name}:")
+                caller_jobs = jobs(caller)
+                found = False
+                for job_name, block in caller_jobs.items():
+                    match = re.search(
+                        rf"(?m)^    uses: \./\.github/workflows/{re.escape(reusable)}$",
+                        block,
+                    )
+                    if match is None:
+                        continue
+                    found = True
+                    with self.subTest(caller=f"{caller_file}:{job_name}:{reusable}"):
+                        with_match = re.search(r"(?m)^    with:\n((?: +.*\n)+)", block)
+                        # Without a `with:` block the run never starts when
+                        # the reusable workflow declares required inputs.
+                        if required:
+                            self.assertIsNotNone(with_match, "the caller passes a with: block")
+                            for name in required:
+                                self.assertRegex(with_match.group(1), rf"(?m)^ +{name}:")
+                with self.subTest(caller=f"{caller_file}:{reusable}"):
+                    self.assertTrue(found, "the caller uses the reusable workflow")
 
     def test_every_job_declares_its_permissions(self):
         for file, text in self.texts.items():

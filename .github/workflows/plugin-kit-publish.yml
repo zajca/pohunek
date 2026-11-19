@@ -6,7 +6,7 @@ name: Publish the plugin kit bundles
 # becomes `core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
 # `nightly-YYYYMMDD-<sha12>`.
 #
-# Release path provenance (issue #1613, high-1): the workflow matches by
+# Release path provenance (issue #1613): the workflow matches by
 # workflow *name*, so the job requires that the `HEAD_BRANCH` release exists
 # in `zajca/pohunek`, is published (not a draft and not a prerelease), and
 # that its tag commit equals `HEAD_SHA` — the same check `notify-tap.yml`
@@ -112,7 +112,7 @@ jobs:
                 ;;
             esac
             # Resolve the tag commit through the git ref namespace: a
-            # branch with the same name must not satisfy the check (H1).
+            # branch with the same name must not satisfy the check.
             # An annotated tag dereferences through its tag object.
             ref="$(gh api "repos/$CORE_REPO/git/ref/tags/$HEAD_BRANCH" --jq '.object.sha')"
             kind="$(gh api "repos/$CORE_REPO/git/ref/tags/$HEAD_BRANCH" --jq '.object.type')"
