@@ -847,13 +847,13 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
             self.assertEqual(re.findall(r"(?m)^      ([a-z_]+):\n        description:", inputs_block), inputs)
 
     def test_every_required_reusable_input_is_passed_by_every_caller(self):
-        # GitHub refuses to start a run whose caller omits a required input,
-        # so every `uses:` of a local reusable workflow must pass each of its
-        # `required: true` inputs in `with:` (fix1c: `release-build.yml` once
-        # declared an unused required `version` that neither caller passed).
+        # GitHub refuses to start a run whose caller omits a required
+        # input, so every `uses:` of a local reusable workflow must pass
+        # each of its `required: true` inputs in `with:`; actionlint flags
+        # a missing one, and this test pins it for the unit suite.
         # The caller map is derived from every local `uses:` in the
         # workflows directory, so `release-evidence.yml` and its callers
-        # are covered too (N5).
+        # are covered too.
         caller_texts = {
             path.name: path.read_text() for path in WORKFLOWS.glob("*.yml")
         }

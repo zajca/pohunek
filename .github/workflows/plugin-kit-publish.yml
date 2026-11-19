@@ -48,8 +48,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The publishing token is minted below, so provenance checks use the
-    # job's read-only token. GH_TOKEN must stay in each gh step: gh does
-    # not pick up github.token on its own in Actions (N1).
+    # job's read-only token.
     environment: plugin-kit-publish
     concurrency:
       group: plugin-kit-publish

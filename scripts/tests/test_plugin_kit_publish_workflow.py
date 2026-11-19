@@ -196,7 +196,7 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         release, nightly = steps
         # The release bundle verifies against its tag; the nightly
         # bundle verifies against main. Each condition lives in its own
-        # step block, so inverting one cannot hide behind the other (N2).
+        # step block, so inverting one cannot hide behind the other.
         self.assertEqual(
             release["if"], "${{ steps.select.outputs.prerelease != 'true' }}"
         )
@@ -222,16 +222,21 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
     def publish_steps(cls):
         jobs = cls.jobs.partition("  publish:\n")[2]
         block = jobs.split("\n    steps:\n", 1)[1]
-        steps, current = [], None
+        steps, current, mode = [], None, None
         for line in block.splitlines():
             if line.startswith("      - "):
                 current = {"env": "", "if": "", "run": "", "name": ""}
                 steps.append(current)
+                mode = None
                 rest = line[len("      - "):]
                 if rest.startswith("name: "):
                     current["name"] = rest[len("name: "):]
                 continue
             if current is None:
+                continue
+            if line.strip() == "":
+                if mode:
+                    current[mode] += "\n"
                 continue
             if line.startswith("        env:"):
                 mode = "env"
@@ -255,8 +260,34 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
             if step["name"] in ("Verify the bundle provenance", "Verify the nightly provenance")
         ]
 
-    def run_verify(self, name, env, files):
-        body = next(step for step in self.verify_steps() if step["name"] == name)["run"]
+    @classmethod
+    def action_env(cls, step):
+        # The subprocess env comes from the step's own `env:` block. The
+        # exact expression `${{ github.token }}` maps to a fixture value;
+        # any other expression maps to the empty string, which is what
+        # Actions gives for an unset secret or variable.
+        def substitute(value):
+            def resolve(match):
+                expression = match.group(1).strip()
+                if expression == "github.token":
+                    return "step-fixture-token"
+                if expression == "github.event.workflow_run.head_branch":
+                    return "v0.44.0"
+                return ""
+            return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", resolve, value)
+
+        env = {}
+        for line in step["env"].splitlines():
+            if not line.strip():
+                continue
+            key, _, value = line.partition(": ")
+            env[key] = substitute(value.strip())
+        return env
+
+    def run_verify(self, name, env_overrides, files):
+        step = next(step for step in self.verify_steps() if step["name"] == name)
+        body = step["run"]
+        env = {**self.action_env(step), **env_overrides}
         root = Path(tempfile.mkdtemp(prefix="plugin-kit-verify-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         dist = root / "dist"
@@ -286,15 +317,16 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         ]
         for step in self.verify_steps():
             with self.subTest(step=step["name"]):
-                completed = self.run_verify(
-                    step["name"], {"GH_TOKEN": "fixture", "HEAD_BRANCH": "v0.44.0"}, files,
-                )
+                self.assertIn("GH_TOKEN: ${{ github.token }}", step["env"])
+                # The run below inherits the step's own env, so it proves
+                # the step authenticates gh on its own.
+                completed = self.run_verify(step["name"], {}, files)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
-                # Without the token gh refuses (exit 4), so a step that
-                # drops GH_TOKEN fails instead of verifying nothing (N1).
-                env = {"HEAD_BRANCH": "v0.44.0"}
-                env.pop("GH_TOKEN", None)
-                refused = self.run_verify(step["name"], env, files)
+                # variable gets the empty string, which gh refuses (exit 4)
+                # instead of verifying nothing.
+                refused = self.run_verify(
+                    step["name"], {"GH_TOKEN": ""}, files
+                )
                 self.assertEqual(refused.returncode, 4)
                 self.assertIn("GH_TOKEN", refused.stderr)
 
@@ -339,7 +371,7 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
 
 
 FAKE_GH_ATTESTATION_VERIFY = """\
-# The real gh refuses to run in Actions without GH_TOKEN (N1):
+# The real gh refuses to run in Actions without a token:
 # "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN
 # environment variable" (exit 4). The fake fails the same way so a
 # verify step without the token cannot regress to green.
@@ -355,7 +387,7 @@ fi
 
 
 FAKE_GH_RELEASE_VIEW = """\
-# The gh 2.x `release view --json` fields (fix1b item 1): an unknown field
+# The gh 2.x `release view --json` fields: an unknown field
 # exits nonzero, so a workflow that asks for one fails instead of
 # publishing on empty data.
 if [ "$1 $2" = "release view" ]; then
