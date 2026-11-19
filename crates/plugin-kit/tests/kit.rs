@@ -968,6 +968,66 @@ fn kit_lint_refuses_a_context_package_without_the_context_feature() {
 }
 
 #[test]
+fn kit_lint_refuses_a_context_package_with_a_missing_dir() {
+    let kit = Kit::new();
+    let dir = kit.dir("context-missing-dir");
+    copy_dir(&context_fixture_dir(), &dir);
+    let manifest = fs::read_to_string(dir.join("runtime.toml")).expect("read the manifest");
+    let manifest = manifest.replace("dir = \"bundle\"", "dir = \"absent\"");
+    assert!(
+        manifest.contains("dir = \"absent\""),
+        "the fixture names the bundle dir"
+    );
+    fs::write(dir.join("runtime.toml"), manifest).expect("point dir at nothing");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("context.dir"),
+        "the refusal names the missing context dir: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_package_with_neither_table() {
+    let kit = Kit::new();
+    let dir = kit.dir("neither-table");
+    copy_dir(&context_fixture_dir(), &dir);
+    let manifest = fs::read_to_string(dir.join("runtime.toml")).expect("read the manifest");
+    let manifest = manifest
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("[context]") && !trimmed.starts_with("dir =")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        !manifest.contains("[context]"),
+        "the variant drops the context table"
+    );
+    fs::write(dir.join("runtime.toml"), manifest).expect("drop the context table");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("package lint failed"),
+        "the refusal names lint: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn kit_verify_refuses_a_wrong_digest() {
     let kit = Kit::new();
     let archive = kit.build(&fixture_dir(), "out");
