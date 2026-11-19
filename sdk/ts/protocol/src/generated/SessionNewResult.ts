@@ -340,8 +340,8 @@ export type SessionNewResult = {
   /**
    * Deferred initial prompt of a kept `session.new` create (see
    * [`SessionInitialInput`]). Absent for sessions created without
-   * initial input. Computed live on list/inspect/new responses;
-   * stored records and events never carry it.
+   * initial input. Computed live and carried by list, inspect and new
+   * responses and by session events; stored records never carry it.
    */
   initial_input?: SessionInitialInput;
   /**

@@ -1914,10 +1914,13 @@ Important fields:
   session created with initial `input`. `pending` means the create kept the
   session while the agent was `blocked` and the daemon still holds the prompt
   (nothing written to the PTY yet); `delivered` means the deferred prompt was
-  written exactly once after the agent turned `idle`; `dropped` means it will
+  written exactly once after the session published `input_ready` and its
+  activity no longer read `blocked`; `dropped` means it will
   never be delivered, with `reason` one of `daemon_restart` (the daemon
   restarted while the prompt was deferred; the text is never persisted, so it
-  is gone), `session_stopped` or `session_exited`. A daemon that predates the
+  is gone), `session_stopped`, `session_exited` or `delivery_failed` (the
+  write failed on a still-running session). Session events carry the field
+  too. A daemon that predates the
   field omits it. Human `session show` prints it as an `initial_input` row.
 - `skip_repo_hooks`: `true` when the session was started with
   `skip_repo_hooks` and runs none of the in-repo hook layer for any of its

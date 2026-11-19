@@ -3145,13 +3145,14 @@ impl SessionCapabilityRefusals {
 
 /// Pending initial input of a kept `session.new` create.
 ///
-/// Set only on `session.list` and `session.inspect` responses (and on the
-/// `SessionInfo` flattened into `SessionNewResult`) for a session whose
-/// initial-input wait timed out while the agent was `blocked`: the session
-/// is kept, the prompt text is held in daemon memory (never persisted at
-/// rest), and the same readiness signal the normal initial-input path uses
-/// delivers it exactly once. Absent for sessions created without initial
-/// input. Computed live; stored records and events never carry it.
+/// Set on `session.list`, `session.inspect` and `session.new` responses (the
+/// `SessionInfo` flattened into `SessionNewResult`) and on session events,
+/// for a session whose initial-input wait timed out while the agent was
+/// `blocked`: the session is kept, the prompt text is held in daemon memory
+/// (never persisted at rest), and the same readiness signal the normal
+/// initial-input path uses delivers it exactly once. Absent for sessions
+/// created without initial input. Computed live; stored records never carry
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionInitialInput.ts"))]
@@ -3532,8 +3533,8 @@ pub struct SessionInfo {
     pub attention_isolated_by: Option<SessionId>,
     /// Deferred initial prompt of a kept `session.new` create (see
     /// [`SessionInitialInput`]). Absent for sessions created without
-    /// initial input. Computed live on list/inspect/new responses;
-    /// stored records and events never carry it.
+    /// initial input. Computed live and carried by list, inspect and new
+    /// responses and by session events; stored records never carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub initial_input: Option<SessionInitialInput>,

@@ -6,13 +6,14 @@ import type { SessionInitialInputState } from "./SessionInitialInputState";
 /**
  * Pending initial input of a kept `session.new` create.
  *
- * Set only on `session.list` and `session.inspect` responses (and on the
- * `SessionInfo` flattened into `SessionNewResult`) for a session whose
- * initial-input wait timed out while the agent was `blocked`: the session
- * is kept, the prompt text is held in daemon memory (never persisted at
- * rest), and the same readiness signal the normal initial-input path uses
- * delivers it exactly once. Absent for sessions created without initial
- * input. Computed live; stored records and events never carry it.
+ * Set on `session.list`, `session.inspect` and `session.new` responses (the
+ * `SessionInfo` flattened into `SessionNewResult`) and on session events,
+ * for a session whose initial-input wait timed out while the agent was
+ * `blocked`: the session is kept, the prompt text is held in daemon memory
+ * (never persisted at rest), and the same readiness signal the normal
+ * initial-input path uses delivers it exactly once. Absent for sessions
+ * created without initial input. Computed live; stored records never carry
+ * it.
  */
 export type SessionInitialInput = {
   /**
