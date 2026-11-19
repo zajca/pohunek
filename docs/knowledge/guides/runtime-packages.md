@@ -123,6 +123,7 @@ The features this core implements:
 | `detect-composer-absent-v1` | 0.42.0 | detection manifest rule matcher `composer_absent` (no descriptor key; enforced against the manifest the descriptor names) |
 | `agent-skill-v1` | 0.42.0 | `[agent_skill]` |
 | `prompt-arg-dash-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the dash rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
+| `prompt-arg-word-paste-v1` | 0.44.0 | `[runtime] prompt_arg` (no new key; a package that needs the bare-word rule below before it sets `prompt_arg = true` lists the feature so an older core refuses it) |
 
 The core owns an append-only table of its features. A row is never removed or
 renamed, because a published descriptor may require it; the table equals a
@@ -351,17 +352,23 @@ descriptor with `runtime_feature_unsupported` (0.38) or `descriptor_invalid`
 
 With `[runtime] prompt_arg = true`, the first prompt of `session.new` is
 appended to the launch arguments as the last argv element, unless the prompt
-starts with `-`. A prompt that starts with `-` is never put in the argv. The core
+starts with `-` or is a single bare word: non-empty and made only of ASCII
+letters, digits, `-`, `_`, `.` and `:`. Such a prompt is never put in the argv. The core
 launches the agent without it and pastes it after readiness, the same way it
 delivers the first prompt of a runtime with `prompt_arg = false`, so an agent
-that parses options after positionals cannot read it as a flag. Text that does
-not start with `-` keeps its argv delivery. A session launched through a
+that parses options after positionals cannot read it as a flag (for example codex
+`logout`), and one that dispatches a trailing bare word cannot run it as a
+subcommand. Every other text keeps its argv delivery; a composer-special word
+such as `/compact`, `!make` or `@file` stays in the argv because it holds a
+character outside the set. A session launched through a
 profile always pastes its first prompt.
 
-A package that sets `prompt_arg = true` and relies on this rule lists
-`prompt-arg-dash-paste-v1` in its top-level `requires` array, so a core without the rule refuses
-the package instead of passing a dash prompt as a flag. A package that does not
-list it still gets the rule on this core.
+A package that sets `prompt_arg = true` and relies on these rules lists
+`prompt-arg-dash-paste-v1` and `prompt-arg-word-paste-v1` in its top-level `requires` array,
+so a core without the rules refuses
+the package instead of passing a dash prompt as a flag or a bare word as a
+subcommand. A package that does not
+list them still gets the rules on this core.
 
 The pasted prompt is written once the runtime shows readiness (see
 [Declaring input readiness](#declaring-input-readiness)). Under the default

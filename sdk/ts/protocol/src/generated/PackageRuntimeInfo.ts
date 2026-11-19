@@ -43,7 +43,8 @@ export type PackageRuntimeInfo = {
   /**
    * Whether the first prompt of a session is appended to the launch
    * arguments instead of being typed into the terminal. A prompt that
-   * starts with `-` is always typed into the terminal.
+   * starts with `-` or is a single bare word (ASCII letters, digits,
+   * `-`, `_`, `.`, `:`) is always typed into the terminal.
    */
   prompt_argument: boolean;
   /**

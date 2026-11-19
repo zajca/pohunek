@@ -1634,7 +1634,7 @@ async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() 
     let cwd = rig.socket.dir.join("cwd-dash-plain");
     std::fs::create_dir(&cwd).expect("create the session directory");
     let mut params = selection_params("pi", &cwd, &[], None);
-    params.input = Some("hello".to_owned());
+    params.input = Some("hello world".to_owned());
     let created: SessionInfo = serde_json::from_value(ok_payload(
         create_session_with_params(&mut rig.control, params).await,
     ))
@@ -1645,12 +1645,12 @@ async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() 
     .await;
     assert_eq!(
         launched.lines().last(),
-        Some("hello"),
+        Some("hello world"),
         "a prompt without a leading dash stays the last argv element: {launched:?}"
     );
     // The prompt rode the argv, so nothing was pasted: the fixture still
     // waits on its first stdin line. A sentinel sent through `session.input`
-    // is the first line it can read; a regression that also pasted `hello`
+    // is the first line it can read; a regression that also pasted the prompt
     // would have filled `stdin.out` with the prompt instead.
     let sentinel = Request::make(
         "agent-options-dash-plain-sentinel",
@@ -1671,5 +1671,102 @@ async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() 
         typed, "sentinel\n",
         "the plain prompt is not also pasted: {typed:?}"
     );
+    rig.finish().await;
+}
+
+/// A one-word first prompt of `session.new` is typed into the agent after
+/// readiness and never becomes an argv token, so a `prompt_arg` runtime
+/// cannot dispatch it as a subcommand (for example codex `logout`). Text
+/// with a space or a composer-special character keeps its argv delivery.
+#[tokio::test]
+async fn a_one_word_first_prompt_is_typed_not_dispatched_as_a_subcommand() {
+    let mut rig = OptionRig::start("agent-options-word-prompt", true).await;
+    let program = rig.socket.dir.join("prompt-agent");
+    std::fs::write(&program, PROMPT_PROGRAM).expect("write the fixture runtime");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fixture runtime executable");
+    install_package(
+        &mut rig,
+        pi_package(
+            "requires = [\"prompt-arg-dash-paste-v1\", \"prompt-arg-word-paste-v1\"]\n",
+            &program.display().to_string(),
+            "",
+            "",
+        ),
+    )
+    .await;
+
+    for (index, prompt) in ["logout", "e", "completion"].into_iter().enumerate() {
+        let cwd = rig.socket.dir.join(format!("cwd-word-{index}"));
+        std::fs::create_dir(&cwd).expect("create the session directory");
+        let mut params = selection_params("pi", &cwd, &[], None);
+        params.input = Some(prompt.to_owned());
+        ok_payload(create_session_with_params(&mut rig.control, params).await);
+
+        let launched = wait_until("the fixture runtime records its argv", || async {
+            std::fs::read_to_string(cwd.join("argv.out")).ok()
+        })
+        .await;
+        assert!(
+            launched.lines().all(|line| line != prompt),
+            "{prompt:?} reached the argv: {launched:?}"
+        );
+        let typed = wait_until("the fixture runtime records its stdin", || async {
+            std::fs::read_to_string(cwd.join("stdin.out")).ok()
+        })
+        .await;
+        assert_eq!(
+            typed,
+            format!("{prompt}\n"),
+            "{prompt:?} arrives as typed input"
+        );
+    }
+
+    for (index, prompt) in ["logout now", "hello world", "/compact"]
+        .into_iter()
+        .enumerate()
+    {
+        let cwd = rig.socket.dir.join(format!("cwd-word-argv-{index}"));
+        std::fs::create_dir(&cwd).expect("create the session directory");
+        let mut params = selection_params("pi", &cwd, &[], None);
+        params.input = Some(prompt.to_owned());
+        let created: SessionInfo = serde_json::from_value(ok_payload(
+            create_session_with_params(&mut rig.control, params).await,
+        ))
+        .expect("the argv prompt creates a session");
+        let launched = wait_until("the fixture runtime records its argv", || async {
+            std::fs::read_to_string(cwd.join("argv.out")).ok()
+        })
+        .await;
+        assert_eq!(
+            launched.lines().last(),
+            Some(prompt),
+            "{prompt:?} stays the last argv element: {launched:?}"
+        );
+        // The prompt rode the argv, so nothing was pasted: the fixture still
+        // waits on its first stdin line. A sentinel sent through
+        // `session.input` is the first line it can read; a regression that
+        // also pasted the prompt would have filled `stdin.out` with it.
+        let sentinel_id = format!("agent-options-word-argv-sentinel-{index}");
+        let sentinel = Request::make(
+            &sentinel_id,
+            method::SESSION_INPUT,
+            serde_json::to_value(SessionInputParams {
+                session_id: created.id.clone(),
+                text: "sentinel\n".to_owned(),
+                wait: None,
+            })
+            .expect("serialize input params"),
+        );
+        ok_payload(exchange(&mut rig.control, &sentinel).await);
+        let typed = wait_until("the fixture runtime records its stdin", || async {
+            std::fs::read_to_string(cwd.join("stdin.out")).ok()
+        })
+        .await;
+        assert_eq!(
+            typed, "sentinel\n",
+            "{prompt:?} is not also pasted: {typed:?}"
+        );
+    }
     rig.finish().await;
 }
