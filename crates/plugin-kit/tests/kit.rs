@@ -71,6 +71,42 @@ fn fixture_dir() -> PathBuf {
     pohunek_test_support::manifest_dir().join("tests/fixtures/kit-package")
 }
 
+fn context_fixture_dir() -> PathBuf {
+    pohunek_test_support::manifest_dir().join("tests/fixtures/kit-context-package")
+}
+
+/// Marks a program executable on Unix; a no-op elsewhere (the kit reads the
+/// archive executable bit the test harness sets on Unix only).
+#[cfg(unix)]
+fn make_executable(program: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(program, fs::Permissions::from_mode(0o755))
+        .expect("make the program executable");
+}
+
+/// Marks a program executable on Unix; a no-op elsewhere (the kit reads the
+/// archive executable bit the test harness sets on Unix only).
+#[cfg(not(unix))]
+fn make_executable(_program: &Path) {}
+
+/// Copies a directory tree: used to mutate a fixture copy without touching
+/// the fixture itself.
+fn copy_dir(from: &Path, to: &Path) {
+    let mut stack = vec![from.to_path_buf()];
+    while let Some(source) = stack.pop() {
+        let relative = source.strip_prefix(from).expect("below the source");
+        let target = to.join(relative);
+        if source.is_dir() {
+            fs::create_dir_all(&target).expect("create the directory");
+            for entry in fs::read_dir(&source).expect("read the directory") {
+                stack.push(entry.expect("read the entry").path());
+            }
+        } else {
+            fs::copy(&source, &target).expect("copy the file");
+        }
+    }
+}
+
 /// Release binaries the isolated daemon copies beside the kit binary; a
 /// change to any of them must re-run the kit suite (`BINARY_USES`).
 const POHUNEK_BIN: &str = "pohunek";
@@ -850,6 +886,8 @@ fn kit_build_refuses_to_replace_the_archive() {
     assert_eq!(digest_of(&archive), before, "the archive is unchanged");
 }
 
+const CONTEXT_PACKAGE_ID: &str = "pohunek.context.kitfixture";
+
 #[test]
 fn kit_lint_refuses_a_broken_descriptor() {
     let kit = Kit::new();
@@ -865,6 +903,173 @@ fn kit_lint_refuses_a_broken_descriptor() {
     assert!(
         stderr_of(&output).contains("package lint failed"),
         "the refusal names lint: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_passes_a_context_package_and_reports_context() {
+    let kit = Kit::new();
+    let package = context_fixture_dir();
+    let output = kit.kit(&["lint", "--dir", s(&package)]);
+    assert!(
+        output.status.success(),
+        "context lint failed: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf-8 stdout"),
+        format!("plugin lint ok: {CONTEXT_PACKAGE_ID} {VERSION} context\n")
+    );
+    let output = kit.kit(&["lint", "--dir", s(&package), "--json"]);
+    assert!(
+        output.status.success(),
+        "context lint --json failed: {}",
+        stderr_of(&output)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("lint --json reports JSON");
+    assert_eq!(report["kind"], Value::String("context".to_owned()));
+    assert_eq!(
+        report["package_id"],
+        Value::String(CONTEXT_PACKAGE_ID.to_owned())
+    );
+    assert!(
+        report.get("runtime_id").is_none(),
+        "a context lint names no runtime id: {report}"
+    );
+    let archive = kit.build(&package, "context-out");
+    let output = kit.kit(&[
+        "verify",
+        "--dir",
+        s(&package),
+        "--archive",
+        s(&archive),
+        "--sha256",
+        &digest_of(&archive),
+    ]);
+    assert!(
+        output.status.success(),
+        "context verify failed: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_context_package_without_the_context_feature() {
+    let kit = Kit::new();
+    let dir = kit.dir("context-without-feature");
+    copy_dir(&context_fixture_dir(), &dir);
+    let manifest = fs::read_to_string(dir.join("runtime.toml")).expect("read the manifest");
+    let manifest = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("requires"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(dir.join("runtime.toml"), manifest).expect("drop requires");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("package-context-v1"),
+        "the refusal names the missing context feature: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_context_package_with_a_missing_dir() {
+    let kit = Kit::new();
+    let dir = kit.dir("context-missing-dir");
+    copy_dir(&context_fixture_dir(), &dir);
+    let manifest = fs::read_to_string(dir.join("runtime.toml")).expect("read the manifest");
+    let manifest = manifest.replace("dir = \"bundle\"", "dir = \"absent\"");
+    assert!(
+        manifest.contains("dir = \"absent\""),
+        "the fixture names the bundle dir"
+    );
+    fs::write(dir.join("runtime.toml"), manifest).expect("point dir at nothing");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("context.dir"),
+        "the refusal names the missing context dir: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_package_with_neither_table() {
+    let kit = Kit::new();
+    let dir = kit.dir("neither-table");
+    copy_dir(&context_fixture_dir(), &dir);
+    let manifest = fs::read_to_string(dir.join("runtime.toml")).expect("read the manifest");
+    let manifest = manifest
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with("[context]") && !trimmed.starts_with("dir =")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        !manifest.contains("[context]"),
+        "the variant drops the context table"
+    );
+    fs::write(dir.join("runtime.toml"), manifest).expect("drop the context table");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("package lint failed"),
+        "the refusal names lint: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("neither a runtime nor commands"),
+        "the refusal names the classify reason: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_commands_only_package() {
+    let kit = Kit::new();
+    let dir = kit.dir("commands-only");
+    fs::write(
+        dir.join("runtime.toml"),
+        "schema = 1\nid = \"pohunek.commands.kitfixture\"\nversion = \"0.1.0\"\nruntime_api = 1\nrequires = [\"package-commands-v1\"]\n\n[commands.host-state]\nprogram = \"bin/fleet-state\"\nargs = [\"--json\"]\nexpose = \"peers\"\n",
+    )
+    .expect("write the commands-only manifest");
+    let bin = dir.join("bin");
+    fs::create_dir(&bin).expect("create the program directory");
+    let program = bin.join("fleet-state");
+    fs::write(&program, "#!/bin/sh\necho ok\n").expect("write the program");
+    make_executable(&program);
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("commands only"),
+        "the refusal names commands-only: {}",
         stderr_of(&output)
     );
 }
