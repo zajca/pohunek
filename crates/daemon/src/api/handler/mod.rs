@@ -542,7 +542,10 @@ async fn handle_negotiated(
         method::SESSION_RENAME => session::handle_session_rename(request, &state.sessions).await,
         method::SESSION_DIFF => session::handle_session_diff(request, &state.sessions).await,
         method::SESSION_RETENTION_SWEEP => {
-            session::handle_session_retention_sweep(request, &state.sessions).await
+            // A `Session(_)` caller sweeps only its own subtree; every other
+            // class sweeps with owner rights.
+            let caller = caller_class(state).await;
+            session::handle_session_retention_sweep(request, &state.sessions, &caller).await
         }
         method::SESSION_INPUT => session::handle_session_input(request, &state.sessions).await,
         method::SESSION_SCREEN => session::handle_session_screen(request, &state.sessions).await,

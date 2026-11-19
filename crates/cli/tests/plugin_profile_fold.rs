@@ -421,3 +421,114 @@ async fn fold_without_dry_run_or_with_one_input_is_a_usage_error() {
     }
     harness.stop().await;
 }
+
+/// An equal `[rights]` table folds: the parent carries it, because a preset
+/// takes its parent's rights.
+#[tokio::test]
+async fn fold_carries_an_equal_rights_table_to_the_parent() {
+    let harness = Harness::start().await;
+    let rights = "[rights]\nspawn_profiles = [\"worker\"]\n";
+    for (name, model) in [("rights-opus", "opus"), ("rights-sonnet", "sonnet")] {
+        harness.profile(
+            name,
+            &format!(
+                "base = \"shell\"\nprogram = \"/bin/sh\"\n\
+                 args = [\"--model\", \"{model}\"]\n{rights}"
+            ),
+        );
+    }
+    let (code, document) = harness
+        .json(&[
+            "plugin",
+            "profile",
+            "fold",
+            "rights-opus",
+            "rights-sonnet",
+            "--into",
+            "rights",
+            "--dry-run",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let parent = table(&document["ok"]["parent"]["text"]);
+    let table = parent["rights"]
+        .as_table()
+        .expect("the parent keeps [rights]");
+    assert_eq!(table["spawn_profiles"], array(&["worker"]), "{parent:?}");
+    harness.stop().await;
+}
+
+/// Inputs whose `[rights]` tables differ cannot share a parent, because a
+/// preset takes its parent's rights.
+#[tokio::test]
+async fn fold_refuses_inputs_that_differ_in_rights() {
+    let harness = Harness::start().await;
+    harness.profile(
+        "rights-a",
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-a\"]\n\
+         [rights]\nspawn_profiles = [\"worker\"]\n",
+    );
+    harness.profile(
+        "rights-b",
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-b\"]\n\
+         [rights]\nspawn_profiles = [\"review\"]\n",
+    );
+    let (code, refused) = harness
+        .json(&[
+            "plugin",
+            "profile",
+            "fold",
+            "rights-a",
+            "rights-b",
+            "--into",
+            "parent",
+            "--dry-run",
+        ])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "fold_incompatible");
+    assert_eq!(
+        refused["err"]["msg"],
+        "cannot fold the profiles: profiles rights-a and rights-b differ in \
+         `rights`; fold needs it equal in every input",
+        "{refused}"
+    );
+    harness.stop().await;
+}
+
+/// A `[rights]` table on only one input counts as different: the parent
+/// must not gain rights one input never had.
+#[tokio::test]
+async fn fold_refuses_rights_on_only_one_input() {
+    let harness = Harness::start().await;
+    harness.profile(
+        "rights-only",
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-a\"]\n\
+         [rights]\nspawn_profiles = [\"worker\"]\n",
+    );
+    harness.profile(
+        "rights-none",
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-b\"]\n",
+    );
+    let (code, refused) = harness
+        .json(&[
+            "plugin",
+            "profile",
+            "fold",
+            "rights-only",
+            "rights-none",
+            "--into",
+            "parent",
+            "--dry-run",
+        ])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "fold_incompatible");
+    assert_eq!(
+        refused["err"]["msg"],
+        "cannot fold the profiles: profiles rights-only and rights-none differ \
+         in `rights`; fold needs it equal in every input",
+        "{refused}"
+    );
+    harness.stop().await;
+}

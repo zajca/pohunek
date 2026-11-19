@@ -156,6 +156,132 @@ async fn sweep_with_session_ids_removes_only_the_named_sessions() {
     assert_eq!(remaining, expected);
 }
 
+/// An adopt parked inside a `remove_tree` cascade is refused with
+/// `tree_removal_in_progress`, then succeeds once the cascade released
+/// its registration: the dirty child below survives the cascade, so the
+/// same adopt runs before and after it. The pre-root gate parks the
+/// cascade deterministically; both adopts run owner-side, under the same
+/// persist and sessions locks the cascade's registration guards.
+#[tokio::test]
+async fn adopt_during_a_cascade_is_refused_then_succeeds_after_it() {
+    let (registry, data_dir, _worktree_root) = retention_registry("adopt-during-cascade");
+    let repo = init_git_repo("adopt-during-cascade");
+    apply_sweep_policy(&registry, &data_dir).await;
+    let root = registry.create(params()).await.expect("create root").id;
+    let child = exited_child(&registry, &root, Some(&repo)).await;
+    let dirty_worktree = child.worktree_path.clone().expect("child worktree");
+    std::fs::write(
+        dirty_worktree.join("README.md"),
+        "work the agent did not commit\n",
+    )
+    .expect("dirty the worktree");
+    let outsider = registry.create(params()).await.expect("create outsider");
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    crate::session::remove_tree::arm_pre_root_gate_for_test(&root, entered_tx, resume_rx);
+    let cascade = tokio::spawn({
+        let registry = registry.clone();
+        let root = root.clone();
+        async move {
+            crate::session::remove_tree::remove_tree(&registry, &tree_params(&root, false)).await
+        }
+    });
+    entered_rx.await.expect("the cascade reaches the root");
+    let refused = registry
+        .adopt(&protocol::SessionAdoptParams {
+            session_id: child.id.clone(),
+            new_parent: outsider.id.clone(),
+        })
+        .await
+        .expect_err("adopt inside the cascade is refused");
+    assert_eq!(
+        refused.code.as_str(),
+        "session_adopt_refused",
+        "{refused:?}"
+    );
+    assert!(
+        refused.msg.contains("tree_removal_in_progress"),
+        "{refused:?}"
+    );
+    resume_tx.send(()).expect("release the cascade");
+    let result = cascade
+        .await
+        .expect("the cascade joins")
+        .expect("cascade runs");
+    assert_eq!(result.removed, 0, "{result:?}");
+    assert_eq!(result.kept, 2, "{result:?}");
+
+    let adopted = registry
+        .adopt(&protocol::SessionAdoptParams {
+            session_id: child.id.clone(),
+            new_parent: outsider.id.clone(),
+        })
+        .await
+        .expect("the same adopt succeeds after the cascade");
+    assert_eq!(
+        adopted
+            .session
+            .spawned_by
+            .expect("child reparented")
+            .session_id,
+        outsider.id,
+        "the child now descends from the outsider"
+    );
+}
+
+/// A sweep from a `Session(X)` caller removes only X's descendants: the
+/// aged outsider survives the sweep even without a selector, and a named
+/// id outside the subtree is not examined and not reported, like an
+/// unknown id.
+#[tokio::test]
+async fn sweep_from_a_session_caller_keeps_sessions_outside_its_subtree() {
+    let (registry, data_dir, _worktree_root) = retention_registry("sweep-session-caller");
+    apply_sweep_policy(&registry, &data_dir).await;
+
+    let caller = registry.create(params()).await.expect("create caller");
+    let child = exited_child(&registry, &caller.id, None).await;
+    let outsider = exited_session(&registry, None).await;
+    age_finished(&registry, &child.id).await;
+    age_finished(&registry, &outsider.id).await;
+    let caller = &caller.id;
+
+    let result = registry
+        .sweep_retention_as(&SessionRetentionParams::default(), Some(caller))
+        .await
+        .expect("session-caller sweep");
+
+    assert_eq!(result.examined, 1, "{result:?}");
+    assert_eq!(result.removed, 1, "{result:?}");
+    assert!(
+        result
+            .sessions
+            .iter()
+            .all(|candidate| candidate.session_id == child.id),
+        "{result:?}"
+    );
+    assert!(
+        session_ids(&registry).await.contains(&outsider.id.0),
+        "the outsider survives"
+    );
+
+    let selected = registry
+        .sweep_retention_as(
+            &SessionRetentionParams {
+                dry_run: true,
+                limit: None,
+                spawned_by: None,
+                session_ids: Some(vec![outsider.id.clone()]),
+            },
+            Some(caller),
+        )
+        .await
+        .expect("named outsider sweep");
+
+    assert_eq!(selected.examined, 0, "{selected:?}");
+    assert!(selected.sessions.is_empty(), "{selected:?}");
+}
+
 #[tokio::test]
 async fn sweep_with_spawned_by_reaches_orphans_of_a_gone_parent() {
     let (registry, data_dir, _worktree_root) = retention_registry("sweep-selector-orphans");

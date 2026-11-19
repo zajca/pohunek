@@ -18,7 +18,8 @@ use protocol::{
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
 use super::{ControlTransport, DaemonState};
 use crate::session::{
-    validate_session_list_filters, ControlPeer, ProfileChange, SessionRegistry, UnconfirmedCleanup,
+    rights::CallerClass, validate_session_list_filters, ControlPeer, ProfileChange,
+    SessionRegistry, UnconfirmedCleanup,
 };
 
 pub(super) async fn handle_session_new(
@@ -249,12 +250,19 @@ pub(super) async fn handle_session_remove_tree(
 pub(super) async fn handle_session_retention_sweep(
     request: &Request,
     sessions: &SessionRegistry,
+    caller: &CallerClass,
 ) -> Response {
     let params = match parse_optional_params::<SessionRetentionParams>(request) {
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    match sessions.sweep_retention(&params).await {
+    // Only a managed session's own caller is subtree-limited: the owner's
+    // shell and every other class sweep with owner rights.
+    let subtree = match caller {
+        CallerClass::Session(id) => Some(id),
+        _ => None,
+    };
+    match sessions.sweep_retention_as(&params, subtree).await {
         Ok(result) => ok_value(request, &result),
         Err(err) => error_value(request, err),
     }
