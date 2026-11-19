@@ -92,16 +92,21 @@ Every row and target runs one job with `contents: read`, no secret and no
 cache restore (Linux on `ubuntu-24.04`, macOS on the pinned `macos-15` label):
 
 - lint of the descriptor or manifest against the core schema and the runtime
-  features it requires;
+  features it requires; a context package lints through the same
+  install-time descriptor loader and passes with
+  `plugin lint ok: <package_id> <version> context`;
 - a reproducible double build of the archive with a byte compare, then
   verification;
 - the screen detection corpus for a runtime package (only when `corpus-dir`
-  is set);
+  is set; never for a context package: a caller that sets `corpus-dir` for
+  one fails);
 - a smoke run of the built package from the plugin kit, in an isolated root:
   the generic smoke stops after the screen check and runs the optional
   `smoke-script` on the same live isolated root only after every generic
   check passed, so the plugin's own input
-  and hook-event checks see the exact host the generic smoke passed on;
+  and hook-event checks see the exact host the generic smoke passed on.
+  A context package serves no runtime, so the smoke never runs for it: a
+  caller that sets `smoke-script` or `upstream-install` for one fails;
 - a version-bump check, so a changed archive carries a new version.
 
 A release is published on a version tag `vX.Y.Z` by the template's release
@@ -115,7 +120,9 @@ workflow, which calls the reusable
 
 The workflow builds the archive with `cargo xtask plugin build` of that core
 tag in a job with read-only permissions, and requires the pushed tag to equal
-`v` plus the archive's version. A second job, which runs no build code, checks
+`v` plus the archive's version. The publishing job declares
+`environment: release`, so the caller repository's environment protection
+(tag rules, reviewers) gates every plugin release. A second job, which runs no build code, checks
 the checksums, attests `<package_id>-<version>.tar.zst`, and publishes it with
 `SHA256SUMS` as a GitHub release of the plugin repository; only that job has
 write access to `contents` and `attestations` and the OIDC `id-token`
@@ -171,8 +178,13 @@ every subcommand takes `--dir <package dir>` and reports through a
 document). Exit status is 0 for a pass, 1 for a failed proof or a refused
 index write, and 2 for every other refusal:
 
-- `lint` loads the descriptor and the detection manifest through the same
-  parser an install runs.
+- `lint` loads the descriptor through the same parser an install runs: a
+  runtime package passes with
+  `plugin lint ok: <package_id> <version> <runtime_id>`, a context package
+  with `plugin lint ok: <package_id> <version> context` (`--json` carries
+  `"kind": "runtime"` or `"kind": "context"`, with no `runtime_id`
+  for a context package); a package that exports neither fails with a named
+  reason.
 - `build` writes the canonical archive like `xtask plugin build`.
 - `verify --archive <file> [--dir <package dir>] [--sha256 <digest>]`
   checks the archive rebuilds from the directory, twice, and matches the

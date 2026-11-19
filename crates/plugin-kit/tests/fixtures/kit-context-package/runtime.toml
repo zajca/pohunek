@@ -1,0 +1,13 @@
+# Fixture context descriptor: a package that exports a directory of files
+# and nothing else. Shape copy of the template context package. The kit
+# lints it through the install-time descriptor loader, builds and verifies
+# it, and the index proves it as a `context` entry.
+
+schema = 1
+id = "pohunek.context.kitfixture"
+version = "0.1.0"
+runtime_api = 1
+requires = ["package-context-v1"]
+
+[context]
+dir = "bundle"
