@@ -4729,6 +4729,7 @@ async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: 
     })
     .await;
     let mut control = control.into_inner();
+    // timing-allowed: #2406 a second write is an absence; only elapsed real time can show it never comes.
     tokio::time::sleep(KEPT_PROMPT_DRAIN).await;
     let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
         .expect("the stub log is text");

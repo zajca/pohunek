@@ -24630,6 +24630,7 @@ async fn initial_input_timeout_names_blocked_state_instead_of_the_startup_grace(
 async fn non_strict_create_blocked_at_the_grace_expiry_still_writes_its_input() {
     let daemon = RestartableDaemon::new("wt-nonstrict-blocked");
     let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        // timing-allowed: #2406 the grace expiry is the behavior under test.
         initial_input_startup_grace: Duration::from_millis(50),
         ..daemon.config.clone()
     });

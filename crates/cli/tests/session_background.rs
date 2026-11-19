@@ -933,6 +933,7 @@ async fn a_restarted_daemon_adopts_the_live_worker_of_a_kept_session() {
         (inspect(&harness, &id).await["activity"] == "idle").then_some(())
     })
     .await;
+    // timing-allowed: #2406 a re-delivery is an absence; only elapsed real time can show it never comes.
     tokio::time::sleep(REDELIVERY_DRAIN).await;
     let delivered = fs::read_to_string(&log).unwrap_or_default();
     assert!(
