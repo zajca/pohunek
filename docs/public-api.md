@@ -2592,7 +2592,9 @@ accepted overlay (TCP) connection has TCP keepalive set from the `service.toml`
 `keepalive_count` (30 s, 10 s and 3 by default, Linux and macOS): a peer that
 vanishes without closing the connection fails its read and releases the slot
 of an in-flight wait within `idle + interval x count` (60 s by default)
-instead of at the wait's deadline. The Unix socket is unchanged. The timeout
+instead of at the wait's deadline. Each accepted overlay connection also has
+`TCP_NODELAY` set, so small daemon replies are not coalesced into
+RTT-spaced bursts. The Unix socket is unchanged. The timeout
 stays the release bound for a client that pipelines another request line
 behind the wait: that line is answered in order after the wait's reply, and
 the read side is not watched again until then.
