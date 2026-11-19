@@ -387,10 +387,12 @@ fn created_order(created_at: &str) -> (Option<OffsetDateTime>, &str) {
 
 impl SessionEntry {
     /// Whether the entry shows an unsettled create: its initial input is still
-    /// undelivered, or its compensation could not finish. The durable record
+    /// undelivered, or its compensation could not finish. A kept create that
+    /// holds a deferred prompt is a settled session: the marker it leaves
+    /// names the deferred prompt, not a create in flight. The durable record
     /// can show more (a create transaction that reconciliation left pending).
     pub(super) fn create_unsettled(&self) -> bool {
-        self.initial_input_owner.is_some()
+        (self.initial_input_owner.is_some() && self.deferred_initial_input.is_none())
             || self.info.runtime.as_ref().is_some_and(|runtime| {
                 runtime.loss_reason.as_deref() == Some(CREATE_COMPENSATION_PENDING)
             })
