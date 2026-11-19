@@ -878,7 +878,15 @@ main and nightly evidence of the release commit covers those.
    artifact), uploads them, and then packs the SDK tarballs. The macOS jobs
    build, ad-hoc sign and verify the Apple Silicon archives; a rehearsal builds
    both macOS components in one job. No macOS job uses secrets or a protected
-   environment.
+   environment. Two more jobs (`kit-linux`, `kit-macos`, issue #1613) build the
+   owner-side plugin kit bundles (`build-kit-<target>`,
+   `pohunek-plugin-kit-<version>-<target>.tar.zst` holding `pohunek`,
+   `pohunekd`, `pohunek-sessiond` and `pohunek-plugin-kit`) on a tag release
+   and on the nightly tier only (the schedule, or a `tier=nightly` dispatch
+   passing `nightly: 'true'` — never a pull request, a push run or any other
+   rehearsal); the attest job attests them with the other producer artifacts
+   in a release, and the `attest-kit` job attests them on the nightly tier,
+   and they never enter the release bundle.
 2. **Evidence** (`release-evidence.yml`, reusable): one job per runner
    (`Rows on ubuntu-24.04`, `Rows on macos-15`) builds the release consumer
    executable once, uploads it for the smoke, then runs the runner's

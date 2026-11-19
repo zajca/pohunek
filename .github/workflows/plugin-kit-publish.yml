@@ -1,0 +1,284 @@
+name: Publish the plugin kit bundles
+
+# Publishes the attested kit bundles (`build-kit-*` artifacts of the Release
+# and nightly CI runs) as releases of the kit repository
+# `pohunekd/pohunek-plugin-kit` (issue #1613): the core release tag `vX.Y.Z`
+# becomes `core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
+# `nightly-YYYYMMDD-<sha12>`.
+#
+# Release path provenance (issue #1613): the workflow matches by
+# workflow *name*, so the job requires that the `HEAD_BRANCH` release exists
+# in `zajca/pohunek`, is published (not a draft and not a prerelease), and
+# that its tag commit equals `HEAD_SHA` — the same check `notify-tap.yml`
+# runs for the tap dispatch. It then runs `gh attestation verify` on each
+# bundle with the `release-evidence.yml` signer workflow before the token is
+# minted, plus the `path` and `head_repository` defense-in-depth checks.
+# Nightlies carry no release attestation, so the `attest-kit` job of
+# release-evidence.yml attests `build-kit-*` on the schedule and the publish
+# job verifies them with `--source-ref refs/heads/main`.
+#
+# The kit repository, its GitHub App, the `plugin-kit-publish` environment
+# and the `PLUGIN_KIT_*` variable/secret are owner-side setup (D3): until the
+# owner creates them, `vars.PLUGIN_KIT_APP_ID` is empty and this job skips
+# without touching anything. The bundle and its attestation are always built;
+# only publication is gated.
+#
+# The job checks out nothing and runs no code from this repository or from a
+# bundle: it only downloads the `build-kit-*` artifacts of the finished run,
+# checks their checksums, mints a one-hour App token, and drives `gh release`
+# in the kit repository. The attestation stays the one the `attest` job of
+# release-evidence.yml recorded: the published bytes are identical, so the
+# digest it covers does not change.
+#
+# Nightly prereleases older than 30 days are deleted after a nightly
+# publish, so the kit repository keeps a bounded nightly history.
+# Linux jobs are pinned to ubuntu-24.04 (#1731), never ubuntu-latest.
+
+on:
+  workflow_run:
+    workflows: [CI, Release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish the kit bundle to the kit repository
+    if: ${{ vars.PLUGIN_KIT_APP_ID != '' && github.event.workflow_run.conclusion == 'success' && ((github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'push') || (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'schedule')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The publishing token is minted below, so provenance checks use the
+    # job's read-only token.
+    environment: plugin-kit-publish
+    concurrency:
+      group: plugin-kit-publish
+    permissions:
+      actions: read
+      attestations: read
+    env:
+      KIT_REPO: pohunekd/pohunek-plugin-kit
+      CORE_REPO: zajca/pohunek
+      WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+      HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+    steps:
+      - name: Select the release tag
+        id: select
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$WORKFLOW_NAME" = Release ]; then
+            case "$HEAD_BRANCH" in
+              v[0-9]*.[0-9]*.[0-9]*)
+                version="${HEAD_BRANCH#v}"
+                echo "tag=core-v$version" >> "$GITHUB_OUTPUT"
+                echo "prerelease=false" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "::error::the Release run must come from a vX.Y.Z tag, got: $HEAD_BRANCH"
+                exit 1
+                ;;
+            esac
+            # The workflow matches by name, so tie the run to the real tag
+            # release: it must exist and be published (not a draft, not a
+            # prerelease), and its tag commit must equal the run's sha — the
+            # same check notify-tap.yml runs before the tap dispatch.
+            case "$WORKFLOW_PATH" in
+              .github/workflows/release.yml) ;;
+              *)
+                echo "::error::the Release run must come from release.yml, got: $WORKFLOW_PATH"
+                exit 1
+                ;;
+            esac
+            if [ "$HEAD_REPO" != "zajca/pohunek" ]; then
+              echo "::error::the Release run must come from zajca/pohunek, got: $HEAD_REPO"
+              exit 1
+            fi
+            info="$(gh release view "$HEAD_BRANCH" --repo "$CORE_REPO" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')"
+            case "$info" in
+              "false false") ;;
+              "false true")
+                echo "$HEAD_BRANCH is a pre-release; the kit release follows published releases only"
+                exit 1
+                ;;
+              *)
+                echo "::error::release $HEAD_BRANCH is not published"
+                exit 1
+                ;;
+            esac
+            # Resolve the tag commit through the git ref namespace: a
+            # branch with the same name must not satisfy the check.
+            # An annotated tag dereferences through its tag object.
+            ref="$(gh api "repos/$CORE_REPO/git/ref/tags/$HEAD_BRANCH" --jq '.object.sha')"
+            kind="$(gh api "repos/$CORE_REPO/git/ref/tags/$HEAD_BRANCH" --jq '.object.type')"
+            case "$kind" in
+              commit) tag_commit="$ref" ;;
+              tag) tag_commit="$(gh api "repos/$CORE_REPO/git/tags/$ref" --jq '.object.sha')" ;;
+              *)
+                echo "::error::tag $HEAD_BRANCH points at $kind, expected a commit"
+                exit 1
+                ;;
+            esac
+            if [ "$tag_commit" != "$HEAD_SHA" ]; then
+              echo "::error::release $HEAD_BRANCH points at $tag_commit, not $HEAD_SHA"
+              exit 1
+            fi
+          elif [ "$WORKFLOW_NAME" = CI ]; then
+            case "$WORKFLOW_PATH" in
+              .github/workflows/ci.yml) ;;
+              *)
+                echo "::error::the CI run must come from ci.yml, got: $WORKFLOW_PATH"
+                exit 1
+                ;;
+            esac
+            if [ "$HEAD_REPO" != "zajca/pohunek" ]; then
+              echo "::error::the CI run must come from zajca/pohunek, got: $HEAD_REPO"
+              exit 1
+            fi
+            day="$(date -u +%Y%m%d)"
+            short="${HEAD_SHA:0:12}"
+            case "$short" in
+              ????????????)
+                case "$short" in
+                  *[!0-9a-f]*) fail=1 ;;
+                  *) fail=0 ;;
+                esac
+                ;;
+              *)
+                fail=1
+                ;;
+            esac
+            if [ "$fail" = 1 ]; then
+              echo "::error::the CI run must carry a commit sha, got: $HEAD_SHA"
+              exit 1
+            fi
+            echo "tag=nightly-$day-$short" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::unexpected workflow run: $WORKFLOW_NAME"
+            exit 1
+          fi
+
+      - name: Download the kit bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-kit-*
+          merge-multiple: true
+          path: dist
+          run-id: ${{ env.RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Check the bundle checksums and version
+        shell: bash
+        env:
+          TAG: ${{ steps.select.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c ./*.sha256
+          count="$(find . -maxdepth 1 -type f -name 'pohunek-plugin-kit-*.tar.zst' | wc -l)"
+          test "$count" = 2 || { echo "::error::expected the gnu and darwin kit bundles, found $count"; exit 1; }
+          version="$(for f in pohunek-plugin-kit-*.tar.zst; do basename "$f" .tar.zst; done | sed -n 's/^pohunek-plugin-kit-\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)-.*$/\1/p' | sort -u)"
+          if [ "$(printf '%s\n' "$version" | wc -l)" != 1 ]; then
+            echo "::error::the kit bundles disagree on the version"
+            exit 1
+          fi
+          case "$TAG" in
+            core-v"$version") ;;
+            nightly-*) ;;
+            *)
+              echo "::error::tag $TAG does not match the bundle version $version"
+              exit 1
+              ;;
+          esac
+          sha256sum -- *.tar.zst > SHA256SUMS
+
+      - name: Verify the bundle provenance
+        if: ${{ steps.select.outputs.prerelease != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for bundle in pohunek-plugin-kit-*.tar.zst; do
+            gh attestation verify "$bundle" --repo "$CORE_REPO" \
+              --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+              --source-ref "refs/tags/$HEAD_BRANCH" --deny-self-hosted-runners
+          done
+
+      - name: Verify the nightly provenance
+        if: ${{ steps.select.outputs.prerelease == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          for bundle in pohunek-plugin-kit-*.tar.zst; do
+            gh attestation verify "$bundle" --repo "$CORE_REPO" \
+              --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+              --source-ref refs/heads/main --deny-self-hosted-runners
+          done
+
+      - name: Mint the kit repository token
+        id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.PLUGIN_KIT_APP_ID }}
+          private-key: ${{ secrets.PLUGIN_KIT_APP_PRIVATE_KEY }}
+          owner: pohunekd
+          repositories: pohunek-plugin-kit
+          permission-contents: write
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ steps.select.outputs.tag }}
+          PRERELEASE: ${{ steps.select.outputs.prerelease }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ "$PRERELEASE" = true ]; then
+            flags="--prerelease"
+            notes="Nightly plugin kit bundle built by zajca/pohunek $WORKFLOW_NAME run $RUN_ID."
+          else
+            flags=""
+            notes="Plugin kit bundle of core release ${TAG#core-}."
+          fi
+          # A draft first, so a failed upload never publishes a partial release.
+          # The tag is created when the draft is published; the kit repository
+          # carries an initial commit (owner setup).
+          # shellcheck disable=SC2086
+          gh release create "$TAG" --repo "$KIT_REPO" --draft \
+            --target main --title "$TAG" --notes "$notes" $flags
+          gh release upload "$TAG" --repo "$KIT_REPO" dist/*.tar.zst dist/SHA256SUMS
+          gh release edit "$TAG" --repo "$KIT_REPO" --draft=false
+
+      - name: Prune nightlies older than 30 days
+        if: ${{ steps.select.outputs.prerelease == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          case "$cutoff" in
+            ????-??-??T??:??:??Z) ;;
+            *) echo "::error::unexpected cutoff date: $cutoff"; exit 1 ;;
+          esac
+          gh release list --repo "$KIT_REPO" --limit 100 \
+            --json tagName,createdAt,isPrerelease --jq \
+            ".[] | select(.isPrerelease and (.tagName | startswith(\"nightly-\")) and .createdAt < \"$cutoff\") | .tagName" \
+          | while IFS= read -r old; do
+            [ -n "$old" ] || continue
+            gh release delete "$old" --repo "$KIT_REPO" --yes --cleanup-tag
+          done

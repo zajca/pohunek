@@ -148,7 +148,7 @@ The same two commands run locally:
   the same id leaves the proved version unselected, so the install check
   refuses it on the default path and the inspect digest check refuses the
   other, selected version under `--no-enable` (the inspect `selected`
-  check is defense in depth). The evidence of a
+  check is defense in depth)). The evidence of a
   context proof carries
   `"kind": "context"`. The
   [index runbook](../runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive)
@@ -210,6 +210,53 @@ index write, and 2 for every other refusal:
   `isolation root: <path>`: the kit has removed the root unless the
   failure is the removal itself. A refusal before the root exists, or the
   failure to write the evidence after the run, names no root.
+
+## Kit bundle
+
+Every core release and every nightly also ships the owner-side plugin kit
+bundle `pohunek-plugin-kit-<X.Y.Z>-<target>.tar.zst` for
+`x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`. The bundle holds
+`pohunek`, `pohunekd`, `pohunek-sessiond` and `pohunek-plugin-kit` plus the
+descriptor schema note; it carries no release MANIFEST and never enters the
+core release bundle. A release bundle is attested with the other release
+assets; a nightly bundle is attested by the `attest-kit` job of
+`release-evidence.yml`. Verify a downloaded bundle with the same signer
+workflow the `plugin-kit-publish` job uses — the release bundle against
+its tag, a nightly bundle against `main`:
+
+```sh
+gh attestation verify <bundle> --repo zajca/pohunek \
+  --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+  --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+gh attestation verify <bundle> --repo zajca/pohunek \
+  --signer-workflow "zajca/pohunek/.github/workflows/release-evidence.yml" \
+  --source-ref refs/heads/main --deny-self-hosted-runners
+```
+
+A bundle attested from any other ref — for example a `tier=nightly`
+dispatch on a branch — is not a kit release and must be refused.
+
+The `plugin-kit-publish` workflow publishes the bundles as releases of
+`pohunekd/pohunek-plugin-kit`: a core release tag `vX.Y.Z` becomes
+`core-vX.Y.Z` once the tag release is published (never a draft or a
+prerelease), a scheduled nightly CI run becomes the prerelease
+`nightly-YYYYMMDD-<sha12>` (nightlies older than 30 days are pruned). The
+provenance of every published bundle verifies with `gh attestation verify`
+against the `release-evidence.yml` signer workflow before the publishing
+token is minted. Until the owner has finished the setup below,
+publication stays gated and the bundles only build.
+
+Owner setup:
+
+- the `plugin-kit-publish` environment's deployment branch policy allows
+  `main` (the publishing job runs on the default branch even though the
+  environment gates the token step);
+- the kit repository's default branch is `main` and it carries an initial
+  commit (the tag is created with `--target main`);
+- `PLUGIN_KIT_APP_ID` is a repository or organization variable, not an
+  environment variable: the job `if:` is evaluated before the environment
+  applies, so an environment variable would skip the job silently;
+- the App private key is an environment secret of `plugin-kit-publish`.
 
 ## Compatibility declaration
 
