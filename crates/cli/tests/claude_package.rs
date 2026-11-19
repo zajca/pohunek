@@ -2166,6 +2166,55 @@ impl Fixture {
         assert_eq!(code, 0, "{sent}");
     }
 
+    /// Answers a pre-handshake blocking dialog (the first-run theme picker,
+    /// the API-key approval) with its default through `pohunek attach`: the
+    /// daemon refuses plain `session input` while the dialog blocks the
+    /// session, so the Enter key goes on the CLI's standard input and reaching
+    /// end of file detaches again. The session must already wait for owner
+    /// action (`blocked`); the screen is read once more right before the key,
+    /// because Enter on the folder-trust dialog would trust the directory.
+    async fn answer_blocking_dialog(&self, id: &str, dialog: &str) {
+        self.wait_activity(id, "blocked").await;
+        let (_title, rows) = self.screen(id).await;
+        assert!(
+            rows.iter().any(|row| row.contains(dialog)),
+            "the screen still shows the {dialog} dialog: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("Yes, I trust this folder")),
+            "refusing to answer into the folder-trust dialog"
+        );
+        let mut command = self
+            .harness
+            .env
+            .tokio_command(pohunek_test_support::bin_exe("pohunek"));
+        command
+            .args(["attach", id])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn pohunek attach");
+        let mut stdin = child.stdin.take().expect("piped attach stdin");
+        tokio::io::AsyncWriteExt::write_all(&mut stdin, b"\r")
+            .await
+            .expect("write the Enter key");
+        drop(stdin);
+        let output = pohunek_test_support::wait::guard(
+            "the attach that answers the dialog to exit",
+            child.wait_with_output(),
+        )
+        .await
+        .expect("wait for pohunek attach");
+        assert!(
+            output.status.success(),
+            "pohunek attach failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Waits until the session's detected activity is `activity` and returns
     /// the session record that matched.
     async fn wait_activity(&self, id: &str, activity: &str) -> Value {
@@ -5685,7 +5734,11 @@ fn capture_directory() -> Option<PathBuf> {
 /// either fails, so this capture needs network egress; it carries only the
 /// dummy key and a throwaway home. Every later screen is captured by
 /// [`capture_the_real_claude_screens`] without egress. Without the variable the
-/// test does nothing.
+/// test does nothing. Each dialog is answered with its default once the
+/// session activity is `blocked`, through `pohunek attach` with the Enter key
+/// on standard input (the daemon refuses plain `session input` while a dialog
+/// blocks the session); the screen is checked once more right before the key
+/// so Enter never lands on the folder-trust dialog.
 #[tokio::test]
 #[ignore = "refreshes compat/claude/screens from a real `claude` with egress; run with POHUNEK_CLAUDE_CAPTURE_DIR and --ignored"]
 async fn capture_the_real_claude_first_run_screens() {
@@ -5699,7 +5752,9 @@ async fn capture_the_real_claude_first_run_screens() {
         .wait_screen_line(&id, "Choose the text style that looks best")
         .await;
     fixture.capture(&directory, &id, "theme").await;
-    fixture.input(&id, "").await;
+    fixture
+        .answer_blocking_dialog(&id, "Choose the text style that looks best")
+        .await;
     fixture
         .wait_screen_line(&id, "Detected a custom API key")
         .await;
@@ -5707,7 +5762,9 @@ async fn capture_the_real_claude_first_run_screens() {
     fixture
         .capture_widths(&directory, &id, "apikey", true)
         .await;
-    fixture.input(&id, "").await;
+    fixture
+        .answer_blocking_dialog(&id, "Detected a custom API key")
+        .await;
     fixture.wait_screen_line(&id, "Select login method").await;
     fixture.capture(&directory, &id, "login").await;
     fixture.stop(&id).await;
