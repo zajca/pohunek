@@ -4168,7 +4168,11 @@ impl SessionRegistry {
     ///
     /// The kept create left the initial observation open, so the detector
     /// keeps publishing `input_ready` for the session. The watcher waits on
-    /// that watch and then delivers exactly once: it claims the deferred
+    /// that watch, then waits on the published events until the recorded
+    /// activity is no longer `blocked` (the detector publishes readiness
+    /// before it records the activity, and a waited write refuses a
+    /// `blocked` one; this is a gate on events, not a poll of the
+    /// activity), and then delivers exactly once: it claims the deferred
     /// prompt under the sessions lock before the write, mirrors the
     /// one-write choice of the normal path (an acknowledged initial input
     /// goes through the acknowledged write only, never through a plain

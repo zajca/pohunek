@@ -3937,6 +3937,11 @@ async fn claude_after_the_handshake_accepts_input_while_blocked_on_a_permission_
     .await;
     let shown = inspect_session(&mut control, &created.id).await;
     assert_eq!(shown.native_session_id.as_deref(), Some(native_id));
+    assert_eq!(
+        shown.activity,
+        Some(AgentActivity::Blocked),
+        "the permission prompt still holds the screen when the answer is sent: {shown:?}"
+    );
 
     let request = Request::make(
         "session-input-after-handshake",

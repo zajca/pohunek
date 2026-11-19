@@ -24638,9 +24638,13 @@ async fn non_strict_create_blocked_at_the_grace_expiry_still_writes_its_input() 
         async move { registry.create(params).await }
     });
     create_gate.entered.notified().await;
+    // The test owns the readiness channel, so the only readiness it can
+    // report is the one it sends: none, so the wait times out.
+    let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(false);
     let id = {
         let mut sessions = registry.inner.sessions.lock().await;
         let entry = sessions.values_mut().next().expect("committed session");
+        entry.input_ready = readiness_rx;
         entry.default_detector_config.input_readiness =
             crate::agent::host::InputReadiness::BracketedPaste;
         entry.info.activity = Some(AgentActivity::Blocked);
@@ -24664,6 +24668,7 @@ async fn non_strict_create_blocked_at_the_grace_expiry_still_writes_its_input() 
         .await
         .expect("create task joins")
         .expect("the non-strict create writes its input after the grace");
+    drop(readiness_tx);
     assert_eq!(created.initial_input, None, "{created:?}");
     let sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get(&id).expect("the session is not rolled back");
