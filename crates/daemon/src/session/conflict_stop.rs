@@ -57,6 +57,14 @@ struct ConflictedRuntime {
     previous_desired_state: DesiredState,
 }
 
+/// The stop intent a live stop committed before it escalated, with the durable
+/// record it replaced.
+pub(super) struct CommittedStop {
+    pub(super) previous_desired_state: DesiredState,
+    pub(super) intent: Box<SessionRecord>,
+    pub(super) previous: Box<SessionRecord>,
+}
+
 /// The refusal of a stop that cannot end a conflicted runtime because the
 /// session `lacks` what the stop needs.
 fn refusal(id: &SessionId, lacks: &str) -> ProtocolError {
@@ -272,7 +280,9 @@ impl SessionRegistry {
     /// that worker's ([`Self::prove_conflicted_runtime`]); a refusal, a changed
     /// runtime or a failed release is returned with the stop cleared, and a
     /// release that may have retired the job also schedules the supervision
-    /// retry that finishes the stop from the durable intent.
+    /// retry that finishes the stop from the durable intent. A release that
+    /// changed nothing rolls the committed intent back and schedules the retry
+    /// that settles the session.
     ///
     /// # Errors
     ///
@@ -285,19 +295,40 @@ impl SessionRegistry {
         transaction_id: &str,
         stop_runtime: Option<&RuntimeWatchIdentity>,
         unresponsive: &crate::runtime::Worker,
+        committed: Box<CommittedStop>,
     ) -> Result<(), ProtocolError> {
         let outcome = Box::pin(self.release_unresponsive_worker(id, unresponsive)).await;
         match outcome {
             Ok(()) => Ok(()),
-            Err(failure) => {
-                self.clear_stopping(id, transaction_id, stop_runtime).await;
-                match failure {
-                    ReleaseFailure::NotStopped(error) => Err(error),
-                    ReleaseFailure::PartiallyStopped(error) => {
-                        self.schedule_supervision_retry(id);
-                        Err(error)
-                    }
+            Err(ReleaseFailure::NotStopped(error)) => {
+                self.rollback_stop_intent(
+                    id,
+                    committed.previous_desired_state,
+                    DesiredState::Stopped,
+                    transaction_id,
+                    stop_runtime,
+                )
+                .await;
+                // Conditional on the intent still being the durable record, so
+                // a classification the watch committed meanwhile is never
+                // undone.
+                if let Err(rollback) = self
+                    .write_session_record_if_current(*committed.intent, *committed.previous)
+                    .await
+                {
+                    warn!(
+                        session_id = %id.0,
+                        error = %rollback,
+                        "the stop intent of a failed stop was not rolled back"
+                    );
                 }
+                self.schedule_supervision_retry(id);
+                Err(error)
+            }
+            Err(ReleaseFailure::PartiallyStopped(error)) => {
+                self.clear_stopping(id, transaction_id, stop_runtime).await;
+                self.schedule_supervision_retry(id);
+                Err(error)
             }
         }
     }

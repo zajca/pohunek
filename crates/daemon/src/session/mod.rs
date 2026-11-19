@@ -145,6 +145,7 @@ pub(crate) mod attention_isolation;
 mod background;
 mod claim;
 mod conflict_stop;
+use conflict_stop::CommittedStop;
 mod create_request;
 mod detector;
 mod diff;
@@ -7242,8 +7243,8 @@ impl SessionRegistry {
             "session_stop_intent_busy",
         ))
         .await;
-        let terminal_base = match committed {
-            Ok(IntentCommit::Committed { intent, .. }) => *intent,
+        let (terminal_base, replaced_record) = match committed {
+            Ok(IntentCommit::Committed { intent, previous }) => (*intent, previous),
             // The exit that ended the session saw this stop's in-memory intent
             // and applied its outcome; the binding is still cleared before
             // the stop returns.
@@ -7305,6 +7306,11 @@ impl SessionRegistry {
                             &transaction_id,
                             stop_runtime.as_ref(),
                             &worker,
+                            Box::new(CommittedStop {
+                                previous_desired_state,
+                                intent: Box::new(terminal_base.clone()),
+                                previous: replaced_record,
+                            }),
                         ))
                         .await?;
                         RuntimeExit {
