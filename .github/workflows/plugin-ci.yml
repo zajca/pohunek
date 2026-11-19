@@ -10,7 +10,11 @@
 #
 # It lints, double-builds, verifies, detect-checks, smokes and version-bump
 # checks the package of `package-dir` on every row of `rows` for every target
-# of `platforms`, in one job per row and target. Rows pin the core the kit is
+# of `platforms`, in one job per row and target. The checks follow the kind
+# `lint` reports: a runtime package runs every check, a commands-only package
+# runs its commands in the smoke and refuses `corpus-dir`, `upstream-install`
+# and `smoke-script`, and a context package runs no smoke and refuses the same
+# three inputs. Rows pin the core the kit is
 # built from: `release` builds the kit from `zajca/pohunek` at `core-tag` and
 # smokes against that tag's attested daemon archive, `nightly` builds from
 # `main`, and `previous-minor` builds from the newest release of the previous
@@ -56,7 +60,7 @@ on:
         type: string
         default: ''
       smoke-script:
-        description: "Executable in the plugin repository, relative to its root, run once by the generic smoke after its screen check, inside the same live isolated root: the isolated `XDG_RUNTIME_DIR` routes its bare `pohunek` commands to the isolated daemon, the live session id is under `POHUNEK_SMOKE_SESSION` (and `POHUNEK_SOCKET_PATH` only informs hook-style clients), the isolated prefix holding `pohunek` is first on PATH, cwd is the plugin repository. A non-zero exit fails the smoke. Empty skips it."
+        description: "Executable in the plugin repository, relative to its root, run once by the generic smoke after its screen check, inside the same live isolated root: the isolated `XDG_RUNTIME_DIR` routes its bare `pohunek` commands to the isolated daemon, the live session id is under `POHUNEK_SMOKE_SESSION` (and `POHUNEK_SOCKET_PATH` only informs hook-style clients), the isolated prefix holding `pohunek` is first on PATH, cwd is the plugin repository. A non-zero exit fails the smoke. Empty skips it. A package without a runtime refuses a non-empty value."
         required: false
         type: string
         default: ''
@@ -236,14 +240,40 @@ jobs:
           line="$(core/target/debug/pohunek-plugin-kit lint --dir "plugin/$PACKAGE_DIR")"
           printf '%s\n' "$line"
           # The lint line names the kind install validation saw: a runtime
-          # package ends in its runtime id, a context package in `context`.
-          # The kind is the `[context]` export the descriptor carries, never
-          # merely the absence of a runtime: a commands-only package fails
-          # the lint (the kit does not support commands-only packages), and
-          # a package with neither a runtime nor a context export fails too,
-          # so every line that passes names one of the two kinds.
+          # package ends in its runtime id, a context package in `context`
+          # and a commands-only package in `commands`. The kind is the export
+          # the descriptor carries, never merely the absence of a runtime; a
+          # package that exports nothing fails the lint.
           kind="$(core/target/debug/pohunek-plugin-kit lint --dir "plugin/$PACKAGE_DIR" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["kind"])')"
           printf 'PACKAGE_KIND=%s\n' "$kind" >>"$GITHUB_ENV"
+
+      # A package without a runtime has nothing to detect and no session to
+      # start: the detection corpus, the upstream install and the smoke
+      # script are runtime-only inputs. A caller that sets any of them for a
+      # context or commands-only package fails here with a named reason,
+      # before any build; the checks are never silently skipped.
+      - name: Refuse runtime-only inputs for a package without a runtime
+        if: env.PACKAGE_KIND != 'runtime'
+        timeout-minutes: 5
+        env:
+          UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
+          SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+          CORPUS_DIR: ${{ inputs.corpus-dir }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for input in UPSTREAM_INSTALL SMOKE_SCRIPT CORPUS_DIR; do
+            eval "value=\${$input:-}"
+            if [ -n "$value" ]; then
+              echo "$input is set but the package is a $PACKAGE_KIND package with no runtime to smoke or detect" >&2
+              failed=1
+            fi
+          done
+          [ "$failed" = 0 ] || exit 1
+          case "$PACKAGE_KIND" in
+            context) echo "context package: smoke and detect-check skipped by kind, no runtime-only input set" ;;
+            commands) echo "commands package: detect-check skipped by kind, the smoke runs every exported command" ;;
+          esac
 
       # A reproducible double build: the same inputs must produce the same
       # bytes twice, so the release the index admits is the archive CI saw.
@@ -279,22 +309,23 @@ jobs:
           CORPUS_DIR: ${{ inputs.corpus-dir }}
         run: |
           set -euo pipefail
-          if [ "${PACKAGE_KIND:-runtime}" = context ]; then
-            echo "a context package has no runtime to detect: refusing corpus-dir" >&2
+          if [ "${PACKAGE_KIND:-runtime}" != runtime ]; then
+            echo "a $PACKAGE_KIND package has no runtime to detect: refusing corpus-dir" >&2
             exit 1
           fi
           core/target/debug/pohunek-plugin-kit detect-check --dir "plugin/$PACKAGE_DIR" --corpus "plugin/$CORPUS_DIR"
 
-      # The generic smoke stops after the screen check; the optional
-      # `smoke-script` runs inside it, on the same live isolated root, only
-      # after every generic check passed, with the isolated `XDG_RUNTIME_DIR`
-      # routing bare `pohunek` and the live session id exported for it, so
-      # the plugin's own input and hook-event checks see the exact host the
-      # generic smoke passed on (planner ruling). A context package serves no
-      # runtime, so the smoke and its caller inputs never run for it: a caller
-      # that sets them for a context package fails in the step Refuse
-      # runtime-only inputs for a context package instead of silently
-      # skipping them.
+      # The generic smoke of a runtime package stops after the screen check;
+      # the optional `smoke-script` runs inside it, on the same live isolated
+      # root, only after every generic check passed, with the isolated
+      # `XDG_RUNTIME_DIR` routing bare `pohunek` and the live session id
+      # exported for it, so the plugin's own input and hook-event checks see
+      # the exact host the generic smoke passed on (planner ruling). The
+      # smoke of a commands-only package installs the archive on the isolated
+      # daemon by its digest and runs every exported command once. A context
+      # package serves no runtime and exports no command, so no smoke runs
+      # for it; its runtime-only inputs fail in the step Refuse runtime-only
+      # inputs for a package without a runtime.
       - name: Smoke the package and the smoke script
         if: env.PACKAGE_KIND != 'context'
         timeout-minutes: 30
@@ -317,30 +348,6 @@ jobs:
             args+=(--script "$SMOKE_SCRIPT")
           fi
           ../core/target/debug/pohunek-plugin-kit smoke "${args[@]}"
-
-      # A context package serves no runtime: the smoke, the upstream
-      # install, the smoke script and the detection corpus never run for it.
-      # A caller that sets any of them fails here with a named reason; the
-      # checks are never silently skipped.
-      - name: Refuse runtime-only inputs for a context package
-        if: env.PACKAGE_KIND == 'context'
-        timeout-minutes: 5
-        env:
-          UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
-          SMOKE_SCRIPT: ${{ inputs.smoke-script }}
-          CORPUS_DIR: ${{ inputs.corpus-dir }}
-        run: |
-          set -euo pipefail
-          failed=0
-          for input in UPSTREAM_INSTALL SMOKE_SCRIPT CORPUS_DIR; do
-            eval "value=\${$input:-}"
-            if [ -n "$value" ]; then
-              echo "$input is set but the package is a context package with no runtime to smoke or detect" >&2
-              failed=1
-            fi
-          done
-          [ "$failed" = 0 ] || exit 1
-          echo "context package: smoke and detect-check skipped by kind, no runtime-only input set"
 
       # A changed archive digest against the latest release of the caller
       # repository requires a new `version` in the descriptor.
