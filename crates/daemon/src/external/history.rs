@@ -146,31 +146,23 @@ fn walk(
     let Ok(base) = fs::canonicalize(&root.path) else {
         return;
     };
-    let mut incomplete = false;
     let mut stack = vec![(base, 0_u8)];
     while let Some((dir, depth)) = stack.pop() {
         if Instant::now() >= deadline {
             limits.insert(CandidateLimit::Time);
             return;
         }
+        let mut cut = false;
         let Some(entries) = list_walked_directory_bounded(
             root,
             &dir,
             true,
             Some(*entries_left),
             Some(deadline),
-            &mut incomplete,
+            &mut cut,
         ) else {
             continue;
         };
-        if incomplete {
-            if Instant::now() >= deadline {
-                limits.insert(CandidateLimit::Time);
-                return;
-            }
-            limits.insert(CandidateLimit::Entries);
-            return;
-        }
         let mut subdirectories = Vec::new();
         let mut session_files = BTreeSet::new();
         for entry in entries {
@@ -230,6 +222,17 @@ fn walk(
                 .rev()
                 .map(|child| (child, depth.saturating_add(1))),
         );
+        if cut {
+            // The kept entries above were visited; the listing beyond them
+            // was not. Report the cut, then end the walk: the budget spent
+            // on this tree is gone.
+            if Instant::now() >= deadline {
+                limits.insert(CandidateLimit::Time);
+            } else {
+                limits.insert(CandidateLimit::Entries);
+            }
+            return;
+        }
     }
 }
 
@@ -244,8 +247,6 @@ enum Head {
     Cut,
 }
 
-/// Reads the working directory from the head of the history file at `path`.
-///
 /// Reads the working directory from the head of the history file at `path`.
 ///
 /// At most `config.head_bytes` bytes and `config.max_records` records are

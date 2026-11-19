@@ -1276,7 +1276,10 @@ fn newest_name_first_bounded(
         return Box::new(listed.into_iter().chain(failed));
     }
     let budget = budget.unwrap_or(usize::MAX);
-    let mut listed: Vec<(std::ffi::OsString, fs::DirEntry)> = Vec::new();
+    // A min-heap on the name keeps the newest `budget` entries: each
+    // replacement costs O(log budget).
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<NamedEntry>> =
+        std::collections::BinaryHeap::new();
     let mut failed: Vec<io::Result<fs::DirEntry>> = Vec::new();
     let mut cut = false;
     for entry in entries {
@@ -1286,23 +1289,14 @@ fn newest_name_first_bounded(
         }
         match entry {
             Ok(found) => {
-                let name = found.file_name();
-                if listed.len() < budget {
-                    listed.push((name, found));
+                let kept = NamedEntry(found.file_name(), found);
+                if heap.len() < budget {
+                    heap.push(std::cmp::Reverse(kept));
                 } else {
                     cut = true;
-                    if budget > 0 {
-                        // Replace the smallest kept name when the new one is
-                        // bigger, keeping the current top set.
-                        let smallest = listed
-                            .iter()
-                            .enumerate()
-                            .min_by(|(_, (a, _)), (_, (b, _))| a.cmp(b))
-                            .map(|(index, _)| index);
-                        if let Some(index) = smallest {
-                            if name > listed[index].0 {
-                                listed[index] = (name, found);
-                            }
+                    if let Some(mut smallest) = heap.peek_mut() {
+                        if kept.0 > smallest.0 .0 {
+                            *smallest = std::cmp::Reverse(kept);
                         }
                     }
                 }
@@ -1313,10 +1307,37 @@ fn newest_name_first_bounded(
     if cut {
         *incomplete = true;
     }
-    let mut listed: Vec<io::Result<fs::DirEntry>> =
-        listed.into_iter().map(|(_, found)| Ok(found)).collect();
-    listed.sort_by_key(|entry| std::cmp::Reverse(entry.as_ref().ok().map(fs::DirEntry::file_name)));
+    // Ascending in `Reverse` is newest name first.
+    let listed: Vec<io::Result<fs::DirEntry>> = heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|std::cmp::Reverse(NamedEntry(_, found))| Ok(found))
+        .collect();
     Box::new(listed.into_iter().chain(failed))
+}
+
+/// A directory entry ordered by its name alone (names are unique within one
+/// directory).
+struct NamedEntry(std::ffi::OsString, fs::DirEntry);
+
+impl PartialEq for NamedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for NamedEntry {}
+
+impl PartialOrd for NamedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NamedEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
 }
 
 /// Whether `path` is known not to be a directory: missing, or something else.

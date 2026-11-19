@@ -729,9 +729,16 @@ async fn a_directory_bigger_than_the_entry_budget_is_cut_and_reported() {
         serde_json::json!(["entries"]),
         "a listing cut by the budget must be reported: {result}"
     );
+    let found = roots(&result);
     assert!(
-        roots(&result).len() <= 2,
+        found.len() <= 2,
         "the listing keeps no more than the budget: {result}"
+    );
+    // The newest history files (`s7`, `s6`) survive the cut and are read;
+    // the cut must not discard the whole directory.
+    assert!(
+        found.iter().any(|root| root.ends_with("h")),
+        "the newest history file of a cut directory is still a candidate: {result}"
     );
     assert_documented_shape(&result);
     rig.finish().await;
