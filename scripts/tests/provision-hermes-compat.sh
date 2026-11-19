@@ -12,8 +12,9 @@ trap cleanup EXIT
 
 copy_root="$test_root/repository"
 fake_bin="$test_root/bin"
-mkdir -p "$copy_root/scripts" "$copy_root/compat/hermes" "$fake_bin"
+mkdir -p "$copy_root/scripts" "$copy_root/compat/hermes" "$copy_root/.github/scripts" "$fake_bin"
 cp "$provision" "$copy_root/scripts/"
+cp "$script_root/.github/scripts/ci-retry" "$copy_root/.github/scripts/"
 cp "$script_root/compat/hermes/compatibility-lock.json" "$copy_root/compat/hermes/"
 
 # The real python3 path is resolved here because the fakes' PATH is restricted.
@@ -246,13 +247,15 @@ if grep -Ev '^[[:space:]]*#' "$provision" | grep -Eq 'readarray|mapfile|realpath
 fi
 
 # The CPython download is bounded by connect, total and stall timeouts and a
-# bounded retry, and a failed uv install names its phase (uv keeps its own
-# defaults).
+# bounded retry, and the uv install runs through the shared retry helper
+# (uv keeps its own defaults inside each attempt).
 grep -Fq -- '--connect-timeout "$NETWORK_CONNECT_TIMEOUT_SECONDS"' "$provision"
 grep -Fq -- '--max-time "$DOWNLOAD_MAX_SECONDS"' "$provision"
 grep -Fq -- '--speed-limit "$NETWORK_STALL_BYTES" --speed-time "$NETWORK_STALL_SECONDS"' "$provision"
 grep -Fq -- '--retry "$((NETWORK_ATTEMPTS - 1))"' "$provision"
 grep -Fq 'cannot install the locked Hermes dependencies' "$provision"
+grep -Fq '"$retry_helper" --label uv-sync-hermes' "$provision"
+grep -Fq 'retry helper is missing at $retry_helper' "$provision"
 
 # Keep the historical-lock workaround explicit and reject an accidental return
 # to the re-resolving mode that failed during the M2 evidence capture.
