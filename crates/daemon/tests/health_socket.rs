@@ -4650,6 +4650,7 @@ async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: 
     let config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
+        store_path: Some(socket.dir.join("metadata.jsonl")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
