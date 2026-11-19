@@ -1124,3 +1124,59 @@ async fn an_integration_install_keeps_the_lifecycle_guard_after_its_caller_goes_
         .try_write()
         .expect("the guard is released with the task");
 }
+
+#[tokio::test]
+async fn a_registry_shutdown_waits_for_an_integration_install_in_flight() {
+    let v = versions("selection-install-shutdown", Some(SUBAGENT)).await;
+    let registry = v.fixture.registry.clone();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let caller = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .packages()
+                .integration_install(move |_retained| {
+                    entered_tx.send(()).expect("announce the activation");
+                    release_rx.recv().expect("wait for the release");
+                    done_tx.send(()).expect("announce completion");
+                    Ok(())
+                })
+                .await
+        }
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv().expect("the install started"))
+        .await
+        .expect("join");
+
+    let shutdown = tokio::spawn({
+        let registry = registry.clone();
+        async move { registry.shutdown().await }
+    });
+    // A refused spawn is an already aborted task, so the probe's join fails
+    // exactly once shutdown stopped admitting tasks and aborted the abortable
+    // ones.
+    pohunek_test_support::wait::wait_until("shutdown stops admitting tasks", || {
+        let probe = registry.spawn_background("admission_probe", async {});
+        async move { probe.await.is_err().then_some(()) }
+    })
+    .await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown waits for the install that is still in flight"
+    );
+
+    release_tx.send(()).expect("release the install");
+    caller
+        .await
+        .expect("join")
+        .expect("the install ran to completion instead of being aborted");
+    done_rx
+        .recv_timeout(HANG_GUARD)
+        .expect("the install finished its work");
+    let report = shutdown.await.expect("join");
+    assert!(report.is_quiescent(), "{report:?}");
+    assert!(report.still_running.is_empty(), "{report:?}");
+}
