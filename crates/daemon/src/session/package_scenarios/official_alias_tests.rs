@@ -2617,9 +2617,7 @@ impl StaleAdoptedSession {
             .reload_runtimes()
             .expect("reload the runtime registry");
         assert!(
-            runtimes
-                .resolve_id(&runtime_id(RuntimeId::CLAUDE))
-                .is_err(),
+            runtimes.resolve_id(&runtime_id(RuntimeId::CLAUDE)).is_err(),
             "the registry no longer serves claude from the package"
         );
         assert_eq!(
@@ -2681,7 +2679,10 @@ async fn a_refused_uninstall_still_moves_a_live_adopted_session_to_the_serving_r
         .packages()
         .package_uninstall(uninstall(&stale.missing))
         .await;
-    assert!(refused.is_err(), "the uninstall of an unknown package fails");
+    assert!(
+        refused.is_err(),
+        "the uninstall of an unknown package fails"
+    );
     assert_eq!(
         stale.running().await,
         stale.generic,
