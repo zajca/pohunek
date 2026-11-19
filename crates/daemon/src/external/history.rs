@@ -430,17 +430,28 @@ mod tests {
         std::fs::create_dir_all(root.join("proj")).expect("create the tree");
         std::fs::write(root.join("proj/s.jsonl"), "{\"cwd\":\"/work\"}\n")
             .expect("write history file");
-        // Search-only ancestor above the history root.
-        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o711))
+        /// Restores the mode so the tempdir can be removed even when an
+        /// assertion fails.
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = Restore(outer.clone());
+        // Search without read permission on the ancestor above the history root.
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o300))
             .expect("restrict the ancestor");
+        assert!(
+            std::fs::read_dir(&outer).is_err(),
+            "the ancestor must not be listable for the test to prove anything"
+        );
         let result = read_cwd(
             &root,
             &root.join("proj/s.jsonl"),
             None,
             &CandidateConfig::default(),
         );
-        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755))
-            .expect("restore the ancestor");
         assert_eq!(
             result.expect("a search-only ancestor does not block the read"),
             Head::Cwd(PathBuf::from("/work"))
