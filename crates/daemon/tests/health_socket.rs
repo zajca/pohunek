@@ -3845,6 +3845,10 @@ async fn claude_stub_session_publishes_screen_blocked_and_refuses_plain_input() 
 /// that reads `blocked` still takes plain `session.input`: the answer is
 /// accepted and reaches the agent, unlike the pre-handshake trust dialog.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario owns the daemon, the reporting agent and the handshake report"
+)]
 async fn claude_after_the_handshake_accepts_input_while_blocked_on_a_permission_prompt() {
     if !pohunek_test_support::process_env::in_own_process() {
         return;
@@ -4983,10 +4987,6 @@ async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
 /// A restart with no worker left drops the deferred text but keeps the
 /// record: the kept create committed, so the dead worker is not an
 /// uncommitted create and reconciliation never compensates it away.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the restart scenario owns both daemons and their shutdown inline"
-)]
 #[tokio::test]
 async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
     let socket = temp_socket("claude-keep-deadworker");
@@ -5089,10 +5089,6 @@ async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
 /// A stopped kept session survives a daemon restart as a stopped record:
 /// the kept create committed, so the deferred marker is not an
 /// uncommitted create and reconciliation never compensates it away.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the restart scenario owns both daemons and their shutdown inline"
-)]
 #[tokio::test]
 async fn claude_kept_session_stopped_record_survives_restart() {
     let socket = temp_socket("claude-keep-stopped");

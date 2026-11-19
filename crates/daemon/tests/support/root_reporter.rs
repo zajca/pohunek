@@ -10,7 +10,7 @@
 //! appended to a results file as `{"step", "response"}`. An `exec` command
 //! replaces the image in place with the given argv.
 
-#![expect(
+#![allow(
     dead_code,
     reason = "each test binary uses a different subset of these helpers"
 )]

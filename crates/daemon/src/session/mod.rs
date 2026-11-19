@@ -4183,67 +4183,8 @@ impl SessionRegistry {
     /// stored outcome; a missing entry ends the watcher. A write failure
     /// on a session that is still running records `delivery_failed`.
     async fn deliver_deferred_initial_input(&self, id: &SessionId) {
-        let shutdown = self.inner.daemon_shutdown.clone();
-        let (mut input_ready, observation) = {
-            let sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get(id) else {
-                return;
-            };
-            (entry.input_ready.clone(), entry.initial_input_done.clone())
-        };
-        loop {
-            // A missing entry is gone for good: the watcher that still
-            // waits would otherwise wake every poll until shutdown.
-            let entry_outcome = {
-                self.inner.sessions.lock().await.get(id).and_then(|entry| {
-                    entry
-                        .deferred_initial_input
-                        .as_ref()
-                        .map(|deferred| (deferred.outcome, deferred.delivering))
-                })
-            };
-            let Some((outcome, delivering)) = entry_outcome else {
-                return;
-            };
-            if outcome.is_some() || delivering {
-                return;
-            }
-            if self.inspect_state(id).await.is_some_and(is_terminal) {
-                self.discard_deferred_initial_input(id, DeferredInitialInputOutcome::SessionExited)
-                    .await;
-                return;
-            }
-            if *input_ready.borrow_and_update() {
-                break;
-            }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                // A delivered or discarded prompt ends the observation, and
-                // whoever ended it recorded the outcome.
-                () = observation.cancelled() => return,
-                changed = input_ready.changed() => {
-                    // The detector ended with the session; the exit path
-                    // records the outcome.
-                    if changed.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-        // The detector publishes `input_ready` before it records the
-        // matching activity, and a waited write refuses a `blocked` one, so
-        // the claim waits until the record shows the dialog is gone.
-        let mut events = self.subscribe();
-        while self.current_activity(id).await == Some(AgentActivity::Blocked) {
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = observation.cancelled() => return,
-                received = events.recv() => {
-                    if matches!(received, Err(broadcast::error::RecvError::Closed)) {
-                        return;
-                    }
-                }
-            }
+        if !self.await_deferred_readiness(id).await {
+            return;
         }
         let (initial_input_done, ack_timeout_ms, text) = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -4279,6 +4220,83 @@ impl SessionRegistry {
                 Err(error) => Err(error),
             },
         };
+        self.finish_deferred_delivery(id, delivered).await;
+    }
+
+    /// Waits until a kept create's deferred prompt may be written: the
+    /// session published `input_ready` and its recorded activity is no
+    /// longer `blocked`. Returns `false` when the prompt will never be
+    /// written (settled, claimed, stopped, exited, or the daemon shut down).
+    async fn await_deferred_readiness(&self, id: &SessionId) -> bool {
+        let shutdown = self.inner.daemon_shutdown.clone();
+        let (mut input_ready, observation) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return false;
+            };
+            (entry.input_ready.clone(), entry.initial_input_done.clone())
+        };
+        loop {
+            // A missing entry is gone for good: the watcher that still
+            // waits would otherwise wake every poll until shutdown.
+            let entry_outcome = {
+                self.inner.sessions.lock().await.get(id).and_then(|entry| {
+                    entry
+                        .deferred_initial_input
+                        .as_ref()
+                        .map(|deferred| (deferred.outcome, deferred.delivering))
+                })
+            };
+            let Some((outcome, delivering)) = entry_outcome else {
+                return false;
+            };
+            if outcome.is_some() || delivering {
+                return false;
+            }
+            if self.inspect_state(id).await.is_some_and(is_terminal) {
+                self.discard_deferred_initial_input(id, DeferredInitialInputOutcome::SessionExited)
+                    .await;
+                return false;
+            }
+            if *input_ready.borrow_and_update() {
+                break;
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return false,
+                // A delivered or discarded prompt ends the observation, and
+                // whoever ended it recorded the outcome.
+                () = observation.cancelled() => return false,
+                changed = input_ready.changed() => {
+                    // The detector ended with the session; the exit path
+                    // records the outcome.
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
+        // The detector publishes `input_ready` before it records the
+        // matching activity, and a waited write refuses a `blocked` one, so
+        // the claim waits until the record shows the dialog is gone.
+        let mut events = self.subscribe();
+        while self.current_activity(id).await == Some(AgentActivity::Blocked) {
+            tokio::select! {
+                () = shutdown.cancelled() => return false,
+                () = observation.cancelled() => return false,
+                received = events.recv() => {
+                    if matches!(received, Err(broadcast::error::RecvError::Closed)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Records how a claimed delivery ended: `delivered` when the write
+    /// succeeded, otherwise the failure outcome, with the durable marker
+    /// cleared. A stop or exit recorded on the claim wins either way.
+    async fn finish_deferred_delivery(&self, id: &SessionId, delivered: Result<(), ProtocolError>) {
         match delivered {
             Ok(()) => {
                 self.resolve_claimed_delivery(id, DeferredInitialInputOutcome::Delivered)

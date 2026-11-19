@@ -236,7 +236,7 @@ fn assistant_creates_a_missing_data_home_for_its_workdir() {
     // whole chain instead of failing with `assistant_workdir_unusable`.
     TEST_ENV.with(|env| {
         let data_home = env.data_home();
-        std::fs::remove_dir(&data_home).expect("the hermetic data home starts empty");
+        std::fs::remove_dir(data_home).expect("the hermetic data home starts empty");
         let output = run_assistant(&["assistant", "--json", "--no-start-daemon"]);
         let document = json_error(&output);
         assert_eq!(

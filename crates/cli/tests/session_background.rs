@@ -818,6 +818,10 @@ async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
 /// never delivers it. The fake agent holds the folder-trust dialog, so the
 /// create keeps the session with a deferred prompt instead of rolling back.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario stages the fake agent, restarts the daemon and observes the adopted session"
+)]
 async fn a_restarted_daemon_adopts_the_live_worker_of_a_kept_session() {
     let harness = start_serving_claude(true).await;
     let agent_dir = harness.env.root().join("fake-trust-agent");

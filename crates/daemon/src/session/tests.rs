@@ -8305,7 +8305,7 @@ async fn start_deferred_delivery(
             delivering: false,
             ended_by: None,
         });
-    }
+    };
     tokio::spawn({
         let registry = registry.clone();
         let id = id.clone();
@@ -8335,11 +8335,11 @@ async fn reported_initial_input(
 
 fn dropped_initial_input(
     reason: protocol::SessionInitialInputDrop,
-) -> Option<protocol::SessionInitialInput> {
-    Some(protocol::SessionInitialInput {
+) -> protocol::SessionInitialInput {
+    protocol::SessionInitialInput {
         state: protocol::SessionInitialInputState::Dropped,
         reason: Some(reason),
-    })
+    }
 }
 
 /// A stop that lands between the text and the Enter of a claimed deferred
@@ -8382,7 +8382,9 @@ async fn a_stop_during_a_deferred_delivery_resolves_the_prompt_as_stopped() {
     );
     assert_eq!(
         reported_initial_input(&registry, &id).await,
-        dropped_initial_input(protocol::SessionInitialInputDrop::SessionStopped)
+        Some(dropped_initial_input(
+            protocol::SessionInitialInputDrop::SessionStopped
+        ))
     );
 }
 
@@ -8410,7 +8412,9 @@ async fn an_exit_during_a_deferred_delivery_resolves_the_prompt_as_exited() {
 
     assert_eq!(
         reported_initial_input(&registry, &id).await,
-        dropped_initial_input(protocol::SessionInitialInputDrop::SessionExited)
+        Some(dropped_initial_input(
+            protocol::SessionInitialInputDrop::SessionExited
+        ))
     );
     registry.stop(&id).await.expect("stop the session");
 }
@@ -8445,7 +8449,9 @@ async fn a_failed_deferred_delivery_on_a_running_session_records_delivery_failed
     );
     assert_eq!(
         reported_initial_input(&registry, &id).await,
-        dropped_initial_input(protocol::SessionInitialInputDrop::DeliveryFailed)
+        Some(dropped_initial_input(
+            protocol::SessionInitialInputDrop::DeliveryFailed
+        ))
     );
     registry.stop(&id).await.expect("stop the session");
 }
