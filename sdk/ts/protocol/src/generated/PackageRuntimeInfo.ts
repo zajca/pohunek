@@ -42,7 +42,8 @@ export type PackageRuntimeInfo = {
   resume_args?: Array<string>;
   /**
    * Whether the first prompt of a session is appended to the launch
-   * arguments instead of being typed into the terminal.
+   * arguments instead of being typed into the terminal. A prompt that
+   * starts with `-` is always typed into the terminal.
    */
   prompt_argument: boolean;
   /**

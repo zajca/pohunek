@@ -212,7 +212,8 @@ pub struct PackageRuntimeInfo {
     #[cfg_attr(feature = "ts", ts(optional))]
     pub resume_args: Option<Vec<String>>,
     /// Whether the first prompt of a session is appended to the launch
-    /// arguments instead of being typed into the terminal.
+    /// arguments instead of being typed into the terminal. A prompt that
+    /// starts with `-` is always typed into the terminal.
     pub prompt_argument: bool,
     /// The core-owned version probe the runtime names, if any. The probe runs
     /// the resolved program with arguments core fixes, never package data.
