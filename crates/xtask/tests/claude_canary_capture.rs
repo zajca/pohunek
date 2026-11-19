@@ -1034,9 +1034,12 @@ fn login_screen_blocked_dialog_is_a_timeout() {
     capture.assert_no_survivors();
 }
 
-/// The two budgets stay apart: a 60 s step timeout with an 8 s first-screen
-/// budget stops the blocked dialog after 8 s. With the first-screen deadline
-/// reverted to the step timeout the same run would print 60 s after a minute.
+/// The two budgets stay apart: the [`ANSWERING_STEP_TIMEOUT`] step timeout
+/// with the [`BLOCKED_DIALOG_STEP_TIMEOUT`] first-screen budget stops the
+/// blocked dialog at the first-screen budget. One budget read drives both the
+/// first-screen deadline and the timeout error, so the error names the budget
+/// in force: reverting that read to the step timeout prints the step timeout
+/// instead.
 #[test]
 fn first_screen_budget_is_separate_from_the_step_timeout() {
     let capture = Capture::new();
@@ -1051,9 +1054,9 @@ fn first_screen_budget_is_separate_from_the_step_timeout() {
             "--scenario",
             "login_screen",
             "--step-timeout-secs",
-            "60",
+            ANSWERING_STEP_TIMEOUT,
             "--first-screen-timeout-secs",
-            "8",
+            BLOCKED_DIALOG_STEP_TIMEOUT,
         ],
     );
     assert_eq!(
@@ -1062,8 +1065,10 @@ fn first_screen_budget_is_separate_from_the_step_timeout() {
         "stderr: {}",
         stderr_of(&output)
     );
+    let step =
+        format!("step `wait for the first screen` timed out after {BLOCKED_DIALOG_STEP_TIMEOUT}s");
     assert!(
-        stderr_of(&output).contains("step `wait for the first screen` timed out after 8s"),
+        stderr_of(&output).contains(&step),
         "stderr names the step: {}",
         stderr_of(&output)
     );
