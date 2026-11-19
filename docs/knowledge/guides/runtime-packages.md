@@ -351,7 +351,7 @@ descriptor with `runtime_feature_unsupported` (0.38) or `descriptor_invalid`
 
 With `[runtime] prompt_arg = true`, the first prompt of `session.new` is
 appended to the launch arguments as the last argv element, unless the prompt
-starts with `-`. A prompt that starts with `-` is never an argv token: the core
+starts with `-`. A prompt that starts with `-` is never put in the argv. The core
 launches the agent without it and pastes it after readiness, the same way it
 delivers the first prompt of a runtime with `prompt_arg = false`, so an agent
 that parses options after positionals cannot read it as a flag. Text that does
