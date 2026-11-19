@@ -408,6 +408,7 @@ pub struct DefinitionParts {
     /// non-resumable runtime.
     pub native: Option<NativeSessionLaunch>,
     /// Whether the initial prompt is passed as a trailing launch argument.
+    /// A prompt that starts with `-` is pasted after readiness instead.
     pub prompt_arg: bool,
     /// Compiled parser for the runtime's version probe, if it has one.
     pub version_probe_parser: Option<HandlerId>,
@@ -903,6 +904,7 @@ impl RuntimeDefinition {
     }
 
     /// Whether the initial prompt is passed as a trailing launch argument.
+    /// A prompt that starts with `-` is pasted after readiness instead.
     #[must_use]
     pub fn prompt_arg(&self) -> bool {
         self.prompt_arg

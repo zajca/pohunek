@@ -363,14 +363,21 @@ A package that sets `prompt_arg = true` and relies on this rule lists
 the package instead of passing a dash prompt as a flag. A package that does not
 list it still gets the rule on this core.
 
-The pasted prompt is written only once the runtime shows readiness, so a
-runtime with `prompt_arg = true` declares a strict readiness rule
-(`[input] ready = "screen_idle"` or `"manifest_idle"`, see
-[Declaring input readiness](#declaring-input-readiness)). Without one the core
-waits at most the compat grace (500 ms) and writes the text whether or not the
-agent reads its input yet. With a strict rule, `session.new` fails with
-`session_input_not_ready` and rolls the session back when readiness does not
-show.
+The pasted prompt is written once the runtime shows readiness (see
+[Declaring input readiness](#declaring-input-readiness)). Under the default
+`bracketed_paste` readiness, a silent agent gets the prompt when the startup
+grace ends, whether or not it reads input yet. For a client that sends
+`extended_input_ready_wait` (the current CLI and SDK) the non-strict wait
+lasts up to the longer of the host grace and the runtime's `[input]`
+`startup_grace_ms`, and a client without it keeps the compat bound
+(500 ms). So a runtime with `prompt_arg = true` declares a strict readiness
+rule (`[input] ready = "screen_idle"` or `"manifest_idle"`), under which
+`session.new` fails with `session_input_not_ready` and rolls back when
+readiness does not show. The exception is the kept blocked case: a strict
+readiness timeout while the agent reads `blocked` keeps the session of a
+hook-handshake runtime declaring the native existence check, succeeds with
+`prompt_delivered: false` and a pending initial input, and delivers the
+prompt once the operator answers and readiness shows.
 
 ## Trusted checkout arguments
 

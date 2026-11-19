@@ -1593,7 +1593,12 @@ async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() 
         .expect("make the fixture runtime executable");
     install_package(
         &mut rig,
-        pi_package("", &program.display().to_string(), "", ""),
+        pi_package(
+            "requires = [\"prompt-arg-dash-paste-v1\"]\n",
+            &program.display().to_string(),
+            "",
+            "",
+        ),
     )
     .await;
 
@@ -1630,7 +1635,10 @@ async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() 
     std::fs::create_dir(&cwd).expect("create the session directory");
     let mut params = selection_params("pi", &cwd, &[], None);
     params.input = Some("hello".to_owned());
-    ok_payload(create_session_with_params(&mut rig.control, params).await);
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut rig.control, params).await,
+    ))
+    .expect("the plain prompt creates a session");
     let launched = wait_until("the fixture runtime records its argv", || async {
         std::fs::read_to_string(cwd.join("argv.out")).ok()
     })
@@ -1639,6 +1647,29 @@ async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() 
         launched.lines().last(),
         Some("hello"),
         "a prompt without a leading dash stays the last argv element: {launched:?}"
+    );
+    // The prompt rode the argv, so nothing was pasted: the fixture still
+    // waits on its first stdin line. A sentinel sent through `session.input`
+    // is the first line it can read; a regression that also pasted `hello`
+    // would have filled `stdin.out` with the prompt instead.
+    let sentinel = Request::make(
+        "agent-options-dash-plain-sentinel",
+        method::SESSION_INPUT,
+        serde_json::to_value(SessionInputParams {
+            session_id: created.id.clone(),
+            text: "sentinel\n".to_owned(),
+            wait: None,
+        })
+        .expect("serialize input params"),
+    );
+    ok_payload(exchange(&mut rig.control, &sentinel).await);
+    let typed = wait_until("the fixture runtime records its stdin", || async {
+        std::fs::read_to_string(cwd.join("stdin.out")).ok()
+    })
+    .await;
+    assert_eq!(
+        typed, "sentinel\n",
+        "the plain prompt is not also pasted: {typed:?}"
     );
     rig.finish().await;
 }
