@@ -4224,6 +4224,8 @@ async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
     // The launcher dedication: a private cwd like `<data_dir>/assistant`.
     let dedicated = socket.dir.join("assistant");
     std::fs::create_dir(&dedicated).expect("create the dedicated workdir");
+    let no_cwd_fallback = owned_no_cwd_fallback(&socket);
+    let _no_cwd_guard = ScopedNoCwdDir::enter(&no_cwd_fallback);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -4309,15 +4311,37 @@ async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
             .expect("stop result");
     drop(control);
 
-    // Revert proof: `cwd: None` blocks again because no directory carries
-    // the trust answer (the real defect behind the onboarding loop). The
-    // create call waits behind the dialog exactly like the first launch did.
+    third_launch_from_no_cwd_fallback_blocks_again(
+        &socket,
+        &mut subscriber,
+        &agents_dir,
+        &second_id,
+        shutdown,
+        handle,
+    )
+    .await;
+}
+
+/// Scenario-3 revert arm: a launch with `cwd: None` resolves to the
+/// test-owned fallback below the socket dir and blocks again, because no
+/// directory there carries the trust answer. The daemon never falls back
+/// to its own process cwd, so the answer marker lands in the per-test
+/// temp dir and never in the repository tree.
+async fn third_launch_from_no_cwd_fallback_blocks_again(
+    socket: &TestSocket,
+    subscriber: &mut Framed<UnixStream, LinesCodec>,
+    agents_dir: &Path,
+    second_id: &SessionId,
+    shutdown: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let no_cwd_fallback = owned_no_cwd_fallback(socket);
     let log_none = socket.dir.join("stub-none.log");
     let gate_none = socket.dir.join("gate-none");
     let script_none = socket.dir.join("claude-trust-none.py");
     write_claude_trust_stub(&script_none, &log_none, &gate_none);
-    write_claude_profile(&agents_dir, "claudetrustnone", &script_none);
-    let mut params = session_params(&socket);
+    write_claude_profile(agents_dir, "claudetrustnone", &script_none);
+    let mut params = session_params(socket);
     params.cwd = None;
     "claudetrustnone".clone_into(&mut params.agent);
     params.input = Some("third launch".to_owned());
@@ -4329,16 +4353,15 @@ async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
         }
     });
     let third_id =
-        wait_for_any_agent_state(&mut subscriber, AgentActivity::Blocked, StateSource::Screen)
-            .await;
-    assert_ne!(third_id, second_id, "the third launch is its own session");
+        wait_for_any_agent_state(subscriber, AgentActivity::Blocked, StateSource::Screen).await;
+    assert_ne!(&third_id, second_id, "the third launch is its own session");
     assert!(
         !third.is_finished(),
         "`cwd: None` waits behind the dialog again"
     );
     std::fs::write(&gate_none, b"go").expect("answer the third dialog");
     wait_for_agent_state_event(
-        &mut subscriber,
+        subscriber,
         &third_id,
         AgentActivity::Idle,
         StateSource::Screen,
@@ -4357,9 +4380,102 @@ async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
         steps.lines().next() == Some("dialog"),
         "a launch with no directory answer draws the dialog: {steps:?}"
     );
+    assert!(
+        no_cwd_fallback.join(TRUST_ANSWER_MARKER).is_file(),
+        "the `cwd: None` answer marker lands in the test-owned fallback"
+    );
+    assert!(
+        !workspace_marker_present(),
+        "the `cwd: None` arm never writes into the repository tree"
+    );
+    assert_no_repo_marker_files();
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+/// Reports whether the trust-answer marker leaked into the daemon crate dir.
+///
+/// The [`ScopedNoCwdDir`] guard enters the test-owned fallback below the
+/// socket dir, so a `cwd: None` session resolves there. A fallback that
+/// resolved to the daemon process cwd (the crate dir under nextest) would
+/// drop the marker here instead; the revert arm above keeps this absent.
+fn workspace_marker_present() -> bool {
+    pohunek_test_support::manifest_dir()
+        .join(TRUST_ANSWER_MARKER)
+        .exists()
+}
+
+/// Fails when the trust-cache scenario leaked a marker into the repo tree.
+///
+/// [`workspace_marker_present`] probes the daemon crate dir. A leaked
+/// marker has exactly one name ([`TRUST_ANSWER_MARKER`]), so walking up to
+/// the workspace root also covers a `current_dir` the runner may have
+/// entered below it.
+fn assert_no_repo_marker_files() {
+    let mut dir = pohunek_test_support::manifest_dir();
+    while dir.pop() {
+        assert!(
+            !dir.join(TRUST_ANSWER_MARKER).exists(),
+            "no trust-answer marker leaks into the repository tree"
+        );
+        if dir.join("Cargo.toml").exists() && dir.join("crates").is_dir() {
+            break;
+        }
+    }
+}
+
+/// Resolves the session launch dir when no project or explicit `cwd` applies:
+/// the test-owned fallback below the daemon socket, never the daemon
+/// process's own working directory. A test daemon inherits the nextest
+/// runner cwd (the crate directory), so falling back to `current_dir`
+/// would let a session write into the repository tree.
+fn owned_no_cwd_fallback(socket: &std::path::Path) -> std::path::PathBuf {
+    let fallback = socket
+        .parent()
+        .expect("test socket has an isolated parent")
+        .join(NO_CWD_FALLBACK_DIR);
+    std::fs::create_dir_all(&fallback).expect("create the test-owned no-cwd fallback");
+    fallback
+}
+
+/// Directory name of [`owned_no_cwd_fallback`].
+const NO_CWD_FALLBACK_DIR: &str = "no-cwd";
+
+/// Holds the process working directory inside the test-owned no-cwd fallback
+/// for the whole trust-cache scenario and restores it on drop.
+///
+/// The daemon resolves a `cwd: None` launch through
+/// `std::env::current_dir`, and the nextest runner starts the test process
+/// with its cwd at the crate directory — so without this guard the third
+/// arm's stub would write its answer marker into the repository tree. The
+/// guard keeps the inherited cwd out of the repo and returns it afterwards,
+/// because the working directory is process-wide.
+struct ScopedNoCwdDir {
+    previous: PathBuf,
+}
+
+impl ScopedNoCwdDir {
+    /// Enters `dir`, returning a guard that restores the previous cwd.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the current directory cannot be read or changed.
+    fn enter(dir: &Path) -> Self {
+        assert!(
+            pohunek_test_support::process_env::runs_in_own_process(),
+            "ScopedNoCwdDir changes the process cwd only in its own process"
+        );
+        let previous = std::env::current_dir().expect("read the test process cwd");
+        pohunek_test_support::process_env::set_current_dir(dir);
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedNoCwdDir {
+    fn drop(&mut self) {
+        pohunek_test_support::process_env::set_current_dir(&self.previous);
+    }
 }
 
 /// #2406 row 1: a `session.new --input` whose grace expires while the claude
