@@ -398,17 +398,19 @@ async fn assistant_host_config(
     }
 }
 
-/// Assistant working directory for a local launch, or `None` for remote.
+/// Assistant working directory for a launch without a target, or `None`.
 ///
-/// Local launches run with `cwd = <data_dir>/assistant`, created 0700 by
-/// the launcher, so Claude Code's per-directory folder trust persists per
-/// host instead of re-asking on every launch. Remote launches keep the
-/// target rule: no local filesystem path is meaningful on another host.
+/// A local launch that names neither `--project` nor `--repo` runs with
+/// `cwd = <data_dir>/assistant`, created 0700 by the launcher, so Claude
+/// Code's per-directory folder trust persists per host instead of
+/// re-asking on every launch. A launch that names a project or repository
+/// starts in that directory, and a remote launch keeps the target rule: no
+/// local filesystem path is meaningful on another host.
 fn assistant_workdir(
     opts: &AssistantOptions,
     paths: &Paths,
 ) -> Result<Option<std::path::PathBuf>, CliError> {
-    if opts.is_remote() {
+    if opts.is_remote() || opts.project.is_some() || opts.repo.is_some() {
         return Ok(None);
     }
     ensure_assistant_workdir(&paths.data_dir).map(Some)
@@ -443,6 +445,7 @@ const ASSISTANT_WORKDIR_FORBIDDEN_MODE: u32 = 0o022;
 /// is not an owner-private directory, or when creation fails.
 fn ensure_assistant_workdir(data_dir: &Path) -> Result<PathBuf, CliError> {
     match std::fs::DirBuilder::new()
+        .recursive(true)
         .mode(ASSISTANT_WORKDIR_MODE)
         .create(data_dir)
     {

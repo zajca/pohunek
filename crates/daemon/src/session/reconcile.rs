@@ -2059,7 +2059,7 @@ impl SessionRegistry {
         // A kept create holds its prompt text in daemon memory only, so a
         // deferred marker of another instance (or none) after a restart
         // means the text is gone: the session proceeds without it and the
-        // entry records the drop reason (#2406 Q1 option B). The durable
+        // entry records the drop reason. The durable
         // marker stays until the classification commits it away (through
         // `write_record_and_install` or the pending-entry fallback), so a
         // lost classification replays the drop from the same record instead
@@ -4281,7 +4281,7 @@ impl SessionRegistry {
         record.info.updated_at = now;
         // A deferred marker of a kept create means the restarted daemon no
         // longer holds the prompt text: the adopted live entry records the
-        // drop reason (#2406 Q1 option B, H3), never the text.
+        // drop reason, never the text.
         let adopted_deferred_drop = deferred_drop_from_record(&record);
         record.transaction = None;
         record.runtime.state = RuntimeState::Live;
@@ -4687,7 +4687,7 @@ impl SessionRegistry {
     /// entry that shows it, returning the classified record with it.
     ///
     /// A kept create whose worker is gone keeps no marker behind: a deferred
-    /// marker loses its prompt text on a restart (#2406 Q1 option B) and a
+    /// marker loses its prompt text on a restart and a
     /// delivering marker is finished with the worker.
     #[expect(
         clippy::too_many_lines,
@@ -4701,14 +4701,14 @@ impl SessionRegistry {
     ) -> (SessionRecord, SessionEntry) {
         // A deferred marker of a kept create means the restarted daemon no
         // longer holds the prompt text: the entry records the drop reason
-        // (#2406 Q1 option B), never the text. Read before the marker is
+        // never the text. Read before the marker is
         // settled below: the classified record keeps no create marker
         // behind, or a later reconcile would replay the drop from the old
         // record as a rollback.
         let deferred_initial_input = deferred_drop_from_record(&record);
         // The marker of a kept create is settled by the classification: a
         // deferred marker loses its prompt text when the daemon restarts
-        // (#2406 Q1 option B), and a delivering marker is finished once
+        // and a delivering marker is finished once
         // the worker is gone. Keeping either would replay the drop or the
         // rollback on every reconcile while the entry claims a reason.
         let mut record = record;
@@ -5069,7 +5069,7 @@ fn initial_input_orphaned(record: &SessionRecord, daemon_instance_id: &str) -> b
 }
 
 /// Whether `record` is a kept create whose deferred prompt another daemon
-/// instance held in memory (#2406 Q1 option B): the marker names another
+/// instance held in memory: the marker names another
 /// instance (or none), so the restart lost the text and the session
 /// proceeds with the drop recorded, never rolled back.
 fn is_orphaned_deferred_initial_input(record: &SessionRecord, daemon_instance_id: &str) -> bool {
@@ -5107,6 +5107,7 @@ fn deferred_drop_from_record(record: &SessionRecord) -> Option<super::DeferredIn
             ack_timeout_ms: None,
             outcome: Some(super::DeferredInitialInputOutcome::DaemonRestart),
             delivering: false,
+            ended_by: None,
         })
 }
 

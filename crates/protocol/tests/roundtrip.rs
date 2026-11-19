@@ -805,7 +805,7 @@ fn session_initial_input_drop_roundtrips_every_reason() {
             state: protocol::SessionInitialInputState::Dropped,
             reason: Some(reason),
         };
-        let value = serde_json::to_value(&info).expect("serialize initial input");
+        let value = serde_json::to_value(info).expect("serialize initial input");
         assert_eq!(
             value,
             serde_json::json!({

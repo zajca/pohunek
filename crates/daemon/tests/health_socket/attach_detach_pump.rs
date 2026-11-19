@@ -1,13 +1,13 @@
-//! Experiment (d) for #2406: attach, answer, detach, then output and input.
+//! Attach, answer, detach, then output and input.
 //!
-//! Hypothesis (d): after `attach` + `detach` the daemon stops draining the
-//! session PTY output, or writes to a stale PTY handle. The agent then blocks
-//! on stdout, runs no hooks and processes no input; the daemon's screen and
-//! `updated_at` freeze.
+//! After `attach` + `detach` the daemon keeps draining the session PTY
+//! output and writing to the live PTY handle: the agent never blocks on
+//! stdout, runs its hooks and processes input, and the daemon's screen and
+//! `updated_at` keep moving.
 //!
 //! The fake dialog agent draws a trust dialog, blocks on a gate file, prints
 //! more than 64 KiB, emits a handshake line, then echoes each stdin line
-//! prefixed with `echo:`. The experiment attaches through the real attach
+//! prefixed with `echo:`. The scenario attaches through the real attach
 //! path, answers, detaches, releases the gate and records:
 //! - whether output after detach reaches the daemon screen,
 //! - whether the handshake arrives via `session.output`,
@@ -22,7 +22,7 @@ use super::*;
 
 /// Fake dialog agent: draws a trust dialog, blocks on `$1` (the gate file),
 /// prints more than 64 KiB, emits the handshake line, then echoes stdin.
-const DIALOG_SCRIPT: &str = "printf 'DIALOG: trust this folder? [y/n]\\n'; while [ ! -e \"$1\" ]; do sleep 0.05; done; head -c 70000 /dev/zero | tr '\\0' A; printf '\\nHANDSHAKE-d2406\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
+const DIALOG_SCRIPT: &str = "printf 'DIALOG: trust this folder? [y/n]\\n'; while [ ! -e \"$1\" ]; do sleep 0.05; done; head -c 70000 /dev/zero | tr '\\0' A; printf '\\nHANDSHAKE-PUMP\\n'; while IFS= read -r line; do printf 'echo:%s\\n' \"$line\"; done";
 
 /// The PTY text the session has printed so far, decoded from `session.output`.
 async fn terminal_text(framed: &mut Framed<UnixStream, LinesCodec>, id: &SessionId) -> String {
@@ -31,7 +31,7 @@ async fn terminal_text(framed: &mut Framed<UnixStream, LinesCodec>, id: &Session
     let params = protocol::SessionOutputParams::new(id.clone(), None, None, 262_144, None)
         .expect("valid output params");
     let request = Request::make(
-        "experiment-d2406-output",
+        "attach-detach-output",
         method::SESSION_OUTPUT,
         serde_json::to_value(params).expect("output params"),
     );
@@ -64,7 +64,7 @@ async fn output_until(
 
 async fn read_screen_text(framed: &mut Framed<UnixStream, LinesCodec>, id: &SessionId) -> String {
     let req = Request::make(
-        "experiment-d2406-read",
+        "attach-detach-read",
         method::SESSION_READ,
         serde_json::to_value(
             protocol::SessionReadParams::new(
@@ -100,7 +100,7 @@ fn dialog_config(gate: &std::path::Path) -> SessionRegistryConfig {
 
 #[tokio::test]
 async fn attach_answer_detach_then_output_and_input() {
-    let socket = temp_socket("attach-detach-d2406");
+    let socket = temp_socket("attach-detach-pump");
     let gate = socket.dir.join("dialog.gate");
     let (shutdown, handle, _) =
         spawn_server_with_config(&socket, "0.0.0", dialog_config(&gate)).await;
@@ -113,7 +113,7 @@ async fn attach_answer_detach_then_output_and_input() {
     let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
     let _ = read_until_marker(&mut raw, b"DIALOG: trust this folder?").await;
 
-    // Answer the dialog like the user did in #2406, then detach.
+    // Answer the dialog like an operator, then detach.
     raw.write_all(b"y\n").await.expect("answer the dialog");
     let detached = detach_stream(&mut control, &attach.stream_id).await;
     assert!(detached.detached, "detach should close the stream");
@@ -124,7 +124,7 @@ async fn attach_answer_detach_then_output_and_input() {
     output_until(
         &mut control,
         &created.id,
-        "HANDSHAKE-d2406",
+        "HANDSHAKE-PUMP",
         "the handshake after detach reaches retained output",
     )
     .await;
@@ -141,7 +141,7 @@ async fn attach_answer_detach_then_output_and_input() {
     let screen = read_screen_text(&mut control, &created.id).await;
     let inspected = inspect_session(&mut control, &created.id).await;
     eprintln!(
-        "experiment(d): handshake_on_screen={} state={:?} activity={:?} updated_at={}",
+        "after detach: handshake_on_screen={} state={:?} activity={:?} updated_at={}",
         screen.contains("HANDSHAKE"),
         inspected.state,
         inspected.activity,
@@ -155,7 +155,7 @@ async fn attach_answer_detach_then_output_and_input() {
 
 #[tokio::test]
 async fn no_attach_answer_via_input_for_contrast() {
-    let socket = temp_socket("no-attach-d2406");
+    let socket = temp_socket("no-attach-pump");
     let gate = socket.dir.join("dialog.gate");
     let (shutdown, handle, _) =
         spawn_server_with_config(&socket, "0.0.0", dialog_config(&gate)).await;
@@ -170,7 +170,7 @@ async fn no_attach_answer_via_input_for_contrast() {
     output_until(
         &mut control,
         &created.id,
-        "HANDSHAKE-d2406",
+        "HANDSHAKE-PUMP",
         "the contrast handshake reaches retained output",
     )
     .await;

@@ -240,7 +240,10 @@ impl SessionRegistry {
             .load_durable_session_record(&session.id)
             .await?
             .and_then(|record| record.transaction)
-            .is_some_and(|transaction| transaction.kind == TransactionKind::Create);
+            .is_some_and(|transaction| {
+                transaction.kind == TransactionKind::Create
+                    && !transaction.is_deferred_initial_input()
+            });
         if unsettled {
             return Err(ProtocolError::session_request_in_progress(&session.id));
         }

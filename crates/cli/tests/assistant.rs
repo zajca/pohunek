@@ -207,6 +207,50 @@ fn assistant_without_a_started_daemon_still_ensures_a_private_workdir() {
 }
 
 #[test]
+fn assistant_with_a_project_or_repo_target_does_not_use_the_private_workdir() {
+    // A launch that names a project or repository starts in that directory,
+    // so the launcher creates no `<data_home>/pohunek/assistant` for it.
+    for target in [["--project", "ui"], ["--repo", "/code/ui"]] {
+        let mut args = vec!["assistant"];
+        args.extend(target);
+        args.extend(["--json", "--no-start-daemon"]);
+        let output = run_assistant(&args);
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "daemon_unreachable",
+            "{args:?}: {document:?}"
+        );
+        TEST_ENV.with(|env| {
+            let workdir = env.data_home().join("pohunek").join("assistant");
+            assert!(
+                std::fs::symlink_metadata(&workdir).is_err(),
+                "{args:?} must not create {workdir:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn assistant_creates_a_missing_data_home_for_its_workdir() {
+    // A fresh account has no data home at all: the launcher creates the
+    // whole chain instead of failing with `assistant_workdir_unusable`.
+    TEST_ENV.with(|env| {
+        let data_home = env.data_home();
+        std::fs::remove_dir(&data_home).expect("the hermetic data home starts empty");
+        let output = run_assistant(&["assistant", "--json", "--no-start-daemon"]);
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "daemon_unreachable",
+            "{document:?}"
+        );
+        let workdir = data_home.join("pohunek").join("assistant");
+        let metadata = std::fs::symlink_metadata(&workdir).expect("the launcher creates it");
+        assert!(metadata.is_dir(), "{workdir:?}");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700, "{workdir:?}");
+    });
+}
+
+#[test]
 fn assistant_refuses_a_foreign_workdir_without_touching_it() {
     TEST_ENV.with(|env| {
         let workdir = env.data_home().join("pohunek").join("assistant");

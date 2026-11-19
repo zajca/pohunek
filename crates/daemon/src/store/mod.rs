@@ -610,9 +610,9 @@ pub struct SessionTransaction {
 /// the daemon's memory and the session must not run without it.
 pub const INITIAL_INPUT_PHASE: &str = "initial_input";
 
-/// Phase of a kept create whose initial input timed out while blocked
-/// (#2406): the session runs, the prompt text is held in daemon memory,
-/// and the first `input_ready` after the keep delivers it exactly once.
+/// Phase of a kept create whose initial input timed out while blocked: the
+/// session runs, the prompt text is held in daemon memory, and the first
+/// `input_ready` after the keep delivers it exactly once.
 /// Free text like [`INITIAL_INPUT_PHASE`], so persisting it needs no store
 /// schema bump. A marker of another instance (or none) after a restart
 /// means the held text is gone: it stays dropped with a recorded reason
@@ -627,7 +627,7 @@ impl SessionTransaction {
     }
 
     /// Whether this is a kept create holding a deferred initial prompt in
-    /// daemon memory (#2406 Q1/Q2).
+    /// daemon memory.
     #[must_use]
     pub fn is_deferred_initial_input(&self) -> bool {
         self.kind == TransactionKind::Create && self.phase == DEFERRED_INITIAL_INPUT_PHASE
@@ -1338,7 +1338,7 @@ impl Store {
     }
 
     /// Rewrites a session's `create/initial_input` marker into the kept
-    /// `create/initial_input_deferred` marker (#2406 Q1/Q2), owned by
+    /// `create/initial_input_deferred` marker, owned by
     /// `daemon_instance_id`, and leaves every other field as persisted.
     ///
     /// The record is re-read under the write lock, so a state a concurrent

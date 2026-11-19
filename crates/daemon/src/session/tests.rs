@@ -50,11 +50,12 @@ use pohunek_test_support::wait::{guard, wait_until, HANG_GUARD};
 
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
-    timestamp_now, worker_error_to_protocol, ActiveAgentReport, ExternalAssociationBlock,
-    InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
-    SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
-    WorkerMetadataProgress, WorkerMetadataRetryCause, WorkerMetadataTracker,
-    MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
+    timestamp_now, worker_error_to_protocol, ActiveAgentReport, DeferredInitialInput,
+    DeferredInitialInputOutcome, ExternalAssociationBlock, InputSubmission, RuntimeExit,
+    RuntimeHandle, RuntimeWatchIdentity, SessionEntry, SessionRegistry, SessionRegistryConfig,
+    ShellCommand, WorkerMetadataApplyOutcome, WorkerMetadataProgress, WorkerMetadataRetryCause,
+    WorkerMetadataTracker, MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY,
+    WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 use crate::events::{EventOrigin, ProducedEvent};
 use crate::worktree::RepoHookLayer;
@@ -8283,6 +8284,170 @@ async fn delayed_plain_input_serves_a_stop_while_the_submit_delay_runs() {
     stop_between_body_and_enter(&registry, &id, &delay_boundary, request)
         .await
         .expect("the text was delivered before the stop");
+}
+
+/// Gives `id` a pending deferred prompt with readiness already shown and
+/// starts its watcher, which claims the prompt and writes it.
+async fn start_deferred_delivery(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    text: &str,
+) -> tokio::task::JoinHandle<()> {
+    let (_readiness_tx, readiness_rx) = tokio::sync::watch::channel(true);
+    {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(id).expect("session entry");
+        entry.input_ready = readiness_rx;
+        entry.deferred_initial_input = Some(DeferredInitialInput {
+            text: text.to_owned(),
+            ack_timeout_ms: None,
+            outcome: None,
+            delivering: false,
+            ended_by: None,
+        });
+    }
+    tokio::spawn({
+        let registry = registry.clone();
+        let id = id.clone();
+        async move { registry.deliver_deferred_initial_input(&id).await }
+    })
+}
+
+/// The deferred prompt of `id` as the entry holds it.
+async fn deferred_entry(registry: &SessionRegistry, id: &SessionId) -> DeferredInitialInput {
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(id)
+        .and_then(|entry| entry.deferred_initial_input.clone())
+        .expect("the deferred prompt")
+}
+
+/// The `initial_input` the session reports.
+async fn reported_initial_input(
+    registry: &SessionRegistry,
+    id: &SessionId,
+) -> Option<protocol::SessionInitialInput> {
+    registry.inspect(id).await.expect("inspect").initial_input
+}
+
+fn dropped_initial_input(
+    reason: protocol::SessionInitialInputDrop,
+) -> Option<protocol::SessionInitialInput> {
+    Some(protocol::SessionInitialInput {
+        state: protocol::SessionInitialInputState::Dropped,
+        reason: Some(reason),
+    })
+}
+
+/// A stop that lands between the text and the Enter of a claimed deferred
+/// delivery is recorded on the claim and wins over the write's own result:
+/// the prompt ends `dropped(session_stopped)`, never `pending`.
+#[tokio::test]
+async fn a_stop_during_a_deferred_delivery_resolves_the_prompt_as_stopped() {
+    let registry = delayed_submit_registry("deferred-delivery-stop");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let watcher = start_deferred_delivery(&registry, &id, "deferred-stop-marker").await;
+
+    reach_boundary(&delay_boundary).await;
+    let claimed = deferred_entry(&registry, &id).await;
+    assert!(
+        claimed.delivering && claimed.outcome.is_none(),
+        "the delivery owns the write: {claimed:?}"
+    );
+    pohunek_test_support::wait::guard(
+        "the stop to be served while the delivery owns the write",
+        Box::pin(registry.stop(&id)),
+    )
+    .await
+    .expect("stop during the deferred delivery");
+    reach_boundary(&delay_boundary).await;
+    pohunek_test_support::wait::guard("the deferred watcher to finish", watcher)
+        .await
+        .expect("the deferred watcher joins");
+
+    let resolved = deferred_entry(&registry, &id).await;
+    assert_eq!(
+        resolved.outcome,
+        Some(DeferredInitialInputOutcome::SessionStopped),
+        "{resolved:?}"
+    );
+    assert!(
+        !resolved.delivering && resolved.text.is_empty(),
+        "{resolved:?}"
+    );
+    assert_eq!(
+        reported_initial_input(&registry, &id).await,
+        dropped_initial_input(protocol::SessionInitialInputDrop::SessionStopped)
+    );
+}
+
+/// An exit recorded during the write wins over `delivered` as well, even
+/// though the Enter reached a still-running agent.
+#[tokio::test]
+async fn an_exit_during_a_deferred_delivery_resolves_the_prompt_as_exited() {
+    let registry = delayed_submit_registry("deferred-delivery-exit");
+    let id = create_delayed_session(&registry, "delayed-codex").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let watcher = start_deferred_delivery(&registry, &id, "deferred-exit-marker").await;
+
+    reach_boundary(&delay_boundary).await;
+    registry.discard_ended_deferred_prompt(&id, false).await;
+    let pending = deferred_entry(&registry, &id).await;
+    assert!(
+        pending.delivering && pending.outcome.is_none(),
+        "the claim stays until the write ends: {pending:?}"
+    );
+    reach_boundary(&delay_boundary).await;
+    pohunek_test_support::wait::guard("the deferred watcher to finish", watcher)
+        .await
+        .expect("the deferred watcher joins");
+
+    assert_eq!(
+        reported_initial_input(&registry, &id).await,
+        dropped_initial_input(protocol::SessionInitialInputDrop::SessionExited)
+    );
+    registry.stop(&id).await.expect("stop the session");
+}
+
+/// A write that fails on a session that keeps running records
+/// `delivery_failed` and releases the claim: the agent turns blocked between
+/// the text and the Enter, so the Enter is withheld.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_deferred_delivery_on_a_running_session_records_delivery_failed() {
+    let registry = delayed_hermes_registry("deferred-delivery-failed");
+    let id = create_delayed_session(&registry, "delayed-hermes").await;
+    let delay_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_submit_delay(Arc::clone(&delay_boundary));
+    let watcher = start_deferred_delivery(&registry, &id, "deferred-failed-marker").await;
+
+    reach_boundary(&delay_boundary).await;
+    assert!(
+        report_agent_activity(&registry, &id, "hermes", AgentActivity::Blocked, 1)
+            .await
+            .recorded
+    );
+    reach_boundary(&delay_boundary).await;
+    pohunek_test_support::wait::guard("the deferred watcher to finish", watcher)
+        .await
+        .expect("the deferred watcher joins");
+
+    let resolved = deferred_entry(&registry, &id).await;
+    assert!(
+        !resolved.delivering && resolved.text.is_empty(),
+        "{resolved:?}"
+    );
+    assert_eq!(
+        reported_initial_input(&registry, &id).await,
+        dropped_initial_input(protocol::SessionInitialInputDrop::DeliveryFailed)
+    );
+    registry.stop(&id).await.expect("stop the session");
 }
 
 /// A Hermes stand-in that answers `got:<line>` once it receives Enter.
@@ -24450,6 +24615,61 @@ async fn initial_input_timeout_names_blocked_state_instead_of_the_startup_grace(
             );
         }
     }
+}
+
+/// A non-strict readiness has no refusal path: its wait is a compat grace
+/// after which the input is written, even when the screen reads `blocked`
+/// at that moment. The create is neither kept nor rolled back.
+#[tokio::test]
+async fn non_strict_create_blocked_at_the_grace_expiry_still_writes_its_input() {
+    let daemon = RestartableDaemon::new("wt-nonstrict-blocked");
+    let (registry, _supervisor) = scripted_registry(SessionRegistryConfig {
+        initial_input_startup_grace: Duration::from_millis(50),
+        ..daemon.config.clone()
+    });
+    let create_gate = hold_initial_input(&registry);
+    let outcome_gate = hold_initial_input_outcome(&registry);
+    let creating = tokio::spawn({
+        let registry = registry.clone();
+        let params = SessionNewParams {
+            input: Some("go".to_owned()),
+            ..daemon.params("feat/nonstrict-blocked")
+        };
+        async move { registry.create(params).await }
+    });
+    create_gate.entered.notified().await;
+    let id = {
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.values_mut().next().expect("committed session");
+        entry.default_detector_config.input_readiness =
+            crate::agent::host::InputReadiness::BracketedPaste;
+        entry.info.activity = Some(AgentActivity::Blocked);
+        entry.info.id.clone()
+    };
+    create_gate.release.notify_one();
+    outcome_gate.entered.notified().await;
+    // The wait already read `blocked`; the write itself must not see it.
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&id)
+        .expect("session entry")
+        .info
+        .activity = None;
+    outcome_gate.release.notify_one();
+
+    let created = creating
+        .await
+        .expect("create task joins")
+        .expect("the non-strict create writes its input after the grace");
+    assert_eq!(created.initial_input, None, "{created:?}");
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(&id).expect("the session is not rolled back");
+    assert!(entry.deferred_initial_input.is_none());
+    drop(sessions);
+    registry.stop(&id).await.expect("stop the session");
 }
 
 /// A `ScreenIdle` create whose wait ends by daemon shutdown is refused even

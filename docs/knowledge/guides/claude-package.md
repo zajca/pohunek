@@ -252,8 +252,8 @@ capture also records from a fresh home:
 - `settings.json`: `{"theme": "dark"}` ends the theme picker.
 - `.claude.json`: `hasCompletedOnboarding: true` ends the welcome flow;
   Pohunek never writes this file: the trust state belongs to Claude Code's own
-  config directory, not to Pohunek. A local `pohunek assistant` therefore runs
-  in its own dedicated `<data-dir>/assistant` directory (created 0700 by the
+  config directory, not to Pohunek. A local `pohunek assistant` without
+  `--project` or `--repo` therefore runs in its own dedicated `<data-dir>/assistant` directory (created 0700 by the
   launcher, refused with `assistant_workdir_unusable` when the path is not a
   user-owned directory), so the answer persists per host — and never for
   `$HOME`, which Claude Code deliberately does not trust as a directory.

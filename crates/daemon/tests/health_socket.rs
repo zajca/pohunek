@@ -617,8 +617,8 @@ fn worker_backed_registry_in(
 
 /// [`worker_backed_registry_in`] over a caller-owned worker home, which
 /// survives a server restart so the next daemon can discover the live
-/// worker (a `#2406` keep restart-drop test holds the guard while both
-/// servers run in turn).
+/// worker (a keep restart-drop test holds the guard while both servers run
+/// in turn).
 fn registry_in_worker_home(
     socket: &std::path::Path,
     mut config: SessionRegistryConfig,
@@ -3751,7 +3751,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
 
 #[tokio::test]
 async fn claude_stub_session_publishes_screen_blocked_and_refuses_plain_input() {
-    // #2406 Q4: a claude session blocked on its pre-handshake dialog refuses
+    // A claude session blocked on its pre-handshake dialog refuses
     // plain `session.input` with `session_input_blocked` instead of a silent
     // `accepted:true`; answering the dialog needs `pohunek attach`.
     if !pohunek_test_support::process_env::in_own_process() {
@@ -3830,6 +3830,135 @@ async fn claude_stub_session_publishes_screen_blocked_and_refuses_plain_input() 
 
     let stop_req = Request::make(
         "session-stop-claude-stub-refused",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// After the claude handshake (the native-id report), a permission prompt
+/// that reads `blocked` still takes plain `session.input`: the answer is
+/// accepted and reaches the agent, unlike the pre-handshake trust dialog.
+#[tokio::test]
+async fn claude_after_the_handshake_accepts_input_while_blocked_on_a_permission_prompt() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let bin_dir = temp_dir("claude-handshake-bin");
+    let cwd = temp_dir("claude-handshake-cwd");
+    let data_dir = temp_dir("claude-handshake-state");
+    let input_log = data_dir.join("input.bin");
+    let native_id = "native-claude-blocked-1";
+    let dialog =
+        "\x1b[2J\x1b[HReview\r\n────\r\nenter to select\r\nesc to cancel\r\n↑/↓ to navigate\r\n";
+    let mut root_agent = root_reporter::RootReporter::install_with_banner(
+        &bin_dir, "claude", "claude", &data_dir, dialog,
+    );
+
+    let socket = temp_socket("claude-handshake");
+    let (shutdown, handle, _) = spawn_server_serving_official_runtimes(
+        &socket,
+        "0.0.0",
+        support::hermetic_registry_config(),
+    )
+    .await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make("subscribe-claude-handshake", method::SUBSCRIBE, Value::Null);
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
+
+    let mut control = connect(&socket).await;
+    let created: SessionInfo = {
+        let _path = PathGuard::prepend(&bin_dir);
+        serde_json::from_value(ok_payload(
+            create_session_with_agent(&mut control, RuntimeRef::claude(), cwd.to_path_buf()).await,
+        ))
+        .expect("claude session info")
+    };
+    let worker_instance_id = created
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.worker_instance_id.as_deref())
+        .expect("created session exposes its runtime id");
+    let report_req = Request::make(
+        "claude-handshake-report",
+        method::SESSION_REPORT_NATIVE_ID,
+        serde_json::to_value(
+            SessionReportNativeIdParams::new(
+                created.id.clone(),
+                worker_instance_id,
+                "claude",
+                created.pid,
+                process_start_identity(created.pid),
+                ReportSequence::new(1),
+                (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format native identity expiry"),
+                native_id,
+                None,
+            )
+            .expect("valid native identity claim"),
+        )
+        .expect("serialize report-native-id params"),
+    );
+    let reported: SessionReportNativeIdResult = serde_json::from_value(ok_payload(
+        root_agent
+            .send(
+                "handshake-report",
+                root_reporter::Via::Root,
+                &socket,
+                &report_req,
+            )
+            .await,
+    ))
+    .expect("report-native-id result");
+    assert!(reported.recorded, "the handshake must be recorded");
+    // The agent keeps its pid and the dialog on screen, and now reads one
+    // line of input like a permission prompt would.
+    root_agent.exec(&[
+        "/bin/sh",
+        "-c",
+        &format!(
+            "IFS= read -r line; printf '%s' \"$line\" > \"{}\"; /bin/sleep 30",
+            input_log.display()
+        ),
+    ]);
+
+    wait_for_agent_state_event(
+        &mut subscriber,
+        &created.id,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    let shown = inspect_session(&mut control, &created.id).await;
+    assert_eq!(shown.native_session_id.as_deref(), Some(native_id));
+
+    let request = Request::make(
+        "session-input-after-handshake",
+        method::SESSION_INPUT,
+        serde_json::to_value(&SessionInputParams {
+            session_id: created.id.clone(),
+            text: "answer-y".to_owned(),
+            wait: None,
+        })
+        .expect("input params"),
+    );
+    let accepted: SessionInputResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &request).await))
+            .expect("input result");
+    assert!(accepted.accepted, "{accepted:?}");
+    wait_until("the blocked agent to receive the answer", || async {
+        (std::fs::read(&input_log).unwrap_or_default() == b"answer-y").then_some(())
+    })
+    .await;
+
+    let stop_req = Request::make(
+        "claude-handshake-stop",
         method::SESSION_STOP,
         serde_json::to_value(&created.id).expect("serialize id"),
     );
@@ -4195,19 +4324,23 @@ with open({received:?}, "wb") as capture:
     let _ = handle.await;
 }
 
-/// #2406 section 1 rows 3 and 4: the fake agent stands in for Claude's
-/// per-directory trust store. On the first launch from a dedicated cwd it
-/// draws the recorded folder-trust dialog, which the owner answers once; the
-/// stub writes the answer into the session cwd, so later launches from the
-/// same directory skip the dialog (rows 3+4: the answer persists per
-/// directory, a second user never re-answers). `cwd: None` blocks again
-/// (revert proof: the directory carries the answer, not the daemon).
+/// The fake agent stands in for Claude's per-directory trust store. On the
+/// first launch from a dedicated cwd it draws the recorded folder-trust
+/// dialog, which the owner answers once; the stub writes the answer into the
+/// session cwd, so later launches from the same directory skip the dialog
+/// (the answer persists per directory, a second user never re-answers).
+/// `cwd: None` blocks again: the directory carries the answer, not the
+/// daemon.
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
-    reason = "#2406 section 1: two full launch cycles plus the cwd:None revert arm in one scenario."
+    reason = "two full launch cycles plus the cwd:None arm in one scenario."
 )]
 async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
+    // The cwd:None arm changes the process working directory.
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
     let socket = temp_socket("claude-trust-cache");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -4322,7 +4455,7 @@ async fn claude_trust_answer_persists_in_the_cwd_across_launches() {
     .await;
 }
 
-/// Scenario-3 revert arm: a launch with `cwd: None` resolves to the
+/// Third launch of the trust-cache scenario: a launch with `cwd: None` resolves to the
 /// test-owned fallback below the socket dir and blocks again, because no
 /// directory there carries the trust answer. The daemon never falls back
 /// to its own process cwd, so the answer marker lands in the per-test
@@ -4478,14 +4611,30 @@ impl Drop for ScopedNoCwdDir {
     }
 }
 
-/// #2406 row 1: a `session.new --input` whose grace expires while the claude
-/// trust dialog holds the screen keeps the session instead of rolling it
-/// back. The call returns `Ok` with `prompt_delivered=false` and a pending
-/// `initial_input` marker; opening the gate renders the prompt box and the
-/// deferred prompt arrives exactly once.
+/// How long a kept session is observed after `delivered` before the
+/// exactly-once count is taken: longer than the 150 ms submit delay plus
+/// every detector tick, so a second write would have landed by then.
+const KEPT_PROMPT_DRAIN: Duration = Duration::from_millis(750);
+
+/// A `session.new --input` whose grace expires while the claude trust dialog
+/// holds the screen keeps the session instead of rolling it back. The call
+/// returns `Ok` with `prompt_delivered=false` and a pending `initial_input`
+/// marker; opening the gate renders the prompt box and the deferred prompt
+/// arrives exactly once.
 #[tokio::test]
 async fn claude_kept_session_blocked_dialog_defers_the_prompt() {
-    let socket = temp_socket("claude-keep");
+    assert_kept_session_defers_the_prompt("claude-keep", None).await;
+}
+
+/// The same keep with `input_ack_timeout_ms` set: the acknowledged write is
+/// the only write, so the prompt still reaches the agent exactly once.
+#[tokio::test]
+async fn claude_kept_session_with_ack_timeout_defers_the_prompt_once() {
+    assert_kept_session_defers_the_prompt("claude-keep-ack", Some(2_000)).await;
+}
+
+async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: Option<u32>) {
+    let socket = temp_socket(tag);
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
     let log = socket.dir.join("stub.log");
@@ -4509,14 +4658,24 @@ async fn claude_kept_session_blocked_dialog_defers_the_prompt() {
     let mut params = session_params(&socket);
     "claudekeep".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
+    params.input_ack_timeout_ms = input_ack_timeout_ms;
+    params.client_request_id = Some(format!("{tag}-request"));
     // The dialog classifies as blocked quickly; the grace (8s) then expires
     // while it still holds the screen, so the call returns the kept session
     // instead of `session_input_not_ready`.
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        create_session_with_params(&mut control, params.clone()).await,
     ))
     .expect("kept claude session info");
     assert_eq!(created.prompt_delivered, Some(false));
+    // The kept create is a settled session: replaying its request id
+    // returns it instead of `session_request_in_progress`.
+    let replayed: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("replay of the kept create");
+    assert_eq!(replayed.replayed, Some(true), "{replayed:?}");
+    assert_eq!(replayed.session.id, created.session.id);
     assert_eq!(
         created
             .session
@@ -4545,13 +4704,6 @@ async fn claude_kept_session_blocked_dialog_defers_the_prompt() {
         StateSource::Screen,
     )
     .await;
-    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
-        .expect("the stub log is text");
-    assert_eq!(
-        steps.matches("hello Claude").count(),
-        1,
-        "the deferred prompt is delivered exactly once: {steps:?}"
-    );
 
     // The write lands before the watcher records the marker, so poll for
     // the delivered state instead of asserting a single inspect.
@@ -4567,6 +4719,14 @@ async fn claude_kept_session_blocked_dialog_defers_the_prompt() {
     })
     .await;
     let mut control = control.into_inner();
+    tokio::time::sleep(KEPT_PROMPT_DRAIN).await;
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert_eq!(
+        steps.matches("hello Claude").count(),
+        1,
+        "the deferred prompt is delivered exactly once: {steps:?}"
+    );
 
     let stop_req = Request::make(
         "claude-keep-stop",
@@ -5019,7 +5179,7 @@ async fn claude_kept_session_stopped_record_survives_restart() {
     drop(second_registry);
 }
 
-/// #2406 row 3: stopping a kept session before readiness discards the
+/// Stopping a kept session before readiness discards the
 /// deferred prompt and records `dropped(session_stopped)`; the prompt never
 /// reaches the agent.
 #[tokio::test]
@@ -5089,7 +5249,7 @@ async fn claude_kept_session_stop_discards_the_deferred_prompt() {
     let _ = handle.await;
 }
 
-/// #2406 row 5: a daemon restart while a kept create holds its prompt in
+/// A daemon restart while a kept create holds its prompt in
 /// memory drops the deferred text (it was never persisted) and records
 /// `dropped(daemon_restart)`; the session runs on without it.
 #[expect(
@@ -5098,9 +5258,6 @@ async fn claude_kept_session_stop_discards_the_deferred_prompt() {
 )]
 #[tokio::test]
 async fn claude_kept_session_restart_drops_the_deferred_prompt() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("pohunek_daemon::session::reconcile=debug,pohunek_daemon::session=debug")
-        .try_init();
     let socket = temp_socket("claude-keep-restart");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");

@@ -299,7 +299,7 @@ impl SessionRegistry {
                 .ok_or_else(|| session_not_found(&session_id.0))?;
             input_runtime_identity(entry, session_id)?;
             entry.input_rules.validate_activity(entry.info.activity)?;
-            // #2406: a runtime whose native reference uses the hook
+            // A runtime whose native reference uses the hook
             // handshake (claude) cannot consume programmatic input before
             // its first native-id report arrives while it is blocked on
             // its trust dialog, so plain `session.input` is refused with
@@ -1248,19 +1248,12 @@ fn input_runtime_identity(
 }
 
 /// Refuses plain `session.input` to a hook-handshake runtime that is blocked
-/// before its first native-id report (#2406 Q4): the pre-handshake dialog
-/// (e.g. claude's trust prompt) cannot consume programmatic input, so the
-/// write is refused with `session_input_blocked` instead of a silent
-/// `accepted:true`. A runtime whose handshake already arrived keeps its
-/// current behaviour, as do non-hook runtimes. Scoped to the claude runtime
-/// in this change; codex and hermes keep their current behaviour.
-/// Refuses plain `session.input` to a hook-handshake runtime that is blocked
-/// before its first native-id report (#2406 Q4): the pre-handshake dialog
-/// (e.g. claude's trust prompt) cannot consume programmatic input, so the
-/// write is refused with `session_input_blocked` instead of a silent
-/// `accepted:true`. A runtime whose handshake already arrived keeps its
-/// current behaviour, as do non-hook runtimes. Scoped to the claude runtime
-/// in this change; codex and hermes keep their current behaviour.
+/// before its first native-id report: the pre-handshake dialog (e.g.
+/// claude's trust prompt) cannot consume programmatic input, so the write
+/// is refused with `session_input_blocked` instead of a silent
+/// `accepted:true`. A runtime whose handshake already arrived accepts the
+/// permission answers it carries, as do non-hook runtimes. Only the claude
+/// runtime is scoped here; codex and hermes declare no existence check.
 ///
 /// The detector publishes `input_ready` before it records the new activity
 /// on the entry, so a write racing the prompt-box classification still sees
@@ -1278,13 +1271,12 @@ fn refuse_pre_handshake_blocked_input(entry: &SessionEntry) -> Result<(), Protoc
     if !handshake_pending {
         return Ok(());
     }
-    // #2406 Q4: only a runtime whose native reference uses the hook
-    // handshake can present a trust dialog that consumes the programmatic
-    // prompt, so only that strategy refuses plain input pre-handshake.
-    // The descriptor's `[native_reference.existence]` check marks the
-    // runtime whose hook handshake reports an id-kind reference the daemon
-    // verifies (claude in this PR); codex and hermes declare no existence
-    // check and keep their current behaviour.
+    // Only a runtime whose native reference uses the hook handshake can
+    // present a trust dialog that consumes the programmatic prompt, so only
+    // that strategy refuses plain input pre-handshake. The descriptor's
+    // `[native_reference.existence]` check marks the runtime whose hook
+    // handshake reports an id-kind reference the daemon verifies (claude);
+    // codex and hermes declare no existence check.
     let hook_handshake = entry.pinned.as_ref().is_some_and(|definition| {
         definition.native_reference_strategy() == NativeReferenceStrategy::Hook
             && definition.hook_existence().is_some()
@@ -1418,11 +1410,7 @@ async fn write_delayed_input(
         delay_boundary.wait().await;
     }
     // The runtime's configured submit pause (150ms for claude), waited
-    // once per delivery. The deferred watcher reaches this write by
-    // polling the activity (blocked to idle), never by waiting on the
-    // initial observation, so this async wait wakes like on the normal
-    // path: the earlier park was the watcher waiting on a readiness the
-    // timed-out wait had already cancelled, not this sleep.
+    // once per delivery.
     tokio::time::sleep(delay).await;
     // Reserved before the session lock below, which keeps the lock order of
     // the control connection first and the session registry second. No

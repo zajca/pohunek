@@ -2826,7 +2826,7 @@ fn render_inspect_human(info: &SessionInfo) -> String {
 
 /// Append the rows shown only when they hold: `worktree_drift` and
 /// `repo_hooks` (a session that skips the in-repo hook layer), plus the
-/// deferred `initial_input` of a kept create (#2406).
+/// deferred `initial_input` of a kept create.
 fn insert_marker_rows(rows: &mut Vec<(&'static str, String)>, info: &SessionInfo) {
     if has_worktree_drift(info) {
         rows.push(("worktree_drift", "yes".to_owned()));
@@ -3212,7 +3212,7 @@ fn activity_label_option(activity: Option<AgentActivity>) -> &'static str {
     activity.map_or("-", activity_label)
 }
 
-/// The deferred `initial_input` of a kept create (#2406): the lifecycle
+/// The deferred `initial_input` of a kept create: the lifecycle
 /// plus, for a prompt that never arrives, the recorded drop reason.
 fn initial_input_label(initial: protocol::SessionInitialInput) -> String {
     use protocol::{SessionInitialInputDrop as Drop, SessionInitialInputState as State};

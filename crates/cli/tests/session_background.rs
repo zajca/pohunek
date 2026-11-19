@@ -814,9 +814,9 @@ async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
 
 /// A kept Claude session whose prompt is still deferred when the daemon
 /// shuts down: the restarted daemon adopts the live worker (same pid) and
-/// reports the deferred prompt dropped with reason `daemon_restart` (#2406
-/// H3). The fake agent holds the folder-trust dialog, so the create keeps
-/// the session with a deferred prompt instead of rolling back.
+/// reports the deferred prompt dropped with reason `daemon_restart`, and
+/// never delivers it. The fake agent holds the folder-trust dialog, so the
+/// create keeps the session with a deferred prompt instead of rolling back.
 #[tokio::test]
 async fn a_restarted_daemon_adopts_the_live_worker_of_a_kept_session() {
     let harness = start_serving_claude(true).await;
@@ -832,17 +832,31 @@ async fn a_restarted_daemon_adopts_the_live_worker_of_a_kept_session() {
         &dialog,
     )
     .expect("stage the recorded folder-trust dialog");
+    let idle = agent_dir.join("idle.txt");
+    // The prompt box Claude draws when it reads input: a rule, the `❯`
+    // line and a rule, which the manifest's `live_prompt_box` rule matches.
+    let rule = "\u{2500}".repeat(24);
+    fs::write(
+        &idle,
+        format!("\x1b[2J\x1b[H{rule}\r\n\u{276f} \r\n{rule}\r\n? for shortcuts\r\n"),
+    )
+    .expect("stage the idle prompt box");
     let log = agent_dir.join("agent.log");
+    let gate = agent_dir.join("gate");
     let script = agent_dir.join("fake-trust.sh");
     // The agent answers the package version probe, draws the trust dialog
-    // the detector reads as `blocked`, then holds standard input: the
-    // create keeps the session with a deferred prompt.
+    // the detector reads as `blocked`, and holds it until the gate opens:
+    // the create keeps the session with a deferred prompt. Opening the
+    // gate draws the idle prompt box, the readiness a held prompt would
+    // wait for, and every later input line lands in the log.
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{}'; exit 0; fi\ncat \"{}\"\nwhile IFS= read -r line; do printf 'got %s\\n' \"$line\" >>\"{}\"; done\n",
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{}'; exit 0; fi\ncat \"{}\"\nwhile [ ! -e \"{}\" ]; do sleep 0.05; done\ncat \"{}\"\nwhile IFS= read -r line; do printf 'got %s\\n' \"$line\" >>\"{}\"; done\n",
             official_runtimes::supported_banner("claude"),
             dialog.display(),
+            gate.display(),
+            idle.display(),
             log.display(),
         ),
     )
@@ -907,8 +921,31 @@ async fn a_restarted_daemon_adopts_the_live_worker_of_a_kept_session() {
         adopted["state"], "running",
         "the session runs on with its live worker: {adopted}"
     );
+
+    // Readiness shows after the adoption, and the held prompt must still
+    // never be written: the adopted entry holds no text and no watcher.
+    fs::write(&gate, b"go").expect("open the gate");
+    wait_until("the adopted agent to show its idle prompt", || async {
+        (inspect(&harness, &id).await["activity"] == "idle").then_some(())
+    })
+    .await;
+    tokio::time::sleep(REDELIVERY_DRAIN).await;
+    let delivered = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !delivered.contains("got hello Claude"),
+        "the dropped prompt was written after the adoption: {delivered:?}"
+    );
+    assert_eq!(
+        inspect(&harness, &id).await["initial_input"]["reason"],
+        "daemon_restart",
+        "the recorded drop reason survives readiness"
+    );
     harness.stop().await;
 }
+
+/// How long the adopted agent is observed after its prompt box shows: at
+/// least five times the 150 ms submit delay of the claude runtime.
+const REDELIVERY_DRAIN: std::time::Duration = std::time::Duration::from_millis(1_000);
 
 /// A worker that died while the daemon was down leaves no snapshot once the
 /// next daemon reconciles it.
