@@ -107,11 +107,15 @@ pub(crate) enum CanaryAction {
         /// is too long is refused before anything starts.
         #[arg(long, value_name = "DIR")]
         scratch_parent: Option<PathBuf>,
-        /// Bound of every wait the driver polls: the first screen, a record
-        /// and the first notification. The CLI's own wait for the agent to
-        /// take a prompt is bounded by the protocol's 8 s maximum instead.
+        /// Bound of the record and the first notification waits the driver
+        /// polls. The CLI's own wait for the agent to take a prompt is
+        /// bounded by the protocol's 8 s maximum instead.
         #[arg(long, value_name = "SECONDS", default_value_t = 120)]
         step_timeout_secs: u64,
+        /// Bound of the wait for the first screen of a session; the step
+        /// timeout when absent.
+        #[arg(long, value_name = "SECONDS")]
+        first_screen_timeout_secs: Option<u64>,
     },
 }
 
@@ -216,6 +220,7 @@ pub(crate) fn run(action: ClaudeAction) -> Result<CanaryOutcome, XtaskError> {
                 scenario,
                 scratch_parent,
                 step_timeout_secs,
+                first_screen_timeout_secs,
             } => canary_capture::run(&canary_capture::CaptureArgs {
                 release_dir,
                 claude,
@@ -225,6 +230,9 @@ pub(crate) fn run(action: ClaudeAction) -> Result<CanaryOutcome, XtaskError> {
                 scenarios: scenario,
                 scratch_parent,
                 step_timeout: std::time::Duration::from_secs(step_timeout_secs),
+                first_screen_timeout: std::time::Duration::from_secs(
+                    first_screen_timeout_secs.unwrap_or(step_timeout_secs),
+                ),
             })
             .map(CanaryOutcome::Capture),
         },

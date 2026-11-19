@@ -74,9 +74,14 @@ pub(crate) struct CaptureArgs {
     pub(crate) scenarios: Vec<String>,
     /// Directory the isolation root is created in; `TMPDIR` when absent.
     pub(crate) scratch_parent: Option<PathBuf>,
-    /// Bound of every wait the driver polls: the first screen, a record and
-    /// the first notification.
+    /// Bound of the record and the first notification waits the driver
+    /// polls.
     pub(crate) step_timeout: Duration,
+    /// Bound of the wait for the first screen of a session; the step
+    /// timeout when the flag is absent. It never bounds the tested waits:
+    /// a loaded host must not stop the run at an earlier screen than the
+    /// step the scenario names.
+    pub(crate) first_screen_timeout: Duration,
 }
 
 /// The canary scenarios, in the order of the expected table.
@@ -361,6 +366,11 @@ fn check_inputs(args: &CaptureArgs, scenarios: &[Scenario]) -> Result<(), XtaskE
     if args.step_timeout.is_zero() {
         return Err(XtaskError::Usage(
             "the capture `--step-timeout-secs` must be positive".to_owned(),
+        ));
+    }
+    if args.first_screen_timeout.is_zero() {
+        return Err(XtaskError::Usage(
+            "the capture `--first-screen-timeout-secs` must be positive".to_owned(),
         ));
     }
     if args.claude_config_dir.is_none() && scenarios.iter().any(|scenario| scenario.uses_account())
@@ -947,7 +957,7 @@ impl Driver<'_> {
         theme_answered: bool,
         picker_records: usize,
     ) -> Result<FirstScreen, StepFailure> {
-        let deadline = Instant::now() + self.args.step_timeout;
+        let deadline = Instant::now() + self.args.first_screen_timeout;
         loop {
             self.read_records(session)?;
             let activity = self.activity(session)?;
@@ -1002,7 +1012,7 @@ impl Driver<'_> {
                 {
                     return Ok(FirstScreen::Prompt);
                 }
-                return Err(self.timed_out("wait for the first screen"));
+                return Err(self.timed_out_first_screen());
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -1076,6 +1086,15 @@ impl Driver<'_> {
         StepFailure::Stopped(format!(
             "step `{step}` timed out after {}s",
             self.args.step_timeout.as_secs()
+        ))
+    }
+
+    /// The first-screen wait stops the run with its own budget named: the
+    /// earlier screen is not the step the scenario tests.
+    fn timed_out_first_screen(&self) -> StepFailure {
+        StepFailure::Stopped(format!(
+            "step `wait for the first screen` timed out after {}s",
+            self.args.first_screen_timeout.as_secs()
         ))
     }
 
