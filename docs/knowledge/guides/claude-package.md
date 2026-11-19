@@ -251,6 +251,12 @@ capture also records from a fresh home:
 
 - `settings.json`: `{"theme": "dark"}` ends the theme picker.
 - `.claude.json`: `hasCompletedOnboarding: true` ends the welcome flow;
+  Pohunek never writes this file: the trust state belongs to Claude Code's own
+  config directory, not to Pohunek. A local `pohunek assistant` without
+  `--project` or `--repo` therefore runs in its own dedicated `<data-dir>/assistant` directory (created 0700 by the
+  launcher, refused with `assistant_workdir_unusable` when the path is not a
+  user-owned directory), so the answer persists per host — and never for
+  `$HOME`, which Claude Code deliberately does not trust as a directory.
   `customApiKeyResponses.approved` lists the last 20 characters of an API key
   the owner approved (the key in `ANTHROPIC_API_KEY` otherwise prompts `Detected
   a custom API key`, whose default answer `No` leads to the login screen);

@@ -9,6 +9,7 @@ use protocol::{
 };
 
 use crate::agent::host::{RuntimeDefinition, RuntimeHost};
+use crate::agent::NativeReferenceStrategy;
 use crate::runtime::{WorkerError, WriteReservation};
 use pohunek_worker_protocol::InspectSnapshot;
 
@@ -298,6 +299,14 @@ impl SessionRegistry {
                 .ok_or_else(|| session_not_found(&session_id.0))?;
             input_runtime_identity(entry, session_id)?;
             entry.input_rules.validate_activity(entry.info.activity)?;
+            // A runtime whose native reference uses the hook
+            // handshake (claude) cannot consume programmatic input before
+            // its first native-id report arrives while it is blocked on
+            // its trust dialog, so plain `session.input` is refused with
+            // `session_input_blocked` instead of a silent `accepted:true`.
+            // After the handshake the permission answers it carries keep
+            // working, and non-hook runtimes are unchanged.
+            refuse_pre_handshake_blocked_input(entry)?;
             (entry.runtime.clone(), entry.input_rules)
         };
 
@@ -1238,6 +1247,46 @@ fn input_runtime_identity(
         .map_err(|_error| ProtocolError::session_terminal_unavailable())
 }
 
+/// Refuses plain `session.input` to a hook-handshake runtime that is blocked
+/// before its first native-id report: the pre-handshake dialog (e.g.
+/// claude's trust prompt) cannot consume programmatic input, so the write
+/// is refused with `session_input_blocked` instead of a silent
+/// `accepted:true`. A runtime whose handshake already arrived accepts the
+/// permission answers it carries, as do non-hook runtimes. Only the claude
+/// runtime is scoped here; codex and hermes declare no existence check.
+///
+/// The detector publishes `input_ready` before it records the new activity
+/// on the entry, so a write racing the prompt-box classification still sees
+/// the stale `blocked` activity: when readiness already shows, the prompt
+/// is readable and the write goes through.
+fn refuse_pre_handshake_blocked_input(entry: &SessionEntry) -> Result<(), ProtocolError> {
+    if entry.info.activity != Some(AgentActivity::Blocked) {
+        return Ok(());
+    }
+    if *entry.input_ready.borrow() {
+        return Ok(());
+    }
+    let handshake_pending =
+        entry.info.native_session_id.is_none() && entry.info.native_session_path.is_none();
+    if !handshake_pending {
+        return Ok(());
+    }
+    // Only a runtime whose native reference uses the hook handshake can
+    // present a trust dialog that consumes the programmatic prompt, so only
+    // that strategy refuses plain input pre-handshake. The descriptor's
+    // `[native_reference.existence]` check marks the runtime whose hook
+    // handshake reports an id-kind reference the daemon verifies (claude);
+    // codex and hermes declare no existence check.
+    let hook_handshake = entry.pinned.as_ref().is_some_and(|definition| {
+        definition.native_reference_strategy() == NativeReferenceStrategy::Hook
+            && definition.hook_existence().is_some()
+    });
+    if hook_handshake {
+        return Err(ProtocolError::session_input_blocked());
+    }
+    Ok(())
+}
+
 fn input_wait_result(
     evidence: ActivityEvidence,
     prompt_accepted: Option<bool>,
@@ -1360,9 +1409,14 @@ async fn write_delayed_input(
         delay_boundary.wait().await;
         delay_boundary.wait().await;
     }
+    // The runtime's configured submit pause (150ms for claude), waited
+    // once per delivery.
     tokio::time::sleep(delay).await;
     // Reserved before the session lock below, which keeps the lock order of
-    // the control connection first and the session registry second.
+    // the control connection first and the session registry second. No
+    // rollback reads the reserved Enter back: `commit` consumes the
+    // reservation, and a failed commit drops it, so the text has no second
+    // send once the claim below resolves.
     let reservation = worker
         .reserve_write(vec![enter_fragment(Duration::ZERO)])
         .await

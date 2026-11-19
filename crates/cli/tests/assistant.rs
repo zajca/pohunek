@@ -1,5 +1,6 @@
 //! Public CLI behavior for `pohunek assistant` argument forms.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, Output};
 
 use pohunek_test_support::env::TestEnv;
@@ -181,4 +182,144 @@ fn assistant_accepts_a_request_id_and_refuses_a_malformed_one_before_dialing() {
             serde_json::from_slice(&output.stdout).expect("one JSON usage error");
         assert_eq!(document["err"]["code"], "cli_usage", "{key:?}: {document}");
     }
+}
+
+#[test]
+fn assistant_without_a_started_daemon_still_ensures_a_private_workdir() {
+    // The hermetic environment holds no daemon and `--no-start-daemon` skips
+    // the bootstrap, so the CLI reports `daemon_unreachable`. The launcher
+    // still ensures `<data_home>/pohunek/assistant` first: without an
+    // owner-private directory the session would start in the wrong place
+    // once the daemon answers.
+    let output = run_assistant(&["assistant", "--json", "--no-start-daemon"]);
+    let document = json_error(&output);
+    assert_eq!(
+        document["err"]["code"], "daemon_unreachable",
+        "{document:?}"
+    );
+    TEST_ENV.with(|env| {
+        let workdir = env.data_home().join("pohunek").join("assistant");
+        let metadata = std::fs::symlink_metadata(&workdir).expect("the launcher creates it");
+        assert!(metadata.is_dir(), "{workdir:?}");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700, "{workdir:?}");
+        std::fs::remove_dir(&workdir).expect("restore the hermetic home");
+    });
+}
+
+#[test]
+fn assistant_with_a_project_or_repo_target_does_not_use_the_private_workdir() {
+    // A launch that names a project or repository starts in that directory,
+    // so the launcher creates no `<data_home>/pohunek/assistant` for it.
+    for target in [["--project", "ui"], ["--repo", "/code/ui"]] {
+        let mut args = vec!["assistant"];
+        args.extend(target);
+        args.extend(["--json", "--no-start-daemon"]);
+        let output = run_assistant(&args);
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "daemon_unreachable",
+            "{args:?}: {document:?}"
+        );
+        TEST_ENV.with(|env| {
+            let workdir = env.data_home().join("pohunek").join("assistant");
+            assert!(
+                std::fs::symlink_metadata(&workdir).is_err(),
+                "{args:?} must not create {workdir:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn assistant_creates_a_missing_data_home_for_its_workdir() {
+    // A fresh account has no data home at all: the launcher creates the
+    // whole chain instead of failing with `assistant_workdir_unusable`.
+    TEST_ENV.with(|env| {
+        let data_home = env.data_home();
+        std::fs::remove_dir(data_home).expect("the hermetic data home starts empty");
+        let output = run_assistant(&["assistant", "--json", "--no-start-daemon"]);
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "daemon_unreachable",
+            "{document:?}"
+        );
+        let workdir = data_home.join("pohunek").join("assistant");
+        let metadata = std::fs::symlink_metadata(&workdir).expect("the launcher creates it");
+        assert!(metadata.is_dir(), "{workdir:?}");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700, "{workdir:?}");
+    });
+}
+
+#[test]
+fn assistant_refuses_a_foreign_workdir_without_touching_it() {
+    TEST_ENV.with(|env| {
+        let workdir = env.data_home().join("pohunek").join("assistant");
+        // A symlink where the directory must be: the launcher inspects with
+        // `symlink_metadata`, refuses with the typed error, and never follows
+        // the link (the target must not exist afterwards).
+        std::fs::create_dir_all(workdir.parent().expect("the data dir parent"))
+            .expect("create the data dir parent");
+        let target = env.data_home().join("foreign-target");
+        std::os::unix::fs::symlink(&target, &workdir).expect("plant the symlink");
+        let output = TEST_ENV.with(|nested| {
+            let mut command = nested.command(pohunek_test_support::bin_exe("pohunek"));
+            command
+                .args(["assistant", "--json", "--print-prompt"])
+                .output()
+                .expect("spawn pohunek")
+        });
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "assistant_workdir_unusable",
+            "{document:?}"
+        );
+        assert!(!target.exists(), "{target:?}");
+        std::fs::remove_file(&workdir).expect("clear the symlink");
+
+        // A group-writable directory the launcher did not create stays as it
+        // is: refused, never chmodded.
+        std::fs::create_dir(&workdir).expect("plant the directory");
+        std::fs::set_permissions(&workdir, std::fs::Permissions::from_mode(0o770))
+            .expect("make it group-writable");
+        let output = TEST_ENV.with(|nested| {
+            let mut command = nested.command(pohunek_test_support::bin_exe("pohunek"));
+            command
+                .args(["assistant", "--json", "--print-prompt"])
+                .output()
+                .expect("spawn pohunek")
+        });
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "assistant_workdir_unusable",
+            "{document:?}"
+        );
+        let mode = std::fs::symlink_metadata(&workdir)
+            .expect("still there")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o770, "the launcher never chmods a foreign path");
+        std::fs::remove_dir(&workdir).expect("clear the directory");
+
+        // A plain file is not a directory either: the same typed error.
+        std::fs::write(&workdir, b"not a directory").expect("plant the file");
+        let output = TEST_ENV.with(|nested| {
+            let mut command = nested.command(pohunek_test_support::bin_exe("pohunek"));
+            command
+                .args(["assistant", "--json", "--print-prompt"])
+                .output()
+                .expect("spawn pohunek")
+        });
+        let document = json_error(&output);
+        assert_eq!(
+            document["err"]["code"], "assistant_workdir_unusable",
+            "{document:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&workdir)
+                .expect("still there")
+                .is_file(),
+            "the launcher never replaces a foreign path"
+        );
+    });
 }

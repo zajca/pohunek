@@ -257,6 +257,7 @@ fn serve_session_and_track(
                                 metadata: std::collections::BTreeMap::new(),
                                 spawned_by: None,
                                 attention_isolated_by: None,
+                                initial_input: None,
                                 created_at: "2026-01-01T00:00:00Z".to_owned(),
                                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
                                 ended_at: None,

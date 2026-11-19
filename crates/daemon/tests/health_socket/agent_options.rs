@@ -111,8 +111,15 @@ impl OptionRig {
             .reconcile_workers()
             .await
             .expect("startup reconciles the sessions of the earlier daemon");
-        let (shutdown, handle, _) =
-            serve_registry(&socket, "0.0.0", None, registry, worker_home).await;
+        let (shutdown, handle, _) = serve_registry(
+            &socket,
+            "0.0.0",
+            None,
+            registry,
+            worker_home.path().to_path_buf(),
+            Some(worker_home),
+        )
+        .await;
         let control = connect(&socket).await;
         Self {
             socket,

@@ -9,6 +9,7 @@ import type { SessionBackground } from "./SessionBackground";
 import type { SessionCapabilities } from "./SessionCapabilities";
 import type { SessionCapabilityRefusals } from "./SessionCapabilityRefusals";
 import type { SessionId } from "./SessionId";
+import type { SessionInitialInput } from "./SessionInitialInput";
 import type { SessionPlacement } from "./SessionPlacement";
 import type { SessionRuntime } from "./SessionRuntime";
 import type { SessionState } from "./SessionState";
@@ -287,6 +288,13 @@ export type SessionInfo = {
    * responses never carry it.
    */
   attention_isolated_by?: SessionId;
+  /**
+   * Deferred initial prompt of a kept `session.new` create (see
+   * [`SessionInitialInput`]). Absent for sessions created without
+   * initial input. Computed live and carried by list, inspect and new
+   * responses and by session events; stored records never carry it.
+   */
+  initial_input?: SessionInitialInput;
   /**
    * Creation timestamp in the daemon's wire timestamp format.
    */

@@ -730,6 +730,7 @@ mod tests {
             activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
+            initial_input: None,
             id: SessionId(id.to_owned()),
             external: Some(false),
             capabilities: SessionCapabilities::default(),

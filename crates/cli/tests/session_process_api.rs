@@ -100,7 +100,7 @@ impl RedactedRequestLog {
 }
 
 struct TestHome {
-    env: TestEnv,
+    pub(crate) env: TestEnv,
     root: PathBuf,
     worker: PathBuf,
 }
@@ -2702,6 +2702,57 @@ const ASSISTANT_ARGS: [&str; 7] = [
 
 /// The request words of the request-form scenarios.
 const ASSISTANT_REQUEST: [&str; 4] = ["review", "the", "failing", "test"];
+
+/// A local assistant launch starts in `<data_home>/pohunek/assistant`, which
+/// the launcher creates owner-private: Claude Code trusts a directory, never
+/// `$HOME`, so the owner's answer persists per host instead of re-asking on
+/// every launch.
+#[test]
+fn an_assistant_launch_starts_in_its_private_workdir() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+
+    let output = home
+        .command()
+        .args(ASSISTANT_ARGS)
+        .args(ASSISTANT_REQUEST)
+        .output()
+        .expect("run pohunek");
+    let created = assert_json_success(&output);
+    assert_eq!(created["session"]["id"], SESSION_ID, "{created}");
+    let requests = fixture.finish();
+    let creation = requests
+        .iter()
+        .find(|request| request.method() == protocol::method::SESSION_NEW)
+        .expect("one session creation");
+    let cwd = creation.params()["cwd"]
+        .as_str()
+        .expect("the launch names a session cwd");
+    let data_dir = home.env.data_home().join("pohunek");
+    assert_eq!(
+        Path::new(cwd),
+        data_dir.join("assistant").as_path(),
+        "the assistant session starts in <data_dir>/assistant"
+    );
+    let mode = fs::symlink_metadata(data_dir.join("assistant"))
+        .expect("the launcher created the workdir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "the launcher-created workdir is owner-private");
+    // The first launch already used the directory; a second one must reuse it
+    // instead of failing on `AlreadyExists`.
+    let home2 = home;
+    let fixture2 = FixtureDaemon::start(&home2.socket(), Scenario::Success);
+    let rerun = home2
+        .command()
+        .args(ASSISTANT_ARGS)
+        .args(ASSISTANT_REQUEST)
+        .output()
+        .expect("run pohunek again");
+    assert_json_success(&rerun);
+    fixture2.finish();
+}
 
 #[test]
 fn an_assistant_request_from_stdin_launches_like_the_positional_form() {

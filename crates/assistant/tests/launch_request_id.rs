@@ -462,6 +462,7 @@ fn launch_params(request_id: Option<&str>) -> LaunchParams {
         no_snapshot: true,
         auto_started_daemon: false,
         request_id: request_id.map(str::to_owned),
+        workdir: None,
     }
 }
 

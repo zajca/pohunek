@@ -17,7 +17,8 @@
 pub(crate) mod bootstrap;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pohunek_assistant::launch as core_assistant;
@@ -145,8 +146,13 @@ pub(crate) async fn run(opts: AssistantOptions, paths: &Paths) -> Result<(), Cli
     if !opts.print_prompt && matches!(remote_confirmation(&opts), ConfirmDecision::RequireYes) {
         return Err(CliError::RemoteConfirmationRequired);
     }
+    // The working directory is ensured first: without an owner-private
+    // `<data_dir>/assistant` the session would start in the wrong directory
+    // (today it inherits the daemon's). A refused foreign path blocks before
+    // any daemon is started or dialed.
+    let workdir = assistant_workdir(&opts, paths)?;
     let auto_started = bootstrap::ensure_daemon(&opts.host, paths, opts.no_start_daemon).await?;
-    run_prepared(opts, paths, auto_started).await
+    run_prepared(opts, paths, auto_started, workdir).await
 }
 
 /// Validate the launch target before any daemon connection is dialed.
@@ -174,9 +180,10 @@ async fn run_prepared(
     opts: AssistantOptions,
     paths: &Paths,
     auto_started: bool,
+    workdir: Option<std::path::PathBuf>,
 ) -> Result<(), CliError> {
     let host = assistant_host_config(&opts, paths).await?;
-    let params = assistant_params(&opts, auto_started);
+    let params = assistant_params(&opts, auto_started, workdir);
     let mut prepared =
         core_assistant::prepare_with_options(&host, params, ConnectionOptions::default())
             .await
@@ -354,6 +361,14 @@ fn emit_launch_output(
             }
         );
         println!("attach: pohunek attach {target}");
+        if info
+            .initial_input
+            .is_some_and(|initial| initial.state == protocol::SessionInitialInputState::Pending)
+        {
+            println!(
+                "assistant waits on an answer to a dialog; the opening prompt is sent once the agent is ready, no extra action is needed unless the dialog is addressed to the operator, in which case use the attach command above"
+            );
+        }
     }
     Ok(())
 }
@@ -383,7 +398,117 @@ async fn assistant_host_config(
     }
 }
 
-fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assistant::LaunchParams {
+/// Assistant working directory for a launch without a target, or `None`.
+///
+/// A local launch that names neither `--project` nor `--repo` runs with
+/// `cwd = <data_dir>/assistant`, created 0700 by the launcher, so Claude
+/// Code's per-directory folder trust persists per host instead of
+/// re-asking on every launch. A launch that names a project or repository
+/// starts in that directory, and a remote launch keeps the target rule: no
+/// local filesystem path is meaningful on another host.
+fn assistant_workdir(
+    opts: &AssistantOptions,
+    paths: &Paths,
+) -> Result<Option<std::path::PathBuf>, CliError> {
+    if opts.is_remote() || opts.project.is_some() || opts.repo.is_some() {
+        return Ok(None);
+    }
+    ensure_assistant_workdir(&paths.data_dir).map(Some)
+}
+
+/// Leaf name of the assistant working directory under the CLI data directory.
+///
+/// Claude Code persists folder trust per directory but never for `$HOME`, so
+/// the assistant runs in its own directory and the owner's answer persists
+/// per host instead of re-asking on every launch.
+const ASSISTANT_WORKDIR_NAME: &str = "assistant";
+/// Owner-private mode of a launcher-created assistant working directory:
+/// no group or other access, so no other local user reads the trust state.
+const ASSISTANT_WORKDIR_MODE: u32 = 0o700;
+/// Mode bits that make an existing assistant directory unusable without
+/// repair: group- or other-writable. The launcher refuses instead of
+/// chmodding a path it did not create.
+const ASSISTANT_WORKDIR_FORBIDDEN_MODE: u32 = 0o022;
+
+/// Ensure `<data_dir>/assistant` exists as an owner-private directory.
+///
+/// Creates the data directory and the leaf with mode 0700 when missing (like
+/// the daemon's own directory bootstrap). An existing path is inspected with
+/// `symlink_metadata`,
+/// never following a symlink: a symlink, a non-directory, a directory owned
+/// by another user, or a group-/other-writable one is the typed error.
+/// A narrower existing mode (for example 0500) is fine and left alone.
+///
+/// # Errors
+///
+/// Returns [`CliError::AssistantWorkdirUnusable`] when the path exists but
+/// is not an owner-private directory, or when creation fails.
+fn ensure_assistant_workdir(data_dir: &Path) -> Result<PathBuf, CliError> {
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(ASSISTANT_WORKDIR_MODE)
+        .create(data_dir)
+    {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(unusable(data_dir, &format!("cannot create it: {err}")));
+        }
+    }
+    let workdir = data_dir.join(ASSISTANT_WORKDIR_NAME);
+    match std::fs::DirBuilder::new()
+        .mode(ASSISTANT_WORKDIR_MODE)
+        .create(&workdir)
+    {
+        Ok(()) => return Ok(workdir),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(unusable(&workdir, &format!("cannot create it: {err}")));
+        }
+    }
+    check_assistant_workdir(&workdir)?;
+    Ok(workdir)
+}
+
+/// Re-check an existing assistant working directory (also after a lost
+/// create race): directory, owned by the invoking user, not
+/// group-/other-writable. Inspects with `symlink_metadata`, so a symlink
+/// is refused instead of followed.
+///
+/// # Errors
+///
+/// Returns [`CliError::AssistantWorkdirUnusable`] on any foreign or unsafe
+/// shape.
+fn check_assistant_workdir(workdir: &Path) -> Result<(), CliError> {
+    let metadata = std::fs::symlink_metadata(workdir)
+        .map_err(|err| unusable(workdir, &format!("cannot inspect it: {err}")))?;
+    if !metadata.is_dir() {
+        return Err(unusable(workdir, "it is not a directory"));
+    }
+    if metadata.uid() != nix::unistd::Uid::effective().as_raw() {
+        return Err(unusable(workdir, "it is not owned by the invoking user"));
+    }
+    if metadata.permissions().mode() & ASSISTANT_WORKDIR_FORBIDDEN_MODE != 0 {
+        return Err(unusable(
+            workdir,
+            "it is group- or other-writable; remove it yourself or fix its mode",
+        ));
+    }
+    Ok(())
+}
+
+fn unusable(workdir: &Path, reason: &str) -> CliError {
+    CliError::AssistantWorkdirUnusable {
+        path: workdir.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn assistant_params(
+    opts: &AssistantOptions,
+    auto_started: bool,
+    workdir: Option<std::path::PathBuf>,
+) -> core_assistant::LaunchParams {
     core_assistant::LaunchParams {
         intent: core_intent(opts.intent),
         request: opts.request.clone(),
@@ -401,6 +526,7 @@ fn assistant_params(opts: &AssistantOptions, auto_started: bool) -> core_assista
         no_snapshot: opts.no_snapshot,
         auto_started_daemon: auto_started,
         request_id: opts.request_id.clone(),
+        workdir,
     }
 }
 

@@ -10,7 +10,7 @@
 use super::*;
 
 use pohunek_service_config::RequiredHook;
-use protocol::{BranchSource, FetchRefRequest, FetchedRef, SessionNewResult};
+use protocol::{BranchSource, FetchRefRequest, FetchedRef};
 
 /// The source ref every scenario fetches.
 const SOURCE_REF: &str = "refs/pull/42/head";

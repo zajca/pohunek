@@ -848,6 +848,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
         activity_revision: None,
         spawned_by: None,
         attention_isolated_by: None,
+        initial_input: None,
         name: name.map(str::to_owned),
         id: SessionId(id.to_owned()),
         external: Some(false),

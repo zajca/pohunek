@@ -15,8 +15,8 @@ use pohunek_worker_protocol::{
 use protocol::{
     AgentActivity, BackgroundItem, BackgroundKind, BackgroundRevision, BackgroundStatus,
     RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus, RuntimeRef,
-    SessionBackground, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
-    UnconfirmedProcess,
+    SessionBackground, SessionInitialInput, SessionInitialInputDrop, SessionInitialInputState,
+    SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent, UnconfirmedProcess,
 };
 use serde::Deserialize;
 
@@ -2056,6 +2056,22 @@ impl SessionRegistry {
     /// and cleans nothing: the session stays pending for the retry, which
     /// re-reads it.
     async fn roll_back_undelivered_create(&self, record: SessionRecord) -> UndeliveredCreate {
+        // A kept create holds its prompt text in daemon memory only, so a
+        // deferred marker of another instance (or none) after a restart
+        // means the text is gone: the session proceeds without it and the
+        // entry records the drop reason. The durable
+        // marker stays until the classification commits it away (through
+        // `write_record_and_install` or the pending-entry fallback), so a
+        // lost classification replays the drop from the same record instead
+        // of degrading it to an inapplicable reason. Only the delivering
+        // `initial_input` marker of another instance rolls back.
+        if is_orphaned_deferred_initial_input(&record, self.daemon_instance_id()) {
+            // The durable marker stays until `unavailable_entry` settles
+            // the classification: a later reconcile must see the same
+            // deferred record and replay the same drop, never a rollback.
+            tracing::warn!(session_id = %record.session_id, reason = "daemon_restart", "dropping a deferred initial prompt the restarted daemon no longer holds");
+            return UndeliveredCreate::Proceed(record);
+        }
         if !self.orphaned_initial_input(&record) {
             return UndeliveredCreate::Proceed(record);
         }
@@ -4263,6 +4279,10 @@ impl SessionRegistry {
             generation_recorded: None,
         });
         record.info.updated_at = now;
+        // A deferred marker of a kept create means the restarted daemon no
+        // longer holds the prompt text: the adopted live entry records the
+        // drop reason, never the text.
+        let adopted_deferred_drop = deferred_drop_from_record(&record);
         record.transaction = None;
         record.runtime.state = RuntimeState::Live;
         record.runtime.worker_id = Some(snapshot.worker_id.to_string());
@@ -4371,6 +4391,12 @@ impl SessionRegistry {
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let (input_ready_tx, input_ready) = watch::channel(false);
         let mut info = record.info.clone();
+        if adopted_deferred_drop.is_some() {
+            info.initial_input = Some(SessionInitialInput {
+                state: SessionInitialInputState::Dropped,
+                reason: Some(SessionInitialInputDrop::DaemonRestart),
+            });
+        }
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
@@ -4422,6 +4448,8 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
+            deferred_initial_input: adopted_deferred_drop
+                .or_else(|| deferred_drop_from_record(&record)),
             create_request: record.create_request.clone(),
             root_process: Some(crate::procwatch::ProcessIdentity {
                 pid: child.pid,
@@ -4438,7 +4466,8 @@ impl SessionRegistry {
                 .map(|held| Box::new(ProfileRights::from_record(held))),
         };
         let listed = record.clone();
-        match self.write_record_and_install(&id, record, entry).await {
+        // Boxed so the entry does not widen the futures of the callers.
+        match Box::pin(self.write_record_and_install(&id, record, entry)).await {
             Ok(metadata) => info.metadata = metadata,
             Err(error) => {
                 tracing::warn!(session_id = %id.0, error = %error, "failed to commit reconciled worker");
@@ -4567,7 +4596,8 @@ impl SessionRegistry {
             .await
             .get(&id)
             .is_some_and(|current| current.info.background.is_some());
-        match self.write_record_and_install(&id, classified, *entry).await {
+        // Boxed so the entry does not widen the futures of the callers.
+        match Box::pin(self.write_record_and_install(&id, classified, *entry)).await {
             Ok(metadata) => info.metadata = metadata,
             Err(error) => {
                 tracing::warn!(session_id = %id.0, error = %error, "failed to persist runtime classification");
@@ -4655,16 +4685,38 @@ impl SessionRegistry {
 
     /// Classifies `record` as `state` for `reason` and builds the in-memory
     /// entry that shows it, returning the classified record with it.
+    ///
+    /// A kept create whose worker is gone keeps no marker behind: a deferred
+    /// marker loses its prompt text on a restart and a
+    /// delivering marker is finished with the worker.
     #[expect(
         clippy::too_many_lines,
         reason = "one struct literal initializes every entry field"
     )]
     pub(super) fn unavailable_entry(
         &self,
-        mut record: SessionRecord,
+        record: SessionRecord,
         classification: &Unavailability,
         reason: &str,
     ) -> (SessionRecord, SessionEntry) {
+        // A deferred marker of a kept create means the restarted daemon no
+        // longer holds the prompt text: the entry records the drop reason
+        // never the text. Read before the marker is
+        // settled below: the classified record keeps no create marker
+        // behind, or a later reconcile would replay the drop from the old
+        // record as a rollback.
+        let deferred_initial_input = deferred_drop_from_record(&record);
+        // The marker of a kept create is settled by the classification: a
+        // deferred marker loses its prompt text when the daemon restarts
+        // and a delivering marker is finished once
+        // the worker is gone. Keeping either would replay the drop or the
+        // rollback on every reconcile while the entry claims a reason.
+        let mut record = record;
+        if record.transaction.as_ref().is_some_and(|transaction| {
+            transaction.is_initial_input() || transaction.is_deferred_initial_input()
+        }) {
+            record.transaction = None;
+        }
         let state = classification.state();
         let now = timestamp_now();
         let runtime = record.info.runtime.get_or_insert(SessionRuntime {
@@ -4725,7 +4777,8 @@ impl SessionRegistry {
         });
         let (detector_preview, _) = mpsc::channel::<super::DetectionPreviewRequest>(1);
         let (_, input_ready) = watch::channel(false);
-        let info = record.info.clone();
+        let mut info = record.info.clone();
+        info.initial_input = None;
         let recorded_generation =
             super::Generation::from_record(&record.session_id, &record.runtime);
         // The boot is read once so the worker-root placement and the
@@ -4786,6 +4839,7 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
+            deferred_initial_input,
             create_request: record.create_request.clone(),
             root_process: None,
             worker_root: match recorded {
@@ -5014,6 +5068,24 @@ fn initial_input_orphaned(record: &SessionRecord, daemon_instance_id: &str) -> b
         && initial_input_owner(record).as_deref() != Some(daemon_instance_id)
 }
 
+/// Whether `record` is a kept create whose deferred prompt another daemon
+/// instance held in memory: the marker names another
+/// instance (or none), so the restart lost the text and the session
+/// proceeds with the drop recorded, never rolled back.
+fn is_orphaned_deferred_initial_input(record: &SessionRecord, daemon_instance_id: &str) -> bool {
+    record.desired_state == DesiredState::Running
+        && record
+            .transaction
+            .as_ref()
+            .is_some_and(crate::store::SessionTransaction::is_deferred_initial_input)
+        && record
+            .transaction
+            .as_ref()
+            .and_then(|transaction| transaction.daemon_instance_id.clone())
+            .as_deref()
+            != Some(daemon_instance_id)
+}
+
 fn initial_input_owner(record: &SessionRecord) -> Option<String> {
     record
         .transaction
@@ -5022,13 +5094,32 @@ fn initial_input_owner(record: &SessionRecord) -> Option<String> {
         .and_then(|transaction| transaction.daemon_instance_id.clone())
 }
 
+/// The deferred drop a record's kept marker records: a deferred marker of
+/// another instance (or none) means the restarted daemon no longer holds
+/// the prompt text, so the entry carries the drop reason, never the text.
+fn deferred_drop_from_record(record: &SessionRecord) -> Option<super::DeferredInitialInput> {
+    record
+        .transaction
+        .as_ref()
+        .filter(|transaction| transaction.is_deferred_initial_input())
+        .map(|_| super::DeferredInitialInput {
+            text: String::new(),
+            ack_timeout_ms: None,
+            outcome: Some(super::DeferredInitialInputOutcome::DaemonRestart),
+            delivering: false,
+            ended_by: None,
+        })
+}
+
 /// Whether `record` is a create that has not committed its session yet.
 ///
 /// A committed create still delivering its initial input is a running
 /// session, not an uncommitted create, so no create compensation applies.
 fn uncommitted_create(record: &SessionRecord) -> bool {
     record.transaction.as_ref().is_some_and(|transaction| {
-        transaction.kind == crate::store::TransactionKind::Create && !transaction.is_initial_input()
+        transaction.kind == crate::store::TransactionKind::Create
+            && !transaction.is_initial_input()
+            && !transaction.is_deferred_initial_input()
     })
 }
 
@@ -9654,6 +9745,7 @@ while os.getppid() == parent:
             activity_revision: None,
             spawned_by: None,
             attention_isolated_by: None,
+            initial_input: None,
             id: SessionId(session_id.to_owned()),
             external: Some(false),
             name: Some("restart continuity".to_owned()),
@@ -11246,6 +11338,7 @@ while os.getppid() == parent:
                 activity_revision: None,
                 spawned_by: None,
                 attention_isolated_by: None,
+                initial_input: None,
                 id: SessionId("s-identity".to_owned()),
                 external: Some(false),
                 name: None,

@@ -79,6 +79,10 @@ pub struct LaunchParams {
     pub rows: u16,
     pub no_snapshot: bool,
     pub auto_started_daemon: bool,
+    /// Local assistant working directory the session starts in. `Some` for
+    /// local launches (`<data_dir>/assistant`, ensured by the launcher);
+    /// `None` for remote launches, which keep the target rule.
+    pub workdir: Option<PathBuf>,
     /// Caller-chosen idempotency key of the launch, to resume an earlier launch
     /// whose outcome was unknown. `None` lets a daemon that supports keys get a
     /// generated one.
@@ -259,7 +263,7 @@ pub async fn prepare_with_options(
         client_request_id,
         agent: selection.name.clone(),
         name: None,
-        cwd: None,
+        cwd: params.workdir.clone(),
         cols: params.cols,
         rows: params.rows,
         project: params.project,

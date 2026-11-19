@@ -153,6 +153,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         exit_code,
         agent_options: std::collections::BTreeMap::new(),
         skip_repo_hooks: false,
+        initial_input: None,
     }
 }
 
@@ -790,6 +791,33 @@ fn session_new_params_roundtrips_with_worktree_fields() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_initial_input_drop_roundtrips_every_reason() {
+    for reason in [
+        protocol::SessionInitialInputDrop::DaemonRestart,
+        protocol::SessionInitialInputDrop::SessionStopped,
+        protocol::SessionInitialInputDrop::SessionExited,
+        protocol::SessionInitialInputDrop::DeliveryFailed,
+    ] {
+        let info = protocol::SessionInitialInput {
+            state: protocol::SessionInitialInputState::Dropped,
+            reason: Some(reason),
+        };
+        let value = serde_json::to_value(info).expect("serialize initial input");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "state": "dropped",
+                "reason": value["reason"],
+            }),
+            "the drop reason serializes as snake_case: {reason:?}"
+        );
+        let back: protocol::SessionInitialInput =
+            serde_json::from_value(value).expect("deserialize initial input");
+        assert_eq!(back, info);
+    }
 }
 
 #[test]

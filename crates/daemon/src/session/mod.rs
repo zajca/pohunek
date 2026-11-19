@@ -1221,6 +1221,13 @@ struct SessionEntry {
     /// running session's record then carries the `initial_input` marker
     /// naming that instance.
     initial_input_owner: Option<String>,
+    /// Deferred initial prompt of a kept create: the text held in daemon
+    /// memory after the readiness wait timed out while the agent was
+    /// `blocked`. Delivered exactly once on the session's `input_ready`
+    /// signal, then cleared. Never persisted at rest: a daemon restart
+    /// drops it with a recorded reason, a stop or exit discards it with a
+    /// recorded reason.
+    deferred_initial_input: Option<DeferredInitialInput>,
     /// The idempotency key and fingerprint of the creating `session.new`,
     /// written to every record of the session and never reported to clients.
     create_request: Option<Box<CreateRequest>>,
@@ -1251,6 +1258,45 @@ pub(crate) struct RuntimeInventorySnapshot {
 
 /// Source of [`SessionEntry::entry_incarnation`]; never repeats in a process.
 static NEXT_ENTRY_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Deferred initial prompt of a kept `session.new` create.
+///
+/// The readiness wait timed out while the agent was `blocked`, so the
+/// session was kept and the prompt text stays in daemon memory until the
+/// `input_ready` signal the watcher waits on delivers it exactly once.
+/// Never persisted at rest: a restart drops it, a stop or exit discards
+/// it, each with a recorded drop reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredInitialInput {
+    /// The prompt text held in memory, never written to the store.
+    text: String,
+    /// Whether `input_ack_timeout_ms` asked for acknowledgement.
+    ack_timeout_ms: Option<u32>,
+    /// How the deferred prompt ended; `None` while still pending.
+    outcome: Option<DeferredInitialInputOutcome>,
+    /// Whether a delivery owns the write. Set under the sessions lock
+    /// before the write starts; the claim resolves the outcome itself, so
+    /// a delivery that ends in any way never leaves the prompt `pending`.
+    delivering: bool,
+    /// A stop or exit that landed while a delivery owned the write. The
+    /// claim records it instead of `delivered` or `delivery_failed`.
+    ended_by: Option<DeferredInitialInputOutcome>,
+}
+
+/// How a deferred initial prompt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredInitialInputOutcome {
+    /// Delivered through the readiness trigger.
+    Delivered,
+    /// Dropped on daemon restart (text was memory-only).
+    DaemonRestart,
+    /// Discarded because the session stopped before readiness.
+    SessionStopped,
+    /// Discarded because the session exited before readiness.
+    SessionExited,
+    /// The deferred write failed while the session was still running.
+    DeliveryFailed,
+}
 
 /// Whether a restored session's record named a worker its entry does not carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1336,6 +1382,34 @@ impl SessionEntry {
         {
             runtime.generation_recorded = Some(self.job.is_some());
         }
+        info.initial_input = self.deferred_initial_input.as_ref().map(|deferred| {
+            use protocol::{
+                SessionInitialInput, SessionInitialInputDrop, SessionInitialInputState,
+            };
+            match deferred.outcome {
+                None => SessionInitialInput::pending(),
+                Some(DeferredInitialInputOutcome::Delivered) => SessionInitialInput {
+                    state: SessionInitialInputState::Delivered,
+                    reason: None,
+                },
+                Some(DeferredInitialInputOutcome::DaemonRestart) => SessionInitialInput {
+                    state: SessionInitialInputState::Dropped,
+                    reason: Some(SessionInitialInputDrop::DaemonRestart),
+                },
+                Some(DeferredInitialInputOutcome::SessionStopped) => SessionInitialInput {
+                    state: SessionInitialInputState::Dropped,
+                    reason: Some(SessionInitialInputDrop::SessionStopped),
+                },
+                Some(DeferredInitialInputOutcome::SessionExited) => SessionInitialInput {
+                    state: SessionInitialInputState::Dropped,
+                    reason: Some(SessionInitialInputDrop::SessionExited),
+                },
+                Some(DeferredInitialInputOutcome::DeliveryFailed) => SessionInitialInput {
+                    state: SessionInitialInputState::Dropped,
+                    reason: Some(SessionInitialInputDrop::DeliveryFailed),
+                },
+            }
+        });
         info
     }
 
@@ -2523,6 +2597,12 @@ impl SessionRegistry {
             })?
     }
 
+    /// Builds the durable record of the registered session `id` from its
+    /// in-memory entry: a finished classification keeps no create marker
+    /// behind (a kept create whose worker is gone either dropped its
+    /// deferred prompt on restart or finished its delivering one with the
+    /// worker). A marker survives only while its entry still owns it: an
+    /// unclaimed deferred outcome, or an unclaimed delivering owner.
     fn session_record(
         id: &SessionId,
         entry: &SessionEntry,
@@ -2553,14 +2633,30 @@ impl SessionRegistry {
             job.record_into(&mut runtime);
         }
         let transaction = transaction.or_else(|| {
-            let owner = entry
-                .initial_input_owner
+            let phase = if entry
+                .deferred_initial_input
                 .as_ref()
-                .filter(|_| desired_state == DesiredState::Running)?;
-            Some(SessionTransaction {
+                .is_some_and(|deferred| deferred.outcome.is_none())
+            {
+                Some(crate::store::DEFERRED_INITIAL_INPUT_PHASE)
+            } else {
+                (entry.initial_input_owner.is_some() && entry.deferred_initial_input.is_none())
+                    .then_some(crate::store::INITIAL_INPUT_PHASE)
+            };
+            let (phase, owner) = match phase {
+                Some(phase) => (
+                    phase,
+                    entry
+                        .initial_input_owner
+                        .as_ref()
+                        .filter(|_| desired_state == DesiredState::Running)?,
+                ),
+                None => return None,
+            };
+            (desired_state == DesiredState::Running).then(|| SessionTransaction {
                 id: format!("create-{}", id.0),
                 kind: TransactionKind::Create,
-                phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
+                phase: phase.to_owned(),
                 previous_worker_id: None,
                 previous_worker_instance_id: None,
                 daemon_instance_id: Some(owner.clone()),
@@ -2574,8 +2670,12 @@ impl SessionRegistry {
             info: SessionInfo {
                 blocked_kind: None,
                 attention_isolated_by: None,
+                initial_input: None,
                 ..entry.info.clone()
             },
+            // A deferred prompt lives in daemon memory only; the durable
+            // marker (`create/initial_input_deferred`) is authoritative and
+            // the entry's computed `initial_input` must never reach the store.
             recovery: Some(Self::resume_binding_from_entry(id, entry)),
             native_identity_ordering: entry.last_native_report.clone(),
             runtime,
@@ -3210,6 +3310,11 @@ impl SessionRegistry {
 
     /// Spawns a finite transaction with the worker or the store that shutdown
     /// waits for instead of aborting.
+    ///
+    /// Work a caller `.await`s (such as a deferred input's delayed submit,
+    /// where the watcher needs the outcome) uses this, never a
+    /// one-detached-`tokio::spawn`: shutdown then waits for the outcome
+    /// instead of racing it, and the `detached_spawn` ratchet stays clean.
     pub(crate) fn spawn_transaction<F>(&self, name: &'static str, task: F) -> JoinHandle<F::Output>
     where
         F: std::future::Future + Send + 'static,
@@ -3848,11 +3953,20 @@ impl SessionRegistry {
     /// delivery or clearing removes the session ([`Self::remove`]), whose
     /// durable removal intent reconciliation finishes as well.
     ///
+    /// When the readiness wait times out while the agent is `blocked`,
+    /// the session is kept instead of rolled back: the prompt text is held
+    /// in daemon memory (never persisted at rest) and a watcher on the
+    /// session's `input_ready` signal delivers it exactly once. `session.new` then
+    /// succeeds with `prompt_delivered: Some(false)` and an additive
+    /// `initial_input: pending` on the returned `SessionInfo`; a stop or
+    /// exit before readiness discards the text with a recorded reason, and
+    /// a restart drops it with a recorded `daemon_restart` reason.
+    ///
     /// # Errors
     ///
     /// Returns the readiness error when the agent declared readiness did not
-    /// show before the deadline, or the delivery or persistence error, after
-    /// the rollback.
+    /// show before the deadline (except the kept `blocked` case), or the
+    /// delivery or persistence error, after the rollback.
     async fn complete_create(
         &self,
         info: SessionInfo,
@@ -3865,7 +3979,10 @@ impl SessionRegistry {
             self.persist_resume_binding(&info.id).await;
         }
         self.spawn_session_hook(SessionHookRequest::of(HookEvent::SessionStart, &info));
-        let Some(input) = pending_initial_input else {
+        // An empty initial prompt is a no-op (like no prompt): there is
+        // nothing to defer, so a blocked dialog rolls back instead of being
+        // kept with an empty deferred prompt.
+        let Some(input) = pending_initial_input.filter(|input| !input.is_empty()) else {
             return Ok((info, None));
         };
         #[cfg(test)]
@@ -3874,12 +3991,38 @@ impl SessionRegistry {
         // the bytes are not delivered to a stdin reader that has not yet
         // entered raw/bracketed-paste mode (and would drop or mis-frame
         // them). Bounded, so a silent agent can never wedge `session.new`.
-        if let Err(error) = self
+        match self
             .await_initial_input_readiness(&info.id, extended_input_ready_wait)
             .await
         {
-            self.rollback_failed_initial_input(&info.id).await;
-            return Err(error);
+            InitialInputReadiness::Ready => {}
+            // The trust-dialog case: the agent waits on a dialog that needs
+            // an answer, so the session is kept and the prompt is deferred
+            // until the operator answers and readiness shows. Scoped to
+            // hook-handshake runtimes declaring the native existence check
+            // (claude); codex and hermes roll back.
+            InitialInputReadiness::Blocked => {
+                if self
+                    .pinned_definition(&info.id)
+                    .await
+                    .is_some_and(|definition| {
+                        definition.native_reference_strategy()
+                            == crate::agent::NativeReferenceStrategy::Hook
+                            && definition.hook_existence().is_some()
+                    })
+                {
+                    return self
+                        .keep_blocked_create(&info, input, input_ack_timeout_ms)
+                        .await;
+                }
+                let error = blocked_readiness_error();
+                self.rollback_failed_initial_input(&info.id).await;
+                return Err(error);
+            }
+            InitialInputReadiness::NotReady(error) | InitialInputReadiness::ShutDown(error) => {
+                self.rollback_failed_initial_input(&info.id).await;
+                return Err(error);
+            }
         }
         let mut prompt_delivered = None;
         let delivered = match input_ack_timeout_ms {
@@ -3905,6 +4048,411 @@ impl SessionRegistry {
             return Err(error);
         }
         Ok((info, prompt_delivered))
+    }
+
+    /// Keeps a create whose readiness wait timed out while the agent is
+    /// `blocked`: rewrites the durable `initial_input` marker into the kept
+    /// `initial_input_deferred` marker, holds the prompt text in daemon
+    /// memory, and spawns a watcher that delivers it exactly once on the
+    /// session's `input_ready` signal.
+    ///
+    /// `session.new` succeeds with `prompt_delivered: Some(false)` and the
+    /// returned session carries `initial_input: pending`; the prompt bytes
+    /// are never written to the store. A stop or exit before readiness
+    /// discards the text with a recorded reason; a restart drops it with
+    /// a recorded `daemon_restart` reason.
+    async fn keep_blocked_create(
+        &self,
+        info: &SessionInfo,
+        input: String,
+        ack_timeout_ms: Option<u32>,
+    ) -> Result<(SessionInfo, Option<bool>), ProtocolError> {
+        let id = info.id.clone();
+        // A keep that cannot persist its marker is a failed create like any
+        // other persistence failure: the session is rolled back so no live
+        // session outlives its `session.new` error.
+        if let Err(error) = self.persist_deferred_initial_input(&id).await {
+            self.rollback_failed_initial_input(&id).await;
+            return Err(error);
+        }
+        {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(&id) else {
+                self.rollback_failed_initial_input(&id).await;
+                return Err(runtime_error(
+                    "session_launch_failed",
+                    format!(
+                        "kept session {} vanished before its deferred prompt was stored",
+                        id.0
+                    ),
+                ));
+            };
+            entry.deferred_initial_input = Some(DeferredInitialInput {
+                text: input,
+                ack_timeout_ms,
+                outcome: None,
+                delivering: false,
+                ended_by: None,
+            });
+        };
+        self.spawn_deferred_initial_input_watcher(id.clone());
+        let session = self.inspect(&id).await?;
+        Ok((session, Some(false)))
+    }
+
+    /// Rewrites the durable `initial_input` marker of a kept create into the
+    /// kept `initial_input_deferred` marker, owned by this daemon instance.
+    ///
+    /// The deferred text itself is never persisted at rest.
+    /// A record that no longer carries the delivering marker (a concurrent
+    /// stop, removal, or exit persisted meanwhile) leaves the deferred text
+    /// with nowhere to go, so the keep is refused and the caller rolls back.
+    /// With no store configured the marker step is skipped and the deferred
+    /// prompt lives in daemon memory only.
+    async fn persist_deferred_initial_input(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        let Some(store) = self.store_for_write()? else {
+            return Ok(());
+        };
+        let instance = self.daemon_instance_id().to_owned();
+        let session_id = id.0.clone();
+        let marked = self
+            .inner
+            .background
+            .spawn_blocking("defer_initial_input", move || {
+                store.mark_initial_input_deferred(&session_id, &instance)
+            })
+            .await
+            .map_err(|_join_error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("deferred prompt task panicked for {}", id.0),
+                )
+            })?
+            .map_err(|error| {
+                runtime_error(
+                    "session_store_failed",
+                    format!("failed to keep the deferred prompt of {}: {error}", id.0),
+                )
+            })?;
+        if !marked.into_value() {
+            return Err(runtime_error(
+                "session_input_not_ready",
+                format!(
+                    "session {} ended before its deferred prompt could be kept; nothing was sent",
+                    id.0
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Watches the session's `input_ready` until it fires, the session ends,
+    /// or the daemon shuts down, then delivers the deferred prompt exactly
+    /// once through the same path as the normal initial input.
+    ///
+    /// A stop or exit before readiness discards the held text with a
+    /// recorded `session_stopped`/`session_exited` reason; the daemon
+    /// shutdown path drops the in-memory text and reconciliation records
+    /// `daemon_restart`. The one-shot flag on the entry guarantees the
+    /// prompt is never written twice, even if readiness flaps.
+    fn spawn_deferred_initial_input_watcher(&self, id: SessionId) {
+        let registry = self.clone();
+        let task_registry = registry.clone();
+        registry.spawn_cooperative("deferred_initial_input", async move {
+            task_registry.deliver_deferred_initial_input(&id).await;
+        });
+    }
+
+    /// Delivers a kept create's deferred prompt once the agent leaves the
+    /// blocking dialog.
+    ///
+    /// The kept create left the initial observation open, so the detector
+    /// keeps publishing `input_ready` for the session. The watcher waits on
+    /// that watch, then waits on the published events until the recorded
+    /// activity is no longer `blocked` (the detector publishes readiness
+    /// before it records the activity, and a waited write refuses a
+    /// `blocked` one; this is a gate on events, not a poll of the
+    /// activity), and then delivers exactly once: it claims the deferred
+    /// prompt under the sessions lock before the write, mirrors the
+    /// one-write choice of the normal path (an acknowledged initial input
+    /// goes through the acknowledged write only, never through a plain
+    /// write first), and resolves the outcome itself from that claim. A
+    /// stop or exit that lands during the write is recorded on the claim
+    /// and wins over `delivered` and `delivery_failed`. A settled
+    /// (stop/exit/restart) entry seen before the claim discards with the
+    /// stored outcome; a missing entry ends the watcher. A write failure
+    /// on a session that is still running records `delivery_failed`.
+    async fn deliver_deferred_initial_input(&self, id: &SessionId) {
+        if !self.await_deferred_readiness(id).await {
+            return;
+        }
+        let (initial_input_done, ack_timeout_ms, text) = {
+            let mut sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get_mut(id) else {
+                return;
+            };
+            let Some(deferred) = entry.deferred_initial_input.as_mut() else {
+                return;
+            };
+            // The claim owns the write: a stop recorded during it resolves
+            // against the claim instead of overwriting the delivery.
+            if deferred.outcome.is_some() || deferred.delivering {
+                return;
+            }
+            deferred.delivering = true;
+            (
+                entry.initial_input_done.clone(),
+                deferred.ack_timeout_ms,
+                deferred.text.clone(),
+            )
+        };
+        let _finish_observation = initial_input_done.clone().drop_guard();
+        let delivered = match ack_timeout_ms {
+            None => match self.write_input_to_session(id, &text).await {
+                Ok(()) => self.commit_initial_input(id).await,
+                Err(error) => Err(error),
+            },
+            Some(timeout_ms) => match self
+                .deliver_acknowledged_initial_input(id, &text, timeout_ms)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+        self.finish_deferred_delivery(id, delivered).await;
+    }
+
+    /// Waits until a kept create's deferred prompt may be written: the
+    /// session published `input_ready` and its recorded activity is no
+    /// longer `blocked`. Returns `false` when the prompt will never be
+    /// written (settled, claimed, stopped, exited, or the daemon shut down).
+    async fn await_deferred_readiness(&self, id: &SessionId) -> bool {
+        let shutdown = self.inner.daemon_shutdown.clone();
+        let (mut input_ready, observation) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return false;
+            };
+            (entry.input_ready.clone(), entry.initial_input_done.clone())
+        };
+        loop {
+            // A missing entry is gone for good: the watcher that still
+            // waits would otherwise wake every poll until shutdown.
+            let entry_outcome = {
+                self.inner.sessions.lock().await.get(id).and_then(|entry| {
+                    entry
+                        .deferred_initial_input
+                        .as_ref()
+                        .map(|deferred| (deferred.outcome, deferred.delivering))
+                })
+            };
+            let Some((outcome, delivering)) = entry_outcome else {
+                return false;
+            };
+            if outcome.is_some() || delivering {
+                return false;
+            }
+            if self.inspect_state(id).await.is_some_and(is_terminal) {
+                self.discard_deferred_initial_input(id, DeferredInitialInputOutcome::SessionExited)
+                    .await;
+                return false;
+            }
+            if *input_ready.borrow_and_update() {
+                break;
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return false,
+                // A delivered or discarded prompt ends the observation, and
+                // whoever ended it recorded the outcome.
+                () = observation.cancelled() => return false,
+                changed = input_ready.changed() => {
+                    // The detector ended with the session; the exit path
+                    // records the outcome.
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+            }
+        }
+        // The detector publishes `input_ready` before it records the
+        // matching activity, and a waited write refuses a `blocked` one, so
+        // the claim waits until the record shows the dialog is gone.
+        let mut events = self.subscribe();
+        while self.current_activity(id).await == Some(AgentActivity::Blocked) {
+            tokio::select! {
+                () = shutdown.cancelled() => return false,
+                () = observation.cancelled() => return false,
+                received = events.recv() => {
+                    if matches!(received, Err(broadcast::error::RecvError::Closed)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Records how a claimed delivery ended: `delivered` when the write
+    /// succeeded, otherwise the failure outcome, with the durable marker
+    /// cleared. A stop or exit recorded on the claim wins either way.
+    async fn finish_deferred_delivery(&self, id: &SessionId, delivered: Result<(), ProtocolError>) {
+        match delivered {
+            Ok(()) => {
+                self.resolve_claimed_delivery(id, DeferredInitialInputOutcome::Delivered)
+                    .await;
+            }
+            Err(error) => {
+                let terminal = self.inspect_state(id).await.is_some_and(is_terminal);
+                let written = if terminal {
+                    DeferredInitialInputOutcome::SessionExited
+                } else {
+                    DeferredInitialInputOutcome::DeliveryFailed
+                };
+                warn!(session_id = %id.0, error = %error, "deferred initial prompt delivery failed; discarding");
+                if let Err(error) = self.clear_deferred_initial_input_marker(id).await {
+                    warn!(session_id = %id.0, error = %error, "failed to clear the deferred prompt marker");
+                }
+                self.resolve_claimed_delivery(id, written).await;
+            }
+        }
+    }
+
+    /// Resolves the outcome of a claimed delivery under the sessions lock:
+    /// `written` is how the write ended, and a stop or exit recorded on the
+    /// claim while it ran takes precedence. The claim is released and the
+    /// text cleared, so the prompt never stays `pending`.
+    async fn resolve_claimed_delivery(&self, id: &SessionId, written: DeferredInitialInputOutcome) {
+        let mut sessions = self.inner.sessions.lock().await;
+        if let Some(entry) = sessions.get_mut(id) {
+            if let Some(deferred) = entry.deferred_initial_input.as_mut() {
+                if deferred.outcome.is_none() && deferred.delivering {
+                    deferred.text.clear();
+                    deferred.outcome = Some(deferred.ended_by.take().unwrap_or(written));
+                    deferred.delivering = false;
+                    entry.initial_input_done.cancel();
+                }
+            }
+        }
+    }
+
+    /// Discards a deferred prompt the session will never receive, recording
+    /// why. The durable marker is cleared so a restart never replays it.
+    /// A terminal session must not resurrect on the next daemon restart:
+    /// resume is for sessions whose live PTY a restart killed, not for ones
+    /// the user stopped or that exited. The session is now terminal, so
+    /// `persist_resume_binding` re-reads it as terminal and removes its
+    /// binding (serialized against any racing resize/capture write).
+    ///
+    /// A user stop discards the deferred prompt as `session_stopped`, any
+    /// other exit as `session_exited`. The delayed watcher that may still
+    /// wait sees the recorded outcome and delivers nothing.
+    async fn discard_ended_deferred_prompt(&self, id: &SessionId, stopped_by_user: bool) {
+        let outcome = if stopped_by_user {
+            DeferredInitialInputOutcome::SessionStopped
+        } else {
+            DeferredInitialInputOutcome::SessionExited
+        };
+        Box::pin(self.discard_deferred_initial_input(id, outcome)).await;
+    }
+
+    async fn discard_deferred_initial_input(
+        &self,
+        id: &SessionId,
+        outcome: DeferredInitialInputOutcome,
+    ) {
+        let reason = match outcome {
+            DeferredInitialInputOutcome::Delivered => "delivered",
+            DeferredInitialInputOutcome::DaemonRestart => "daemon_restart",
+            DeferredInitialInputOutcome::SessionStopped => "session_stopped",
+            DeferredInitialInputOutcome::SessionExited => "session_exited",
+            DeferredInitialInputOutcome::DeliveryFailed => "delivery_failed",
+        };
+        let has_pending_deferred = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(|entry| {
+                entry
+                    .deferred_initial_input
+                    .as_ref()
+                    .is_some_and(|deferred| deferred.outcome.is_none())
+            });
+        // Every exit reports through here, so without a pending deferred
+        // prompt there is nothing to log and no marker to clear.
+        if !has_pending_deferred {
+            return;
+        }
+        if let Some(entry) = self.inner.sessions.lock().await.get(id) {
+            entry.initial_input_done.cancel();
+        }
+        warn!(session_id = %id.0, reason, "discarding a deferred initial prompt");
+        if let Err(error) = self.clear_deferred_initial_input_marker(id).await {
+            warn!(session_id = %id.0, error = %error, "failed to clear the deferred prompt marker");
+        }
+        let mut sessions = self.inner.sessions.lock().await;
+        if let Some(entry) = sessions.get_mut(id) {
+            if let Some(deferred) = entry.deferred_initial_input.as_mut() {
+                if deferred.outcome.is_none() {
+                    if deferred.delivering {
+                        // The claimed delivery resolves the outcome when
+                        // its write ends.
+                        deferred.ended_by.get_or_insert(outcome);
+                    } else {
+                        deferred.text.clear();
+                        deferred.outcome = Some(outcome);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Clears the durable deferred marker of a kept create.
+    ///
+    /// Only the deferred marker is cleared: unlike `commit_initial_input`,
+    /// a still-delivering normal `initial_input` marker survives, so an
+    /// exit of an unrelated create never moves what reconciliation sees.
+    async fn clear_deferred_initial_input_marker(
+        &self,
+        id: &SessionId,
+    ) -> Result<(), ProtocolError> {
+        if let Some(store) = self.store_for_write()? {
+            let session_id = id.0.clone();
+            self.inner
+                .background
+                .spawn_blocking("clear_initial_input", move || {
+                    store.clear_initial_input(&session_id)
+                })
+                .await
+                .map_err(|_join_error| {
+                    runtime_error(
+                        "session_store_failed",
+                        format!("deferred prompt clear task panicked for {}", id.0),
+                    )
+                })?
+                .map_err(|error| {
+                    runtime_error(
+                        "session_store_failed",
+                        format!("failed to clear the deferred prompt of {}: {error}", id.0),
+                    )
+                })?;
+        }
+        if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
+            entry.initial_input_owner = None;
+        }
+        Ok(())
+    }
+
+    /// The published state of a session, or `None` when it is gone.
+    async fn inspect_state(&self, id: &SessionId) -> Option<SessionState> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|entry| entry.info.state)
     }
 
     /// Clears the `initial_input` marker of a delivered create, durably
@@ -3941,6 +4489,9 @@ impl SessionRegistry {
         }
         if let Some(entry) = self.inner.sessions.lock().await.get_mut(id) {
             entry.initial_input_owner = None;
+            // A delivered deferred prompt keeps its entry: the deferred
+            // watcher records the `delivered` outcome right after this
+            // commit, so `session list/inspect` keeps reporting it.
         }
         Ok(())
     }
@@ -4920,11 +5471,11 @@ impl SessionRegistry {
         &self,
         session_id: &SessionId,
         extended_input_ready_wait: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> InitialInputReadiness {
         let (input_ready, readiness, runtime_grace, initial_input_done) = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
-                return Ok(());
+                return InitialInputReadiness::Ready;
             };
             (
                 entry.input_ready.clone(),
@@ -4936,7 +5487,7 @@ impl SessionRegistry {
                 entry.initial_input_done.clone(),
             )
         };
-        let _finish_observation = initial_input_done.clone().drop_guard();
+        let finish_observation = initial_input_done.clone().drop_guard();
         let strict = matches!(
             readiness,
             InputReadiness::ScreenIdle | InputReadiness::ManifestIdle
@@ -4952,31 +5503,46 @@ impl SessionRegistry {
             configured.min(pohunek_service_config::COMPAT_INITIAL_INPUT_STARTUP_GRACE)
         };
         if grace.is_zero() && !strict {
-            return Ok(());
+            return InitialInputReadiness::Ready;
         }
         let outcome = self.wait_for_input_readiness(input_ready, grace).await;
-        initial_input_done.cancel();
+        // Only a strict readiness keeps a blocked create: a non-strict
+        // timeout is the compat grace, after which the prompt is written.
+        let blocked = strict
+            && outcome == InitialInputWait::TimedOut
+            && self.current_activity(session_id).await == Some(AgentActivity::Blocked);
+        // A kept create leaves the initial observation open: the detector
+        // keeps publishing `input_ready` for the session, and the deferred
+        // watcher ends the observation when the prompt is delivered or
+        // discarded. The blocked-ness travels as the typed outcome below,
+        // never as a message string match.
+        if blocked {
+            finish_observation.disarm();
+        } else {
+            initial_input_done.cancel();
+        }
         #[cfg(test)]
         self.hold_initial_input_outcome().await;
+        if blocked {
+            return InitialInputReadiness::Blocked;
+        }
         match (strict, outcome) {
-            (_, InitialInputWait::Ready) | (false, _) => Ok(()),
+            (_, InitialInputWait::Ready) | (false, _) => InitialInputReadiness::Ready,
             (true, InitialInputWait::TimedOut) => {
                 let activity = self.current_activity(session_id).await;
-                let message = if activity == Some(AgentActivity::Blocked) {
-                    "the agent waits on a dialog that needs an answer (last activity: blocked); nothing was sent and the session was not kept, start the session without --input, answer the agent's dialog in it (`pohunek attach <session-id>`) and then send the input".to_owned()
-                } else {
-                    let label = activity.map_or_else(
-                        || "none".to_owned(),
-                        |activity| format!("{activity:?}").to_lowercase(),
-                    );
+                let label = activity.map_or_else(
+                    || "none".to_owned(),
+                    |activity| format!("{activity:?}").to_lowercase(),
+                );
+                InitialInputReadiness::NotReady(runtime_error(
+                    "session_input_not_ready",
                     format!(
                         "agent did not show an editable prompt within {} ms (last activity: {label}); nothing was sent, raise input.initial_startup_grace_ms if the agent starts slowly",
                         grace.as_millis()
-                    )
-                };
-                Err(runtime_error("session_input_not_ready", message))
+                    ),
+                ))
             }
-            (true, InitialInputWait::ShutDown) => Err(runtime_error(
+            (true, InitialInputWait::ShutDown) => InitialInputReadiness::ShutDown(runtime_error(
                 "session_input_not_ready",
                 "the daemon shut down before the agent showed an editable prompt; nothing was sent",
             )),
@@ -6168,6 +6734,16 @@ impl SessionRegistry {
             .await
             .get(id)
             .and_then(|entry| entry.info.activity)
+    }
+
+    /// The pinned runtime definition of managed session `id`, when it has one.
+    async fn pinned_definition(&self, id: &SessionId) -> Option<Arc<RuntimeDefinition>> {
+        self.inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|entry| entry.pinned.clone())
     }
 
     /// Inspect a session by raw id string.
@@ -7941,11 +8517,23 @@ impl SessionRegistry {
         let replaced = {
             let mut sessions = self.inner.sessions.lock().await;
             // A rebuilt entry of the same session keeps the launch association
-            // the live one held.
+            // the live one held, and a recorded deferred drop: a placeholder
+            // that carried `dropped(daemon_restart)` is replaced by the live
+            // adoption, which must keep the reason.
             if entry.reference_launch.is_none() {
                 entry.reference_launch = sessions
                     .get(id)
                     .and_then(|live| live.reference_launch.clone());
+            }
+            if entry.deferred_initial_input.is_none() {
+                let recorded = sessions.get(id).and_then(|live| {
+                    live.deferred_initial_input
+                        .clone()
+                        .filter(|deferred| deferred.outcome.is_some() && !deferred.delivering)
+                });
+                if recorded.is_some() {
+                    entry.deferred_initial_input = recorded;
+                }
             }
             self.set_unpersisted(&id.0, None);
             self.inner.turns.observe_state(id, entry.info.state);
@@ -8081,12 +8669,9 @@ impl SessionRegistry {
             self.cancel_session_attaches(id).await;
         }
         self.remove_pending_attaches_for_session(id).await;
-        // A terminal session must not resurrect on the next daemon restart:
-        // resume is for sessions whose live PTY a restart killed, not for ones
-        // the user stopped or that exited. The session is now terminal, so
-        // `persist_resume_binding` re-reads it as terminal and removes its
-        // binding (serialized against any racing resize/capture write).
         self.persist_resume_binding(id).await;
+        self.discard_ended_deferred_prompt(id, stopped_by_user)
+            .await;
         self.spawn_session_hook(SessionHookRequest {
             stop_reason: Some(updated.stop_reason),
             ..SessionHookRequest::of(HookEvent::SessionStop, &committed_info)
@@ -8782,6 +9367,7 @@ fn external_session_info(
         blocked_kind: None,
         activity_epoch: None,
         activity_revision: None,
+        initial_input: None,
         id: external_session_id(fact.pid),
         external: Some(true),
         capabilities: protocol::SessionCapabilities::default(),
@@ -9022,6 +9608,7 @@ fn create_intent_record(
     let info = SessionInfo {
         blocked_kind: None,
         attention_isolated_by: None,
+        initial_input: None,
         activity_epoch: None,
         activity_revision: None,
         id: id.clone(),
@@ -10037,6 +10624,32 @@ pub(super) fn session_not_found(id: &str) -> ProtocolError {
         "session_not_found",
         format!("session not found: {id}"),
         None,
+    )
+}
+
+/// How the initial-input readiness wait of a create ended.
+enum InitialInputReadiness {
+    /// The agent showed an editable prompt; the prompt was written.
+    Ready,
+    /// The agent waits on a dialog that needs an answer (`blocked`
+    /// activity at the timeout): only then is a create kept with a
+    /// deferred prompt instead of rolled back. The initial observation
+    /// stays open when this is returned, so the detector keeps publishing
+    /// `input_ready`.
+    Blocked,
+    /// The agent showed no editable prompt in time.
+    NotReady(ProtocolError),
+    /// The daemon shut down before the wait ended.
+    ShutDown(ProtocolError),
+}
+
+/// The non-kept refusal for a create whose agent waits on a dialog that
+/// needs an answer (for example a hook-handshake runtime this change does
+/// not keep yet): nothing was sent and the session was not kept.
+fn blocked_readiness_error() -> ProtocolError {
+    runtime_error(
+        "session_input_not_ready",
+        "the agent waits on a dialog that needs an answer (last activity: blocked); nothing was sent and the session was not kept, start the session without --input, answer the agent's dialog in it (`pohunek attach <session-id>`) and then send the input",
     )
 }
 

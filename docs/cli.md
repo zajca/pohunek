@@ -152,7 +152,7 @@ static peers. Errors and output keep the name you typed.
 | `pohunek setup config [--force] [--json]` | Install the default `attach.conf` and prompt templates; existing files are kept unless `--force`. |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant project / update [request…]` | Steer the assistant toward project configuration or toward reconciling an update; the flags are those of `pohunek assistant`. |
-| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with the knowledge bundle of the assistant context package (`pohunek.context.assistant`, installed by digest; `assistant_package_missing` names the install command) + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. |
+| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with the knowledge bundle of the assistant context package (`pohunek.context.assistant`, installed by digest; `assistant_package_missing` names the install command) + launch snapshot (launch metadata only); `--from-remote` and `--reset-diverged` start its worktree from `origin/<branch>` as for `session new`; `--request-stdin` reads the request from stdin, `--request-timeout-ms`, `--request-id` and `--meta k=v` as on `session new`. A local launch without `--project` or `--repo` starts its session with `cwd` `<data-dir>/assistant`, which the launcher creates at mode 0700 when missing (an existing path that is not a user-owned directory, or is group- or world-writable, is refused with `assistant_workdir_unusable` before any daemon is started or dialed; the launcher never chmods or replaces it). |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
 | `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
@@ -648,6 +648,22 @@ cannot be combined with request words, and a remote launch with it needs
 `--yes`, since stdin cannot also answer the confirmation prompt.
 `--request-timeout-ms`, `--request-id` and `--meta key=value` work as on
 `session new`:
+
+A local launch that names neither `--project` nor `--repo` starts its
+session with `cwd` `<data-dir>/assistant`: a dedicated directory the
+launcher creates, with its missing parents, at mode 0700, so
+Claude Code's folder-trust answer persists per host instead of re-asking on
+every launch. The directory is per directory by design — Claude Code trusts a
+directory, never `$HOME` — which is why the assistant does not start in `$HOME`
+or in the invoking shell's directory. Pohunek never writes `~/.claude.json`;
+the trust state belongs to Claude Code's own config directory. An existing
+path that is not a directory the invoking user owns, or that is group- or
+world-writable, is refused with `assistant_workdir_unusable` before any daemon
+is started or dialed; the launcher never chmods or replaces it (remove or fix
+it yourself). A narrower existing mode is left alone. A launch with
+`--project` or `--repo` starts in that project directory, and a remote
+launch sets no working directory: no local path is meaningful on another
+host.
 
 ```bash
 printf '%s' 'Why does attach fail on my laptop?' \

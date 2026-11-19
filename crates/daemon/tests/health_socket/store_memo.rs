@@ -201,7 +201,15 @@ pub(super) async fn api_golden_steps() -> [String; 3] {
         .reconcile_workers()
         .await
         .expect("startup reconciles the stored session");
-    let (shutdown, handle, _) = serve_registry(&socket, "0.0.0", None, registry, worker_home).await;
+    let (shutdown, handle, _) = serve_registry(
+        &socket,
+        "0.0.0",
+        None,
+        registry,
+        worker_home.path().to_path_buf(),
+        Some(worker_home),
+    )
+    .await;
     let mut control = connect(&socket).await;
     // Reconciliation stamps the stored session with the time it ran.
     let reconciled_at = inspect_session(&mut control, &SessionId(FIXTURE_SESSION.to_owned()))
