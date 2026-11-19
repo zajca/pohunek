@@ -250,8 +250,8 @@ pub(super) async fn handle_session_remove_tree(
 /// `session.retention.sweep`: run one retention sweep now.
 ///
 /// Refusals for callers the daemon cannot place (`Unknown`,
-/// `Unattributed`) apply to `dry_run` too: a refused caller learns nothing
-/// about the host's sessions, not even their count.
+/// `Unattributed`) follow one fail-closed rule for the whole sweep,
+/// `dry_run` included.
 pub(super) async fn handle_session_retention_sweep(
     request: &Request,
     state: &DaemonState,
@@ -262,7 +262,8 @@ pub(super) async fn handle_session_retention_sweep(
         Err(err) => return error_value(request, err),
     };
     // Owner callers sweep with owner rights: the local owner socket, the
-    // overlay, and a `shell` runtime session no session spawned. A managed
+    // overlay, a `shell` runtime session no session spawned, and a session
+    // whose profile sets `[rights] owner_equivalent`. A managed
     // session sweeps only its own strict subtree; callers the daemon cannot
     // place are refused, with the same audit line the owner-only gate
     // writes.
