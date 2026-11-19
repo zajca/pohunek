@@ -62,6 +62,7 @@ cargo xtask claude canary capture \
   --out <empty-or-new-dir> \
   [--scratch-parent /short/absolute/dir] \
   [--step-timeout-secs <seconds>] \
+  [--first-screen-timeout-secs <seconds>] \
   [--scenario idle_after_turn|permission_prompt|mcp_elicitation|login_screen|running_turn]...
 ```
 
@@ -81,10 +82,16 @@ cargo xtask claude canary capture \
   `TMPDIR` does not). The capture checks this the way the daemon does before
   it starts anything; a parent that is too long exits 2 naming the path
   length.
-- `--step-timeout-secs`: the bound of every wait the driver polls (the
-  first screen, a record and the first notification); 120 by default. The
-  CLI's own wait for the agent to take a prompt (`--until working` of the
-  turn scenarios) is bounded by the protocol's 8 s maximum instead.
+- `--step-timeout-secs`: the bound of the record and the first
+  notification waits the driver polls; 120 by default. The CLI's own wait
+  for the agent to take a prompt (`--until working` of the turn
+  scenarios) is bounded by the protocol's 8 s maximum instead.
+- `--first-screen-timeout-secs`: the bound of the wait for the first
+  screen of a session; the step timeout when absent, refused when zero
+  like it. It bounds only that setup wait: a loaded host must not stop
+  the run at an earlier screen than the step the scenario names. A
+  first-screen timeout names `wait for the first screen` with its own
+  budget on stderr.
 
 Before every account scenario the command prints one warning line to
 stderr: the scenario runs as the account of `--claude-config-dir` and may
@@ -133,7 +140,8 @@ Claude's prompt only from a record read after the picker records; a startup
 `idle` written before the picker is ignored. For the login scenario without
 the theme picker answered, in an empty config home where Claude goes straight
 to its prompt, the capture exits 2 with "Claude opened its prompt without a
-login in an empty config home", and only after `--step-timeout-secs` has
+login in an empty config home", and only after the first-screen wait
+(`--first-screen-timeout-secs`, the step timeout when absent) has
 elapsed, because the prompt box is not recognized while Claude holds its
 `idle` record. The theme picker in an account scenario exits 2: finish Claude's
 first run for that config first.

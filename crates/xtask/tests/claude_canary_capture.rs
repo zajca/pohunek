@@ -41,6 +41,12 @@ const ANSWERING_STEP_TIMEOUT: &str = "60";
 /// Step bound of the scenarios that wait for an answer that never comes.
 const SILENT_STEP_TIMEOUT: &str = "3";
 
+/// Bound of the first-screen wait of the scenarios whose tested step is a
+/// later one: the first screen is setup, not the behaviour under test, so
+/// a loaded host must not stop the run before the tested step. A hanging
+/// guard (120 s); no new literal below the hang guard.
+const SETUP_FIRST_SCREEN_TIMEOUT_SECS: u64 = pohunek_test_support::wait::HANG_GUARD.as_secs();
+
 /// The deadline is the behaviour under test: rule 4 refuses at it.
 const PROMPT_REFUSAL_STEP_TIMEOUT: &str = "3";
 
@@ -229,7 +235,9 @@ impl Capture {
             .expect("run xtask")
     }
 
-    /// Runs `capture` with the given inputs and extra flags.
+    /// Runs `capture` with the given inputs and extra flags. The default
+    /// first-screen budget is the step timeout; callers whose tested step is
+    /// a later one pass [`first_screen_setup`], the hang guard, instead.
     fn capture(
         &self,
         release: &Path,
@@ -320,6 +328,41 @@ fn unknown_scenario_is_refused() {
         stderr_of(&output).contains("unknown canary scenario `not_a_scenario`"),
         "{}",
         stderr_of(&output)
+    );
+}
+
+/// A zero first-screen budget is refused like a zero step timeout, before
+/// anything starts.
+#[test]
+fn zero_first_screen_timeout_is_refused() {
+    let capture = Capture::new();
+    let workdir = capture.workdir(&[]);
+    let output = capture.capture(
+        Path::new("/nonexistent-release-dir"),
+        &capture.claude(),
+        None,
+        &workdir,
+        &[
+            "--scenario",
+            "login_screen",
+            "--first-screen-timeout-secs",
+            "0",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("`--first-screen-timeout-secs` must be positive"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !capture.out().exists(),
+        "nothing is written before the inputs pass"
     );
 }
 
@@ -518,6 +561,8 @@ fn scratch_parent_at_the_socket_limit_runs_and_one_byte_more_is_refused() {
         "login_screen",
         "--step-timeout-secs",
         ANSWERING_STEP_TIMEOUT,
+        "--first-screen-timeout-secs",
+        &first_screen_setup(),
     ]);
     assert_eq!(
         output.status.code(),
@@ -541,7 +586,12 @@ fn every_scenario_matches_the_expected_table() {
         &capture.claude(),
         Some(&config),
         &workdir,
-        &["--step-timeout-secs", ANSWERING_STEP_TIMEOUT],
+        &[
+            "--step-timeout-secs",
+            ANSWERING_STEP_TIMEOUT,
+            "--first-screen-timeout-secs",
+            &first_screen_setup(),
+        ],
     );
     assert_eq!(
         output.status.code(),
@@ -766,11 +816,22 @@ fn refuses_the_first_run_theme_picker(mode: &[&str]) {
     assert_eq!(theme_input(&workdir), "", "no key reached the picker");
 }
 
-/// C5.
+/// The first-screen budget of a scenario whose tested step is later:
+/// the first screen is setup, not the behaviour under test. Every capture
+/// that tests a later step passes it, so a loaded host never stops the run
+/// at an earlier screen than the scenario names.
+fn first_screen_setup() -> String {
+    format!("{SETUP_FIRST_SCREEN_TIMEOUT_SECS}")
+}
+
+/// C5. The stand-in holds the first screen for five seconds (`slower-start`),
+/// longer than the 3 s step bound: with the fix the first screen has its own
+/// budget and the run reaches the tested step; with the first-screen deadline
+/// reverted to the step timeout it stops at `wait for the first screen`.
 #[test]
 fn silent_agent_stops_with_the_partial_capture() {
     let capture = Capture::new();
-    let workdir = capture.workdir(&["silent"]);
+    let workdir = capture.workdir(&["silent", "slower-start"]);
     let config = capture.config_dir();
     let release = capture.release_dir();
     let output = capture.capture(
@@ -785,6 +846,8 @@ fn silent_agent_stops_with_the_partial_capture() {
             "running_turn",
             "--step-timeout-secs",
             SILENT_STEP_TIMEOUT,
+            "--first-screen-timeout-secs",
+            &first_screen_setup(),
         ],
     );
     assert_eq!(
@@ -823,6 +886,8 @@ fn silent_agent_stops_at_the_record_wait() {
             "permission_prompt",
             "--step-timeout-secs",
             SILENT_STEP_TIMEOUT,
+            "--first-screen-timeout-secs",
+            &first_screen_setup(),
         ],
     );
     assert_eq!(
@@ -957,9 +1022,49 @@ fn login_screen_blocked_dialog_is_a_timeout() {
         "stderr: {}",
         stderr_of(&output)
     );
+    // No `--first-screen-timeout-secs`: the blocked dialog stops at the
+    // default, the 8 s step timeout.
+    let step =
+        format!("step `wait for the first screen` timed out after {BLOCKED_DIALOG_STEP_TIMEOUT}s");
     assert!(
-        stderr_of(&output).contains("timed out"),
-        "{}",
+        stderr_of(&output).contains(&step),
+        "stderr names the step: {}",
+        stderr_of(&output)
+    );
+    capture.assert_no_survivors();
+}
+
+/// The two budgets stay apart: a 60 s step timeout with an 8 s first-screen
+/// budget stops the blocked dialog after 8 s. With the first-screen deadline
+/// reverted to the step timeout the same run would print 60 s after a minute.
+#[test]
+fn first_screen_budget_is_separate_from_the_step_timeout() {
+    let capture = Capture::new();
+    let workdir = capture.workdir(&["api-key-dialog"]);
+    let release = capture.release_dir();
+    let output = capture.capture(
+        &release,
+        &capture.claude(),
+        None,
+        &workdir,
+        &[
+            "--scenario",
+            "login_screen",
+            "--step-timeout-secs",
+            "60",
+            "--first-screen-timeout-secs",
+            "8",
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("step `wait for the first screen` timed out after 8s"),
+        "stderr names the step: {}",
         stderr_of(&output)
     );
     capture.assert_no_survivors();
