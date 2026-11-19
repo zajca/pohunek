@@ -2541,6 +2541,155 @@ async fn a_live_built_in_claude_session_follows_its_package_detector_through_ins
         .expect("remove the adopted session");
 }
 
+/// A live adopted Claude session whose running detector still follows the
+/// installed official package while the runtime registry already serves
+/// something else: the package was disabled through the store and the registry
+/// reloaded without any session refresh.
+struct StaleAdoptedSession {
+    adopted: Fixture,
+    id: protocol::SessionId,
+    package_config: String,
+    generic: String,
+    missing: PackageDigest,
+}
+
+impl StaleAdoptedSession {
+    async fn start(tag: &str) -> Self {
+        let key = signing_key("root");
+        let dir = temp_dir(tag);
+        let store_path = temp_store_path(tag);
+        let fixture = Fixture::with_anchor_and_store(
+            &format!("{tag}-plugins"),
+            anchor(&[&key], Vec::new()),
+            store_path.clone(),
+        );
+        fixture.write_profile(
+            PROFILE,
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 600\"]\n",
+        );
+        let previous = compiled_in_daemon(&fixture, &store_path);
+        let created = previous
+            .create(protocol::SessionNewParams {
+                agent: PROFILE.to_owned(),
+                cwd: Some(dir),
+                ..params()
+            })
+            .await
+            .expect("a session of the built-in Claude runtime");
+        let adopted = fixture.reopen_with_workers_of(&previous).await;
+        Box::pin(adopted.registry.reconcile_workers())
+            .await
+            .expect("startup reconciliation");
+
+        let package = real_official(RuntimeId::CLAUDE);
+        install_real_official(&adopted, &adopted.registry, RuntimeId::CLAUDE, &package, 5).await;
+        let served = adopted
+            .registry
+            .inner
+            .profiles
+            .runtimes()
+            .resolve_id(&runtime_id(RuntimeId::CLAUDE))
+            .expect("the package serves claude");
+        let package_config =
+            detector_debug(&crate::detect::DetectorConfig::for_definition(&served));
+        let generic = detector_debug(&crate::detect::DetectorConfig::generic_shell());
+        assert_ne!(package_config, generic);
+        let stale = Self {
+            adopted,
+            id: created.id,
+            package_config,
+            generic,
+            missing: official("claude").digest,
+        };
+        assert_eq!(stale.running().await, stale.package_config);
+
+        let runtimes = stale.adopted.registry.inner.profiles.runtimes().clone();
+        runtimes
+            .package_store()
+            .expect("package store")
+            .registry()
+            .set_enabled(&package.digest, false)
+            .expect("disable the package outside any package transaction");
+        stale
+            .adopted
+            .registry
+            .packages()
+            .reload_runtimes()
+            .expect("reload the runtime registry");
+        assert!(
+            runtimes
+                .resolve_id(&runtime_id(RuntimeId::CLAUDE))
+                .is_err(),
+            "the registry no longer serves claude from the package"
+        );
+        assert_eq!(
+            stale.running().await,
+            stale.package_config,
+            "nothing refreshed the live session yet"
+        );
+        stale
+    }
+
+    async fn running(&self) -> String {
+        let sessions = self.adopted.registry.inner.sessions.lock().await;
+        let entry = sessions.get(&self.id).expect("the live session");
+        let config = entry.detector_config.borrow().config.clone();
+        detector_debug(&config)
+    }
+
+    async fn finish(self) {
+        self.adopted
+            .registry
+            .stop(&self.id)
+            .await
+            .expect("stop the adopted session");
+        self.adopted
+            .registry
+            .remove(&self.id)
+            .await
+            .expect("remove the adopted session");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_package_change_still_moves_a_live_adopted_session_to_the_serving_runtime() {
+    let stale = StaleAdoptedSession::start("claude-refused-change").await;
+    let refused = stale
+        .adopted
+        .registry
+        .packages()
+        .package_set_enabled(PackageSetEnabledParams {
+            digest: stale.missing.clone(),
+            enabled: false,
+        })
+        .await;
+    assert!(refused.is_err(), "the change of an unknown package fails");
+    assert_eq!(
+        stale.running().await,
+        stale.generic,
+        "the failed transaction still refreshes the adopted session"
+    );
+    stale.finish().await;
+}
+
+#[tokio::test]
+async fn a_refused_uninstall_still_moves_a_live_adopted_session_to_the_serving_runtime() {
+    let stale = StaleAdoptedSession::start("claude-refused-uninstall").await;
+    let refused = stale
+        .adopted
+        .registry
+        .packages()
+        .package_uninstall(uninstall(&stale.missing))
+        .await;
+    assert!(refused.is_err(), "the uninstall of an unknown package fails");
+    assert_eq!(
+        stale.running().await,
+        stale.generic,
+        "the failed uninstall still refreshes the adopted session"
+    );
+    stale.finish().await;
+}
+
 /// Arms `registry` to park every active-agent report resolution between
 /// resolving its agent and committing it, until [`disarm_report_hold`].
 fn arm_report_hold(registry: &SessionRegistry) -> crate::runtime::lifecycle::tests::StartGate {
