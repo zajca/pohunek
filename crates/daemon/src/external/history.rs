@@ -13,9 +13,9 @@
 // Rust guideline compliant 2026-10-12
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -23,7 +23,9 @@ use protocol::{CandidateLimit, RuntimeRef};
 use serde_json::Value;
 use tracing::debug;
 
-use super::{is_jsonl_path, list_walked_directory, observed_roots, string_at, TranscriptRoot};
+use super::{
+    is_jsonl_path, list_walked_directory_bounded, observed_roots, string_at, TranscriptRoot,
+};
 use crate::agent::host::{HeadKeyPath, TranscriptParser};
 use crate::integration::ConfigHomes;
 use crate::project::candidates::CandidateConfig;
@@ -151,14 +153,33 @@ fn walk(
             limits.insert(CandidateLimit::Time);
             return;
         }
-        let Some(entries) = list_walked_directory(root, &dir, true, &mut incomplete) else {
+        let Some(entries) = list_walked_directory_bounded(
+            root,
+            &dir,
+            true,
+            Some(*entries_left),
+            Some(deadline),
+            &mut incomplete,
+        ) else {
             continue;
         };
+        if incomplete {
+            if Instant::now() >= deadline {
+                limits.insert(CandidateLimit::Time);
+                return;
+            }
+            limits.insert(CandidateLimit::Entries);
+            return;
+        }
         let mut subdirectories = Vec::new();
         let mut session_files = BTreeSet::new();
         for entry in entries {
             if *entries_left == 0 {
                 limits.insert(CandidateLimit::Entries);
+                return;
+            }
+            if Instant::now() >= deadline {
+                limits.insert(CandidateLimit::Time);
                 return;
             }
             *entries_left -= 1;
@@ -225,22 +246,26 @@ enum Head {
 
 /// Reads the working directory from the head of the history file at `path`.
 ///
+/// Reads the working directory from the head of the history file at `path`.
+///
 /// At most `config.head_bytes` bytes and `config.max_records` records are
-/// read. The file is opened without following a symlink and must be a regular
-/// file. The first record that carries a valid working directory wins: its
-/// top-level `cwd` key, or, for the first record only, the `cwd_path` the
-/// runtime declares.
+/// read. The file is opened relative to directory fds, `O_NOFOLLOW` on
+/// every component, and must be a regular file, so an intermediate
+/// directory swapped for a symlink between the walk and this read is
+/// refused. The first record that carries a valid working directory wins:
+/// its top-level `cwd` key, or, for the first record only, the `cwd_path`
+/// the runtime declares.
 fn read_cwd(
     path: &Path,
     declared: Option<&HeadKeyPath>,
     config: &CandidateConfig,
 ) -> io::Result<Head> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Ok(Head::None);
+    let file = open_history_file(path)?;
+    {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Ok(Head::None);
+        }
     }
     let limit = u64::try_from(config.head_bytes).unwrap_or(u64::MAX);
     let mut head = Vec::new();
@@ -273,6 +298,63 @@ fn read_cwd(
     Ok(Head::None)
 }
 
+/// Opens the history file at `path` relative to directory fds, refusing a
+/// symlink on every component, including the file itself. The whole path
+/// is walked with `openat` so a directory swapped for a symlink after the
+/// walk is not followed. Absolute paths start from `/`; relative paths
+/// start from the process working directory.
+fn open_history_file(path: &Path) -> io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    let components: Vec<_> = path.components().collect();
+    let mut cursor: Option<OwnedFd> = None;
+    for (index, component) in components.iter().enumerate() {
+        let is_last = index + 1 == components.len();
+        match component {
+            Component::RootDir => {
+                cursor = Some(open_dir_at(None, std::ffi::OsStr::new("/"))?);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "history path",
+                ));
+            }
+            Component::Normal(name) => {
+                if is_last {
+                    let flags = OFlags::RDONLY
+                        | OFlags::NOFOLLOW
+                        | OFlags::NONBLOCK
+                        | OFlags::NOCTTY
+                        | OFlags::CLOEXEC;
+                    let handle = match cursor.as_ref() {
+                        Some(dir) => rustix::fs::openat(dir, *name, flags, Mode::empty()),
+                        None => rustix::fs::open(*name, flags, Mode::empty()),
+                    }
+                    .map_err(io::Error::from)?;
+                    return Ok(std::fs::File::from(handle));
+                }
+                cursor = Some(open_dir_at(cursor.as_ref(), name)?);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "no history file name",
+    ))
+}
+
+/// Opens one path component as a directory with `O_NOFOLLOW`.
+fn open_dir_at(parent: Option<&OwnedFd>, name: &std::ffi::OsStr) -> io::Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let handle = match parent {
+        Some(dir) => rustix::fs::openat(dir, name, flags, Mode::empty()),
+        None => rustix::fs::open(name, flags, Mode::empty()),
+    }
+    .map_err(io::Error::from)?;
+    Ok(handle)
+}
 /// `text` as a working directory, or `None` unless it is an absolute path of
 /// plain components within [`MAX_CWD_BYTES`] and without a NUL byte.
 fn validated_cwd(text: &str) -> Option<PathBuf> {
@@ -285,4 +367,28 @@ fn validated_cwd(text: &str) -> Option<PathBuf> {
             .components()
             .all(|part| matches!(part, Component::RootDir | Component::Normal(_)));
     plain.then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_cwd_refuses_an_intermediate_symlink_component() {
+        let dir = pohunek_test_support::tempdir().expect("fixture directory");
+        let base = dir.path();
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("create real directory");
+        std::fs::write(real.join("inside.jsonl"), "{\"cwd\":\"/work\"}\n")
+            .expect("write history file");
+        // An intermediate component that is a symlink towards the real tree.
+        let link = base.join("linked");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink intermediate directory");
+        let config = CandidateConfig::default();
+        let result = read_cwd(&link.join("inside.jsonl"), None, &config);
+        assert!(
+            result.is_err(),
+            "an intermediate symlink must be refused, got {result:?}"
+        );
+    }
 }

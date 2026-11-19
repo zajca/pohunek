@@ -692,3 +692,82 @@ async fn history_directory_budget_counts_only_directories_the_walk_enters() {
     );
     rig.finish().await;
 }
+
+#[tokio::test]
+async fn a_directory_bigger_than_the_entry_budget_is_cut_and_reported() {
+    // The budget is far below the number of entries in one directory, so the
+    // listing must stop at the budget and report `entries`. An unbounded
+    // collect would list every entry first and report nothing (or only the
+    // later per-entry budget) — the assertion that `entries` is reported
+    // with at most `max_entries` candidates is what fails without the bound.
+    let mut rig = Rig::start_with("pcand-bigdir", |config| {
+        config.candidates.max_entries = 2;
+    })
+    .await;
+    let home = rig.home_dir();
+    let work = home.join("work");
+    let path = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
+    for (index, name) in ["a", "b", "c", "d", "e", "f", "g", "h"]
+        .into_iter()
+        .enumerate()
+    {
+        let repo = make_repo(&rig.home, &work.join(name), None);
+        let file = write_claude(
+            &home,
+            "-bulk",
+            &format!("s{index}"),
+            &[claude_user(&path(&repo))],
+        );
+        let age = Duration::from_secs(3600 * (8 - u64::try_from(index).expect("small index")));
+        touch(&file, SystemTime::now() - age);
+    }
+    let result = rig
+        .candidates(serde_json::json!({ "sources": ["history"] }))
+        .await;
+    assert_eq!(
+        result["limits_reached"],
+        serde_json::json!(["entries"]),
+        "a listing cut by the budget must be reported: {result}"
+    );
+    assert!(
+        roots(&result).len() <= 2,
+        "the listing keeps no more than the budget: {result}"
+    );
+    assert_documented_shape(&result);
+    rig.finish().await;
+}
+
+#[tokio::test]
+async fn an_intermediate_directory_swapped_for_a_symlink_is_not_followed() {
+    // The walk records the file below `proj`; before the read, `proj` is
+    // replaced by a symlink to a directory holding a decoy file. The read
+    // must not follow it, so the decoy repository is never proposed.
+    let mut rig = Rig::start("pcand-swap").await;
+    let home = rig.home_dir();
+    let work = home.join("work");
+    let real = make_repo(&rig.home, &work.join("real"), None);
+    let decoy = make_repo(&rig.home, &work.join("decoy"), None);
+    let path = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
+    let proj = home.join(".claude/projects/-proj");
+    std::fs::create_dir_all(&proj).expect("create the project directory");
+    std::fs::write(proj.join("s.jsonl"), claude_user(&path(&real)) + "\n")
+        .expect("write the history file");
+    let outside = home.join("outside-history");
+    std::fs::create_dir_all(outside.join("-proj")).expect("create the outside tree");
+    std::fs::write(
+        outside.join("-proj/s.jsonl"),
+        claude_user(&path(&decoy)) + "\n",
+    )
+    .expect("write the decoy history file");
+    std::fs::remove_dir_all(&proj).expect("remove the real directory");
+    symlink(outside.join("-proj"), &proj).expect("swap in the symlink");
+    let result = rig
+        .candidates(serde_json::json!({ "sources": ["history"] }))
+        .await;
+    assert!(
+        !roots(&result).contains(&decoy),
+        "a swapped intermediate directory must not be followed: {result}"
+    );
+    assert_documented_shape(&result);
+    rig.finish().await;
+}
