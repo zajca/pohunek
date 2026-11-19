@@ -21006,18 +21006,18 @@ fn initial_prompt_is_a_launch_argument_only_when_the_definition_says_so() {
     let as_argument = super::input::plan_initial_input_delivery(
         &resolved(true),
         pty_command("acme", []),
-        Some("hello".to_owned()),
+        Some("hello world".to_owned()),
     );
     let typed = super::input::plan_initial_input_delivery(
         &resolved(false),
         pty_command("acme", []),
-        Some("hello".to_owned()),
+        Some("hello world".to_owned()),
     );
 
-    assert_eq!(as_argument.command.args, vec!["hello".to_owned()]);
+    assert_eq!(as_argument.command.args, vec!["hello world".to_owned()]);
     assert_eq!(as_argument.pending_initial_input, None);
     assert!(typed.command.args.is_empty());
-    assert_eq!(typed.pending_initial_input.as_deref(), Some("hello"));
+    assert_eq!(typed.pending_initial_input.as_deref(), Some("hello world"));
 }
 
 // ---------------------------------------------------------------------------
@@ -26027,10 +26027,10 @@ async fn a_prompt_in_the_launch_arguments_makes_the_first_answer_a_turn() {
     );
 
     let prompted = registry
-        .create(launch(Some("hello")))
+        .create(launch(Some("hello world")))
         .await
         .expect("create prompted");
-    wait_for_file_contains(&marker, "hello\n").await;
+    wait_for_file_contains(&marker, "hello world\n").await;
     registry
         .record_activity(&prompted.id, transition(AgentActivity::Working))
         .await;
@@ -26060,14 +26060,14 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
         .create(SessionNewParams {
             agent: "pi".to_owned(),
             cwd: Some(dir.clone()),
-            input: Some("hello".to_owned()),
+            input: Some("hello world".to_owned()),
             ..params()
         })
         .await
         .expect("create a hook-less package session");
 
     // Launch: fixed args, the assigned template, then the prompt.
-    let first = wait_for_file_contains(&marker, "hello\n").await;
+    let first = wait_for_file_contains(&marker, "hello world\n").await;
     assert!(first.starts_with("launch\n"));
     let launch = recorded_launch(&marker, 0);
     let reference = created
@@ -26081,7 +26081,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
             "fast",
             "--session-id",
             reference.as_str(),
-            "hello"
+            "hello world"
         ]
     );
     assert!(

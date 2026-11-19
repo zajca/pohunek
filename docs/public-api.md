@@ -554,9 +554,9 @@ Shared payloads:
   table, absent for a runtime without one). The program, the
   fixed arguments and every template are exactly what the daemon can put in
   the argv of a process it launches as the owner (the first prompt is appended
-  when `prompt_argument` is true and the prompt does not start with `-`; a
-  prompt that starts with `-` is pasted after readiness instead, never put in
-  the argv, see `prompt-arg-dash-paste-v1`), so all of it can be reviewed before an
+  when `prompt_argument` is true and the prompt neither starts with `-` nor is a
+  single bare word; such a prompt is pasted after readiness instead, never put in
+  the argv, see `prompt-arg-dash-paste-v1` and `prompt-arg-word-paste-v1`), so all of it can be reviewed before an
   install. A descriptor carries no environment values, setup commands or hooks.
 - `CommandInfo`: `name` (`[a-z][a-z0-9-]{0,31}`), `program` (package-relative
   path of a manifest file with the executable bit), `args` (fixed literal

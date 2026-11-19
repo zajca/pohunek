@@ -1501,17 +1501,32 @@ impl SessionRegistry {
     }
 }
 
+/// Whether a first prompt must be typed into the terminal instead of
+/// appended to the launch argv: an agent CLI reads a leading dash as an
+/// option and a bare word as a subcommand name, so both are pasted after
+/// readiness. Any other text stays one argv prompt. The character set is a
+/// protocol rule, not a tunable: it is stated in the runtime-packages guide.
+fn needs_terminal_paste(input: &str) -> bool {
+    input.starts_with('-') || is_bare_word(input)
+}
+
+/// A non-empty prompt of ASCII letters, digits, `-`, `_`, `.` and `:` only.
+fn is_bare_word(input: &str) -> bool {
+    !input.is_empty()
+        && input
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 pub(super) fn plan_initial_input_delivery(
     resolved: &ResolvedAgent,
     mut command: LaunchCommand,
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
-    // A prompt that starts with `-` would be read as an option by an agent CLI
-    // that parses flags after positionals, so it is pasted after readiness.
-    let dash_prompt = initial_input
-        .as_deref()
-        .is_some_and(|input| input.starts_with('-'));
-    if resolved.profile.is_none() && resolved.definition.prompt_arg() && !dash_prompt {
+    // A pasted prompt keeps its text; it is never run as an option or a
+    // subcommand by the agent CLI.
+    let pasted_prompt = initial_input.as_deref().is_some_and(needs_terminal_paste);
+    if resolved.profile.is_none() && resolved.definition.prompt_arg() && !pasted_prompt {
         let prompt_in_argv = initial_input.is_some();
         if let Some(input) = initial_input {
             command.args.push(input);
