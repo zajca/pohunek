@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pohunek_platform::supervisor::{
     DefinitionFacts, Error as SupervisorError, ServiceId, ServiceState, Supervisor,
@@ -1113,4 +1114,425 @@ async fn a_rewritten_record_does_not_turn_a_partial_generation_into_an_absent_on
         .await
         .expect_err("the classified partial generation still refuses the skip");
     assert_eq!(fixture.record_count(), 1);
+}
+
+/// The durable stop state a `stop` left behind: the desired state and the
+/// transaction of the stored record of the fixture session.
+fn durable_stop_state(fixture: &Fixture) -> (DesiredState, Option<TransactionKind>) {
+    durable_state_of(&fixture.store, SESSION)
+}
+
+fn durable_state_of(store: &Path, session: &str) -> (DesiredState, Option<TransactionKind>) {
+    let record = Store::new(store.to_owned())
+        .load_sessions()
+        .expect("read durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == session)
+        .expect("durable session");
+    (
+        record.desired_state,
+        record.transaction.map(|transaction| transaction.kind),
+    )
+}
+
+/// Conflicted-runtime stop (`settle_failed_release`), `NotStopped`: the
+/// supervisor is unreachable and its job is proven alive beside the live
+/// journaled worker, so the retirement changed nothing. The stop intent is
+/// rolled back: the durable record keeps its desired state and no
+/// transaction, so a retried stop starts over.
+#[tokio::test]
+async fn a_stop_with_an_unproven_retirement_rolls_the_intent_back() {
+    let fixture = Fixture::new(RUNTIME).await;
+    let stand_in = LiveWorkerStandIn::spawn();
+    let identity = stand_in.identity();
+    write_live_journal(&fixture.state_root, RUNTIME, &stand_in);
+    fixture.supervisor.script_job(
+        service_id(),
+        JobScript::Present {
+            state: ServiceState::Running,
+            process: Some(identity),
+            definition: None,
+        },
+    );
+    fixture.supervisor.script_retire_unavailable(service_id());
+
+    let error = fixture
+        .registry
+        .stop(&fixture.id)
+        .await
+        .expect_err("the unreachable supervisor retires nothing");
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+        "{error:?}"
+    );
+    assert_eq!(
+        fixture.supervisor.retired(),
+        vec![service_id()],
+        "only the recorded generation's job was retired"
+    );
+    assert_eq!(
+        durable_stop_state(&fixture),
+        (DesiredState::Running, None),
+        "the untouched retirement rolls the durable stop intent back"
+    );
+    let info = fixture.registry.inspect(&fixture.id).await.expect("listed");
+    assert_eq!(info.state, protocol::SessionState::Running);
+}
+
+/// Conflicted-runtime stop (`settle_failed_release`), `PartiallyStopped`: the
+/// supervisor ended the live journaled worker but failed its retire call, so
+/// the retirement partly took effect. The durable stop intent stays in its
+/// requested phase, so reconciliation finishes the stop instead of treating
+/// the runtime as untouched.
+#[tokio::test]
+async fn a_stop_with_a_partly_effective_retirement_keeps_the_intent() {
+    let fixture = Fixture::new(RUNTIME).await;
+    let stand_in = LiveWorkerStandIn::spawn();
+    let identity = stand_in.identity();
+    write_live_journal(&fixture.state_root, RUNTIME, &stand_in);
+    fixture.supervisor.script_job(
+        service_id(),
+        JobScript::Present {
+            state: ServiceState::Running,
+            process: Some(identity),
+            definition: None,
+        },
+    );
+    fixture
+        .supervisor
+        .script_retire_ends_then_fails(service_id(), identity.pid);
+
+    let error = fixture
+        .registry
+        .stop(&fixture.id)
+        .await
+        .expect_err("the failing supervisor proves no retirement");
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+        "{error:?}"
+    );
+    assert_eq!(
+        fixture.supervisor.retired(),
+        vec![service_id()],
+        "only the recorded generation's job was retired"
+    );
+    assert_eq!(
+        durable_stop_state(&fixture),
+        (DesiredState::Stopped, Some(TransactionKind::Stop)),
+        "the partly effective retirement keeps the durable stop intent"
+    );
+}
+
+/// E6: the worker exit watcher reconnects a new `Worker` handle while a stop
+/// waits for the old one. The escalation re-checks the connection identity
+/// before anything is retired: it returns `session_runtime_transition_busy`
+/// and clears the stop intent, so a retried stop runs against the reconnected
+/// worker instead of the supervisor ending the wrong runtime.
+#[tokio::test]
+async fn a_stop_racing_a_reconnected_worker_returns_busy_and_clears_the_intent() {
+    let mut escalation = Box::pin(Escalation::start("stop-racing-reconnect")).await;
+    let registry = escalation.registry.clone();
+    let id = escalation.id.clone();
+    let unresponsive = escalation.worker.clone();
+    let socket_path = unresponsive.socket_path().to_path_buf();
+    // The original connection yields its lease, so the reconnected handle is
+    // a distinct connection to the same worker identity.
+    unresponsive
+        .release_controller()
+        .await
+        .expect("release the controller lease");
+    let reconnected =
+        crate::runtime::Worker::connect_discovered(&socket_path, registry.daemon_instance_id())
+            .await
+            .expect("reconnect the worker");
+    // The watcher's reconnect installs the handle after it wrote the durable
+    // record, so that write lands over the committed stop intent.
+    let adopted = registry
+        .adopt_reconnected_worker(&id, &escalation.expected, reconnected)
+        .await;
+    assert!(
+        matches!(
+            adopted,
+            crate::session::RuntimeTransitionOutcome::Applied(_)
+        ),
+        "the reconnect is adopted: {adopted:?}"
+    );
+
+    let error = escalation
+        .end_unresponsive_worker()
+        .await
+        .expect_err("the reconnected worker is not the frozen one");
+    assert_eq!(error.code, "session_runtime_transition_busy", "{error:?}");
+    assert_eq!(
+        durable_state_of(&escalation.store, &id.0),
+        (DesiredState::Running, None),
+        "the busy stop rolls the durable intent back"
+    );
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = &sessions[&id];
+    assert!(!entry.stopping, "the busy stop clears the stopping flag");
+    assert_eq!(
+        entry.stop_transaction_id, None,
+        "the stop intent is cleared"
+    );
+    assert_eq!(entry.info.state, protocol::SessionState::Running);
+}
+
+/// Supervision retry delay that no scenario waits out: a scheduled retry is
+/// observed as pending.
+const RETRY_NEVER: Duration = Duration::from_hours(1);
+
+/// Points the journal of the session's worker and its scripted supervisor job
+/// at `identity`, so a scripted retirement ends the stand-in process instead of
+/// the test process.
+fn name_stand_in(
+    registry: &SessionRegistry,
+    supervisor: &ScriptedSupervisor,
+    id: &SessionId,
+    worker_id: &str,
+    service: &ServiceId,
+    identity: ProcessIdentity,
+) {
+    let journal = Journal::new(
+        registry
+            .inner
+            .config
+            .worker_state_root
+            .clone()
+            .expect("state root")
+            .join(&id.0)
+            .join(format!("{worker_id}.json")),
+    );
+    let mut recorded = journal.load().expect("worker journal");
+    recorded.worker_pid = identity.pid;
+    recorded.worker_start_identity = identity.start_identity.get().to_string();
+    journal.write(&recorded).expect("rewrite worker journal");
+    supervisor.script_job(
+        service.clone(),
+        JobScript::Present {
+            state: ServiceState::Running,
+            process: Some(identity),
+            definition: None,
+        },
+    );
+}
+
+/// A live session on an in-process worker whose supervisor job and journal
+/// name a stand-in process, with its stop intent committed the way a live stop
+/// commits it before the worker is asked to stop.
+struct Escalation {
+    registry: SessionRegistry,
+    supervisor: Arc<ScriptedSupervisor>,
+    store: PathBuf,
+    id: SessionId,
+    service: ServiceId,
+    worker: crate::runtime::Worker,
+    identity: ProcessIdentity,
+    transaction_id: String,
+    expected: crate::session::RuntimeWatchIdentity,
+    committed: Option<Box<crate::session::conflict_stop::CommittedStop>>,
+    _stand_in: LiveWorkerStandIn,
+}
+
+impl Escalation {
+    async fn start(tag: &str) -> Self {
+        let store = super::temp_store_path(tag);
+        let (registry, supervisor) = super::scripted_registry(SessionRegistryConfig {
+            shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            store_path: Some(store.clone()),
+            supervision_retry_initial: RETRY_NEVER,
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(super::params()).await.expect("create");
+        let id = created.id.clone();
+        let record = super::stored_record(&store, &id);
+        let service = ServiceId::parse(record.runtime.service_id.clone().expect("service id"))
+            .expect("service id parses");
+        let worker_id = record
+            .info
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_id.clone())
+            .expect("worker id");
+
+        let stand_in = LiveWorkerStandIn::spawn();
+        let identity = stand_in.identity();
+        name_stand_in(&registry, &supervisor, &id, &worker_id, &service, identity);
+
+        let transaction_id = "stop-1".to_owned();
+        let (worker, expected, previous_desired_state, intent) = {
+            let mut sessions = registry.inner.sessions.lock().await;
+            let entry = sessions.get_mut(&id).expect("session entry");
+            let crate::session::RuntimeHandle::Worker(worker) = &entry.runtime else {
+                panic!("live worker runtime");
+            };
+            let worker = worker.clone();
+            let expected = crate::session::RuntimeWatchIdentity::from_info(&entry.info)
+                .expect("runtime identity");
+            let previous_desired_state = entry.desired_state;
+            entry.stopping = true;
+            entry.stop_transaction_id = Some(transaction_id.clone());
+            entry.desired_state = DesiredState::Stopped;
+            let intent = SessionRegistry::session_record(
+                &id,
+                entry,
+                DesiredState::Stopped,
+                Some(crate::store::SessionTransaction {
+                    id: transaction_id.clone(),
+                    kind: TransactionKind::Stop,
+                    phase: "requested".to_owned(),
+                    previous_worker_id: None,
+                    previous_worker_instance_id: None,
+                    daemon_instance_id: None,
+                }),
+            );
+            (worker, expected, previous_desired_state, intent)
+        };
+        let committed = match registry
+            .commit_intent(&id, intent, "its stop intent", "session_stop_intent_busy")
+            .await
+            .expect("commit the stop intent")
+        {
+            crate::session::IntentCommit::Committed { intent, previous } => {
+                Box::new(crate::session::conflict_stop::CommittedStop {
+                    previous_desired_state,
+                    intent,
+                    previous,
+                })
+            }
+            crate::session::IntentCommit::Ended(state) => panic!("session ended: {state:?}"),
+        };
+        assert_eq!(
+            durable_state_of(&store, &id.0),
+            (DesiredState::Stopped, Some(TransactionKind::Stop)),
+            "the stop intent is durable before the escalation"
+        );
+        Self {
+            registry,
+            supervisor,
+            store,
+            id,
+            service,
+            worker,
+            identity,
+            transaction_id,
+            expected,
+            committed: Some(committed),
+            _stand_in: stand_in,
+        }
+    }
+
+    async fn end_unresponsive_worker(&mut self) -> Result<(), protocol::ProtocolError> {
+        let committed = self.committed.take().expect("the stop intent is committed");
+        Box::pin(self.registry.end_unresponsive_worker(
+            &self.id,
+            &self.transaction_id,
+            Some(&self.expected),
+            &self.worker,
+            committed,
+        ))
+        .await
+    }
+
+    fn supervision_retry_pending(&self) -> bool {
+        self.registry
+            .inner
+            .supervision_retries
+            .state
+            .lock()
+            .expect("supervision retry state is never poisoned")
+            .pending
+            .contains(&self.id.0)
+    }
+
+    async fn assert_stop_cleared(&self) {
+        let sessions = self.registry.inner.sessions.lock().await;
+        let entry = &sessions[&self.id];
+        assert!(!entry.stopping, "the failed escalation clears the stop");
+        assert_eq!(entry.stop_transaction_id, None);
+    }
+}
+
+/// E3, `NotStopped` at the live escalation: the supervisor is unreachable and
+/// its job is proven alive beside the journaled worker, so the retirement
+/// changed nothing. The committed stop intent is rolled back and a supervision
+/// retry is scheduled.
+#[tokio::test]
+async fn an_escalation_that_retired_nothing_rolls_the_stop_intent_back() {
+    let mut escalation = Box::pin(Escalation::start("escalation-not-stopped")).await;
+    escalation
+        .supervisor
+        .script_retire_unavailable(escalation.service.clone());
+
+    let error = escalation
+        .end_unresponsive_worker()
+        .await
+        .expect_err("the unreachable supervisor retires nothing");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+        "{error:?}"
+    );
+    assert_eq!(
+        escalation.supervisor.retired(),
+        vec![escalation.service.clone()],
+        "only the recorded generation's job was retired"
+    );
+    assert_eq!(
+        durable_state_of(&escalation.store, &escalation.id.0),
+        (DesiredState::Running, None),
+        "the untouched retirement rolls the durable stop intent back"
+    );
+    assert!(
+        escalation.supervision_retry_pending(),
+        "a supervision retry is scheduled"
+    );
+    escalation.assert_stop_cleared().await;
+    let info = escalation
+        .registry
+        .inspect(&escalation.id)
+        .await
+        .expect("listed");
+    assert_eq!(info.state, protocol::SessionState::Running);
+}
+
+/// E3, `PartiallyStopped` at the live escalation: the supervisor ended the
+/// journaled worker but failed its retire call. The durable stop intent is
+/// kept and a supervision retry is scheduled to finish the stop.
+#[tokio::test]
+async fn an_escalation_with_a_partly_effective_retirement_keeps_the_intent_and_retries() {
+    let mut escalation = Box::pin(Escalation::start("escalation-partially-stopped")).await;
+    escalation
+        .supervisor
+        .script_retire_ends_then_fails(escalation.service.clone(), escalation.identity.pid);
+
+    let error = escalation
+        .end_unresponsive_worker()
+        .await
+        .expect_err("the failing supervisor proves no retirement");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+        "{error:?}"
+    );
+    assert_eq!(
+        escalation.supervisor.retired(),
+        vec![escalation.service.clone()],
+        "only the recorded generation's job was retired"
+    );
+    assert_eq!(
+        durable_state_of(&escalation.store, &escalation.id.0),
+        (DesiredState::Stopped, Some(TransactionKind::Stop)),
+        "the partly effective retirement keeps the durable stop intent"
+    );
+    assert!(
+        escalation.supervision_retry_pending(),
+        "a supervision retry finishes the stop"
+    );
+    escalation.assert_stop_cleared().await;
 }
