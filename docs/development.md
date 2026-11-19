@@ -279,11 +279,11 @@ in a workflow has a step `timeout-minutes` and apt network timeouts.
 rustup, uv, cargo fetch) runs through `.github/scripts/ci-retry`, with
 bounded attempts and per-attempt timeouts from the workflow `env` (or from
 the setup-rust action's own defaulted `retry-*` inputs, calibrated to the
-same ci.yml values). The seed curl downloads (setup-zig, setup-mold,
-setup-sccache, setup-uv) carry curl's own retry and transfer limits instead
-of the helper. `scripts/provision-hermes-compat` runs its `uv sync` without
-the helper, under uv's own retry and read-timeout defaults; in CI the job
-timeout bounds it. An exhausted helper retry marks the job with
+same ci.yml values). `scripts/provision-hermes-compat` runs its `uv sync`
+through the helper too (`ci-retry: uv-sync-hermes`, under the uv-class
+bounds); an exhausted retry fails that step with the helper's `::error`
+annotation but does not set the marker, because the provisioner runs with
+GITHUB_ENV cleared. An exhausted helper retry marks the job with
 `CI_INFRA_FAILURE`.
 
 **Pinned download cache.** Pinned third-party bytes come from

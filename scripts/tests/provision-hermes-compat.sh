@@ -12,8 +12,9 @@ trap cleanup EXIT
 
 copy_root="$test_root/repository"
 fake_bin="$test_root/bin"
-mkdir -p "$copy_root/scripts" "$copy_root/compat/hermes" "$fake_bin"
+mkdir -p "$copy_root/scripts" "$copy_root/compat/hermes" "$copy_root/.github/scripts" "$fake_bin"
 cp "$provision" "$copy_root/scripts/"
+cp "$script_root/.github/scripts/ci-retry" "$copy_root/.github/scripts/"
 cp "$script_root/compat/hermes/compatibility-lock.json" "$copy_root/compat/hermes/"
 
 # The real python3 path is resolved here because the fakes' PATH is restricted.
@@ -213,6 +214,19 @@ fi
 grep -Fq 'sha256sum or shasum' "$test_root/stderr"
 test ! -e "$git_marker"
 
+# Without the retry helper inside the checkout the provisioner refuses before
+# any git or network command, instead of syncing unwrapped.
+rm -f "$copy_root/.github/scripts/ci-retry" "$git_marker"
+if PATH="$fake_bin:/usr/bin:/bin" \
+  "$copy_root/scripts/provision-hermes-compat" "$test_root/no-helper-install" \
+  >"$test_root/stdout" 2>"$test_root/stderr"; then
+  printf '%s\n' 'provisioner unexpectedly ran without the retry helper' >&2
+  exit 1
+fi
+grep -Fq 'retry helper is missing at' "$test_root/stderr"
+test ! -e "$git_marker"
+cp "$script_root/.github/scripts/ci-retry" "$copy_root/.github/scripts/"
+
 # A host without a pinned CPython runtime is refused before any upstream
 # command runs.
 unsupported_bin="$test_root/unsupported-bin"
@@ -246,13 +260,14 @@ if grep -Ev '^[[:space:]]*#' "$provision" | grep -Eq 'readarray|mapfile|realpath
 fi
 
 # The CPython download is bounded by connect, total and stall timeouts and a
-# bounded retry, and a failed uv install names its phase (uv keeps its own
-# defaults).
+# bounded retry, and the uv install runs through the shared retry helper
+# (uv keeps its own defaults inside each attempt).
 grep -Fq -- '--connect-timeout "$NETWORK_CONNECT_TIMEOUT_SECONDS"' "$provision"
 grep -Fq -- '--max-time "$DOWNLOAD_MAX_SECONDS"' "$provision"
 grep -Fq -- '--speed-limit "$NETWORK_STALL_BYTES" --speed-time "$NETWORK_STALL_SECONDS"' "$provision"
 grep -Fq -- '--retry "$((NETWORK_ATTEMPTS - 1))"' "$provision"
 grep -Fq 'cannot install the locked Hermes dependencies' "$provision"
+grep -Fq '"$retry_helper" --label uv-sync-hermes' "$provision"
 
 # Keep the historical-lock workaround explicit and reject an accidental return
 # to the re-resolving mode that failed during the M2 evidence capture.
