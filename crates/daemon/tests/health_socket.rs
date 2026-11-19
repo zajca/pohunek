@@ -4723,7 +4723,7 @@ async fn wait_for_any_agent_state(
 const TRUST_ANSWER_MARKER: &str = ".fake-trust-accepted";
 
 fn trust_stub_answer_probe() -> String {
-    format!("import os\nTRUST_ANSWER = os.path.join(os.getcwd(), {TRUST_ANSWER_MARKER:?})\n",)
+    format!("import os\nTRUST_ANSWER = os.path.join(os.getcwd(), {TRUST_ANSWER_MARKER:?})\n")
 }
 
 fn write_claude_trust_stub(script: &Path, log: &Path, gate: &Path) {
