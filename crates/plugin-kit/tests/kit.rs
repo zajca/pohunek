@@ -75,6 +75,20 @@ fn context_fixture_dir() -> PathBuf {
     pohunek_test_support::manifest_dir().join("tests/fixtures/kit-context-package")
 }
 
+/// Marks a program executable on Unix; a no-op elsewhere (the kit reads the
+/// archive executable bit the test harness sets on Unix only).
+#[cfg(unix)]
+fn make_executable(program: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(program, fs::Permissions::from_mode(0o755))
+        .expect("make the program executable");
+}
+
+/// Marks a program executable on Unix; a no-op elsewhere (the kit reads the
+/// archive executable bit the test harness sets on Unix only).
+#[cfg(not(unix))]
+fn make_executable(_program: &Path) {}
+
 /// Copies a directory tree: used to mutate a fixture copy without touching
 /// the fixture itself.
 fn copy_dir(from: &Path, to: &Path) {
@@ -1023,6 +1037,39 @@ fn kit_lint_refuses_a_package_with_neither_table() {
     assert!(
         stderr_of(&output).contains("package lint failed"),
         "the refusal names lint: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("neither a runtime nor commands"),
+        "the refusal names the classify reason: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_commands_only_package() {
+    let kit = Kit::new();
+    let dir = kit.dir("commands-only");
+    fs::write(
+        dir.join("runtime.toml"),
+        "schema = 1\nid = \"pohunek.commands.kitfixture\"\nversion = \"0.1.0\"\nruntime_api = 1\nrequires = [\"package-commands-v1\"]\n\n[commands.host-state]\nprogram = \"bin/fleet-state\"\nargs = [\"--json\"]\nexpose = \"peers\"\n",
+    )
+    .expect("write the commands-only manifest");
+    let bin = dir.join("bin");
+    fs::create_dir(&bin).expect("create the program directory");
+    let program = bin.join("fleet-state");
+    fs::write(&program, "#!/bin/sh\necho ok\n").expect("write the program");
+    make_executable(&program);
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("commands only"),
+        "the refusal names commands-only: {}",
         stderr_of(&output)
     );
 }

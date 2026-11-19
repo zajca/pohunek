@@ -183,8 +183,10 @@ index write, and 2 for every other refusal:
   `plugin lint ok: <package_id> <version> <runtime_id>`, a context package
   with `plugin lint ok: <package_id> <version> context` (`--json` carries
   `"kind": "runtime"` or `"kind": "context"`, with no `runtime_id`
-  for a context package); a package that exports neither fails with a named
-  reason.
+  for a context package). The kind is the `[context]` export the descriptor
+  carries, never merely the absence of a runtime: a commands-only package
+  fails with a named reason (the kit does not support commands-only
+  packages), and a package that exports neither fails with a named reason.
 - `build` writes the canonical archive like `xtask plugin build`.
 - `verify --archive <file> [--dir <package dir>] [--sha256 <digest>]`
   checks the archive rebuilds from the directory, twice, and matches the

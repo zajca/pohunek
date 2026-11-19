@@ -237,8 +237,11 @@ jobs:
           printf '%s\n' "$line"
           # The lint line names the kind install validation saw: a runtime
           # package ends in its runtime id, a context package in `context`.
-          # A package with neither a runtime nor a context export fails the
-          # lint, so every line that passes names one of the two kinds.
+          # The kind is the `[context]` export the descriptor carries, never
+          # merely the absence of a runtime: a commands-only package fails
+          # the lint (the kit does not support commands-only packages), and
+          # a package with neither a runtime nor a context export fails too,
+          # so every line that passes names one of the two kinds.
           kind="$(core/target/debug/pohunek-plugin-kit lint --dir "plugin/$PACKAGE_DIR" --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["kind"])')"
           printf 'PACKAGE_KIND=%s\n' "$kind" >>"$GITHUB_ENV"
 
@@ -289,7 +292,8 @@ jobs:
       # the plugin's own input and hook-event checks see the exact host the
       # generic smoke passed on (planner ruling). A context package serves no
       # runtime, so the smoke and its caller inputs never run for it: a caller
-      # that sets them for a context package fails here instead of silently
+      # that sets them for a context package fails in the step Refuse
+      # runtime-only inputs for a context package instead of silently
       # skipping them.
       - name: Smoke the package and the smoke script
         if: env.PACKAGE_KIND != 'context'

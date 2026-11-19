@@ -19,12 +19,18 @@ use crate::archive::{archive_package, build_bytes};
 use crate::error::Error;
 
 /// What a passing lint reports: the kind the descriptor exports.
+///
+/// The kind is what install validation saw: `Context` means the descriptor
+/// carries a `[context]` export (`descriptor.context_dir().is_some()`),
+/// never merely the absence of a runtime. A commands-only descriptor (no
+/// runtime, no context) is refused: the plugin kit does not support
+/// commands-only packages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PackageKind {
     /// The descriptor exports a runtime.
     Runtime,
-    /// The descriptor exports a directory of files and nothing else.
+    /// The descriptor exports a `[context]` directory of files and nothing else.
     Context,
 }
 
@@ -92,6 +98,7 @@ pub fn lint(args: &LintArgs) -> Result<LintReport, Error> {
         })?;
     let (_package_id, _version) = archive_package(&verified, &args.dir)?;
     let identity = descriptor.identity().clone();
+    let context_dir = descriptor.context_dir().is_some();
     let runtime_id = match descriptor.into_parts() {
         (Some(definition), _commands) => {
             let BindingProvenance::Package { package, .. } = &definition.binding().provenance
@@ -107,14 +114,30 @@ pub fn lint(args: &LintArgs) -> Result<LintReport, Error> {
             }
             Some(definition.runtime_id().clone())
         }
-        (None, _commands) => None,
+        (None, commands) => {
+            if !context_dir && !commands.is_empty() {
+                return Err(Error::Usage(
+                    "package lint failed: the package exports commands only, which the plugin kit does not support".to_owned(),
+                ));
+            }
+            None
+        }
     };
     Ok(LintReport {
         package_id: identity.id,
         version: identity.version,
         kind: match &runtime_id {
             Some(_) => PackageKind::Runtime,
-            None => PackageKind::Context,
+            None if context_dir => PackageKind::Context,
+            // A descriptor with neither a runtime nor a context export fails
+            // above in `descriptor_from_archive`; reaching here without a
+            // context dir is unreachable.
+            None => {
+                return Err(Error::Usage(
+                    "package lint failed: the package exports neither a runtime nor a context"
+                        .to_owned(),
+                ));
+            }
         },
         runtime_id,
     })
