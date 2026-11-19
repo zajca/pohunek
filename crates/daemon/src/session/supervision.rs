@@ -1539,10 +1539,11 @@ impl SessionRegistry {
                 return false;
             }
         };
-        let creating = record
-            .transaction
-            .as_ref()
-            .is_some_and(|transaction| transaction.kind == crate::store::TransactionKind::Create);
+        let creating = record.transaction.as_ref().is_some_and(|transaction| {
+            transaction.kind == crate::store::TransactionKind::Create
+                && !transaction.is_initial_input()
+                && !transaction.is_deferred_initial_input()
+        });
         match waiting {
             // The runtime was proven ended before the first attempt, and a
             // create generation never runs again, so only the removal repeats.

@@ -3211,6 +3211,8 @@ pub enum SessionInitialInputDrop {
     SessionStopped,
     /// The session exited before readiness.
     SessionExited,
+    /// The deferred write failed while the session was still running.
+    DeliveryFailed,
     /// A value a newer daemon sent that this build does not know.
     #[doc(hidden)]
     #[serde(rename = "unknown", skip_deserializing)]

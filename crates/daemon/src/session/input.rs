@@ -1417,17 +1417,18 @@ async fn write_delayed_input(
         delay_boundary.wait().await;
         delay_boundary.wait().await;
     }
-    // #2406: a deferred watcher's transaction never wakes from an async
-    // wait here (`tokio::time::sleep` and a `yield_now` loop both park
-    // forever, while the same waits complete in the watcher itself and on
-    // the normal create path); a blocking sleep completes. The delay is
-    // the runtime's configured submit pause (150ms for claude), waited
-    // once per deferred delivery.
-    // TODO(#2406): find why async waits park in this transaction and use
-    // an async wait again.
-    std::thread::sleep(delay);
+    // The runtime's configured submit pause (150ms for claude), waited
+    // once per delivery. The deferred watcher reaches this write by
+    // polling the activity (blocked to idle), never by waiting on the
+    // initial observation, so this async wait wakes like on the normal
+    // path: the earlier park was the watcher waiting on a readiness the
+    // timed-out wait had already cancelled, not this sleep.
+    tokio::time::sleep(delay).await;
     // Reserved before the session lock below, which keeps the lock order of
-    // the control connection first and the session registry second.
+    // the control connection first and the session registry second. No
+    // rollback reads the reserved Enter back: `commit` consumes the
+    // reservation, and a failed commit drops it, so the text has no second
+    // send once the claim below resolves.
     let reservation = worker
         .reserve_write(vec![enter_fragment(Duration::ZERO)])
         .await

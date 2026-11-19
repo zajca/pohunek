@@ -366,7 +366,7 @@ fn emit_launch_output(
             .is_some_and(|initial| initial.state == protocol::SessionInitialInputState::Pending)
         {
             println!(
-                "assistant waits on an answer to a dialog; the opening prompt is sent once the agent is ready"
+                "assistant waits on an answer to a dialog; the opening prompt is sent once the agent is ready, no extra action is needed unless the dialog is addressed to the operator, in which case use the attach command above"
             );
         }
     }

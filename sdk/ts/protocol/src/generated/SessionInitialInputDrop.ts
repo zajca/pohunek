@@ -6,4 +6,5 @@
 export type SessionInitialInputDrop =
   | "daemon_restart"
   | "session_stopped"
-  | "session_exited";
+  | "session_exited"
+  | "delivery_failed";

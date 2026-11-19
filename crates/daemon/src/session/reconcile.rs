@@ -4438,7 +4438,7 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
-            deferred_initial_input: None,
+            deferred_initial_input: deferred_drop_from_record(&record),
             create_request: record.create_request.clone(),
             root_process: Some(crate::procwatch::ProcessIdentity {
                 pid: child.pid,
@@ -4694,15 +4694,7 @@ impl SessionRegistry {
         // settled below: the classified record keeps no create marker
         // behind, or a later reconcile would replay the drop from the old
         // record as a rollback.
-        let deferred_initial_input = record
-            .transaction
-            .as_ref()
-            .filter(|transaction| transaction.is_deferred_initial_input())
-            .map(|_| super::DeferredInitialInput {
-                text: String::new(),
-                ack_timeout_ms: None,
-                outcome: Some(super::DeferredInitialInputOutcome::DaemonRestart),
-            });
+        let deferred_initial_input = deferred_drop_from_record(&record);
         // The marker of a kept create is settled by the classification: a
         // deferred marker loses its prompt text when the daemon restarts
         // (#2406 Q1 option B), and a delivering marker is finished once
@@ -5091,13 +5083,31 @@ fn initial_input_owner(record: &SessionRecord) -> Option<String> {
         .and_then(|transaction| transaction.daemon_instance_id.clone())
 }
 
+/// The deferred drop a record's kept marker records: a deferred marker of
+/// another instance (or none) means the restarted daemon no longer holds
+/// the prompt text, so the entry carries the drop reason, never the text.
+fn deferred_drop_from_record(record: &SessionRecord) -> Option<super::DeferredInitialInput> {
+    record
+        .transaction
+        .as_ref()
+        .filter(|transaction| transaction.is_deferred_initial_input())
+        .map(|_| super::DeferredInitialInput {
+            text: String::new(),
+            ack_timeout_ms: None,
+            outcome: Some(super::DeferredInitialInputOutcome::DaemonRestart),
+            delivering: false,
+        })
+}
+
 /// Whether `record` is a create that has not committed its session yet.
 ///
 /// A committed create still delivering its initial input is a running
 /// session, not an uncommitted create, so no create compensation applies.
 fn uncommitted_create(record: &SessionRecord) -> bool {
     record.transaction.as_ref().is_some_and(|transaction| {
-        transaction.kind == crate::store::TransactionKind::Create && !transaction.is_initial_input()
+        transaction.kind == crate::store::TransactionKind::Create
+            && !transaction.is_initial_input()
+            && !transaction.is_deferred_initial_input()
     })
 }
 

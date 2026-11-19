@@ -14,4 +14,11 @@ back: the daemon delivers the prompt exactly once when the agent is ready,
 `--json` carries `prompt_delivered: false` with `initial_input: pending`,
 and `session.input` before the handshake is refused with
 `session_input_blocked` (answer in `pohunek attach`).
+A deferred prompt is discarded with a recorded reason when it can never
+be delivered: `session_stopped` or `session_exited` on stop or exit,
+`daemon_restart` on restart (the text is never persisted at rest and is
+gone with the old daemon), and `delivery_failed` when the write itself
+fails on a still-running session. `pohunek session show` prints the
+pending or dropped state, and an empty `--input` keeps no deferred
+prompt at all.
 ([#2406](https://github.com/zajca/pohunek/issues/2406))

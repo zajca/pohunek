@@ -3227,6 +3227,7 @@ fn initial_input_label(initial: protocol::SessionInitialInput) -> String {
         Some(Drop::DaemonRestart) => format!("{state} (daemon_restart)"),
         Some(Drop::SessionStopped) => format!("{state} (session_stopped)"),
         Some(Drop::SessionExited) => format!("{state} (session_exited)"),
+        Some(Drop::DeliveryFailed) => format!("{state} (delivery_failed)"),
         Some(Drop::Unknown) => format!("{state} (unknown)"),
     }
 }

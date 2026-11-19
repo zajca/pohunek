@@ -4484,7 +4484,7 @@ impl Drop for ScopedNoCwdDir {
 /// `initial_input` marker; opening the gate renders the prompt box and the
 /// deferred prompt arrives exactly once.
 #[tokio::test]
-async fn claude_blocked_dialog_keeps_the_session_and_defers_the_prompt() {
+async fn claude_kept_session_blocked_dialog_defers_the_prompt() {
     let socket = temp_socket("claude-keep");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -4579,6 +4579,444 @@ async fn claude_blocked_dialog_keeps_the_session_and_defers_the_prompt() {
 
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+/// A kept create with an empty prompt is a no-op (like no prompt): no
+/// deferred prompt is kept, so `initial_input` stays absent and the session
+/// runs without waiting for readiness.
+#[tokio::test]
+async fn claude_kept_session_empty_input_is_no_keep() {
+    let socket = temp_socket("claude-keep-empty");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-empty.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeepempty", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeepempty".clone_into(&mut params.agent);
+    params.input = Some(String::new());
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("session with an empty prompt starts");
+    assert_eq!(
+        created.session.initial_input, None,
+        "an empty prompt keeps no deferred prompt: {created:?}"
+    );
+    assert_eq!(created.prompt_delivered, None);
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// An answered dialog alone delivers nothing: only the prompt box (the
+/// activity turning `idle`) triggers the deferred write, so a stop after
+/// the answer still discards with `session_stopped` and the prompt never
+/// reaches the agent.
+#[tokio::test]
+async fn claude_kept_session_answered_dialog_alone_delivers_nothing() {
+    let socket = temp_socket("claude-keep-answered");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-answered.py");
+    write_claude_trust_stub_no_box(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeepanswered", &script);
+    let config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeepanswered".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    assert_eq!(
+        created
+            .session
+            .initial_input
+            .as_ref()
+            .map(|initial| initial.state),
+        Some(protocol::SessionInitialInputState::Pending)
+    );
+    // Answer the dialog; the stub never draws the prompt box, so the
+    // activity never turns `idle` and nothing is delivered.
+    std::fs::write(&gate, b"go").expect("open the gate");
+    read_file_until(&log, b"gate").await;
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown.initial_input.as_ref().map(|initial| initial.state),
+        Some(protocol::SessionInitialInputState::Pending),
+        "the answered dialog alone keeps the prompt pending: {shown:?}"
+    );
+
+    let stop_req = Request::make(
+        "claude-keep-answered-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.session.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown
+            .initial_input
+            .as_ref()
+            .map(|initial| (initial.state, initial.reason)),
+        Some((
+            protocol::SessionInitialInputState::Dropped,
+            Some(protocol::SessionInitialInputDrop::SessionStopped)
+        )),
+        "stop records the discard reason: {shown:?}"
+    );
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert!(
+        !steps.contains("hello Claude"),
+        "the discarded prompt never reaches the agent: {steps:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A restart after the dialog was answered but before the prompt box
+/// rendered drops the deferred text like any pending prompt and keeps the
+/// running record: the restarted daemon holds no prompt text.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart scenario owns both daemons and their shutdown inline"
+)]
+#[tokio::test]
+async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
+    let socket = temp_socket("claude-keep-answered-restart");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-answered-restart.py");
+    write_claude_trust_stub_no_box(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeepansweredrestart", &script);
+    let config = || SessionRegistryConfig {
+        agents_dir: Some(agents_dir.clone()),
+        store_path: Some(socket.dir.join("metadata.jsonl")),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        // timing-allowed: #2406 the restart must outlast the worker lease.
+        worker_connect_deadline: std::time::Duration::from_secs(30),
+        ..support::hermetic_registry_config()
+    };
+    let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-kar-")
+        .expect("create the restart worker home");
+    let worker_home = worker_home_guard.path().to_path_buf();
+    let first = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        true,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeepansweredrestart".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    assert_eq!(
+        created
+            .session
+            .initial_input
+            .as_ref()
+            .map(|initial| initial.state),
+        Some(protocol::SessionInitialInputState::Pending)
+    );
+    std::fs::write(&gate, b"go").expect("open the gate");
+    read_file_until(&log, b"gate").await;
+    drop(control);
+    let ServedRegistry {
+        registry: first_registry,
+        shutdown: first_shutdown,
+        handle: first_handle,
+        ..
+    } = first;
+    let _ = first_shutdown.send(());
+    let _ = first_handle.await;
+    drop(first_registry);
+    let second = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        false,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown
+            .initial_input
+            .as_ref()
+            .map(|initial| (initial.state, initial.reason)),
+        Some((
+            protocol::SessionInitialInputState::Dropped,
+            Some(protocol::SessionInitialInputDrop::DaemonRestart)
+        )),
+        "restart records the discard reason: {shown:?}"
+    );
+    assert_eq!(
+        shown.state,
+        SessionState::Running,
+        "the session runs on without its deferred prompt: {shown:?}"
+    );
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert!(
+        !steps.contains("hello Claude"),
+        "the dropped prompt never reaches the agent: {steps:?}"
+    );
+
+    drop(control);
+    let ServedRegistry {
+        registry: second_registry,
+        shutdown: second_shutdown,
+        handle: second_handle,
+        ..
+    } = second;
+    let _ = second_shutdown.send(());
+    let _ = second_handle.await;
+    drop(second_registry);
+}
+
+/// A restart with no worker left drops the deferred text but keeps the
+/// record: the kept create committed, so the dead worker is not an
+/// uncommitted create and reconciliation never compensates it away.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart scenario owns both daemons and their shutdown inline"
+)]
+#[tokio::test]
+async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
+    let socket = temp_socket("claude-keep-deadworker");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-deadworker.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeepdeadworker", &script);
+    let config = || SessionRegistryConfig {
+        agents_dir: Some(agents_dir.clone()),
+        store_path: Some(socket.dir.join("metadata.jsonl")),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        // timing-allowed: #2406 the restart must outlast the worker lease.
+        worker_connect_deadline: std::time::Duration::from_secs(30),
+        ..support::hermetic_registry_config()
+    };
+    let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-kdw-")
+        .expect("create the restart worker home");
+    let worker_home = worker_home_guard.path().to_path_buf();
+    let first = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        true,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeepdeadworker".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    drop(control);
+    let ServedRegistry {
+        registry: first_registry,
+        shutdown: first_shutdown,
+        handle: first_handle,
+        ..
+    } = first;
+    let _ = first_shutdown.send(());
+    let _ = first_handle.await;
+    drop(first_registry);
+    // The worker home is gone, so the restarted daemon finds no worker to
+    // adopt and no home to relaunch one from: the deferred marker meets a
+    // dead worker, never a live adoption.
+    std::fs::remove_dir_all(&worker_home).expect("remove the dead worker home");
+    let second = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        false,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown
+            .initial_input
+            .as_ref()
+            .map(|initial| (initial.state, initial.reason)),
+        Some((
+            protocol::SessionInitialInputState::Dropped,
+            Some(protocol::SessionInitialInputDrop::DaemonRestart)
+        )),
+        "the dead worker does not take the deferred reason with it: {shown:?}"
+    );
+    assert!(
+        matches!(shown.state, SessionState::Failed | SessionState::Stopped),
+        "the record is kept as a terminal session, never compensated away: {shown:?}"
+    );
+    let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
+        .expect("the stub log is text");
+    assert!(
+        !steps.contains("hello Claude"),
+        "the dropped prompt never reaches the agent: {steps:?}"
+    );
+    drop(control);
+    let ServedRegistry {
+        registry: second_registry,
+        shutdown: second_shutdown,
+        handle: second_handle,
+        ..
+    } = second;
+    let _ = second_shutdown.send(());
+    let _ = second_handle.await;
+    drop(second_registry);
+}
+
+/// A stopped kept session survives a daemon restart as a stopped record:
+/// the kept create committed, so the deferred marker is not an
+/// uncommitted create and reconciliation never compensates it away.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart scenario owns both daemons and their shutdown inline"
+)]
+#[tokio::test]
+async fn claude_kept_session_stopped_record_survives_restart() {
+    let socket = temp_socket("claude-keep-stopped");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let log = socket.dir.join("stub.log");
+    let gate = socket.dir.join("gate");
+    let script = socket.dir.join("claude-keep-stopped.py");
+    write_claude_trust_stub(&script, &log, &gate);
+    write_claude_profile(&agents_dir, "claudekeepstopped", &script);
+    let config = || SessionRegistryConfig {
+        agents_dir: Some(agents_dir.clone()),
+        store_path: Some(socket.dir.join("metadata.jsonl")),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        // timing-allowed: #2406 the restart must outlast the worker lease.
+        worker_connect_deadline: std::time::Duration::from_secs(30),
+        ..support::hermetic_registry_config()
+    };
+    let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-ksr-")
+        .expect("create the restart worker home");
+    let worker_home = worker_home_guard.path().to_path_buf();
+    let first = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        true,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    "claudekeepstopped".clone_into(&mut params.agent);
+    params.input = Some("hello Claude".to_owned());
+    let created: SessionNewResult = serde_json::from_value(ok_payload(
+        create_session_with_params(&mut control, params).await,
+    ))
+    .expect("kept claude session info");
+    let stop_req = Request::make(
+        "claude-keep-stopped-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&created.session.id).expect("serialize id"),
+    );
+    let _: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
+            .expect("stop result");
+    drop(control);
+    let ServedRegistry {
+        registry: first_registry,
+        shutdown: first_shutdown,
+        handle: first_handle,
+        ..
+    } = first;
+    let _ = first_shutdown.send(());
+    let _ = first_handle.await;
+    drop(first_registry);
+    let second = serve_official_runtimes_at(
+        &socket,
+        "0.0.0",
+        config(),
+        support::hermetic_environment_source(),
+        false,
+        &worker_home,
+        None,
+    )
+    .await;
+    let mut control = connect(&socket).await;
+    let shown = inspect_session(&mut control, &created.session.id).await;
+    assert_eq!(
+        shown.state,
+        SessionState::Stopped,
+        "the stopped kept session is still listed after the restart: {shown:?}"
+    );
+    assert_eq!(
+        shown.initial_input, None,
+        "no deferred prompt is resurrected by the restart: {shown:?}"
+    );
+
+    drop(control);
+    let ServedRegistry {
+        registry: second_registry,
+        shutdown: second_shutdown,
+        handle: second_handle,
+        ..
+    } = second;
+    let _ = second_shutdown.send(());
+    let _ = second_handle.await;
+    drop(second_registry);
 }
 
 /// #2406 row 3: stopping a kept session before readiness discards the
@@ -4778,6 +5216,7 @@ async fn claude_kept_session_restart_drops_the_deferred_prompt() {
         SessionState::Running,
         "the session runs on without its deferred prompt: {shown:?}"
     );
+
     let steps = String::from_utf8(std::fs::read(&log).expect("read the stub log"))
         .expect("the stub log is text");
     assert!(
@@ -4899,6 +5338,66 @@ while True:
         ),
     )
     .expect("write Claude stub with a trust dialog");
+}
+
+/// Variant of [`write_claude_trust_stub`] whose stub answers the trust
+/// dialog but never draws the prompt box: the session stays `blocked`
+/// after the answer, so only the activity (never the answer alone) can
+/// trigger the deferred write.
+fn write_claude_trust_stub_no_box(script: &Path, log: &Path, gate: &Path) {
+    let trust = std::fs::read_to_string(
+        pohunek_test_support::workspace_root().join("compat/claude/screens/trust.txt"),
+    )
+    .expect("read the recorded trust dialog");
+    let trust_screen = format!("\x1b[2J\x1b[H{}", trust.trim_end().replace('\n', "\r\n"));
+    let hex = |text: &str| {
+        text.bytes()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect::<Vec<_>>()
+            .concat()
+    };
+    std::fs::write(
+        script,
+        format!(
+            r#"import os
+import select
+import termios
+import tty
+
+tty.setraw(0, termios.TCSANOW)
+log = open({log:?}, "ab", buffering=0)
+
+def note(text):
+    log.write(text + b"\n")
+
+{probe}
+if os.path.exists(TRUST_ANSWER):
+    note(b"cached")
+else:
+    os.write(1, b"\x1b[?2004h")
+    os.write(1, b"{trust}")
+    note(b"dialog")
+    while not os.path.exists({gate:?}):
+        ready, _, _ = select.select([0], [], [], 0.05)
+        if ready:
+            note(b"input:" + os.read(0, 4096))
+    note(b"gate")
+    with open(TRUST_ANSWER, "w") as accepted:
+        accepted.write("answered\n")
+note(b"answered-no-box")
+while True:
+    chunk = os.read(0, 4096)
+    if not chunk:
+        break
+    note(b"input:" + chunk)
+"#,
+            log = log.display().to_string(),
+            gate = gate.display().to_string(),
+            probe = trust_stub_answer_probe(),
+            trust = hex(&trust_screen),
+        ),
+    )
+    .expect("write Claude stub with a trust dialog and no prompt box");
 }
 
 /// A session whose Claude stub first draws the recorded folder-trust dialog
