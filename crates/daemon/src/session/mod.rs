@@ -722,7 +722,12 @@ impl ReadinessDeadlineHold {
     #[must_use]
     pub fn armed() -> (Self, std::sync::Arc<tokio::sync::Notify>) {
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        (Self { release: std::sync::Arc::clone(&release) }, release)
+        (
+            Self {
+                release: std::sync::Arc::clone(&release),
+            },
+            release,
+        )
     }
 
     /// Releases the parked create, so its readiness deadline starts.

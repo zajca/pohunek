@@ -5939,11 +5939,7 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::make(
-        "subscribe-codex-popup",
-        method::SUBSCRIBE,
-        Value::Null,
-    );
+    let subscribe_req = Request::make("subscribe-codex-popup", method::SUBSCRIBE, Value::Null);
     let ack = exchange(&mut subscriber, &subscribe_req).await;
     assert!(ack.is_ok(), "subscribe should ack");
     let mut control = connect(&socket).await;
