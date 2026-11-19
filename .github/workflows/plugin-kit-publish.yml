@@ -47,8 +47,9 @@ jobs:
     if: ${{ vars.PLUGIN_KIT_APP_ID != '' && github.event.workflow_run.conclusion == 'success' && ((github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'push') || (github.event.workflow_run.name == 'CI' && github.event.workflow_run.event == 'schedule')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # The default branch lands here even when the environment gates the
-    # token step, so the environment deployment policy must allow `main`.
+    # The publishing token is minted below, so provenance checks use the
+    # job's read-only token. GH_TOKEN must stay in each gh step: gh does
+    # not pick up github.token on its own in Actions (N1).
     environment: plugin-kit-publish
     concurrency:
       group: plugin-kit-publish
@@ -202,6 +203,7 @@ jobs:
         if: ${{ steps.select.outputs.prerelease != 'true' }}
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
@@ -215,6 +217,8 @@ jobs:
       - name: Verify the nightly provenance
         if: ${{ steps.select.outputs.prerelease == 'true' }}
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd dist

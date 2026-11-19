@@ -851,12 +851,27 @@ class EvidenceWorkflowTests(ReleaseWorkflowFiles):
         # so every `uses:` of a local reusable workflow must pass each of its
         # `required: true` inputs in `with:` (fix1c: `release-build.yml` once
         # declared an unused required `version` that neither caller passed).
-        callers = {
-            "release-build.yml": ["ci.yml", "release.yml"],
+        # The caller map is derived from every local `uses:` in the
+        # workflows directory, so `release-evidence.yml` and its callers
+        # are covered too (N5).
+        caller_texts = {
+            path.name: path.read_text() for path in WORKFLOWS.glob("*.yml")
         }
-        caller_texts = {"ci.yml": self.ci, "release.yml": self.release}
-        for reusable, caller_files in callers.items():
-            build = self.texts[reusable]
+        uses = re.compile(r"(?m)^    uses: \./\.github/workflows/([a-z0-9-]+\.yml)$")
+        callers: dict[str, list[str]] = {}
+        for caller_file, caller in caller_texts.items():
+            for reusable in uses.findall(caller):
+                if reusable == caller_file:
+                    continue
+                callers.setdefault(reusable, [])
+                if caller_file not in callers[reusable]:
+                    callers[reusable].append(caller_file)
+        self.assertIn("release-build.yml", callers)
+        self.assertIn("release-evidence.yml", callers)
+        for reusable, caller_files in sorted(callers.items()):
+            build = caller_texts[reusable]
+            if "    inputs:\n" not in build:
+                continue
             inputs_block = build.split("    inputs:\n", 1)[1].split("\n    outputs:", 1)[0]
             required = [
                 name for name in re.findall(r"(?m)^      ([a-z_]+):\n", inputs_block)

@@ -188,16 +188,115 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
         self.assertIn("is a pre-release", select)
 
     def test_the_provenance_is_verified_before_the_token_is_minted(self):
-        bundle_verify = self.text.partition("- name: Verify the bundle provenance")[2]
-        mint_at = bundle_verify.index("- name: Mint the kit repository token")
-        verify = bundle_verify[:mint_at]
-        self.assertIn("gh attestation verify", verify)
-        self.assertIn("--signer-workflow \"zajca/pohunek/.github/workflows/release-evidence.yml\"", verify)
-        self.assertIn("--source-ref \"refs/tags/$HEAD_BRANCH\"", verify)
-        self.assertIn("--deny-self-hosted-runners", verify)
-        # Nightlies carry no release attestation: they verify against main.
-        self.assertIn('if: ${{ steps.select.outputs.prerelease == \'true\' }}', bundle_verify)
-        self.assertIn("--source-ref refs/heads/main", bundle_verify)
+        steps = self.verify_steps()
+        self.assertEqual(
+            [step["name"] for step in steps],
+            ["Verify the bundle provenance", "Verify the nightly provenance"],
+        )
+        release, nightly = steps
+        # The release bundle verifies against its tag; the nightly
+        # bundle verifies against main. Each condition lives in its own
+        # step block, so inverting one cannot hide behind the other (N2).
+        self.assertEqual(
+            release["if"], "${{ steps.select.outputs.prerelease != 'true' }}"
+        )
+        self.assertIn("--source-ref \"refs/tags/$HEAD_BRANCH\"", release["run"])
+        self.assertEqual(
+            nightly["if"], "${{ steps.select.outputs.prerelease == 'true' }}"
+        )
+        self.assertIn("--source-ref refs/heads/main", nightly["run"])
+        for step in steps:
+            with self.subTest(step=step["name"]):
+                self.assertIn("gh attestation verify", step["run"])
+                self.assertIn(
+                    "--signer-workflow \"zajca/pohunek/.github/workflows/release-evidence.yml\"",
+                    step["run"],
+                )
+                self.assertIn("--deny-self-hosted-runners", step["run"])
+                self.assertIn("GH_TOKEN", step["env"])
+        mint_at = self.text.index("- name: Mint the kit repository token")
+        for step in steps:
+            self.assertLess(self.text.index(f"- name: {step['name']}"), mint_at)
+
+    @classmethod
+    def publish_steps(cls):
+        jobs = cls.jobs.partition("  publish:\n")[2]
+        block = jobs.split("\n    steps:\n", 1)[1]
+        steps, current = [], None
+        for line in block.splitlines():
+            if line.startswith("      - "):
+                current = {"env": "", "if": "", "run": "", "name": ""}
+                steps.append(current)
+                rest = line[len("      - "):]
+                if rest.startswith("name: "):
+                    current["name"] = rest[len("name: "):]
+                continue
+            if current is None:
+                continue
+            if line.startswith("        env:"):
+                mode = "env"
+            elif line.startswith("        if: "):
+                current["if"] = line.split("if: ", 1)[1]
+                mode = None
+            elif line.startswith("        run: |"):
+                mode = "run"
+            elif line.startswith("          ") and mode:
+                current[mode] += line[10:] + "\n"
+            elif line and not line.startswith(" "):
+                break
+            else:
+                mode = None
+        return [step for step in steps if step["name"]]
+
+    @classmethod
+    def verify_steps(cls):
+        return [
+            step for step in cls.publish_steps()
+            if step["name"] in ("Verify the bundle provenance", "Verify the nightly provenance")
+        ]
+
+    def run_verify(self, name, env, files):
+        body = next(step for step in self.verify_steps() if step["name"] == name)["run"]
+        root = Path(tempfile.mkdtemp(prefix="plugin-kit-verify-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        dist = root / "dist"
+        dist.mkdir()
+        for relative in files:
+            (dist / relative).write_bytes(b"fixture")
+        bindir = root / "bin"
+        bindir.mkdir()
+        (bindir / "gh").write_text("#!/bin/sh\n" + FAKE_GH_ATTESTATION_VERIFY)
+        (bindir / "gh").chmod(0o755)
+        env = {
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "HOME": str(root),
+            "CORE_REPO": "zajca/pohunek",
+            **env,
+        }
+        completed = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", body],
+            cwd=root, env=env, capture_output=True, text=True, timeout=60,
+        )
+        return completed
+
+    def test_the_verify_steps_authenticate_gh(self):
+        files = [
+            "pohunek-plugin-kit-0.44.0-x86_64-unknown-linux-gnu.tar.zst",
+            "pohunek-plugin-kit-0.44.0-aarch64-apple-darwin.tar.zst",
+        ]
+        for step in self.verify_steps():
+            with self.subTest(step=step["name"]):
+                completed = self.run_verify(
+                    step["name"], {"GH_TOKEN": "fixture", "HEAD_BRANCH": "v0.44.0"}, files,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                # Without the token gh refuses (exit 4), so a step that
+                # drops GH_TOKEN fails instead of verifying nothing (N1).
+                env = {"HEAD_BRANCH": "v0.44.0"}
+                env.pop("GH_TOKEN", None)
+                refused = self.run_verify(step["name"], env, files)
+                self.assertEqual(refused.returncode, 4)
+                self.assertIn("GH_TOKEN", refused.stderr)
 
     def test_the_publish_is_draft_first(self):
         publish = self.text.partition("- name: Publish the release")[2]
@@ -237,6 +336,22 @@ class PluginKitPublishWorkflowTests(unittest.TestCase):
     def test_the_publish_runs_in_the_gated_environment(self):
         publish = self.jobs.partition("  publish:\n")[2]
         self.assertIn("    environment: plugin-kit-publish\n", publish)
+
+
+FAKE_GH_ATTESTATION_VERIFY = """\
+# The real gh refuses to run in Actions without GH_TOKEN (N1):
+# "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN
+# environment variable" (exit 4). The fake fails the same way so a
+# verify step without the token cannot regress to green.
+if [ "$1 $2" = "attestation verify" ]; then
+  if [ -z "${GH_TOKEN:-}" ]; then
+    echo "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable" >&2
+    exit 4
+  fi
+  printf 'verified: %s\n' "$3"
+  exit 0
+fi
+"""
 
 
 FAKE_GH_RELEASE_VIEW = """\
