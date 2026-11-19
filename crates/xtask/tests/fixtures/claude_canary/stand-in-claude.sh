@@ -16,6 +16,10 @@
 #   startup-idle  emit `state=idle` and keep the screen blank for a second
 #                 before the theme picker
 #   slow-start    show a blank screen for two seconds before the first screen
+#   slower-start  show a blank screen for five seconds before the first
+#                 screen: longer than the 3 s silent step bound, so the
+#                 silent partial-capture scenario reaches its tested step
+#                 only when the first screen has its own budget (#2431)
 #   prompt-box    in an empty config home, emit state=idle and draw
 #                 the prompt box instead of the first-run screens,
 #                 then hold
@@ -34,6 +38,7 @@ logs=$(dirname "$config")
 printf '%s\n' "$*" >> "$logs/argv.log"
 stty raw -echo
 if [ -e ./slow-start ]; then printf '\033[2J\033[H'; sleep 2; fi
+if [ -e ./slower-start ]; then printf '\033[2J\033[H'; sleep 5; fi
 emit() { printf '\033]7501;state=%s:app=claude-code\033\\' "$1"; }
 hold() { while :; do sleep 1; done; }
 rule='────────────────────────────────────────'

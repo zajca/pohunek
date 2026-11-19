@@ -982,7 +982,7 @@ impl Driver<'_> {
             // A startup `state=idle` can precede first-run screens, so in the login
             // scenario an idle record counts only after the picker; while Claude holds
             // the idle record the detector reports `osc_progress` over the prompt box,
-            // so the step deadline decides "straight to the prompt".
+            // so the first-screen deadline decides "straight to the prompt".
             let last_record_idle = session
                 .records
                 .last()
