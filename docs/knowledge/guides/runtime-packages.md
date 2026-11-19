@@ -359,7 +359,7 @@ not start with `-` keeps its argv delivery. A session launched through a
 profile always pastes its first prompt.
 
 A package that sets `prompt_arg = true` and relies on this rule lists
-`requires = ["prompt-arg-dash-paste-v1"]`, so a core without the rule refuses
+`prompt-arg-dash-paste-v1` in its top-level `requires` array, so a core without the rule refuses
 the package instead of passing a dash prompt as a flag. A package that does not
 list it still gets the rule on this core.
 
