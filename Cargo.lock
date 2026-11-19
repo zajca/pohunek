@@ -1774,6 +1774,7 @@ dependencies = [
  "nix 0.29.0",
  "notify",
  "pohunek-client",
+ "pohunek-daemon",
  "pohunek-hostcheck",
  "pohunek-knowledge",
  "pohunek-logging",

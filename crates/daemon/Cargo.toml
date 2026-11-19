@@ -10,6 +10,13 @@ description = "pohunek host daemon: owns PTYs and serves the control protocol."
 name = "pohunekd"
 path = "src/main.rs"
 
+[features]
+# Test-only seams of the daemon (M-TEST-UTIL); never enabled by a release
+# build. Integration tests reach the session registry only through the
+# server, so the readiness-deadline hold travels in `SessionRegistryConfig`
+# instead of a registry method.
+test-util = []
+
 [dependencies]
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -65,6 +72,11 @@ tempfile = { workspace = true }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [dev-dependencies]
+# The daemon's own `test-util` seams for integration tests: the
+# readiness-deadline hold travels in `SessionRegistryConfig` because tests
+# reach the registry only through the server. A self dev-dependency edge,
+# so the non-test `pohunekd` build never enables it.
+pohunek-daemon = { path = ".", features = ["test-util"] }
 # `test-util` enables tokio's paused clock (`start_paused`) so the attention
 # debounce coordinator tests advance time deterministically instead of sleeping.
 tokio = { workspace = true, features = ["test-util"] }

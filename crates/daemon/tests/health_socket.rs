@@ -4053,12 +4053,13 @@ async fn codex_captured_startup_dialog(
         &bytes,
     );
     write_official_profile(&agents_dir, "codex", "codexstartupdialog", &script);
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
+    let release_deadline = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -4091,6 +4092,9 @@ async fn codex_captured_startup_dialog(
     };
     assert_eq!(published.payload()["activity"], Value::from("blocked"));
     assert_eq!(published.payload()["source"], Value::from("screen"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace decides the refused create.
+    release_deadline.notify_one();
 
     if let Some(release) = release {
         assert!(
@@ -5896,10 +5900,19 @@ async fn codex_initial_input_is_refused_while_the_startup_update_popup_holds_the
 /// A profile override without idle evidence keeps Codex's strict policy.
 #[tokio::test]
 async fn codex_initial_input_is_refused_with_an_override_without_idle_evidence() {
-    codex_popup_is_refused(Some("rules = []\n")).await;
+    codex_popup_is_refused_inner(Some("rules = []\n"), false).await;
 }
 
 async fn codex_popup_is_refused(override_manifest: Option<&str>) {
+    codex_popup_is_refused_inner(override_manifest, true).await;
+}
+
+/// `Some` documented popup-regression refusal verdict carries a daemon
+/// `Blocked`/`Screen` classification the parked create can wait for: the
+/// startup update popup. A profile override without idle evidence
+/// (`rules = []`) keeps Codex's strict policy but publishes no screen
+/// verdict, so that case refuses while the deadline runs and skips the hold.
+async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_deadline: bool) {
     let socket = temp_socket("codex-popup");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -5916,25 +5929,50 @@ async fn codex_popup_is_refused(override_manifest: Option<&str>) {
         std::fs::write(profile, format!("{body}manifest = \"popup\"\n"))
             .expect("declare override manifest");
     }
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
         ..support::hermetic_registry_config()
     };
+    let release_deadline = hold_deadline.then(|| arm_readiness_deadline_hold(&mut config));
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-codex-popup",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(ack.is_ok(), "subscribe should ack");
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     params.cols = 100;
     "codexpopup".clone_into(&mut params.agent);
     params.input = Some("hello Codex".to_owned());
-    let error = err_payload(create_session_with_params(&mut control, params).await);
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    if let Some(release_deadline) = release_deadline {
+        let published = wait_for_any_agent_state_event(
+            &mut subscriber,
+            AgentActivity::Blocked,
+            StateSource::Screen,
+        )
+        .await;
+        assert_eq!(published.payload()["activity"], Value::from("blocked"));
+        assert_eq!(published.payload()["source"], Value::from("screen"));
+        // The verdict landed with no deadline running; release the hold so
+        // the held grace decides the refused create.
+        release_deadline.notify_one();
+    }
+    let error = err_payload(create.await.expect("create task joins"));
     assert_eq!(error.code, "session_input_not_ready");
 
+    let mut observer = connect(&socket).await;
     let list = Request::make("codex-popup-list", method::SESSION_LIST, Value::Null);
     let sessions: Vec<SessionInfo> =
-        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+        serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
             .expect("list sessions");
     assert!(sessions.is_empty(), "the refused session was rolled back");
     let captured = std::fs::read(&received).unwrap_or_default();
@@ -5951,6 +5989,10 @@ async fn codex_popup_is_refused(override_manifest: Option<&str>) {
 /// `source` for any session and returns it. The popup regressions run one
 /// session at a time and its create is still waiting for readiness when the
 /// popup is classified, so the event cannot name a session the test knows.
+/// The readiness deadline is held while this waits (see
+/// `arm_readiness_deadline_hold`): the verdict must land with no deadline
+/// running, so a late classification is a hang with a name instead of a
+/// `select!` timeout race.
 async fn wait_for_any_agent_state_event(
     framed: &mut Framed<UnixStream, LinesCodec>,
     activity: AgentActivity,
@@ -5987,8 +6029,21 @@ async fn wait_for_any_agent_state_event(
     }
 }
 
-/// The same refusal with a synthetic adversarial idle-looking terminal title
-/// (`work`) set while the popup holds — the measured popup set no title, so
+/// Arms the readiness-deadline hold of a popup-regression config: the
+/// create parks before its deadline starts, the test waits for the
+/// classification with no deadline running, then releases the hold so the
+/// deadline decides. Returns the releaser the test calls once the verdict
+/// it waits for is visible.
+#[cfg(feature = "test-util")]
+fn arm_readiness_deadline_hold(
+    config: &mut SessionRegistryConfig,
+) -> std::sync::Arc<tokio::sync::Notify> {
+    let (hold, release) = pohunek_daemon::session::ReadinessDeadlineHold::armed();
+    config.readiness_deadline_hold = Some(hold);
+    release
+}
+
+/// The same refusal with a synthetic adversarial idle-looking terminal title — the measured popup set no title, so
 /// this is the case the rule must survive, not one the capture observed: the
 /// popup blocker outranks the title's idle evidence, so the stale title must
 /// not release the prompt. The test first waits for the daemon to classify
@@ -6003,12 +6058,13 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
     let script = socket.dir.join("codex-popup-stale.py");
     codex_update_popup_stub(&script, &received, true, None);
     write_official_profile(&agents_dir, "codex", "codexpopupstale", &script);
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
+    let release_deadline = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -6040,6 +6096,9 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
     };
     assert_eq!(published.payload()["activity"], Value::from("blocked"));
     assert_eq!(published.payload()["source"], Value::from("screen"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace decides the refused create.
+    release_deadline.notify_one();
 
     let error = err_payload(create.await.expect("create task joins"));
     assert_eq!(error.code, "session_input_not_ready");
