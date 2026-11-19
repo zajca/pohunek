@@ -3685,8 +3685,10 @@ exit; procwatch remains the Codex release backstop.
   value that is not an absolute path of plain components is skipped.
 - **No symlink is followed** below a history root: a linked directory is not
   entered and a linked file is not opened. Files are opened relative to
-  directory fds with `O_NOFOLLOW` on every component, so an intermediate
-  directory replaced by a symlink between the walk and the read is refused.
+  directory fds with `O_NOFOLLOW` on every component below the history root;
+  the root itself is opened by its canonical path. An intermediate directory
+  below the root replaced by a symlink between the walk and the read is
+  refused.
 - **Bounded listings.** One directory listing keeps at most the remaining
   entry budget, the newest names first, and the deadline is checked while
   listing; a cut listing ends the walk with the entries kept and is named in
