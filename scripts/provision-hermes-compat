@@ -97,6 +97,13 @@ observed_lock_sha256="$(sha256_of "$lock_path")"
 [[ "$observed_lock_sha256" == "$EXPECTED_LOCK_SHA256" ]] \
   || fail "compatibility lock SHA-256 does not match the reviewed digest"
 
+# The retried `uv sync` below needs the shared helper inside the checkout.
+# Refuse here, before any git or network command, so a copy without it
+# never syncs unwrapped.
+retry_helper="$script_root/.github/scripts/ci-retry"
+[[ -f "$retry_helper" && -x "$retry_helper" ]] \
+  || fail "retry helper is missing at $retry_helper"
+
 # The host python3 only runs the small helper programs below; the Hermes venv
 # uses the pinned CPython runtime.
 python_bin="$(command -v python3)"
@@ -253,12 +260,7 @@ archive_sha256="${lock_fields[6]}"
 
 # No provider or GitHub credential is needed. Clearing common credential and
 # Git transport variables prevents a caller's ambient secrets from reaching
-# the verified upstream build or its dependency installers. The GITHUB_ENV
-# path alone is kept aside first: the retried `uv sync` below passes it to
-# the helper so an exhausted retry still marks the job with
-# CI_INFRA_FAILURE; the helper only appends that one marker line, and the
-# scrubbed process itself never sees the file.
-provisioner_github_env="${GITHUB_ENV:-}"
+# the verified upstream build or its dependency installers.
 unset ANTHROPIC_API_KEY AZURE_OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN GOOGLE_API_KEY
 unset HERMES_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY SSH_AUTH_SOCK
 unset GIT_ASKPASS GIT_SSH GIT_SSH_COMMAND
@@ -374,21 +376,18 @@ fi
 # from substituting a downloaded interpreter. --frozen is intentional: newer
 # uv releases re-resolve and reject this historical lock under --locked, while
 # frozen consumes its exact hash-pinned resolution without modifying it.
-# The sync goes through the shared retry helper (`ci-retry: uv-sync-hermes`),
-# with the GITHUB_ENV path passed through so an exhausted retry still marks
-# the job with CI_INFRA_FAILURE; the provisioner's own credential scrub below stays
-# in force for everything the helper runs. The helper lives beside the
-# checkout, resolved from this script's directory, and a copy of the
-# provisioner without it refuses instead of syncing unwrapped.
+# The sync goes through the shared retry helper (`ci-retry: uv-sync-hermes`)
+# under the uv-class bounds. The helper lives inside the checkout, resolved
+# from this script's directory. An exhausted retry fails here with the
+# helper's `::error` annotation and does not set CI_INFRA_FAILURE: the
+# credential scrub above clears GITHUB_ENV, so the helper has no marker file.
+# A copy of the provisioner without the helper refuses instead of syncing
+# unwrapped (checked in the preflight next to the digest-tool refusal).
 phase "installing the locked Hermes dependencies with uv"
-retry_helper="$script_root/.github/scripts/ci-retry"
-[[ -f "$retry_helper" && -x "$retry_helper" ]] \
-  || fail "retry helper is missing at $retry_helper"
 UV_CACHE_DIR="$uv_cache_root" \
   UV_NO_CONFIG=1 \
   UV_PYTHON_DOWNLOADS=never \
   UV_PROJECT_ENVIRONMENT="$venv_root" \
-  GITHUB_ENV="$provisioner_github_env" \
   "$retry_helper" --label uv-sync-hermes \
   --attempts "$UV_SYNC_RETRY_ATTEMPTS" \
   --attempt-timeout "$UV_SYNC_ATTEMPT_TIMEOUT_SECONDS" \

@@ -214,6 +214,19 @@ fi
 grep -Fq 'sha256sum or shasum' "$test_root/stderr"
 test ! -e "$git_marker"
 
+# Without the retry helper inside the checkout the provisioner refuses before
+# any git or network command, instead of syncing unwrapped.
+rm -f "$copy_root/.github/scripts/ci-retry" "$git_marker"
+if PATH="$fake_bin:/usr/bin:/bin" \
+  "$copy_root/scripts/provision-hermes-compat" "$test_root/no-helper-install" \
+  >"$test_root/stdout" 2>"$test_root/stderr"; then
+  printf '%s\n' 'provisioner unexpectedly ran without the retry helper' >&2
+  exit 1
+fi
+grep -Fq 'retry helper is missing at' "$test_root/stderr"
+test ! -e "$git_marker"
+cp "$script_root/.github/scripts/ci-retry" "$copy_root/.github/scripts/"
+
 # A host without a pinned CPython runtime is refused before any upstream
 # command runs.
 unsupported_bin="$test_root/unsupported-bin"
@@ -255,7 +268,6 @@ grep -Fq -- '--speed-limit "$NETWORK_STALL_BYTES" --speed-time "$NETWORK_STALL_S
 grep -Fq -- '--retry "$((NETWORK_ATTEMPTS - 1))"' "$provision"
 grep -Fq 'cannot install the locked Hermes dependencies' "$provision"
 grep -Fq '"$retry_helper" --label uv-sync-hermes' "$provision"
-grep -Fq 'retry helper is missing at $retry_helper' "$provision"
 
 # Keep the historical-lock workaround explicit and reject an accidental return
 # to the re-resolving mode that failed during the M2 evidence capture.
