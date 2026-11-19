@@ -696,50 +696,64 @@ pub struct SessionRegistryConfig {
     /// Test-only hold parking a create before its initial-input readiness
     /// deadline starts (M-TEST-UTIL). `None` in production and in every
     /// test that does not arm it: the deadline starts at once. A test arms
-    /// it with a [`tokio::sync::Notify`] it keeps, waits for the readiness
-    /// verdict on real time while no deadline runs, then releases the
-    /// hold so the deadline decides. Never read from `service.toml`.
+    /// it, waits for the readiness verdict on real time while no deadline
+    /// runs, then releases the hold once so the parked deadline decides.
+    /// The first create to arrive takes the hold; the registry runs one
+    /// session at a time in these tests. Never read from `service.toml`.
     #[cfg(feature = "test-util")]
     pub readiness_deadline_hold: Option<ReadinessDeadlineHold>,
 }
 
 /// Test-only hold on the start of the initial-input readiness deadline
-/// (M-TEST-UTIL). The test keeps a clone of the [`tokio::sync::Notify`]
-/// and releases the parked create with `notify_one` once the readiness
+/// (M-TEST-UTIL). One-shot: the parked create drops the hold after its
+/// release, so a stored permit can never release a later create. Every
+/// create that arrives while the hold is armed parks; the registry runs
+/// one session at a time in these tests. The test keeps the
+/// [`tokio::sync::Notify`] releaser from [`Self::armed`] and drops it
+/// into the parked create with [`Self::release`] once the readiness
 /// verdict it waits for is visible, so the deadline decides afterwards.
-/// Equality is by shared gate: two holds are equal while they release the
-/// same parked create.
+/// Equality is by shared gate: two holds are equal while they park the
+/// same create.
 #[cfg(feature = "test-util")]
 #[derive(Debug, Clone)]
 pub struct ReadinessDeadlineHold {
-    release: std::sync::Arc<tokio::sync::Notify>,
+    gate: GatePermit,
 }
+
+/// The releaser a [`ReadinessDeadlineHold`] parks on.
+#[cfg(feature = "test-util")]
+type GatePermit = std::sync::Arc<tokio::sync::Notify>;
 
 #[cfg(feature = "test-util")]
 impl ReadinessDeadlineHold {
-    /// Arms the hold: the next create with a pending initial input parks
-    /// until [`Self::release`] is called.
+    /// Arms the hold: every create with a pending initial input parks
+    /// while the hold is armed, until [`Self::release`] is called.
+    /// Returns the hold and its releaser.
     #[must_use]
-    pub fn armed() -> (Self, std::sync::Arc<tokio::sync::Notify>) {
-        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    pub fn armed() -> (Self, GatePermit) {
+        let release = GatePermit::default();
         (
             Self {
-                release: std::sync::Arc::clone(&release),
+                gate: std::sync::Arc::clone(&release),
             },
             release,
         )
     }
 
-    /// Releases the parked create, so its readiness deadline starts.
-    pub fn release(&self) {
-        self.release.notify_one();
+    /// Releases the parked create, so its readiness deadline starts. Only
+    /// the releaser returned by [`Self::armed`] for this hold opens it;
+    /// any other notifier is ignored.
+    pub fn release(&self, releaser: &GatePermit) {
+        if std::sync::Arc::ptr_eq(&self.gate, releaser) {
+            self.gate.notify_one();
+        }
     }
 }
 
 #[cfg(feature = "test-util")]
 impl PartialEq for ReadinessDeadlineHold {
     fn eq(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.release, &other.release)
+        std::sync::Arc::ptr_eq(&self.gate, &other.gate)
     }
 }
 
@@ -5542,12 +5556,14 @@ impl SessionRegistry {
             )
         };
         let finish_observation = initial_input_done.clone().drop_guard();
-        // A test hold parks the create before the deadline below starts, so
-        // the readiness verdict the test waits for lands while no deadline
-        // runs. Production and unarmed tests never see the hold (`None`).
+        // A test hold parks the create before the deadline below starts,
+        // so the readiness verdict the test waits for lands while no
+        // deadline runs. Production and unarmed tests never see the hold
+        // (`None`). Every parked create waits for the release; the
+        // tests run one session at a time.
         #[cfg(feature = "test-util")]
         if let Some(hold) = self.inner.config.readiness_deadline_hold.clone() {
-            hold.release.notified().await;
+            hold.gate.notified().await;
         }
         let strict = matches!(
             readiness,

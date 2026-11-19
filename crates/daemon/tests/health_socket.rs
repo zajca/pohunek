@@ -4059,7 +4059,7 @@ async fn codex_captured_startup_dialog(
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
-    let release_deadline = arm_readiness_deadline_hold(&mut config);
+    let (deadline_hold, release_deadline) = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -4094,7 +4094,7 @@ async fn codex_captured_startup_dialog(
     assert_eq!(published.payload()["source"], Value::from("screen"));
     // The verdict landed with no deadline running; release the hold so the
     // held grace decides the refused create.
-    release_deadline.notify_one();
+    deadline_hold.release(&release_deadline);
 
     if let Some(release) = release {
         assert!(
@@ -5935,7 +5935,7 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
         initial_input_startup_grace: UNRENDERED_PROMPT_GRACE,
         ..support::hermetic_registry_config()
     };
-    let release_deadline = hold_deadline.then(|| arm_readiness_deadline_hold(&mut config));
+    let armed_deadline_hold = hold_deadline.then(|| arm_readiness_deadline_hold(&mut config));
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut subscriber = connect(&socket).await;
@@ -5949,7 +5949,7 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
     params.input = Some("hello Codex".to_owned());
     let create =
         tokio::spawn(async move { create_session_with_params(&mut control, params).await });
-    if let Some(release_deadline) = release_deadline {
+    if let Some((deadline_hold, release_deadline)) = armed_deadline_hold {
         let published = wait_for_any_agent_state_event(
             &mut subscriber,
             AgentActivity::Blocked,
@@ -5960,7 +5960,7 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
         assert_eq!(published.payload()["source"], Value::from("screen"));
         // The verdict landed with no deadline running; release the hold so
         // the held grace decides the refused create.
-        release_deadline.notify_one();
+        deadline_hold.release(&release_deadline);
     }
     let error = err_payload(create.await.expect("create task joins"));
     assert_eq!(error.code, "session_input_not_ready");
@@ -6026,17 +6026,21 @@ async fn wait_for_any_agent_state_event(
 }
 
 /// Arms the readiness-deadline hold of a popup-regression config: the
-/// create parks before its deadline starts, the test waits for the
+/// first create parks before its deadline starts, the test waits for the
 /// classification with no deadline running, then releases the hold so the
-/// deadline decides. Returns the releaser the test calls once the verdict
-/// it waits for is visible.
+/// deadline decides. Returns the hold and its releaser; the test passes
+/// both to [`ReadinessDeadlineHold::release`] once the verdict it waits
+/// for is visible.
 #[cfg(feature = "test-util")]
 fn arm_readiness_deadline_hold(
     config: &mut SessionRegistryConfig,
-) -> std::sync::Arc<tokio::sync::Notify> {
+) -> (
+    pohunek_daemon::session::ReadinessDeadlineHold,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
     let (hold, release) = pohunek_daemon::session::ReadinessDeadlineHold::armed();
-    config.readiness_deadline_hold = Some(hold);
-    release
+    config.readiness_deadline_hold = Some(hold.clone());
+    (hold, release)
 }
 
 /// The same refusal with a synthetic adversarial idle-looking terminal title — the measured popup set no title, so
@@ -6060,7 +6064,7 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
-    let release_deadline = arm_readiness_deadline_hold(&mut config);
+    let (deadline_hold, release_deadline) = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -6094,7 +6098,7 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
     assert_eq!(published.payload()["source"], Value::from("screen"));
     // The verdict landed with no deadline running; release the hold so the
     // held grace decides the refused create.
-    release_deadline.notify_one();
+    deadline_hold.release(&release_deadline);
 
     let error = err_payload(create.await.expect("create task joins"));
     assert_eq!(error.code, "session_input_not_ready");
