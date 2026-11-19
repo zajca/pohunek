@@ -1342,7 +1342,6 @@ impl Escalation {
         let store = super::temp_store_path(tag);
         let (registry, supervisor) = super::scripted_registry(SessionRegistryConfig {
             shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-            stop_grace: Duration::from_millis(50),
             store_path: Some(store.clone()),
             supervision_retry_initial: RETRY_NEVER,
             ..SessionRegistryConfig::default()
