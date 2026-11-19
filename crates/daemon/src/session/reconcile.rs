@@ -15,8 +15,8 @@ use pohunek_worker_protocol::{
 use protocol::{
     AgentActivity, BackgroundItem, BackgroundKind, BackgroundRevision, BackgroundStatus,
     RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus, RuntimeRef,
-    SessionBackground, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
-    UnconfirmedProcess,
+    SessionBackground, SessionInitialInput, SessionInitialInputDrop, SessionInitialInputState,
+    SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent, UnconfirmedProcess,
 };
 use serde::Deserialize;
 
@@ -4279,6 +4279,10 @@ impl SessionRegistry {
             generation_recorded: None,
         });
         record.info.updated_at = now;
+        // A deferred marker of a kept create means the restarted daemon no
+        // longer holds the prompt text: the adopted live entry records the
+        // drop reason (#2406 Q1 option B, H3), never the text.
+        let adopted_deferred_drop = deferred_drop_from_record(&record);
         record.transaction = None;
         record.runtime.state = RuntimeState::Live;
         record.runtime.worker_id = Some(snapshot.worker_id.to_string());
@@ -4387,6 +4391,12 @@ impl SessionRegistry {
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
         let (input_ready_tx, input_ready) = watch::channel(false);
         let mut info = record.info.clone();
+        if adopted_deferred_drop.is_some() {
+            info.initial_input = Some(SessionInitialInput {
+                state: SessionInitialInputState::Dropped,
+                reason: Some(SessionInitialInputDrop::DaemonRestart),
+            });
+        }
         let entry = SessionEntry {
             info: info.clone(),
             activity_revision: 0,
@@ -4438,7 +4448,8 @@ impl SessionRegistry {
             cwd_observed_at: crate::time::now(),
             reference_launch: None,
             initial_input_owner: initial_input_owner(&record),
-            deferred_initial_input: deferred_drop_from_record(&record),
+            deferred_initial_input: adopted_deferred_drop
+                .or_else(|| deferred_drop_from_record(&record)),
             create_request: record.create_request.clone(),
             root_process: Some(crate::procwatch::ProcessIdentity {
                 pid: child.pid,

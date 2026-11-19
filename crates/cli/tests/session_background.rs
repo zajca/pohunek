@@ -812,6 +812,104 @@ async fn a_restarted_daemon_shows_the_background_its_live_worker_holds() {
     harness.stop().await;
 }
 
+/// A kept Claude session whose prompt is still deferred when the daemon
+/// shuts down: the restarted daemon adopts the live worker (same pid) and
+/// reports the deferred prompt dropped with reason `daemon_restart` (#2406
+/// H3). The fake agent holds the folder-trust dialog, so the create keeps
+/// the session with a deferred prompt instead of rolling back.
+#[tokio::test]
+async fn a_restarted_daemon_adopts_the_live_worker_of_a_kept_session() {
+    let harness = start_serving_claude(true).await;
+    let agent_dir = harness.env.root().join("fake-trust-agent");
+    let config_dir = harness.env.root().join("trust-claude-config");
+    for dir in [&agent_dir, &config_dir] {
+        fs::create_dir_all(dir).expect("create the fixture directory");
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("private directory");
+    }
+    let dialog = agent_dir.join("trust.txt");
+    fs::copy(
+        pohunek_test_support::workspace_root().join("compat/claude/screens/trust.txt"),
+        &dialog,
+    )
+    .expect("stage the recorded folder-trust dialog");
+    let log = agent_dir.join("agent.log");
+    let script = agent_dir.join("fake-trust.sh");
+    // The agent answers the package version probe, draws the trust dialog
+    // the detector reads as `blocked`, then holds standard input: the
+    // create keeps the session with a deferred prompt.
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{}'; exit 0; fi\ncat \"{}\"\nwhile IFS= read -r line; do printf 'got %s\\n' \"$line\" >>\"{}\"; done\n",
+            official_runtimes::supported_banner("claude"),
+            dialog.display(),
+            log.display(),
+        ),
+    )
+    .expect("write the fake trust agent");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("agent mode");
+    harness.profile(
+        "trust-claude",
+        &format!(
+            "base = \"claude\"\n{}program = \"{}\"\n\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            official_runtimes::profile_pin("claude"),
+            script.display(),
+            config_dir.display(),
+        ),
+    );
+
+    let agent_dir_text = agent_dir.display().to_string();
+    let (code, created) = harness
+        .json(&[
+            "session",
+            "new",
+            "--agent",
+            "trust-claude",
+            "--cwd",
+            &agent_dir_text,
+            "--input",
+            "hello Claude",
+            "--input-ack-timeout-ms",
+            "8000",
+        ])
+        .await;
+    assert_eq!(code, 0, "{created}");
+    let id = created["ok"]["id"]
+        .as_str()
+        .expect("kept session id")
+        .to_owned();
+    assert_eq!(
+        created["ok"]["initial_input"]["state"], "pending",
+        "the blocked dialog defers the prompt: {created}"
+    );
+    assert_eq!(
+        created["ok"]["prompt_delivered"], false,
+        "nothing is delivered before readiness: {created}"
+    );
+
+    let pid = worker_pid(&harness, &id).await;
+    let surviving = harness.shut_down().await;
+    let harness = Harness::start_over(surviving).await;
+    let adopted = wait_until("the restarted daemon to adopt the live worker", || async {
+        let info = inspect(&harness, &id).await;
+        (info["runtime"]["state"] == "live"
+            && info["initial_input"]["state"] == "dropped"
+            && info["initial_input"]["reason"] == "daemon_restart")
+            .then_some(info)
+    })
+    .await;
+    assert_eq!(
+        worker_pid(&harness, &id).await,
+        pid,
+        "the restarted daemon adopts the same live worker: {adopted}"
+    );
+    assert_eq!(
+        adopted["state"], "running",
+        "the session runs on with its live worker: {adopted}"
+    );
+    harness.stop().await;
+}
+
 /// A worker that died while the daemon was down leaves no snapshot once the
 /// next daemon reconciles it.
 #[tokio::test]
