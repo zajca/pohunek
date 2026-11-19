@@ -29,4 +29,6 @@ mod selection_tests;
 #[cfg(test)]
 mod test_fixture;
 #[cfg(test)]
+pub(crate) use test_fixture::{explicit, Fixture, Package};
+#[cfg(test)]
 mod tests;

@@ -34,8 +34,10 @@ use crate::error::CliError;
 use crate::paths::Paths;
 
 /// Root keys every input must hold with one value: the launch keys other
-/// than `args` and `[env]`.
-const EQUAL_KEYS: [&str; 8] = [
+/// than `args` and `[env]`. `[rights]` is compared as a whole table: inputs
+/// whose tables differ cannot share a parent, because a preset takes its
+/// parent's rights.
+const EQUAL_KEYS: [&str; 9] = [
     "base",
     "package",
     "digest",
@@ -44,10 +46,11 @@ const EQUAL_KEYS: [&str; 8] = [
     "resume",
     "input_rules",
     "secret_env",
+    "rights",
 ];
 
 /// Root keys a full profile file may hold.
-const PROFILE_KEYS: [&str; 14] = [
+const PROFILE_KEYS: [&str; 15] = [
     "base",
     "package",
     "digest",
@@ -57,6 +60,7 @@ const PROFILE_KEYS: [&str; 14] = [
     "secret_env",
     "input_rules",
     "resume",
+    "rights",
     "manifest",
     "display_name",
     "audience",
@@ -639,7 +643,7 @@ fn parent_text(
             root.insert(key, Item::Value(edit_value(value)));
         }
     }
-    for key in ["input_rules", "resume"] {
+    for key in ["input_rules", "resume", "rights"] {
         if let Some(toml::Value::Table(table)) = first.root.get(key) {
             root.insert(key, Item::Table(edit_table(table)));
         }

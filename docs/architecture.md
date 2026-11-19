@@ -2350,21 +2350,22 @@ that remain are cheap, free-by-default, or inherited:
   class decides the rights of `session.stop`, `session.resume`,
   `session.remove`, `session.remove_accepting_unconfirmed`,
   `session.remove_tree`, `session.rename`, `session.set_metadata`,
-  `session.input`, `session.resize` and `session.attach`. Read methods,
+  `session.input`, `session.resize`, `session.attach` and
+  `session.retention.sweep`. Read methods,
   `session.new` and `session.adopt` have their own rules below; every other
   non-session method is not checked.
 
   | Caller | Evidence | Class |
   |---|---|---|
   | Remote overlay connection, or in-process dispatch | no kernel peer | `Owner` (the overlay policy is the gate) |
-  | Local peer of another user, a peer the kernel no longer attests, or an accepted socket the kernel could not attest | socket credentials | `Unknown`: every checked mutation is refused with `unknown_caller` |
+  | Local peer of another user, a peer the kernel no longer attests, or an accepted socket the kernel could not attest | socket credentials | `Unknown`: every checked mutation is refused with `unknown_caller`, including `session.retention.sweep` even as `dry_run` |
   | Ancestry reaches a live session's PTY root or its worker process (pid and start identity, at most 128 parent links) | parent walk | `Session(X)` |
   | Linux, no ancestry match, the control group is inside session X's worker unit | control group | `Session(X)` |
   | Ancestry names X and the control group names another session | both | `Session(X)`; ancestry wins |
-  | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights; a shell a session spawned is `Session(X)` of its own tree |
+  | Ancestry reaches a `shell` runtime session X that no session spawned | session record | `OwnerShell(X)`: owner rights, including an unlimited `session.retention.sweep`; a shell a session spawned is `Session(X)` of its own tree |
   | The session X the caller belongs to runs a profile with `[rights] owner_equivalent = true` | profile file | `OwnerShell(X)`: owner rights |
   | None of the above while every live session has a worker identity or a control group placement: the owner's terminal, a service outside every session tree, a process that left its tree | | `Owner` |
-  | None of the above while a live session has no worker identity the daemon can place by pid or control group | | `Unattributed`: every checked mutation is refused with `unattributed_caller`, and the placement is not kept for the connection |
+  | None of the above while a live session has no worker identity the daemon can place by pid or control group | | `Unattributed`: every checked mutation is refused with `unattributed_caller` (including `session.retention.sweep` even as `dry_run`), and the placement is not kept for the connection |
 
   The daemon starts each session's worker itself, or reattaches a live one
   after a restart, so it knows the worker's pid and start identity before the

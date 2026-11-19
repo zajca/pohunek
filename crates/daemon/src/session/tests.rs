@@ -1816,7 +1816,7 @@ async fn the_shell_command_text_never_breaks_the_registry_or_the_snapshot_progra
 
 /// Returns the metadata store path inside a fresh private directory that is
 /// removed when the calling test thread ends.
-pub(super) fn temp_store_path(tag: &str) -> PathBuf {
+pub(crate) fn temp_store_path(tag: &str) -> PathBuf {
     crate::test_support::thread_scoped_dir(&format!("pohunek-session-{tag}-"))
         .join("metadata.jsonl")
 }
@@ -1843,7 +1843,7 @@ fn test_native_launch(kind: SessionRefKind) -> NativeSessionLaunch {
         .expect("valid test templates")
 }
 
-pub(super) fn temp_dir(tag: &str) -> PathBuf {
+pub(crate) fn temp_dir(tag: &str) -> PathBuf {
     let dir = temp_store_path(tag)
         .parent()
         .expect("store parent")
@@ -21565,7 +21565,7 @@ impl ProcessInspector for UnreadableCandidateHost {
 
 /// The shortest policy the validator accepts, so a backdated session ages out
 /// without the tests having to simulate a month of wall-clock time.
-fn sweep_policy() -> SessionRetentionPolicy {
+pub(crate) fn sweep_policy() -> SessionRetentionPolicy {
     SessionRetentionPolicy {
         enabled: true,
         sweep_interval_secs: 60,
@@ -21589,14 +21589,28 @@ fn backdated_stamp(age: time::Duration) -> String {
 
 /// Create a session that exits on its own, optionally on its own worktree.
 async fn exited_session(registry: &SessionRegistry, repo: Option<&PathBuf>) -> SessionInfo {
+    exited_session_on(registry, "shell", repo).await
+}
+
+/// Create a session that exits on its own with the `agent` profile, for
+/// registries whose host serves only named profiles.
+pub(crate) async fn exited_session_on(
+    registry: &SessionRegistry,
+    agent: &str,
+    repo: Option<&PathBuf>,
+) -> SessionInfo {
     let create = match repo {
         Some(repo) => SessionNewParams {
             cwd: None,
             repo: Some(repo.clone()),
             branch: Some(format!("feat/{}", uuid_like())),
+            agent: agent.to_owned(),
             ..params()
         },
-        None => params(),
+        None => SessionNewParams {
+            agent: agent.to_owned(),
+            ..params()
+        },
     };
     let created = registry.create(create).await.expect("create session");
     registry

@@ -405,7 +405,9 @@ the example above it launches `worker` and `review` and nothing else, and
 `session.resume` of one of its descendants relaunches only a listed profile. A
 request that names a profile outside the list is refused with
 `session_right_denied` (`reason=spawn_profile_not_allowed`). A preset has the
-rights of its parent profile.
+rights of its parent profile. `session.retention.sweep` from a session sweeps
+only its own subtree: a record outside it survives even when the policy
+selects it, and a named id outside it is not examined and not reported.
 
 The table is read from the profile file, never from a request, and an unknown
 key or an entry that is not a profile name is `invalid_profile`. A session
@@ -430,7 +432,8 @@ keeps the `[rights]` table of the file it replaces, because a profile
 definition carries none, and a preset cannot replace a profile that has one
 (`package_profile_unusable`). The profile files are still the owner's lever and,
 like every file of the same user, within reach of a same-user process that
-edits them directly. `plugin profile fold` does not read `[rights]`. A profile
+edits them directly. `plugin profile fold` reads `[rights]` like any other
+launch key: inputs whose tables differ cannot share a parent. A profile
 without the table has neither key.
 
 ## Launch options
@@ -567,8 +570,9 @@ holds it.
 
 `pohunek plugin profile fold <name> <name>... --into <parent> --dry-run`
 proposes such a family from existing profiles and writes nothing. The inputs
-must agree on every launch key but `args` and `[env]` and must not be presets
-or declare options. Each flag group of `args` that differs between them
+must agree on every launch key but `args` and `[env]`, `[rights]` included,
+and must not be presets or declare options. An equal `[rights]` table is
+carried to the proposed parent, because a preset takes its parent's rights. Each flag group of `args` that differs between them
 becomes an option named after the flag, with one choice per variant and
 `none` where an input lacks the flag; an `[env]` key whose value differs
 becomes an `env-<key>` option. The output is the parent profile text, one

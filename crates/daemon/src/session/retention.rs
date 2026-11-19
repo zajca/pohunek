@@ -17,7 +17,7 @@ use std::{
 
 use pohunek_platform::filesystem::{FsError, TrustedDir};
 use protocol::{
-    ErrorClass, ProtocolError, RuntimeState, SessionInfo, SessionRetentionCandidate,
+    ErrorClass, ProtocolError, RuntimeState, SessionId, SessionInfo, SessionRetentionCandidate,
     SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
     SessionRetentionResult,
 };
@@ -110,6 +110,13 @@ impl SessionRegistry {
             .clone()
     }
 
+    /// The mutable retention policy, for tests that inject the operator's
+    /// policy without a policy file.
+    #[cfg(test)]
+    pub(crate) fn retention_policy_mut(&self) -> &std::sync::RwLock<SessionRetentionPolicy> {
+        &self.inner.retention.policy
+    }
+
     /// Loads the durable retention policy into the registry.
     ///
     /// A missing document yields the documented default. Call this once at
@@ -145,7 +152,26 @@ impl SessionRegistry {
         &self,
         params: &SessionRetentionParams,
     ) -> Result<SessionRetentionResult, ProtocolError> {
-        self.sweep_retention_at(params, OffsetDateTime::now_utc())
+        self.sweep_retention_as(params, None).await
+    }
+
+    /// Runs one retention sweep against the current policy for `caller`: a
+    /// `Some(_)` caller sweeps only its own strict subtree, so a record
+    /// outside it survives even when the policy selects it. An explicit
+    /// `session_ids` entry outside the subtree is not examined and not
+    /// reported, like an unknown id. `None` sweeps with owner rights.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProtocolError`] only when the sweep itself cannot run; a
+    /// removal that fails is counted in [`SessionRetentionResult::failed`] and
+    /// leaves that session in place.
+    pub async fn sweep_retention_as(
+        &self,
+        params: &SessionRetentionParams,
+        caller: Option<&SessionId>,
+    ) -> Result<SessionRetentionResult, ProtocolError> {
+        self.sweep_retention_at(params, caller, OffsetDateTime::now_utc())
             .await
     }
 
@@ -161,12 +187,13 @@ impl SessionRegistry {
     pub(crate) async fn sweep_retention_at(
         &self,
         params: &SessionRetentionParams,
+        caller: Option<&SessionId>,
         now: OffsetDateTime,
     ) -> Result<SessionRetentionResult, ProtocolError> {
         let _guard = self.inner.retention.sweep_lock.lock().await;
         let policy = self.retention_policy();
         let sessions = self.list_raw().await;
-        let selected = select_subset(&sessions, params)?;
+        let selected = select_subset(&sessions, params, caller)?;
         let examined = count(selected.iter());
         let mut candidates = select_candidates(&selected, &policy, now);
         self.apply_worktree_holds(&mut candidates).await;
@@ -456,15 +483,23 @@ fn count<T>(items: impl Iterator<Item = T>) -> u32 {
 /// by the caller. No selector keeps every session; the daemon is the single
 /// place that resolves what `spawned_by` matches, so a child is recognized
 /// by the id alone and an orphan matches even when its parent is gone.
+///
+/// A `Session(_)` caller sweeps only its own subtree: without a selector
+/// every session outside it is dropped, and a selector keeps only the
+/// entries that are both selected and inside it. An entry skipped this way
+/// is not examined and not reported, like an unknown id.
 fn select_subset(
     sessions: &[SessionInfo],
     params: &SessionRetentionParams,
+    caller: Option<&SessionId>,
 ) -> Result<Vec<SessionInfo>, ProtocolError> {
-    match (&params.spawned_by, &params.session_ids) {
-        (Some(_), Some(_)) => Err(ProtocolError::bad_request(
-            "session.retention.sweep accepts either spawned_by or session_ids, never both",
-        )),
-        (Some(parent), None) => Ok(sessions
+    let selected = match (&params.spawned_by, &params.session_ids) {
+        (Some(_), Some(_)) => {
+            return Err(ProtocolError::bad_request(
+                "session.retention.sweep accepts either spawned_by or session_ids, never both",
+            ));
+        }
+        (Some(parent), None) => sessions
             .iter()
             .filter(|session| {
                 session
@@ -473,7 +508,7 @@ fn select_subset(
                     .is_some_and(|origin| &origin.session_id == parent)
             })
             .cloned()
-            .collect()),
+            .collect(),
         (None, Some(ids)) => {
             if ids.is_empty() || ids.len() > protocol::MAX_RETENTION_SELECTOR_IDS {
                 return Err(ProtocolError::bad_request(format!(
@@ -482,14 +517,24 @@ fn select_subset(
                     ids.len()
                 )));
             }
-            Ok(sessions
+            sessions
                 .iter()
                 .filter(|session| ids.contains(&session.id))
                 .cloned()
-                .collect())
+                .collect()
         }
-        (None, None) => Ok(sessions.to_vec()),
-    }
+        (None, None) => sessions.to_vec(),
+    };
+    let Some(caller) = caller else {
+        return Ok(selected);
+    };
+    let lookup = |id: &SessionId| sessions.iter().find(|session| session.id == *id);
+    Ok(selected
+        .into_iter()
+        .filter(|session| {
+            session.id != *caller && super::rights::descends_from(lookup, &session.id, caller)
+        })
+        .collect())
 }
 
 /// Returns the rule that applies to `session` and the timestamp it ages from.
