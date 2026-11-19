@@ -723,8 +723,19 @@ fn login_row_keeps_a_pre_picker_record(mode: &[&str]) {
 /// theme picker; the capture refuses it and types nothing into it.
 #[test]
 fn an_account_scenario_refuses_the_first_run_theme_picker() {
+    refuses_the_first_run_theme_picker(&[]);
+}
+
+/// An `idle` record written with the picker does not make it the prompt: the
+/// account scenario still refuses the picker and types nothing into it.
+#[test]
+fn an_idle_record_with_the_picker_does_not_let_an_account_scenario_type() {
+    refuses_the_first_run_theme_picker(&["picker-record"]);
+}
+
+fn refuses_the_first_run_theme_picker(mode: &[&str]) {
     let capture = Capture::new();
-    let workdir = capture.workdir(&[]);
+    let workdir = capture.workdir(mode);
     let config = capture.env.cwd().join("fresh-config");
     std::fs::create_dir(&config).expect("mkdir");
     let release = capture.release_dir();

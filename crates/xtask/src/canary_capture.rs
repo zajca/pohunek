@@ -959,12 +959,13 @@ impl Driver<'_> {
                 return Ok(FirstScreen::Login);
             }
             // After the answer the picker stays until Claude redraws; the
-            // wait goes on for the screen that follows it.
-            // The key goes in once the session awaits owner action, the state
-            // in which only an attach may answer the dialog.
+            // wait goes on for the screen that follows it. The login scenario
+            // sends its key once the session awaits owner action, the state in
+            // which only an attach may answer the dialog; every other scenario
+            // refuses the picker as soon as it shows.
             if !theme_answered
                 && self.screen_rules.theme_picker.matches(&detection)
-                && activity.as_deref() == Some("blocked")
+                && (scenario != Scenario::LoginScreen || activity.as_deref() == Some("blocked"))
             {
                 return Ok(FirstScreen::Theme);
             }
