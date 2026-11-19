@@ -1569,3 +1569,76 @@ async fn inspect_runs_one_lookup_for_a_shared_shim() {
     );
     rig.finish().await;
 }
+
+/// A runtime program that records its argv in `argv.out`, announces
+/// readiness, then records the first line it reads from stdin in `stdin.out`.
+/// Each file is renamed into place so a reader never sees a partial write.
+const PROMPT_PROGRAM: &str = "#!/bin/sh\n\
+    printf '%s\\n' \"$@\" > argv.tmp; mv argv.tmp argv.out\n\
+    printf 'ready\\n'\n\
+    IFS= read -r line\n\
+    printf '%s\\n' \"$line\" > stdin.tmp; mv stdin.tmp stdin.out\n\
+    exec sleep 30\n";
+
+/// The first prompt of `session.new` reaches a `prompt_arg` runtime as its
+/// last argv element unless it starts with `-`; such a prompt is typed into
+/// the agent after readiness and never becomes an argv token an option
+/// parser could read as a flag.
+#[tokio::test]
+async fn a_first_prompt_starting_with_a_dash_is_typed_not_passed_as_an_option() {
+    let mut rig = OptionRig::start("agent-options-dash-prompt", true).await;
+    let program = rig.socket.dir.join("prompt-agent");
+    std::fs::write(&program, PROMPT_PROGRAM).expect("write the fixture runtime");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fixture runtime executable");
+    install_package(
+        &mut rig,
+        pi_package("", &program.display().to_string(), "", ""),
+    )
+    .await;
+
+    for (index, prompt) in ["--version", "-p x", "-- --version"]
+        .into_iter()
+        .enumerate()
+    {
+        let cwd = rig.socket.dir.join(format!("cwd-dash-{index}"));
+        std::fs::create_dir(&cwd).expect("create the session directory");
+        let mut params = selection_params("pi", &cwd, &[], None);
+        params.input = Some(prompt.to_owned());
+        ok_payload(create_session_with_params(&mut rig.control, params).await);
+
+        let launched = wait_until("the fixture runtime records its argv", || async {
+            std::fs::read_to_string(cwd.join("argv.out")).ok()
+        })
+        .await;
+        assert!(
+            launched.lines().all(|line| line != prompt),
+            "{prompt:?} reached the argv: {launched:?}"
+        );
+        let typed = wait_until("the fixture runtime records its stdin", || async {
+            std::fs::read_to_string(cwd.join("stdin.out")).ok()
+        })
+        .await;
+        assert_eq!(
+            typed,
+            format!("{prompt}\n"),
+            "{prompt:?} arrives as typed input"
+        );
+    }
+
+    let cwd = rig.socket.dir.join("cwd-dash-plain");
+    std::fs::create_dir(&cwd).expect("create the session directory");
+    let mut params = selection_params("pi", &cwd, &[], None);
+    params.input = Some("hello".to_owned());
+    ok_payload(create_session_with_params(&mut rig.control, params).await);
+    let launched = wait_until("the fixture runtime records its argv", || async {
+        std::fs::read_to_string(cwd.join("argv.out")).ok()
+    })
+    .await;
+    assert_eq!(
+        launched.lines().last(),
+        Some("hello"),
+        "a prompt without a leading dash stays the last argv element: {launched:?}"
+    );
+    rig.finish().await;
+}

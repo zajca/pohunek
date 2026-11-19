@@ -1983,7 +1983,7 @@ fn render_runtime_details(output: &mut String, runtime: &PackageRuntimeInfo) {
         output,
         "First prompt: {}",
         if runtime.prompt_argument {
-            "appended to the arguments"
+            "appended to the arguments, typed into the terminal when it starts with `-`"
         } else {
             "typed into the terminal"
         }
@@ -2620,7 +2620,7 @@ mod tests {
         for needle in [
             "Launch adds: [\"-c\", \"run \\u{1b}[31m\", \"{reference}\"]",
             "arguments: [\"--session\", \"{reference}\"]",
-            "First prompt: appended to the arguments",
+            "First prompt: appended to the arguments, typed into the terminal when it starts with `-`",
             "Version probe: probe",
             "acme.pi 1.0.0",
             DIGEST_A,
