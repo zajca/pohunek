@@ -13,13 +13,17 @@ use socket2::SockRef;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-/// Sets `TCP_NODELAY` on `stream` and logs the result.
+/// Sets `TCP_NODELAY` on `stream` and logs the value the kernel reports back.
 ///
 /// A failure is logged with the peer and the OS error and otherwise ignored:
-/// a connection without `TCP_NODELAY` still works, and refusing it would turn a
-/// socket-option error into an outage.
+/// a connection without `TCP_NODELAY` still works, and refusing it would turn
+/// a socket-option error into an outage. The log says which step failed,
+/// because the socket state differs: after a set error Nagle may still be on,
+/// after a read-back error the configured value is applied but could not be
+/// confirmed.
 pub(super) fn apply(stream: &TcpStream, peer: SocketAddr) {
-    if let Err(err) = SockRef::from(stream).set_tcp_nodelay(true) {
+    let socket = SockRef::from(stream);
+    if let Err(err) = socket.set_tcp_nodelay(true) {
         warn!(
             peer = %peer,
             error = %err,
@@ -28,5 +32,17 @@ pub(super) fn apply(stream: &TcpStream, peer: SocketAddr) {
         );
         return;
     }
-    debug!(peer = %peer, nodelay.enabled = true, "remote TCP_NODELAY applied");
+    match socket.tcp_nodelay() {
+        Ok(enabled) => debug!(
+            peer = %peer,
+            nodelay.enabled = enabled,
+            "remote TCP_NODELAY applied"
+        ),
+        Err(err) => warn!(
+            peer = %peer,
+            error = %err,
+            errno = err.raw_os_error(),
+            "remote TCP_NODELAY was set but reading the applied value back failed; the configured value is in effect"
+        ),
+    }
 }
