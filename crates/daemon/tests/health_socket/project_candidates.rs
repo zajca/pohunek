@@ -695,11 +695,10 @@ async fn history_directory_budget_counts_only_directories_the_walk_enters() {
 
 #[tokio::test]
 async fn a_directory_bigger_than_the_entry_budget_is_cut_and_reported() {
-    // The budget is far below the number of entries in one directory, so the
-    // listing must stop at the budget and report `entries`. An unbounded
-    // collect would list every entry first and report nothing (or only the
-    // later per-entry budget) — the assertion that `entries` is reported
-    // with at most `max_entries` candidates is what fails without the bound.
+    // The budget is far below the number of entries in one directory. The
+    // newest kept entries of the cut listing are still visited and `entries`
+    // is reported. The listing bound itself and the fd-relative open are
+    // guarded by the module tests in `crates/daemon/src/external/`.
     let mut rig = Rig::start_with("pcand-bigdir", |config| {
         config.candidates.max_entries = 2;
     })
@@ -739,41 +738,6 @@ async fn a_directory_bigger_than_the_entry_budget_is_cut_and_reported() {
     assert!(
         found.iter().any(|root| root.ends_with("h")),
         "the newest history file of a cut directory is still a candidate: {result}"
-    );
-    assert_documented_shape(&result);
-    rig.finish().await;
-}
-
-#[tokio::test]
-async fn an_intermediate_directory_swapped_for_a_symlink_is_not_followed() {
-    // The walk records the file below `proj`; before the read, `proj` is
-    // replaced by a symlink to a directory holding a decoy file. The read
-    // must not follow it, so the decoy repository is never proposed.
-    let mut rig = Rig::start("pcand-swap").await;
-    let home = rig.home_dir();
-    let work = home.join("work");
-    let real = make_repo(&rig.home, &work.join("real"), None);
-    let decoy = make_repo(&rig.home, &work.join("decoy"), None);
-    let path = |path: &Path| path.to_str().expect("utf-8 path").to_owned();
-    let proj = home.join(".claude/projects/-proj");
-    std::fs::create_dir_all(&proj).expect("create the project directory");
-    std::fs::write(proj.join("s.jsonl"), claude_user(&path(&real)) + "\n")
-        .expect("write the history file");
-    let outside = home.join("outside-history");
-    std::fs::create_dir_all(outside.join("-proj")).expect("create the outside tree");
-    std::fs::write(
-        outside.join("-proj/s.jsonl"),
-        claude_user(&path(&decoy)) + "\n",
-    )
-    .expect("write the decoy history file");
-    std::fs::remove_dir_all(&proj).expect("remove the real directory");
-    symlink(outside.join("-proj"), &proj).expect("swap in the symlink");
-    let result = rig
-        .candidates(serde_json::json!({ "sources": ["history"] }))
-        .await;
-    assert!(
-        !roots(&result).contains(&decoy),
-        "a swapped intermediate directory must not be followed: {result}"
     );
     assert_documented_shape(&result);
     rig.finish().await;
