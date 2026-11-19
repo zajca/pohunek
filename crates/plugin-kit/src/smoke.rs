@@ -52,26 +52,45 @@ pub struct SmokeReport {
     pub package_id: protocol::PackageId,
     /// Package version smoked.
     pub version: protocol::PackageVersion,
-    /// Activity the detector reported when the smoke stopped.
-    pub activity: AgentActivity,
-    /// Non-empty screen lines the smoke saw.
-    pub screen_lines: usize,
+    /// Activity the detector reported when the smoke stopped; absent for a
+    /// commands-only package, which starts no session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<AgentActivity>,
+    /// Non-empty screen lines the smoke saw; absent for a commands-only
+    /// package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screen_lines: Option<usize>,
+    /// Commands a commands-only package exports, each run once and exited 0;
+    /// empty for a runtime package.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<String>,
     /// Isolation root the smoke ran in, removed before the report.
     pub root: PathBuf,
 }
 
 impl SmokeReport {
     /// The single stdout line of a passing smoke:
-    /// `plugin smoke ok: <package_id> <version> <activity> <n> screen lines`.
+    /// `plugin smoke ok: <package_id> <version> <activity> <n> screen lines`
+    /// for a runtime package,
+    /// `plugin smoke ok: <package_id> <version> commands <n> commands run`
+    /// for a commands-only package.
     #[must_use]
     pub fn line(&self) -> String {
-        format!(
-            "plugin smoke ok: {} {} {} {} screen lines",
-            self.package_id,
-            self.version,
-            activity_label(self.activity),
-            self.screen_lines
-        )
+        match (self.activity, self.screen_lines) {
+            (Some(activity), Some(screen_lines)) => format!(
+                "plugin smoke ok: {} {} {} {} screen lines",
+                self.package_id,
+                self.version,
+                activity_label(activity),
+                screen_lines
+            ),
+            _ => format!(
+                "plugin smoke ok: {} {} commands {} commands run",
+                self.package_id,
+                self.version,
+                self.commands.len()
+            ),
+        }
     }
 }
 
@@ -95,20 +114,40 @@ fn activity_label(activity: AgentActivity) -> &'static str {
 pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
     let bytes = build_bytes(&args.dir, &Limits::DEFAULT)?;
     let verified = package::read_archive(&bytes, &Limits::DEFAULT).map_err(Error::Package)?;
-    let (_package_id, version) = archive_package(&verified, &args.dir)?;
-    let identity = archive_identity(&verified, &args.dir)?;
+    let (package_id, version) = archive_package(&verified, &args.dir)?;
+    let commands = commands_only_exports(&verified, &args.dir)?;
+    if commands.is_some() && (args.upstream.is_some() || args.script.is_some()) {
+        return Err(refuse(
+            "a commands-only package serves no runtime: --upstream and --script apply to a runtime package only",
+        ));
+    }
+    let identity = match commands {
+        Some(_) => None,
+        None => Some(archive_identity(&verified, &args.dir)?),
+    };
 
     let root = Root::create().map_err(Error::Usage)?;
     let path = root.path().to_path_buf();
-    let outcome = smoke_in(
-        &root,
-        &args.release_dir,
-        args.upstream.as_deref(),
-        args.script.as_deref(),
-        &bytes,
-        &identity,
-        &version,
-    );
+    let outcome = match (&identity, &commands) {
+        (Some(identity), _) => smoke_in(
+            &root,
+            &args.release_dir,
+            args.upstream.as_deref(),
+            args.script.as_deref(),
+            &bytes,
+            identity,
+            &version,
+        ),
+        (None, Some(commands)) => smoke_commands_in(
+            &root,
+            &args.release_dir,
+            &bytes,
+            &package_id,
+            &version,
+            commands,
+        ),
+        (None, None) => unreachable!("a package without an identity exports commands only"),
+    };
     let removal = root.remove().map_err(Error::Usage);
     // Every failure past this point names the used isolation root. The
     // removal ran on every path, so the named root is gone unless the
@@ -122,6 +161,33 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
         error: Box::new(error),
     })?;
     Ok(report)
+}
+
+/// The command names of a descriptor that exports commands and neither a
+/// runtime nor a context; `None` for any other shape.
+fn commands_only_exports(
+    verified: &package::VerifiedArchive,
+    archive: &Path,
+) -> Result<Option<Vec<String>>, Error> {
+    let descriptor = verified
+        .entries()
+        .iter()
+        .find(|entry| entry.path == crate::archive::DESCRIPTOR_PATH)
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "package archive `{}` has no `{}`",
+                archive.display(),
+                crate::archive::DESCRIPTOR_PATH
+            ))
+        })?;
+    let (_id, _version, table) = crate::archive::descriptor_package(&descriptor.contents)?;
+    if table.contains_key("runtime") || table.contains_key("context") {
+        return Ok(None);
+    }
+    Ok(table
+        .get("commands")
+        .and_then(toml::Value::as_table)
+        .map(|commands| commands.keys().cloned().collect()))
 }
 
 /// Steps on an existing root: trust, host, install, start, detect, screen,
@@ -182,10 +248,119 @@ fn smoke_in(
     Ok(SmokeReport {
         package_id: identity.package_id.clone(),
         version: version.clone(),
-        activity,
-        screen_lines,
+        activity: Some(activity),
+        screen_lines: Some(screen_lines),
+        commands: Vec::new(),
         root: root.path().to_path_buf(),
     })
+}
+
+/// Commands-only smoke on an existing root: an empty throwaway trust, an
+/// isolated daemon, an owner-trusted install of the archive by its digest, and
+/// one `host command run local` per exported command. Every command must exit
+/// 0 and the install must report the package enabled.
+fn smoke_commands_in(
+    root: &Root,
+    release_dir: &Path,
+    archive: &[u8],
+    package_id: &protocol::PackageId,
+    version: &protocol::PackageVersion,
+    commands: &[String],
+) -> Result<SmokeReport, Error> {
+    let digest = package::read_archive(archive, &Limits::DEFAULT)
+        .map_err(Error::Package)?
+        .digest()
+        .clone();
+    let trust = root.path().join("trust");
+    std::fs::create_dir_all(&trust).map_err(crate::files::io_error(&trust))?;
+    throwaway::write(&ThrowawayArgs {
+        entries: Vec::new(),
+        output: trust.clone(),
+        schema_version: package::INDEX_SCHEMA_VERSION,
+    })?;
+    let mut host = Host::prepare(
+        root,
+        release_dir,
+        &trust.join(crate::throwaway::ANCHOR_FILE),
+        &trust.join(package::INDEX_CHANNEL_FILE_NAME),
+    )
+    .map_err(Error::Usage)?;
+    host.launch_local_only(root).map_err(Error::Usage)?;
+    let ran = run_commands(&mut host, package_id, archive, &digest, commands);
+    let stop = host.stop().map_err(Error::Usage);
+    ran?;
+    stop?;
+    Ok(SmokeReport {
+        package_id: package_id.clone(),
+        version: version.clone(),
+        activity: None,
+        screen_lines: None,
+        commands: commands.to_vec(),
+        root: root.path().to_path_buf(),
+    })
+}
+
+/// Installs the archive under the owner's digest trust and runs every
+/// exported command once through the isolated CLI.
+fn run_commands(
+    host: &mut Host,
+    package_id: &protocol::PackageId,
+    archive: &[u8],
+    digest: &package::PackageDigest,
+    commands: &[String],
+) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = host.root().join("archives");
+    std::fs::create_dir_all(&directory).map_err(crate::files::io_error(&directory))?;
+    let archive_path = directory.join("package.tar.zst");
+    std::fs::write(&archive_path, archive)
+        .and_then(|()| {
+            std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o644))
+        })
+        .map_err(|error| refuse(format!("cannot write the archive copy: {error}")))?;
+    let archive_arg = archive_path.to_string_lossy();
+    let output = host
+        .cli(&[
+            "plugin",
+            "install",
+            &archive_arg,
+            "--sha256",
+            digest.as_str(),
+            "--yes",
+            "--json",
+        ])
+        .map_err(Error::Usage)?;
+    let installed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_error| refuse("`pohunek plugin install`: stdout is not one JSON document"))?;
+    if output.code != Some(0)
+        || installed["ok"]["package"]["digest"] != digest.as_str()
+        || installed["ok"]["package"]["enabled"] != true
+    {
+        return Err(refuse(
+            "the install did not report the archive as an enabled package",
+        ));
+    }
+    for command in commands {
+        let output = host
+            .cli(&[
+                "host",
+                "command",
+                "run",
+                "local",
+                package_id.as_str(),
+                command,
+            ])
+            .map_err(Error::Usage)?;
+        if output.code != Some(0) {
+            return Err(refuse(format!(
+                "the command `{command}` of `{package_id}` exited {}",
+                output
+                    .code
+                    .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Installs the archive under the throwaway trust, starts one session on the

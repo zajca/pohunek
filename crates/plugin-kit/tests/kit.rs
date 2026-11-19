@@ -1046,20 +1046,90 @@ fn kit_lint_refuses_a_package_with_neither_table() {
     );
 }
 
-#[test]
-fn kit_lint_refuses_a_commands_only_package() {
-    let kit = Kit::new();
-    let dir = kit.dir("commands-only");
+/// Package id of the commands-only packages the scenarios write.
+const COMMANDS_PACKAGE_ID: &str = "pohunek.commands.kitfixture";
+
+/// Writes a commands-only package named `name` below the kit's temp root: one
+/// command `host-state` running `bin/fleet-state` with `body` as its script.
+/// `extra_manifest` is appended to the descriptor.
+fn write_commands_package(
+    kit: &Kit,
+    name: &str,
+    requires: &str,
+    extra_manifest: &str,
+    body: &str,
+) -> PathBuf {
+    let dir = kit.dir(name);
     fs::write(
         dir.join("runtime.toml"),
-        "schema = 1\nid = \"pohunek.commands.kitfixture\"\nversion = \"0.1.0\"\nruntime_api = 1\nrequires = [\"package-commands-v1\"]\n\n[commands.host-state]\nprogram = \"bin/fleet-state\"\nargs = [\"--json\"]\nexpose = \"peers\"\n",
+        format!(
+            "schema = 1\nid = \"{COMMANDS_PACKAGE_ID}\"\nversion = \"{VERSION}\"\nruntime_api = 1\n{requires}\n[commands.host-state]\nprogram = \"bin/fleet-state\"\nargs = [\"--json\"]\nexpose = \"peers\"\n{extra_manifest}"
+        ),
     )
     .expect("write the commands-only manifest");
     let bin = dir.join("bin");
     fs::create_dir(&bin).expect("create the program directory");
     let program = bin.join("fleet-state");
-    fs::write(&program, "#!/bin/sh\necho ok\n").expect("write the program");
+    fs::write(&program, body).expect("write the program");
     make_executable(&program);
+    dir
+}
+
+const COMMANDS_REQUIRES: &str = "requires = [\"package-commands-v1\"]\n";
+
+#[test]
+fn kit_lint_passes_a_commands_only_package_and_reports_commands() {
+    let kit = Kit::new();
+    let dir = write_commands_package(
+        &kit,
+        "commands-only",
+        COMMANDS_REQUIRES,
+        "",
+        "#!/bin/sh\necho ok\n",
+    );
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert!(
+        output.status.success(),
+        "commands lint failed: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("utf-8 stdout"),
+        format!("plugin lint ok: {COMMANDS_PACKAGE_ID} {VERSION} commands\n")
+    );
+    let output = kit.kit(&["lint", "--dir", s(&dir), "--json"]);
+    assert!(
+        output.status.success(),
+        "commands lint --json failed: {}",
+        stderr_of(&output)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("lint --json reports JSON");
+    assert_eq!(report["kind"], Value::String("commands".to_owned()));
+    assert!(
+        report.get("runtime_id").is_none(),
+        "a commands lint names no runtime id: {report}"
+    );
+    let archive = kit.build(&dir, "commands-out");
+    let output = kit.kit(&[
+        "verify",
+        "--dir",
+        s(&dir),
+        "--archive",
+        s(&archive),
+        "--sha256",
+        &digest_of(&archive),
+    ]);
+    assert!(
+        output.status.success(),
+        "commands verify failed: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_commands_package_without_the_commands_feature() {
+    let kit = Kit::new();
+    let dir = write_commands_package(&kit, "commands-no-feature", "", "", "#!/bin/sh\necho ok\n");
     let output = kit.kit(&["lint", "--dir", s(&dir)]);
     assert_eq!(
         output.status.code(),
@@ -1068,8 +1138,155 @@ fn kit_lint_refuses_a_commands_only_package() {
         stderr_of(&output)
     );
     assert!(
-        stderr_of(&output).contains("commands only"),
-        "the refusal names commands-only: {}",
+        stderr_of(&output).contains("package-commands-v1"),
+        "the refusal names the missing feature: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_a_commands_package_with_a_missing_program() {
+    let kit = Kit::new();
+    let dir = write_commands_package(
+        &kit,
+        "commands-missing-program",
+        COMMANDS_REQUIRES,
+        "",
+        "#!/bin/sh\necho ok\n",
+    );
+    fs::remove_file(dir.join("bin/fleet-state")).expect("remove the program");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("package lint failed"),
+        "the refusal names lint: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_lint_refuses_commands_combined_with_a_context() {
+    let kit = Kit::new();
+    let dir = write_commands_package(
+        &kit,
+        "commands-and-context",
+        "requires = [\"package-commands-v1\", \"package-context-v1\"]\n",
+        "\n[context]\ndir = \"bundle\"\n",
+        "#!/bin/sh\necho ok\n",
+    );
+    fs::create_dir(dir.join("bundle")).expect("create the bundle");
+    fs::write(dir.join("bundle/note.md"), "note\n").expect("write a bundle file");
+    let output = kit.kit(&["lint", "--dir", s(&dir)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("cannot be combined"),
+        "the refusal names the combination: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn kit_smoke_runs_every_command_of_a_commands_only_package() {
+    let kit = Kit::new();
+    let release = release_dir();
+    let dir = write_commands_package(
+        &kit,
+        "commands-smoke",
+        COMMANDS_REQUIRES,
+        "",
+        "#!/bin/sh\necho fleet-ok\n",
+    );
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&dir),
+        "--release-dir",
+        s(&release),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "commands smoke failed: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(document["package_id"].as_str(), Some(COMMANDS_PACKAGE_ID));
+    assert_eq!(document["commands"], serde_json::json!(["host-state"]));
+    assert!(
+        document.get("activity").is_none() && document.get("screen_lines").is_none(),
+        "a commands smoke starts no session: {document:?}"
+    );
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_fails_when_a_command_exits_non_zero() {
+    let kit = Kit::new();
+    let release = release_dir();
+    let dir = write_commands_package(
+        &kit,
+        "commands-smoke-failing",
+        COMMANDS_REQUIRES,
+        "",
+        "#!/bin/sh\nexit 3\n",
+    );
+    let output = kit.kit(&["smoke", "--dir", s(&dir), "--release-dir", s(&release)]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("host-state"),
+        "the failure names the command: {}",
+        stderr_of(&output)
+    );
+    named_root(&output);
+}
+
+#[test]
+fn kit_smoke_refuses_runtime_only_inputs_for_a_commands_only_package() {
+    let kit = Kit::new();
+    let release = release_dir();
+    let dir = write_commands_package(
+        &kit,
+        "commands-smoke-script",
+        COMMANDS_REQUIRES,
+        "",
+        "#!/bin/sh\necho ok\n",
+    );
+    let script = kit.path("smoke-script.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write the script");
+    make_executable(&script);
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&dir),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("serves no runtime"),
+        "the refusal names the runtime-only input: {}",
         stderr_of(&output)
     );
 }

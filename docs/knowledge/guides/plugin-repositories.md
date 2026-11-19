@@ -92,22 +92,37 @@ Every row and target runs one job with `contents: read`, no secret and no
 cache restore (Linux on `ubuntu-24.04`, macOS on the pinned `macos-15` label):
 
 - lint of the descriptor or manifest against the core schema and the runtime
-  features it requires; a context package lints through the same
-  install-time descriptor loader and passes with
-  `plugin lint ok: <package_id> <version> context`;
+  features it requires; every kind lints through the same install-time
+  descriptor loader, and the lint line names the kind it saw: a runtime
+  package passes with `plugin lint ok: <package_id> <version> <runtime_id>`,
+  a context package with `... context` and a commands-only package with
+  `... commands`;
 - a reproducible double build of the archive with a byte compare, then
   verification;
 - the screen detection corpus for a runtime package (only when `corpus-dir`
-  is set; never for a context package: a caller that sets `corpus-dir` for
-  one fails);
-- a smoke run of the built package from the plugin kit, in an isolated root:
-  the generic smoke stops after the screen check and runs the optional
-  `smoke-script` on the same live isolated root only after every generic
-  check passed, so the plugin's own input
-  and hook-event checks see the exact host the generic smoke passed on.
-  A context package serves no runtime, so the smoke never runs for it: a
-  caller that sets `smoke-script` or `upstream-install` for one fails;
+  is set; never for a context or commands-only package: a caller that sets
+  `corpus-dir` for one fails);
+- a smoke run of the built package from the plugin kit, in an isolated root.
+  For a runtime package the generic smoke stops after the screen check and
+  runs the optional `smoke-script` on the same live isolated root only after
+  every generic check passed, so the plugin's own input and hook-event checks
+  see the exact host the generic smoke passed on. For a commands-only package
+  the smoke installs the archive on the isolated daemon by its digest and runs
+  every exported command once (`pohunek host command run local`); a command
+  that exits non-zero fails the smoke. A context package serves no runtime and
+  exports no command, so no smoke runs for it. A caller that sets
+  `smoke-script` or `upstream-install` for a context or commands-only package
+  fails with a named reason before the build, never a silent skip;
 - a version-bump check, so a changed archive carries a new version.
+
+What runs per kind:
+
+| Check | Runtime | Commands-only | Context |
+|---|---|---|---|
+| lint, double build, verify, version bump | runs | runs | runs |
+| detect-check (`corpus-dir`) | runs when set | input refused | input refused |
+| smoke | session start, screen check, `smoke-script` | install, every command run once | does not run |
+| `upstream-install`, `smoke-script` | run when set | input refused | input refused |
 
 A release is published on a version tag `vX.Y.Z` by the template's release
 workflow, which calls the reusable
@@ -181,12 +196,14 @@ index write, and 2 for every other refusal:
 - `lint` loads the descriptor through the same parser an install runs: a
   runtime package passes with
   `plugin lint ok: <package_id> <version> <runtime_id>`, a context package
-  with `plugin lint ok: <package_id> <version> context` (`--json` carries
-  `"kind": "runtime"` or `"kind": "context"`, with no `runtime_id`
-  for a context package). The kind is the `[context]` export the descriptor
-  carries, never merely the absence of a runtime: a commands-only package
-  fails with a named reason (the kit does not support commands-only
-  packages), and a package that exports neither fails with a named reason.
+  with `plugin lint ok: <package_id> <version> context` and a commands-only
+  package with `plugin lint ok: <package_id> <version> commands` (`--json`
+  carries `"kind": "runtime"`, `"kind": "context"` or `"kind": "commands"`,
+  with no `runtime_id` for the last two). The kind is the export the
+  descriptor carries, never merely the absence of a runtime: a package that
+  exports a context is `context`, one that exports commands without a runtime
+  or a context is `commands`, and one that exports none fails with a named
+  reason.
 - `build` writes the canonical archive like `xtask plugin build`.
 - `verify --archive <file> [--dir <package dir>] [--sha256 <digest>]`
   checks the archive rebuilds from the directory, twice, and matches the
@@ -200,7 +217,13 @@ index write, and 2 for every other refusal:
   installs the built package on an isolated daemon through a throwaway
   index, starts it, waits for detection past `unknown`, and requires a
   non-empty screen; then it stops and removes the session. The generic
-  smoke stops after the screen check: no full agent run. `--upstream` puts
+  smoke stops after the screen check: no full agent run. A commands-only
+  package starts no session: the smoke installs its archive with
+  `pohunek plugin install --sha256`, runs every exported command once with
+  `pohunek host command run local`, requires exit 0 from each, and reports
+  `plugin smoke ok: <package_id> <version> commands <n> commands run`
+  (`--json` carries `commands` instead of `activity` and `screen_lines`);
+  `--upstream` and `--script` are refused for it. `--upstream` puts
   a directory (or the directory of an executable) in front of the isolated
   daemon's `PATH`, so the runtime program resolves to the locked upstream
   install there. `--script` runs a plugin-owned executable once after every
