@@ -97,6 +97,10 @@ jobs:
   release:
     name: attest and publish the plugin archive
     needs: build
+    # The caller repository's `release` environment gates this job: its tag
+    # rules and reviewers apply to every plugin release. A calling job
+    # (`uses:`) cannot declare an environment, so it is declared here.
+    environment: release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     # This job runs no code of the plugin or of the core checkout: it only
