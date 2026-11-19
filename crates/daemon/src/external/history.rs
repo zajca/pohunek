@@ -377,6 +377,17 @@ fn validated_cwd(text: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Restores a directory's mode on drop so the tempdir can be removed even
+    /// when an assertion fails.
+    struct Restore(PathBuf);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     #[test]
     fn read_cwd_refuses_an_intermediate_symlink_component() {
         let dir = pohunek_test_support::tempdir().expect("fixture directory");
@@ -430,14 +441,6 @@ mod tests {
         std::fs::create_dir_all(root.join("proj")).expect("create the tree");
         std::fs::write(root.join("proj/s.jsonl"), "{\"cwd\":\"/work\"}\n")
             .expect("write history file");
-        /// Restores the mode so the tempdir can be removed even when an
-        /// assertion fails.
-        struct Restore(PathBuf);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
-            }
-        }
         let _restore = Restore(outer.clone());
         // Search without read permission on the ancestor above the history root.
         std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o300))
