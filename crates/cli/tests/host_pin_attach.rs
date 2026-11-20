@@ -87,7 +87,17 @@ struct Scene {
 impl Scene {
     /// `hold_streams` keeps every raw attach stream open until the client
     /// closes it; otherwise a stream closes right after its prelude.
+    /// `refuse_inspect_after_first_detach` answers the first post-detach
+    /// `session.inspect` with `session_not_found`: the session was removed
+    /// while the stream was down.
     fn new(hold_streams: bool) -> Self {
+        Self::with_removed_before_probe(hold_streams, false)
+    }
+
+    fn with_removed_before_probe(
+        hold_streams: bool,
+        refuse_inspect_after_first_detach: bool,
+    ) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let root = env.root().to_path_buf();
         for directory in ["run/pohunek", "state/pohunek", "config", "home"] {
@@ -119,7 +129,14 @@ impl Scene {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the fixture");
         let port = listener.local_addr().expect("fixture address").port();
         let served = Served::default();
-        serve(listener, Arc::clone(&served), hold_streams);
+        let inspect_refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        serve(
+            listener,
+            Arc::clone(&served),
+            hold_streams,
+            refuse_inspect_after_first_detach,
+            Arc::clone(&inspect_refused),
+        );
         Self {
             env,
             path,
@@ -154,18 +171,43 @@ impl Scene {
 /// Serves control requests and raw attach streams on `listener`.
 ///
 /// A raw attach stream closes right after its prelude, which the client takes
-/// as a lost stream; a `subscribe` request keeps its connection open.
-fn serve(listener: TcpListener, served: Served, hold_streams: bool) {
+/// as a lost stream; a `subscribe` request keeps its connection open. When
+/// `refuse_inspect_after_first_detach` holds, the first post-detach
+/// `session.inspect` is refused with `session_not_found` and counted in
+/// `inspect_refused`, so the scenario can assert the remote end of the
+/// removed-before-probe path.
+fn serve(
+    listener: TcpListener,
+    served: Served,
+    hold_streams: bool,
+    refuse_inspect_after_first_detach: bool,
+    inspect_refused: Arc<std::sync::atomic::AtomicBool>,
+) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = stream.expect("accept a fixture connection");
             let served = Arc::clone(&served);
-            thread::spawn(move || serve_connection(stream, &served, hold_streams));
+            let inspect_refused = Arc::clone(&inspect_refused);
+            thread::spawn(move || {
+                serve_connection(
+                    stream,
+                    &served,
+                    hold_streams,
+                    refuse_inspect_after_first_detach,
+                    &inspect_refused,
+                );
+            });
         }
     });
 }
 
-fn serve_connection(stream: TcpStream, served: &Served, hold_streams: bool) {
+fn serve_connection(
+    stream: TcpStream,
+    served: &Served,
+    hold_streams: bool,
+    refuse_inspect_after_first_detach: bool,
+    inspect_refused: &Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     loop {
@@ -190,6 +232,39 @@ fn serve_connection(stream: TcpStream, served: &Served, hold_streams: bool) {
             .lock()
             .expect("served requests")
             .push(request.method().to_owned());
+        let detached = served
+            .lock()
+            .expect("served requests")
+            .iter()
+            .any(|method| method == protocol::method::SESSION_DETACH);
+        if refuse_inspect_after_first_detach
+            && request.method() == protocol::method::SESSION_INSPECT
+            && detached
+            && !inspect_refused.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // The session was removed while the stream was down: refuse the
+            // first post-detach probe as a gone session at once, instead of
+            // reporting it running.
+            inspect_refused.store(true, std::sync::atomic::Ordering::SeqCst);
+            let response = Response::err(
+                PROTOCOL_VERSION,
+                request.id(),
+                protocol::ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "session_not_found",
+                    format!("session not found: {SESSION_ID}"),
+                    None,
+                ),
+            )
+            .expect("valid fixture response");
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::to_string(&response).expect("serialize the response")
+            )
+            .expect("write the fixture response");
+            continue;
+        }
         let response = Response::ok(PROTOCOL_VERSION, request.id(), result_for(&request))
             .expect("valid fixture response");
         writeln!(
@@ -245,6 +320,84 @@ fn result_for(request: &Request) -> Value {
         // Terminal resize and the like: acknowledged, and recorded by method.
         _ => json!({}),
     }
+}
+
+#[test]
+fn a_session_removed_before_the_reconnect_probe_ends_the_remote_attach() {
+    let scene = Scene::with_removed_before_probe(false, true);
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: TERMINAL_ROWS,
+            cols: TERMINAL_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open a pty");
+    let std_command = scene.command();
+    let mut command = CommandBuilder::new(std_command.get_program());
+    command.env_clear();
+    for (name, value) in std_command.get_envs() {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    for argument in std_command.get_args() {
+        command.arg(argument);
+    }
+    command.cwd(scene.env.cwd());
+    let mut child = pair.slave.spawn_command(command).expect("start the attach");
+    drop(pair.slave);
+    let (mut reader, writer) = (
+        pair.master.try_clone_reader().expect("pty reader"),
+        pair.master.take_writer().expect("pty writer"),
+    );
+    let mut output = Vec::new();
+    // Drop the writer only once the peer closes: closing it early would
+    // hang up the PTY while the attach still runs.
+    let reader_thread = thread::spawn(move || {
+        let writer = writer;
+        let mut buffer = [0_u8; 4096];
+        while let Ok(read) = std::io::Read::read(&mut reader, &mut buffer) {
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+        drop(writer);
+        output
+    });
+    // The stream closes right after its prelude; the client detaches and
+    // probes, and the fixture refuses the first post-detach probe with
+    // `session_not_found`. The attach must end at once with exit 0.
+    let status = poll_until("the remote attach to end", || {
+        child.try_wait().expect("poll the remote attach")
+    });
+    let output = reader_thread.join().expect("join the pty reader");
+    let output = String::from_utf8_lossy(&output).into_owned();
+    assert!(
+        status.success(),
+        "a removed session ends the remote attach with exit 0: {output:?}"
+    );
+    assert!(
+        output.contains(&format!(
+            "[pohunek] session {SESSION_ID} removed; attach ended"
+        )),
+        "the attach reports the removed session: {output:?}"
+    );
+    let served = scene.served();
+    let attaches = served
+        .iter()
+        .filter(|method| *method == protocol::method::SESSION_ATTACH)
+        .count();
+    assert_eq!(
+        attaches, 1,
+        "no re-attach is attempted after the removal: {served:?}"
+    );
+    let dialed = scene.dialed();
+    assert!(
+        dialed.iter().all(|ip| ip == FIRST_IP),
+        "no connection of the attach follows the name to the second peer: {dialed:?}"
+    );
 }
 
 #[test]

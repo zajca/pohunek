@@ -634,34 +634,19 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
                 // latter case fall through to the normal `StreamClosed`
                 // reconnect path below, where `reconnect.next` and
                 // `wait_for_attach_reconnect` apply the attempt limit,
-                // interval, and window.
+                // interval, and window. A retryable re-attach refusal
+                // (a draining daemon answered `daemon_shutting_down`
+                // between the probe and the re-attach) takes the same
+                // path: the tail below spends one attempt per refused
+                // re-attach, so the attempt limit and the window bound
+                // the retry.
                 if is_session_ended_refusal(&error) {
                     let ended = confirm_session_ended(host, paths, target).await?;
                     if ended {
                         return Ok(());
                     }
-                    AttachStreamEnd::StreamClosed
-                } else {
-                    // A retryable re-attach refusal (a draining daemon
-                    // answered `daemon_shutting_down` between the probe
-                    // and the re-attach): no stream was opened, so this
-                    // iteration holds no budget yet. Spend one attempt
-                    // now so the attempt limit and the window bound the
-                    // retry instead of looping free.
-                    if !spend_reattach_retry(
-                        &mut reconnect,
-                        &attach_config.reconnect,
-                        host,
-                        paths,
-                        target,
-                    )
-                    .await?
-                    {
-                        return Ok(());
-                    }
-                    debug_assert!(reattaching);
-                    continue;
                 }
+                AttachStreamEnd::StreamClosed
             }
             Err(error) => return Err(error),
         };
@@ -709,43 +694,6 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
                 );
                 return Ok(());
             }
-        }
-    }
-}
-
-/// Spends one reconnect attempt for a retryable re-attach refusal and
-/// waits out its delay: the refusal opened no stream, so the iteration
-/// below holds no budget yet. Returns whether the reconnect loop should
-/// continue (through a fresh `Reattach` probe).
-async fn spend_reattach_retry(
-    reconnect: &mut AttachReconnectBudget,
-    config: &AttachReconnectConfig,
-    host: &PinnedHost,
-    paths: &Paths,
-    target: &Target,
-) -> Result<bool, CliError> {
-    match reconnect.next(config, time::Instant::now()) {
-        AttachReconnectPermit::Retry { deadline, attempt } => {
-            if !wait_for_attach_reconnect(host, paths, target, config, deadline, attempt).await? {
-                return Ok(false);
-            }
-            Ok(true)
-        }
-        AttachReconnectPermit::Disabled => Ok(false),
-        AttachReconnectPermit::WindowExpired => {
-            eprintln!(
-                "[pohunek] attach reconnect window expired for session {}",
-                target.session_id
-            );
-            Ok(false)
-        }
-        AttachReconnectPermit::AttemptsExhausted => {
-            eprintln!(
-                "[pohunek] attach stream closed after {} automatic reattach attempts for \
-                 session {}; giving up",
-                config.max_attempts, target.session_id
-            );
-            Ok(false)
         }
     }
 }
@@ -2378,7 +2326,22 @@ async fn confirm_session_ended(
     paths: &Paths,
     target: &Target,
 ) -> Result<bool, CliError> {
-    let mut client = Client::connect_pinned(host, paths).await?;
+    let mut client = match Client::connect_pinned(host, paths).await {
+        Ok(client) => client,
+        Err(error)
+            if matches!(
+                reconnect_decision_from_error(&error),
+                AttachReconnectDecision::Retry
+            ) =>
+        {
+            // The daemon went away before the confirm connected: retry
+            // through the normal `StreamClosed` reconnect path below,
+            // where `reconnect.next` and `wait_for_attach_reconnect`
+            // apply the attempt limit, interval, and window.
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
     let request = build_inspect_request(target)?;
     match client.request(&request).await {
         Ok(result) => {
