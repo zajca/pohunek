@@ -43,6 +43,8 @@ from pathlib import Path
 
 CHECKOUT = Path(__file__).resolve().parents[1]
 CONFIG_IN_TREE = "scripts/ci-reuse.json"
+
+
 def _load_eligibility():
     # Only the module beside this script: a checkout always carries
     # scripts/ci_eligibility.py next to scripts/ci-reuse, and a copy
@@ -173,7 +175,7 @@ def commit_tree(sha: str) -> str:
     return result.stdout.strip()
 
 
-def _run_age(run: dict, completed_at, now: datetime.datetime) -> str:
+def _run_age(completed_at, now: datetime.datetime) -> str:
     """Age of a source leg for the summary, from its `completed_at` against
     the injected `now`, or empty when unknown; always shown, even below one
     hour (the usual case for a merge)."""
@@ -342,7 +344,7 @@ def decide(
     sha: str,
     repo: str,
     consumer_event: str,
-) -> tuple[list[str], dict | None, str, dict[str, str]]:
+) -> tuple[list[str], dict[str, dict], str, dict[str, str]]:
     """The skip list, the source run of each skipped job, a global reason, per-job reasons.
 
     Per job (issue #2204): the newest leg-complete `success` (not `skipped`)
@@ -364,7 +366,6 @@ def decide(
         key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
         reverse=True,
     )
-    skip: list[str] = []
     per_run_reasons: dict[str, str] = {}
     selected: dict[str, dict] = {}
     narrowed_by_run: dict[int, bool | None] = {}
@@ -482,7 +483,7 @@ def summarize(
         if job_id in skip and run is not None:
             age = ""
             if leg_completed and now is not None:
-                age = _run_age(run, leg_completed.get(job_id), now)
+                age = _run_age(leg_completed.get(job_id), now)
             link = f"[run {run['id']}]({run.get('html_url')}){age}"
             lines.append(f"| {job_id} | reused from {link} |")
         elif job_reasons and job_id in job_reasons:
@@ -523,7 +524,6 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     workflow_file = os.environ["WORKFLOW_FILE"]
     moment = now or datetime.datetime.now(datetime.timezone.utc)
     max_age = datetime.timedelta(hours=config["max_age_hours"])
-    reason = ""
     listed = True
     try:
         runs = list_runs(repo, workflow_file, moment, max_age)

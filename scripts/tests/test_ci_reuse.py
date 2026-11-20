@@ -651,9 +651,6 @@ else:
         self.assertIn("platform-contracts", skip)
         self.assertIn("hermes-compatibility-macos", skip)
 
-
-
-
     def test_a_push_reuses_a_pull_request_source_by_tree(self):
         # Push: the merge commit differs from the PR
         # head that tested the same tree. The source is on another commit

@@ -207,6 +207,9 @@ elif "/git/commits/" in endpoint:
     if sha in fixture.get("unknown_commits", []):
         print("gh: Not Found (HTTP 404)", file=sys.stderr)
         raise SystemExit(1)
+    if sha in fixture.get("malformed_commits", []):
+        print(json.dumps({"sha": sha, "tree": "not-an-object"}))
+        raise SystemExit(0)
     print(json.dumps({"sha": sha, "tree": {"sha": fixture.get("trees", {}).get(sha, "f" * 40)}}))
 elif "/commits" in endpoint:
     print(json.dumps([{"sha": fixture.get("resolved_ref")}]))
@@ -1410,6 +1413,10 @@ jobs:
             repo=REPO, head_repo=REPO,
         )
         fixture["artifacts"][str(OTHER_SOURCE)] = [f"tested-tree-{TREE}"]
+        for source_id in (REUSE_SOURCE_ID, OTHER_SOURCE):
+            fixture["runs_by_id"][str(source_id)]["html_url"] = (
+                f"https://ghe.example.test/o/r/actions/runs/{source_id}"
+            )
         source_jobs = jobs_page(overrides={"required check": "success"})
         second = [job for job in source_jobs["jobs"] if job["name"] == "required check"]
         fixture["jobs_by_run"][str(OTHER_SOURCE)] = {"jobs": second}
@@ -1424,6 +1431,29 @@ jobs:
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", text.stdout)
         self.assertIn(f"/actions/runs/{OTHER_SOURCE}", text.stdout)
+        # The report names each source by the URL the API returned for it.
+        for source_id in (REUSE_SOURCE_ID, OTHER_SOURCE):
+            url = f"https://ghe.example.test/o/r/actions/runs/{source_id}"
+            self.assertIn(url, text.stdout)
+            self.assertIn(url, report["reused_from"]["urls"])
+
+    def test_a_tree_lookup_bug_is_not_reported_as_a_lookup_refusal(self):
+        # A commits API answer the script cannot interpret is a bug, not a
+        # refused source: it must surface instead of reading as
+        # `tree lookup failed`.
+        OTHER = "b" * 40
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = run_doc(
+            sha=OTHER, event="push", branch="main",
+            run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+        )
+        fixture["malformed_commits"] = [OTHER]
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("tree lookup failed", result.stdout + result.stderr)
+        self.assertIn("AttributeError", result.stderr)
 
     def test_a_push_reuse_union_by_tree_accepts_a_source_on_another_commit(self):
         # A pull_request source whose head_sha differs from the push

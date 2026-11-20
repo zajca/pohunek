@@ -640,6 +640,7 @@ def verify_reuse(
             mismatch = eligibility.evidence_tree_match(
                 source, sha, tree,
                 lambda commit: commit_tree(repo, commit, cache),
+                (EvidenceError,),
             )
         else:
             # A dispatched delta run reuses the same commit (SHA). The
@@ -714,11 +715,6 @@ def verify_reuse(
                         f"source job {name} in {source_url} is older than "
                         f"{reuse['max_age_hours']}h (evidence {evidence_url})"
                     )
-                elif refusal.startswith("concluded"):
-                    failures.append(
-                        f"source job {name} in {source_url} {refusal} "
-                        f"(evidence {evidence_url})"
-                    )
                 else:
                     failures.append(
                         f"source job {name} in {source_url} {refusal} "
@@ -769,7 +765,7 @@ def verify_reuse(
     primary = runs_by_id.get(record["source_run_id"])
     primary_url = primary[1] if primary else "unknown"
     job_run = {job_id: record["jobs"][job_id]["run_id"] for job_id in record["jobs"]}
-    return reused, [], {"run_id": record["source_run_id"], "run_ids": source_ids, "url": primary_url, "jobs": sorted(record["jobs"]), "job_run": job_run}, alias
+    return reused, [], {"run_id": record["source_run_id"], "run_ids": source_ids, "url": primary_url, "urls": [runs_by_id[i][1] for i in source_ids if i in runs_by_id], "jobs": sorted(record["jobs"]), "job_run": job_run}, alias
 
 
 
@@ -777,9 +773,9 @@ def dispatch_runs(repo: str, config: dict[str, Any], tier: str) -> list[dict[str
     """Newest dispatch runs of `tier`, used only to find the run for a
     dispatch request. These are not reuse sources: same-repository is the
     only eligibility piece that applies here (a fork cannot dispatch this
-    workflow), and the tier marker picks the right lane."""
-    """Dispatch runs of `tier` in `repo` within the tree-match window, in any
-    state, newest first. Other events never supply evidence by tree."""
+    workflow), and the tier marker picks the right lane. The window is the
+    tree-match window, runs in any state count, newest first, and other
+    events never supply evidence by tree."""
     since = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(
         days=config["tree_match_max_age_days"]
     )
@@ -1186,11 +1182,7 @@ def main() -> int:
             detail = ""
             if result["match"] == "tree":
                 detail = f" by tree {result['tree']} (dispatch run on {result['run_sha']})"
-            source_urls = []
-            for run_id in reused_from.get("run_ids") or [reused_from.get("run_id")]:
-                if isinstance(run_id, int):
-                    source_urls.append(f"https://github.com/{args.repo}/actions/runs/{run_id}")
-            source_line = ", ".join(source_urls) or reused_from["url"]
+            source_line = ", ".join(reused_from["urls"]) or reused_from["url"]
             print(
                 f"ci-evidence: {args.tier} tier passed for {args.sha}{detail} "
                 f"by union of {result['url']} and {source_line}"

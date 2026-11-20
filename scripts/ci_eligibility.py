@@ -191,12 +191,15 @@ def evidence_commit_match(source: dict, sha: str) -> str | None:
     return f"has head SHA {source.get('head_sha')}, expected {sha}"
 
 
-def evidence_tree_match(source: dict, sha: str, tree: str, lookup) -> str | None:
+def evidence_tree_match(
+    source: dict, sha: str, tree: str, lookup, lookup_errors: tuple[type[Exception], ...]
+) -> str | None:
     """Why `source` does not answer a push consumer, or None when the
     source's tree is the evidence tree. A `pull_request` source is matched
     by its recorded tested tree (the caller compares it); any other event
     matches by commit or, via `lookup`, by the tree of its head commit. A
-    lookup failure names the cause instead of reading as a mismatch."""
+    lookup failure of a type in `lookup_errors` names the cause instead of
+    reading as a mismatch; any other exception is a bug and propagates."""
     if source.get("event") == "pull_request":
         return None  # the caller compares the recorded tree
     if source.get("head_sha") == sha:
@@ -206,7 +209,7 @@ def evidence_tree_match(source: dict, sha: str, tree: str, lookup) -> str | None
         return "has neither the commit nor the tree"
     try:
         source_tree = lookup(head_sha)
-    except Exception as error:
+    except lookup_errors as error:
         return f"tree lookup failed: {error}"
     if source_tree == tree:
         return None

@@ -23,6 +23,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -195,7 +196,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
                         help="owner/name (default: $GITHUB_REPOSITORY)")
     args = parser.parse_args(argv)
-    import re
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
         print("ci-reuse-junit: --repo is not in owner/name form", file=sys.stderr)
         return 1

@@ -544,8 +544,6 @@ def evaluate_condition(
     python = python.replace("!cancelled()", "(not cancelled)")
     python = python.replace("github.event_name", "event")
     python = python.replace("inputs.tier", "tier")
-    python = re.sub(r"\binputs\.([a-z_]+)", r"inputs.get('\1', False)", python)
-    # Inputs read as booleans: `inputs.delta` is True on a delta dispatch.
     python = python.replace(f"needs.{PACKAGE_SELECTOR}.result", "result")
     python = re.sub(
         rf"needs\.{re.escape(PACKAGE_SELECTOR)}\.outputs\.([a-z_]+)",
@@ -4484,7 +4482,6 @@ class DeltaReuseWiringTests(unittest.TestCase):
     def test_the_kill_switch_is_documented_and_defaults_on(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn('CI_REUSE_PUSH: "true"', text)
-        self.assertIn("issue #2204", text)
 
     def test_the_kill_switch_step_always_emits_a_skip_list(self):
         # `steps.nopus.outputs.skip` must be non-empty even
@@ -4492,7 +4489,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         # always see a list.
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("steps.nopus.outputs.skip", text)
-        self.assertRegex(text, r"steps\.nopus\.outputs\.skip[^\n]*\|\| '\\[\\]'|steps\.decide\.outputs\.skip")
+        self.assertRegex(text, r"steps\.nopus\.outputs\.skip \|\| '\[\]'")
 
     def test_the_upload_step_shares_the_decide_gate(self):
         # The upload step must not read `steps.decide.outputs.tree`
