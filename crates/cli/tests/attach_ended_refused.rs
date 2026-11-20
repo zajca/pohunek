@@ -348,8 +348,8 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
                 ],
                 // In mode ConfirmConnectRefused the first post-EOF probe
                 // answers `running` so the client decides `Reattach`; the
-                // confirm then fails to connect and every later probe
-                // fails the same way, so no confirming answer is queued.
+                // queued `stopped` is never reached, because after the
+                // refused re-attach no connection reaches the fixture.
                 Mode::ConfirmConnectRefused => vec![
                     InspectAnswer::State("running"),
                     InspectAnswer::State("stopped"),
