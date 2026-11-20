@@ -296,13 +296,18 @@ async fn a_worker_that_died_while_the_daemon_was_down_has_no_exit_evidence() {
 }
 
 /// #2440: the first request a restarted real daemon serves already sees
-/// every kept session. The listener binds only after startup reconciliation
-/// loads and reconciles the durable state, so a reconnect probe can never
-/// observe a transiently empty registry: `session_not_found` after a
-/// restart is permanent. The test restarts the real daemon through the
-/// native manager, waits for the first socket that serves a request, and
-/// carries both inspects over one raw connection with no session list in
-/// between; the resumed session keeps its id and terminal state.
+/// every kept session. The daemon serves requests only after startup
+/// reconciliation loads and reconciles the durable state, so a reconnect
+/// probe can never observe a transiently empty registry: `session_not_found`
+/// after a restart is permanent.
+///
+/// The test restarts the real daemon through the native manager without a
+/// `session.list` readiness poll: `restart_daemon_unready` waits only for
+/// the new job process and the previous process's exit, then a connect
+/// poll retries only connect errors until the first connection succeeds. The two `session.inspect`s are the
+/// first requests the new daemon serves. One session is a plain shell, the
+/// other a seeded resumable record with a resume binding; both keep their
+/// ids and post-reconcile states.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     target_os = "linux",
@@ -347,24 +352,53 @@ async fn the_first_inspect_after_a_restart_finds_every_kept_session() {
         .await
         .id
         .0;
-    let resumable = fixture
-        .new_session("restart-first-inspect-resumable")
-        .await
-        .id
-        .0;
-    stop_session(&fixture, &resumable).await;
-    // No `session.inspect` readiness poll runs before the restart: the
-    // restart below waits for the first socket that serves a request
-    // (`restart_daemon` serves a `session.list` over its own connection),
-    // and the raw connection that follows carries both inspects without
-    // an intervening list of its own.
-    let _restarted = fixture.restart_daemon().await;
-    let stream = tokio::net::UnixStream::connect(&fixture.paths.socket)
-        .await
-        .expect("the restarted daemon accepts one connection");
+    // A seeded resumable record, next to the plain shell session: it
+    // carries a resume binding, so startup reconciliation takes the
+    // binding-merge path for it. The store write lands directly; the
+    // daemon never created this record. The runtime stays `Live`: a
+    // `Lost` record with no worker is swept as unrecoverable, while a
+    // live one reconciles into `Lost` and keeps its id.
+    fixture.install_claude_package().await;
+    let resumable = "restart-first-inspect-resumable";
+    fixture.seed_record(
+        resumable,
+        pohunek_daemon::store::RuntimeRecord {
+            state: RuntimeState::Live,
+            worker_id: None,
+            worker_instance_id: None,
+            service_id: None,
+            generation: None,
+            executable: None,
+            reason: None,
+        },
+    );
+    stop_session(&fixture, &shell).await;
+    // `restart_daemon_unready` replaces the job and waits for the new
+    // job process and the previous process's exit, but serves no
+    // request: the connect poll below retries only connect errors
+    // through the harness wait helper, so the two inspects are the
+    // first requests the new daemon serves.
+    fixture.restart_daemon_unready().await;
+    let stream = eventually("the restarted daemon to accept a connection", || async {
+        match tokio::net::UnixStream::connect(&fixture.paths.socket).await {
+            Ok(stream) => Some(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                // The replacement job exists but has not bound its
+                // socket yet; only connect errors retry.
+                None
+            }
+            Err(error) => panic!("connect to the restarted daemon: {error}"),
+        }
+    })
+    .await;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    for id in [&shell, &resumable] {
+    for id in [&shell, resumable] {
         let inspected = inspect(&mut reader, &mut writer, id).await;
         assert_eq!(&inspected.id.0, id, "the kept session keeps its id");
         assert!(
@@ -372,10 +406,17 @@ async fn the_first_inspect_after_a_restart_finds_every_kept_session() {
             "the first connection after the restart serves the reconciled record: {inspected:?}"
         );
     }
+    drop(reader);
+    drop(writer);
     assert_eq!(
-        fixture.inspect(&resumable).await.state,
+        fixture.inspect(&shell).await.state,
         ProtocolSessionState::Stopped,
-        "the resumed session keeps its terminal state"
+        "the stopped shell keeps its terminal state"
+    );
+    assert_eq!(
+        fixture.inspect(resumable).await.id.0,
+        resumable,
+        "the lost resumable record reconciles and keeps its id"
     );
 }
 

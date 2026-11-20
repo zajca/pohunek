@@ -2358,12 +2358,17 @@ fn reconnect_decision_from_error(err: &CliError) -> AttachReconnectDecision {
             AttachReconnectDecision::Retry
         }
         CliError::Protocol(source) if source.code.as_str() == "session_not_found" => {
-            // The daemon binds its control socket only after it has loaded
-            // and reconciled its durable sessions, so a restarted daemon
+            // The daemon serves requests only after it has loaded and
+            // reconciled its durable sessions, so a restarted daemon
             // cannot answer `session_not_found` for a session that still
             // exists. The session is gone for good: end the attach at once
             // instead of retrying until the window expires.
             AttachReconnectDecision::Finish
+        }
+        CliError::Protocol(source) if source.code.as_str() == "daemon_shutting_down" => {
+            // The daemon is restarting or going away: keep retrying until
+            // the window expires instead of failing at once.
+            AttachReconnectDecision::Retry
         }
         CliError::Client(source)
             if matches!(
@@ -4029,6 +4034,16 @@ mod tests {
         assert_eq!(
             reconnect_decision_from_state(protocol::SessionState::Done),
             AttachReconnectDecision::Finish
+        );
+        let err = CliError::Protocol(protocol::ProtocolError::new(
+            protocol::ErrorClass::Runtime,
+            "daemon_shutting_down",
+            "the daemon is shutting down",
+            None,
+        ));
+        assert_eq!(
+            reconnect_decision_from_error(&err),
+            AttachReconnectDecision::Retry
         );
     }
 

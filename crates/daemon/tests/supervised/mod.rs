@@ -327,6 +327,32 @@ impl Installation {
         }
     }
 
+    /// Restarts only the daemon job and waits until the manager reports a
+    /// new job process and the previous process exits. Unlike
+    /// [`Self::restart_daemon`], it serves no request first: the caller's
+    /// first connection carries the first request the new daemon serves.
+    /// Waiting for the previous process (not a request) keeps the old
+    /// daemon from answering the first connection on its still-bound
+    /// socket.
+    pub(crate) async fn restart_daemon_unready(&self) -> ProcessIdentity {
+        let previous = self.daemon_process().await;
+        self.daemon
+            .replace(&self.daemon_definition())
+            .await
+            .expect("restart the daemon job");
+        let process = eventually("daemon job process", || async {
+            self.daemon
+                .inspect()
+                .await
+                .ok()
+                .and_then(|job| job.process)
+                .filter(|process| process != &previous)
+        })
+        .await;
+        self.wait_gone(previous, "previous daemon").await;
+        process
+    }
+
     /// Restarts only the daemon through the native manager.
     pub(crate) async fn restart_daemon(&self) -> ProcessIdentity {
         let previous = self.daemon_process().await;
