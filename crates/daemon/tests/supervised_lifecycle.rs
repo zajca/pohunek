@@ -45,8 +45,9 @@ use pohunek_worker_protocol::{
     ResponseKind,
 };
 use protocol::{
-    method, RuntimeState, SessionId, SessionInputParams, SessionResizeParams, SessionTurnEventKind,
-    SessionWaitTurnParams, SessionWaitTurnReason,
+    method, RuntimeState, SessionId, SessionInfo, SessionInputParams, SessionResizeParams,
+    SessionState as ProtocolSessionState, SessionTurnEventKind, SessionWaitTurnParams,
+    SessionWaitTurnReason,
 };
 use supervised::{
     backend, contains, counters, eventually, explained, loss_reason, read_until, runtime_state,
@@ -292,6 +293,90 @@ async fn a_worker_that_died_while_the_daemon_was_down_has_no_exit_evidence() {
         .runtime
         .expect("the lost session keeps its runtime");
     assert_eq!(runtime.exit, None, "nothing watched the worker's end");
+}
+
+/// #2440: the first request a restarted real daemon serves already sees
+/// every kept session. The listener binds only after startup reconciliation
+/// loads and reconciles the durable state, so a reconnect probe can never
+/// observe a transiently empty registry: `session_not_found` after a
+/// restart is permanent. The test restarts the real daemon through the
+/// native manager, waits for the first socket that serves a request, and
+/// carries both inspects over one raw connection with no session list in
+/// between; the resumed session keeps its id and terminal state.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+async fn the_first_inspect_after_a_restart_finds_every_kept_session() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    async fn inspect(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        session_id: &str,
+    ) -> SessionInfo {
+        let request = protocol::Request::new(
+            "restart-first-inspect",
+            protocol::method::SESSION_INSPECT,
+            serde_json::to_value(protocol::SessionId(session_id.to_owned())).expect("session id"),
+        )
+        .expect("inspect request");
+        let line = serde_json::to_string(&request).expect("serialize request");
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .expect("send inspect");
+        writer.write_all(b"\n").await.expect("send inspect");
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.expect("read inspect");
+        let response: protocol::Response =
+            serde_json::from_str(reply.trim_end()).expect("parse inspect");
+        serde_json::from_value(
+            response
+                .into_result()
+                .unwrap_or_else(|error| panic!("first connection inspects {session_id}: {error}")),
+        )
+        .expect("the restarted daemon inspects the kept session")
+    }
+
+    let fixture = Installation::new(Settings::default()).await;
+    fixture.start_daemon().await;
+    let shell = fixture
+        .new_session("restart-first-inspect-shell")
+        .await
+        .id
+        .0;
+    let resumable = fixture
+        .new_session("restart-first-inspect-resumable")
+        .await
+        .id
+        .0;
+    stop_session(&fixture, &resumable).await;
+    // No `session.inspect` readiness poll runs before the restart: the
+    // restart below waits for the first socket that serves a request
+    // (`restart_daemon` serves a `session.list` over its own connection),
+    // and the raw connection that follows carries both inspects without
+    // an intervening list of its own.
+    let _restarted = fixture.restart_daemon().await;
+    let stream = tokio::net::UnixStream::connect(&fixture.paths.socket)
+        .await
+        .expect("the restarted daemon accepts one connection");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    for id in [&shell, &resumable] {
+        let inspected = inspect(&mut reader, &mut writer, id).await;
+        assert_eq!(&inspected.id.0, id, "the kept session keeps its id");
+        assert!(
+            !matches!(inspected.state, ProtocolSessionState::Starting),
+            "the first connection after the restart serves the reconciled record: {inspected:?}"
+        );
+    }
+    assert_eq!(
+        fixture.inspect(&resumable).await.state,
+        ProtocolSessionState::Stopped,
+        "the resumed session keeps its terminal state"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1770,35 +1770,3 @@ async fn a_one_word_first_prompt_is_typed_not_dispatched_as_a_subcommand() {
     }
     rig.finish().await;
 }
-
-/// #2440: the first connection served after a restart already sees every
-/// kept session. The listener binds only after startup reconciliation
-/// loaded and reconciled the durable state, so a reconnect probe can never
-/// observe a transiently empty registry: `session_not_found` after a
-/// restart is permanent.
-#[tokio::test]
-async fn the_first_inspect_after_a_restart_finds_every_kept_session() {
-    let (mut rig, _digest) = resumable_rig("agent-options-restart-first-inspect").await;
-    let (resumable, _cwd) = stopped_bold_session(&mut rig).await;
-    rig.write_profile("plain", RECORDING_HEAD);
-    let (shell, _shell_cwd) = rig.create("plain").await;
-    let shell: SessionInfo =
-        serde_json::from_value(ok_payload(shell)).expect("the shell session info");
-    let mut rig = rig.restarted().await;
-    for id in [&resumable.id, &shell.id] {
-        let request = Request::make(
-            "agent-options-restart-first-inspect",
-            method::SESSION_INSPECT,
-            serde_json::to_value(id).expect("serialize session id"),
-        );
-        let inspected: SessionInfo =
-            serde_json::from_value(ok_payload(exchange(&mut rig.control, &request).await))
-                .expect("the restarted daemon inspects the kept session");
-        assert_eq!(&inspected.id, id, "the kept session keeps its id");
-        assert!(
-            !matches!(inspected.state, SessionState::Starting),
-            "the first connection after the restart serves the reconciled record: {inspected:?}"
-        );
-    }
-    rig.finish().await;
-}

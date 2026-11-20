@@ -4017,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_reconnect_decision_retries_only_live_or_temporarily_missing_sessions() {
+    fn attach_reconnect_decision_from_probe_state() {
         assert_eq!(
             reconnect_decision_from_state(protocol::SessionState::Running),
             AttachReconnectDecision::Reattach
@@ -4028,22 +4028,6 @@ mod tests {
         );
         assert_eq!(
             reconnect_decision_from_state(protocol::SessionState::Done),
-            AttachReconnectDecision::Finish
-        );
-
-        // A `session_not_found` from the reconnect probe is permanent: the
-        // daemon binds its socket only after loading and reconciling its
-        // durable sessions, so a restarted daemon cannot miss a session
-        // that still exists. The attach ends at once instead of retrying
-        // until the window expires.
-        let missing = protocol::ProtocolError::new(
-            protocol::ErrorClass::Runtime,
-            "session_not_found",
-            "session removed while the attach waited to reconnect",
-            None,
-        );
-        assert_eq!(
-            reconnect_decision_from_error(&CliError::Protocol(missing)),
             AttachReconnectDecision::Finish
         );
     }
