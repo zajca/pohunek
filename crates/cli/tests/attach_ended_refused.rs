@@ -354,7 +354,10 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
     if !matches!(mode, Mode::RefuseFirstAttach) {
         // The client attaches and opens the subscription before the
         // reconnect path is armed; wait for that round-trip to settle so the
-        // kill is not raced with setup.
+        // kill is not raced with setup. The client fails fast when the
+        // socket path has nobody listening, so the attach ID alone only
+        // proves that settling: an attach with no subscription yet was
+        // rejected before reaching the fixture.
         poll_until("the fixture to serve the attach and subscription", || {
             fixture
                 .methods()
@@ -421,23 +424,39 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
     )
 }
 
-/// Serves the fixture daemon on `socket`. Restart modes (`RestartAndResume`
-/// and `RemovedDuringRestart`) drop the first `restart_connects` accepted
-/// probe connections after the first detach without a reply: the client
-/// reads EOF at once, which the transport reports as `framing` (a
-/// `Retry`), as a killed daemon does. The fixture then answers once the
-/// scripted post-EOF answers say the replacement daemon is back.
+/// Starts the fixture listener thread and returns once it owns the socket
+/// path: no client request can arrive before the fixture is ready to
+/// answer it.
 fn serve_fixture_daemon(socket: &Path, fixture: &Fixture) {
+    let (ready, waiter) = std::sync::mpsc::channel::<std::io::Result<()>>();
     let fixture = fixture.clone();
     let socket = socket.to_path_buf();
-    thread::spawn(move || {
-        serve_on_listener(&socket, &fixture);
+    thread::spawn(move || match UnixListener::bind(&socket) {
+        Ok(listener) => {
+            let _ignored = ready.send(Ok(()));
+            serve_on_listener(listener, &fixture);
+        }
+        Err(error) => {
+            let _ignored = ready.send(Err(error));
+        }
     });
+    // The fixture process shares no other gate with the client, so a
+    // failed listener bind must surface here, before the client races a
+    // socket path with nobody listening on it.
+    waiter
+        .recv()
+        .expect("the fixture listener thread starts")
+        .expect("bind the fixture daemon");
 }
 
-/// Accept loop of the fixture listener.
-fn serve_on_listener(socket: &Path, fixture: &Fixture) {
-    let listener = UnixListener::bind(socket).expect("bind the fixture daemon");
+/// Accept loop of the pre-bound fixture listener: every accepted stream is
+/// already connected, so the client can never send a request that lands on
+/// a socket path with nobody listening.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the listener is moved in from the single bind of serve_fixture_daemon"
+)]
+fn serve_on_listener(listener: UnixListener, fixture: &Fixture) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { return };
         let fixture = fixture.clone();
