@@ -4059,7 +4059,7 @@ async fn codex_captured_startup_dialog(
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
-    let (deadline_hold, release_deadline) = arm_readiness_deadline_hold(&mut config);
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -4094,7 +4094,7 @@ async fn codex_captured_startup_dialog(
     assert_eq!(published.payload()["source"], Value::from("screen"));
     // The verdict landed with no deadline running; release the hold so the
     // held grace decides the refused create.
-    deadline_hold.release(&release_deadline);
+    deadline_hold.release();
 
     if let Some(release) = release {
         assert!(
@@ -4103,9 +4103,13 @@ async fn codex_captured_startup_dialog(
         );
         let (mut barrier, _) = release.accept().await.expect("runtime awaits dismissal");
         barrier.write_all(b"release").await.expect("dismiss dialog");
-        let created: SessionInfo =
-            serde_json::from_value(ok_payload(create.await.expect("create task joins")))
-                .expect("created session");
+        let created: SessionInfo = serde_json::from_value(ok_payload(
+            tokio::time::timeout(HANG_GUARD, create)
+                .await
+                .expect("the dismissed create answers before the hang guard")
+                .expect("create task joins"),
+        ))
+        .expect("created session");
         assert_codex_input_delivered_once(&received).await;
         let mut observer = connect(&socket).await;
         let request = Request::make(
@@ -4117,7 +4121,12 @@ async fn codex_captured_startup_dialog(
             serde_json::from_value(ok_payload(exchange(&mut observer, &request).await))
                 .expect("stop session");
     } else {
-        let error = err_payload(create.await.expect("create task joins"));
+        let error = err_payload(
+            tokio::time::timeout(HANG_GUARD, create)
+                .await
+                .expect("the refused create answers before the hang guard")
+                .expect("create task joins"),
+        );
         assert_eq!(error.code, "session_input_not_ready");
 
         let mut observer = connect(&socket).await;
@@ -4636,16 +4645,24 @@ const KEPT_PROMPT_DRAIN: Duration = Duration::from_millis(750);
 /// arrives exactly once.
 #[tokio::test]
 async fn claude_kept_session_blocked_dialog_defers_the_prompt() {
-    assert_kept_session_defers_the_prompt("claude-keep", None).await;
+    Box::pin(assert_kept_session_defers_the_prompt("claude-keep", None)).await;
 }
 
 /// The same keep with `input_ack_timeout_ms` set: the acknowledged write is
 /// the only write, so the prompt still reaches the agent exactly once.
 #[tokio::test]
 async fn claude_kept_session_with_ack_timeout_defers_the_prompt_once() {
-    assert_kept_session_defers_the_prompt("claude-keep-ack", Some(2_000)).await;
+    Box::pin(assert_kept_session_defers_the_prompt(
+        "claude-keep-ack",
+        Some(2_000),
+    ))
+    .await;
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one held create plus the replay, delivery, and exact-once arms in one scenario."
+)]
 async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: Option<u32>) {
     let socket = temp_socket(tag);
     let agents_dir = socket.dir.join("agents");
@@ -4655,13 +4672,14 @@ async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: 
     let script = socket.dir.join("claude-keep.py");
     write_claude_trust_stub(&script, &log, &gate);
     write_claude_profile(&agents_dir, "claudekeep", &script);
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         store_path: Some(socket.dir.join("metadata.jsonl")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let mut subscriber = connect(&socket).await;
@@ -4674,18 +4692,40 @@ async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: 
     params.input = Some("hello Claude".to_owned());
     params.input_ack_timeout_ms = input_ack_timeout_ms;
     params.client_request_id = Some(format!("{tag}-request"));
-    // The dialog classifies as blocked quickly; the grace (8s) then expires
-    // while it still holds the screen, so the call returns the kept session
-    // instead of `session_input_not_ready`.
-    let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params.clone()).await,
-    ))
-    .expect("kept claude session info");
+    let created: SessionNewResult = {
+        let create =
+            tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+        let published = wait_for_any_agent_state_event(
+            &mut subscriber,
+            AgentActivity::Blocked,
+            StateSource::Screen,
+        )
+        .await;
+        assert_eq!(published.payload()["activity"], Value::from("blocked"));
+        // The verdict landed with no deadline running; release the hold so the
+        // held grace expires while the dialog still holds the screen, and the
+        // call returns the kept session instead of `session_input_not_ready`.
+        deadline_hold.release();
+        serde_json::from_value(ok_payload(
+            tokio::time::timeout(HANG_GUARD, create)
+                .await
+                .expect("the kept create answers before the hang guard")
+                .expect("create task joins"),
+        ))
+        .expect("kept claude session info")
+    };
     assert_eq!(created.prompt_delivered, Some(false));
     // The kept create is a settled session: replaying its request id
-    // returns it instead of `session_request_in_progress`.
+    // returns it instead of `session_request_in_progress`. A second create
+    // in the armed registry skips the take-once hold.
+    let mut control = connect(&socket).await;
+    let mut replay_params = session_params(&socket);
+    "claudekeep".clone_into(&mut replay_params.agent);
+    replay_params.input = Some("hello Claude".to_owned());
+    replay_params.input_ack_timeout_ms = input_ack_timeout_ms;
+    replay_params.client_request_id = Some(format!("{tag}-request"));
     let replayed: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        create_session_with_params(&mut control, replay_params).await,
     ))
     .expect("replay of the kept create");
     assert_eq!(replayed.replayed, Some(true), "{replayed:?}");
@@ -4751,6 +4791,7 @@ async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: 
     let _: SessionStopResult =
         serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
             .expect("stop result");
+    drop(subscriber);
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -4809,20 +4850,44 @@ async fn claude_kept_session_answered_dialog_alone_delivers_nothing() {
     let script = socket.dir.join("claude-keep-answered.py");
     write_claude_trust_stub_no_box(&script, &log, &gate);
     write_claude_profile(&agents_dir, "claudekeepanswered", &script);
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-claude-keep-answered",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     "claudekeepanswered".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = wait_for_any_agent_state_event(
+        &mut subscriber,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace keeps the session while the dialog holds the screen.
+    deadline_hold.release();
+    let mut control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
     ))
     .expect("kept claude session info");
     assert_eq!(
@@ -4870,6 +4935,7 @@ async fn claude_kept_session_answered_dialog_alone_delivers_nothing() {
         !steps.contains("hello Claude"),
         "the discarded prompt never reaches the agent: {steps:?}"
     );
+    drop(subscriber);
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -4904,22 +4970,47 @@ async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
     let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-kar-")
         .expect("create the restart worker home");
     let worker_home = worker_home_guard.path().to_path_buf();
+    let mut first_config = config();
+    let first_hold = arm_readiness_deadline_hold(&mut first_config);
     let first = serve_official_runtimes_at(
         &socket,
         "0.0.0",
-        config(),
+        first_config,
         support::hermetic_environment_source(),
         true,
         &worker_home,
         None,
     )
     .await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-claude-keep-answered-restart",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     "claudekeepansweredrestart".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = wait_for_any_agent_state_event(
+        &mut subscriber,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace keeps the session while the dialog holds the screen.
+    first_hold.release();
+    let control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
     ))
     .expect("kept claude session info");
     assert_eq!(
@@ -4932,6 +5023,7 @@ async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
     );
     std::fs::write(&gate, b"go").expect("open the gate");
     read_file_until(&log, b"gate").await;
+    drop(subscriber);
     drop(control);
     let ServedRegistry {
         registry: first_registry,
@@ -4992,6 +5084,10 @@ async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
 /// A restart with no worker left drops the deferred text but keeps the
 /// record: the kept create committed, so the dead worker is not an
 /// uncommitted create and reconciliation never compensates it away.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart scenario owns both daemons and their shutdown inline"
+)]
 #[tokio::test]
 async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
     let socket = temp_socket("claude-keep-deadworker");
@@ -5014,24 +5110,50 @@ async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
     let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-kdw-")
         .expect("create the restart worker home");
     let worker_home = worker_home_guard.path().to_path_buf();
+    let mut first_config = config();
+    let first_hold = arm_readiness_deadline_hold(&mut first_config);
     let first = serve_official_runtimes_at(
         &socket,
         "0.0.0",
-        config(),
+        first_config,
         support::hermetic_environment_source(),
         true,
         &worker_home,
         None,
     )
     .await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-claude-keep-deadworker",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     "claudekeepdeadworker".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = wait_for_any_agent_state_event(
+        &mut subscriber,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace keeps the session while the dialog holds the screen.
+    first_hold.release();
+    let control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
     ))
     .expect("kept claude session info");
+    drop(subscriber);
     drop(control);
     let ServedRegistry {
         registry: first_registry,
@@ -5094,6 +5216,10 @@ async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
 /// A stopped kept session survives a daemon restart as a stopped record:
 /// the kept create committed, so the deferred marker is not an
 /// uncommitted create and reconciliation never compensates it away.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restart scenario owns both daemons and their shutdown inline"
+)]
 #[tokio::test]
 async fn claude_kept_session_stopped_record_survives_restart() {
     let socket = temp_socket("claude-keep-stopped");
@@ -5116,22 +5242,47 @@ async fn claude_kept_session_stopped_record_survives_restart() {
     let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-ksr-")
         .expect("create the restart worker home");
     let worker_home = worker_home_guard.path().to_path_buf();
+    let mut first_config = config();
+    let first_hold = arm_readiness_deadline_hold(&mut first_config);
     let first = serve_official_runtimes_at(
         &socket,
         "0.0.0",
-        config(),
+        first_config,
         support::hermetic_environment_source(),
         true,
         &worker_home,
         None,
     )
     .await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-claude-keep-stopped",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     "claudekeepstopped".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = wait_for_any_agent_state_event(
+        &mut subscriber,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace keeps the session while the dialog holds the screen.
+    first_hold.release();
+    let mut control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
     ))
     .expect("kept claude session info");
     let stop_req = Request::make(
@@ -5142,6 +5293,7 @@ async fn claude_kept_session_stopped_record_survives_restart() {
     let _: SessionStopResult =
         serde_json::from_value(ok_payload(exchange(&mut control, &stop_req).await))
             .expect("stop result");
+    drop(subscriber);
     drop(control);
     let ServedRegistry {
         registry: first_registry,
@@ -5199,20 +5351,40 @@ async fn claude_kept_session_stop_discards_the_deferred_prompt() {
     let script = socket.dir.join("claude-keep-stop.py");
     write_claude_trust_stub(&script, &log, &gate);
     write_claude_profile(&agents_dir, "claudekeepstop", &script);
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make("subscribe-claude-keep-stop", method::SUBSCRIBE, Value::Null);
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     "claudekeepstop".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = wait_for_any_agent_state_event(
+        &mut subscriber,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace keeps the session while the dialog holds the screen.
+    deadline_hold.release();
+    let mut control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
     ))
     .expect("kept claude session info");
     assert_eq!(
@@ -5287,25 +5459,48 @@ async fn claude_kept_session_restart_drops_the_deferred_prompt() {
     let worker_home_guard = pohunek_test_support::tempdir_with_prefix("pw-kr-")
         .expect("create the restart worker home");
     let worker_home = worker_home_guard.path().to_path_buf();
+    let mut first_config = config();
+    let first_hold = arm_readiness_deadline_hold(&mut first_config);
     let first = serve_official_runtimes_at(
         &socket,
         "0.0.0",
-        config(),
+        first_config,
         support::hermetic_environment_source(),
         true,
         &worker_home,
         None,
     )
     .await;
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-claude-keep-restart",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    assert!(exchange(&mut subscriber, &subscribe_req).await.is_ok());
     let mut control = connect(&socket).await;
     let mut params = session_params(&socket);
     "claudekeeprestart".clone_into(&mut params.agent);
     params.input = Some("hello Claude".to_owned());
-    // The dialog classifies as blocked quickly; the grace (8s) then expires
-    // while it still holds the screen, so the call returns the kept session
-    // instead of `session_input_not_ready`.
+    let create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let published = wait_for_any_agent_state_event(
+        &mut subscriber,
+        AgentActivity::Blocked,
+        StateSource::Screen,
+    )
+    .await;
+    assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace expires while the dialog still holds the screen, and the
+    // call returns the kept session instead of `session_input_not_ready`.
+    first_hold.release();
+    let control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
-        create_session_with_params(&mut control, params).await,
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
     ))
     .expect("kept claude session info");
     assert_eq!(
@@ -5335,6 +5530,7 @@ async fn claude_kept_session_restart_drops_the_deferred_prompt() {
     // it, so the restart below shuts the serving registry down (closing
     // its worker connection and releasing the controller lease) before
     // the new daemon reconciles: the production stop path.
+    drop(subscriber);
     drop(control);
     let ServedRegistry {
         registry: first_registry,
@@ -5907,11 +6103,10 @@ async fn codex_popup_is_refused(override_manifest: Option<&str>) {
     codex_popup_is_refused_inner(override_manifest, true).await;
 }
 
-/// `Some` documented popup-regression refusal verdict carries a daemon
-/// `Blocked`/`Screen` classification the parked create can wait for: the
-/// startup update popup. A profile override without idle evidence
-/// (`rules = []`) keeps Codex's strict policy but publishes no screen
-/// verdict, so that case refuses while the deadline runs and skips the hold.
+/// `hold_deadline` arms the readiness-deadline hold and waits for the
+/// popup's `Blocked`/`Screen` verdict before the deadline starts. The
+/// `rules = []` override publishes no screen verdict and refuses with
+/// either ordering, so it runs unheld.
 async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_deadline: bool) {
     let socket = temp_socket("codex-popup");
     let agents_dir = socket.dir.join("agents");
@@ -5949,7 +6144,7 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
     params.input = Some("hello Codex".to_owned());
     let create =
         tokio::spawn(async move { create_session_with_params(&mut control, params).await });
-    if let Some((deadline_hold, release_deadline)) = armed_deadline_hold {
+    if let Some(deadline_hold) = armed_deadline_hold {
         let published = wait_for_any_agent_state_event(
             &mut subscriber,
             AgentActivity::Blocked,
@@ -5960,9 +6155,14 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
         assert_eq!(published.payload()["source"], Value::from("screen"));
         // The verdict landed with no deadline running; release the hold so
         // the held grace decides the refused create.
-        deadline_hold.release(&release_deadline);
+        deadline_hold.release();
     }
-    let error = err_payload(create.await.expect("create task joins"));
+    let error = err_payload(
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the refused create answers before the hang guard")
+            .expect("create task joins"),
+    );
     assert_eq!(error.code, "session_input_not_ready");
 
     let mut observer = connect(&socket).await;
@@ -5985,10 +6185,10 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
 /// `source` for any session and returns it. The popup regressions run one
 /// session at a time and its create is still waiting for readiness when the
 /// popup is classified, so the event cannot name a session the test knows.
-/// The readiness deadline is held while this waits (see
-/// `arm_readiness_deadline_hold`): the verdict must land with no deadline
-/// running, so a late classification is a hang with a name instead of a
-/// `select!` timeout race.
+/// The readiness deadline stays parked while this waits (see
+/// `arm_readiness_deadline_hold`): the verdict lands with no deadline
+/// running, and a late classification fails at `HANG_GUARD` with the
+/// events seen.
 async fn wait_for_any_agent_state_event(
     framed: &mut Framed<UnixStream, LinesCodec>,
     activity: AgentActivity,
@@ -6026,24 +6226,22 @@ async fn wait_for_any_agent_state_event(
 }
 
 /// Arms the readiness-deadline hold of a popup-regression config: the
-/// first create parks before its deadline starts, the test waits for the
-/// classification with no deadline running, then releases the hold so the
-/// deadline decides. Returns the hold and its releaser; the test passes
-/// both to [`ReadinessDeadlineHold::release`] once the verdict it waits
-/// for is visible.
+/// first create with an initial input parks before its deadline starts,
+/// the test waits for the classification with no deadline running, then
+/// releases the hold so the deadline decides. Returns the hold; the test
+/// calls [`ReadinessDeadlineHold::release`] once the verdict it waits for
+/// is visible. Later creates skip the hold.
 #[cfg(feature = "test-util")]
 fn arm_readiness_deadline_hold(
     config: &mut SessionRegistryConfig,
-) -> (
-    pohunek_daemon::session::ReadinessDeadlineHold,
-    std::sync::Arc<tokio::sync::Notify>,
-) {
-    let (hold, release) = pohunek_daemon::session::ReadinessDeadlineHold::armed();
+) -> pohunek_daemon::session::ReadinessDeadlineHold {
+    let hold = pohunek_daemon::session::ReadinessDeadlineHold::armed();
     config.readiness_deadline_hold = Some(hold.clone());
-    (hold, release)
+    hold
 }
 
-/// The same refusal with a synthetic adversarial idle-looking terminal title — the measured popup set no title, so
+/// The same refusal with a synthetic adversarial idle-looking terminal title
+/// (`work`) set while the popup holds — the measured popup set no title, so
 /// this is the case the rule must survive, not one the capture observed: the
 /// popup blocker outranks the title's idle evidence, so the stale title must
 /// not release the prompt. The test first waits for the daemon to classify
@@ -6064,7 +6262,7 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
-    let (deadline_hold, release_deadline) = arm_readiness_deadline_hold(&mut config);
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
 
@@ -6098,9 +6296,14 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
     assert_eq!(published.payload()["source"], Value::from("screen"));
     // The verdict landed with no deadline running; release the hold so the
     // held grace decides the refused create.
-    deadline_hold.release(&release_deadline);
+    deadline_hold.release();
 
-    let error = err_payload(create.await.expect("create task joins"));
+    let error = err_payload(
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the refused create answers before the hang guard")
+            .expect("create task joins"),
+    );
     assert_eq!(error.code, "session_input_not_ready");
 
     let mut observer = connect(&socket).await;
@@ -6133,12 +6336,13 @@ async fn codex_initial_input_is_delivered_once_the_update_popup_clears_and_the_t
     let release_path = socket.dir.join("codex-popup-release.sock");
     codex_update_popup_stub(&script, &received, true, Some(&release_path));
     write_official_profile(&agents_dir, "codex", "codexpopuprelease", &script);
-    let config = SessionRegistryConfig {
+    let mut config = SessionRegistryConfig {
         agents_dir: Some(agents_dir),
         host_state_dir: Some(socket.dir.join("host-state")),
         initial_input_startup_grace: CODEX_POPUP_GRACE,
         ..support::hermetic_registry_config()
     };
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
     let (shutdown, handle, _) =
         spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
     let release = tokio::net::UnixListener::bind(&release_path).expect("bind the release listener");
@@ -6170,6 +6374,11 @@ async fn codex_initial_input_is_delivered_once_the_update_popup_clears_and_the_t
         ),
     };
     assert_eq!(published.payload()["activity"], Value::from("blocked"));
+    // The verdict landed with no deadline running; release the hold so the
+    // held grace decides the create, then dismiss the popup through the
+    // stub's release socket, after which it redraws the composer and sets
+    // the idle title.
+    deadline_hold.release();
 
     // The daemon holds the popup as blocked. Dismissing it hands the stub the
     // release byte, after which it redraws the composer and sets the idle
@@ -6183,9 +6392,13 @@ async fn codex_initial_input_is_delivered_once_the_update_popup_clears_and_the_t
         .await
         .expect("release the popup");
 
-    let created: SessionInfo =
-        serde_json::from_value(ok_payload(create.await.expect("create task joins")))
-            .expect("codex session info once the popup cleared");
+    let created: SessionInfo = serde_json::from_value(ok_payload(
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the kept create answers before the hang guard")
+            .expect("create task joins"),
+    ))
+    .expect("codex session info once the popup cleared");
     let bytes = read_file_until(&received, b"hello Codex").await;
     assert_eq!(
         bytes
