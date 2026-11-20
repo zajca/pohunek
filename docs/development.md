@@ -348,7 +348,11 @@ cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbook
 Before the push, `scripts/guard-pack --base origin/main` runs the pull-request
 gates the list above lacks (changelog fragment, package version bump, macOS
 test selection for an added `#[ignore`, docs check) and names each failing gate;
-an `UNDECIDED` line is a gate only CI can decide (see the gates skill).
+an `UNDECIDED` line is a gate only CI can decide (see the gates skill). A diff
+that changes a file under `crates/` also carries the table of
+`scripts/red-on-old` in the PR body: each regression scenario run on the old
+code (the changed non-test files restored to the merge base, in a scratch
+worktree) and on the new code (see the `pr-handoff` skill).
 
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see the
 [verification guide](../.agents/instructions/verification.md) for watcher and
