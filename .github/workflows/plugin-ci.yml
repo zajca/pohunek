@@ -64,6 +64,11 @@ on:
         required: false
         type: string
         default: ''
+      smoke-script-timeout:
+        description: "Bound for the smoke script in whole seconds, passed as `--script-timeout` when set: integer 1..=900, absent keeps the kit default of 60 s. At most 900 s so the bound still fits the smoke step's `timeout-minutes: 30` (inside the `check` job's 60) with setup headroom. A package without a runtime refuses a non-empty value."
+        required: false
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -170,6 +175,7 @@ jobs:
           CORPUS_DIR: ${{ inputs.corpus-dir }}
           UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
           SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+          SMOKE_SCRIPT_TIMEOUT: ${{ inputs.smoke-script-timeout }}
         run: |
           set -euo pipefail
           # Every input but `package-dir` is optional: an empty value
@@ -188,6 +194,15 @@ jobs:
           test -z "${CORPUS_DIR:-}" || test -f "plugin/$CORPUS_DIR/cases.toml"
           test -z "${UPSTREAM_INSTALL:-}" || test -f "plugin/$UPSTREAM_INSTALL"
           test -z "${SMOKE_SCRIPT:-}" || test -f "plugin/$SMOKE_SCRIPT"
+          if [ -n "${SMOKE_SCRIPT_TIMEOUT:-}" ]; then
+            case "$SMOKE_SCRIPT_TIMEOUT" in
+              '' | *[!0-9]* | ????*) echo "SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900: $SMOKE_SCRIPT_TIMEOUT" >&2; exit 1 ;;
+            esac
+            if [ "$SMOKE_SCRIPT_TIMEOUT" -lt 1 ] || [ "$SMOKE_SCRIPT_TIMEOUT" -gt 900 ]; then
+              echo "SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900: $SMOKE_SCRIPT_TIMEOUT" >&2
+              exit 1
+            fi
+          fi
 
       # The `release` row smokes against the attested daemon archive of the
       # core tag: the provenance check is the one
@@ -258,11 +273,12 @@ jobs:
         env:
           UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
           SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+          SMOKE_SCRIPT_TIMEOUT: ${{ inputs.smoke-script-timeout }}
           CORPUS_DIR: ${{ inputs.corpus-dir }}
         run: |
           set -euo pipefail
           failed=0
-          for input in UPSTREAM_INSTALL SMOKE_SCRIPT CORPUS_DIR; do
+          for input in UPSTREAM_INSTALL SMOKE_SCRIPT SMOKE_SCRIPT_TIMEOUT CORPUS_DIR; do
             eval "value=\${$input:-}"
             if [ -n "$value" ]; then
               echo "$input is set but the package is a $PACKAGE_KIND package with no runtime to smoke or detect" >&2
@@ -334,6 +350,7 @@ jobs:
           PACKAGE_DIR: ${{ inputs.package-dir }}
           UPSTREAM_INSTALL: ${{ inputs.upstream-install }}
           SMOKE_SCRIPT: ${{ inputs.smoke-script }}
+          SMOKE_SCRIPT_TIMEOUT: ${{ inputs.smoke-script-timeout }}
         run: |
           set -euo pipefail
           args=(--dir "$PACKAGE_DIR" --release-dir ../release-dir --json)
@@ -346,6 +363,9 @@ jobs:
           fi
           if [ -n "${SMOKE_SCRIPT:-}" ]; then
             args+=(--script "$SMOKE_SCRIPT")
+          fi
+          if [ -n "${SMOKE_SCRIPT_TIMEOUT:-}" ]; then
+            args+=(--script-timeout "$SMOKE_SCRIPT_TIMEOUT")
           fi
           ../core/target/debug/pohunek-plugin-kit smoke "${args[@]}"
 

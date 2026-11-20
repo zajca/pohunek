@@ -74,6 +74,7 @@ class PluginCiWorkflowTests(unittest.TestCase):
             "corpus-dir:",
             "upstream-install:",
             "smoke-script:",
+            "smoke-script-timeout:",
         ):
             self.assertIn(name, header)
         self.assertIn("required: true", header)
@@ -137,10 +138,26 @@ class PluginCiWorkflowTests(unittest.TestCase):
         smoke = self.text.partition("Smoke the package and the smoke script")[2]
         self.assertIn("--script", smoke)
         self.assertIn('SMOKE_SCRIPT', smoke)
+        self.assertIn("--script-timeout", smoke)
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT', smoke)
         self.assertIn("working-directory: plugin", smoke)
         header = self.text.partition("\njobs:\n")[0]
         self.assertIn('POHUNEK_SMOKE_SESSION', header)
         self.assertNotIn("POHUNEK_SOCKET", smoke)
+
+    def test_the_script_timeout_is_an_optional_bounded_integer(self):
+        header = self.text.partition("\njobs:\n")[0]
+        self.assertIn("smoke-script-timeout:", header)
+        self.assertIn("1..=900", header)
+        setup = self.text.partition("Set up the package inputs")[2].partition("Refuse runtime-only")[0]
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT', setup)
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900', setup)
+        self.assertIn('????*', setup)
+        smoke = self.text.partition("Smoke the package and the smoke script")[2].partition("Check the version bump")[0]
+        self.assertIn('args+=(--script-timeout "$SMOKE_SCRIPT_TIMEOUT")', smoke)
+        refuse = self.text.partition("Refuse runtime-only inputs for a package without a runtime")[2].partition("Smoke the package and the smoke script")[0]
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT', refuse.partition("env:")[2].partition("run:")[0])
+        self.assertIn('for input in UPSTREAM_INSTALL SMOKE_SCRIPT SMOKE_SCRIPT_TIMEOUT CORPUS_DIR', refuse)
 
     def test_the_platform_maps_to_a_runner(self):
         self.assertIn("matrix.platform == 'aarch64-apple-darwin'", self.text)
@@ -263,6 +280,27 @@ class PluginCiShellTests(unittest.TestCase):
             files=["plugin/package/x", "plugin/corpus/cases.toml", "plugin/install.sh", "plugin/smoke.sh"],
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_script_timeout_check_accepts_its_bounds(self):
+        for bound in ("1", "60", "900"):
+            with self.subTest(bound=bound):
+                completed = self.run_body(
+                    "Set up the package inputs",
+                    {"PACKAGE_DIR": "package", "CORPUS_DIR": "", "UPSTREAM_INSTALL": "", "SMOKE_SCRIPT": "", "SMOKE_SCRIPT_TIMEOUT": bound},
+                    files=["plugin/package/x"],
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_the_script_timeout_check_rejects_out_of_range_values(self):
+        for bound in ("0", "901", "99999999999999999999", "12x"):
+            with self.subTest(bound=bound):
+                completed = self.run_body(
+                    "Set up the package inputs",
+                    {"PACKAGE_DIR": "package", "CORPUS_DIR": "", "UPSTREAM_INSTALL": "", "SMOKE_SCRIPT": "", "SMOKE_SCRIPT_TIMEOUT": bound},
+                    files=["plugin/package/x"],
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900", completed.stderr)
 
     def test_the_version_bump_passes_without_a_previous_release(self):
         gh = "#!/bin/sh\nif [ \"$1 $2\" = \"release list\" ]; then exit 0; fi\nexit 1\n"
