@@ -237,8 +237,10 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    ```
 
    Verify the attestation (`gh attestation verify <archive> --repo
-   pohunekd/plugin-assistant`), then append the archive's sha256 to the core release
-   notes of `zajca/pohunek` (these commands run in the plugin clone, so each names
+   pohunekd/plugin-assistant --signer-workflow
+   zajca/pohunek/.github/workflows/plugin-release.yml`; the archive is signed by
+   the core reusable workflow, so the bare form fails), then append the
+   archive's sha256 to the core release notes of `zajca/pohunek` (these commands run in the plugin clone, so each names
    the repository): fetch the body first (`gh release view "vX.Y.Z" --repo
    zajca/pohunek --json body --jq .body > FILE`), add the digest line after the
    end marker, and

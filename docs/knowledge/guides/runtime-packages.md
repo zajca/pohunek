@@ -876,7 +876,11 @@ repeating the command; the CLI never retries an install on its own.
   package the signed catalog or the signed official index authorized. A
   local install is refused a runtime id a recorded verified index reserves.
   A local package installed before that reservation keeps serving, and
-  `pohunek doctor` warns with `runtime_id_reserved_by_official`. Serving
+  `pohunek doctor` warns with `runtime_id_reserved_by_official`. While such a
+  local package holds the runtime id, `pohunek plugin install <official id>`
+  is refused with `package_runtime_conflict`, whose `details.holder` names the
+  local package; nothing is replaced, so remove or replace the local package
+  first. Serving
   refuses only the four compiled ids `shell`, `codex`, `claude` and `hermes`.
 - `--catalog <file>` authorizes an official package through the signed catalog,
   verified against the trust anchor file shipped beside the daemon (see the
@@ -925,6 +929,12 @@ repeating the command; the CLI never retries an install on its own.
   refreshes once when it is older, and with `--index-url` always fetches from that
   URL and ignores the stored copy; `--index-url` with a different URL is a
   transport replacement, not a trust root — the daemon still verifies it.
+  `pohunek plugin update <package> <archive> --index <file>` applies the same
+  checks and refuses an index older than the stored one
+  (`package_index_rollback`), an index that omits the archive's digest
+  (`package_untrusted`) and a digest a recorded catalog revoked
+  (`package_revoked`); the installed version stays selected and keeps
+  launching.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 
