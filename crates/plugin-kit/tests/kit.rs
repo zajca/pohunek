@@ -528,6 +528,11 @@ fn kit_smoke_passes_on_fixture() {
         document["screen_lines"].as_u64().unwrap_or(0) > 0,
         "the smoke saw a non-empty screen: {document:?}"
     );
+    assert_eq!(
+        document["detection_timeout_s"],
+        serde_json::json!(60),
+        "a run without the flag reports the 60 s default detection bound"
+    );
     used_root(&document, &kit);
 }
 
@@ -641,6 +646,10 @@ fn kit_smoke_skips_the_script_when_the_screen_check_fails() {
         s(&release),
         "--script",
         s(&script),
+        // The quiet package never prints what the detector knows, so the
+        // 1 s bound always expires and host speed cannot change the outcome.
+        "--detection-timeout",
+        "1",
         "--json",
     ]);
     assert!(
@@ -649,7 +658,7 @@ fn kit_smoke_skips_the_script_when_the_screen_check_fails() {
         stderr_of(&output)
     );
     assert!(
-        stderr_of(&output).contains("the detector stayed `unknown`"),
+        stderr_of(&output).contains("the detector stayed `unknown` for 1s"),
         "the screen check failed first: {}",
         stderr_of(&output)
     );
@@ -904,6 +913,34 @@ fn kit_smoke_refuses_a_script_timeout_outside_its_range() {
         );
         assert!(
             stderr_of(&output).contains("--script-timeout must be 1..=900 seconds"),
+            "the refusal names the range: {}",
+            stderr_of(&output)
+        );
+    }
+}
+
+#[test]
+fn kit_smoke_refuses_a_detection_timeout_outside_its_range() {
+    let kit = Kit::new();
+    let release = release_dir();
+    for bound in ["0", "61"] {
+        let output = kit.kit(&[
+            "smoke",
+            "--dir",
+            s(&fixture_dir()),
+            "--release-dir",
+            s(&release),
+            "--detection-timeout",
+            bound,
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "rc is 2 for --detection-timeout {bound}: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("--detection-timeout must be 1..=60 seconds"),
             "the refusal names the range: {}",
             stderr_of(&output)
         );
@@ -1465,6 +1502,7 @@ fn kit_smoke_refuses_runtime_only_inputs_for_a_commands_only_package() {
     for extra in [
         vec!["--script", s(&script)],
         vec!["--script-timeout", "120"],
+        vec!["--detection-timeout", "30"],
     ] {
         let mut argv = vec![
             "smoke".to_owned(),
@@ -1487,9 +1525,9 @@ fn kit_smoke_refuses_runtime_only_inputs_for_a_commands_only_package() {
             "the refusal names the runtime-only input: {}",
             stderr_of(&output)
         );
-        if extra[0] == "--script-timeout" {
+        if extra[0] == "--script-timeout" || extra[0] == "--detection-timeout" {
             assert!(
-                stderr_of(&output).contains("--script-timeout"),
+                stderr_of(&output).contains(extra[0]),
                 "the commands-only refusal names the bound flag: {}",
                 stderr_of(&output)
             );

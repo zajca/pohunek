@@ -218,7 +218,7 @@ index write, and 2 for every other refusal:
   corpus through the detector: `cases.toml` holds `[[case]]` tables with a
   `screen` file under `screens/`, a `width`, and the expected `working`,
   `blocked`, `idle` or `unknown` activity.
-- `smoke --release-dir <dir> [--upstream <path>] [--script <path>] [--script-timeout <seconds>]`
+- `smoke --release-dir <dir> [--upstream <path>] [--script <path>] [--script-timeout <seconds>] [--detection-timeout <seconds>]`
   installs the built package on an isolated daemon through a throwaway
   index, starts it, waits for detection past `unknown`, and requires a
   non-empty screen; then it stops and removes the session. The generic
@@ -228,7 +228,8 @@ index write, and 2 for every other refusal:
   `pohunek host command run local`, requires exit 0 from each, and reports
   `plugin smoke ok: <package_id> <version> commands <n> commands run`
   (`--json` carries `commands` instead of `activity` and `screen_lines`);
-  `--upstream`, `--script` and `--script-timeout` are refused for it. `--upstream` puts
+  `--upstream`, `--script`, `--script-timeout` and `--detection-timeout` are
+  refused for it. `--upstream` puts
   a directory (or the directory of an executable) in front of the isolated
   daemon's `PATH`, so the runtime program resolves to the locked upstream
   install there. `--script` runs a plugin-owned executable once after every
@@ -245,7 +246,12 @@ index write, and 2 for every other refusal:
   (`1..=900`, absent keeps the 60 s default); a script that outlives its
   bound fails the smoke with an error naming the script and the bound, and
   the passing `--json` report carries the effective bound as
-  `script_timeout_s`.
+  `script_timeout_s`. `--detection-timeout` bounds the wait for the
+  detector to leave `unknown` in whole seconds (`1..=60`, absent keeps the
+  60 s default); it can only tighten the bound, so a value above 60 is
+  refused before the rig starts. A runtime that stays `unknown` past the
+  bound fails the smoke with an error naming the bound, and the passing
+  `--json` report carries the effective bound as `detection_timeout_s`.
 - `prove --release-dir <dir> --evidence <file> [--no-enable]` runs the same
   install path as `xtask plugin prove` from the package directory and writes
   the verdict as evidence JSON, plus the kit digest (`kit_sha256`); with

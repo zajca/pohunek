@@ -109,6 +109,11 @@ enum Command {
         /// job's 60) with setup.
         #[arg(long)]
         script_timeout: Option<u64>,
+        /// Bound for the detector to leave `unknown` in whole seconds;
+        /// absent keeps the 60 s default. Valid range 1..=60: the option can
+        /// only tighten the bound. Refused for a commands-only package.
+        #[arg(long)]
+        detection_timeout: Option<u64>,
         /// Print the report as a single JSON document.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -209,6 +214,7 @@ fn dispatch(command: Command) -> Result<(), Error> {
             upstream,
             script,
             script_timeout,
+            detection_timeout,
             json,
         } => {
             let report = smoke::smoke(&smoke::SmokeArgs {
@@ -217,6 +223,7 @@ fn dispatch(command: Command) -> Result<(), Error> {
                 upstream,
                 script,
                 script_timeout_secs: script_timeout,
+                detection_timeout_secs: detection_timeout,
             })?;
             emit(json, &report.line(), &report)
         }
