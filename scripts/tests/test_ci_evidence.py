@@ -1753,18 +1753,30 @@ jobs:
         self.assertIn("/actions/runs/456", result.stderr)
 
     def test_a_reuse_union_is_refused_for_a_disallowed_source_event(self):
-        # `workflow_dispatch` is a lawful source event; narrowing the
-        # allowlist to just `push` refuses the dispatch source by name.
-        union_fixture(self)
-        self.config_data["reuse"] = {
-            "max_age_hours": 24,
-            "source_events": ["push"],
+        # Narrowing the allowlist to just `push` refuses a pull request
+        # source and a dispatch source by name.
+        sources = {
+            "pull_request": run_doc(
+                sha=SHA, event="pull_request", branch="zajca/feature",
+                run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO,
+            ),
+            "workflow_dispatch": dispatch_doc(sha=SHA, run_id=REUSE_SOURCE_ID),
         }
-        self.write_config()
-        result = self.invoke("main")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not allow for reuse", result.stderr)
-        self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
+        for event, source in sources.items():
+            with self.subTest(source_event=event):
+                union_fixture(self)
+                fixture = json.loads(self.fixture.read_text())
+                fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source
+                self.fixture.write_text(json.dumps(fixture))
+                self.config_data["reuse"] = {
+                    "max_age_hours": 24,
+                    "source_events": ["push"],
+                }
+                self.write_config()
+                result = self.invoke("main")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("does not allow for reuse", result.stderr)
+                self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
 
     def test_a_reuse_union_is_refused_for_a_nightly_source_event(self):
         union_fixture(self)

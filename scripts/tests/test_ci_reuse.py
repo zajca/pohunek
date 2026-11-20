@@ -17,6 +17,7 @@ is visible to the script exactly as the API serves it.
 import base64
 import contextlib
 import datetime
+import functools
 import io
 import json
 import os
@@ -124,6 +125,25 @@ else:
 '''
 
 
+# A leg that ends one of these fails its run: the workflow has no
+# `continue-on-error`.
+RED_CONCLUSIONS = ("failure", "cancelled", "timed_out")
+
+
+def as_consumer(event):
+    """Runs the decorated scenario as the consumer event `event`."""
+
+    def decorate(test):
+        @functools.wraps(test)
+        def wrapper(self):
+            with self.consumer(event):
+                test(self)
+
+        return wrapper
+
+    return decorate
+
+
 def run_doc(run_id=777, event="pull_request", head_repo=REPO, branch="zajca/feature", head_sha=None,
             status="completed", conclusion="success", path=".github/workflows/ci.yml@refs/heads/main"):
     # Push sources default to main branch (run_tier main); PR sources stay
@@ -223,13 +243,24 @@ class CiReuseProcessTests(unittest.TestCase):
         self.addCleanup(self.restore_env)
         os.environ["GITHUB_REPOSITORY"] = REPO
         os.environ["GITHUB_SHA"] = SHA
-        os.environ["GITHUB_EVENT_NAME"] = "push"
+        os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
         os.environ["GITHUB_OUTPUT"] = str(self.output)
         os.environ["RUNNER_TEMP"] = str(self.directory)
         os.environ["WORKFLOW_FILE"] = "ci.yml"
         os.environ["GH_CALLS"] = str(self.calls)
         os.environ["PATH"] = f"{bin_dir}{os.pathsep}{self.saved['PATH']}"
         self.git_tree = None
+
+    @contextlib.contextmanager
+    def consumer(self, event):
+        """Runs the script as the consumer event `event`; the baseline
+        scenarios run as a delta dispatch."""
+        previous = os.environ["GITHUB_EVENT_NAME"]
+        os.environ["GITHUB_EVENT_NAME"] = event
+        try:
+            yield
+        finally:
+            os.environ["GITHUB_EVENT_NAME"] = previous
 
     def restore_env(self):
         for key, value in self.saved.items():
@@ -239,6 +270,13 @@ class CiReuseProcessTests(unittest.TestCase):
                 os.environ[key] = value
 
     def write_fixture(self, runs, jobs_by_run, artifacts, artifact_zips=None):
+        for run in runs:
+            legs = jobs_by_run.get(str(run["id"]), [])
+            if run["conclusion"] == "success" and isinstance(legs, list):
+                red = [leg["name"] for leg in legs if leg["conclusion"] in RED_CONCLUSIONS]
+                self.assertEqual(
+                    red, [], f"run {run['id']} concluded success with red legs"
+                )
         self.fixture.write_text(json.dumps({
             "runs": runs,
             "jobs_by_run": jobs_by_run,
@@ -385,11 +423,11 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertEqual(self.outputs()["skip"], "[]")
         self.assertEqual(self.outputs()["source_run"], "")
 
-    def test_a_red_leg_drops_only_its_job_while_the_rest_stays_reused(self):
+    def test_a_skipped_leg_drops_only_its_job_while_the_rest_stays_reused(self):
         jobs = green_jobs()
         for entry in jobs:
             if entry["name"] == "fmt + clippy":
-                entry["conclusion"] = "failure"
+                entry["conclusion"] = "skipped"
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": jobs},
@@ -402,9 +440,28 @@ class CiReuseProcessTests(unittest.TestCase):
         rc = self.run_script_with_tree(TREE)
         self.assertEqual(rc, 0)
         skip = json.loads(self.outputs()["skip"])
-        # Only the job with the red leg stays out; the rest is still reused.
+        # Only the job with the skipped leg stays out; the rest is still reused.
         self.assertNotIn("test", skip)
         self.assertIn("darwin-check", skip)
+
+    def test_a_failed_run_with_a_red_leg_supplies_nothing(self):
+        jobs = green_jobs()
+        for entry in jobs:
+            if entry["name"] == "fmt + clippy":
+                entry["conclusion"] = "failure"
+        self.write_fixture(
+            runs=[run_doc(conclusion="failure")],
+            jobs_by_run={"777": jobs},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.outputs()["skip"], "[]")
+        self.assertEqual(self.outputs()["source_run"], "")
 
     def test_a_source_older_than_a_day_gives_an_empty_skip(self):
         jobs = []
@@ -425,15 +482,15 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertEqual(self.outputs()["skip"], "[]")
         self.assertEqual(self.outputs()["source_run"], "")
 
-    def test_a_red_heavy_leg_drops_build_tests_by_closure(self):
-        # A red `tests (heavy 1/3, PTY + Hermes)` leg drops
+    def test_a_skipped_heavy_leg_drops_build_tests_by_closure(self):
+        # A skipped `tests (heavy 1/3, PTY + Hermes)` leg drops
         # `integration`, and the closure to a fixed point must take
         # `build-tests` (its producer) out of `skip` too, while jobs that
         # do not depend on it stay reused.
         jobs = green_jobs()
         for entry in jobs:
             if entry["name"] == "tests (heavy 1/3, PTY + Hermes)":
-                entry["conclusion"] = "failure"
+                entry["conclusion"] = "skipped"
         self.write_fixture(
             runs=[run_doc()],
             jobs_by_run={"777": jobs},
@@ -651,6 +708,7 @@ else:
         self.assertIn("platform-contracts", skip)
         self.assertIn("hermes-compatibility-macos", skip)
 
+    @as_consumer("push")
     def test_a_push_reuses_a_pull_request_source_by_tree(self):
         # Push: the merge commit differs from the PR
         # head that tested the same tree. The source is on another commit
@@ -671,10 +729,12 @@ else:
         self.assertEqual(self.outputs()["source_run"], "777")
         self.assertEqual(self.outputs()["source_runs"], "[777]")
 
+    @as_consumer("push")
     def test_a_push_takes_the_newest_green_leg_in_each_job(self):
         # Two same-tree sources (push 888 newer, pull_request 777 older).
         # The newer push run supplies `test`; the older supplies the rest.
-        # `test` appears red in the older run but green in the newer one.
+        # `test` has a skipped leg in the older run and a green one in the
+        # newer one.
         newer_jobs = [job("fmt + clippy")]  # push 888 supplies only `test`
         older_jobs = green_jobs()
         self.write_fixture(
@@ -682,7 +742,7 @@ else:
                 run_doc(run_id=888, event="push"),
                 run_doc(run_id=777, event="pull_request"),
             ],
-            jobs_by_run={"888": newer_jobs, "777": older_jobs + [job("fmt + clippy", conclusion="failure")]},
+            jobs_by_run={"888": newer_jobs, "777": older_jobs + [job("fmt + clippy", conclusion="skipped")]},
             artifacts={
                 "888": [{"name": f"tested-tree-{TREE}", "id": 1}, {"name": "test-selection", "id": 2}],
                 "777": [{"name": f"tested-tree-{TREE}", "id": 3}, {"name": "test-selection", "id": 4}],
@@ -711,11 +771,8 @@ else:
             ]},
             artifact_zips={"2": selection_zip("full")},
         )
-        try:
-            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+        with self.consumer("workflow_dispatch"):
             rc = self.run_script_with_tree(TREE)
-        finally:
-            os.environ["GITHUB_EVENT_NAME"] = "push"
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
@@ -729,11 +786,8 @@ else:
             ]},
             artifact_zips={"2": selection_zip("full")},
         )
-        try:
-            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+        with self.consumer("workflow_dispatch"):
             rc = self.run_script_with_tree(TREE)
-        finally:
-            os.environ["GITHUB_EVENT_NAME"] = "push"
         self.assertEqual(rc, 0)
         self.assertIn("test", json.loads(self.outputs()["skip"]))
 
@@ -760,6 +814,7 @@ else:
         skip = json.loads(self.outputs()["skip"])
         self.assertNotIn("test", skip)
 
+    @as_consumer("push")
     def test_a_push_never_reuses_a_source_older_than_a_day(self):
         stale_jobs = [job(entry["name"], completed_at=STALE) for entry in green_jobs()]
         self.write_fixture(
@@ -792,6 +847,7 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    @as_consumer("push")
     def test_a_run_from_another_repository_supplies_nothing(self):
         # The listing only names this repository's runs; a same-tree run
         # recorded under another owner never supplies reuse, even when the
@@ -810,6 +866,7 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    @as_consumer("push")
     def test_a_push_never_uses_a_fork_source(self):
         self.write_fixture(
             runs=[run_doc(run_id=777, event="push", head_repo="someone/pohunek")],
@@ -842,6 +899,7 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    @as_consumer("push")
     def test_a_push_to_a_feature_branch_never_supplies_reuse(self):
         # A push source must be a main-branch push (run_tier main).
         self.write_fixture(
@@ -870,14 +928,12 @@ else:
             ]},
             artifact_zips={"2": selection_zip("full")},
         )
-        try:
-            os.environ["GITHUB_EVENT_NAME"] = "schedule"
+        with self.consumer("schedule"):
             rc = self.run_script_with_tree(TREE)
-        finally:
-            os.environ["GITHUB_EVENT_NAME"] = "push"
         self.assertEqual(rc, 1)
         self.assertEqual(json.loads(self.outputs().get("skip", "[]")), [])
 
+    @as_consumer("push")
     def test_a_run_created_before_the_window_supplies_nothing(self):
         # A run created more than 24h ago never supplies reuse, even when
         # every leg is green and fresh: the run-level age guard drops it
@@ -897,6 +953,7 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    @as_consumer("push")
     def test_a_source_for_another_tree_never_supplies_a_job(self):
         self.write_fixture(
             runs=[run_doc(run_id=777, event="push")],
@@ -911,6 +968,7 @@ else:
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
+    @as_consumer("push")
     def test_a_source_with_conclusion_not_success_supplies_nothing(self):
         self.write_fixture(
             runs=[run_doc(run_id=777, event="push", conclusion="cancelled")],
@@ -937,11 +995,8 @@ else:
             ]},
             artifact_zips={"2": selection_zip("full")},
         )
-        try:
-            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+        with self.consumer("workflow_dispatch"):
             rc = self.run_script_with_tree(TREE)
-        finally:
-            os.environ["GITHUB_EVENT_NAME"] = "push"
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(self.outputs()["skip"]), [])
 
@@ -991,6 +1046,7 @@ else:
         since = (NOW - datetime.timedelta(hours=24)).date().isoformat()
         self.assertIn(f"created=>={since}", query.replace(" ", ""))
 
+    @as_consumer("push")
     def test_a_full_first_run_stops_before_the_second_listing(self):
         # The candidate loop stops when every allowlisted job has its
         # newest leg: with one full same-tree run first, the older run's
