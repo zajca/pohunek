@@ -821,10 +821,25 @@ fn a_netbird_probe_that_never_answers_is_bounded_and_killed() {
         .as_str()
         .is_some_and(|message| message.contains("did not answer within")));
     let pid = fs::read_to_string(&pid).expect("the fake recorded its pid");
-    assert!(
-        !std::path::Path::new("/proc").join(pid.trim()).exists(),
-        "the hung CLI was killed and reaped"
-    );
+    // The probe is a grandchild of the CLI: the CLI reaps its supervisor shell,
+    // and the killed probe is reparented to init, which reaps it on its own
+    // schedule. Dead means gone or a zombie.
+    pohunek_test_support::wait::poll_until("the killed netbird probe to be dead", || {
+        probe_is_dead(pid.trim()).then_some(())
+    });
+}
+
+/// Whether `/proc/<pid>` is gone or names a zombie (state `Z`).
+#[cfg(target_os = "linux")]
+fn probe_is_dead(pid: &str) -> bool {
+    match fs::read_to_string(std::path::Path::new("/proc").join(pid).join("stat")) {
+        // The state follows the parenthesised command name, which may itself
+        // contain spaces and parentheses.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// A `NetBird` address that two peers list is no route: the listing keeps both

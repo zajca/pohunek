@@ -496,7 +496,11 @@ deadline closed it and is refused with the retryable
 `session_runtime_reconnecting`. A stop that the
 worker leaves unanswered, or whose own exchange expires, proves the recorded
 worker identity from its journal and job, retires the job through the service
-manager, and commits the session `stopped`; a refused proof retires nothing.
+manager, and commits the session `stopped`; a refused proof retires nothing. The
+rollback of a refused create escalates the same way when its stop goes
+unanswered, and ends with the session removed instead of `stopped`; a
+`session.remove` from a user does not escalate and returns the typed removal
+error.
 
 The daemon stops its own background work through one tree (`crates/daemon/src/shutdown.rs`).
 The session registry spawns every watcher, exit committer, forwarder and retry

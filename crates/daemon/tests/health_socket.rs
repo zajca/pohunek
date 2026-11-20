@@ -4209,11 +4209,14 @@ async fn a_refused_codex_create_whose_worker_freezes_is_still_rolled_back() {
     use nix::unistd::Pid;
 
     /// Resumes the frozen worker when the scenario ends, so a failing run
-    /// leaves no stopped process behind.
-    struct Thaw(Pid);
+    /// leaves no stopped process behind. The scenario disarms it once the
+    /// worker is gone, because a reaped pid may belong to another process.
+    struct Thaw(Option<Pid>);
     impl Drop for Thaw {
         fn drop(&mut self) {
-            let _ = kill(self.0, Signal::SIGCONT);
+            if let Some(worker) = self.0 {
+                let _ = kill(worker, Signal::SIGCONT);
+            }
         }
     }
 
@@ -4275,7 +4278,7 @@ async fn a_refused_codex_create_whose_worker_freezes_is_still_rolled_back() {
     assert_eq!(workers.len(), 1, "{workers:?}");
     let worker = Pid::from_raw(i32::try_from(workers[0].pid).expect("worker pid"));
     kill(worker, Signal::SIGSTOP).expect("freeze the worker");
-    let _thaw = Thaw(worker);
+    let mut thaw = Thaw(Some(worker));
 
     deadline_hold.release();
     let error = err_payload(
@@ -4307,6 +4310,7 @@ async fn a_refused_codex_create_whose_worker_freezes_is_still_rolled_back() {
             .map(|_| ())
     })
     .await;
+    thaw.0 = None;
     let _ = shutdown.send(());
     let _ = handle.await;
 }

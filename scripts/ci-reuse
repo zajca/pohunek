@@ -536,10 +536,6 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
             skip, sources, reason, job_reasons = decide(
                 config, tree, runs, moment, sha, repo, consumer_event,
             )
-            if dry_run:
-                print(json.dumps({"skip": skip, "source_runs": sorted({r['id'] for r in sources.values()}),
-                                  "reason": reason}))
-                return 0
         except ReuseError as error:
             warn(str(error))
             skip, sources, reason = [], {}, str(error)
@@ -551,8 +547,9 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     else:
         if listed:
             warn("no same-tree run; running everything")
-    if dry_run and not runs:
-        print(json.dumps({"skip": [], "source_runs": [], "reason": reason}))
+    if dry_run:
+        print(json.dumps({"skip": skip, "source_runs": sorted({r['id'] for r in sources.values()}),
+                          "reason": reason}))
         return 0
     ordered_run_ids = sorted({run["id"] for run in sources.values()})
     # The primary source run is the one supplying the most reused jobs
