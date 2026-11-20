@@ -876,7 +876,11 @@ repeating the command; the CLI never retries an install on its own.
   package the signed catalog or the signed official index authorized. A
   local install is refused a runtime id a recorded verified index reserves.
   A local package installed before that reservation keeps serving, and
-  `pohunek doctor` warns with `runtime_id_reserved_by_official`. Serving
+  `pohunek doctor` warns with `runtime_id_reserved_by_official`. While such a
+  local package holds the runtime id, `pohunek plugin install <official id>`
+  is refused with `package_runtime_conflict`, whose `details.holder` names the
+  local package; nothing is replaced, so remove or replace the local package
+  first. Serving
   refuses only the four compiled ids `shell`, `codex`, `claude` and `hermes`.
 - `--catalog <file>` authorizes an official package through the signed catalog,
   verified against the trust anchor file shipped beside the daemon (see the
@@ -902,7 +906,12 @@ repeating the command; the CLI never retries an install on its own.
   refuses it (`official_trust_unavailable`) and `pohunek doctor` reports the
   `plugin_index_channel` check as `warn`; catalog installs are unaffected.
 - `pohunek plugin install --index <file>` sends a local signed index to the
-  daemon with a local archive. `pohunek plugin install <package-id>[@<version>]`
+  daemon with a local archive. `pohunek plugin update <package> <archive>
+  --index <file>` applies the same checks and refuses an index older than the
+  stored one (`package_index_rollback`), an index that omits the archive's
+  digest (`package_untrusted`) and a digest a recorded catalog revoked
+  (`package_revoked`); the installed version stays selected and keeps
+  launching. `pohunek plugin install <package-id>[@<version>]`
   fetches the official plugin index and the archive it lists first, over
   `https` (or `http` to the local machine, which tests use), and then does the
   same: the transport carries no trust, the daemon verifies the index

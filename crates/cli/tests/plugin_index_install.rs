@@ -25,12 +25,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ed25519_dalek::{Signer as _, SigningKey};
 use package::{
     build_archive, index_key_record_signing_message, index_signing_message, read_archive,
-    revocation_signing_message, ArchiveEntry, CatalogSignature, IndexBody, IndexChannel,
-    IndexEntry, IndexEntryKind, IndexEnvelope, IndexKeyRecord, Limits, PackageDigest,
+    revocation_signing_message, ArchiveEntry, CatalogEntry, CatalogSignature, IndexBody,
+    IndexChannel, IndexEntry, IndexEntryKind, IndexEnvelope, IndexKeyRecord, Limits, PackageDigest,
     RevocationBody, SignedRevocations, INDEX_SCHEMA_VERSION, INDEX_SCHEMA_VERSION_2,
 };
 use pohunek_test_support::bin_exe;
-use pohunek_test_support::catalog::{anchor_for, host_platform, key_id, test_key, ANY_CORE};
+use pohunek_test_support::catalog::{
+    anchor_for, attestations_for, catalog_of, host_platform, key_id, signed, test_key, ANY_CORE,
+    RUNTIME_API, WINDOW_END,
+};
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde_json::Value;
 
@@ -2593,6 +2596,230 @@ async fn a_runtime_conflict_names_the_holding_package() {
         stderr.contains(HOLDER_ID),
         "human output names the holder: {stderr}"
     );
+}
+
+/// Asserts that the one installed package is still `version`, selected and
+/// enabled, that its runtime launches, and that no staging directory remains.
+async fn assert_only_version_serves(rig: &Rig, version: &str) {
+    let packages = rig.install.packages().await;
+    assert_eq!(packages.len(), 1, "{packages:?}");
+    assert_eq!(packages[0]["package"]["version"], version, "{packages:?}");
+    assert_eq!(packages[0]["selected"], true, "{packages:?}");
+    assert_eq!(packages[0]["enabled"], true, "{packages:?}");
+    assert!(rig.serves(RUNTIME).await, "the installed package launches");
+    assert!(
+        rig.staging_leftovers().is_empty(),
+        "the staging directory is removed"
+    );
+}
+
+/// An update authorized by an index file that no longer lists the new digest
+/// is refused, whichever file carries it: an older document that still lists
+/// the digest is below the stored high-water mark, and a current document that
+/// omits it authorizes nothing. Either way nothing is replaced and the
+/// installed package keeps launching.
+#[tokio::test]
+async fn an_update_to_a_digest_the_stored_index_no_longer_lists_is_refused() {
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    let second = rig.listing("0.2.0");
+    let second_file = rig.install.write("0.2.0.tar.zst", &second.archive.bytes);
+    let second_path = second_file.to_str().expect("utf-8 path").to_owned();
+    let older = rig.install.write(
+        "older-index.json",
+        &rig.keys.document(
+            &rig.keys.key,
+            now() - KEY_BACK_DATE / 2,
+            vec![second.entry()],
+        ),
+    );
+    let older_path = older.to_str().expect("utf-8 path").to_owned();
+    let current = rig.install.write(
+        "current-index.json",
+        &rig.keys.signed(vec![rig.listing("0.1.0").entry()]),
+    );
+    let current_path = current.to_str().expect("utf-8 path").to_owned();
+    // The stored copy lists 0.1.0 only and is newer than the older document.
+    rig.refresh().await;
+
+    for (name, index, code_name) in [
+        (
+            "an index below the stored mark",
+            &older_path,
+            "package_index_rollback",
+        ),
+        (
+            "an index that omits the digest",
+            &current_path,
+            "package_untrusted",
+        ),
+    ] {
+        let (code, document) = rig
+            .install
+            .json(&[
+                "plugin",
+                "update",
+                PACKAGE_ID,
+                &second_path,
+                "--index",
+                index,
+                "--yes",
+            ])
+            .await;
+        assert_ne!(code, 0, "{name} is refused: {document}");
+        assert_eq!(err_code(&document), code_name, "{name}: {document}");
+        assert_only_version_serves(&rig, "0.1.0").await;
+    }
+}
+
+/// An update to a digest that a recorded catalog revoked is refused as revoked
+/// even though a current index file lists it. The index itself revokes only
+/// keys; digest revocation arrives through a catalog.
+#[tokio::test]
+async fn an_update_to_a_digest_a_recorded_catalog_revoked_is_refused() {
+    const REVOKER_ID: &str = "acme.runtime.idxrevoker";
+    const REVOKER_RUNTIME: &str = "idxrevoker";
+    let rig = Rig::start().await;
+    rig.publish(&[rig.listing("0.1.0")]);
+    let (code, document) = rig.install(PACKAGE_ID, &["--yes"]).await;
+    assert_eq!(code, 0, "{document}");
+    let second = rig.listing("0.2.0");
+    let second_file = rig.install.write("0.2.0.tar.zst", &second.archive.bytes);
+    let second_path = second_file.to_str().expect("utf-8 path").to_owned();
+    let index = rig.install.write(
+        "index.json",
+        &rig.keys
+            .signed(vec![rig.listing("0.1.0").entry(), second.entry()]),
+    );
+    let index_path = index.to_str().expect("utf-8 path").to_owned();
+
+    // A catalog that lists another package and revokes the update's digest.
+    let carrier = archive_of(REVOKER_ID, REVOKER_RUNTIME, "1.0.0");
+    let carrier_file = rig.install.write("carrier.tar.zst", &carrier.bytes);
+    let carrier_path = carrier_file.to_str().expect("utf-8 path").to_owned();
+    let platform = host_platform();
+    let mut revoking = catalog_of(
+        1,
+        WINDOW_END,
+        vec![CatalogEntry {
+            package_id: PackageId::parse(REVOKER_ID).expect("package id"),
+            runtime_id: RuntimeId::parse(REVOKER_RUNTIME).expect("runtime id"),
+            version: PackageVersion::parse("1.0.0").expect("version"),
+            digest: carrier.digest.clone(),
+            runtime_api: RUNTIME_API,
+            platforms: vec![platform.clone()],
+            attestations: attestations_for(&[platform]),
+            core: ANY_CORE.to_owned(),
+        }],
+    );
+    revoking.revoked_digests = vec![second.archive.digest.clone()];
+    let catalog = rig
+        .install
+        .write("revoking-catalog.json", &signed(&rig.keys.root, revoking));
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            &carrier_path,
+            "--catalog",
+            catalog.to_str().expect("utf-8 path"),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "update",
+            PACKAGE_ID,
+            &second_path,
+            "--index",
+            &index_path,
+            "--yes",
+        ])
+        .await;
+
+    assert_ne!(code, 0, "the revoked digest is refused: {document}");
+    assert_eq!(err_code(&document), "package_revoked", "{document}");
+    let selected: Vec<_> = rig
+        .install
+        .packages()
+        .await
+        .into_iter()
+        .filter(|package| package["package"]["id"] == PACKAGE_ID)
+        .collect();
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    assert_eq!(selected[0]["package"]["version"], "0.1.0");
+    assert_eq!(selected[0]["selected"], true);
+    assert!(rig.serves(RUNTIME).await, "the installed package launches");
+    assert!(rig.staging_leftovers().is_empty());
+}
+
+/// `plugin install <official id>` while a local package holds the runtime id
+/// the verified index reserved is refused with `package_runtime_conflict`
+/// naming the local holder; the holder stays installed and serving and nothing
+/// is staged.
+#[tokio::test]
+async fn an_official_install_over_a_local_runtime_holder_is_refused() {
+    let rig = Rig::start().await;
+    let local = archive_of(LOCAL_PACKAGE_ID, RESERVED_RUNTIME, "1.0.0");
+    let local_file = rig.install.write("local.tar.zst", &local.bytes);
+    let (code, document) = rig
+        .install
+        .json(&[
+            "plugin",
+            "install",
+            local_file.to_str().expect("utf-8 path"),
+            "--sha256",
+            local.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{document}");
+    let official = Listing::of(
+        RESERVED_PACKAGE_ID,
+        RESERVED_RUNTIME,
+        "1.0.0",
+        rig.server.url(&archive_path("1.0.0")),
+    );
+    rig.server.set(
+        INDEX_PATH,
+        Route::Body(rig.keys.signed(vec![official.entry()])),
+    );
+    rig.server.set(
+        &archive_path("1.0.0"),
+        Route::Body(official.archive.bytes.clone()),
+    );
+    rig.refresh().await;
+
+    let run = rig
+        .run(
+            &["plugin", "install", RESERVED_PACKAGE_ID, "--yes"],
+            &rig.official_urls(),
+        )
+        .await;
+
+    assert_ne!(run.code, 0, "{} / {}", run.document, run.stderr);
+    assert_eq!(err_code(&run.document), "package_runtime_conflict");
+    assert_eq!(
+        run.document["err"]["details"]["holder"], LOCAL_PACKAGE_ID,
+        "{}",
+        run.document
+    );
+    let packages = rig.install.packages().await;
+    assert_eq!(packages.len(), 1, "{packages:?}");
+    assert_eq!(packages[0]["package"]["id"], LOCAL_PACKAGE_ID);
+    assert_eq!(packages[0]["selected"], true);
+    assert!(
+        rig.serves(RESERVED_RUNTIME).await,
+        "the local holder keeps launching"
+    );
+    assert!(rig.staging_leftovers().is_empty());
 }
 
 /// A schema 1 install that moves only the revocation mark leaves the stored
