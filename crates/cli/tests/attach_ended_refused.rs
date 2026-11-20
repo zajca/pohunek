@@ -94,12 +94,19 @@ enum Mode {
     /// removal committed during the restart). The attach must end at
     /// once.
     RemovedDuringRestart,
-    /// #2448: after the stream EOF every probe is refused with
-    /// `daemon_shutting_down` while the daemon goes away, then the probe
-    /// sees `running`, serves a second attach, and ends that stream with
-    /// a stop. The attach must retry across the shutting-down probes
+    /// #2448: after the stream EOF the first two probes are refused
+    /// with `daemon_shutting_down` while the daemon goes away, then the
+    /// probe sees `running`, serves a second attach, and ends that stream
+    /// with a stop. The attach must retry across the shutting-down probes
     /// and reattach instead of failing.
     DaemonShuttingDown,
+    /// L2: after the stream EOF the probes see `running`, but the
+    /// fixture refuses the first re-attach with
+    /// `daemon_shutting_down` (the drain started between the probe and
+    /// the re-attach). The attach must route that retryable re-attach
+    /// refusal back through the reconnect budget and window, then
+    /// re-attach on the retried probe instead of erroring.
+    ShuttingDownReattach,
 }
 
 /// What the fixture tracks around the attach stream EOF.
@@ -255,7 +262,8 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
             Mode::RefusedReattach
             | Mode::RefuseFirstAttach
             | Mode::RemovedBeforeProbe
-            | Mode::DaemonShuttingDown => 0,
+            | Mode::DaemonShuttingDown
+            | Mode::ShuttingDownReattach => 0,
         })),
         ..Fixture::default()
     };
@@ -265,6 +273,7 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
             | Mode::RemovedDuringRestart
             | Mode::RemovedBeforeProbe
             | Mode::DaemonShuttingDown
+            | Mode::ShuttingDownReattach
     ) {
         // The modes script every post-EOF answer explicitly. The outage
         // itself needs no scripted answer: the fixture drops the first
@@ -287,13 +296,25 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
                 Mode::RemovedBeforeProbe | Mode::RemovedDuringRestart => {
                     vec![InspectAnswer::NotFound, InspectAnswer::State("stopped")]
                 }
-                // #2448: the going-away daemon refuses the first probes
-                // with `daemon_shutting_down`, which the client must
-                // retry; the `running` answer then re-attaches like the
-                // restart resume above.
+                // #2448: the going-away daemon refuses the first two
+                // probes with `daemon_shutting_down`, which the client
+                // must retry; the `running` answer then re-attaches like
+                // the restart resume above.
                 Mode::DaemonShuttingDown => vec![
                     InspectAnswer::ShuttingDown,
                     InspectAnswer::ShuttingDown,
+                    InspectAnswer::State("running"),
+                ],
+                // L2: in mode ShuttingDownReattach the refused re-attach is
+                // the first post-EOF attach and consumes no scripted answer,
+                // so the re-attach script only queues the retried probe: the
+                // first `running` answer probes `Reattach` and refuses, the
+                // retry (`ShuttingDown` becomes `Retry`) probes `Reattach`
+                // again and is served. Queue a second scripted `running` for
+                // that retry; the terminal `stopped` after the queue ends the
+                // served stream as usual.
+                Mode::ShuttingDownReattach => vec![
+                    InspectAnswer::State("running"),
                     InspectAnswer::State("running"),
                 ],
                 // The first attach and the refused modes script no
@@ -330,7 +351,7 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
     command.cwd(env.cwd());
     let child = pair.slave.spawn_command(command).expect("start the attach");
     drop(pair.slave);
-    let cli = CliProcess(child);
+    let mut cli = CliProcess(child);
     let _env = env;
     let mut reader = pair.master.try_clone_reader().expect("pty reader");
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -352,18 +373,17 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
     });
 
     if !matches!(mode, Mode::RefuseFirstAttach) {
-        // The client attaches and opens the subscription before the
-        // reconnect path is armed; wait for that round-trip to settle so the
-        // kill is not raced with setup. The client fails fast when the
-        // socket path has nobody listening, so the attach ID alone only
-        // proves that settling: an attach with no subscription yet was
-        // rejected before reaching the fixture.
+        // The raw stream and the status updater's subscription arrive on
+        // two fixture threads, so neither orders the other: wait for both
+        // the subscription record and the stored first stream before the
+        // kill takes the stream the client reads from.
         poll_until("the fixture to serve the attach and subscription", || {
-            fixture
+            let subscribed = fixture
                 .methods()
                 .iter()
-                .any(|method| method == protocol::method::SUBSCRIBE)
-                .then_some(())
+                .any(|method| method == protocol::method::SUBSCRIBE);
+            let stored = fixture.stream.lock().expect("stream lock").is_some();
+            (subscribed && stored).then_some(())
         });
         // The stop kills the raw stream while the session is still listed as
         // running; the client reads EOF on its next read.
@@ -377,15 +397,25 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
             .expect("kill the attach stream");
     }
 
-    if matches!(mode, Mode::RestartAndResume | Mode::DaemonShuttingDown) {
+    if matches!(
+        mode,
+        Mode::RestartAndResume | Mode::DaemonShuttingDown | Mode::ShuttingDownReattach
+    ) {
         // End the resumed stream when the client has opened it: the stop
-        // made the client detach and probe again, and the client stores
-        // the re-attach stream as soon as the connection arrives at the
-        // fixture. Wait for the attach count and then the stored stream
-        // in two steps so a connection that arrives before its reply
-        // cannot end the wrong stream.
+        // made the client detach and probe again, and the fixture stores
+        // the re-attach stream when the raw-stream connection arrives.
+        // Wait for the attach count and then the stored stream in two
+        // steps so a connection that arrives before its reply cannot end
+        // the wrong stream. Either wait also ends when the client has
+        // exited: a refused re-attach must fail the assertions below
+        // with the client output, never at the hang guard.
         poll_until("the fixture to serve the re-attach", || {
-            (fixture.restart_attaches() == 1).then_some(())
+            (fixture.restart_attaches() == 1).then_some(()).or_else(|| {
+                cli.0
+                    .try_wait()
+                    .expect("poll the attach client")
+                    .map(|_| ())
+            })
         });
         poll_until("the fixture to store the re-attach stream", || {
             fixture
@@ -394,22 +424,34 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
                 .expect("resumed stream lock")
                 .is_some()
                 .then_some(())
+                .or_else(|| {
+                    cli.0
+                        .try_wait()
+                        .expect("poll the attach client")
+                        .map(|_| ())
+                })
         });
-        fixture
-            .resumed_stream
-            .lock()
-            .expect("resumed stream lock")
-            .take()
-            .expect("the re-attach stream is open")
-            .shutdown(std::net::Shutdown::Both)
-            .expect("stop the resumed stream");
+        if cli
+            .0
+            .try_wait()
+            .expect("poll the attach client before the stop")
+            .is_none()
+        {
+            fixture
+                .resumed_stream
+                .lock()
+                .expect("resumed stream lock")
+                .take()
+                .expect("the re-attach stream is open")
+                .shutdown(std::net::Shutdown::Both)
+                .expect("stop the resumed stream");
+        }
     }
 
     // The client must end on its own once the stop commits. With the
     // trailing `stopped` scripted, a reverted client ends on the
     // `stopped` probe and fails the removed-message and tail
     // assertions.
-    let mut cli = cli;
     let status = poll_until("the attach client to exit after the stop", || {
         cli.0.try_wait().expect("poll the attach client")
     });
@@ -489,7 +531,7 @@ fn serve_connection(stream: UnixStream, fixture: &Fixture) {
             if fixture.detached()
                 && matches!(
                     fixture.mode(),
-                    Mode::RestartAndResume | Mode::DaemonShuttingDown
+                    Mode::RestartAndResume | Mode::DaemonShuttingDown | Mode::ShuttingDownReattach
                 )
                 && fixture.stream.lock().expect("stream lock").is_none()
             {
@@ -533,14 +575,15 @@ fn serve_connection(stream: UnixStream, fixture: &Fixture) {
             // across the reply: the guard must not survive into the
             // branch, where the same mutex is touched again.
             let scripted = match fixture.mode() {
-                Mode::RestartAndResume | Mode::RemovedDuringRestart | Mode::DaemonShuttingDown => {
-                    fixture
-                        .post_eof_inspects
-                        .lock()
-                        .expect("inspects lock")
-                        .first()
-                        .copied()
-                }
+                Mode::RestartAndResume
+                | Mode::RemovedDuringRestart
+                | Mode::DaemonShuttingDown
+                | Mode::ShuttingDownReattach => fixture
+                    .post_eof_inspects
+                    .lock()
+                    .expect("inspects lock")
+                    .first()
+                    .copied(),
                 _ => None,
             };
             if let Some(answer) = scripted {
@@ -630,7 +673,14 @@ fn serve_connection(stream: UnixStream, fixture: &Fixture) {
 
 /// Fixture replies for the control requests the attach makes. The restart
 /// outage lives one layer up, in `serve_connection`: this function only
-/// answers the connections the fixture accepts.
+/// answers the connections the fixture accepts. `post_eof_tail` covers
+/// the probe and re-attach order the fixed client takes through the
+/// reconnect budget precisely because each mode scripts exactly the
+/// requests it asserts: unspecified modes answer `running` and any later
+/// post-EOF probe reports the terminal state so the stream can end.
+/// For `ShuttingDownReattach`, the served scripted probes are ordered
+/// before any fallback `stopped`, so the assertions read the refused
+/// re-attach's retry order off the log, not off timing.
 #[allow(
     clippy::too_many_lines,
     clippy::needless_pass_by_value,
@@ -663,6 +713,42 @@ fn result_for(request: &Request, fixture: Fixture) -> Response {
                 )
                 .expect("valid fixture response");
             }
+            // L2: in ShuttingDownReattach the first re-attach is the
+            // only attach after the EOF detach (no outage drops it), so
+            // refuse exactly it with `daemon_shutting_down`: the drain
+            // started between the probe and the re-attach. The fixed
+            // client retries through the reconnect budget; every other
+            // attach after the EOF detach is the served re-attach with
+            // a fresh stream.
+            if fixture.detached() && fixture.mode() == Mode::ShuttingDownReattach {
+                let attempt = {
+                    let mut served = fixture
+                        .restart_attaches
+                        .lock()
+                        .expect("restart attaches lock");
+                    *served += 1;
+                    *served
+                };
+                if attempt == 1 {
+                    return Response::err(
+                        PROTOCOL_VERSION,
+                        request.id(),
+                        ProtocolError::new(
+                            ErrorClass::Runtime,
+                            "daemon_shutting_down",
+                            "the daemon is shutting down",
+                            None,
+                        ),
+                    )
+                    .expect("valid fixture response");
+                }
+                return Response::ok(
+                    PROTOCOL_VERSION,
+                    request.id(),
+                    json!({ "stream_id": STREAM_ID }),
+                )
+                .expect("valid fixture response");
+            }
             // The second attach is the re-attach of mode RefusedReattach:
             // the stop committed between the probe inspect and this
             // re-attach, so the session is no longer attachable. The
@@ -685,7 +771,8 @@ fn result_for(request: &Request, fixture: Fixture) -> Response {
                 // both the reply and the stored stream are visible. The
                 // probe reports the terminal state afterwards, so any
                 // later attach is refused like the ended stop in mode
-                // `RefusedReattach`.
+                // `RefusedReattach`. Count it so the main thread can
+                // wait for the served re-attach and then its stream.
                 *fixture
                     .restart_attaches
                     .lock()
@@ -772,7 +859,10 @@ fn result_for(request: &Request, fixture: Fixture) -> Response {
             } else if probe_after_eof
                 && matches!(
                     fixture.mode(),
-                    Mode::RestartAndResume | Mode::RemovedDuringRestart | Mode::DaemonShuttingDown
+                    Mode::RestartAndResume
+                        | Mode::RemovedDuringRestart
+                        | Mode::DaemonShuttingDown
+                        | Mode::ShuttingDownReattach
                 )
                 && fixture
                     .post_eof_inspects
@@ -1141,6 +1231,57 @@ fn an_attach_retries_across_daemon_shutting_down_and_reattaches() {
     assert!(
         !output.contains("given up") && !output.contains("reattach attempts"),
         "no re-attach failure precedes the resumed stream: {output:?}"
+    );
+}
+
+#[test]
+fn a_re_attach_refused_by_a_draining_daemon_is_retried() {
+    let (exited_zero, output, fixture) = attach_scenario(Mode::ShuttingDownReattach);
+    assert!(
+        exited_zero,
+        "the attach survives the refused re-attach with exit 0: {output:?}"
+    );
+    assert!(
+        !output.contains("daemon_shutting_down"),
+        "the refused re-attach never surfaces as an error: {output:?}"
+    );
+    assert!(
+        !output.contains("attach ended"),
+        "the resumed session is not reported as ended: {output:?}"
+    );
+    assert_eq!(
+        fixture.restart_attaches(),
+        2,
+        "the refused re-attach is retried until it is served: {:?}",
+        fixture.methods()
+    );
+    let post_eof = post_eof_tail(&fixture);
+    let positions = |method: &str| -> Vec<usize> {
+        post_eof
+            .iter()
+            .enumerate()
+            .filter(|(_, seen)| *seen == method)
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let inspects = positions(protocol::method::SESSION_INSPECT);
+    let attaches = positions(protocol::method::SESSION_ATTACH);
+    let detaches = positions(protocol::method::SESSION_DETACH);
+    assert!(
+        inspects.len() >= 2,
+        "the probe and its retry run before the stop-observing probe: {:?}",
+        fixture.methods()
+    );
+    assert_eq!(
+        attaches.len(),
+        2,
+        "the refused re-attach runs again after the retried probe: {:?}",
+        fixture.methods()
+    );
+    assert!(
+        inspects[0] < attaches[0] && attaches[1] < detaches[0],
+        "the first probe precedes the refused re-attach, the retry serves it before the stop: {:?}",
+        fixture.methods()
     );
 }
 
