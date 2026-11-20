@@ -4521,7 +4521,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertEqual(int(retention.group(1)), 30)
         self.assertIn("overwrite: true", upload)
 
-    def test_the_reuse_job_runs_on_a_push_while_the_kill_switch_is_on(self):
+    def test_the_reuse_job_condition_admits_only_a_push_and_a_delta_main_dispatch(self):
         condition = job_condition(REUSE_JOB)
         on = bool(evaluate_needs_expression(
             condition, event="push",
@@ -4539,6 +4539,13 @@ class DeltaReuseWiringTests(unittest.TestCase):
             changes=dict(changes_of("workflow_dispatch")),
         ))
         self.assertFalse(nightly, "a nightly dispatch never runs reuse")
+        delta = bool(evaluate_needs_expression(
+            condition, event="workflow_dispatch", tier="main",
+            inputs={"delta": True},
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("workflow_dispatch")),
+        ))
+        self.assertTrue(delta, "a delta main dispatch runs reuse")
         full = bool(evaluate_needs_expression(
             condition, event="workflow_dispatch", tier="main",
             inputs={"delta": False},

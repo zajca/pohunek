@@ -1151,6 +1151,36 @@ else:
         self.assertEqual(self.output.read_text(), "")
         self.assertFalse((self.directory / f"ci-reuse-{TREE}.json").exists())
 
+    def test_dry_run_returns_after_the_report_when_the_decision_fails(self):
+        # A failed decision leaves an empty skip list; `--dry-run` still stops
+        # after the report and never reaches the step outputs or the record.
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [{"name": f"tested-tree-{TREE}", "id": 1}]},
+        )
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("ci_reuse_under_test", str(SCRIPT))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        module.commit_tree = lambda sha: TREE
+
+        def refuse(*args, **kwargs):
+            raise module.ReuseError("the decision failed")
+
+        module.decide = refuse
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = module.main(now=NOW, argv=["--dry-run"])
+        lines = [line for line in buffer.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(rc, 0)
+        decision = json.loads(lines[-1])
+        self.assertEqual(decision["skip"], [])
+        self.assertEqual(decision["reason"], "the decision failed")
+        self.assertEqual(self.output.read_text(), "")
+        self.assertFalse((self.directory / f"ci-reuse-{TREE}.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

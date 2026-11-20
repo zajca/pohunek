@@ -799,9 +799,18 @@ class RunRowsTests(unittest.TestCase):
         self.assertFalse(self.rows.attestation("alpha").exists())
 
     def test_a_detached_process_with_a_scrubbed_environment_is_found_by_its_working_directory(self):
+        detached_pid = self.rows.directory / "detached.pid"
         self.consumer(
             'if [ "$row" = alpha ]; then\n'
-            f'    (cd "$HOME" && {DETACH} /usr/bin/env -i /bin/sleep 300 </dev/null >/dev/null 2>&1 &)\n'
+            f'    (cd "$HOME" && {{ {DETACH} /usr/bin/env -i /bin/sleep 300 </dev/null >/dev/null 2>&1 & '
+            f'echo $! > {detached_pid}; }})\n'
+            # The pid is the same through the perl, env and sleep execs; the row
+            # returns only once it names sleep, so the guard scans a settled
+            # process. The poll is bounded; a miss leaves the assertion below to fail.
+            "    for _ in $(seq 400); do\n"
+            f'        ps -o comm= -p "$(cat {detached_pid})" 2>/dev/null | grep -q sleep && break\n'
+            "        /bin/sleep 0.05\n"
+            "    done\n"
             "fi\n"
             f"{PASSING_CONSUMER}"
         )
