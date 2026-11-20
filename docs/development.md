@@ -345,6 +345,11 @@ cargo build --workspace --release
 cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks/prompt-contract shape, doc commands vs the clap tree, crate table, package lists, numeric protocol/schema facts, doc index
 ```
 
+Before the push, `scripts/guard-pack --base origin/main` runs the pull-request
+gates the list above lacks (changelog fragment, package version bump, macOS
+test selection for an added `#[ignore`, docs check) and names each failing gate;
+an `UNDECIDED` line is a gate only CI can decide (see the gates skill).
+
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see the
 [verification guide](../.agents/instructions/verification.md) for watcher and
 CI-timing variants):
