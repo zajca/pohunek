@@ -1330,6 +1330,17 @@ so a package that ranks such a rule above a blocker also lists a 0.39.0 feature
 in `requires`, as the official Codex package does). The table and the flag are rejected when malformed, and a rule
 flag without the table is an error.
 
+A blocked rule that sets `visible_blocker = true` names a dialog the user must
+answer, drawn on the screen. It outranks a held record, and it holds `blocked`
+while the agent keeps writing output that changes no screen text (cursor
+moves, cursor show/hide, a redraw of the same frame), with or without a record
+held. A blocked rule without the flag (loose transcript text) and a
+title-sourced blocker alone do not: bytes over them read as working. A
+`visible_blocker` title or progress rule that outranks a dialog rule still holds
+`blocked` while the screen alone names a `visible_blocker` dialog; the state's
+source is then `osc_title` or `osc_progress`, the winning rule's. Set the flag on every rule that matches a
+real dialog.
+
 The record is arbitrated with the screen rules (a visible dialog always wins
 over a non-blocked record; a `blocked` record always wins; `working` reads
 working; `done`, `idle` and `error` read idle), reported as `state_source =

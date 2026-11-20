@@ -1217,7 +1217,10 @@ priority order:
    per-agent rule sets (regions + contains/regex/any/not gates). This is how
    interactive approval prompts are detected (e.g. Claude's "enter to select" /
    "esc to cancel" form).
-3. **PTY activity (working authority).** Bytes flowing = working. Idle
+3. **PTY activity (working authority).** Bytes flowing = working, except
+   output that changes no screen text (cursor moves, cursor show/hide, a
+   redraw of the same characters) while a `visible_blocker` screen rule still
+   wins the screen: that output restates the dialog and keeps `blocked`. Idle
    transitions are debounced behind a stability window (recheck ~100 ms, ~3
    confirmations, ~700 ms cap) and gated on visible UI confirmation to avoid
    flicker.
@@ -1262,7 +1265,8 @@ the screen rules stay the fallback.
 - **Evidence order.** From strongest to weakest: a visible dialog; the
   authoritative 7501 root record; a stale record's screen fallback (see
   Staleness below); OSC 9;4 progress and titles; screen text;
-  process activity; unknown. A hook or `session report-agent` report that
+  process activity (a visible dialog also outranks it for output that changes
+  no screen text); unknown. A hook or `session report-agent` report that
   carries the activity sits above all detector evidence: while it is current
   no detector transition, record included, is applied.
 - **Arbitration.** One fixed rule combines the held record with the screen
@@ -1286,7 +1290,13 @@ the screen rules stay the fallback.
   working screen match. `done`, `idle` and `error` are one pohunek activity, so a
   restated or changed one among them is no transition (`error` folds into idle).
   Because a held record is structured evidence, the bytes-flowing fallback does
-  not fire under it.
+  not fire under it. With no record held, the fallback also does not fire for a
+  chunk that changes no screen text while a `visible_blocker` screen rule wins
+  the whole screen; weak blockers and a title-sourced blocker alone keep the
+  fallback. A `visible_blocker` title or progress blocker that outranks such a
+  dialog (Codex "Action Required" over its approval prompt) holds `blocked`
+  with source `osc_title` or `osc_progress` as long as the screen alone still
+  names a `visible_blocker` dialog.
 - **Staleness.** A manifest may declare `[program_status] stale_after_ms`. A
   held record that disagrees with the screen winner for at least that long
   (a `blocked` record over an idle or working screen with no dialog, a
