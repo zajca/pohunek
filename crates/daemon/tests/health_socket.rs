@@ -4231,6 +4231,8 @@ with open({received:?}, "wb") as capture:
 
 #[tokio::test]
 async fn claude_initial_input_is_not_sent_before_the_prompt_box_renders() {
+    let daemon_log = connection_shutdown::Captured::default();
+    let _log_guard = connection_shutdown::capture_logs(&daemon_log);
     let socket = temp_socket("claude-no-prompt");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -4258,7 +4260,11 @@ async fn claude_initial_input_is_not_sent_before_the_prompt_box_renders() {
     let sessions: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
             .expect("list sessions");
-    assert!(sessions.is_empty(), "the refused session was rolled back");
+    assert!(
+        sessions.is_empty(),
+        "the refused session was rolled back: {sessions:?}\ndaemon log:\n{}",
+        daemon_log.text()
+    );
     let captured = std::fs::read(&received).unwrap_or_default();
     assert!(
         captured.is_empty(),
@@ -6102,6 +6108,8 @@ async fn codex_popup_is_refused(override_manifest: Option<&str>) {
 /// `rules = []` override publishes no screen verdict and refuses with
 /// either ordering, so it runs unheld.
 async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_deadline: bool) {
+    let daemon_log = connection_shutdown::Captured::default();
+    let _log_guard = connection_shutdown::capture_logs(&daemon_log);
     let socket = temp_socket("codex-popup");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -6169,7 +6177,11 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
     let sessions: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
             .expect("list sessions");
-    assert!(sessions.is_empty(), "the refused session was rolled back");
+    assert!(
+        sessions.is_empty(),
+        "the refused session was rolled back: {sessions:?}\ndaemon log:\n{}",
+        daemon_log.text()
+    );
     let captured = std::fs::read(&received).unwrap_or_default();
     assert!(
         captured.is_empty(),
@@ -6248,6 +6260,8 @@ fn arm_readiness_deadline_hold(
 /// verdict.
 #[tokio::test]
 async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_the_update_popup() {
+    let daemon_log = connection_shutdown::Captured::default();
+    let _log_guard = connection_shutdown::capture_logs(&daemon_log);
     let socket = temp_socket("codex-popup-stale");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -6310,7 +6324,11 @@ async fn codex_initial_input_is_refused_while_a_stale_idle_title_survives_under_
     let sessions: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
             .expect("list sessions");
-    assert!(sessions.is_empty(), "the refused session was rolled back");
+    assert!(
+        sessions.is_empty(),
+        "the refused session was rolled back: {sessions:?}\ndaemon log:\n{}",
+        daemon_log.text()
+    );
     let captured = std::fs::read(&received).unwrap_or_default();
     assert!(
         captured.is_empty(),
@@ -6650,6 +6668,8 @@ with open({received:?}, "wb") as capture:
 /// an older client's launch is refused and rolled back as for Claude.
 #[tokio::test]
 async fn pi_initial_input_is_not_sent_before_its_editor_frame_renders() {
+    let daemon_log = connection_shutdown::Captured::default();
+    let _log_guard = connection_shutdown::capture_logs(&daemon_log);
     let socket = temp_socket("pi-no-frame");
     let agents_dir = socket.dir.join("agents");
     std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
@@ -6696,7 +6716,11 @@ with open({received:?}, "wb") as capture:
     let sessions: Vec<SessionInfo> =
         serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
             .expect("list sessions");
-    assert!(sessions.is_empty(), "the refused session was rolled back");
+    assert!(
+        sessions.is_empty(),
+        "the refused session was rolled back: {sessions:?}\ndaemon log:\n{}",
+        daemon_log.text()
+    );
     let captured = std::fs::read(&received).unwrap_or_default();
     assert!(
         captured.is_empty(),
