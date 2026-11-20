@@ -4539,6 +4539,13 @@ class DeltaReuseWiringTests(unittest.TestCase):
             changes=dict(changes_of("workflow_dispatch")),
         ))
         self.assertFalse(nightly, "a nightly dispatch never runs reuse")
+        delta = bool(evaluate_needs_expression(
+            condition, event="workflow_dispatch", tier="main",
+            inputs={"delta": True},
+            outputs={REUSE_JOB: {"skip": "[]"}},
+            changes=dict(changes_of("workflow_dispatch")),
+        ))
+        self.assertTrue(delta, "a delta main dispatch runs reuse")
         full = bool(evaluate_needs_expression(
             condition, event="workflow_dispatch", tier="main",
             inputs={"delta": False},
