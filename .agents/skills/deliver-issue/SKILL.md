@@ -115,7 +115,12 @@ slice:
 1. Run the full applicable gate set per the `gates` skill once on the final
    revision of each slice, on the whole worktree, not per crate. A gate that
    cannot run locally (see environment rules) is named as CI-only in the
-   evidence, never silently skipped.
+   evidence, never silently skipped. Then run
+   `scripts/guard-pack --base origin/main` on the checked-out head and fix every
+   `FAIL` before the push; an `UNDECIDED` gate is CI-only and goes into the
+   evidence as such. When the diff changes a file under `crates/`, run
+   `scripts/red-on-old` (see `pr-handoff`) before the Opus review in step 3 and
+   keep its table for the PR body.
 2. Commit per `pr-handoff`: explicit staging, `--no-gpg-sign`, concise
    imperative English message with the *why*, no trailers or footers.
 3. Run a local Opus subagent review of `git diff origin/main...HEAD` for the

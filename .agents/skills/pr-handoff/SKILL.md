@@ -115,6 +115,23 @@ unpublished slices as pending.
      `path:line` evidence, test counts, and any verification step worth
      repeating by hand. This section mirrors the final audit report; do not
      invent or embellish results.
+   - *Red on old code* — required when the diff changes a file under `crates/`;
+     a diff that touches only docs, `.agents/`, `.github/` or `scripts/` is
+     exempt, and no label is involved. Paste the table that
+     `HEAVY_RUN=scripts/heavy-run scripts/red-on-old --base origin/main
+     --scratch-root <dir> --rows ... --scenario <row>=<nextest filterset>
+     --package <package>` prints (the tree must be committed and clean): one row
+     per contract or case-table row, with the scenario that proves it, its
+     result on the old code (a failing test) and on the new code (passing). A
+     row the script cannot revert (the fix and its test share a file, a changed
+     file's `mod` declaration cannot be read, or the old tree does not build)
+     carries `--manual <row>=<how the old behaviour
+     was reproduced>` next to its `--scenario`, which still runs on the new
+     code. Test code is what the old tree keeps: files under `tests` or
+     `fixtures`, `tests.rs`, `*_tests.rs`, `crates/test-support/`, and every
+     source file a `#[cfg(test)] mod` declaration names, with the files below
+     such a directory module. End the section with a `Not tried:` line naming every
+     row, state or path no scenario covers, or `Not tried: nothing`.
 5. **Open and verify.** `gh` in a non-interactive agent shell never prompts:
    save the assembled title and body to a scratch file and pass them
    explicitly — `gh pr create --base <main-or-previous-slice-branch> --head

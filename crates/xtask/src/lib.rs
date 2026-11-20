@@ -408,7 +408,8 @@ pub fn check_docs(
 
 /// Runs the drift checks between the docs and their sources of truth (the
 /// clap command tree, the workspace members, `runtime-packages/`, the
-/// documentation indexes) against the checkout at `repo`, printing one
+/// documentation indexes, the protocol, worker-protocol and store schema
+/// constants) against the checkout at `repo`, printing one
 /// `[PASS]`/`[FAIL]` line per check, and returns the names of the failed ones.
 ///
 /// # Errors
@@ -418,6 +419,19 @@ pub fn check_docs(
 /// root is expected.
 pub fn check_doc_drift(repo: impl AsRef<Path>) -> Result<Vec<&'static str>, XtaskError> {
     doc_drift::check(repo.as_ref())
+}
+
+/// The numeric statements of the docs at `repo` that differ from the protocol,
+/// worker-protocol and store schema constants, as
+/// `<page>:<line> states <fact>, but <CONSTANT> in <source> is <value>`.
+///
+/// # Errors
+///
+/// Returns [`XtaskError::Io`] when a page or the source file of a constant
+/// cannot be read, and [`XtaskError::UnsupportedFileType`] for a symbolic link
+/// where a documentation root is expected.
+pub fn doc_fact_problems(repo: impl AsRef<Path>) -> Result<Vec<String>, XtaskError> {
+    doc_drift::numeric_fact_problems(repo.as_ref())
 }
 
 /// Dispatch of the `claude` command; a nonzero outcome becomes the

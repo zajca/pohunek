@@ -342,8 +342,17 @@ cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spa
 scripts/heavy-run cargo nextest run --profile ci --test-threads 16 --workspace --all-features  # the only 16-thread command; never plain cargo tw
 cargo test --doc --workspace --all-features  # nextest excludes doctests
 cargo build --workspace --release
-cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks/prompt-contract shape, doc commands vs the clap tree, crate table, package lists, doc index
+cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks/prompt-contract shape, doc commands vs the clap tree, crate table, package lists, numeric protocol/schema facts, doc index
 ```
+
+Before the push, `scripts/guard-pack --base origin/main` runs the pull-request
+gates the list above lacks (changelog fragment, package version bump, macOS
+test selection for an added `#[ignore`, docs check) and names each failing gate;
+an `UNDECIDED` line is a gate only CI can decide (see the gates skill). A diff
+that changes a file under `crates/` also carries the table of
+`scripts/red-on-old` in the PR body: each regression scenario run on the old
+code (the changed non-test files restored to the merge base, in a scratch
+worktree) and on the new code (see the `pr-handoff` skill).
 
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see the
 [verification guide](../.agents/instructions/verification.md) for watcher and

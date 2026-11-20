@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Run the pre-push gates that CI runs on a pull request and local gates miss.
+
+Each gate is the exact CI command in its own process with its own exit code,
+and prints one line:
+
+  <gate>: PASS|FAIL|UNDECIDED|SKIP (<reason>)
+
+The last line is the summary. It lists every UNDECIDED gate: an undecided gate
+could not run here (no network, no published release) and CI still enforces
+it, so it is never green. A SKIP is a gate that does not apply to the diff. The
+exit code is 1 when any gate fails and 0 otherwise.
+
+The cargo gates read the checked-out working tree, so `--head` must be the
+checked-out commit (the default). The full output of every gate is written to
+`target/guard-pack/<head-sha>/<gate>.log`.
+
+Usage:
+  scripts/guard-pack --base REV [--head REV] [--labels-json JSON] [--root DIR]
+
+`$CARGO`, `$GH` and `$HEAVY_RUN` replace `cargo`, `gh` and `scripts/heavy-run`.
+`--root` names another repository tree and defaults to the one holding this
+script.
+
+Gates, in order:
+  changelog-check    python3 scripts/changelog check
+  changelog-guard    python3 scripts/changelog guard (a fragment or the exemption label)
+  package-affected   cargo xtask package affected
+  package-bump       the version gate of the official packages against the last release
+  test-selection     scripts/test-partitions check-macos, only when the diff adds `#[ignore`
+  docs-check         cargo xtask docs check
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+MACOS_PLATFORM = "darwin"
+# Names the host platform instead of `sys.platform` (for the scenarios).
+PLATFORM_VARIABLE = "GUARD_PACK_PLATFORM"
+PASS = "PASS"
+FAIL = "FAIL"
+UNDECIDED = "UNDECIDED"
+SKIP = "SKIP"
+
+# Mirrors PACKAGE_BUMP_RELEASE_LIMIT of .github/workflows/ci.yml.
+RELEASE_LIST_LIMIT = 200
+# Mirrors PACKAGE_BASELINE_FETCH_TIMEOUT of .github/workflows/ci.yml.
+BASELINE_FETCH_TIMEOUT_SECONDS = 120
+
+CHANGELOG_CONFIG = ".github/changelog.json"
+RELEASE_VERSION_SCRIPT = "scripts/release-workflow/version"
+CATALOG_ASSET = "runtime-catalog.json"
+CATALOG_ANCHOR = "packaging/runtime-catalog-anchor.json"
+SCRATCH_DIRECTORY = "target/guard-pack"
+PARTITIONS_SCRIPT = "scripts/test-partitions"
+# The archive CI builds for the macOS partition check; the scope is `all`.
+MACOS_ARCHIVE_NAME = "macos-all.tar.zst"
+MACOS_PROFILE = "macos"
+IGNORED_TEST_ATTRIBUTE = "#[ignore"
+RELEASE_TAG = re.compile(r"v([0-9]+)\.([0-9]+)\.([0-9]+)")
+MISSING_TESTS = re.compile(r"missing=(\[[^\]]*\])")
+NO_FRAGMENT_HINT = "no fragment; the no-changelog label would exempt"
+
+
+class Gate:
+    """The outcome of one gate."""
+
+    def __init__(self, name: str, status: str, reason: str) -> None:
+        self.name = name
+        self.status = status
+        self.reason = reason
+
+    def line(self) -> str:
+        return f"{self.name}: {self.status} ({self.reason})"
+
+
+class Context:
+    """Everything a gate needs: the tree, the revisions and the programs."""
+
+    def __init__(self, root: Path, base: str, head: str, labels_json: str | None) -> None:
+        self.root = root
+        self.base = base
+        self.head = head
+        self.labels_json = labels_json
+        self.cargo = os.environ.get("CARGO", "cargo")
+        self.gh = os.environ.get("GH", "gh")
+        self.heavy_run = os.environ.get("HEAVY_RUN", str(root / "scripts" / "heavy-run"))
+        self.platform = os.environ.get(PLATFORM_VARIABLE, sys.platform)
+        self.head_sha = ""
+        self.scratch = root
+
+    def run(self, name: str, command: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+        """Runs `command` in the tree and keeps its output in the gate's log."""
+        try:
+            result = subprocess.run(
+                command, cwd=self.root, capture_output=True, text=True, timeout=timeout,
+            )
+        except FileNotFoundError as error:
+            result = subprocess.CompletedProcess(command, 127, "", f"{error}")
+        except OSError as error:
+            result = subprocess.CompletedProcess(command, 126, "", f"{error}")
+        self.log(name, command, result)
+        return result
+
+    def log(self, name: str, command: list[str], result: subprocess.CompletedProcess) -> None:
+        with (self.scratch / f"{name}.log").open("a", encoding="utf-8") as log:
+            log.write(f"$ {' '.join(command)}\n(rc={result.returncode})\n")
+            log.write(result.stdout or "")
+            log.write(result.stderr or "")
+
+    def log_path(self, name: str) -> str:
+        return str((self.scratch / f"{name}.log").relative_to(self.root))
+
+
+def first_line(text: str) -> str:
+    """The first non-blank line of `text`, as a one-line reason."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return "no output"
+
+
+def last_error(result: subprocess.CompletedProcess) -> str:
+    """A one-line reason from a failed process: its last non-blank error line."""
+    lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    if not lines:
+        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    return lines[-1] if lines else "no output"
+
+
+def git(context: Context, *arguments: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *arguments], cwd=context.root, capture_output=True, text=True, check=False,
+    )
+
+
+def resolve(context: Context, revision: str) -> str:
+    result = git(context, "rev-parse", "--verify", f"{revision}^{{commit}}")
+    if result.returncode != 0:
+        sys.exit(f"guard-pack: {revision} is not a commit: {last_error(result)}")
+    return result.stdout.strip()
+
+
+def changelog_check(context: Context) -> Gate:
+    result = context.run(
+        "changelog-check", [sys.executable, str(context.root / "scripts/changelog"), "check"],
+    )
+    if result.returncode == 0:
+        return Gate("changelog-check", PASS, first_line(result.stdout))
+    return Gate("changelog-check", FAIL, f"{last_error(result)}; {context.log_path('changelog-check')}")
+
+
+def changelog_guard(context: Context) -> Gate:
+    command = [
+        sys.executable, str(context.root / "scripts/changelog"), "guard",
+        "--base", context.base, "--head", context.head,
+        "--labels-json", context.labels_json if context.labels_json is not None else "[]",
+    ]
+    result = context.run("changelog-guard", command)
+    if result.returncode == 0:
+        return Gate("changelog-guard", PASS, first_line(result.stdout))
+    reason = last_error(result)
+    if context.labels_json is None:
+        reason = f"{NO_FRAGMENT_HINT}: {reason}"
+    return Gate("changelog-guard", FAIL, f"{reason}; {context.log_path('changelog-guard')}")
+
+
+def package_affected(context: Context) -> Gate:
+    result = context.run(
+        "package-affected",
+        [context.cargo, "xtask", "package", "affected", "--base", context.base, "--json"],
+    )
+    if result.returncode == 0:
+        return Gate("package-affected", PASS, f"informational; {context.log_path('package-affected')}")
+    return Gate("package-affected", FAIL, f"{last_error(result)}; {context.log_path('package-affected')}")
+
+
+def undecided(cause: str) -> Gate:
+    return Gate("package-bump", UNDECIDED, f"CI-only: {cause}")
+
+
+def select_release(tags: list[str], version: str) -> str:
+    """The highest `vX.Y.Z` tag at or below `version`, without the `v`; empty when none."""
+    ceiling = tuple(int(part) for part in version.split("."))
+    best: tuple[int, ...] | None = None
+    for tag in tags:
+        match = RELEASE_TAG.fullmatch(tag.strip())
+        if match is None:
+            continue
+        candidate = tuple(int(part) for part in match.groups())
+        if candidate <= ceiling and (best is None or candidate > best):
+            best = candidate
+    return ".".join(str(part) for part in best) if best is not None else ""
+
+
+def repository_name(context: Context) -> str:
+    config = json.loads((context.root / CHANGELOG_CONFIG).read_text(encoding="utf-8"))
+    return config["repository"]
+
+
+def package_bump(context: Context) -> Gate:
+    gate = "package-bump"
+    version_run = context.run(gate, [str(context.root / RELEASE_VERSION_SCRIPT), "rehearsal", ""])
+    version = version_run.stdout.strip()
+    if version_run.returncode != 0 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        return Gate(gate, FAIL, f"the workspace version cannot be read: {last_error(version_run)}")
+    repository = repository_name(context)
+    listing = context.run(gate, [
+        context.gh, "release", "list", "--repo", repository, "--exclude-drafts",
+        "--exclude-pre-releases", "--limit", str(RELEASE_LIST_LIMIT),
+        "--json", "tagName", "--jq", ".[].tagName",
+    ])
+    if listing.returncode != 0:
+        return undecided(f"the releases of {repository} could not be listed: {last_error(listing)}")
+    released = select_release(listing.stdout.splitlines(), version)
+    if not released:
+        return undecided(f"no published release at or below the workspace version {version}")
+    baseline = context.scratch / "package-bump-baseline"
+    shutil.rmtree(baseline, ignore_errors=True)
+    baseline.mkdir(parents=True)
+    try:
+        download = context.run(gate, [
+            context.gh, "release", "download", f"v{released}", "--repo", repository,
+            "--dir", str(baseline), "--pattern", CATALOG_ASSET,
+        ], timeout=BASELINE_FETCH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return undecided(f"the catalog of v{released} was not downloaded within {BASELINE_FETCH_TIMEOUT_SECONDS}s")
+    if download.returncode != 0:
+        return undecided(f"the catalog of v{released} could not be downloaded: {last_error(download)}")
+    result = context.run(gate, [
+        context.cargo, "xtask", "package", "bump",
+        "--catalog", str(baseline / CATALOG_ASSET), "--anchor", CATALOG_ANCHOR,
+        "--release-dir", str(baseline), "--version", released, "--json",
+    ])
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        report = None
+    if result.returncode != 0:
+        if report is None:
+            return Gate(gate, FAIL, f"{last_error(result)}; {context.log_path(gate)}")
+        failing = ", ".join(
+            f"{name}: {entry.get('reason')}"
+            for name, entry in sorted(report.get("packages", {}).items())
+            if entry.get("verdict") == "fail"
+        )
+        return Gate(gate, FAIL, f"v{released}: {failing or last_error(result)}; {context.log_path(gate)}")
+    if report is None:
+        return Gate(gate, FAIL, f"the verdict is not JSON; {context.log_path(gate)}")
+    verdict = report.get("verdict")
+    if verdict == "undecided":
+        return undecided(f"the catalog of v{released} is absent")
+    if verdict == "pass":
+        return Gate(gate, PASS, f"against v{released}")
+    return Gate(gate, FAIL, f"unknown verdict {verdict!r}; {context.log_path(gate)}")
+
+
+def adds_ignored_test(context: Context) -> tuple[bool, str | None]:
+    """Whether the diff adds an ignored test, and the git error when the diff could not be read."""
+    diff = git(context, "diff", "-U0", f"{context.base}...{context.head}", "--", "*.rs")
+    if diff.returncode != 0:
+        return False, last_error(diff)
+    added = any(
+        line.startswith("+") and not line.startswith("+++") and IGNORED_TEST_ATTRIBUTE in line
+        for line in diff.stdout.splitlines()
+    )
+    return added, None
+
+
+def macos_packages(context: Context) -> list[str]:
+    """The packages of the `all` scope, read from the partition script itself."""
+    path = str(context.root / PARTITIONS_SCRIPT)
+    loader = importlib.machinery.SourceFileLoader("test_partitions_scope", path)
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return list(module.MACOS_SCOPES["all"][0])
+
+
+def test_selection(context: Context) -> Gate:
+    gate = "test-selection"
+    added, error = adds_ignored_test(context)
+    if error is not None:
+        return Gate(gate, FAIL, f"git diff failed: {error}")
+    if not added:
+        return Gate(gate, SKIP, "no ignored test added")
+    if context.platform != MACOS_PLATFORM:
+        # CI checks an archive built on macOS; a Linux archive lacks the macOS-only tests.
+        return Gate(gate, UNDECIDED, f"CI-only: the macOS test partition needs a macOS host, this is {context.platform}")
+    archive = context.scratch / MACOS_ARCHIVE_NAME
+    packages = [argument for name in macos_packages(context) for argument in ("-p", name)]
+    built = context.run(gate, [
+        context.heavy_run, context.cargo, "nextest", "archive", "--locked",
+        "--profile", MACOS_PROFILE, *packages, "--archive-file", str(archive),
+    ])
+    if built.returncode != 0:
+        return Gate(gate, FAIL, f"the macOS archive did not build: {last_error(built)}; {context.log_path(gate)}")
+    checked = context.run(gate, [
+        context.heavy_run, sys.executable, str(context.root / PARTITIONS_SCRIPT),
+        "--archive-file", str(archive), "check-macos", "--scope", "all",
+    ])
+    archive.unlink(missing_ok=True)
+    if checked.returncode == 0:
+        return Gate(gate, PASS, "every test of the scope runs exactly once")
+    missing = MISSING_TESTS.search((checked.stderr or "") + (checked.stdout or ""))
+    reason = f"missing={missing.group(1)}" if missing else last_error(checked)
+    return Gate(gate, FAIL, f"{reason}; {context.log_path(gate)}")
+
+
+def docs_check(context: Context) -> Gate:
+    result = context.run("docs-check", [context.cargo, "xtask", "docs", "check"])
+    if result.returncode == 0:
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        return Gate("docs-check", PASS, lines[-1].strip() if lines else "no output")
+    return Gate("docs-check", FAIL, f"{last_error(result)}; {context.log_path('docs-check')}")
+
+
+GATES = (changelog_check, changelog_guard, package_affected, package_bump, test_selection, docs_check)
+
+
+def summary(gates: list[Gate]) -> str:
+    counts = {status: sum(1 for gate in gates if gate.status == status) for status in (PASS, FAIL, UNDECIDED, SKIP)}
+    text = "guard-pack: " + ", ".join(f"{counts[status]} {status}" for status in (PASS, FAIL, UNDECIDED, SKIP))
+    pending = [f"{gate.name} ({gate.reason})" for gate in gates if gate.status == UNDECIDED]
+    if pending:
+        text += "; UNDECIDED, CI enforces these: " + "; ".join(pending)
+    return text
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the pre-push gates of CI.")
+    parser.add_argument("--base", required=True, help="the pull request's base revision")
+    parser.add_argument("--head", default="HEAD", help="the checked-out head (default HEAD)")
+    parser.add_argument("--labels-json", help="the pull request labels as a JSON array")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    arguments = parser.parse_args()
+    root = arguments.root.resolve()
+    context = Context(root, arguments.base, arguments.head, arguments.labels_json)
+    context.head_sha = resolve(context, arguments.head)
+    if context.head_sha != resolve(context, "HEAD"):
+        sys.exit(f"guard-pack: --head {arguments.head} is not the checked-out commit; the cargo gates read the working tree")
+    if git(context, "status", "--porcelain").stdout.strip():
+        sys.exit("guard-pack: the tree is not clean; the gates read the working tree, so commit or discard the changes first")
+    resolve(context, arguments.base)
+    context.scratch = root / SCRATCH_DIRECTORY / context.head_sha
+    context.scratch.mkdir(parents=True, exist_ok=True)
+    for stale in context.scratch.glob("*.log"):
+        stale.unlink()
+    gates: list[Gate] = []
+    for run_gate in GATES:
+        try:
+            gate = run_gate(context)
+        except Exception as error:  # reported as a FAIL line, never swallowed
+            gate = Gate(run_gate.__name__.replace("_", "-"), FAIL, f"crashed: {type(error).__name__}: {error}")
+        gates.append(gate)
+        print(gate.line(), flush=True)
+    print(summary(gates))
+    return 1 if any(gate.status == FAIL for gate in gates) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

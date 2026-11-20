@@ -59,10 +59,46 @@ reason.
 `cargo xtask docs check` validates the assistant knowledge bundle (schema,
 knowledge-log fragments, drift, source-map, the shape of the assistant prompt
 contract, runbooks, secret scan, release extras, command examples against the
-clap tree, the crate table, the package lists and the documentation index). Run
+clap tree, the crate table, the package lists, the numeric protocol, worker
+and store schema facts, and the documentation index). Run
 it for every change; it is mandatory when the change touches anything under
 `docs/knowledge/`, a CLI command/flag, a protocol method/event, or
 `docs/public-api.md`.
+
+## Pre-push guard pack
+
+```bash
+scripts/guard-pack --base origin/main [--labels-json '["no-changelog"]']
+```
+
+Run it on the committed, clean, checked-out head of the branch (it refuses an
+uncommitted tree), after the core gates and before the push. The cargo steps
+run as `$CARGO`, `gh` as `$GH` and the archive build under `$HEAVY_RUN`
+(`scripts/heavy-run` by default); each gate's full output is in
+`target/guard-pack/<head-sha>/<gate>.log`. It runs the PR-only CI gates that the core set does not cover, each
+as its own process, and prints one line per gate and a summary line:
+
+- `changelog-check` and `changelog-guard`: the fragment rules of
+  `scripts/changelog`. Without `--labels-json` a guard failure also says that
+  the `no-changelog` label would exempt the change; the label is the
+  maintainer's decision, not the script's.
+- `package-affected`: `cargo xtask package affected` (informational).
+- `package-bump`: the version gate of the official packages against the last
+  published release, with the failing package and its code
+  (`version_not_bumped`).
+- `test-selection`: `scripts/test-partitions check-macos` on the macOS archive,
+  only when the diff adds `#[ignore`; otherwise `SKIP`. CI checks an archive
+  built on macOS, so on another host the gate is `UNDECIDED`; run it on a macOS
+  host (minutes warm, much longer cold).
+- `docs-check`: `cargo xtask docs check`.
+
+`FAIL` is fixed before the push; the exit code is 1. `UNDECIDED` means the gate
+could not run here (no network, no published release at or below the workspace
+version): it exits 0, the summary line lists it, and it is CI-only evidence,
+never green. `SKIP` means the gate does not apply to the diff. A gate that cannot
+run its program or read the diff (a `git diff` error, a program that is not
+executable) is never `SKIP`: it is `FAIL (<gate> crashed: ...)` or carries the
+error, the later gates still run and the summary line is always printed.
 
 ## Stress the changed tests
 

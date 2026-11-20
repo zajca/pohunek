@@ -1187,7 +1187,8 @@ flaky, and hermetic obligations in this guide still apply.
   deleting a test.
 - **When a change needs a scenario:** a bug or
   lifecycle/durability/concurrency/security fix gets a regression scenario that fails
-  without the fix and passes with it — extend an existing integration/E2E scenario
+  without the fix and passes with it (the `scripts/red-on-old` table in the PR body is
+  that evidence) — extend an existing integration/E2E scenario
   when one fits; new observable behavior (a command, flag, protocol method/event,
   error contract) is exercised through its callers' supported boundary; a trivial
   helper change or an already-covered refactor needs no new test.
