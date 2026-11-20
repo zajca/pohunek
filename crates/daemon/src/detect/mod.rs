@@ -637,6 +637,20 @@ impl Detector {
         };
         self.update_staleness(now);
         let hit = self.activity_evidence(freshness);
+        // Output that changes no screen text restates the visible screen: a
+        // dialog that still wins it is no process evidence. Weak blockers and
+        // title-sourced winners stay with the byte fallback, because loose
+        // text and a cached title can outlive the state they described.
+        let hit = hit.or_else(|| {
+            (has_process_activity && !freshness.screen)
+                .then(|| self.activity_evidence(ContextFreshness::all()))
+                .flatten()
+                .filter(|hit| {
+                    hit.evidence.activity == AgentActivity::Blocked
+                        && hit.visible_blocker
+                        && hit.evidence.source == StateSource::Screen
+                })
+        });
         let has_structured_evidence = hit.is_some();
         // Output that changes no region and applies no event restates the
         // held evidence, so it does not refresh its age.
@@ -668,6 +682,8 @@ impl Detector {
             );
         }
 
+        // Reached only when no structured evidence, a restated visible
+        // blocker included, explains the chunk.
         if has_process_activity && !has_structured_evidence {
             push_transition(&mut transitions, self.state.observe_bytes(now));
         }
