@@ -481,6 +481,21 @@ pub fn try_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
     workers_retaining(root, &[])
 }
 
+/// Lists the workers whose socket path is below `root` and whose parent is
+/// this process: the workers of an in-process registry with a
+/// `SubprocessWorkerLauncher`, which [`try_workers_under`] leaves out.
+///
+/// # Errors
+///
+/// Returns the I/O error when the process table cannot be read.
+pub fn try_child_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
+    let own_pid = std::process::id();
+    Ok(workers_among(&process_table()?, root, &[])
+        .into_iter()
+        .filter(|worker| worker.parent_pid == own_pid)
+        .collect())
+}
+
 /// [`try_workers_under`] that also follows the sessions in `retained`.
 fn workers_retaining(root: &Path, retained: &[ProcessId]) -> io::Result<Vec<WorkerProcess>> {
     let own_pid = std::process::id();

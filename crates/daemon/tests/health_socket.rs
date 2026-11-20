@@ -4191,6 +4191,125 @@ codex_captured_dialog_tests! {
     "trust", 160: codex_captured_trust_160_holds_initial_input_under_a_stale_title, codex_captured_trust_160_holds_initial_input_without_a_stale_title, codex_captured_trust_160_delivers_initial_input_once_after_dismissal;
 }
 
+/// Stop bound of the frozen-worker rollback scenario.
+// timing-allowed: #2453 the worker is frozen with SIGSTOP, so its stop answer never comes; the bound only shortens the wait for that certain expiry.
+const FROZEN_STOP_GRACE: Duration = Duration::from_millis(100);
+
+/// A refused `session.new` whose worker stops answering while the refusal is
+/// rolled back leaves no session behind: the rollback ends the worker through
+/// its supervisor instead of returning the typed removal error that a user
+/// `session.remove` gets. The worker is frozen with `SIGSTOP` after the
+/// startup dialog is classified, before the readiness deadline decides the
+/// refusal.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_refused_codex_create_whose_worker_freezes_is_still_rolled_back() {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    /// Resumes the frozen worker when the scenario ends, so a failing run
+    /// leaves no stopped process behind.
+    struct Thaw(Pid);
+    impl Drop for Thaw {
+        fn drop(&mut self) {
+            let _ = kill(self.0, Signal::SIGCONT);
+        }
+    }
+
+    let daemon_log = connection_shutdown::Captured::default();
+    let _log_guard = connection_shutdown::capture_logs(&daemon_log);
+    let socket = temp_socket("codex-frozen-rollback");
+    let agents_dir = socket.dir.join("agents");
+    std::fs::create_dir(&agents_dir).expect("create isolated agent profiles");
+    let received = socket.dir.join("received.bin");
+    let script = socket.dir.join("codex-frozen-rollback.py");
+    let bytes = codex_dialog_capture("login", 80);
+    codex_startup_dialog_stub(&script, &received, true, None, &bytes);
+    write_official_profile(&agents_dir, "codex", "codexfrozenrollback", &script);
+    let mut config = SessionRegistryConfig {
+        agents_dir: Some(agents_dir),
+        host_state_dir: Some(socket.dir.join("host-state")),
+        initial_input_startup_grace: CODEX_POPUP_GRACE,
+        stop_grace: FROZEN_STOP_GRACE,
+        kill_reap_deadline: FROZEN_STOP_GRACE * 2,
+        terminal_commit_wait: FROZEN_STOP_GRACE * 3,
+        worker_stop_headroom: FROZEN_STOP_GRACE * 3,
+        worker_exchange_wait: FROZEN_STOP_GRACE * 5,
+        ..support::hermetic_registry_config()
+    };
+    let deadline_hold = arm_readiness_deadline_hold(&mut config);
+    let (shutdown, handle, _) =
+        spawn_server_serving_official_runtimes(&socket, "0.0.0", config).await;
+
+    let mut subscriber = connect(&socket).await;
+    let subscribe_req = Request::make(
+        "subscribe-codex-frozen-rollback",
+        method::SUBSCRIBE,
+        Value::Null,
+    );
+    let ack = exchange(&mut subscriber, &subscribe_req).await;
+    assert!(ack.is_ok(), "subscribe should ack");
+
+    let mut control = connect(&socket).await;
+    let mut params = session_params(&socket);
+    params.cols = 80;
+    params.rows = 40;
+    "codexfrozenrollback".clone_into(&mut params.agent);
+    params.input = Some("hello Codex".to_owned());
+    let mut create =
+        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    tokio::select! {
+        _ = wait_for_any_agent_state_event(
+            &mut subscriber,
+            AgentActivity::Blocked,
+            StateSource::Screen,
+        ) => {},
+        answered = &mut create => panic!(
+            "session.new answered before the dialog was classified: {answered:?}"
+        ),
+    }
+
+    let workers = pohunek_test_support::workers::try_child_workers_under(&socket.dir)
+        .expect("read the process table");
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    let worker = Pid::from_raw(i32::try_from(workers[0].pid).expect("worker pid"));
+    kill(worker, Signal::SIGSTOP).expect("freeze the worker");
+    let _thaw = Thaw(worker);
+
+    deadline_hold.release();
+    let error = err_payload(
+        tokio::time::timeout(HANG_GUARD, create)
+            .await
+            .expect("the refused create answers before the hang guard")
+            .expect("create task joins"),
+    );
+    assert_eq!(error.code, "session_input_not_ready");
+
+    let mut observer = connect(&socket).await;
+    let list = Request::make(
+        "codex-frozen-rollback-list",
+        method::SESSION_LIST,
+        Value::Null,
+    );
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+            .expect("list sessions");
+    assert!(
+        sessions.is_empty(),
+        "the refused session was rolled back: {sessions:?}\ndaemon log:\n{}",
+        daemon_log.text()
+    );
+    wait_until("the frozen worker to be ended", || async {
+        pohunek_test_support::workers::try_child_workers_under(&socket.dir)
+            .ok()
+            .filter(Vec::is_empty)
+            .map(|_| ())
+    })
+    .await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
 /// Writes a host profile `name` over the pinned official Claude package whose
 /// program is a launcher for `script`. A profile-backed launch writes the
 /// initial input once readiness is observed; an unprofiled `claude` launch
