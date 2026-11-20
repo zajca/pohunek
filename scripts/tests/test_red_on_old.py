@@ -398,6 +398,28 @@ class ModulesThatOnlyATestBuildCompiles(RedOnOldScenarios):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.rows(result)["R1"][2:], ["manual: set the value back by hand", "PASS"])
 
+    def test_a_path_module_declared_inside_a_test_module_is_test_code(self):
+        self.git("checkout", "-q", "main")
+        declaration = '#[cfg(test)]\n#[path = "a_tests.rs"]\nmod tests;\n'
+        result = self.run_fix(
+            "broken\n" + declaration, "fixed\n" + declaration,
+            {"a_tests.rs": '#[path = "a_tests_helper.rs"]\nmod helper;\n', "a_tests_helper.rs": "old helper\n"},
+            {"a_tests.rs": '#[path = "a_tests_helper.rs"]\nmod helper;\n', "a_tests_helper.rs": "new helper\n"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = self.old_tree_runs()
+        self.assertTrue(runs)
+        self.assertTrue(all("crates/demo/src/a_tests_helper.rs=new helper" in run for run in runs), runs)
+
+    def test_a_cfg_that_combines_not_with_test_is_never_taken_for_production(self):
+        self.git("checkout", "-q", "main")
+        declaration = "#[cfg(all(not(windows), test))]\nmod z;\n"
+        result = self.run_fix(
+            "broken\n" + declaration, "fixed\n" + declaration, {"z.rs": "old\n"}, {"z.rs": "new\n"},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("crates/demo/src/z.rs", result.stderr)
+
     def test_a_module_that_a_host_cfg_may_compile_out_is_never_taken_for_production(self):
         self.git("checkout", "-q", "main")
         result = self.run_fix(

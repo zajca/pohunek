@@ -360,7 +360,7 @@ def main() -> int:
     for run_gate in GATES:
         try:
             gate = run_gate(context)
-        except (OSError, ValueError, KeyError, ImportError) as error:
+        except Exception as error:  # reported as a FAIL line, never swallowed
             gate = Gate(run_gate.__name__.replace("_", "-"), FAIL, f"crashed: {type(error).__name__}: {error}")
         gates.append(gate)
         print(gate.line(), flush=True)

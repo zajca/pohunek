@@ -266,6 +266,21 @@ class AGateThatCannotRunItsProgram(GuardPackScenarios):
         self.assertTrue(summary.startswith("guard-pack: "), summary)
 
 
+class AGateThatRaisesAnyException(GuardPackScenarios):
+    def test_a_partition_script_that_loads_but_lacks_its_scopes_is_a_failure_line(self):
+        self.write("src/lib.rs", "// code\n#[ignore = \"slow\"]\nfn an_ignored_test() {}\n")
+        self.write("scripts/test-partitions", PARTITIONS.replace("MACOS_SCOPES", "RENAMED_SCOPES"))
+        self.commit("an ignored test, and the partition table is renamed")
+        result = self.guard_pack()
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        gates, summary = self.gate_lines(result)
+        self.assertEqual(len(gates), 6)
+        self.assertIn("test-selection: FAIL (crashed: AttributeError:", gates["test-selection"])
+        self.assertIn("docs-check: PASS", gates["docs-check"])
+        self.assertTrue(summary.startswith("guard-pack: "), summary)
+
+
 class ChangelogGates(GuardPackScenarios):
     def test_a_documented_behavior_change_without_a_fragment_fails_and_names_the_label(self):
         self.write("docs/cli.md", "cli, changed\n")

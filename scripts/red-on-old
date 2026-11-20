@@ -172,7 +172,7 @@ class ModuleTree:
         self.root = root
         self.helpers = helpers
         self.declarations: dict[str, list[tuple[str, list[str]]]] = {}
-        self.path_targets: dict[str, list[list[str]]] = {}
+        self.path_targets: dict[str, list[tuple[str, list[str]]]] = {}
         self.kinds: dict[str, str] = {}
 
     def declared_in(self, declaring: str) -> list[tuple[str, list[str]]]:
@@ -192,7 +192,7 @@ class ModuleTree:
                     path_match = PATH_ATTRIBUTE.match(attribute)
                     if path_match:
                         target = os.path.normpath(f"{directory}/{path_match.group(1)}")
-                        self.path_targets.setdefault(target, []).append(attributes)
+                        self.path_targets.setdefault(target, []).append((declaring, attributes))
         return self.declarations[declaring]
 
     def scan_crate(self, source_directory: str) -> None:
@@ -211,9 +211,17 @@ class ModuleTree:
                 continue
             if not self.helpers.host_dependent_cfg(body):
                 return TEST
-            if re.search(r"\btest\b", body) and not re.search(r"\bnot\s*\(", body):
+            if re.fullmatch(r"cfg\s*\(\s*not\s*\(\s*test\s*\)\s*\)", body):
+                continue
+            if re.search(r"\btest\b", body):
                 return UNKNOWN
         return PRODUCTION
+
+    def declarer_kind(self, declaring: str) -> str:
+        """The kind a module inherits from the file that declares it."""
+        if is_test_path(declaring):
+            return TEST
+        return self.kind(declaring) if CRATE_SOURCE.match(declaring) else PRODUCTION
 
     def candidates(self, path: str) -> tuple[str, list[str]]:
         """The module name of a file and the files that may declare it."""
@@ -242,8 +250,9 @@ class ModuleTree:
         relative = match.group(2)
         if relative in CRATE_ROOT_NAMES or relative.startswith("bin/"):
             return PRODUCTION
-        for attributes in self.path_targets.get(path, ()):
-            return self.cfg_kind(attributes)
+        for declaring, attributes in self.path_targets.get(path, ()):
+            own = self.cfg_kind(attributes)
+            return own if own != PRODUCTION else self.declarer_kind(declaring)
         module, declaring_files = self.candidates(path)
         for declaring in declaring_files:
             for name, attributes in self.declared_in(declaring):
@@ -252,7 +261,7 @@ class ModuleTree:
                 own = self.cfg_kind(attributes)
                 if own != PRODUCTION:
                     return own
-                return self.kind(declaring) if CRATE_SOURCE.match(declaring) else PRODUCTION
+                return self.declarer_kind(declaring)
         return UNKNOWN
 
 
