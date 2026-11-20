@@ -37,7 +37,11 @@ adds one (`plugin-directories`).
 
 Only the owner creates `pohunekd/*` repositories. An agent proposes one in an
 issue and waits for the grant. The `pohunek.` namespace and the
-`pohunekd/plugin-*` names are reserved to the official tier.
+`pohunekd/plugin-*` names are reserved to the official tier. The index admits
+only official entries under the `pohunek.` namespace; the daemon does not
+refuse a `pohunek.*` package id on a local install by digest or link (see the
+[trust model](runtime-packages.md#trust-model)), so check the `origin` of an
+installed package.
 
 ## Naming
 

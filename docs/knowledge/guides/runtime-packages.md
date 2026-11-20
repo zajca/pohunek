@@ -866,6 +866,16 @@ repeating the command; the CLI never retries an install on its own.
   has reserved (`pohunek plugin index refresh` records it); before any
   verified index has listed `pi`, the documented Pi `--sha256` flow keeps
   working.
+- A local install (`--sha256` or `plugin link`) refuses reserved runtime ids,
+  not a `pohunek.*` package id. The daemon applies no check to the package id
+  prefix on that path, and a package without a runtime (a context or commands
+  package) meets no reserved-id check at all. A local package therefore can
+  carry a `pohunek.*` id. The `origin` field of `pohunek plugin list --json`
+  and `pohunek plugin inspect --json` tells it apart from an official package:
+  `explicit_digest` or `link` for a local install, `official` only for a
+  package the signed catalog or the signed official index authorized. A
+  local package never serves `shell`, `codex`, `claude` or `hermes`, nor a
+  runtime id a recorded verified index reserved.
 - `--catalog <file>` authorizes an official package through the signed catalog,
   verified against the trust anchor file shipped beside the daemon (see the
   [runtime catalog](../concepts/runtime-catalog.md#trust-anchor-file)). A host
