@@ -5,6 +5,338 @@ Each change records its entry as its own fragment under `log.d/`, named
 `## Unreleased` sections, and `scripts/release` files them under the release
 heading. Entries are newest first.
 
+## 0.44.0
+
+### 2026-11-20, push reuse wording, #2321
+
+- Correction to the push-reuse entry of #2204: the `ci-reuse` record is written
+  on every path, a fail-open run included (it then names no job), and it names
+  only legs that were green in their source run. A delta dispatch reads its
+  sources from pull request, push and dispatch runs, one source run per reused
+  job, not from a single pull request run.
+
+### 2026-11-20, bounded per-run smoke script timeout, #2446
+
+- `pohunek-plugin-kit smoke --script-timeout <seconds>` bounds only the
+  smoke script: an integer `1..=900`, absent keeps the 60 s default. Outside
+  the range, with no `--script`, or for a commands-only package, the smoke
+  refuses with a named error before the rig starts. A script that outlives
+  its bound fails the smoke with an error naming the script and the bound
+  (`smoke script <path> did not exit within <N> s`); the passing `--json`
+  report carries the effective bound as `script_timeout_s`. Every other kit
+  child keeps its own bound: CLI commands, `pohunekd --version` and external
+  programs keep `COMMAND_TIMEOUT` (60 s), the daemon start keeps
+  `READY_TIMEOUT` (30 s).
+- The reusable `plugin-ci.yml` takes an optional `smoke-script-timeout`
+  input (string, default empty = kit default), validated to `1..=900` in the
+  `Set up the package inputs` step, refused for a context or commands-only
+  package like `smoke-script`, and passed as `--script-timeout` only when
+  set. The smoke step's `timeout-minutes: 30` (inside the `check` job's 60) still covers the 900 s bound
+  with setup headroom. See
+  `docs/knowledge/guides/plugin-repositories.md`.
+
+### 2026-11-20, a visible dialog stays blocked under screen-neutral output, #2447
+
+- A screen rule with `visible_blocker = true` that wins the visible screen
+  keeps the session `blocked` (source `screen`) while the agent writes output
+  that changes no screen text: cursor moves, cursor show/hide, SGR-only
+  writes, a redraw of the same characters. Before, such a chunk skipped the
+  screen rules and the bytes-mean-working fallback published `working`
+  (source `process`) over the dialog, so a program with no 7501 record (Mistral
+  Vibe, Hermes, Claude or Codex below their authority gates, Pi below 1.1.0)
+  never read `blocked` under a blinking cursor, and its attention record
+  flickered.
+- `Detector::feed` re-evaluates the whole screen for a chunk that has process
+  bytes, no evidence and no screen-text change, and keeps the result only when
+  it is a screen-sourced `visible_blocker` `blocked`; `tick` runs the same
+  evaluation, so live detection agrees with `detect-check` replay. Weak
+  blockers (rules without `visible_blocker`), a title-sourced blocker alone
+  and every other state keep the byte fallback. A `visible_blocker` title or
+  progress winner that outranks a screen dialog (Codex "Action Required" over
+  its approval prompt, below the authority gate) is kept as the held reading
+  when the screen alone, evaluated without titles and progress, still yields a
+  `visible_blocker` dialog; the published source is then `osc_title` or
+  `osc_progress`. A screen-only dialog still carries no `blocked_kind`.
+- No protocol, store, package-format or SDK change; older cores keep the gap.
+  See "Agent state detection" in `docs/architecture.md` and the
+  `visible_blocker` paragraph of `docs/knowledge/guides/runtime-packages.md`.
+
+### 2026-11-20, smoke detection timeout, #2455
+
+- `pohunek-plugin-kit smoke --detection-timeout <seconds>` bounds the wait
+  for the detector to leave `unknown`: an integer `1..=60`, absent keeps the
+  60 s default. The range tops out at the default, so the option can only
+  tighten the bounded-detection contract. Outside the range, or for a
+  commands-only package, the smoke refuses with a named error before the rig
+  starts. A runtime that stays `unknown` past the bound fails the smoke with
+  an error naming the bound (the detector stayed `unknown` for `<N>s` after
+  start); the passing `--json` report carries the effective bound as
+  `detection_timeout_s`, absent for a commands-only package. The failing-
+  detection scenario in `crates/plugin-kit/tests/kit.rs` runs with a 1 s
+  bound instead of waiting out 60 s. See
+  `docs/knowledge/guides/plugin-repositories.md`.
+
+### 2026-11-19, remote TCP_NODELAY, #1796
+
+- Every connection the daemon accepts on an overlay (NetBird or Tailscale)
+  address now has `TCP_NODELAY` set next to the TCP keepalive from the
+  `service.toml` `[waits]` keys, so small daemon replies leave without
+  waiting for the previous ACK instead of leaving in RTT-spaced bursts on a
+  real link. A failure to set the option is logged as a warning
+  (`remote TCP_NODELAY setup failed`, with the peer and the errno) and the
+  connection is still served. See [setup](guides/setup.md).
+
+### 2026-11-19, kit and plugin-ci for commands-only packages, #2415
+
+- `pohunek-plugin-kit lint` accepts a commands-only package
+  (`package-commands-v1`, no runtime, no context) through the install-time
+  descriptor loader and reports `"kind": "commands"` (line
+  `plugin lint ok: <package_id> <version> commands`). `smoke` installs such a
+  package on an isolated `--local-only` daemon with `plugin install --sha256`
+  and runs each exported command once with `host command run local`; a
+  non-zero exit fails the smoke, and `--upstream` and `--script` are refused.
+  The report carries `commands` instead of `activity` and `screen_lines`.
+- The reusable `plugin-ci.yml` refuses `corpus-dir`, `upstream-install` and
+  `smoke-script` for a context or commands-only package right after the lint,
+  before any build, and runs the smoke for a commands-only package. See
+  `docs/knowledge/guides/plugin-repositories.md`.
+
+### 2026-11-19, canary theme picker through attach, #2419
+
+- The Claude canary `login_screen` scenario answers the first-run theme
+  picker through `pohunek attach` (one Enter on standard input, then
+  detach) once the session activity is `blocked`, instead of plain
+  `session input`, which the daemon refuses while a dialog blocks the
+  session. The capture no longer depends on beating the activity
+  transition. No daemon, protocol or CLI change.
+
+### 2026-11-19, a first prompt that starts with `-` is pasted, #2426
+
+- For a runtime with `prompt_arg = true`, a first prompt of `session.new` that
+  starts with `-` (for example `--version` or `-p x`) is no longer appended to
+  the launch argv, where an agent CLI could read it as an option. It is pasted
+  after readiness like the first prompt of a `prompt_arg = false` runtime, and
+  its turn is counted as a pasted prompt. A prompt that does not start with `-`
+  stays the last argv element.
+- New runtime feature `prompt-arg-dash-paste-v1` (0.44.0): a package that sets
+  `prompt_arg = true` can list it in `requires`, so an older core refuses the
+  package. See `docs/knowledge/guides/runtime-packages.md` ("First prompt
+  delivery") and `docs/public-api.md` (`PackageRuntimeInfo`).
+
+### 2026-11-19, canary capture first-screen budget, #2431
+
+- `cargo xtask claude canary capture` takes `--first-screen-timeout-secs`,
+  the bound of the wait for the first screen of a session (the step timeout
+  when absent, refused when zero like it). It bounds only that setup wait:
+  a loaded host no longer stops the run at an earlier screen than the step
+  the scenario tests; the record and the first notification waits keep
+  `--step-timeout-secs`, and a first-screen timeout names `wait for the
+  first screen` with its own budget. No daemon, protocol or CLI change.
+
+### 2026-11-19, a one-word first prompt is pasted, #2433
+
+- For a runtime with `prompt_arg = true`, a first prompt of `session.new` that
+  is a single bare word (non-empty, only ASCII letters, digits, `-`, `_`, `.`
+  and `:`; for example `logout`, `e` or `completion`) is no longer appended to
+  the launch argv, where an agent CLI could dispatch it as a subcommand. It is
+  pasted after readiness like a dash prompt, and its turn is counted as a
+  pasted prompt. Composer-special words (`/compact`, `!make`, `@file`) hold a
+  character outside the set and stay the last argv element, as does any
+  multi-word prompt.
+- New runtime feature `prompt-arg-word-paste-v1` (0.44.0): a package that sets
+  `prompt_arg = true` lists it together with `prompt-arg-dash-paste-v1` in
+  `requires`, so an older core refuses the package. See
+  `docs/knowledge/guides/runtime-packages.md` ("First prompt delivery") and
+  `docs/public-api.md` (`PackageRuntimeInfo`).
+
+### 2026-11-18, kit bundle and gated publishing, #1613
+
+- The release build ships the owner-side plugin kit bundle
+  `pohunek-plugin-kit-<version>-<target>.tar.zst` for
+  `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` (the `kit-linux` and
+  `kit-macos` jobs of `release-build.yml`, on tag releases and the nightly
+  tier only — the schedule or a `tier=nightly` dispatch — never on pull
+  request or push runs). The bundle
+  holds `pohunek`, `pohunekd`, `pohunek-sessiond` and `pohunek-plugin-kit`
+  plus the descriptor schema note; it carries no release MANIFEST and never
+  enters the release bundle. The `attest` job of `release-evidence.yml`
+  attests it with the other producer artifacts in a release, and the
+  `attest-kit` job attests it on the nightly tier, so a downloaded bundle
+  verifies with the same signer workflow identity as the existing release
+  assets.
+- The new `plugin-kit-publish` workflow publishes the bundles as releases of
+  `pohunekd/pohunek-plugin-kit`: a core release tag `vX.Y.Z` becomes
+  `core-vX.Y.Z`, a scheduled nightly CI run becomes the prerelease
+  `nightly-YYYYMMDD-<sha12>`; the release is created as a draft with
+  `SHA256SUMS`, uploaded, then published, and nightlies older than 30 days
+  are pruned. The job checks out nothing, runs no release-asset code, and
+  stays gated on `vars.PLUGIN_KIT_APP_ID` until the owner has created the kit
+  repository, its GitHub App and the `plugin-kit-publish` environment.
+
+### 2026-11-18, reusable plugin CI, #1613
+
+- The reusable `.github/workflows/plugin-ci.yml` runs the plugin kit per row
+  and platform in one `contents: read` job (Linux on `ubuntu-24.04`, macOS on
+  the pinned `macos-15` label): lint, a double
+  build with a byte compare, verify, detect-check when `corpus-dir` is set,
+  smoke, and a version-bump check. The `release` row builds the kit from
+  `zajca/pohunek` at `core-tag` and smokes against that tag's attested daemon
+  archive, `nightly` builds from `main`, and `previous-minor` builds from the
+  newest release of the previous minor (usable from core 0.45); the optional
+  `smoke-script` runs inside
+  the generic smoke on the same live isolated root only after every generic
+  check passed, in the smoke's own cwd (the workflow runs the step from the
+  plugin repository), with the isolated `prefix` (holding `pohunek`) first
+  on the script `PATH`, bare `pohunek` routed through the isolated
+  `XDG_RUNTIME_DIR` (`POHUNEK_SOCKET_PATH` is only information for
+  hook-style clients), `POHUNEK_SMOKE_SESSION` exporting the live session
+  id, the script's stdout and stderr both on the kit's stderr so `--json`
+  stdout stays one JSON document, and the script's process group killed
+  after exit on every path.
+  The "Required CI" section of the plugin repository guide lists every input,
+  every row and the tag scheme ([Plugin
+  repositories](guides/plugin-repositories.md#required-ci)).
+
+### 2026-11-18, index-host follow-ups, #2384
+
+- `package_runtime_conflict` carries `details.holder`: the installed package
+  id that serves the runtime id (absent when a built-in runtime serves it),
+  so the refusal names the holder on the wire instead of only in `msg`. The
+  CLI prints the holder in the human error; JSON clients already see the typed
+  `ProtocolError.details`.
+- A stored index copy below only the revocation high-water mark is refreshed
+  before an install by id, like a copy below the index sequence mark: the CLI
+  compares both marks in `read_stored`, and a daemon-side refusal stays the
+  backstop (`package_index_rollback`).
+
+### 2026-11-18, daemon flake batch, #2401
+
+- #2401: the idle-backoff procwatch tests no longer measure scheduler delay.
+  The paused clock sections run under `AutoAdvanceInhibitor`, so the clock
+  moves only through explicit `advance`, and each `advance_settling` step
+  overshoots the tick by `TIMER_TICK`, so a scan timer armed for the tick
+  boundary fires without relying on auto-advance. Too-frequent scans fail
+  the count bound, executor-thread scans fail the executor-thread counter,
+  and scans slower than the backoff stall the paused clock and fail the
+  due-scan hang guard.
+- #2018: not reproduced (15/15 local stress iterations green); the
+  best-effort `rollback_failed_initial_input` design stands, and the
+  leftover-session instrumentation from #2331 already on this head waits for
+  the next occurrence. No code change.
+- #2021: not reproduced (30/30 local stress iterations green); the shutdown
+  `ShutdownReport` instrumentation from #2331 already on this head waits for
+  the next occurrence, and the 5 s shutdown bound is unchanged. No code
+  change.
+
+### 2026-11-18, blocked initial-input hint, #2404
+
+- A `session.new --input` timeout while the session activity is `blocked`
+  names the blocked state and says the session was not kept: start the
+  session without `--input`, answer the agent's dialog in it
+  (`pohunek attach <session-id>`) and then send the input, instead of raising
+  `input.initial_startup_grace_ms`; a merely slow start keeps the grace hint.
+  The code stays `session_input_not_ready` and no protocol field changes.
+
+### 2026-11-17, plugin kit commands, #1613
+
+- The `pohunek-plugin-kit` binary covers all six plugin kit operations over
+  one package directory: `lint`, `build`, `verify`, `detect-check`, `smoke`
+  and `prove`. `smoke --release-dir <dir> [--upstream <path>]` installs the
+  built package on an isolated daemon through a throwaway index, starts it,
+  waits for detection past `unknown`, requires a non-empty screen, then stops
+  and removes the session; `--upstream` puts a locked install in front of the
+  isolated daemon's `PATH`. `cargo xtask plugin build` delegates to the kit
+  logic, keeping its exact contract including exit codes.
+
+### 2026-11-16, stored plugin index, #1614
+
+The daemon stores the official plugin index under `<plugins>/index/` (`official-v1.json` / `official-v2.json`) with a sidecar `stored.json` recording `stored_at` per schema. The CLI refreshes on demand only when the stored copy is older than 24 hours; there is no background refresh. `pohunek plugin index refresh` stages the bytes and calls `plugin.index.apply`, which verifies signature, expiry and rollback before storing and accumulating reserved runtime ids.
+
+Doctor detail `plugin_index` reports `not_used` / `not_refreshed` / `current` / `stale` / `package_index_expired` / `package_index_invalid` / `package_index_state_unreadable` / `package_revoked` (an unlisted index digest: fail for the selected one, warn for an unselected one a profile pin or retained session still references, not reported for an unselected unreferenced one; names id and version) / `runtime_id_reserved_by_official` (warn). A revoked or delisted digest never blocks launch.
+
+Installed packages keep their origin: local packages whose declared runtime id is now listed as reserved get `runtime_id_reserved_by_official` and still run. The namespace guard is data-driven: a local (`--sha256` or link) install is refused (`package_runtime_not_claimable`) when its declared runtime id is in the accumulated reserved set, so the Pi `--sha256` checkout flow works before the stored index lists `pi`. Each record carries a `provenance` (`index`/`catalog`/`local`); pre-change records upgrade by source (`Official` to `catalog`, the rest to `local`) and are never treated as index-origin.
+
+A damaged or newer-schema `index-state.json` refuses local installs, links and refreshes with `package_index_state_unreadable` (a wrong mode or owner included, never `package_registry_failed`). `pohunek plugin index refresh --repair-state` is the explicit recovery: it verifies the fetched document against the stored verified copy, commits the new state atomically and keeps the damaged bytes as `index-state.json.damaged-<unix-ts>`. The daemon codes of this lane carry the `package_` prefix (`package_index_invalid`, `package_index_expired`, `package_index_rollback`, `package_index_channel_missing`, `package_index_state_unreadable`).
+
+### 2026-11-16, the feature-removal check, #1659
+
+- `cargo xtask plugin features-check [--index <file>]` fails when a runtime
+  feature a package requires is missing from the registry (the
+  `crates/daemon/src/agent/host/fixtures/features.txt` snapshot the
+  append-only guard compares `RUNTIME_FEATURES` against): a removal waits until
+  nothing requires the feature. It collects `requires` from
+  `runtime-packages/*/runtime.toml` and from every `runtime` entry of an index
+  document, whose archive is fetched from the entry's `url`, verified against
+  the entry's digest and read for its descriptor (a digest mismatch fails; a
+  context entry has no runtime descriptor and is skipped; the index signature
+  is not verified, the check reads requirements and authorizes nothing).
+  Without `--index` the official index v2 is fetched; a failed fetch (of the
+  index or of an entry archive) prints a `warn` naming the URL and the check
+  continues with the other sources, so it never fails on the network alone.
+  ([Plugin repositories](guides/plugin-repositories.md)).
+
+### 2026-11-16, NetBird non-owner account, #2382
+
+- `netbird_state_restricted` remedy now names the `[netbird.static_peers.<name>]` table, the host-id source via `pohunek host governance inspect local --json`, and `sudo netbird profile claim` with `netbird profile list --show-owner`. `overlay::OverlayError::StateRestricted` gains a required `remedy: String` field.
+- Multi-overlay discovery failure keeps the restricted overlay remedy in `recover` with overlay prefix.
+- Restricted error detail distinguishes a missing static-peer table, a NetBird daemon that is not Connected, and an unlisted host; the discovery path notes that static peers are used only by `--host <name>` and never appear in discovery.
+- Doctor warning for restricted NetBird now includes the remedy text.
+- Docs decision list explains NetBird ownership model, static-peer remedy, `profile claim` cost, `NB_DISABLE_PROFILE_OWNERSHIP` warning, and removal of NetBird downgrade suggestion.
+
+### 2026-11-16, version-manager shims, #2383
+
+- A profile `program` that is a version-manager shim (a symlink to the `mise`
+  manager under the agent's name) is probed through the installed executable
+  the manager names and launched through the shim link, so `argv[0]` keeps the
+  configured name. The lookup (`mise which`, owner location variables,
+  `MISE_OFFLINE=1`, `MISE_AUTO_INSTALL=0`, sandbox working directory, its own
+  deadline) is read-only; the probe of the named executable keeps the private
+  sandbox. A shim with no installed release reports `available: true`,
+  `supported: false` and refuses the launch with `agent_runtime_unsupported`
+  naming the empty install set; other `argv[0]` dispatchers behind a symlink
+  are probed through their link in the private sandbox ([Agent
+  profiles](concepts/agent-profiles.md#wrapper-programs-and-version-probes),
+  [Version managers](guides/runtime-packages.md#version-managers)).
+
+### 2026-11-15, attested parent and session.adopt, #2002
+
+- `session.new` from inside a session records that session as `spawned_by`; markers naming another session are refused with `session_right_denied` (`reason=origin_mismatch`). `session.adopt` and `pohunek session adopt <child> <new-parent>` (owner only, `session_adopt_supported`) move a session under a new parent; a session gets `reason=owner_only`, and a loop, a self-parent or a session inside a running `session.remove_tree` is `session_adopt_refused`. A profile's `[rights]` table sets `spawn_profiles` (`reason=spawn_profile_not_allowed`) and `owner_equivalent` ([Agent profiles](concepts/agent-profiles.md#session-rights), [Trust model](safety/trust-model.md)).
+
+### 2026-11-15, session rights by kernel peer, #2005
+
+- A request from a process inside a session's tree is checked against that session's rights: it reaches only the session's `spawned_by` descendants, plus `session.input` to its parent while the parent is not blocked, and is otherwise refused with `session_right_denied` (`reason=not_descendant`, `parent_blocked` or `unknown_caller`). Owner terminals, services outside every session tree and `shell` sessions keep owner rights, and a process that leaves the tree does too: a guardrail, not a wall ([Trust model](safety/trust-model.md)). `pohunek doctor` reports `session_rights`.
+
+### 2026-11-15, plugin prove for context entries, #2170
+
+- `cargo xtask plugin prove` proves a `kind = "context"` index entry the way
+  it proves a runtime one: the throwaway trust signs a schema 2 index
+  (`index throwaway --schema-version 2`, `official-index-v2.json`), the digest
+  step refuses a descriptor that carries a `[runtime]` table or no `[context]`
+  table, the install must report the context package official with the entry's
+  digest, enabled, and selected on the default path, and the inspect must
+  report it enabled and selected without a fault and read the package back
+  (`pohunek.context.assistant` also renders the assistant prompt for the
+  explicit `--agent prove-assistant` name, which skips auto selection because
+  the host reports no such agent, so the readback touches the installed
+  package; `--print-prompt` starts no session; a `prove --no-enable` install
+  stages a disabled install the inspect predicate must refuse, and a
+  `prove --pre-install` newer version leaves the proved version unselected).
+  The
+  evidence carries `"kind": "context"`. The proof daemon always starts with
+  `--local-only` (#2372), and so does the isolated Hermes package host and the
+  release smoke ([Build and prove a plugin archive](runbooks/plugin-index-keys.md#6-build-and-prove-a-plugin-archive),
+  [Plugin repositories](guides/plugin-repositories.md)).
+
+### 2026-11-15, local-only daemon, #2368
+
+- `pohunekd --local-only` starts no remote control listener: it asks no
+  overlay for an address, binds no TCP socket and logs `remote control
+  listener disabled by --local-only; serving local-only`. A repeated flag is
+  refused at startup. The isolated daemon of `cargo xtask claude canary
+  capture` runs with it and requires the log line before any session, so it
+  never tries to bind the host's overlay listener; the installed service does
+  not use it ([Debug the daemon](runbooks/debug-daemon.md)).
+
 ## 0.43.1
 
 ### 2026-11-15, skip the in-repo hook layer, #2366

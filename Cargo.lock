@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-assistant"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "getrandom 0.2.17",
  "pohunek-client",
@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-cli"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-client"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "futures",
  "libc",
@@ -1762,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-daemon"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-hostcheck"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "pohunek-overlay",
  "pohunek-paths",
@@ -1831,7 +1831,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-knowledge"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "pohunek-protocol",
  "pohunek-test-support",
@@ -1843,14 +1843,14 @@ dependencies = [
 
 [[package]]
 name = "pohunek-logging"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "pohunek-test-support",
 ]
 
 [[package]]
 name = "pohunek-netbird"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "pohunek-overlay",
  "pohunek-platform",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-overlay"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "base64 0.22.1",
  "futures",
@@ -1872,7 +1872,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-overlay-tailscale"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "pohunek-overlay",
  "pohunek-platform",
@@ -1886,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-package"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "ed25519-dalek",
  "nix 0.29.0",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-paths"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "nix 0.29.0",
  "serde",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-platform"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "async-io",
  "calcifer-macos-acl",
@@ -1940,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-plugin-kit"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "clap",
  "ed25519-dalek",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-prompt"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.18",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-protocol"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "base64 0.22.1",
  "pohunek-test-support",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-service-config"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "pohunek-paths",
  "pohunek-platform",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-session-worker"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "libc",
  "nix 0.29.0",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-shape-guard"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-terminal"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-test-support"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "pohunek-worker-protocol"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3960,7 +3960,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.43.1"
+version = "0.44.0"
 dependencies = [
  "base64 0.22.1",
  "clap",

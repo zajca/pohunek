@@ -1,3 +1,0 @@
-## Unreleased (2026-11-15, session rights by kernel peer, #2005)
-
-- A request from a process inside a session's tree is checked against that session's rights: it reaches only the session's `spawned_by` descendants, plus `session.input` to its parent while the parent is not blocked, and is otherwise refused with `session_right_denied` (`reason=not_descendant`, `parent_blocked` or `unknown_caller`). Owner terminals, services outside every session tree and `shell` sessions keep owner rights, and a process that leaves the tree does too: a guardrail, not a wall ([Trust model](safety/trust-model.md)). `pohunek doctor` reports `session_rights`.
