@@ -20,6 +20,44 @@ const HIDDEN_PREFIX: &str = "__";
 /// The onboarding guide whose floor the deny table must cover.
 const ONBOARDING_GUIDE: &str = "docs/knowledge/guides/onboarding.md";
 
+/// Sources of the constants the numeric facts are held to.
+const PROTOCOL_SOURCE: &str = "crates/protocol/src/version.rs";
+const WORKER_SOURCE: &str = "crates/worker-protocol/src/version.rs";
+const STORE_SOURCE: &str = "crates/daemon/src/store/schema.rs";
+
+/// A protocol version source with the declaration shapes of the real crate.
+fn protocol_source(version: u32) -> String {
+    format!(
+        "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion({version});\n\n\
+         pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0);\n"
+    )
+}
+
+fn worker_source(current: u32, previous: u32) -> String {
+    format!(
+        "pub const CURRENT_VERSION: Version = Version({current});\n\n\
+         pub const PREVIOUS_VERSION: Version = Version({previous});\n"
+    )
+}
+
+fn store_source(version: u32) -> String {
+    format!("pub const STORE_SCHEMA_VERSION: u32 = {version};\n")
+}
+
+/// A page with one statement of each numeric fact. The window sentence is on
+/// line 3, the constants on line 5, the store schema on line 7 and the worker
+/// window on line 9.
+fn facts_page(min: u32, max: u32, worker: (u32, u32), store: u32) -> String {
+    format!(
+        "Features.\n\n\
+         The public protocol window is `{min}..={max}`.\n\n\
+         `PROTOCOL_VERSION` ({max}) and `MIN_PROTOCOL_VERSION` is `{min}`.\n\n\
+         The store schema is `STORE_SCHEMA_VERSION` (currently {store}).\n\n\
+         The worker window `PREVIOUS_VERSION..=CURRENT_VERSION` is currently {} and {}.\n",
+        worker.0, worker.1
+    )
+}
+
 /// A fixture checkout.
 struct Checkout {
     root: tempfile::TempDir,
@@ -129,7 +167,10 @@ impl Checkout {
             "docs/install.md",
             "The archive holds `runtime/packages/pi.tar.zst`.\n",
         );
-        checkout.write("docs/features.md", "Features.\n");
+        checkout.write(PROTOCOL_SOURCE, &protocol_source(5));
+        checkout.write(WORKER_SOURCE, &worker_source(8, 7));
+        checkout.write(STORE_SOURCE, &store_source(22));
+        checkout.write("docs/features.md", &facts_page(5, 5, (7, 8), 22));
         checkout.write("README.md", "Readme.\n");
         checkout.write(
             "docs/README.md",
@@ -643,4 +684,119 @@ fn a_floor_flag_listed_without_a_rule_must_stay_in_the_floor() {
         "with `--all-profiles` or `--skill`.",
     );
     assert_eq!(dropped.failed_checks(), vec!["onboarding-floor"]);
+}
+
+/// Problems that start with `page:line`.
+fn problems_at(checkout: &Checkout, location: &str) -> Vec<String> {
+    xtask::doc_fact_problems(checkout.root.path())
+        .expect("the facts are read")
+        .into_iter()
+        .filter(|problem| problem.starts_with(location))
+        .collect()
+}
+
+#[test]
+fn a_changed_protocol_window_without_a_doc_change_fails_numeric_facts() {
+    let checkout = Checkout::consistent();
+    checkout.write(PROTOCOL_SOURCE, &protocol_source(6));
+    assert_eq!(checkout.failed_checks(), vec!["numeric-facts"]);
+    assert_eq!(
+        problems_at(&checkout, "docs/features.md:3 "),
+        vec![format!(
+            "docs/features.md:3 states the protocol window 5..=5, but \
+             MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION in {PROTOCOL_SOURCE} is 6..=6"
+        )]
+    );
+    assert_eq!(problems_at(&checkout, "docs/features.md:5 ").len(), 2);
+}
+
+#[test]
+fn a_changed_store_schema_or_worker_window_fails_numeric_facts() {
+    let store = Checkout::consistent();
+    store.write(STORE_SOURCE, &store_source(23));
+    assert_eq!(store.failed_checks(), vec!["numeric-facts"]);
+    assert_eq!(
+        problems_at(&store, "docs/features.md:7 "),
+        vec![format!(
+            "docs/features.md:7 states the current store schema 22, but \
+             STORE_SCHEMA_VERSION in {STORE_SOURCE} is 23"
+        )]
+    );
+
+    let worker = Checkout::consistent();
+    worker.write(WORKER_SOURCE, &worker_source(9, 8));
+    assert_eq!(worker.failed_checks(), vec!["numeric-facts"]);
+    assert_eq!(
+        problems_at(&worker, "docs/features.md:9 "),
+        vec![format!(
+            "docs/features.md:9 states the worker window 7 and 8, but \
+             PREVIOUS_VERSION and CURRENT_VERSION in {WORKER_SOURCE} is 8 and 9"
+        )]
+    );
+}
+
+#[test]
+fn a_window_that_spans_several_versions_is_read_from_both_declarations() {
+    let checkout = Checkout::consistent();
+    checkout.write(
+        PROTOCOL_SOURCE,
+        "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(7);\n\
+         pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0 - 2);\n",
+    );
+    checkout.write("docs/features.md", &facts_page(5, 7, (7, 8), 22));
+    assert_eq!(checkout.failed_checks(), Vec::<&str>::new());
+}
+
+#[test]
+fn historical_versions_and_config_ranges_are_not_numeric_facts() {
+    let page = "\
+        Store schema 20 added the profile revision, and store schema 21 the rest.\n\n\
+        Protocol 4 served `4..=4` before the break.\n\n\
+        The timeout accepts `1..=600000` milliseconds.\n\n\
+        The protocol clients send `1..=3` retries.\n";
+    assert_eq!(
+        Checkout::consistent().failed_with_page(page),
+        Vec::<&str>::new()
+    );
+}
+
+#[test]
+fn an_unrecognised_constant_declaration_fails_numeric_facts() {
+    let checkout = Checkout::consistent();
+    checkout.write(
+        PROTOCOL_SOURCE,
+        "pub const PROTOCOL_VERSION: ProtocolVersion = next_version();\n\
+         pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0);\n",
+    );
+    assert_eq!(checkout.failed_checks(), vec!["numeric-facts"]);
+    let problems = xtask::doc_fact_problems(checkout.root.path()).expect("the facts are read");
+    assert_eq!(
+        problems,
+        vec![format!(
+            "{PROTOCOL_SOURCE}: no declaration of PROTOCOL_VERSION in a recognised shape"
+        )]
+    );
+}
+
+#[test]
+fn the_parsed_window_is_the_built_window() {
+    let root = pohunek_test_support::workspace_root();
+    let built = protocol::SUPPORTED_PROTOCOL_VERSIONS;
+    let checkout = Checkout::consistent();
+    checkout.write(
+        PROTOCOL_SOURCE,
+        &fs::read_to_string(root.join(PROTOCOL_SOURCE)).expect("read the protocol source"),
+    );
+    checkout.write(
+        "docs/features.md",
+        &facts_page(built.minimum().get(), built.maximum().get(), (7, 8), 22),
+    );
+    assert_eq!(
+        problems_at(&checkout, "docs/features.md:3 "),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        problems_at(&checkout, "docs/features.md:5 "),
+        Vec::<String>::new()
+    );
 }

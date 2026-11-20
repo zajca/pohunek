@@ -7,7 +7,9 @@
 //! - The fact checks hold the crate table of `docs/development.md` to the
 //!   workspace members, the assistant source map to every workspace crate, the
 //!   official package lists and counts of the user docs
-//!   to `runtime-packages/`, and the documentation indexes to every page.
+//!   to `runtime-packages/`, the documentation indexes to every page, and the
+//!   protocol window, worker window and store schema numbers the docs state to
+//!   their constants ([`numeric_facts`]).
 //! - The onboarding floor check holds the onboarding guide's floor commands to
 //!   its Claude deny table ([`onboarding_floor`]).
 //! - The plugin boundary check rejects a top-level directory under
@@ -26,6 +28,7 @@ use regex::Regex;
 use crate::checks::{collect_pohunek_examples, parse_failure_message};
 use crate::XtaskError;
 
+mod numeric_facts;
 mod onboarding_floor;
 
 /// The CLI reference the reverse and `--json` checks read.
@@ -1161,6 +1164,11 @@ fn check_plugin_directories(repo: &Path) -> Result<bool, XtaskError> {
     Ok(false)
 }
 
+/// The numeric statements of the docs that differ from their constants.
+pub(crate) fn numeric_fact_problems(repo: &Path) -> Result<Vec<String>, XtaskError> {
+    numeric_facts::problems(repo)
+}
+
 /// Runs every drift check of this module against the checkout at `repo` and
 /// returns the names of the checks that failed.
 pub(crate) fn check(repo: &Path) -> Result<Vec<&'static str>, XtaskError> {
@@ -1175,6 +1183,7 @@ pub(crate) fn check(repo: &Path) -> Result<Vec<&'static str>, XtaskError> {
         ("crate-table", check_crate_table(repo)?),
         ("source-map-crates", check_source_map_crates(repo)?),
         ("package-lists", check_package_lists(repo)?),
+        ("numeric-facts", numeric_facts::check(repo)?),
         ("doc-index", check_index_reachability(repo)?),
         ("plugin-directories", check_plugin_directories(repo)?),
         ("onboarding-floor", onboarding_floor::check(repo)?),

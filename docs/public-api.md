@@ -2320,7 +2320,7 @@ running inside a session on the same host. `plugin profile migrate` and
 its frozen revision over the migration pin (the `package` and `digest` keys), so
 it resumes without the decision; any other rewrite of the text needs the decision
 once for the existing sessions of that profile. The optional `profile_revision` field of a
-resume binding (store schema 3 and later; the current store schema is 20) is
+resume binding (store schema 3 and later; the current store schema is 22) is
 absent for sessions without a profile and for bindings written by schema 2.
 
 For a profile that declares `[options]`, the revision covers the launch the
