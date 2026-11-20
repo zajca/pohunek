@@ -906,12 +906,7 @@ repeating the command; the CLI never retries an install on its own.
   refuses it (`official_trust_unavailable`) and `pohunek doctor` reports the
   `plugin_index_channel` check as `warn`; catalog installs are unaffected.
 - `pohunek plugin install --index <file>` sends a local signed index to the
-  daemon with a local archive. `pohunek plugin update <package> <archive>
-  --index <file>` applies the same checks and refuses an index older than the
-  stored one (`package_index_rollback`), an index that omits the archive's
-  digest (`package_untrusted`) and a digest a recorded catalog revoked
-  (`package_revoked`); the installed version stays selected and keeps
-  launching. `pohunek plugin install <package-id>[@<version>]`
+  daemon with a local archive. `pohunek plugin install <package-id>[@<version>]`
   fetches the official plugin index and the archive it lists first, over
   `https` (or `http` to the local machine, which tests use), and then does the
   same: the transport carries no trust, the daemon verifies the index
@@ -934,6 +929,12 @@ repeating the command; the CLI never retries an install on its own.
   refreshes once when it is older, and with `--index-url` always fetches from that
   URL and ignores the stored copy; `--index-url` with a different URL is a
   transport replacement, not a trust root — the daemon still verifies it.
+  `pohunek plugin update <package> <archive> --index <file>` applies the same
+  checks and refuses an index older than the stored one
+  (`package_index_rollback`), an index that omits the archive's digest
+  (`package_untrusted`) and a digest a recorded catalog revoked
+  (`package_revoked`); the installed version stays selected and keeps
+  launching.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 
