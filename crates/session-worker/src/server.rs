@@ -8810,6 +8810,22 @@ mod tests {
         }
     }
 
+    /// Subscribes this thread to the worker's warnings; the events a scenario's
+    /// tasks emit on its current-thread runtime land in the returned capture.
+    #[cfg(target_os = "linux")]
+    fn capture_warnings() -> (EventCapture, tracing::subscriber::DefaultGuard) {
+        let capture = EventCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer({
+                let capture = capture.clone();
+                move || capture.clone()
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        (capture, tracing::subscriber::set_default(subscriber))
+    }
+
     fn logged_field(logged: &str, name: &str) -> u64 {
         let marker = format!("{name}=");
         let start = logged
@@ -10100,14 +10116,16 @@ mod tests {
             pohunek_test_support::host_lock::UNREADABLE_HOLDERS,
             "escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset",
         );
+        let (capture, _subscriber) = capture_warnings();
         let directory = BarrierDirectory::new();
         let ready = directory.path().join("escaped-ready");
         // The escaped holder never closes the PTY, so the runtime always ends with
-        // the root's exit at the same final offset; these windows only keep the
-        // test fast.
+        // the root's exit at the same final offset; the drain window only keeps
+        // the test fast. The stop grace is the product default: it is also the
+        // sweep's settle window for same-user processes with unreadable markers,
+        // which a loaded host starts at any time.
         let config = crate::WorkerConfig {
             post_exit_drain_timeout: Duration::from_millis(50),
-            stop_grace: Duration::from_millis(50),
             ..crate::WorkerConfig::new()
         };
         let server = super::Server::bind(super::ServerArgs {
@@ -10167,11 +10185,7 @@ mod tests {
             worker_instance_id,
         );
 
-        pohunek_test_support::wait::wait_until("the forced-close terminal commit", || async {
-            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
-                .then_some(())
-        })
-        .await;
+        assert_exits_without_a_fault(&server, &capture).await;
         let final_offset = pty.output().next_offset();
         let journal = server.shared.journal.load().expect("load terminal journal");
         assert_eq!(journal.phase, super::JournalPhase::Terminal);
@@ -10184,6 +10198,29 @@ mod tests {
         let state = server.shared.state.lock().await;
         let exit = state.exit.as_ref().expect("the exit is published");
         assert!(exit.output_forced_closed);
+    }
+
+    /// Waits for the runtime's terminal phase. A faulted runtime never reaches
+    /// Exited; it fails the scenario with the captured warnings, which name the
+    /// sweep's blocker, instead of running into the hang guard.
+    #[cfg(target_os = "linux")]
+    async fn assert_exits_without_a_fault(server: &super::Server, capture: &EventCapture) {
+        let phase =
+            pohunek_test_support::wait::wait_until("the runtime's terminal phase", || async {
+                let phase = server.shared.state.lock().await.phase;
+                matches!(
+                    phase,
+                    super::WireRuntimePhase::Exited | super::WireRuntimePhase::Faulted
+                )
+                .then_some(phase)
+            })
+            .await;
+        assert_eq!(
+            phase,
+            super::WireRuntimePhase::Exited,
+            "the forced-close sweep faulted the runtime: {}",
+            String::from_utf8_lossy(&capture.0.lock().expect("event capture")),
+        );
     }
 
     #[tokio::test]

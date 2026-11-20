@@ -83,7 +83,7 @@ crates/platform/tests/process_lineage.rs 1
 crates/platform/tests/systemd.rs 6
 crates/service-config/tests/service_config.rs 7
 crates/session-worker/src/pty.rs 8
-crates/session-worker/src/server.rs 17
+crates/session-worker/src/server.rs 16
 crates/session-worker/tests/program_status_probe.rs 2
 crates/session-worker/tests/pty_launch.rs 2
 crates/session-worker/tests/resources.rs 2
