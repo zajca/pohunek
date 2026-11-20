@@ -330,14 +330,20 @@ install by id.
   other entry is admitted to the verified tier.
 - A plugin archive is accepted only when both of these hold:
   - `gh attestation verify <archive> --repo <source.repo> --signer-workflow
-    zajca/pohunek/.github/workflows/plugin-release.yml --signer-digest <commit
+    zajca/pohunek/.github/workflows/plugin-release.yml --signer-digest <object
     of the zajca/pohunek tag source.built_with> --source-ref
     refs/tags/<source.tag> --source-digest <source.commit>
-    --deny-self-hosted-runners` succeeds. The commit is resolved only through
-    the qualified tag ref of `zajca/pohunek` itself, never through a bare sha,
-    so a commit of a fork network cannot satisfy it. Whether `--signer-digest`
-    matches the commit of a reusable workflow is checked by the first plugin
-    release; admission is not trusted before that check has passed.
+    --deny-self-hosted-runners` succeeds. The signer digest is the object that
+    the qualified tag ref `refs/tags/<source.built_with>` of `zajca/pohunek`
+    points to: for an annotated tag it is the tag object, not the commit the
+    tag points to, and the commit is refused with `expected BuildSignerDigest`.
+    `gh api repos/zajca/pohunek/git/refs/tags/<tag> --jq .object.sha` prints
+    it. The tag is resolved only through that qualified ref of `zajca/pohunek`
+    itself, never through a bare sha, so a commit of a fork network cannot
+    satisfy it. Admission passes this check for a plugin built with a core
+    release tag: the `pohunek.runtime.muse` 0.1.0 entry (built with `v0.43.1`)
+    passed it in the index admission run for
+    `pohunekd/pohunek-plugin-index#10` (run 44729152089).
   - `cargo xtask plugin build` at `zajca/pohunek` tag `source.built_with`, run on
     `source.commit`, reproduces the entry digest. A build by other code cannot
     match this rebuild, so the `core-tag` input and the workflow commit do not
