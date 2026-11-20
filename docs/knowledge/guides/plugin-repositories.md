@@ -37,7 +37,11 @@ adds one (`plugin-directories`).
 
 Only the owner creates `pohunekd/*` repositories. An agent proposes one in an
 issue and waits for the grant. The `pohunek.` namespace and the
-`pohunekd/plugin-*` names are reserved to the official tier.
+`pohunekd/plugin-*` names are reserved to the official tier. The index admits
+only official entries under the `pohunek.` namespace; the daemon does not
+refuse a `pohunek.*` package id on a local install by digest or link (see the
+[trust model](runtime-packages.md#trust-model)), so check the `origin` of an
+installed package.
 
 ## Naming
 
@@ -361,7 +365,8 @@ install by id.
   `predicate=<name>: <detail>`, where `<name>` is one of `schema`, `existing-tree`, `package-id-binding`, `refused-runtime-id`, `url-charset`, `identity-conflict`, `duplicate-digest`, `version-not-semver`, `version-not-release`, `duplicate-version`, `version-not-greater`, `core-range-unparsed`, `core-prerelease`, `core-excludes-core-tag`, `core-lower-bound` (the `Predicate` enum in
   `crates/xtask/src/plugin_index/admit.rs`).
 - Without admission, an owner can still install a published archive by its
-  digest (community tier); such an install never serves a reserved runtime id.
+  digest (community tier); such an install is refused a runtime id the daemon
+  reserves (see the [trust model](runtime-packages.md#trust-model)).
 
 ## Release snapshot
 
