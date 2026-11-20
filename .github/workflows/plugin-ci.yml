@@ -65,7 +65,7 @@ on:
         type: string
         default: ''
       smoke-script-timeout:
-        description: "Bound for the smoke script in whole seconds, passed as `--script-timeout` when set: integer 1..=900, absent keeps the kit default of 60 s. At most 900 s so the bound still fits the smoke job's `timeout-minutes: 30` with setup headroom. A package without a runtime refuses a non-empty value."
+        description: "Bound for the smoke script in whole seconds, passed as `--script-timeout` when set: integer 1..=900, absent keeps the kit default of 60 s. At most 900 s so the bound still fits the smoke step's `timeout-minutes: 30` (inside the `check` job's 60) with setup headroom. A package without a runtime refuses a non-empty value."
         required: false
         type: string
         default: ''
@@ -196,7 +196,7 @@ jobs:
           test -z "${SMOKE_SCRIPT:-}" || test -f "plugin/$SMOKE_SCRIPT"
           if [ -n "${SMOKE_SCRIPT_TIMEOUT:-}" ]; then
             case "$SMOKE_SCRIPT_TIMEOUT" in
-              '' | *[!0-9]*) echo "SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900: $SMOKE_SCRIPT_TIMEOUT" >&2; exit 1 ;;
+              '' | *[!0-9]* | ????*) echo "SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900: $SMOKE_SCRIPT_TIMEOUT" >&2; exit 1 ;;
             esac
             if [ "$SMOKE_SCRIPT_TIMEOUT" -lt 1 ] || [ "$SMOKE_SCRIPT_TIMEOUT" -gt 900 ]; then
               echo "SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900: $SMOKE_SCRIPT_TIMEOUT" >&2

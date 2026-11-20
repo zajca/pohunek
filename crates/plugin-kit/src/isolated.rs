@@ -134,14 +134,12 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest one CLI command may run.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Default bound for the smoke script: without `--script-timeout` the
-/// smoke keeps the documented 60 s bound.
-///
-/// Smallest and largest accepted `--script-timeout`: the max is 900 s so a
-/// long plugin E2E still fits the smoke job's `timeout-minutes: 30` bound
-/// with setup headroom.
+/// Bound for the smoke script without `--script-timeout`: the documented 60 s.
 pub const SCRIPT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+/// Smallest accepted `--script-timeout`.
 pub const SCRIPT_TIMEOUT_MIN: Duration = Duration::from_secs(1);
+/// Largest accepted `--script-timeout`: 900 s still fits the smoke step's
+/// `timeout-minutes: 30` (inside the `check` job's 60) with setup headroom.
 pub const SCRIPT_TIMEOUT_MAX: Duration = Duration::from_mins(15);
 
 /// Pause between two checks of a child process.
@@ -664,12 +662,8 @@ impl Host {
             .process_group(0)
             .spawn()
             .map_err(|error| format!("cannot start the smoke script: {error}"))?;
-        let bound = timeout.as_secs();
-        let what = format!(
-            "smoke script {} did not exit within {bound} s",
-            script.display()
-        );
-        let status = wait_for_exit(&mut child, &what, timeout);
+        let name = format!("smoke script {}", script.display());
+        let status = wait_for_exit(&mut child, &name, timeout);
         // No backgrounded child outlives the run. The script is already
         // reaped here, so a fully exited group whose pgid the kernel has
         // meanwhile handed to an unrelated new group would take the
@@ -735,8 +729,7 @@ impl Host {
             .process_group(0)
             .spawn()
             .map_err(|error| format!("cannot start `{program}`: {error}"))?;
-        let label = format!("`{program}` did not finish within {COMMAND_TIMEOUT:?}");
-        let status = wait_for_exit(&mut child, &label, COMMAND_TIMEOUT)?;
+        let status = wait_for_exit(&mut child, program, COMMAND_TIMEOUT)?;
         let mut stdout = Vec::new();
         File::open(&output_path)
             .and_then(|file| file.take(OUTPUT_LIMIT_BYTES + 1).read_to_end(&mut stdout))
@@ -848,9 +841,9 @@ impl Drop for Host {
 
 /// Waits for `child` until it exits or `timeout` passes, then reaps its
 /// process group on a timeout or a wait error. Returns the exit status;
-/// `what` names the child in the wait error, and on a timeout the
-/// caller-provided `what` already carries the bound.
-fn wait_for_exit(child: &mut Child, what: &str, timeout: Duration) -> Result<ExitStatus, String> {
+/// on a timeout the error names the child and the bound as
+/// `<name> did not exit within <N> s`.
+fn wait_for_exit(child: &mut Child, name: &str, timeout: Duration) -> Result<ExitStatus, String> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -858,11 +851,14 @@ fn wait_for_exit(child: &mut Child, what: &str, timeout: Duration) -> Result<Exi
             Ok(None) if Instant::now() < deadline => thread::sleep(POLL_INTERVAL),
             Ok(None) => {
                 end_group(child);
-                return Err(what.to_string());
+                return Err(format!(
+                    "{name} did not exit within {} s",
+                    timeout.as_secs()
+                ));
             }
             Err(error) => {
                 end_group(child);
-                return Err(format!("cannot wait for {what}: {error}"));
+                return Err(format!("cannot wait for {name}: {error}"));
             }
         }
     }

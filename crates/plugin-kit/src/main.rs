@@ -105,7 +105,8 @@ enum Command {
         script: Option<PathBuf>,
         /// Bound for the smoke script in whole seconds; absent keeps the
         /// 60 s default. Valid range 1..=900, so a long plugin E2E still
-        /// fits the smoke job's `timeout-minutes: 30` bound with setup.
+        /// fits the smoke step's `timeout-minutes: 30` (inside the `check`
+        /// job's 60) with setup.
         #[arg(long)]
         script_timeout: Option<u64>,
         /// Print the report as a single JSON document.

@@ -12,6 +12,6 @@
   input (string, default empty = kit default), validated to `1..=900` in the
   `Set up the package inputs` step, refused for a context or commands-only
   package like `smoke-script`, and passed as `--script-timeout` only when
-  set. The smoke job's `timeout-minutes: 30` still covers the 900 s bound
+  set. The smoke step's `timeout-minutes: 30` (inside the `check` job's 60) still covers the 900 s bound
   with setup headroom. See
   `docs/knowledge/guides/plugin-repositories.md`.

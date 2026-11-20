@@ -225,7 +225,10 @@ fn commands_only_exports(
 /// Steps on an existing root: trust, host, install, start, detect, screen,
 /// then stop and remove the session. Every step runs through the isolated
 /// `pohunek` CLI, so the smoke exercises the same surface an owner uses.
-#[expect(clippy::too_many_arguments, reason = "the smoke plumbing threads one bound alongside the existing paths")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads one bound alongside the path arguments"
+)]
 fn smoke_in(
     root: &Root,
     release_dir: &Path,

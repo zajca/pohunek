@@ -780,26 +780,42 @@ fn kit_smoke_reports_the_effective_script_timeout() {
     }
 }
 
+// One script with a known, bounded run time proves both directions of
+// the configurable bound: 3 s of sleep fails under `--script-timeout 1`
+// and passes under `--script-timeout 20`, with 17 s of headroom for a
+// loaded runner (well under HANG_GUARD's 120 s).
 #[test]
-fn kit_smoke_passes_when_a_slow_script_gets_its_bound() {
+fn kit_smoke_bounds_a_slow_script_by_its_timeout() {
     use std::os::unix::fs::PermissionsExt as _;
     let kit = Kit::new();
     let release = release_dir();
-    let gate = kit.path("gate.txt");
     let script = kit.path("smoke-slow.sh");
-    // The script waits on a file the test creates, not on a sleep: the
-    // wait is bounded by the script timeout below, the creator poll by
-    // HANG_GUARD.
-    fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nset -eu\nfor _ in $(seq 1 100); do\n  [ -f \"{}\" ] && exit 0\n  sleep 0.1\ndone\nexit 1\n",
-            gate.display()
-        ),
-    )
-    .expect("write the slow script");
+    fs::write(&script, "#!/bin/sh\nsleep 3\nexit 0\n").expect("write the slow script");
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
-    fs::write(&gate, "open").expect("open the gate");
+    let short = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--script-timeout",
+        "1",
+    ]);
+    assert!(
+        !short.status.success(),
+        "a script past its bound must fail the smoke"
+    );
+    assert!(
+        stderr_of(&short).contains(&format!(
+            "smoke script {} did not exit within 1 s",
+            script.display()
+        )),
+        "the timeout error names the script and the bound: {}",
+        stderr_of(&short)
+    );
+    named_root(&short);
     let output = kit.kit(&[
         "smoke",
         "--dir",
@@ -809,7 +825,7 @@ fn kit_smoke_passes_when_a_slow_script_gets_its_bound() {
         "--script",
         s(&script),
         "--script-timeout",
-        "10",
+        "20",
         "--json",
     ]);
     assert!(
@@ -820,7 +836,7 @@ fn kit_smoke_passes_when_a_slow_script_gets_its_bound() {
     let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
     assert_eq!(
         document["script_timeout_s"],
-        serde_json::json!(10_u64),
+        serde_json::json!(20_u64),
         "the report carries the raised script bound"
     );
     used_root(&document, &kit);
@@ -1446,26 +1462,39 @@ fn kit_smoke_refuses_runtime_only_inputs_for_a_commands_only_package() {
     let script = kit.path("smoke-script.sh");
     fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write the script");
     make_executable(&script);
-    let output = kit.kit(&[
-        "smoke",
-        "--dir",
-        s(&dir),
-        "--release-dir",
-        s(&release),
-        "--script",
-        s(&script),
-    ]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "rc is 2: {}",
-        stderr_of(&output)
-    );
-    assert!(
-        stderr_of(&output).contains("serves no runtime"),
-        "the refusal names the runtime-only input: {}",
-        stderr_of(&output)
-    );
+    for extra in [
+        vec!["--script", s(&script)],
+        vec!["--script-timeout", "120"],
+    ] {
+        let mut argv = vec![
+            "smoke".to_owned(),
+            "--dir".to_owned(),
+            s(&dir).to_owned(),
+            "--release-dir".to_owned(),
+            s(&release).to_owned(),
+        ];
+        argv.extend(extra.iter().map(ToString::to_string));
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = kit.kit(&refs);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "rc is 2: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("serves no runtime"),
+            "the refusal names the runtime-only input: {}",
+            stderr_of(&output)
+        );
+        if extra[0] == "--script-timeout" {
+            assert!(
+                stderr_of(&output).contains("--script-timeout"),
+                "the commands-only refusal names the bound flag: {}",
+                stderr_of(&output)
+            );
+        }
+    }
 }
 
 #[test]
