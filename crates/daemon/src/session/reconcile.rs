@@ -25211,6 +25211,11 @@ generation "$1"
                     "{label}"
                 );
                 assert_usable(&registry, &id, &label).await;
+                // The stop schedules its terminal acknowledgement as a
+                // background transaction (see `SessionRegistry::settle_transactions`):
+                // wait for it before the store read and `shutdown`, or the
+                // acknowledgement can outlive the shutdown bound under load.
+                registry.settle_transactions().await;
                 assert_eq!(
                     Store::new(store_path)
                         .load_sessions()
