@@ -95,7 +95,10 @@ as its own process, and prints one line per gate and a summary line:
 `FAIL` is fixed before the push; the exit code is 1. `UNDECIDED` means the gate
 could not run here (no network, no published release at or below the workspace
 version): it exits 0, the summary line lists it, and it is CI-only evidence,
-never green. `SKIP` means the gate does not apply to the diff.
+never green. `SKIP` means the gate does not apply to the diff. A gate that cannot
+run its program or read the diff (a `git diff` error, a program that is not
+executable) is never `SKIP`: it is `FAIL (<gate> crashed: ...)` or carries the
+error, the later gates still run and the summary line is always printed.
 
 ## Stress the changed tests
 

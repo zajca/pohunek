@@ -37,8 +37,14 @@ FAKE_CARGO = textwrap.dedent(
     #!/usr/bin/env python3
     import os, sys
     args = sys.argv[1:]
+    sources = []
+    for directory, _, names in os.walk("crates/demo/src"):
+        for name in sorted(names):
+            path = os.path.join(directory, name)
+            if path != "crates/demo/src/lib.rs":
+                sources.append(path + "=" + open(path).read().split("\\n")[0])
     with open(os.environ["FAKE_CALLS"], "a") as calls:
-        calls.write(os.getcwd() + " cargo " + " ".join(args) + "\\n")
+        calls.write(os.getcwd() + " cargo " + " ".join(args) + " | " + " ".join(sorted(sources)) + "\\n")
     lib = open("crates/demo/src/lib.rs").read()
     if args[0] == "build":
         if "nobuild" in lib:
@@ -262,7 +268,7 @@ class FilterThatSelectsNothing(RedOnOldScenarios):
 
 class ProductionFileThatAlsoChangesTestCode(RedOnOldScenarios):
     def mixed_fix(self):
-        self.write(LIB, "fixed\n")
+        self.write(LIB, "fixed\nmod mixed;\n")
         self.write(MIXED, MIXED_NEW)
         self.write(SCENARIOS, "// scenarios\n")
         self.commit("fix with an inline test")
@@ -301,10 +307,106 @@ class ProductionFileThatAlsoChangesTestCode(RedOnOldScenarios):
     def test_a_change_to_production_lines_outside_the_test_module_is_restored_automatically(self):
         self.write(MIXED, MIXED_OLD.replace("        1\n", "        2\n", 1).replace("super::value(), 1", "super::value(), 1"))
         self.write(SCENARIOS, "// scenarios\n")
-        self.write(LIB, "fixed\n")
+        self.write(LIB, "fixed\nmod mixed;\n")
         self.commit("fix a production line only")
         result = self.red_on_old("--rows", "R1", "--scenario", "R1=test(red)", "--package", "demo")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class ModulesThatOnlyATestBuildCompiles(RedOnOldScenarios):
+    """A `mod` declaration decides whether a changed source file is test code."""
+
+    def old_tree_runs(self):
+        return [call for call in self.calls.read_text().splitlines() if "red-on-old-" in call and " nextest " in call]
+
+    def run_fix(self, lib_old, lib_new, files_old, files_new, *extra):
+        for path, text in files_old.items():
+            self.write(f"crates/demo/src/{path}", text)
+        self.write(LIB, lib_old)
+        self.commit("main with the modules")
+        self.git("checkout", "-q", "-b", "fix2")
+        for path, text in files_new.items():
+            self.write(f"crates/demo/src/{path}", text)
+        self.write(LIB, lib_new)
+        self.write(SCENARIOS, "// scenarios\n")
+        self.commit("fix")
+        return self.red_on_old("--rows", "R1", "--scenario", "R1=test(red)", "--package", "demo", *extra)
+
+    def test_the_old_tree_keeps_a_helper_declared_by_a_cfg_test_module(self):
+        self.git("checkout", "-q", "main")
+        result = self.run_fix(
+            "broken\n#[cfg(test)]\nmod test_support;\n", "fixed\n#[cfg(test)]\nmod test_support;\n",
+            {"test_support.rs": "old helper\n"}, {"test_support.rs": "new helper\n"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = self.old_tree_runs()
+        self.assertTrue(runs)
+        self.assertTrue(all("crates/demo/src/test_support.rs=new helper" in run for run in runs), runs)
+
+    def test_the_old_tree_restores_a_helper_that_a_production_module_declares(self):
+        self.git("checkout", "-q", "main")
+        result = self.run_fix(
+            "broken\nmod helper;\n", "fixed\nmod helper;\n",
+            {"helper.rs": "old helper\n"}, {"helper.rs": "new helper\n"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = self.old_tree_runs()
+        self.assertTrue(runs)
+        self.assertTrue(all("crates/demo/src/helper.rs=old helper" in run for run in runs), runs)
+
+    def test_every_file_below_a_cfg_test_directory_module_is_test_code(self):
+        self.git("checkout", "-q", "main")
+        result = self.run_fix(
+            "broken\n#[cfg(test)]\nmod scenarios_dir;\n", "fixed\n#[cfg(test)]\nmod scenarios_dir;\n",
+            {"scenarios_dir/mod.rs": "mod leaf;\n", "scenarios_dir/leaf.rs": "old leaf\n"},
+            {"scenarios_dir/mod.rs": "mod leaf;\n", "scenarios_dir/leaf.rs": "new leaf\n"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = self.old_tree_runs()
+        self.assertTrue(runs)
+        self.assertTrue(all("crates/demo/src/scenarios_dir/leaf.rs=new leaf" in run for run in runs), runs)
+
+    def test_a_path_attribute_names_the_file_of_a_cfg_test_module(self):
+        self.git("checkout", "-q", "main")
+        declaration = '#[cfg(test)]\n#[path = "support/impl_file.rs"]\nmod helper;\n'
+        result = self.run_fix(
+            "broken\n" + declaration, "fixed\n" + declaration,
+            {"support/impl_file.rs": "old helper\n"}, {"support/impl_file.rs": "new helper\n"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = self.old_tree_runs()
+        self.assertTrue(runs)
+        self.assertTrue(all("crates/demo/src/support/impl_file.rs=new helper" in run for run in runs), runs)
+
+    def test_a_file_whose_declaration_cannot_be_read_is_refused_until_every_row_is_manual(self):
+        self.git("checkout", "-q", "main")
+        result = self.run_fix(
+            "broken\n", "fixed\n", {"orphan.rs": "old\n"}, {"orphan.rs": "new\n"},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("crates/demo/src/orphan.rs", result.stderr)
+        self.assertIn("--manual", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.calls.read_text(), "")
+
+    def test_a_manual_row_accepts_a_file_whose_declaration_cannot_be_read(self):
+        self.git("checkout", "-q", "main")
+        result = self.run_fix(
+            "broken\n", "fixed\n", {"orphan.rs": "old\n"}, {"orphan.rs": "new\n"},
+            "--manual", "R1=set the value back by hand",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.rows(result)["R1"][2:], ["manual: set the value back by hand", "PASS"])
+
+    def test_a_module_that_a_host_cfg_may_compile_out_is_never_taken_for_production(self):
+        self.git("checkout", "-q", "main")
+        result = self.run_fix(
+            "broken\n#[cfg(any(target_os = \"macos\", test))]\nmod layout;\n",
+            "fixed\n#[cfg(any(target_os = \"macos\", test))]\nmod layout;\n",
+            {"layout.rs": "old\n"}, {"layout.rs": "new\n"},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("crates/demo/src/layout.rs", result.stderr)
 
 
 class ScratchWorktreeCleanup(RedOnOldScenarios):
