@@ -400,8 +400,8 @@ run or run attempt of the tier on the commit itself has completed, the runs on
 the commit decide, so a tree match never hides a failure there; pull-request, push, and
 schedule runs never match by tree. The report names the run and whether it
 matched by `sha` or by `tree`; a delta dispatch (`delta: true`) additionally
-names the recorded source pull request run whose green jobs it reuses, and the
-union of both runs decides. A `main` push (`push` event) likewise reuses
+names the recorded source runs (one per reused job: pull request, push or
+dispatch runs) whose green legs it reuses, and the union of the runs decides. A `main` push (`push` event) likewise reuses
 the newest green legs of the previous same-tree runs (PR, push, tier=main
 dispatch) within 24h while the workflow-level `CI_REUSE_PUSH` kill switch is
 `true`; `scripts/ci-reuse` decides per job and `scripts/ci-evidence` verifies

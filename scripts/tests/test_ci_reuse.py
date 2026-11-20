@@ -1,6 +1,6 @@
-"""Scenarios for the delta-reuse decision of `scripts/ci-reuse` (issue #2203).
+"""Scenarios for the reuse decision of `scripts/ci-reuse` for a delta dispatch and a main push (issues #2203, #2204).
 
-The tests import `scripts/ci-reuse` as a module and call its `main()` with an
+The consumer event is `GITHUB_EVENT_NAME`. The tests import `scripts/ci-reuse` as a module and call its `main()` with an
 injected `now` (the clock is a scenario input, never the wall clock) against
 a fake `gh` on PATH, the same technique `test_ci_evidence.py` uses: each
 scenario writes a fixture of workflow runs, their artifacts and their jobs,
@@ -426,7 +426,7 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertEqual(self.outputs()["source_run"], "")
 
     def test_a_red_heavy_leg_drops_build_tests_by_closure(self):
-        # Row 12: a red `tests (heavy 1/3, PTY + Hermes)` leg drops
+        # A red `tests (heavy 1/3, PTY + Hermes)` leg drops
         # `integration`, and the closure to a fixed point must take
         # `build-tests` (its producer) out of `skip` too, while jobs that
         # do not depend on it stay reused.
@@ -452,7 +452,7 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertIn("fast-tests", skip)
 
     def test_an_unreadable_selection_counts_as_narrowed(self):
-        # Row 9: a `selection.json` that cannot be parsed counts as
+        # A `selection.json` that cannot be parsed counts as
         # narrowed, so the selection-dependent jobs are not reused.
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -473,7 +473,7 @@ class CiReuseProcessTests(unittest.TestCase):
         self.assertIn("test", skip)
 
     def test_an_artifact_list_error_gives_an_empty_skip_with_exit_zero(self):
-        # Row 11: an artifact-list error after a successful run list gives
+        # An artifact-list error after a successful run list gives
         # `skip=[]`, a warning, and exit 0 (the reuse job must not fail).
         gh = self.bin_dir / "gh"
         gh.write_text(r'''#!/usr/bin/env python3
@@ -501,7 +501,7 @@ else:
         self.assertIn("cannot list artifacts of run 777", out)
 
     def test_a_job_list_error_gives_an_empty_skip_with_exit_zero(self):
-        # Row 11: a job-list error after good runs and artifacts gives
+        # A job-list error after good runs and artifacts gives
         # `skip=[]`, a warning, and exit 0.
         gh = self.bin_dir / "gh"
         gh.write_text(r'''#!/usr/bin/env python3
@@ -543,7 +543,7 @@ else:
         self.assertIn("cannot list jobs of run 777", out)
 
     def test_a_selection_download_timeout_gives_an_empty_skip_with_exit_zero(self):
-        # Row 11: the `test-selection` zip download hangs (TimeoutExpired):
+        # The `test-selection` zip download hangs (TimeoutExpired):
         # `download_artifact` must catch it and fail open, not crash the
         # reuse job with a traceback.
         import subprocess as subprocess_module
@@ -655,7 +655,7 @@ else:
 
 
     def test_a_push_reuses_a_pull_request_source_by_tree(self):
-        # Push (issue #2204, rows 1-2): the merge commit differs from the PR
+        # Push: the merge commit differs from the PR
         # head that tested the same tree. The source is on another commit
         # (OTHER_SHA) but its recorded tested-tree equals the push tree.
         self.write_fixture(
@@ -703,7 +703,7 @@ else:
         self.assertIn(record["jobs"]["test"]["run_id"], record["source_runs"])
 
     def test_a_delta_dispatch_never_reuses_a_same_tree_source_on_another_commit(self):
-        # Row 15: a delta dispatch reuses the same commit; a same-tree
+        # A delta dispatch reuses the same commit; a same-tree
         # source on another commit is not a dispatch source.
         self.write_fixture(
             runs=[run_doc(run_id=777, event="workflow_dispatch", head_sha="b" * 40)],
@@ -930,7 +930,7 @@ else:
 
     def test_a_source_with_head_sha_mismatch_for_a_dispatch_supplies_nothing(self):
         # A delta dispatch must not reuse a same-tree PR source on
-        # another commit (row 15 via consumer event).
+        # another commit (the consumer event decides).
         self.write_fixture(
             runs=[run_doc(run_id=777, event="pull_request", head_sha="b" * 40)],
             jobs_by_run={"777": green_jobs()},

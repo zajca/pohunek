@@ -9,8 +9,7 @@ against an injected clock. Never `cargo-audit`, never schedule or nightly.
 
 The scripts load this module by path with importlib (the way the tests load
 the scripts), because the checked-in scripts carry no `.py` suffix and share
-no package. Every guard in this module is killed by a scenario in
-`scripts/tests/test_ci_reuse.py` or `scripts/tests/test_ci_evidence.py`.
+no package.
 """
 
 from __future__ import annotations
@@ -156,8 +155,8 @@ def run_source_reasons(
     The rule itself lives in `source_is_eligible`; this names the failed
     pieces so a refusal says which guard failed. A caller passes the
     evidence run's `created_at` as the clock so the window reads against
-    the evidence run (one-sided age), and the check drops to the epoch
-    when the source timestamp is unreadable instead of failing open."""
+    the evidence run (one-sided age). An unreadable source timestamp is
+    reported as `has no readable created_at` or as older than the window."""
     reasons: list[str] = []
     if (source.get("repository") or {}).get("full_name") != repo or (
         source.get("head_repository") or {}
@@ -195,11 +194,11 @@ def evidence_commit_match(source: dict, sha: str) -> str | None:
 def evidence_tree_match(source: dict, sha: str, tree: str, lookup) -> str | None:
     """Why `source` does not answer a push consumer, or None when the
     source's tree is the evidence tree. A `pull_request` source is matched
-    by its recorded tested tree (checked separately below); any other event
+    by its recorded tested tree (the caller compares it); any other event
     matches by commit or, via `lookup`, by the tree of its head commit. A
     lookup failure names the cause instead of reading as a mismatch."""
     if source.get("event") == "pull_request":
-        return None  # recorded tree checked below
+        return None  # the caller compares the recorded tree
     if source.get("head_sha") == sha:
         return None
     head_sha = source.get("head_sha")

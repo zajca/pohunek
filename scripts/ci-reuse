@@ -20,12 +20,12 @@ among candidates whose `tested-tree-*` record is exactly the tree, within
 `selection_dependent`, the source selection must be `full`. Then every job
 with a consumer outside `skip` is removed, iterated to a fixed point.
 
-Outputs: `skip`, `source_run` (primary), `source_runs` (all), `tree`.
-The script writes the `ci-reuse-<tree>` record under `$RUNNER_TEMP` and
+Outputs: `skip`, `source_run` (primary), `source_runs` (all); the workflow
+step adds `tree`. The script writes the `ci-reuse-<tree>` record under `$RUNNER_TEMP` and
 appends a summary table. Any API error or ambiguity gives `skip=[]` with a
 warning. Only an internal bug is red.
 
-`--dry-run` prints the decision (and the API query args) without writing the
+`--dry-run` prints the consumer event and the decision without writing the
 record or outputs, for CI proof.
 """
 
@@ -343,7 +343,7 @@ def decide(
     repo: str,
     consumer_event: str,
 ) -> tuple[list[str], dict | None, str, dict[str, str]]:
-    """The skip list, the newest source run, a global reason, per-job reasons.
+    """The skip list, the source run of each skipped job, a global reason, per-job reasons.
 
     Per job (issue #2204): the newest leg-complete `success` (not `skipped`)
     among the candidate runs whose `tested-tree-*` record is exactly `tree`.
@@ -440,6 +440,9 @@ def decide(
     # The newest green leg wins per job; the audit job is never allowlisted.
     skip_set = set(selected)
     closure_reasons: dict[str, str] = {}
+    # Closure to a fixed point: a pair member is reused only when its partner
+    # is, and a producer only when every consumer is; both rules only remove
+    # jobs.
     changed = True
     while changed:
         changed = False
@@ -598,6 +601,9 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
                 entries = []
                 for name in job["names"]:
                     attempts = by_name.get(name, [])
+                    # `decide` skips only jobs it found green in this run's
+                    # listing, so a missing name means the listing changed
+                    # under it: run everything.
                     if not attempts:
                         warn(f"source run {run['id']} no longer lists {name}; running everything")
                         failed = True

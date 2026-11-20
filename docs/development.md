@@ -221,13 +221,13 @@ finds the newest green legs of the previous runs of the same tree from this
 repository — pull request runs, prior main pushes, and tier=main delta dispatches,
 each within 24 hours, fork runs never — and reuses those green legs (per job, the
 newest green leg; a skipped or failed leg is never reused); the reusable jobs those legs name skip instead of running again. A delta dispatch only accepts a source on the same commit (`head_sha == GITHUB_SHA`); a `main` push may match by recorded tested tree. A failed `reuse` run fails
-the verdict, so no job is wrongly skipped, and a failed reused leg can never be named again: the record is written only on success. Reused legs must be
+the verdict, so no job is wrongly skipped. The record names only legs that were green in their source run, and a fail-open run writes an empty record. Reused legs must be
 `success` in the source run (a skipped or failed leg is never reused) and
 they are looked up by job name with the same `tested-tree-*` record the
 evidence script uses, so a renamed job cannot be silently skipped and a
 renamed matrix leg falls back to running. The list query is bounded in time
 (`created>=now-24h` in the API filter, `per_page=100`); `--dry-run` prints the
-query arguments and the decision without writing outputs or a record, for
+consumer event and the decision without writing outputs or a record, for
 manual proof. `scripts/ci-reuse`
 decides the skip list from `scripts/ci-reuse.json` (the allowlist, mirrored by
 `scripts/tests/test_ci_tiers.py` guards); the source selection must be `mode == "full"`,

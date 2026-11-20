@@ -586,8 +586,8 @@ def verify_reuse(
     leg green and fresh, with every required step of a reused job passed.
     Returns the reused display names, the union failures, and the
     `reused_from` record. Without a reuse artifact there is no union: empty
-    names, no failures, no record, and the caller verifies the run exactly
-    as before."""
+    names, no failures, no record, and the caller verifies the run on its own
+    jobs alone."""
     reuse = config.get("reuse")
     if not isinstance(reuse, dict):
         return set(), [], None, {}
@@ -1107,8 +1107,9 @@ def tree_evidence(
             reused_from = None
             if recorded == {tree} and failures and run.get("conclusion") == "success":
                 jobs = get_jobs(args.repo, run["id"])
-                # ci-reuse skips only jobs the newest same-commit pull request
-                # run has green, so the source run shares this run's commit.
+                # On this branch the evidence run is a dispatch: `verify_reuse` is
+                # called with the run's own head SHA, so every source must be on
+                # that commit.
                 reused, reuse_failures, reused_from, alias = verify_reuse(
                     args.repo, run, config, args.tier, run["head_sha"], cache, jobs
                 )

@@ -3719,9 +3719,8 @@ def reverse_needs() -> dict[str, set[str]]:
 class DeltaReuseWiringTests(unittest.TestCase):
     @staticmethod
     def gate_of(step: str, name: str) -> str:
-        # The K1 murder: a decide step without a gate reads as running
-        # everywhere, so assert the gate exists instead of crashing in
-        # the condition parser.
+        # A step without an `if:` reads as running everywhere, so assert
+        # the gate exists instead of crashing in the condition parser.
         match = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
         assert match is not None, f"the {name} step lost its gate"
         return match.group(1) or match.group(2)  # type: ignore[union-attr]
@@ -4331,7 +4330,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
         )
 
     def test_a_cancelled_or_failed_reused_leg_cannot_be_reported_green(self):
-        # Contract row 13: a `failure` or `cancelled` result of a reused
+        # A `failure` or `cancelled` result of a reused
         # leg fails the verdict, even when the reuse clause would excuse
         # a `skipped` result. Evaluate each verdict step that checks a
         # reusable job on the dispatch path (event `workflow_dispatch`,
@@ -4420,7 +4419,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
             "this run's own reports arrive through the pinned download action",
         )
 
-    def test_the_reuse_job_runs_only_on_a_delta_dispatch(self):
+    def test_the_reuse_job_runs_on_a_delta_dispatch_and_on_a_push(self):
         job = workflow_jobs()[REUSE_JOB]
         self.assertNotRegex(job, r"(?m)^    needs:")
         # The `gh` calls must not hang the 21 jobs that wait on them:
@@ -4571,7 +4570,7 @@ class DeltaReuseWiringTests(unittest.TestCase):
                 )
 
     def test_the_kill_switch_on_decides_and_the_outputs_fall_back(self):
-        # M9: with the switch on a push decides (the step runs) while the
+        # With the switch on a push decides (the step runs) while the
         # kill-switch step is skipped, and a delta dispatch decides too;
         # the `skip` job output reads the decide output first and only
         # falls back to the kill-switch step.
