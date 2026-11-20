@@ -621,16 +621,30 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
         .await
         {
             Ok(end) => end,
-            Err(error) if reattaching && is_session_ended_refusal(&error) => {
+            Err(error)
+                if reattaching
+                    && (is_session_ended_refusal(&error)
+                        || matches!(
+                            reconnect_decision_from_error(&error),
+                            AttachReconnectDecision::Retry
+                        )) =>
+            {
                 // The confirm ended the attach outright, or reports the
                 // session alive again (a `resume` raced the stop): in the
                 // latter case fall through to the normal `StreamClosed`
                 // reconnect path below, where `reconnect.next` and
                 // `wait_for_attach_reconnect` apply the attempt limit,
-                // interval, and window.
-                let ended = confirm_session_ended(host, paths, target).await?;
-                if ended {
-                    return Ok(());
+                // interval, and window. A retryable re-attach refusal
+                // (a draining daemon answered `daemon_shutting_down`
+                // between the probe and the re-attach) takes the same
+                // path: the tail below spends one attempt per refused
+                // re-attach, so the attempt limit and the window bound
+                // the retry.
+                if is_session_ended_refusal(&error) {
+                    let ended = confirm_session_ended(host, paths, target).await?;
+                    if ended {
+                        return Ok(());
+                    }
                 }
                 AttachStreamEnd::StreamClosed
             }
@@ -2227,7 +2241,12 @@ async fn wait_for_attach_reconnect(
             Ok(AttachReconnectDecision::Retry) => {}
             Err(err) => match reconnect_decision_from_error(&err) {
                 AttachReconnectDecision::Retry => {}
-                AttachReconnectDecision::Finish => return Ok(false),
+                AttachReconnectDecision::Finish => {
+                    if is_session_ended_refusal(&err) {
+                        print_session_removed_ended(target);
+                    }
+                    return Ok(false);
+                }
                 AttachReconnectDecision::Reattach => return Ok(true),
                 AttachReconnectDecision::Fail => return Err(err),
             },
@@ -2272,6 +2291,20 @@ fn reconnect_decision_from_state(state: SessionState) -> AttachReconnectDecision
     }
 }
 
+/// The daemon's typed error behind an attach failure, local
+/// (`CliError::Protocol`) or relayed by a remote host
+/// (`CliError::Client(RemoteProtocol)`). Returns `None` for transport
+/// errors, which carry no daemon code.
+fn protocol_error_from_attach_failure(err: &CliError) -> Option<&protocol::ProtocolError> {
+    match err {
+        CliError::Protocol(source) => Some(source),
+        CliError::Client(pohunek_client::ClientError::RemoteProtocol { source, .. }) => {
+            Some(source)
+        }
+        _ => None,
+    }
+}
+
 /// A `session.attach` refusal that proves the session ended after the probe
 /// saw it running: the daemon refuses exactly the re-attach of a session
 /// that is gone (`session_not_found`, from the entry lookup) or terminal
@@ -2279,7 +2312,10 @@ fn reconnect_decision_from_state(state: SessionState) -> AttachReconnectDecision
 /// consults this after a `Reattach` probe decision, when the stop or exit
 /// may have committed between the probe and the re-attach.
 fn is_session_ended_refusal(err: &CliError) -> bool {
-    matches!(err, CliError::Protocol(source) if matches!(source.code.as_str(), "session_not_found" | "session_not_running"))
+    matches!(
+        protocol_error_from_attach_failure(err).map(|source| source.code.as_str()),
+        Some("session_not_found" | "session_not_running")
+    )
 }
 
 /// One authoritative post-refusal inspect on the registry that refused the
@@ -2290,7 +2326,22 @@ async fn confirm_session_ended(
     paths: &Paths,
     target: &Target,
 ) -> Result<bool, CliError> {
-    let mut client = Client::connect_pinned(host, paths).await?;
+    let mut client = match Client::connect_pinned(host, paths).await {
+        Ok(client) => client,
+        Err(error)
+            if matches!(
+                reconnect_decision_from_error(&error),
+                AttachReconnectDecision::Retry
+            ) =>
+        {
+            // The daemon went away before the confirm connected: retry
+            // through the `StreamClosed` path in `run_attach`, where
+            // `reconnect.next` and `wait_for_attach_reconnect` apply the
+            // attempt limit, interval, and window.
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
     let request = build_inspect_request(target)?;
     match client.request(&request).await {
         Ok(result) => {
@@ -2319,17 +2370,14 @@ async fn confirm_session_ended(
         }
         Err(error) => {
             if is_session_ended_refusal(&error) {
-                eprintln!(
-                    "[pohunek] session {} removed; attach ended",
-                    target.session_id,
-                );
+                print_session_removed_ended(target);
                 Ok(true)
             } else if matches!(
                 reconnect_decision_from_error(&error),
                 AttachReconnectDecision::Retry
             ) {
                 // The daemon went away mid-confirm: fall through to the
-                // normal `StreamClosed` reconnect path below, where
+                // `StreamClosed` path in `run_attach`, where
                 // `reconnect.next` and `wait_for_attach_reconnect` apply
                 // the attempt limit, interval, and window.
                 Ok(false)
@@ -2340,26 +2388,49 @@ async fn confirm_session_ended(
     }
 }
 
+/// One line for every attach path that ends because the session is gone:
+/// the R3 confirm and the R2 reconnect probe share it.
+fn print_session_removed_ended(target: &Target) {
+    eprintln!(
+        "[pohunek] session {} removed; attach ended",
+        target.session_id,
+    );
+}
+
 fn reconnect_decision_from_error(err: &CliError) -> AttachReconnectDecision {
     match err {
         CliError::DaemonUnreachable { .. } => AttachReconnectDecision::Retry,
-        CliError::Protocol(source)
-            if matches!(
-                source.code.as_str(),
-                "session_not_found" | "session_not_running"
-            ) =>
-        {
-            AttachReconnectDecision::Retry
-        }
-        CliError::Client(source)
-            if matches!(
-                source.to_protocol_error().code.as_str(),
-                "daemon_unreachable" | "host_unreachable" | "remote_daemon_unavailable" | "framing"
-            ) =>
-        {
-            AttachReconnectDecision::Retry
-        }
-        _ => AttachReconnectDecision::Fail,
+        _ => match protocol_error_from_attach_failure(err).map(|source| source.code.as_str()) {
+            Some("session_not_running") => AttachReconnectDecision::Retry,
+            Some("session_not_found") => {
+                // The daemon serves requests only after it has loaded and
+                // reconciled its durable sessions, so a restarted daemon
+                // cannot answer `session_not_found` for a session that still
+                // exists. The session is gone for good: end the attach at once
+                // instead of retrying until the window expires.
+                AttachReconnectDecision::Finish
+            }
+            Some("daemon_shutting_down") => {
+                // The daemon is restarting or going away: keep retrying until
+                // the window expires instead of failing at once.
+                AttachReconnectDecision::Retry
+            }
+            None => match err {
+                CliError::Client(source)
+                    if matches!(
+                        source.to_protocol_error().code.as_str(),
+                        "daemon_unreachable"
+                            | "host_unreachable"
+                            | "remote_daemon_unavailable"
+                            | "framing"
+                    ) =>
+                {
+                    AttachReconnectDecision::Retry
+                }
+                _ => AttachReconnectDecision::Fail,
+            },
+            Some(_) => AttachReconnectDecision::Fail,
+        },
     }
 }
 
@@ -4003,7 +4074,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_reconnect_decision_retries_only_live_or_temporarily_missing_sessions() {
+    fn attach_reconnect_decision_from_probe_state() {
         assert_eq!(
             reconnect_decision_from_state(protocol::SessionState::Running),
             AttachReconnectDecision::Reattach
@@ -4016,15 +4087,44 @@ mod tests {
             reconnect_decision_from_state(protocol::SessionState::Done),
             AttachReconnectDecision::Finish
         );
-
-        let missing = protocol::ProtocolError::new(
-            protocol::ErrorClass::Runtime,
-            "session_not_found",
-            "session vanished during restart",
-            None,
-        );
+        let local = |code: &str| {
+            CliError::Protocol(protocol::ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                code,
+                format!("test {code}"),
+                None,
+            ))
+        };
+        let remote = |code: &str| {
+            CliError::Client(pohunek_client::ClientError::RemoteProtocol {
+                host: "peer".to_owned(),
+                source: protocol::ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    code,
+                    format!("test {code}"),
+                    None,
+                ),
+            })
+        };
+        for make in [local, remote] {
+            assert_eq!(
+                reconnect_decision_from_error(&make("session_not_running")),
+                AttachReconnectDecision::Retry
+            );
+            assert_eq!(
+                reconnect_decision_from_error(&make("session_not_found")),
+                AttachReconnectDecision::Finish
+            );
+            assert_eq!(
+                reconnect_decision_from_error(&make("daemon_shutting_down")),
+                AttachReconnectDecision::Retry
+            );
+            assert!(is_session_ended_refusal(&make("session_not_found")));
+            assert!(is_session_ended_refusal(&make("session_not_running")));
+            assert!(!is_session_ended_refusal(&make("daemon_shutting_down")));
+        }
         assert_eq!(
-            reconnect_decision_from_error(&CliError::Protocol(missing)),
+            reconnect_decision_from_error(&local("daemon_shutting_down")),
             AttachReconnectDecision::Retry
         );
     }

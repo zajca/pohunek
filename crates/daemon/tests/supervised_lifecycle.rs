@@ -45,8 +45,9 @@ use pohunek_worker_protocol::{
     ResponseKind,
 };
 use protocol::{
-    method, RuntimeState, SessionId, SessionInputParams, SessionResizeParams, SessionTurnEventKind,
-    SessionWaitTurnParams, SessionWaitTurnReason,
+    method, RuntimeState, SessionId, SessionInfo, SessionInputParams, SessionResizeParams,
+    SessionState as ProtocolSessionState, SessionTurnEventKind, SessionWaitTurnParams,
+    SessionWaitTurnReason,
 };
 use supervised::{
     backend, contains, counters, eventually, explained, loss_reason, read_until, runtime_state,
@@ -292,6 +293,131 @@ async fn a_worker_that_died_while_the_daemon_was_down_has_no_exit_evidence() {
         .runtime
         .expect("the lost session keeps its runtime");
     assert_eq!(runtime.exit, None, "nothing watched the worker's end");
+}
+
+/// #2440: the first request a restarted real daemon serves already sees
+/// every kept session. The daemon serves requests only after startup
+/// reconciliation loads and reconciles the durable state, so a reconnect
+/// probe can never observe a transiently empty registry: `session_not_found`
+/// after a restart is permanent.
+///
+/// The test restarts the real daemon through the native manager without a
+/// `session.list` readiness poll: `restart_daemon_unready` waits only for
+/// the new job process and the previous process's exit, then a connect
+/// poll retries only connect errors until the first connection succeeds. The two `session.inspect`s are the
+/// first requests the new daemon serves. One session is a plain shell, the
+/// other a seeded resumable record with a resume binding; both keep their
+/// ids and post-reconcile states.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+async fn the_first_inspect_after_a_restart_finds_every_kept_session() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    async fn inspect(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        session_id: &str,
+    ) -> SessionInfo {
+        let request = protocol::Request::new(
+            "restart-first-inspect",
+            protocol::method::SESSION_INSPECT,
+            serde_json::to_value(protocol::SessionId(session_id.to_owned())).expect("session id"),
+        )
+        .expect("inspect request");
+        let line = serde_json::to_string(&request).expect("serialize request");
+        writer
+            .write_all(line.as_bytes())
+            .await
+            .expect("send inspect");
+        writer.write_all(b"\n").await.expect("send inspect");
+        let mut reply = String::new();
+        reader.read_line(&mut reply).await.expect("read inspect");
+        let response: protocol::Response =
+            serde_json::from_str(reply.trim_end()).expect("parse inspect");
+        serde_json::from_value(
+            response
+                .into_result()
+                .unwrap_or_else(|error| panic!("first connection inspects {session_id}: {error}")),
+        )
+        .expect("the restarted daemon inspects the kept session")
+    }
+
+    let fixture = Installation::new(Settings::default()).await;
+    fixture.start_daemon().await;
+    let shell = fixture
+        .new_session("restart-first-inspect-shell")
+        .await
+        .id
+        .0;
+    // A seeded resumable record, next to the plain shell session: it
+    // carries a resume binding, so startup reconciliation takes the
+    // binding-merge path for it. The store write lands directly; the
+    // daemon never created this record. The runtime stays `Live`: a
+    // `Lost` record with no worker is swept as unrecoverable, while a
+    // live one reconciles into `Lost` and keeps its id.
+    fixture.install_claude_package().await;
+    let resumable = "restart-first-inspect-resumable";
+    fixture.seed_record(
+        resumable,
+        pohunek_daemon::store::RuntimeRecord {
+            state: RuntimeState::Live,
+            worker_id: None,
+            worker_instance_id: None,
+            service_id: None,
+            generation: None,
+            executable: None,
+            reason: None,
+        },
+    );
+    stop_session(&fixture, &shell).await;
+    // `restart_daemon_unready` replaces the job and waits for the new
+    // job process and the previous process's exit, but serves no
+    // request: the connect poll below retries only connect errors
+    // through the harness wait helper, so the two inspects are the
+    // first requests the new daemon serves.
+    fixture.restart_daemon_unready().await;
+    let stream = eventually("the restarted daemon to accept a connection", || async {
+        match tokio::net::UnixStream::connect(&fixture.paths.socket).await {
+            Ok(stream) => Some(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                // The replacement job exists but has not bound its
+                // socket yet; only connect errors retry.
+                None
+            }
+            Err(error) => panic!("connect to the restarted daemon: {error}"),
+        }
+    })
+    .await;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    for id in [&shell, resumable] {
+        let inspected = inspect(&mut reader, &mut writer, id).await;
+        assert_eq!(&inspected.id.0, id, "the kept session keeps its id");
+        assert!(
+            !matches!(inspected.state, ProtocolSessionState::Starting),
+            "the first connection after the restart serves the reconciled record: {inspected:?}"
+        );
+    }
+    drop(reader);
+    drop(writer);
+    assert_eq!(
+        fixture.inspect(&shell).await.state,
+        ProtocolSessionState::Stopped,
+        "the stopped shell keeps its terminal state"
+    );
+    assert_eq!(
+        fixture.inspect(resumable).await.id.0,
+        resumable,
+        "the lost resumable record reconciles and keeps its id"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

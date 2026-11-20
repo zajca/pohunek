@@ -1239,7 +1239,12 @@ The replacement daemon reconciles with the existing per-session worker, so
 Codex, Claude, Hermes, and plain shell sessions retain the same PTY, child PID,
 and runtime id. A typed worker-stream failure is surfaced once and is not
 retried. A lost worker cannot be reconstructed by retrying attach; inspect
-`runtime.state` and use explicit native recovery only when supported.
+`runtime.state` and use explicit native recovery only when supported. A session
+removed meanwhile ends the attach at once: as soon as the reconnect probe sees
+the session gone, the attach prints `[pohunek] session <id> removed; attach
+ended` with exit 0, also when the removal lands during a daemon restart. A
+daemon that is unreachable, that is shutting down, or a session that is `starting`, is retried until
+the window ends.
 
 ## Idempotent session.new
 
