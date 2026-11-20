@@ -20,10 +20,18 @@ use crate::error::{refuse, Error};
 use crate::isolated::{Host, Root};
 use crate::throwaway::{self, ThrowawayArgs};
 
-/// How long a smoke waits for the detector to leave `unknown` after start.
+/// Default bound for the detector to leave `unknown` after start.
 /// A prompt prints immediately; a runtime that needs longer to print its
 /// first screen fails the smoke.
-const SMOKE_DETECTION_TIMEOUT: Duration = Duration::from_secs(60);
+const DETECTION_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
+
+/// Shortest `--detection-timeout` a smoke accepts.
+const DETECTION_TIMEOUT_MIN: Duration = Duration::from_secs(1);
+
+/// Longest `--detection-timeout` a smoke accepts: the default. The option
+/// only tightens the bounded-detection contract; a loosened bound would hide
+/// a runtime that is too slow to show its first screen.
+const DETECTION_TIMEOUT_MAX: Duration = DETECTION_TIMEOUT_DEFAULT;
 
 /// Delay between the detection polls while waiting to leave `unknown`.
 const SMOKE_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -47,6 +55,10 @@ pub struct SmokeArgs {
     /// [`SCRIPT_TIMEOUT_DEFAULT`](crate::isolated::SCRIPT_TIMEOUT_DEFAULT).
     /// Validated to `1..=900` in [`smoke`] before the rig starts.
     pub script_timeout_secs: Option<u64>,
+    /// Bound for the detector to leave `unknown` in whole seconds; `None`
+    /// keeps the 60 s default. Validated to `1..=60` in [`smoke`] before the
+    /// rig starts, so it can only tighten the bound.
+    pub detection_timeout_secs: Option<u64>,
 }
 
 /// What a passing smoke reports.
@@ -69,6 +81,11 @@ pub struct SmokeReport {
     /// passed no `--script-timeout`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub script_timeout_s: Option<u64>,
+    /// Effective detection bound in whole seconds; present on every runtime
+    /// smoke run (the default when the caller passed no
+    /// `--detection-timeout`), absent for a commands-only package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection_timeout_s: Option<u64>,
     /// Commands a commands-only package exports, each run once and exited 0;
     /// empty for a runtime package.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -126,11 +143,25 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
     let (package_id, version) = archive_package(&verified, &args.dir)?;
     let commands = commands_only_exports(&verified, &args.dir)?;
     if commands.is_some()
-        && (args.upstream.is_some() || args.script.is_some() || args.script_timeout_secs.is_some())
+        && (args.upstream.is_some()
+            || args.script.is_some()
+            || args.script_timeout_secs.is_some()
+            || args.detection_timeout_secs.is_some())
     {
         return Err(refuse(
-            "a commands-only package serves no runtime: --upstream, --script and --script-timeout apply to a runtime package only",
+            "a commands-only package serves no runtime: --upstream, --script, --script-timeout and --detection-timeout apply to a runtime package only",
         ));
+    }
+    if let Some(seconds) = args.detection_timeout_secs {
+        let (min, max) = (
+            DETECTION_TIMEOUT_MIN.as_secs(),
+            DETECTION_TIMEOUT_MAX.as_secs(),
+        );
+        if seconds < min || seconds > max {
+            return Err(refuse(format!(
+                "--detection-timeout must be {min}..={max} seconds: {seconds}"
+            )));
+        }
     }
     if let Some(seconds) = args.script_timeout_secs {
         let (min, max) = (
@@ -159,6 +190,9 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
         args.script_timeout_secs
             .unwrap_or(crate::isolated::SCRIPT_TIMEOUT_DEFAULT.as_secs()),
     );
+    let detection_timeout = args
+        .detection_timeout_secs
+        .map_or(DETECTION_TIMEOUT_DEFAULT, Duration::from_secs);
     let outcome = match (&identity, &commands) {
         (Some(identity), _) => smoke_in(
             &root,
@@ -166,6 +200,7 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
             args.upstream.as_deref(),
             args.script.as_deref(),
             timeout,
+            detection_timeout,
             &bytes,
             identity,
             &version,
@@ -235,6 +270,7 @@ fn smoke_in(
     upstream: Option<&Path>,
     script: Option<&Path>,
     script_timeout: Duration,
+    detection_timeout: Duration,
     archive: &[u8],
     identity: &crate::archive::Identity,
     version: &protocol::PackageVersion,
@@ -285,6 +321,7 @@ fn smoke_in(
         &digest,
         script,
         script_timeout,
+        detection_timeout,
     );
     let stop = host.stop().map_err(Error::Usage);
     let (activity, screen_lines) = smoke?;
@@ -295,6 +332,7 @@ fn smoke_in(
         activity: Some(activity),
         screen_lines: Some(screen_lines),
         script_timeout_s: script.map(|_| script_timeout.as_secs()),
+        detection_timeout_s: Some(detection_timeout.as_secs()),
         commands: Vec::new(),
         root: root.path().to_path_buf(),
     })
@@ -341,6 +379,7 @@ fn smoke_commands_in(
         activity: None,
         screen_lines: None,
         script_timeout_s: None,
+        detection_timeout_s: None,
         commands: commands.to_vec(),
         root: root.path().to_path_buf(),
     })
@@ -421,6 +460,7 @@ fn smoke_session(
     digest: &package::PackageDigest,
     script: Option<&Path>,
     script_timeout: Duration,
+    detection_timeout: Duration,
 ) -> Result<(AgentActivity, usize), Error> {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = host.root().join("archives");
@@ -468,7 +508,7 @@ fn smoke_session(
         .as_str()
         .ok_or_else(|| refuse("`pohunek session new` reported no session id"))?
         .to_owned();
-    let wait = wait_for_screen(host, &session);
+    let wait = wait_for_screen(host, &session, detection_timeout);
     // The script runs only after every generic smoke check passed: a
     // failed wait never starts it, and teardown still happens below.
     let scripted = match (&wait, script) {
@@ -539,8 +579,12 @@ fn check_session_command(host: &mut Host, argv: &[&str]) -> Result<(), Error> {
     Ok(())
 }
 /// `session list --json`, then requires a non-empty `session screen`.
-fn wait_for_screen(host: &mut Host, session: &str) -> Result<(AgentActivity, usize), Error> {
-    let deadline = std::time::Instant::now() + SMOKE_DETECTION_TIMEOUT;
+fn wait_for_screen(
+    host: &mut Host,
+    session: &str,
+    timeout: Duration,
+) -> Result<(AgentActivity, usize), Error> {
+    let deadline = std::time::Instant::now() + timeout;
     let activity = loop {
         let output = host
             .cli(&["session", "list", "--json"])
@@ -562,7 +606,7 @@ fn wait_for_screen(host: &mut Host, session: &str) -> Result<(AgentActivity, usi
         }
         if std::time::Instant::now() >= deadline {
             return Err(refuse(format!(
-                "the detector stayed `unknown` for {SMOKE_DETECTION_TIMEOUT:?} after start"
+                "the detector stayed `unknown` for {timeout:?} after start"
             )));
         }
         std::thread::sleep(SMOKE_POLL_INTERVAL);
