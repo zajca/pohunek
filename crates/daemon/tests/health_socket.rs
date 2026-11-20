@@ -6136,8 +6136,10 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
     params.cols = 100;
     "codexpopup".clone_into(&mut params.agent);
     params.input = Some("hello Codex".to_owned());
-    let create =
-        tokio::spawn(async move { create_session_with_params(&mut control, params).await });
+    let create = tokio::spawn(async move {
+        let result = create_session_with_params(&mut control, params).await;
+        (control, result)
+    });
     if let Some(deadline_hold) = armed_deadline_hold {
         let published = wait_for_any_agent_state_event(
             &mut subscriber,
@@ -6151,18 +6153,21 @@ async fn codex_popup_is_refused_inner(override_manifest: Option<&str>, hold_dead
         // the held grace decides the refused create.
         deadline_hold.release();
     }
-    let error = err_payload(
-        tokio::time::timeout(HANG_GUARD, create)
+    let (mut control, error) = {
+        let (control, result) = tokio::time::timeout(HANG_GUARD, create)
             .await
             .expect("the refused create answers before the hang guard")
-            .expect("create task joins"),
-    );
+            .expect("create task joins");
+        (control, err_payload(result))
+    };
     assert_eq!(error.code, "session_input_not_ready");
 
-    let mut observer = connect(&socket).await;
+    // The list runs on the create connection, as on main: it observes the
+    // refusal reply before the rollback that follows it, so a fresh
+    // connection cannot race the rollback.
     let list = Request::make("codex-popup-list", method::SESSION_LIST, Value::Null);
     let sessions: Vec<SessionInfo> =
-        serde_json::from_value(ok_payload(exchange(&mut observer, &list).await))
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
             .expect("list sessions");
     assert!(sessions.is_empty(), "the refused session was rolled back");
     let captured = std::fs::read(&received).unwrap_or_default();
