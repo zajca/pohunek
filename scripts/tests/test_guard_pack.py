@@ -236,6 +236,36 @@ class EveryGateRunsAsItsOwnProcess(GuardPackScenarios):
         self.assertEqual(result.stdout, "")
 
 
+class AGateThatCannotRunItsProgram(GuardPackScenarios):
+    def test_a_program_that_is_not_executable_is_undecided_and_the_later_gates_still_run(self):
+        self.write("src/lib.rs", "// changed\n")
+        self.commit("change")
+        no_exec_bit = self.bin / "gh-without-exec-bit"
+        no_exec_bit.write_text("#!/bin/sh\nexit 0\n")
+        no_exec_bit.chmod(0o644)
+        result = self.guard_pack(GH=str(no_exec_bit))
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        gates, summary = self.gate_lines(result)
+        self.assertEqual(len(gates), 6)
+        self.assertIn("package-bump: UNDECIDED (CI-only:", gates["package-bump"])
+        self.assertIn("docs-check: PASS", gates["docs-check"])
+        self.assertTrue(summary.startswith("guard-pack: "), summary)
+
+    def test_a_gate_that_raises_is_a_failure_line_and_the_summary_is_still_printed(self):
+        self.write("src/lib.rs", "// code\n#[ignore = \"slow\"]\nfn an_ignored_test() {}\n")
+        self.git("rm", "-q", "scripts/test-partitions")
+        self.commit("an ignored test, and the partition script is gone")
+        result = self.guard_pack()
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        gates, summary = self.gate_lines(result)
+        self.assertEqual(len(gates), 6)
+        self.assertIn("test-selection: FAIL (crashed: ", gates["test-selection"])
+        self.assertIn("docs-check: PASS", gates["docs-check"])
+        self.assertTrue(summary.startswith("guard-pack: "), summary)
+
+
 class ChangelogGates(GuardPackScenarios):
     def test_a_documented_behavior_change_without_a_fragment_fails_and_names_the_label(self):
         self.write("docs/cli.md", "cli, changed\n")
@@ -362,6 +392,20 @@ class TestSelectionGate(GuardPackScenarios):
         self.assertEqual(result.returncode, 1)
         gates, _summary = self.gate_lines(result)
         self.assertIn("test-selection: FAIL (the macOS archive did not build: error: could not compile the archive", gates["test-selection"])
+
+    def test_a_diff_that_git_cannot_compute_fails_the_gate_and_never_skips_it(self):
+        self.write("src/lib.rs", "// changed\n")
+        self.commit("change")
+        self.git("checkout", "-q", "--orphan", "unrelated")
+        self.git("rm", "-rfq", ".")
+        self.write("unrelated.txt", "no shared history\n")
+        self.commit("unrelated root")
+        self.git("checkout", "-q", "pr")
+        result = self.guard_pack("--base", "unrelated")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        gates, _summary = self.gate_lines(result)
+        self.assertIn("test-selection: FAIL (git diff failed:", gates["test-selection"])
+        self.assertNotIn("SKIP", gates["test-selection"])
 
     def test_an_ignore_that_the_diff_removes_does_not_run_the_gate(self):
         self.write("src/lib.rs", "// code\n#[ignore]\nfn an_ignored_test() {}\n")

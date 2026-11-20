@@ -107,6 +107,8 @@ class Context:
             )
         except FileNotFoundError as error:
             result = subprocess.CompletedProcess(command, 127, "", f"{error}")
+        except OSError as error:
+            result = subprocess.CompletedProcess(command, 126, "", f"{error}")
         self.log(name, command, result)
         return result
 
@@ -264,12 +266,16 @@ def package_bump(context: Context) -> Gate:
     return Gate(gate, FAIL, f"unknown verdict {verdict!r}; {context.log_path(gate)}")
 
 
-def adds_ignored_test(context: Context) -> bool:
+def adds_ignored_test(context: Context) -> tuple[bool, str | None]:
+    """Whether the diff adds an ignored test, and the git error when the diff could not be read."""
     diff = git(context, "diff", "-U0", f"{context.base}...{context.head}", "--", "*.rs")
-    return any(
+    if diff.returncode != 0:
+        return False, last_error(diff)
+    added = any(
         line.startswith("+") and not line.startswith("+++") and IGNORED_TEST_ATTRIBUTE in line
         for line in diff.stdout.splitlines()
     )
+    return added, None
 
 
 def macos_packages(context: Context) -> list[str]:
@@ -283,7 +289,10 @@ def macos_packages(context: Context) -> list[str]:
 
 def test_selection(context: Context) -> Gate:
     gate = "test-selection"
-    if not adds_ignored_test(context):
+    added, error = adds_ignored_test(context)
+    if error is not None:
+        return Gate(gate, FAIL, f"git diff failed: {error}")
+    if not added:
         return Gate(gate, SKIP, "no ignored test added")
     if context.platform != MACOS_PLATFORM:
         # CI checks an archive built on macOS; a Linux archive lacks the macOS-only tests.
@@ -349,7 +358,10 @@ def main() -> int:
         stale.unlink()
     gates: list[Gate] = []
     for run_gate in GATES:
-        gate = run_gate(context)
+        try:
+            gate = run_gate(context)
+        except (OSError, ValueError, KeyError, ImportError) as error:
+            gate = Gate(run_gate.__name__.replace("_", "-"), FAIL, f"crashed: {type(error).__name__}: {error}")
         gates.append(gate)
         print(gate.line(), flush=True)
     print(summary(gates))
