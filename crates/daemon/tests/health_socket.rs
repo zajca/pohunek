@@ -4659,9 +4659,9 @@ async fn claude_kept_session_with_ack_timeout_defers_the_prompt_once() {
     .await;
 }
 
-#[allow(
+#[expect(
     clippy::too_many_lines,
-    reason = "one held create plus the replay, delivery, and exact-once arms in one scenario."
+    reason = "one held create plus the replay, delivery, and exact-once arms in one scenario"
 )]
 async fn assert_kept_session_defers_the_prompt(tag: &str, input_ack_timeout_ms: Option<u32>) {
     let socket = temp_socket(tag);
@@ -5005,7 +5005,6 @@ async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
     // The verdict landed with no deadline running; release the hold so the
     // held grace keeps the session while the dialog holds the screen.
     first_hold.release();
-    let control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
         tokio::time::timeout(HANG_GUARD, create)
             .await
@@ -5024,7 +5023,6 @@ async fn claude_kept_session_restart_after_answer_drops_the_deferred_prompt() {
     std::fs::write(&gate, b"go").expect("open the gate");
     read_file_until(&log, b"gate").await;
     drop(subscriber);
-    drop(control);
     let ServedRegistry {
         registry: first_registry,
         shutdown: first_shutdown,
@@ -5145,7 +5143,6 @@ async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
     // The verdict landed with no deadline running; release the hold so the
     // held grace keeps the session while the dialog holds the screen.
     first_hold.release();
-    let control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
         tokio::time::timeout(HANG_GUARD, create)
             .await
@@ -5154,7 +5151,6 @@ async fn claude_kept_session_dead_worker_restart_keeps_the_record() {
     ))
     .expect("kept claude session info");
     drop(subscriber);
-    drop(control);
     let ServedRegistry {
         registry: first_registry,
         shutdown: first_shutdown,
@@ -5495,7 +5491,6 @@ async fn claude_kept_session_restart_drops_the_deferred_prompt() {
     // held grace expires while the dialog still holds the screen, and the
     // call returns the kept session instead of `session_input_not_ready`.
     first_hold.release();
-    let control = connect(&socket).await;
     let created: SessionNewResult = serde_json::from_value(ok_payload(
         tokio::time::timeout(HANG_GUARD, create)
             .await
@@ -5531,7 +5526,6 @@ async fn claude_kept_session_restart_drops_the_deferred_prompt() {
     // its worker connection and releasing the controller lease) before
     // the new daemon reconciles: the production stop path.
     drop(subscriber);
-    drop(control);
     let ServedRegistry {
         registry: first_registry,
         shutdown: first_shutdown,
@@ -6375,9 +6369,7 @@ async fn codex_initial_input_is_delivered_once_the_update_popup_clears_and_the_t
     };
     assert_eq!(published.payload()["activity"], Value::from("blocked"));
     // The verdict landed with no deadline running; release the hold so the
-    // held grace decides the create, then dismiss the popup through the
-    // stub's release socket, after which it redraws the composer and sets
-    // the idle title.
+    // held grace decides the create.
     deadline_hold.release();
 
     // The daemon holds the popup as blocked. Dismissing it hands the stub the
@@ -6395,7 +6387,7 @@ async fn codex_initial_input_is_delivered_once_the_update_popup_clears_and_the_t
     let created: SessionInfo = serde_json::from_value(ok_payload(
         tokio::time::timeout(HANG_GUARD, create)
             .await
-            .expect("the kept create answers before the hang guard")
+            .expect("the delivered create answers before the hang guard")
             .expect("create task joins"),
     ))
     .expect("codex session info once the popup cleared");
