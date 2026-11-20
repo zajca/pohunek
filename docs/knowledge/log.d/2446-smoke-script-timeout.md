@@ -7,7 +7,9 @@
   its bound fails the smoke with an error naming the script and the bound
   (`smoke script <path> did not exit within <N> s`); the passing `--json`
   report carries the effective bound as `script_timeout_s`. Every other kit
-  child (install, lint commands, daemon start) keeps `COMMAND_TIMEOUT`.
+  child keeps its own bound: CLI commands, `pohunekd --version` and external
+  programs keep `COMMAND_TIMEOUT` (60 s), the daemon start keeps
+  `READY_TIMEOUT` (30 s).
 - The reusable `plugin-ci.yml` takes an optional `smoke-script-timeout`
   input (string, default empty = kit default), validated to `1..=900` in the
   `Set up the package inputs` step, refused for a context or commands-only

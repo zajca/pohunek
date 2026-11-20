@@ -729,7 +729,7 @@ impl Host {
             .process_group(0)
             .spawn()
             .map_err(|error| format!("cannot start `{program}`: {error}"))?;
-        let status = wait_for_exit(&mut child, program, COMMAND_TIMEOUT)?;
+        let status = wait_for_exit(&mut child, &format!("`{program}`"), COMMAND_TIMEOUT)?;
         let mut stdout = Vec::new();
         File::open(&output_path)
             .and_then(|file| file.take(OUTPUT_LIMIT_BYTES + 1).read_to_end(&mut stdout))
