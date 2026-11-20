@@ -70,13 +70,14 @@ const REMOVED_MESSAGE: &str = "[pohunek] session s-attach-ended-refused removed;
 /// Fixture behavior after the attach stream EOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Mode {
-    /// #2440 L5: the daemon goes away between the re-attach refusal and
-    /// the confirm: the first post-EOF probe sees `running`, the re-attach
-    /// is refused `session_not_running`, the confirm connection is dropped
-    /// without a reply, and the next probe sees the confirming `stopped`.
-    /// The attach must retry through the reconnect budget and end with
-    /// exit 0 instead of erroring on the dropped confirm connection.
-    ConfirmConnectDropped,
+    /// #2440: the socket goes away between the re-attach refusal and
+    /// the confirm: the first post-EOF probe sees `running`, the
+    /// re-attach is refused `session_not_running`, then the fixture
+    /// moves the socket path away so the confirm connection fails with
+    /// `DaemonUnreachable`. The attach must end through the reconnect
+    /// budget (window expiry or exhausted attempts), not the refused
+    /// connection error.
+    ConfirmConnectRefused,
     /// #2441 case d: probe sees `running`, the re-attach is refused, and
     /// the confirming inspect sees `stopped`.
     #[default]
@@ -107,7 +108,7 @@ enum Mode {
     /// with a stop. The attach must retry across the shutting-down probes
     /// and reattach instead of failing.
     DaemonShuttingDown,
-    /// #2448 follow-up: after the stream EOF the probes see `running`,
+    /// #2448: after the stream EOF the probes see `running`,
     /// but the fixture refuses the first re-attach with
     /// `daemon_shutting_down` (the drain started between the probe and
     /// the re-attach). The attach must route that retryable re-attach
@@ -132,10 +133,6 @@ struct Fixture {
     resumed_stream: Arc<Mutex<Option<UnixStream>>>,
     /// The client sent `session.detach` after reading the stream EOF.
     detached: Arc<Mutex<bool>>,
-    /// Post-EOF `session.inspect` confirm connections to drop without a
-    /// reply before scripted answers resume. Only the L5 confirm-drop mode
-    /// starts with one; every other mode keeps the count at zero.
-    dropped_confirms: Arc<Mutex<usize>>,
     /// Post-EOF probe connections the fixture dropped without a reply
     /// while the replacement daemon was still away.
     refused_probes: Arc<Mutex<usize>>,
@@ -148,6 +145,10 @@ struct Fixture {
     restart_attaches: Arc<Mutex<usize>>,
     /// Fixture behavior after the stream EOF.
     mode: Arc<Mutex<Mode>>,
+    /// Live socket path of the fixture listener: the confirm-connect
+    /// mode moves it aside after refusing the re-attach, so the confirm
+    /// connection fails with ENOENT instead of answering.
+    socket_path: Arc<Mutex<std::path::PathBuf>>,
 }
 
 /// What a scripted post-EOF `session.inspect` answers.
@@ -175,8 +176,8 @@ impl Clone for Fixture {
             post_eof_inspects: Arc::clone(&self.post_eof_inspects),
             stream: Arc::clone(&self.stream),
             detached: Arc::clone(&self.detached),
-            dropped_confirms: Arc::clone(&self.dropped_confirms),
             mode: Arc::clone(&self.mode),
+            socket_path: Arc::clone(&self.socket_path),
         }
     }
 }
@@ -198,11 +199,6 @@ impl Fixture {
     /// Whether the client sent `session.detach` after the stream EOF.
     fn detached(&self) -> bool {
         *self.detached.lock().expect("detached lock")
-    }
-
-    /// Post-EOF confirm connections still to drop without a reply.
-    fn dropped_confirms_remaining(&self) -> usize {
-        *self.dropped_confirms.lock().expect("dropped confirms lock")
     }
 
     /// Post-EOF probe connections the fixture dropped without a reply
@@ -275,10 +271,7 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
 
     let fixture = Fixture {
         mode: Arc::new(Mutex::new(mode)),
-        dropped_confirms: Arc::new(Mutex::new(match mode {
-            Mode::ConfirmConnectDropped => 1,
-            _ => 0,
-        })),
+        socket_path: Arc::new(Mutex::new(socket.clone())),
         restart_connects: Arc::new(Mutex::new(match mode {
             Mode::RestartAndResume | Mode::RemovedDuringRestart => 2,
             Mode::RefusedReattach
@@ -286,10 +279,23 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
             | Mode::RemovedBeforeProbe
             | Mode::DaemonShuttingDown
             | Mode::ShuttingDownReattach
-            | Mode::ConfirmConnectDropped => 0,
+            | Mode::ConfirmConnectRefused => 0,
         })),
         ..Fixture::default()
     };
+    // The confirm-connect mode runs a short reconnect window: every
+    // later probe also fails to connect, so the attach must end through
+    // the budget (window expiry), and a long window would only slow the
+    // scenario. No other mode touches the window.
+    if mode == Mode::ConfirmConnectRefused {
+        fs::write(
+            config_dir.join("attach.conf"),
+            "attach_reconnect_seconds = 2\n\
+             attach_reconnect_interval_seconds = 0.1\n\
+             attach_reconnect_max_attempts = 10\n",
+        )
+        .expect("shorten the reconnect window for the confirm-connect mode");
+    }
     if matches!(
         mode,
         Mode::RestartAndResume
@@ -297,7 +303,7 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
             | Mode::RemovedBeforeProbe
             | Mode::DaemonShuttingDown
             | Mode::ShuttingDownReattach
-            | Mode::ConfirmConnectDropped
+            | Mode::ConfirmConnectRefused
     ) {
         // The modes script every post-EOF answer explicitly. The outage
         // itself needs no scripted answer: the fixture drops the first
@@ -340,11 +346,11 @@ fn attach_scenario(mode: Mode) -> (bool, String, Fixture) {
                     InspectAnswer::State("running"),
                     InspectAnswer::State("running"),
                 ],
-                // In mode ConfirmConnectDropped the first post-EOF probe
-                // answers `running` so the client decides `Reattach`, then
-                // the confirming probe after the dropped confirm answers
-                // `stopped`.
-                Mode::ConfirmConnectDropped => vec![
+                // In mode ConfirmConnectRefused the first post-EOF probe
+                // answers `running` so the client decides `Reattach`; the
+                // confirm then fails to connect and every later probe
+                // fails the same way, so no confirming answer is queued.
+                Mode::ConfirmConnectRefused => vec![
                     InspectAnswer::State("running"),
                     InspectAnswer::State("stopped"),
                 ],
@@ -605,21 +611,6 @@ fn serve_connection(stream: UnixStream, fixture: &Fixture) {
                 return;
             }
         }
-        if request.method() == protocol::method::SESSION_INSPECT
-            && fixture.detached()
-            && fixture.mode() == Mode::ConfirmConnectDropped
-            && fixture.dropped_confirms_remaining() > 0
-        {
-            // The daemon went away between the re-attach refusal and the
-            // confirm: drop the confirm connection without a reply, so it
-            // fails with a `Retry` mapped from a refused connection as a
-            // killed daemon does.
-            *fixture
-                .dropped_confirms
-                .lock()
-                .expect("dropped confirms lock") -= 1;
-            return;
-        }
         if request.method() == protocol::method::SESSION_INSPECT && fixture.detached() {
             // Take the next scripted answer without holding the lock
             // across the reply: the guard must not survive into the
@@ -629,7 +620,7 @@ fn serve_connection(stream: UnixStream, fixture: &Fixture) {
                 | Mode::RemovedDuringRestart
                 | Mode::DaemonShuttingDown
                 | Mode::ShuttingDownReattach
-                | Mode::ConfirmConnectDropped => fixture
+                | Mode::ConfirmConnectRefused => fixture
                     .post_eof_inspects
                     .lock()
                     .expect("inspects lock")
@@ -840,6 +831,23 @@ fn result_for(request: &Request, fixture: Fixture) -> Response {
                     json!({ "stream_id": STREAM_ID }),
                 )
             } else {
+                // The stop committed between the probe and this re-attach.
+                // In mode ConfirmConnectRefused the daemon then goes
+                // away: move the socket path aside before refusing, so
+                // the confirm connection fails with ENOENT (`Retry`
+                // through `DaemonUnreachable`) instead of answering. Do
+                // not restore it: every later probe fails the same way,
+                // so the attach must end through the reconnect budget.
+                if fixture.detached() && fixture.mode() == Mode::ConfirmConnectRefused {
+                    let live = fixture
+                        .socket_path
+                        .lock()
+                        .expect("socket path lock")
+                        .clone();
+                    let gone = live.with_extension("gone");
+                    let _ignored = std::fs::remove_file(&gone);
+                    std::fs::rename(&live, &gone).expect("move the socket path away");
+                }
                 Response::err(
                     PROTOCOL_VERSION,
                     request.id(),
@@ -910,7 +918,7 @@ fn result_for(request: &Request, fixture: Fixture) -> Response {
                         | Mode::RemovedDuringRestart
                         | Mode::DaemonShuttingDown
                         | Mode::ShuttingDownReattach
-                        | Mode::ConfirmConnectDropped
+                        | Mode::ConfirmConnectRefused
                 )
                 && fixture
                     .post_eof_inspects
@@ -1334,40 +1342,39 @@ fn a_re_attach_refused_by_a_draining_daemon_is_retried() {
 }
 
 #[test]
-fn a_dropped_confirm_connection_is_retried_until_the_session_end_is_confirmed() {
-    let (exited_zero, output, fixture) = attach_scenario(Mode::ConfirmConnectDropped);
+fn a_refused_confirm_connection_ends_through_the_reconnect_budget() {
+    let (exited_zero, output, fixture) = attach_scenario(Mode::ConfirmConnectRefused);
     assert!(
         exited_zero,
-        "the attach ends with exit 0 after the dropped confirm: {output:?}"
+        "the attach ends through the reconnect budget: {output:?}"
     );
     assert!(
-        output.contains(ENDED_MESSAGE),
-        "the attach reports the ended session: {output:?}"
+        output.contains("attach reconnect window expired for session"),
+        "the attach reports the expired window: {output:?}"
     );
     assert!(
-        !output.contains("daemon error"),
-        "no daemon error is reported for an ended session: {output:?}"
+        !output.contains("cannot reach the daemon"),
+        "the raw connect error never surfaces: {output:?}"
     );
-    // After the stream EOF the client detaches, probes (running),
-    // re-attaches (refused), drops the first confirm connection (no
-    // method trace), and confirms the end on the retried probe (stopped):
-    // no other request may run in between. Probe-inspect counts alone
-    // cannot prove the dropped confirm, because the status snapshot and
-    // the status updater inspect earlier.
+    // After the stream EOF the client detaches, probes (running), and
+    // re-attaches (refused while the socket moves away): nothing after
+    // the refused re-attach reaches the fixture, because every later
+    // connection fails with ENOENT. Probe-inspect counts alone cannot
+    // prove the unreached confirm, because the status snapshot and the
+    // status updater inspect earlier.
     assert_eq!(
         post_eof_tail(&fixture),
         [
             protocol::method::SESSION_INSPECT,
             protocol::method::SESSION_ATTACH,
-            protocol::method::SESSION_INSPECT,
         ],
-        "the refused re-attach is confirmed by a fresh inspect: {:?}",
+        "no request runs after the refused re-attach: {:?}",
         fixture.methods()
     );
     assert_eq!(
-        fixture.dropped_confirms_remaining(),
+        fixture.restart_attaches(),
         0,
-        "the confirm connection was dropped exactly once: {:?}",
+        "the re-attach refusal left no served re-attach: {:?}",
         fixture.methods()
     );
 }

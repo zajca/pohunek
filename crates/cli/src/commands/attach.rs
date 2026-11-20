@@ -2335,9 +2335,9 @@ async fn confirm_session_ended(
             ) =>
         {
             // The daemon went away before the confirm connected: retry
-            // through the normal `StreamClosed` reconnect path below,
-            // where `reconnect.next` and `wait_for_attach_reconnect`
-            // apply the attempt limit, interval, and window.
+            // through the `StreamClosed` path in `run_attach`, where
+            // `reconnect.next` and `wait_for_attach_reconnect` apply the
+            // attempt limit, interval, and window.
             return Ok(false);
         }
         Err(error) => return Err(error),
@@ -2377,7 +2377,7 @@ async fn confirm_session_ended(
                 AttachReconnectDecision::Retry
             ) {
                 // The daemon went away mid-confirm: fall through to the
-                // normal `StreamClosed` reconnect path below, where
+                // `StreamClosed` path in `run_attach`, where
                 // `reconnect.next` and `wait_for_attach_reconnect` apply
                 // the attempt limit, interval, and window.
                 Ok(false)
