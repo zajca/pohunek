@@ -65,7 +65,6 @@ eligibility = _load_eligibility()
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
 SCHEMA_VERSION = 1
 
 
@@ -376,12 +375,7 @@ def decide(
             names = artifact_names(repo, run["id"])
         except ReuseError as error:
             return [], {}, f"cannot list artifacts of run {run['id']}: {error}", {}
-        trees = {
-            match.group(1)
-            for name in names
-            if (match := TESTED_TREE_ARTIFACT.fullmatch(name))
-        }
-        if trees != {tree}:
+        if eligibility.recorded_tree_refusal(eligibility.tested_trees(names), tree):
             continue
         try:
             jobs = run_jobs(repo, run["id"])
@@ -407,7 +401,7 @@ def decide(
                 per_run_reasons.setdefault(job_id, "no green leg in the source run")
                 continue
             refusals = [
-                eligibility.source_is_reused(run, job_id, leg, now, max_age, narrowed, False)
+                eligibility.source_is_reused(run, job_id, leg, now, max_age)
                 for leg in legs
             ]
             bad = next((refusal for refusal in refusals if refusal), None)

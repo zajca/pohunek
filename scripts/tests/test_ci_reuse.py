@@ -1026,6 +1026,59 @@ else:
         self.assertEqual(record["jobs"], {})
         self.assertEqual(record["source_runs"], [])
 
+    def test_a_job_listing_error_while_building_the_record_resets_the_record(self):
+        # The decide listing of run 777 succeeds; the second jobs listing,
+        # which reads the record entries, fails. The decision and the record
+        # both fall back to reusing nothing.
+        gh = self.bin_dir / "gh"
+        gh.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+fixture_path = Path(os.environ["GH_FIXTURE"])
+fixture = json.loads(fixture_path.read_text())
+args = sys.argv[1:]
+endpoint = next((a for a in args[1:] if a.startswith("repos/")), "")
+if "/actions/workflows/" in endpoint and "/runs" in endpoint:
+    print(json.dumps([{"workflow_runs": fixture["runs"]}]))
+elif endpoint.endswith("/artifacts"):
+    print(json.dumps([{"artifacts": fixture["artifacts"]["777"]}]))
+elif "/actions/artifacts/" in endpoint and endpoint.endswith("/zip"):
+    import base64
+    sys.stdout.buffer.write(base64.b64decode(fixture["artifact_zips"][endpoint.split("/")[-2]]))
+elif "/jobs" in endpoint:
+    counter = Path(str(fixture_path) + ".jobs-calls")
+    seen = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(seen + 1))
+    if seen == 0:
+        print(json.dumps([{"jobs": fixture["jobs_by_run"]["777"]}]))
+    else:
+        print("gh: API error 500", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    raise SystemExit("unexpected " + repr(endpoint))
+''')
+        gh.chmod(0o755)
+        self.write_fixture(
+            runs=[run_doc()],
+            jobs_by_run={"777": green_jobs()},
+            artifacts={"777": [
+                {"name": f"tested-tree-{TREE}", "id": 1},
+                {"name": "test-selection", "id": 2},
+            ]},
+            artifact_zips={"2": selection_zip("full")},
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = self.run_script_with_tree(TREE)
+        self.assertEqual(rc, 0)
+        self.assertIn("cannot list jobs of the source runs", buffer.getvalue())
+        self.assertEqual(json.loads(self.outputs()["skip"]), [])
+        self.assertEqual(self.outputs()["source_run"], "")
+        record = self.record(TREE)
+        self.assertEqual(record["jobs"], {})
+        self.assertEqual(record["source_runs"], [])
+        self.assertIsNone(record["source_run_id"])
+
     def test_a_listing_query_filters_by_the_reuse_window(self):
         # The listing query carries the reuse window to the API: the `created`
         # filter starts at now-24h, so the listing never grows unbounded.

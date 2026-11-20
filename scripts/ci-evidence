@@ -46,7 +46,6 @@ REF_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # Artifact the `required jobs (paths filter)` job of ci.yml uploads with the tree
 # its run checked out.
-TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
 # Record the `reuse` job uploads: which source run each reused job was
 # taken from (one entry per job; a delta dispatch or a push may name more
 # than one run).
@@ -229,6 +228,22 @@ def _workflow_jobs(repo: str, sha: str, path: str) -> list[tuple[str, str, Any, 
             uses.group(1) if uses else None,
         ))
     return jobs
+
+
+def never_reused_display_names(repo: str, sha: str, workflow_path: str) -> set[str]:
+    """The display names of the jobs of the workflow in the tree of `sha` that
+    are never reused, whatever key a record files them under. An unreadable
+    workflow gives no names, as it gives no aliases."""
+    try:
+        jobs = _workflow_jobs(repo, sha, workflow_path)
+    except EvidenceError:
+        return set()
+    return {
+        leg
+        for job_id, name, matrix, _uses in jobs
+        if job_id in eligibility.NEVER_REUSED
+        for leg in _leg_names(name, matrix)
+    }
 
 
 def reuse_aliases(repo: str, sha: str, workflow_path: str, reused_names: set[str]) -> dict[str, str]:
@@ -465,17 +480,14 @@ def recorded_trees(repo: str, run_id: int) -> set[str]:
     )
     if not isinstance(pages, list):
         raise EvidenceError("Actions API returned an invalid artifact list")
-    trees = set()
+    names = []
     for page in pages:
         if isinstance(page, dict):
             values = page.get("artifacts")
             if not isinstance(values, list):
                 raise EvidenceError("Actions API response has no artifacts list")
-            for artifact in values:
-                match = TESTED_TREE_ARTIFACT.fullmatch(str(artifact.get("name", "")))
-                if match:
-                    trees.add(match.group(1))
-    return trees
+            names.extend(str(artifact.get("name", "")) for artifact in values)
+    return eligibility.tested_trees(names)
 
 
 def reuse_record(repo: str, run_id: int, tree: str) -> dict[str, Any] | None:
@@ -655,12 +667,9 @@ def verify_reuse(
         except EvidenceError as error:
             failures.append(f"source {source_url} artifacts could not be read: {error}")
             recorded = set()
-        if recorded != {tree}:
-            names = ", ".join(sorted(recorded)) or "none"
-            failures.append(
-                f"source {source_url} recorded tested tree {names}, "
-                f"expected {tree} (evidence {evidence_url})"
-            )
+        refusal = eligibility.recorded_tree_refusal(recorded, tree)
+        if refusal is not None:
+            failures.append(f"source {source_url} {refusal} (evidence {evidence_url})")
         try:
             source_jobs = get_jobs(repo, source_id)
         except EvidenceError as error:
@@ -694,6 +703,7 @@ def verify_reuse(
                 f"reuse record names {name}, but it ran in {evidence_url} "
                 f"(conclusion={', '.join(conclusions)})"
             )
+    never_reused_names = never_reused_display_names(repo, sha, config["workflow_path"])
     window = datetime.timedelta(hours=reuse["max_age_hours"])
     for job_id in sorted(record["jobs"]):
         source_id = record["jobs"][job_id]["run_id"]
@@ -701,13 +711,19 @@ def verify_reuse(
             continue
         _source, source_url, source_by_name = runs_by_id[source_id]
         for name in record["jobs"][job_id]["names"]:
+            if name in never_reused_names:
+                failures.append(
+                    f"source job {name} in {source_url} is never reused "
+                    f"(evidence {evidence_url})"
+                )
+                continue
             attempts = source_by_name.get(name, [])
             if not attempts:
                 failures.append(f"source {source_url} never ran {name} reused by {evidence_url}")
                 continue
             newest = newest_attempt(attempts)
             refusal = eligibility.source_is_reused(
-                source, job_id, newest, created, window, None, False,
+                source, job_id, newest, created, window,
             )
             if refusal is not None:
                 if refusal == "is older than the reuse window":
@@ -1099,9 +1115,10 @@ def tree_evidence(
             return None, f"the newest run of tree {tree}, {url}, is still {run.get('status')}"
         try:
             recorded = recorded_trees(args.repo, run["id"])
-            failures = run_failures(args.repo, run, config, args.tier) if recorded == {tree} else []
+            tree_refusal = eligibility.recorded_tree_refusal(recorded, tree)
+            failures = run_failures(args.repo, run, config, args.tier) if tree_refusal is None else []
             reused_from = None
-            if recorded == {tree} and failures and run.get("conclusion") == "success":
+            if tree_refusal is None and failures and run.get("conclusion") == "success":
                 jobs = get_jobs(args.repo, run["id"])
                 # On this branch the evidence run is a dispatch: `verify_reuse` is
                 # called with the run's own head SHA, so every source must be on
@@ -1116,9 +1133,8 @@ def tree_evidence(
                     failures = run_failures(args.repo, run, config, args.tier, reused=reused, alias=alias)
         except EvidenceError as error:
             return None, f"tree match {url} could not be read: {error}"
-        if recorded != {tree}:
-            names = ", ".join(sorted(recorded)) or "none"
-            return None, f"tree match {url} recorded tested tree {names}, expected {tree}"
+        if tree_refusal is not None:
+            return None, f"tree match {url} {tree_refusal}"
         if failures:
             return None, f"tree match {url} failed: {'; '.join(failures)}"
         return evidence(args, run, config, match="tree", tree=tree, reused_from=reused_from), None

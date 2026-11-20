@@ -344,7 +344,7 @@ def reuse_config(base):
     return config
 
 
-def reuse_zip(tree, jobs, source_run_id=REUSE_SOURCE_ID):
+def reuse_zip(tree, jobs, source_run_id=REUSE_SOURCE_ID, runs=None):
     """A base64 zip holding the `ci-reuse-<tree>` record for the fixture."""
     import base64
     import io
@@ -359,7 +359,7 @@ def reuse_zip(tree, jobs, source_run_id=REUSE_SOURCE_ID):
         "source_head_sha": SHA,
         "jobs": {
             job_id: {
-                "run_id": source_run_id,
+                "run_id": (runs or {}).get(job_id, source_run_id),
                 "names": names,
                 "source_job_ids": [1000 + index for index, _ in enumerate(names)],
                 "completed_at": ["2026-11-12T11:00:00Z" for _ in names],
@@ -1501,6 +1501,38 @@ jobs:
         self.assertIn("cargo-audit (RustSec advisories)", result.stderr)
         self.assertIn(f"/actions/runs/{REUSE_SOURCE_ID}", result.stderr)
 
+    def test_an_audit_leg_is_refused_under_any_record_key(self):
+        # The refusal follows the leg's display name in the workflow of the
+        # tree, not the job id the record files the leg under.
+        workflow = """name: ci
+jobs:
+  audit:
+    name: cargo-audit (RustSec advisories)
+    runs-on: ubuntu-24.04
+"""
+        union_fixture(self, tree_files={SHA: {WORKFLOW_PATH: workflow}})
+        fixture = json.loads(self.fixture.read_text())
+        fixture["artifact_zips"]["11"] = reuse_zip(
+            TREE, {"matrix": [REUSE_JOB], "advisories": ["cargo-audit (RustSec advisories)"]},
+            source_run_id=REUSE_SOURCE_ID,
+        )
+        source_jobs = fixture["jobs_by_run"][str(REUSE_SOURCE_ID)]["jobs"]
+        source_jobs.append(dict(
+            source_jobs[0], name="cargo-audit (RustSec advisories)",
+            conclusion="success",
+        ))
+        fixture["jobs_by_run"]["456"]["jobs"].append({
+            "name": "cargo-audit (RustSec advisories)",
+            "status": "completed",
+            "conclusion": "skipped",
+            "completed_at": "2026-11-12T11:00:00Z",
+        })
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is never reused", result.stderr)
+        self.assertIn("cargo-audit (RustSec advisories)", result.stderr)
+
     def test_a_dispatch_evidence_refuses_a_same_tree_source_on_another_commit(self):
         # Evidence on the tree path (dispatch
         # consumer) must not accept a same-tree PR source on another commit.
@@ -1599,6 +1631,114 @@ jobs:
         self.fixture.write_text(json.dumps(fixture))
         result = self.invoke("main", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_required_step_is_read_from_the_run_each_record_entry_names(self):
+        # `required check` is reused from run 888, whose step failed; the
+        # primary source 777 shows the same step green, so reading the
+        # primary run instead of the entry's own run would accept the union.
+        OTHER_SOURCE = 888
+        self.config_data["required_steps"]["main"] = [
+            {"job": "required check", "step": "Check formatting"}
+        ]
+        self.write_config()
+        step = lambda conclusion: [{"name": "Check formatting", "conclusion": conclusion}]
+        union_fixture(self)
+        fixture = json.loads(self.fixture.read_text())
+        fixture["artifact_zips"]["11"] = reuse_zip(
+            TREE,
+            {"matrix": [REUSE_JOB], "required": ["required check"]},
+            runs={"required": OTHER_SOURCE},
+        )
+        fixture["runs_by_id"][str(OTHER_SOURCE)] = run_doc(
+            sha=SHA, event="pull_request", branch="zajca/feature",
+            run_id=OTHER_SOURCE, repo=REPO, head_repo=REPO,
+        )
+        fixture["artifacts"][str(OTHER_SOURCE)] = [f"tested-tree-{TREE}"]
+        green = {"status": "completed", "completed_at": "2026-11-12T11:00:00Z"}
+        fixture["jobs_by_run"][str(REUSE_SOURCE_ID)] = {"jobs": [
+            {"name": REUSE_JOB, "conclusion": "success", **green},
+            {"name": "required check", "conclusion": "success",
+             "steps": step("success"), **green},
+        ]}
+        fixture["jobs_by_run"][str(OTHER_SOURCE)] = {"jobs": [
+            {"name": "required check", "conclusion": "success",
+             "steps": step("failure"), **green},
+        ]}
+        fixture["jobs_by_run"]["456"] = jobs_page(
+            overrides={REUSE_JOB: "skipped", "required check": "skipped"}
+        )
+        self.fixture.write_text(json.dumps(fixture))
+        result = self.invoke("main")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required step Check formatting", result.stderr)
+        self.assertIn(f"/actions/runs/{OTHER_SOURCE}", result.stderr)
+
+    def push_source_fixture(self, source, *, head_tree=None, unknown_head=False, events=None):
+        """The union fixture with run 777 replaced by `source` and the
+        sources of every event in `events` allowed; `head_tree` is the tree
+        the commits API answers for the source's head commit."""
+        union_fixture(self)
+        self.config_data["reuse"]["source_events"] = list(
+            events or ["pull_request", "push", "workflow_dispatch"]
+        )
+        self.write_config()
+        fixture = json.loads(self.fixture.read_text())
+        fixture["runs_by_id"][str(REUSE_SOURCE_ID)] = source
+        if head_tree is not None and source.get("head_sha"):
+            fixture["trees"][source["head_sha"]] = head_tree
+        if unknown_head:
+            fixture["unknown_commits"] = [source["head_sha"]]
+        self.fixture.write_text(json.dumps(fixture))
+
+    def test_a_push_source_on_another_commit_is_matched_by_its_head_tree(self):
+        OTHER = "b" * 40
+        push = lambda **values: run_doc(
+            sha=OTHER, event="push", branch="main", run_id=REUSE_SOURCE_ID,
+            repo=REPO, head_repo=REPO, **values,
+        )
+        self.push_source_fixture(push(), head_tree=TREE)
+        accepted = self.invoke("main", "--json")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.push_source_fixture(push(), head_tree="d" * 40)
+        refused = self.invoke("main", "--json")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("has neither the commit nor the tree", refused.stderr)
+        self.push_source_fixture(push(), unknown_head=True)
+        unreadable = self.invoke("main", "--json")
+        self.assertNotEqual(unreadable.returncode, 0)
+        self.assertIn("tree lookup failed", unreadable.stderr)
+        headless = push()
+        del headless["head_sha"]
+        self.push_source_fixture(headless)
+        nameless = self.invoke("main", "--json")
+        self.assertNotEqual(nameless.returncode, 0)
+        self.assertIn("has neither the commit nor the tree", nameless.stderr)
+
+    def test_a_source_run_is_refused_by_each_run_level_guard(self):
+        stale = "2026-11-10T12:00:00Z"
+        cases = (
+            ("a push off main", "is not a main push",
+             run_doc(event="push", branch="zajca/feature", run_id=REUSE_SOURCE_ID,
+                     repo=REPO, head_repo=REPO), None),
+            ("a nightly dispatch", "is not a tier=main dispatch",
+             dispatch_doc(sha=SHA, tier="nightly", run_id=REUSE_SOURCE_ID), None),
+            ("a failed run", "did not conclude success",
+             run_doc(event="pull_request", branch="zajca/feature", conclusion="failure",
+                     run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO), None),
+            ("a run older than the window", "is older than the reuse window",
+             run_doc(event="pull_request", branch="zajca/feature", created_at=stale,
+                     run_id=REUSE_SOURCE_ID, repo=REPO, head_repo=REPO), None),
+            ("a schedule run", "is a schedule run, which is never reused",
+             run_doc(event="schedule", branch="main", run_id=REUSE_SOURCE_ID,
+                     repo=REPO, head_repo=REPO),
+             ["pull_request", "push", "workflow_dispatch", "schedule"]),
+        )
+        for label, reason, source, events in cases:
+            with self.subTest(source=label):
+                self.push_source_fixture(source, head_tree=TREE, events=events)
+                result = self.invoke("main", "--json")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(reason, result.stderr)
 
     def test_source_leg_age_is_one_sided(self):
         union_fixture(self, jobs_by_run={
