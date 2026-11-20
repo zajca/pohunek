@@ -1335,8 +1335,11 @@ answer, drawn on the screen. It outranks a held record, and it holds `blocked`
 while the agent keeps writing output that changes no screen text (cursor
 moves, cursor show/hide, a redraw of the same frame), with or without a record
 held. A blocked rule without the flag (loose transcript text) and a
-title-sourced blocker do not: bytes over them read as working. Set the flag on
-every rule that matches a real dialog.
+title-sourced blocker alone do not: bytes over them read as working. A
+`visible_blocker` title rule that outranks a dialog rule still holds `blocked`
+while the screen alone names a `visible_blocker` dialog; the state's source is
+then `osc_title`, the winning rule's. Set the flag on every rule that matches a
+real dialog.
 
 The record is arbitrated with the screen rules (a visible dialog always wins
 over a non-blocked record; a `blocked` record always wins; `working` reads

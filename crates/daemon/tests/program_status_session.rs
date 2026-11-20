@@ -81,6 +81,8 @@ const TEST_COLS: u16 = 100;
 const TEST_ROWS: u16 = 24;
 /// The `app` the stand-in agent's records carry and its manifest opts in with.
 const APP: &str = "fake";
+/// The terminal title the stand-in manifest's title blocker matches.
+const BLOCKING_TITLE: &str = "FAKE-BLOCK-TITLE";
 /// The reply the worker writes for an answered probe, as hex.
 const REPLY_HEX: &str = "1b5d373530313b3f1b5c";
 /// Byte length of the reply.
@@ -121,7 +123,8 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// background loop that every 40 ms writes output that leaves the dialog
 /// unchanged, alternating a cursor hide, home and show with a redraw of the
 /// remembered frame (a changing spinner glyph above the dialog after `j`), and counts its
-/// iterations in `hold.count`; `H` stops it. In the `screen` mode the
+/// iterations in `hold.count`; `H` stops it. `T` sets the terminal title the
+/// manifest's title blocker (priority above every dialog) matches. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
 /// transcript bullet that only looks like one, above the prompt box.
@@ -194,7 +197,7 @@ run() {{
     k) show '' "$dialog" ;;
     j) show 1 "$dialog" ;;
     h) hold & echo $! > "$dir/hold.pid" ;;
-    H) kill "$(cat "$dir/hold.pid")" ;;
+    H|T) control "$1" ;;
     P) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit 'blocked:kind=permission' ;;
     K) printf '\033[2J\033[H────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'; emit blocked ;;
     y) printf '\033[2J\033[H'; box ;;
@@ -229,7 +232,8 @@ done
 }
 
 /// The shell fragment behind the `h` command: the remembered frame and the
-/// output loop, which writes only bytes that leave the screen text unchanged.
+/// output loop, which writes only bytes that leave the screen text unchanged,
+/// and the `H` and `T` controls (`T` sets `BLOCKING_TITLE`).
 const HOLD_LOOP: &str = r#"frame=
 spin=
 dialog='────────────────\r\n  Yes, I trust this folder\r\n  No, exit\r\n  Enter to confirm\r\n'
@@ -237,6 +241,12 @@ show() {
   spin=$1; frame=$2; top=
   if [ "$spin" = 1 ]; then top='✻ Billowing… (1…\r\n'; fi
   printf "\033[2J\033[H$top$frame"
+}
+control() {
+  case "$1" in
+    H) kill "$(cat "$dir/hold.pid")" ;;
+    T) printf '\033]2;FAKE-BLOCK-TITLE\033\\' ;;
+  esac
 }
 hold() {
   i=0
@@ -250,7 +260,7 @@ hold() {
     else
       printf "\033[H$frame"
     fi
-    printf '%s' "$i" > "$dir/hold.count"
+    printf '%s' "$i" > "$dir/hold.count.tmp" && mv "$dir/hold.count.tmp" "$dir/hold.count"
     sleep 0.04
   done
 }"#;
@@ -298,7 +308,9 @@ fn opted_in_manifest_with_staleness(
         .map(|ms| format!("stale_after_ms = {ms}\n"))
         .unwrap_or_default();
     format!(
-        "{shipped}\n[program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n{gate}{stale}"
+        "{shipped}\n[[rules]]\nid = \"fake_title_blocked\"\nstate = \"blocked\"\npriority = 1100\n\
+         region = \"osc_title\"\nvisible_blocker = true\ncontains = [\"{BLOCKING_TITLE}\"]\n\n\
+         [program_status]\napp = \"{APP}\"\nanswer_probe = {answer_probe}\n{gate}{stale}"
     )
 }
 
@@ -3004,6 +3016,91 @@ async fn a_weak_blocker_under_output_still_reads_working() {
         fixture.activity(&created.id).await,
         Some((AgentActivity::Working, StateSource::Process)),
         "a weak blocker under output reads working"
+    );
+
+    command(&fixture, b'H');
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A title blocker that outranks a screen dialog (the Codex shape: "Action
+/// Required" over its approval prompt) does not let screen-neutral output turn
+/// the session into working: the title winner is the held reading while the
+/// screen still names a dialog.
+#[tokio::test]
+async fn a_title_blocker_over_a_screen_dialog_holds_blocked_under_output() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(false).await;
+    let created = fixture.start("fake-plain-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    command(&fixture, b'k');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::Screen))
+        .await;
+    command(&fixture, b'T');
+    command(&fixture, b'h');
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Blocked, StateSource::OscTitle))
+        .await;
+
+    let mut events = fixture.registry.subscribe();
+    let floor = hold_iterations(&fixture);
+    wait_for_hold_iterations(&fixture, floor).await;
+    assert_eq!(
+        fixture.activity(&created.id).await,
+        Some((AgentActivity::Blocked, StateSource::OscTitle)),
+        "the title winner holds while the screen still names the dialog"
+    );
+    let states = agent_states(&mut events);
+    assert!(
+        states
+            .iter()
+            .all(|event| event.payload()["activity"] != "working"),
+        "no working edge under the title blocker over a dialog: {states:?}"
+    );
+
+    command(&fixture, b'H');
+    fixture
+        .registry
+        .stop(&created.id)
+        .await
+        .expect("stop the session");
+}
+
+/// A title blocker with no dialog on the screen is no screen evidence: output
+/// that changes no screen text keeps the byte fallback and reads working.
+#[tokio::test]
+async fn a_title_blocker_without_a_screen_dialog_under_output_reads_working() {
+    if !pohunek_test_support::process_env::in_own_process() {
+        return;
+    }
+    let fixture = Fixture::new(false).await;
+    let created = fixture.start("fake-plain-fifo").await;
+    fixture
+        .wait_activity(&created.id, (AgentActivity::Idle, StateSource::Screen))
+        .await;
+    let mut events = fixture.registry.subscribe();
+
+    command(&fixture, b'T');
+    command(&fixture, b'h');
+    wait_until("a process working edge", || {
+        let seen = saw_process_working(&mut events);
+        async move { seen.then_some(()) }
+    })
+    .await;
+    let floor = hold_iterations(&fixture);
+    wait_for_hold_iterations(&fixture, floor).await;
+    assert_eq!(
+        fixture.activity(&created.id).await,
+        Some((AgentActivity::Working, StateSource::Process)),
+        "a title blocker alone under output reads working"
     );
 
     command(&fixture, b'H');
