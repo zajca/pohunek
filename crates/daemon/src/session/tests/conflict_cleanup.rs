@@ -1339,6 +1339,17 @@ struct Escalation {
 
 impl Escalation {
     async fn start(tag: &str) -> Self {
+        Box::pin(Self::start_with(
+            tag,
+            DesiredState::Stopped,
+            TransactionKind::Stop,
+        ))
+        .await
+    }
+
+    /// A live worker whose committed intent is `desired` with a `kind`
+    /// transaction, as the escalation of a stop or of a removal commits it.
+    async fn start_with(tag: &str, desired: DesiredState, kind: TransactionKind) -> Self {
         let store = super::temp_store_path(tag);
         let (registry, supervisor) = super::scripted_registry(SessionRegistryConfig {
             shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -1375,14 +1386,14 @@ impl Escalation {
             let previous_desired_state = entry.desired_state;
             entry.stopping = true;
             entry.stop_transaction_id = Some(transaction_id.clone());
-            entry.desired_state = DesiredState::Stopped;
+            entry.desired_state = desired;
             let intent = SessionRegistry::session_record(
                 &id,
                 entry,
-                DesiredState::Stopped,
+                desired,
                 Some(crate::store::SessionTransaction {
                     id: transaction_id.clone(),
-                    kind: TransactionKind::Stop,
+                    kind,
                     phase: "requested".to_owned(),
                     previous_worker_id: None,
                     previous_worker_instance_id: None,
@@ -1407,8 +1418,8 @@ impl Escalation {
         };
         assert_eq!(
             durable_state_of(&store, &id.0),
-            (DesiredState::Stopped, Some(TransactionKind::Stop)),
-            "the stop intent is durable before the escalation"
+            (desired, Some(kind)),
+            "the intent is durable before the escalation"
         );
         Self {
             registry,
@@ -1498,6 +1509,44 @@ async fn an_escalation_that_retired_nothing_rolls_the_stop_intent_back() {
         .await
         .expect("listed");
     assert_eq!(info.state, protocol::SessionState::Running);
+}
+
+/// `NotStopped` at the escalation of a removal (the rollback of a refused
+/// create): the rolled-back intent is the removal that was committed, so the
+/// stop is cleared and the session is back to its previous desired state.
+#[tokio::test]
+async fn an_escalation_of_a_removal_that_retired_nothing_rolls_the_removal_intent_back() {
+    let mut escalation = Box::pin(Escalation::start_with(
+        "escalation-removal-not-stopped",
+        DesiredState::Removed,
+        TransactionKind::Remove,
+    ))
+    .await;
+    escalation
+        .supervisor
+        .script_retire_unavailable(escalation.service.clone());
+
+    let error = escalation
+        .end_unresponsive_worker()
+        .await
+        .expect_err("the unreachable supervisor retires nothing");
+
+    assert_eq!(
+        error.code,
+        crate::runtime::lifecycle::SUPERVISION_UNAVAILABLE,
+        "{error:?}"
+    );
+    assert_eq!(
+        durable_state_of(&escalation.store, &escalation.id.0),
+        (DesiredState::Running, None),
+        "the untouched retirement rolls the durable removal intent back"
+    );
+    escalation.assert_stop_cleared().await;
+    let sessions = escalation.registry.inner.sessions.lock().await;
+    assert_eq!(
+        sessions[&escalation.id].desired_state,
+        DesiredState::Running
+    );
 }
 
 /// E3, `PartiallyStopped` at the live escalation: the supervisor ended the
