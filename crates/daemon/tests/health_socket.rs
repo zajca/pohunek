@@ -4192,6 +4192,7 @@ codex_captured_dialog_tests! {
 }
 
 /// Stop bound of the frozen-worker rollback scenario.
+#[cfg(target_os = "linux")]
 // timing-allowed: #2453 the worker is frozen with SIGSTOP, so its stop answer never comes; the bound only shortens the wait for that certain expiry.
 const FROZEN_STOP_GRACE: Duration = Duration::from_millis(100);
 
