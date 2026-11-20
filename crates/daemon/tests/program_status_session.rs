@@ -118,9 +118,9 @@ const WAIT_MS: u32 = protocol::MAX_SESSION_WAIT_MS;
 /// `blocked:kind=permission` record carrying a marker text as `msg=`;
 /// `m` draws a marker line. `k` draws the folder trust dialog and `j` the
 /// same dialog under a status line; each remembers its frame. `h` starts a
-/// background loop that every 40 ms writes output changing no screen text,
-/// alternating a cursor hide, home and show with a redraw of the remembered
-/// frame (a changing spinner glyph above the dialog after `j`), and counts its
+/// background loop that every 40 ms writes output that leaves the dialog
+/// unchanged, alternating a cursor hide, home and show with a redraw of the
+/// remembered frame (a changing spinner glyph above the dialog after `j`), and counts its
 /// iterations in `hold.count`; `H` stops it. In the `screen` mode the
 /// program answers no probe and draws one screen per FIFO byte: `s` and `w`
 /// draw a status line whose timer the terminal width cut, `b`, `n` and `k` a
