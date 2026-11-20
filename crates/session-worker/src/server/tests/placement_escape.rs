@@ -352,20 +352,7 @@ impl StartedRuntime {
     }
 }
 
-/// Subscribes this thread to the worker's warnings; the events a scenario's
-/// tasks emit on its current-thread runtime land in the returned capture.
-fn capture_warnings() -> (super::EventCapture, tracing::subscriber::DefaultGuard) {
-    let capture = super::EventCapture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer({
-            let capture = capture.clone();
-            move || capture.clone()
-        })
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    (capture, tracing::subscriber::set_default(subscriber))
-}
+use super::capture_warnings;
 
 fn escape_warnings(capture: &super::EventCapture) -> usize {
     String::from_utf8_lossy(&capture.0.lock().expect("event capture"))
