@@ -1019,7 +1019,7 @@ jobs:
       skip: ${{ steps.decide.outputs.skip || steps.nopus.outputs.skip || '[]' }}
       source_run: ${{ steps.decide.outputs.source_run || steps.nopus.outputs.source_run || '' }}
       source_runs: ${{ steps.decide.outputs.source_runs || steps.nopus.outputs.source_runs || '[]' }}
-      tree: ${{ steps.decide.outputs.tree || steps.nopus.outputs.tree || '' }}
+      tree: ${{ steps.decide.outputs.tree || '' }}
     steps:
       - uses: actions/checkout@v4
         with:

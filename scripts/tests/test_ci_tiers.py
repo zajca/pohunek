@@ -3134,13 +3134,16 @@ def evaluate_needs_expression(
     inputs: dict[str, bool | str] | None = None,
     matrix: dict[str, str] | None = None,
     reuse_skip: list[str] | None = None,
+    step_outputs: dict[str, dict[str, str]] | None = None,
 ):
     """Evaluate an expression over `needs.<job>.result` and `.outputs.<name>`.
 
     Understands `!cancelled()`, `always()`, `failure()`, `fromJSON`,
     `contains`, `github.event_name`, `inputs.tier`, `env.<NAME>`,
-    `matrix.<name>`, `steps.<id>.outcome`, `needs.<job>.result` and
-    `needs.<job>.outputs.<name>`, string and integer literals, `==`, `!=`, `!`,
+    `matrix.<name>`, `github.sha`, `steps.<id>.outcome`,
+    `steps.<id>.outputs.<name>` (read from `step_outputs`),
+    `needs.<job>.result` and `needs.<job>.outputs.<name>`, string and integer
+    literals, `==`, `!=`, `!`,
     `&&`, `||` and parentheses; anything else fails the translation. `&&` and
     `||` return an operand, as in GitHub Actions, so a value expression
     evaluates to its value. A missing result or output reads as the empty
@@ -3155,7 +3158,13 @@ def evaluate_needs_expression(
     # A step of a reused leg that ran successfully reads success; a
     # conditional step that never ran reads skipped, which never matters for
     # a fail-fast clause (`failure()` already reads false on a green leg).
+    python = re.sub(
+        r"steps\.([A-Za-z0-9_-]+)\.outputs\.([a-z_]+)",
+        r"stepouts.get('\1', {}).get('\2', '')",
+        python,
+    )
     python = re.sub(r"steps\.[A-Za-z0-9_-]+\.outcome", "'success'", python)
+    python = python.replace("github.sha", "'" + "a" * 40 + "'")
     python = python.replace("always()", "(True)")
     python = python.replace("success()", "(True)")
     python = python.replace("fromJSON(", "fromjson(")
@@ -3182,7 +3191,7 @@ def evaluate_needs_expression(
     python = re.sub(r"'[^']*'", lambda literal: literal.group(0).lower(), python)
     leftover = re.sub(
         r"'[^']*'|\b(?:not|and|or|True|False|event|tier|cancelled|fromjson|contains|changes\.get|"
-        r"results\.get|outputs\.get|envs\.get|matrix\.get|inputs\.get|reuse_skip|get|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
+        r"results\.get|outputs\.get|stepouts\.get|envs\.get|matrix\.get|inputs\.get|reuse_skip|get|\d+|success)\b|==|!=|[(){}.,\s\[\]]",
         "",
         python,
     )
@@ -3195,6 +3204,10 @@ def evaluate_needs_expression(
         "fromjson": json.loads,
         "contains": _contains,
         "reuse_skip": [name.lower() for name in (reuse_skip or [])],
+        "stepouts": {
+            step: {name: value.lower() for name, value in values.items()}
+            for step, values in (step_outputs or {}).items()
+        },
         # Literals are lowered with the rest of the expression, keys included.
         "envs": {name.lower(): value.lower() for name, value in (env or {}).items()},
         "matrix": {name.lower(): value.lower() for name, value in (matrix or {}).items()},
@@ -3228,6 +3241,73 @@ def step_condition(step: str) -> str:
     if match is None:
         raise AssertionError(f"step has no condition: {step!r}")
     return match.group(1) or match.group(2)
+
+
+def step_id(step: str) -> str | None:
+    match = re.search(r"(?m)^        id: (\S+)$", step)
+    return match.group(1) if match else None
+
+
+def written_step_outputs(step: str) -> dict[str, str]:
+    """The outputs a step writes, read from its `>> "$GITHUB_OUTPUT"` lines.
+
+    A value that is a shell expansion reads as a non-empty placeholder; a
+    step that runs `scripts/ci-reuse` also writes every output that script
+    emits. A line that writes `$GITHUB_OUTPUT` in a form this reader does not
+    understand fails the test instead of being skipped.
+    """
+    outputs: dict[str, str] = {}
+    for line in step.splitlines():
+        if "$GITHUB_OUTPUT" not in line or ">>" not in line:
+            continue
+        match = re.match(r"\s*(?:echo|printf)\s+([\"']?)([A-Za-z_]\w*)=(.*)", line)
+        if match is None:
+            raise AssertionError(f"unreadable output write: {line.strip()!r}")
+        rest = match.group(3)
+        if match.group(1) == "" and rest[:1] in "\"'" and rest[1:2] != rest[:1]:
+            value = "x"
+        elif match.group(1) == "":
+            value = ""
+        else:
+            value = rest.split(match.group(1), 1)[0]
+        if "$" in value or "%s" in value:
+            value = "x"
+        outputs[match.group(2)] = value
+    if re.search(r"(?m)^\s+python3 scripts/ci-reuse$", step):
+        script = (ROOT / "scripts/ci-reuse").read_text()
+        for name in re.findall(r'(?m)^    output\("([a-z_]+)",', script):
+            outputs[name] = "x"
+    return outputs
+
+
+def step_outputs_on_path(
+    job: str, *, event: str, env: dict[str, str], tier: str = ""
+) -> dict[str, dict[str, str]]:
+    """The outputs of the steps of `job` whose `if:` is true on this path,
+    keyed by step id. A step without an `if:` runs."""
+    outputs: dict[str, dict[str, str]] = {}
+    for step in job_steps(job).values():
+        identifier = step_id(step)
+        gate = re.search(r"(?m)^        if: (?:\$\{\{ (.+) \}\}|(.+))$", step)
+        if gate is not None and not evaluate_needs_expression(
+            gate.group(1) or gate.group(2), event=event, tier=tier, env=env
+        ):
+            continue
+        if identifier is not None:
+            outputs[identifier] = written_step_outputs(step)
+    return outputs
+
+
+def job_output_expressions(job: str) -> dict[str, str]:
+    """The `outputs:` of a job as name -> expression (without `${{ }}`)."""
+    block = job.split("    outputs:\n", 1)[1]
+    expressions: dict[str, str] = {}
+    for line in block.splitlines():
+        match = re.match(r"      ([a-z_]+): \$\{\{ (.+) \}\}$", line)
+        if match is None:
+            break
+        expressions[match.group(1)] = match.group(2)
+    return expressions
 
 
 def step_env_expression(step: str, name: str) -> str:
@@ -4502,31 +4582,64 @@ class DeltaReuseWiringTests(unittest.TestCase):
         self.assertIn(decide_gate, upload_block, "upload must share the decide gate")
 
     def test_the_record_download_runs_only_when_the_reuse_job_emits_a_tree(self):
-        # With the switch off the kill-switch step emits no tree, so the
-        # record download must stay skipped (a missing ci-reuse-<tree>
-        # artifact would fail the test-duplicates job); with the switch
-        # on and on a delta dispatch the decide step emits the tree and
-        # the download runs.
+        # The job outputs are evaluated from the steps that run on each
+        # path: with the switch off no step emits a tree, so the record
+        # download stays skipped (a missing ci-reuse-<tree> artifact would
+        # fail the test-duplicates job); with the switch on and on a delta
+        # dispatch the decide step emits the tree and the download runs.
+        job = workflow_jobs()[REUSE_JOB]
+        expressions = job_output_expressions(job)
+        self.assertEqual(
+            set(expressions), {"skip", "source_run", "source_runs", "tree"}
+        )
         steps = job_steps(workflow_jobs()["test-duplicates"])
-        download = steps["Download the reuse record"]
-        condition = self.gate_of(download, "record download")
-        self.assertEqual(condition, "needs.reuse.outputs.tree != ''")
-        nopus_outputs: dict[str, dict[str, str]] = {
-            REUSE_JOB: {"skip": "[]", "tree": ""},
+        download = self.gate_of(steps["Download the reuse record"], "record download")
+        paths = (
+            ("push, switch off", "push", "", "false", False),
+            ("push, switch on", "push", "", "true", True),
+            ("delta dispatch", "workflow_dispatch", "main", "true", True),
+        )
+        for label, event, tier, switch, downloads in paths:
+            with self.subTest(path=label):
+                env = {"CI_REUSE_PUSH": switch}
+                on_path = step_outputs_on_path(job, event=event, tier=tier, env=env)
+                outputs = {
+                    name: str(evaluate_needs_expression(
+                        expression, event=event, tier=tier, env=env,
+                        step_outputs=on_path,
+                    ))
+                    for name, expression in expressions.items()
+                }
+                self.assertNotEqual(outputs["skip"], "", "the skip list always reads")
+                self.assertNotEqual(outputs["source_runs"], "")
+                self.assertEqual(outputs["tree"] != "", downloads, outputs)
+                self.assertEqual(
+                    bool(evaluate_needs_expression(
+                        download, event=event, tier=tier, outputs={REUSE_JOB: outputs},
+                    )),
+                    downloads,
+                    "the download runs exactly when the job emits a tree",
+                )
+                if not downloads:
+                    self.assertFalse(
+                        any("tree" in written for written in on_path.values()),
+                        "no step on the kill-switch path emits a tree",
+                    )
+
+    def test_every_reuse_job_output_names_an_output_its_step_writes(self):
+        job = workflow_jobs()[REUSE_JOB]
+        written = {
+            step_id(step): set(written_step_outputs(step))
+            for step in job_steps(job).values()
+            if step_id(step) is not None
         }
-        self.assertFalse(bool(evaluate_needs_expression(
-            condition, event="push", outputs=nopus_outputs,
-        )), "no record exists with the switch off, the download stays skipped")
-        decide_outputs: dict[str, dict[str, str]] = {
-            REUSE_JOB: {"skip": "[]", "tree": "c" * 40},
-        }
-        self.assertTrue(bool(evaluate_needs_expression(
-            condition, event="push", outputs=decide_outputs,
-        )), "with the switch on the decide tree names the record")
-        self.assertTrue(bool(evaluate_needs_expression(
-            condition, event="workflow_dispatch", tier="main",
-            outputs=decide_outputs,
-        )), "a delta dispatch downloads the record its decide step names")
+        for name, expression in job_output_expressions(job).items():
+            for identifier, output in re.findall(
+                r"steps\.([A-Za-z0-9_-]+)\.outputs\.([a-z_]+)", expression
+            ):
+                with self.subTest(output=name, operand=f"{identifier}.{output}"):
+                    self.assertIn(identifier, written)
+                    self.assertIn(output, written[identifier])
 
     def test_the_kill_switch_off_runs_nothing_and_skips_nothing(self):
         # With the switch off a push runs only the kill-switch step,
@@ -4541,7 +4654,6 @@ class DeltaReuseWiringTests(unittest.TestCase):
         upload_block = steps["Upload the reuse record"]
         self.assertIn("id: nopus", nopus_block)
         self.assertIn('echo "skip=[]" >> "$GITHUB_OUTPUT"', nopus_block)
-        self.assertNotIn('echo "tree=', nopus_block)
         nopus = self.gate_of(nopus_block, "kill-switch")
         decide = self.gate_of(decide_block, "decide")
         upload = self.gate_of(upload_block, "upload")
@@ -4590,14 +4702,25 @@ class DeltaReuseWiringTests(unittest.TestCase):
             ),
             "the decide step runs on a delta dispatch",
         )
-        outputs = workflow_jobs()[REUSE_JOB]
-        skip_line = next(
-            (line for line in outputs.splitlines() if line.strip().startswith("skip:")),
+        expression = job_output_expressions(job)["skip"]
+        env = {"CI_REUSE_PUSH": "true"}
+        decided = step_outputs_on_path(job, event="push", env=env)
+        self.assertEqual(
+            str(evaluate_needs_expression(
+                expression, event="push", env=env, step_outputs=decided,
+            )),
+            "x",
+            "the decide output wins over the kill-switch step",
         )
-        decide_pos = skip_line.find("steps.decide.outputs.skip")
-        nopus_pos = skip_line.find("steps.nopus.outputs.skip")
-        self.assertGreaterEqual(decide_pos, 0)
-        self.assertGreater(nopus_pos, decide_pos, "decide wins over the kill-switch step")
+        env = {"CI_REUSE_PUSH": "false"}
+        switched_off = step_outputs_on_path(job, event="push", env=env)
+        self.assertEqual(
+            str(evaluate_needs_expression(
+                expression, event="push", env=env, step_outputs=switched_off,
+            )),
+            "[]",
+            "the kill-switch step supplies the empty list",
+        )
 
     def test_every_reusable_job_needs_reuse_and_names_itself_in_skip(self):
         jobs = workflow_jobs()
