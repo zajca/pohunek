@@ -10,7 +10,10 @@ takes from them. Jobs the record does not name are never touched, so this
 run's own reports (downloaded afterwards by the pinned
 `actions/download-artifact`) win every name collision.
 
-`gh` failures are retried a bounded number of times; an exhausted retry
+`gh` failures are retried a bounded number of times, set by the environment
+variables `CI_RETRY_ATTEMPTS` (at least 1) and `CI_RETRY_BACKOFF_SECONDS`
+(pause in seconds); the script exits 1 when either is missing or malformed.
+An exhausted retry
 fails the step, so `test-duplicates` never checks a silently partial set.
 A missing record (reuse skipped or the kill switch off), a record without
 jobs, and a missing or expired artifact are not errors: the job simply has
@@ -23,6 +26,7 @@ import argparse
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -45,7 +49,10 @@ JOB_JUNIT: dict[str, tuple[str, ...]] = {
     "integration": ("nextest-junit-heavy-1", "nextest-junit-heavy-2", "nextest-junit-heavy-3"),
 }
 
-MAX_ATTEMPTS = 3
+# The retry bound and the pause between attempts are the workflow's calibrated
+# `CI_RETRY_*` values; the step inherits them from the workflow `env`.
+RETRY_ATTEMPTS_ENV = "CI_RETRY_ATTEMPTS"
+RETRY_BACKOFF_ENV = "CI_RETRY_BACKOFF_SECONDS"
 LIST_TIMEOUT = 60
 ZIP_TIMEOUT = 120
 
@@ -58,10 +65,26 @@ def warn(message: str) -> None:
     print(f"::warning::ci-reuse-junit: {message}", flush=True)
 
 
+def retry_policy() -> tuple[int, int]:
+    """The attempt bound and the pause in seconds between attempts, from the
+    environment; a missing or malformed value is an error."""
+    values = []
+    for name in (RETRY_ATTEMPTS_ENV, RETRY_BACKOFF_ENV):
+        raw = os.environ.get(name, "")
+        if not re.fullmatch(r"\d+", raw):
+            raise JunitError(f"{name} must be set to a non-negative integer, got {raw!r}")
+        values.append(int(raw))
+    attempts, backoff = values
+    if attempts < 1:
+        raise JunitError(f"{RETRY_ATTEMPTS_ENV} must be at least 1")
+    return attempts, backoff
+
+
 def run_gh(arguments: list[str], timeout: int, kind: str) -> bytes:
     """Run `gh` with bounded retries; return stdout on success."""
+    max_attempts, backoff = retry_policy()
     last = "unknown error"
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
             result = subprocess.run(
                 ["gh", *arguments],
@@ -78,10 +101,10 @@ def run_gh(arguments: list[str], timeout: int, kind: str) -> bytes:
                 return result.stdout
             detail = result.stderr.decode(errors="replace").strip() if isinstance(result.stderr, bytes) else str(result.stderr or "").strip()
             last = detail or f"gh exited with status {result.returncode} ({kind})"
-        if attempt < MAX_ATTEMPTS:
-            warn(f"{last}; retrying ({attempt}/{MAX_ATTEMPTS})")
-            time.sleep(attempt)
-    raise JunitError(f"{last}; giving up after {MAX_ATTEMPTS} attempts ({kind})")
+        if attempt < max_attempts:
+            warn(f"{last}; retrying ({attempt}/{max_attempts})")
+            time.sleep(backoff)
+    raise JunitError(f"{last}; giving up after {max_attempts} attempts ({kind})")
 
 
 def list_artifacts(repo: str, run_id: int) -> dict[str, int]:
@@ -195,9 +218,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
                         help="owner/name (default: $GITHUB_REPOSITORY)")
     args = parser.parse_args(argv)
-    import re
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
         print("ci-reuse-junit: --repo is not in owner/name form", file=sys.stderr)
+        return 1
+    try:
+        retry_policy()
+    except JunitError as error:
+        print(f"ci-reuse-junit: {error}", file=sys.stderr)
         return 1
     try:
         text = args.record.read_text()

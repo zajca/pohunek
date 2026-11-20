@@ -1860,6 +1860,15 @@ impl From<bool> for UnconfirmedCleanup {
     }
 }
 
+/// What a stop does when its worker does not answer within the stop bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnansweredStop {
+    /// End the worker through its supervisor and commit a lost runtime.
+    Escalate,
+    /// Return the typed `worker_operation_failed` and keep the session listed.
+    Refuse,
+}
+
 /// What [`SessionRegistry::release_removed_session`] cleaned up.
 #[derive(Debug)]
 struct ReleasedSession {
@@ -5652,14 +5661,20 @@ impl SessionRegistry {
 
     /// Roll back a session whose initial `--input` could not be delivered or
     /// committed by removing it ([`Self::remove`]): stop the runtime, retire
-    /// its job, and free its worktree, so its branch is free for a retry.
+    /// its job, and free its worktree, so its branch is free for a retry. A
+    /// worker that does not answer the implied stop is ended through its
+    /// supervisor, as [`Self::stop`] does, because the refused client holds no
+    /// session to retry the removal on.
     ///
     /// The removal persists its intent before it acts, and until then the
     /// record keeps the `initial_input` marker, so reconciliation finishes a
     /// rollback this cannot. Best-effort: a failure is logged, never
     /// propagated, so the caller still returns the original input error.
     async fn rollback_failed_initial_input(&self, id: &SessionId) {
-        if let Err(err) = self.remove(id).await {
+        if let Err(err) = self
+            .remove_with_unanswered(id, UnconfirmedCleanup::Refuse, UnansweredStop::Escalate)
+            .await
+        {
             warn!(
                 session_id = %id.0,
                 error = %err,
@@ -7239,8 +7254,14 @@ impl SessionRegistry {
         if let Some(stopped) = self.stop_unavailable_runtime(id).await? {
             return Ok(stopped);
         }
-        self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop, None)
-            .await
+        self.stop_with_intent(
+            id,
+            DesiredState::Stopped,
+            TransactionKind::Stop,
+            UnansweredStop::Escalate,
+            None,
+        )
+        .await
     }
 
     #[expect(
@@ -7252,6 +7273,7 @@ impl SessionRegistry {
         id: &SessionId,
         desired_state: DesiredState,
         transaction_kind: TransactionKind,
+        unanswered: UnansweredStop,
         only_if: Option<&(dyn Fn(&SessionEntry) -> bool + Sync)>,
     ) -> Result<SessionStopResult, ProtocolError> {
         self.ensure_not_external_session(id).await?;
@@ -7366,10 +7388,11 @@ impl SessionRegistry {
                     }
                     Err(
                         WorkerError::StopUnanswered { .. } | WorkerError::ExchangeTimedOut { .. },
-                    ) if transaction_kind == TransactionKind::Stop => {
+                    ) if unanswered == UnansweredStop::Escalate => {
                         // The worker is frozen, not slow: it is ended through its
                         // supervisor and the stop commits the terminal outcome of
-                        // a runtime that was lost.
+                        // a runtime that was lost. A removal escalates only when
+                        // its caller asks for it (the rollback of a refused create).
                         Box::pin(self.end_unresponsive_worker(
                             id,
                             &transaction_id,
@@ -7654,6 +7677,18 @@ impl SessionRegistry {
         id: &SessionId,
         cleanup: UnconfirmedCleanup,
     ) -> Result<SessionRemoveResult, ProtocolError> {
+        self.remove_with_unanswered(id, cleanup, UnansweredStop::Refuse)
+            .await
+    }
+
+    /// [`Self::remove_with`] whose implied stop escalates an unanswered worker
+    /// through its supervisor when `unanswered` says so.
+    async fn remove_with_unanswered(
+        &self,
+        id: &SessionId,
+        cleanup: UnconfirmedCleanup,
+        unanswered: UnansweredStop,
+    ) -> Result<SessionRemoveResult, ProtocolError> {
         self.ensure_not_external_session(id).await?;
         let _guard = self.lock_lifecycle(id).await;
         let prove_and_remove_conflict = {
@@ -7690,7 +7725,13 @@ impl SessionRegistry {
             self.plan_unreachable_removal(id, cleanup).await?;
         let stopped = if should_stop {
             let stopped = self
-                .stop_with_intent(id, DesiredState::Removed, TransactionKind::Remove, None)
+                .stop_with_intent(
+                    id,
+                    DesiredState::Removed,
+                    TransactionKind::Remove,
+                    unanswered,
+                    None,
+                )
                 .await?
                 .stopped;
             self.retire_unstopped_job(id).await?;

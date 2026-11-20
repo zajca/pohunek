@@ -17,8 +17,8 @@
   {
    "event": "push",
    "job": "tests (core, fast)",
-   "median_seconds_max": 203,
-   "reason": "Window 2026-11-15..2026-11-19, 30 green push runs of ci.yml on main: shard wall median 184 s, +10 %.",
+   "median_seconds_max": 234,
+   "reason": "Window 2026-11-19..2026-11-20, 16 green push runs of ci.yml on main that ran the shard: wall median 213 s, +10 %. The shard grew from a 119 s median (2026-11-14..2026-11-17) when the plugin-kit smoke and prove tests joined it: 34 tests, +103 s of test time, 61 s of it in kit_smoke_skips_the_script_when_the_screen_check_fails, which waits out the 60 s detector timeout of the smoke (runs 43781689098 vs 44525072744, 44572083050).",
    "step": null
   },
   {

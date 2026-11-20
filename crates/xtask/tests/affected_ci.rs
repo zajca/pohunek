@@ -681,16 +681,33 @@ fn the_ci_configuration_and_the_test_job_scripts_select_everything() {
 }
 
 #[test]
-fn the_delta_reuse_wiring_selects_everything() {
-    for path in ["scripts/ci-reuse", "scripts/ci-reuse.json"] {
+fn the_reuse_wiring_selects_everything() {
+    for (path, reason) in [
+        (
+            "scripts/ci-reuse",
+            "decides the push and delta-dispatch reuse",
+        ),
+        (
+            "scripts/ci-reuse.json",
+            "allowlist of the push and delta-dispatch reuse",
+        ),
+        (
+            "scripts/ci_eligibility.py",
+            "eligibility rule shared by the push and delta-dispatch reuse gates",
+        ),
+        (
+            "scripts/ci-reuse-junit",
+            "downloads the JUnit reports of the reused CI test jobs",
+        ),
+    ] {
         let repo = Repo::new();
         repo.change(&[path]);
         let selection = repo.select();
         assert_full(&selection, path);
         let causes = selection["full_causes"].to_string();
         assert!(
-            causes.contains("delta-dispatch reuse"),
-            "the reuse rule names its reason for {path}: {causes}",
+            causes.contains(reason),
+            "the reuse wiring names its reason for {path}: {causes}",
         );
     }
 }

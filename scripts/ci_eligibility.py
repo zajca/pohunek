@@ -9,13 +9,13 @@ against an injected clock. Never `cargo-audit`, never schedule or nightly.
 
 The scripts load this module by path with importlib (the way the tests load
 the scripts), because the checked-in scripts carry no `.py` suffix and share
-no package. Every guard in this module is killed by a scenario in
-`scripts/tests/test_ci_reuse.py` or `scripts/tests/test_ci_evidence.py`.
+no package.
 """
 
 from __future__ import annotations
 
 import datetime
+import re
 
 
 # Jobs whose build inputs live outside the tree: the advisory database, the
@@ -26,6 +26,29 @@ NEVER_REUSED = frozenset({
     "package-version-bump", "test-selection-verdict", "test-duplicates",
     "reuse",
 })
+
+
+# The artifact a CI run uploads to record the tree it tested.
+TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
+
+
+def tested_trees(artifact_names) -> set[str]:
+    """The trees named by the `tested-tree-<tree>` artifacts among
+    `artifact_names`."""
+    return {
+        match.group(1)
+        for name in artifact_names
+        if (match := TESTED_TREE_ARTIFACT.fullmatch(str(name)))
+    }
+
+
+def recorded_tree_refusal(recorded: set[str], tree: str) -> str | None:
+    """Why a run whose recorded tested trees are `recorded` did not test
+    `tree`, or None when its only recorded tree is `tree`."""
+    if recorded == {tree}:
+        return None
+    names = ", ".join(sorted(recorded)) or "none"
+    return f"recorded tested tree {names}, expected {tree}"
 
 
 def parse_moment(value) -> datetime.datetime | None:
@@ -70,32 +93,14 @@ def source_is_eligible(
     allowed_events: tuple | list,
 ) -> bool:
     """Whether a workflow run may supply reused jobs: it is a run of this
-    repository (never a fork), its event is allowed, a push source is on the
-    main branch, a dispatch source is a tier=main dispatch, its run-level
+    repository (never a fork), its event is allowed, a push source is a main
+    push, a dispatch source is a tier=main dispatch, its run-level
     conclusion is `success`, and it was created within `max_age` of `now`.
 
     Never `cargo-audit` (the advisory database changes independently of the
-    tree), never schedule or nightly.
+    tree), never schedule or nightly. [`run_source_reasons`] is the rule.
     """
-    if (run.get("repository") or {}).get("full_name") != repo:
-        return False
-    if (run.get("head_repository") or {}).get("full_name") != repo:
-        return False
-    event = run.get("event")
-    if event not in allowed_events:
-        return False
-    if event == "push" and run.get("head_branch") != "main":
-        return False
-    if event == "workflow_dispatch" and run_tier(run, workflow_path) != "main":
-        return False
-    if event == "schedule":
-        return False
-    if run.get("conclusion") != "success" or run.get("status") != "completed":
-        return False
-    created = parse_moment(run.get("created_at"))
-    if created is None or now - created > max_age:
-        return False
-    return True
+    return not run_source_reasons(run, repo, workflow_path, now, max_age, allowed_events)
 
 
 def consumer_matches(run: dict, consumer_event: str, sha: str) -> bool:
@@ -121,24 +126,17 @@ def leg_is_fresh(
     return now - completed <= max_age
 
 
-def job_is_reused(
-    job_id: str,
-    conclusion,
-    fresh: bool,
-    selection_narrowed: bool,
-    selection_dependent: bool,
-) -> bool:
+def job_is_reused(job_id: str, conclusion, fresh: bool) -> bool:
     """Whether one source leg supplies its job: the job is allowlisted
     (never `cargo-audit`), the leg concluded `success` (a skipped or failed
-    leg is never reused), the leg is fresh, and a `selection_dependent` job
-    comes only from a run whose selection was not narrowed."""
+    leg is never reused), and the leg is fresh. The callers decide the
+    selection-dependent jobs themselves, because reading a source run's
+    selection needs the network."""
     if job_id in NEVER_REUSED:
         return False
     if conclusion != "success":
         return False
     if not fresh:
-        return False
-    if selection_dependent and selection_narrowed:
         return False
     return True
 
@@ -153,11 +151,11 @@ def run_source_reasons(
 ) -> list[str]:
     """Why `source` fails the shared run-level rule, one line per guard.
 
-    The rule itself lives in `source_is_eligible`; this names the failed
-    pieces so a refusal says which guard failed. A caller passes the
-    evidence run's `created_at` as the clock so the window reads against
-    the evidence run (one-sided age), and the check drops to the epoch
-    when the source timestamp is unreadable instead of failing open."""
+    This is the run-level rule: it names each failed guard so a refusal says
+    which one failed. A caller passes the clock the window reads against (the
+    evidence run's `created_at`, or the decision moment); the age is one-sided.
+    An unreadable source timestamp is reported as `has no readable created_at`
+    or as older than the window."""
     reasons: list[str] = []
     if (source.get("repository") or {}).get("full_name") != repo or (
         source.get("head_repository") or {}
@@ -169,6 +167,8 @@ def run_source_reasons(
             "which the candidate does not allow for reuse"
         )
     event = source.get("event")
+    if event == "schedule":
+        reasons.append("is a schedule run, which is never reused")
     if event == "push" and run_tier(source, workflow_path) != "main":
         reasons.append("is not a main push")
     if event == "workflow_dispatch" and run_tier(source, workflow_path) != "main":
@@ -192,14 +192,17 @@ def evidence_commit_match(source: dict, sha: str) -> str | None:
     return f"has head SHA {source.get('head_sha')}, expected {sha}"
 
 
-def evidence_tree_match(source: dict, sha: str, tree: str, lookup) -> str | None:
+def evidence_tree_match(
+    source: dict, sha: str, tree: str, lookup, lookup_errors: tuple[type[Exception], ...]
+) -> str | None:
     """Why `source` does not answer a push consumer, or None when the
     source's tree is the evidence tree. A `pull_request` source is matched
-    by its recorded tested tree (checked separately below); any other event
+    by its recorded tested tree (the caller compares it); any other event
     matches by commit or, via `lookup`, by the tree of its head commit. A
-    lookup failure names the cause instead of reading as a mismatch."""
+    lookup failure of a type in `lookup_errors` names the cause instead of
+    reading as a mismatch; any other exception is a bug and propagates."""
     if source.get("event") == "pull_request":
-        return None  # recorded tree checked below
+        return None  # the caller compares the recorded tree
     if source.get("head_sha") == sha:
         return None
     head_sha = source.get("head_sha")
@@ -207,7 +210,7 @@ def evidence_tree_match(source: dict, sha: str, tree: str, lookup) -> str | None
         return "has neither the commit nor the tree"
     try:
         source_tree = lookup(head_sha)
-    except Exception as error:
+    except lookup_errors as error:
         return f"tree lookup failed: {error}"
     if source_tree == tree:
         return None
@@ -220,14 +223,11 @@ def source_is_reused(
     newest: dict,
     evidence_created,
     window: datetime.timedelta,
-    narrowed: bool | None,
-    selection_dependent: bool,
 ) -> str | None:
     """Why the newest leg of `job_id` in `source` is not reused, or None
-    when it is: the leg concluded `success` (never skipped or failed), the
-    leg is fresh against the evidence run's `created_at`, and a
-    `selection_dependent` job comes only from a full (not narrowed)
-    selection. The caller appends the source URL and the evidence URL."""
+    when it is: the leg concluded `success` (never skipped or failed) and is
+    fresh against the evidence run's `created_at`. The caller appends the
+    source URL and the evidence URL."""
     conclusion = newest.get("conclusion")
     if conclusion != "success":
         return f"concluded {conclusion}"
@@ -236,10 +236,8 @@ def source_is_reused(
     completed = parse_moment(newest.get("completed_at"))
     if completed is None or evidence_created - completed > window:
         return "is older than the reuse window"
-    if not job_is_reused(job_id, conclusion, True, bool(narrowed), selection_dependent):
+    if not job_is_reused(job_id, conclusion, True):
         if job_id in NEVER_REUSED:
             return "is never reused"
-        if selection_dependent and narrowed:
-            return "comes from a narrowed selection"
         return "is not eligible for reuse"
     return None

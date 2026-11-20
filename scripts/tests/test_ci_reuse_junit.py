@@ -127,13 +127,21 @@ class ReuseJunitDownloadTests(unittest.TestCase):
             "jobs": jobs,
         }))
 
-    def run_script(self):
+    def run_script(self, retry_attempts="3", retry_backoff="0"):
+        environment = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("CI_RETRY_")
+        }
+        if retry_attempts is not None:
+            environment["CI_RETRY_ATTEMPTS"] = retry_attempts
+        if retry_backoff is not None:
+            environment["CI_RETRY_BACKOFF_SECONDS"] = retry_backoff
         return subprocess.run(
             [sys.executable, str(SCRIPT),
              "--record", str(self.record),
              "--dest", str(self.dest),
              "--repo", REPO],
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=environment,
         )
 
     def test_each_reused_job_comes_from_the_run_its_record_entry_names(self):
@@ -230,6 +238,37 @@ class ReuseJunitDownloadTests(unittest.TestCase):
         listings = [call for call in calls if "/actions/runs/666/artifacts" in " ".join(call)]
         self.assertEqual(len(listings), 3)
 
+    def test_the_retry_bound_is_the_workflow_value(self):
+        self.write_record({
+            "fast-tests": {"run_id": 666, "names": ["tests (core, fast)"]},
+        })
+        self.write_fixture({
+            "fail_listings": {"666": 99},
+            "artifacts": {"666": [{"name": "nextest-junit-core", "id": 11}]},
+            "artifact_zips": {"11": report_zip("from-666")},
+        })
+        result = self.run_script(retry_attempts="2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("giving up after 2 attempts", result.stderr)
+        calls = json.loads(self.fixture.read_text())["calls"]
+        listings = [call for call in calls if "/actions/runs/666/artifacts" in " ".join(call)]
+        self.assertEqual(len(listings), 2)
+
+    def test_a_missing_retry_value_fails_before_any_download(self):
+        self.write_record({
+            "fast-tests": {"run_id": 666, "names": ["tests (core, fast)"]},
+        })
+        self.write_fixture({
+            "artifacts": {"666": [{"name": "nextest-junit-core", "id": 11}]},
+            "artifact_zips": {"11": report_zip("from-666")},
+        })
+        for missing in ({"retry_attempts": None}, {"retry_backoff": None}):
+            with self.subTest(missing=missing):
+                result = self.run_script(**missing)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must be set to a non-negative integer", result.stderr)
+                self.assertNotIn("calls", json.loads(self.fixture.read_text()))
+
     def test_a_missing_record_is_not_an_error(self):
         # Reuse skipped (or the kill switch off): no record, no reports,
         # and the step still succeeds for the run's own download.
@@ -253,7 +292,62 @@ def workflow_jobs():
     }
 
 
+def matrix_values(body, key):
+    """The values `matrix.<key>` takes in a job: the literal list of its
+    matrix line, or the literal fallback list of a dynamic expression."""
+    match = re.search(rf"(?m)^        {key}: (.+)$", body)
+    if match is None:
+        raise AssertionError(f"no matrix {key} in the job")
+    line = match.group(1)
+    literal = re.fullmatch(r"\[(.*)\]", line)
+    if literal is None:
+        literal = re.search(r"'(\[[^']*\])'", line)
+        if literal is None:
+            raise AssertionError(f"matrix {key} has no literal list: {line!r}")
+        return [str(value) for value in json.loads(literal.group(1))]
+    return [item.strip().strip("\"'") for item in literal.group(1).split(",")]
+
+
+def uploaded_junit_names(body):
+    """The JUnit artifact names a job uploads, matrix values expanded."""
+    names = set()
+    for name in re.findall(r"(?m)^          name: (.*junit.*)$", body):
+        keys = re.findall(r"\$\{\{ matrix\.(\w+) \}\}", name)
+        if not keys:
+            names.add(name)
+            continue
+        (key,) = keys
+        for value in matrix_values(body, key):
+            names.add(name.replace("${{ matrix.%s }}" % key, value))
+    return names
+
+
+def load_script(path, name):
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 class ReuseJunitWiringTests(unittest.TestCase):
+    def test_every_junit_artifact_of_a_reusable_job_is_listed_for_download(self):
+        # The download table is a hand copy of what the workflow uploads:
+        # a renamed artifact or a job added to the allowlist must change both.
+        table = load_script(SCRIPT, "ci_reuse_junit_under_test").JOB_JUNIT
+        allowlisted = json.loads((ROOT / "scripts" / "ci-reuse.json").read_text())["jobs"]
+        jobs = workflow_jobs()
+        self.assertEqual(set(table) - set(allowlisted), set(), "a row for a job that is not reusable")
+        for job_id in allowlisted:
+            with self.subTest(job=job_id):
+                self.assertEqual(
+                    uploaded_junit_names(jobs[job_id]),
+                    set(table.get(job_id, ())),
+                )
+
     def test_reused_reports_come_from_the_record_before_the_own_download(self):
         body = workflow_jobs()["test-duplicates"]
         self.assertIn("needs.reuse.outputs.tree", body)

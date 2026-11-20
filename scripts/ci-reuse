@@ -20,12 +20,12 @@ among candidates whose `tested-tree-*` record is exactly the tree, within
 `selection_dependent`, the source selection must be `full`. Then every job
 with a consumer outside `skip` is removed, iterated to a fixed point.
 
-Outputs: `skip`, `source_run` (primary), `source_runs` (all), `tree`.
-The script writes the `ci-reuse-<tree>` record under `$RUNNER_TEMP` and
+Outputs: `skip`, `source_run` (primary), `source_runs` (all); the workflow
+step adds `tree`. The script writes the `ci-reuse-<tree>` record under `$RUNNER_TEMP` and
 appends a summary table. Any API error or ambiguity gives `skip=[]` with a
 warning. Only an internal bug is red.
 
-`--dry-run` prints the decision (and the API query args) without writing the
+`--dry-run` prints the consumer event and the decision without writing the
 record or outputs, for CI proof.
 """
 
@@ -43,6 +43,8 @@ from pathlib import Path
 
 CHECKOUT = Path(__file__).resolve().parents[1]
 CONFIG_IN_TREE = "scripts/ci-reuse.json"
+
+
 def _load_eligibility():
     # Only the module beside this script: a checkout always carries
     # scripts/ci_eligibility.py next to scripts/ci-reuse, and a copy
@@ -63,7 +65,6 @@ eligibility = _load_eligibility()
 
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-TESTED_TREE_ARTIFACT = re.compile(r"^tested-tree-([0-9a-f]{40})$")
 SCHEMA_VERSION = 1
 
 
@@ -173,7 +174,7 @@ def commit_tree(sha: str) -> str:
     return result.stdout.strip()
 
 
-def _run_age(run: dict, completed_at, now: datetime.datetime) -> str:
+def _run_age(completed_at, now: datetime.datetime) -> str:
     """Age of a source leg for the summary, from its `completed_at` against
     the injected `now`, or empty when unknown; always shown, even below one
     hour (the usual case for a merge)."""
@@ -342,8 +343,8 @@ def decide(
     sha: str,
     repo: str,
     consumer_event: str,
-) -> tuple[list[str], dict | None, str, dict[str, str]]:
-    """The skip list, the newest source run, a global reason, per-job reasons.
+) -> tuple[list[str], dict[str, dict], str, dict[str, str]]:
+    """The skip list, the source run of each skipped job, a global reason, per-job reasons.
 
     Per job (issue #2204): the newest leg-complete `success` (not `skipped`)
     among the candidate runs whose `tested-tree-*` record is exactly `tree`.
@@ -364,7 +365,6 @@ def decide(
         key=lambda item: (item.get("run_number", 0), item.get("run_attempt", 1)),
         reverse=True,
     )
-    skip: list[str] = []
     per_run_reasons: dict[str, str] = {}
     selected: dict[str, dict] = {}
     narrowed_by_run: dict[int, bool | None] = {}
@@ -375,12 +375,7 @@ def decide(
             names = artifact_names(repo, run["id"])
         except ReuseError as error:
             return [], {}, f"cannot list artifacts of run {run['id']}: {error}", {}
-        trees = {
-            match.group(1)
-            for name in names
-            if (match := TESTED_TREE_ARTIFACT.fullmatch(name))
-        }
-        if trees != {tree}:
+        if eligibility.recorded_tree_refusal(eligibility.tested_trees(names), tree):
             continue
         try:
             jobs = run_jobs(repo, run["id"])
@@ -406,7 +401,7 @@ def decide(
                 per_run_reasons.setdefault(job_id, "no green leg in the source run")
                 continue
             refusals = [
-                eligibility.source_is_reused(run, job_id, leg, now, max_age, narrowed, False)
+                eligibility.source_is_reused(run, job_id, leg, now, max_age)
                 for leg in legs
             ]
             bad = next((refusal for refusal in refusals if refusal), None)
@@ -440,6 +435,9 @@ def decide(
     # The newest green leg wins per job; the audit job is never allowlisted.
     skip_set = set(selected)
     closure_reasons: dict[str, str] = {}
+    # Closure to a fixed point: a pair member is reused only when its partner
+    # is, and a producer only when every consumer is; both rules only remove
+    # jobs.
     changed = True
     while changed:
         changed = False
@@ -479,7 +477,7 @@ def summarize(
         if job_id in skip and run is not None:
             age = ""
             if leg_completed and now is not None:
-                age = _run_age(run, leg_completed.get(job_id), now)
+                age = _run_age(leg_completed.get(job_id), now)
             link = f"[run {run['id']}]({run.get('html_url')}){age}"
             lines.append(f"| {job_id} | reused from {link} |")
         elif job_reasons and job_id in job_reasons:
@@ -520,7 +518,6 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
     workflow_file = os.environ["WORKFLOW_FILE"]
     moment = now or datetime.datetime.now(datetime.timezone.utc)
     max_age = datetime.timedelta(hours=config["max_age_hours"])
-    reason = ""
     listed = True
     try:
         runs = list_runs(repo, workflow_file, moment, max_age)
@@ -598,6 +595,9 @@ def main(now: datetime.datetime | None = None, argv: list[str] | None = None) ->
                 entries = []
                 for name in job["names"]:
                     attempts = by_name.get(name, [])
+                    # `decide` skips only jobs it found green in this run's
+                    # listing, so a missing name means the listing changed
+                    # under it: run everything.
                     if not attempts:
                         warn(f"source run {run['id']} no longer lists {name}; running everything")
                         failed = True

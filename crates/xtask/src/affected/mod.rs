@@ -668,11 +668,19 @@ pub(crate) const CI_RULES: &[(Pattern, &str)] = &[
     ),
     (
         Pattern::File("scripts/ci-reuse"),
-        "decides the delta-dispatch reuse of the CI test jobs",
+        "decides the push and delta-dispatch reuse of the CI test jobs",
     ),
     (
         Pattern::File("scripts/ci-reuse.json"),
-        "allowlist of the delta-dispatch reuse of the CI test jobs",
+        "allowlist of the push and delta-dispatch reuse of the CI test jobs",
+    ),
+    (
+        Pattern::File("scripts/ci_eligibility.py"),
+        "eligibility rule shared by the push and delta-dispatch reuse gates",
+    ),
+    (
+        Pattern::File("scripts/ci-reuse-junit"),
+        "downloads the JUnit reports of the reused CI test jobs",
     ),
 ];
 

@@ -275,7 +275,8 @@ impl SessionRegistry {
     /// Ends the supervised job of a worker that did not answer a stop, once
     /// the recorded identity is proven the job's.
     ///
-    /// The caller holds the stop intent. Nothing is retired unless the journal
+    /// The caller holds the stop's intent (`Stopped`, or `Removed` for the
+    /// rollback of a refused create). Nothing is retired unless the journal
     /// of the recorded generation names the recorded worker and the job is
     /// that worker's ([`Self::prove_conflicted_runtime`]); a refusal, a changed
     /// runtime or a failed release is returned with the stop cleared, and a
@@ -305,7 +306,7 @@ impl SessionRegistry {
                     .rollback_stop_intent(
                         id,
                         committed.previous_desired_state,
-                        DesiredState::Stopped,
+                        committed.intent.desired_state,
                         transaction_id,
                         stop_runtime,
                     )
