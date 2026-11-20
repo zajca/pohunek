@@ -874,8 +874,10 @@ repeating the command; the CLI never retries an install on its own.
   and `pohunek plugin inspect --json` tells it apart from an official package:
   `explicit_digest` or `link` for a local install, `official` only for a
   package the signed catalog or the signed official index authorized. A
-  local package never serves `shell`, `codex`, `claude` or `hermes`, nor a
-  runtime id a recorded verified index reserved.
+  local install is refused a runtime id a recorded verified index reserves.
+  A local package installed before that reservation keeps serving, and
+  `pohunek doctor` warns with `runtime_id_reserved_by_official`. Serving
+  refuses only the four compiled ids `shell`, `codex`, `claude` and `hermes`.
 - `--catalog <file>` authorizes an official package through the signed catalog,
   verified against the trust anchor file shipped beside the daemon (see the
   [runtime catalog](../concepts/runtime-catalog.md#trust-anchor-file)). A host
