@@ -640,9 +640,10 @@ impl Detector {
         // Output that changes no screen text restates the visible screen: a
         // dialog that still wins it is no process evidence. Weak blockers and a
         // title blocker alone stay with the byte fallback, because loose text
-        // and a cached title can outlive the state they described. A title
-        // blocker that outranks a screen dialog is kept (it is the winner
-        // `tick` observes) only while the screen alone still names a dialog.
+        // and a cached title can outlive the state they described. A title or
+        // progress blocker that outranks a screen dialog is kept (it is the
+        // winner `tick` observes) only while the screen alone still names a
+        // dialog.
         let hit = hit.or_else(|| {
             if !has_process_activity || freshness.screen {
                 return None;

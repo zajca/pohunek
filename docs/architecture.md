@@ -1293,9 +1293,10 @@ the screen rules stay the fallback.
   not fire under it. With no record held, the fallback also does not fire for a
   chunk that changes no screen text while a `visible_blocker` screen rule wins
   the whole screen; weak blockers and a title-sourced blocker alone keep the
-  fallback. A title blocker that outranks such a dialog (Codex "Action
-  Required" over its approval prompt) holds `blocked` with source `osc_title`
-  as long as the screen alone still names a `visible_blocker` dialog.
+  fallback. A `visible_blocker` title or progress blocker that outranks such a
+  dialog (Codex "Action Required" over its approval prompt) holds `blocked`
+  with source `osc_title` or `osc_progress` as long as the screen alone still
+  names a `visible_blocker` dialog.
 - **Staleness.** A manifest may declare `[program_status] stale_after_ms`. A
   held record that disagrees with the screen winner for at least that long
   (a `blocked` record over an idle or working screen with no dialog, a

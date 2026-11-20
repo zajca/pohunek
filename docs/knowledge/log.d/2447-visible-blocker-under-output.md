@@ -14,12 +14,12 @@
   it is a screen-sourced `visible_blocker` `blocked`; `tick` runs the same
   evaluation, so live detection agrees with `detect-check` replay. Weak
   blockers (rules without `visible_blocker`), a title-sourced blocker alone
-  and every other state keep the byte fallback. A `visible_blocker` title
-  winner that outranks a screen dialog (Codex "Action Required" over its
-  approval prompt, below the authority gate) is kept as the held reading when
-  the screen alone, evaluated without titles and progress, still yields a
-  `visible_blocker` dialog; the published source is then `osc_title`. A screen-only dialog still carries no
-  `blocked_kind`.
+  and every other state keep the byte fallback. A `visible_blocker` title or
+  progress winner that outranks a screen dialog (Codex "Action Required" over
+  its approval prompt, below the authority gate) is kept as the held reading
+  when the screen alone, evaluated without titles and progress, still yields a
+  `visible_blocker` dialog; the published source is then `osc_title` or
+  `osc_progress`. A screen-only dialog still carries no `blocked_kind`.
 - No protocol, store, package-format or SDK change; older cores keep the gap.
   See "Agent state detection" in `docs/architecture.md` and the
   `visible_blocker` paragraph of `docs/knowledge/guides/runtime-packages.md`.
