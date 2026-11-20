@@ -744,6 +744,183 @@ fn kit_smoke_refuses_a_failing_script() {
 }
 
 #[test]
+fn kit_smoke_reports_the_effective_script_timeout() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-timeout.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    for (args, expected) in [(vec![], 60_u64), (vec!["--script-timeout", "120"], 120_u64)] {
+        let mut argv = vec![
+            "smoke".to_owned(),
+            "--dir".to_owned(),
+            s(&fixture_dir()).to_owned(),
+            "--release-dir".to_owned(),
+            s(&release).to_owned(),
+            "--script".to_owned(),
+            s(&script).to_owned(),
+            "--json".to_owned(),
+        ];
+        argv.extend(args.iter().map(ToString::to_string));
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = kit.kit(&refs);
+        assert!(
+            output.status.success(),
+            "smoke with a script failed: {}",
+            stderr_of(&output)
+        );
+        let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+        assert_eq!(
+            document["script_timeout_s"],
+            serde_json::json!(expected),
+            "the report carries the effective script bound"
+        );
+        used_root(&document, &kit);
+    }
+}
+
+#[test]
+fn kit_smoke_passes_when_a_slow_script_gets_its_bound() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let gate = kit.path("gate.txt");
+    let script = kit.path("smoke-slow.sh");
+    // The script waits on a file the test creates, not on a sleep: the
+    // wait is bounded by the script timeout below, the creator poll by
+    // HANG_GUARD.
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nset -eu\nfor _ in $(seq 1 100); do\n  [ -f \"{}\" ] && exit 0\n  sleep 0.1\ndone\nexit 1\n",
+            gate.display()
+        ),
+    )
+    .expect("write the slow script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    fs::write(&gate, "open").expect("open the gate");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--script-timeout",
+        "10",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "smoke with a raised script bound failed: {}",
+        stderr_of(&output)
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
+    assert_eq!(
+        document["script_timeout_s"],
+        serde_json::json!(10_u64),
+        "the report carries the raised script bound"
+    );
+    used_root(&document, &kit);
+}
+
+#[test]
+fn kit_smoke_fails_when_the_script_outlives_its_bound() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-hang.sh");
+    fs::write(&script, "#!/bin/sh\nexec sleep 300\n").expect("write the hanging script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script",
+        s(&script),
+        "--script-timeout",
+        "1",
+    ]);
+    assert!(
+        !output.status.success(),
+        "a script past its bound must fail the smoke"
+    );
+    assert!(
+        stderr_of(&output).contains(&format!(
+            "smoke script {} did not exit within 1 s",
+            script.display()
+        )),
+        "the timeout error names the script and the bound: {}",
+        stderr_of(&output)
+    );
+    named_root(&output);
+}
+
+#[test]
+fn kit_smoke_refuses_a_script_timeout_outside_its_range() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let kit = Kit::new();
+    let release = release_dir();
+    let script = kit.path("smoke-range.sh");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod the script");
+    for bound in ["0", "901"] {
+        let output = kit.kit(&[
+            "smoke",
+            "--dir",
+            s(&fixture_dir()),
+            "--release-dir",
+            s(&release),
+            "--script",
+            s(&script),
+            "--script-timeout",
+            bound,
+        ]);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "rc is 2 for --script-timeout {bound}: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains("--script-timeout must be 1..=900 seconds"),
+            "the refusal names the range: {}",
+            stderr_of(&output)
+        );
+    }
+}
+
+#[test]
+fn kit_smoke_refuses_a_script_timeout_without_a_script() {
+    let kit = Kit::new();
+    let release = release_dir();
+    let output = kit.kit(&[
+        "smoke",
+        "--dir",
+        s(&fixture_dir()),
+        "--release-dir",
+        s(&release),
+        "--script-timeout",
+        "120",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "rc is 2: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("--script-timeout needs --script"),
+        "the refusal names the missing script: {}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
 fn kit_prove_passes_on_fixture() {
     let kit = Kit::new();
     let release = release_dir();

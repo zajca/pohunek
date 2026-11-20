@@ -74,6 +74,7 @@ class PluginCiWorkflowTests(unittest.TestCase):
             "corpus-dir:",
             "upstream-install:",
             "smoke-script:",
+            "smoke-script-timeout:",
         ):
             self.assertIn(name, header)
         self.assertIn("required: true", header)
@@ -137,10 +138,22 @@ class PluginCiWorkflowTests(unittest.TestCase):
         smoke = self.text.partition("Smoke the package and the smoke script")[2]
         self.assertIn("--script", smoke)
         self.assertIn('SMOKE_SCRIPT', smoke)
+        self.assertIn("--script-timeout", smoke)
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT', smoke)
         self.assertIn("working-directory: plugin", smoke)
         header = self.text.partition("\njobs:\n")[0]
         self.assertIn('POHUNEK_SMOKE_SESSION', header)
         self.assertNotIn("POHUNEK_SOCKET", smoke)
+
+    def test_the_script_timeout_is_an_optional_bounded_integer(self):
+        header = self.text.partition("\njobs:\n")[0]
+        self.assertIn("smoke-script-timeout:", header)
+        self.assertIn("1..=900", header)
+        setup = self.text.partition("Set up the package inputs")[2].partition("Refuse runtime-only")[0]
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT', setup)
+        self.assertIn('SMOKE_SCRIPT_TIMEOUT must be an integer 1..=900', setup)
+        smoke = self.text.partition("Smoke the package and the smoke script")[2].partition("Check the version bump")[0]
+        self.assertIn('args+=(--script-timeout "$SMOKE_SCRIPT_TIMEOUT")', smoke)
 
     def test_the_platform_maps_to_a_runner(self):
         self.assertIn("matrix.platform == 'aarch64-apple-darwin'", self.text)

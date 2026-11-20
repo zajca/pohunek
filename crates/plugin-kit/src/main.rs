@@ -103,6 +103,11 @@ enum Command {
         /// both go to the kit's stderr.
         #[arg(long)]
         script: Option<PathBuf>,
+        /// Bound for the smoke script in whole seconds; absent keeps the
+        /// 60 s default. Valid range 1..=900, so a long plugin E2E still
+        /// fits the smoke job's `timeout-minutes: 30` bound with setup.
+        #[arg(long)]
+        script_timeout: Option<u64>,
         /// Print the report as a single JSON document.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -202,6 +207,7 @@ fn dispatch(command: Command) -> Result<(), Error> {
             release_dir,
             upstream,
             script,
+            script_timeout,
             json,
         } => {
             let report = smoke::smoke(&smoke::SmokeArgs {
@@ -209,6 +215,7 @@ fn dispatch(command: Command) -> Result<(), Error> {
                 release_dir,
                 upstream,
                 script,
+                script_timeout_secs: script_timeout,
             })?;
             emit(json, &report.line(), &report)
         }

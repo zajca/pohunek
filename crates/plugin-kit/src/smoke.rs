@@ -43,6 +43,10 @@ pub struct SmokeArgs {
     /// run once inside the live isolated root after the generic smoke
     /// checks pass.
     pub script: Option<PathBuf>,
+    /// Bound for the smoke script in whole seconds; `None` keeps
+    /// [`SCRIPT_TIMEOUT_DEFAULT`](crate::isolated::SCRIPT_TIMEOUT_DEFAULT).
+    /// Validated to `1..=900` in [`smoke`] before the rig starts.
+    pub script_timeout_secs: Option<u64>,
 }
 
 /// What a passing smoke reports.
@@ -60,6 +64,11 @@ pub struct SmokeReport {
     /// package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screen_lines: Option<usize>,
+    /// Effective smoke-script bound in whole seconds; present on every
+    /// runtime smoke run that had a script (the default when the caller
+    /// passed no `--script-timeout`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script_timeout_s: Option<u64>,
     /// Commands a commands-only package exports, each run once and exited 0;
     /// empty for a runtime package.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -116,10 +125,28 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
     let verified = package::read_archive(&bytes, &Limits::DEFAULT).map_err(Error::Package)?;
     let (package_id, version) = archive_package(&verified, &args.dir)?;
     let commands = commands_only_exports(&verified, &args.dir)?;
-    if commands.is_some() && (args.upstream.is_some() || args.script.is_some()) {
+    if commands.is_some()
+        && (args.upstream.is_some() || args.script.is_some() || args.script_timeout_secs.is_some())
+    {
         return Err(refuse(
-            "a commands-only package serves no runtime: --upstream and --script apply to a runtime package only",
+            "a commands-only package serves no runtime: --upstream, --script and --script-timeout apply to a runtime package only",
         ));
+    }
+    if let Some(seconds) = args.script_timeout_secs {
+        let (min, max) = (
+            crate::isolated::SCRIPT_TIMEOUT_MIN.as_secs(),
+            crate::isolated::SCRIPT_TIMEOUT_MAX.as_secs(),
+        );
+        if seconds < min || seconds > max {
+            return Err(refuse(format!(
+                "--script-timeout must be {min}..={max} seconds: {seconds}"
+            )));
+        }
+        if args.script.is_none() {
+            return Err(refuse(
+                "--script-timeout needs --script: no smoke script runs without one",
+            ));
+        }
     }
     let identity = match commands {
         Some(_) => None,
@@ -128,12 +155,17 @@ pub fn smoke(args: &SmokeArgs) -> Result<SmokeReport, Error> {
 
     let root = Root::create().map_err(Error::Usage)?;
     let path = root.path().to_path_buf();
+    let timeout = Duration::from_secs(
+        args.script_timeout_secs
+            .unwrap_or(crate::isolated::SCRIPT_TIMEOUT_DEFAULT.as_secs()),
+    );
     let outcome = match (&identity, &commands) {
         (Some(identity), _) => smoke_in(
             &root,
             &args.release_dir,
             args.upstream.as_deref(),
             args.script.as_deref(),
+            timeout,
             &bytes,
             identity,
             &version,
@@ -193,11 +225,13 @@ fn commands_only_exports(
 /// Steps on an existing root: trust, host, install, start, detect, screen,
 /// then stop and remove the session. Every step runs through the isolated
 /// `pohunek` CLI, so the smoke exercises the same surface an owner uses.
+#[expect(clippy::too_many_arguments, reason = "the smoke plumbing threads one bound alongside the existing paths")]
 fn smoke_in(
     root: &Root,
     release_dir: &Path,
     upstream: Option<&Path>,
     script: Option<&Path>,
+    script_timeout: Duration,
     archive: &[u8],
     identity: &crate::archive::Identity,
     version: &protocol::PackageVersion,
@@ -241,7 +275,14 @@ fn smoke_in(
     }
     host.launch_local_only(root).map_err(Error::Usage)?;
 
-    let smoke = smoke_session(&mut host, &identity.runtime_id, archive, &digest, script);
+    let smoke = smoke_session(
+        &mut host,
+        &identity.runtime_id,
+        archive,
+        &digest,
+        script,
+        script_timeout,
+    );
     let stop = host.stop().map_err(Error::Usage);
     let (activity, screen_lines) = smoke?;
     stop?;
@@ -250,6 +291,7 @@ fn smoke_in(
         version: version.clone(),
         activity: Some(activity),
         screen_lines: Some(screen_lines),
+        script_timeout_s: script.map(|_| script_timeout.as_secs()),
         commands: Vec::new(),
         root: root.path().to_path_buf(),
     })
@@ -295,6 +337,7 @@ fn smoke_commands_in(
         version: version.clone(),
         activity: None,
         screen_lines: None,
+        script_timeout_s: None,
         commands: commands.to_vec(),
         root: root.path().to_path_buf(),
     })
@@ -374,6 +417,7 @@ fn smoke_session(
     archive: &[u8],
     digest: &package::PackageDigest,
     script: Option<&Path>,
+    script_timeout: Duration,
 ) -> Result<(AgentActivity, usize), Error> {
     use std::os::unix::fs::PermissionsExt as _;
     let directory = host.root().join("archives");
@@ -425,7 +469,7 @@ fn smoke_session(
     // The script runs only after every generic smoke check passed: a
     // failed wait never starts it, and teardown still happens below.
     let scripted = match (&wait, script) {
-        (Ok(_), Some(script)) => Some(run_script(host, script, &session)),
+        (Ok(_), Some(script)) => Some(run_script(host, script, &session, script_timeout)),
         _ => None,
     };
     let cleanup = stop_session(host, &session);
@@ -449,8 +493,15 @@ fn smoke_session(
 /// the kit's stderr unchanged, so `--json` stdout stays one JSON document.
 /// A non-zero script exit fails the smoke with an error naming the script
 /// and the exit code.
-fn run_script(host: &mut Host, script: &Path, session: &str) -> Result<(), Error> {
-    let status = host.run_script(script, session).map_err(Error::Usage)?;
+fn run_script(
+    host: &mut Host,
+    script: &Path,
+    session: &str,
+    script_timeout: Duration,
+) -> Result<(), Error> {
+    let status = host
+        .run_script(script, session, script_timeout)
+        .map_err(Error::Usage)?;
     if status.success() {
         return Ok(());
     }

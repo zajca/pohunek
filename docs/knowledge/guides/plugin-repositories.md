@@ -87,6 +87,7 @@ It calls the reusable
 | `corpus-dir` (default empty) | The detection corpus directory, a path below the repository root holding `cases.toml`; empty skips `detect-check`. |
 | `upstream-install` (default empty) | A script, a path below the repository root, that installs the locked upstream into `$UPSTREAM_BIN` (an absolute directory the workflow creates and exports); the script must leave the directory existing and non-empty; empty skips the upstream install the smoke puts on `PATH`. |
 | `smoke-script` (default empty) | An executable, a path below the repository root, run once by the generic smoke after every generic check passed, inside the same live isolated root: bare `pohunek` reaches the isolated daemon through the isolated `XDG_RUNTIME_DIR` (the isolated prefix is first on the script's `PATH`), the live session id is under `POHUNEK_SMOKE_SESSION` (`POHUNEK_SOCKET_PATH` is exported only as information for hook-style clients), the isolated environment, the repository root as cwd (the smoke step runs with the plugin repository as its working directory); a non-zero exit fails the smoke; empty skips it. |
+| `smoke-script-timeout` (default empty) | The smoke-script bound in whole seconds, passed as `--script-timeout` when set: integer `1..=900`, absent keeps the kit default of 60 s. At most 900 s so the bound still fits the smoke job's `timeout-minutes: 30` with setup headroom. Refused for a context or commands-only package like `smoke-script`. |
 
 Every row and target runs one job with `contents: read`, no secret and no
 cache restore (Linux on `ubuntu-24.04`, macOS on the pinned `macos-15` label):
@@ -213,7 +214,7 @@ index write, and 2 for every other refusal:
   corpus through the detector: `cases.toml` holds `[[case]]` tables with a
   `screen` file under `screens/`, a `width`, and the expected `working`,
   `blocked`, `idle` or `unknown` activity.
-- `smoke --release-dir <dir> [--upstream <path>] [--script <path>]`
+- `smoke --release-dir <dir> [--upstream <path>] [--script <path>] [--script-timeout <seconds>]`
   installs the built package on an isolated daemon through a throwaway
   index, starts it, waits for detection past `unknown`, and requires a
   non-empty screen; then it stops and removes the session. The generic
@@ -223,7 +224,7 @@ index write, and 2 for every other refusal:
   `pohunek host command run local`, requires exit 0 from each, and reports
   `plugin smoke ok: <package_id> <version> commands <n> commands run`
   (`--json` carries `commands` instead of `activity` and `screen_lines`);
-  `--upstream` and `--script` are refused for it. `--upstream` puts
+  `--upstream`, `--script` and `--script-timeout` are refused for it. `--upstream` puts
   a directory (or the directory of an executable) in front of the isolated
   daemon's `PATH`, so the runtime program resolves to the locked upstream
   install there. `--script` runs a plugin-owned executable once after every
@@ -236,7 +237,11 @@ index write, and 2 for every other refusal:
   document. The script runs in the kit's own cwd (the plugin repository the
   caller starts the kit in), its process group is killed after it exits on
   every path, and a non-zero exit fails the smoke naming the script and the
-  exit code.
+  exit code. `--script-timeout` bounds the script in whole seconds
+  (`1..=900`, absent keeps the 60 s default); a script that outlives its
+  bound fails the smoke with an error naming the script and the bound, and
+  the passing `--json` report carries the effective bound as
+  `script_timeout_s`.
 - `prove --release-dir <dir> --evidence <file> [--no-enable]` runs the same
   install path as `xtask plugin prove` from the package directory and writes
   the verdict as evidence JSON, plus the kit digest (`kit_sha256`); with
