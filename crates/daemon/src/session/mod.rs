@@ -218,7 +218,7 @@ pub use resume::ProfileChange;
 use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
-pub use tmpdir::store_session_tmp_root;
+pub use tmpdir::{session_tmp_base_problem, store_session_tmp_root};
 pub(crate) use turn_events::{TurnEdge, TurnEvents, TurnId, TurnOwner, TurnVerdict};
 
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
@@ -555,10 +555,12 @@ pub struct SessionRegistryConfig {
     /// repo+branch fails (no silent default).
     pub worktree_root: Option<PathBuf>,
     /// Root of the sessions' private temporary directories
-    /// (`<cache_dir>/session-tmp/<store key>`, see
+    /// (`<namespace.session_tmp_root>/<store key>`, see
     /// [`store_session_tmp_root`]); each launch exports its session's
-    /// directory below it as `TMPDIR`. `None` launches sessions with the
-    /// `TMPDIR` of their profile or of the forwarded daemon environment.
+    /// directory below it as `TMPDIR`. The configured root above the store
+    /// key must exist: the registry never creates it. `None` launches sessions
+    /// with the `TMPDIR` of their profile or of the forwarded daemon
+    /// environment.
     pub session_tmp_root: Option<PathBuf>,
     /// Wall-clock bound on each worktree/session lifecycle hook. A hook that
     /// exceeds it is terminated and recorded/logged as a non-fatal hook warning,
@@ -2648,12 +2650,13 @@ impl SessionRegistry {
             return Ok((Vec::new(), WorktreeCleanup::default()));
         };
         let session_id = id.0.clone();
+        let search_path = self.search_path_snapshot();
         self.store_for_write()?;
         self.inner
             .background
             .spawn_blocking("cleanup_session_worktrees", move || {
                 let mut warnings = Vec::new();
-                let cleanup = worktree.cleanup_session(&session_id, &mut warnings)?;
+                let cleanup = worktree.cleanup_session(&session_id, &search_path, &mut warnings)?;
                 Ok((warnings, cleanup))
             })
             .await
@@ -3618,6 +3621,7 @@ impl SessionRegistry {
             Vec::new()
         };
         let reference = reference.to_owned();
+        let search_path = self.search_path_snapshot();
         self.store_for_write()?;
         self.inner
             .background
@@ -3638,6 +3642,7 @@ impl SessionRegistry {
                                 let prune = manager.cleanup_project(
                                     &record.id(),
                                     &skip,
+                                    &search_path,
                                     &mut hook_warnings,
                                 )?;
                                 for warning in &hook_warnings {
@@ -3726,6 +3731,7 @@ impl SessionRegistry {
             return Err(ProtocolError::worktree_in_use());
         }
         let path = path.to_owned();
+        let search_path = self.search_path_snapshot();
         self.store_for_write()?;
         self.inner
             .background
@@ -3733,7 +3739,7 @@ impl SessionRegistry {
                 "remove_worktree",
                 move || -> Result<WorktreeRemoveResult, ProtocolError> {
                     let mut warnings = Vec::new();
-                    let removed = manager.remove_one(&path, &mut warnings)?;
+                    let removed = manager.remove_one(&path, &search_path, &mut warnings)?;
                     if !removed {
                         return Err(runtime_error(
                             "worktree_not_owned",
@@ -3867,15 +3873,16 @@ impl SessionRegistry {
         &self,
         resolved: &ResolvedAgent,
         profile_env: &[(String, String)],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
         // A runtime without a version probe resolves the same way so a
         // missing program fails before the target is bound; its environment
         // only matters when a probe runs, so floors still fail closed
         // without a probed release: a runtime that reports no version cannot
         // meet any `min_runtime`.
-        let base = self.launch_base_environment()?;
+        let base = self.launch_base_environment(search_path)?;
         let environment =
-            host::ProbeEnvironment::for_launch(&base, profile_env, self.search_path().as_deref());
+            host::ProbeEnvironment::for_launch(&base, profile_env, search_path.as_os_str());
         let program =
             host::validate_launch_runtime(&resolved.definition, resolved.spawn(), &environment)?;
         resolved.check_option_floors(program.as_ref().and_then(ValidatedLaunchProgram::version))?;
@@ -3888,13 +3895,18 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// As [`Self::create`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered create: validate, claim, resolve, probe, then the detached transaction on one search path snapshot"
+    )]
     pub async fn create_outcome_spawned_by(
         &self,
         mut params: SessionNewParams,
         spawned_by: Option<protocol::SpawnedBy>,
     ) -> Result<CreateOutcome, ProtocolError> {
-        // The create resolves and launches on the `PATH` the manager holds now.
-        self.refreshed_search_path().await;
+        // The create resolves and launches on the `PATH` the manager holds now,
+        // and every step of it runs on this one snapshot.
+        let search_path = self.refreshed_search_path().await;
         // Taken before the secret values are removed, so the fingerprint covers
         // the slot names and never a value.
         let fingerprint = create_request::request_fingerprint(&params)?;
@@ -3931,7 +3943,8 @@ impl SessionRegistry {
             .profile
             .as_ref()
             .map_or(&[][..], |profile| profile.env.as_slice());
-        let validated_program = self.validated_create_program(&resolved, profile_env)?;
+        let validated_program =
+            self.validated_create_program(&resolved, profile_env, &search_path)?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's
         // own cwd for a local session, else the daemon's. A resolved project
         // overrides this with its checkout (or worktree) path.
@@ -3956,6 +3969,7 @@ impl SessionRegistry {
                 &id,
                 LaunchKind::Create,
                 &resolved.snapshot_args(),
+                &search_path,
             )?;
             if let Some((slot, _)) = secret_env
                 .iter()
@@ -3989,6 +4003,7 @@ impl SessionRegistry {
                     secret_env,
                     spawned_by,
                     create_request,
+                    &search_path,
                 ))
                 .await?;
             let (session, prompt_delivered) = registry
@@ -3997,6 +4012,7 @@ impl SessionRegistry {
                     pending_initial_input,
                     extended_input_ready_wait,
                     input_ack_timeout,
+                    search_path,
                 )
                 .await
                 .map_err(|err| note_kept_backup(err, branch.as_deref(), source.as_ref()))?;
@@ -4044,12 +4060,15 @@ impl SessionRegistry {
         pending_initial_input: Option<String>,
         extended_input_ready_wait: bool,
         input_ack_timeout_ms: Option<u32>,
+        search_path: crate::runtime::SearchPath,
     ) -> Result<(SessionInfo, Option<bool>), ProtocolError> {
         // A reference assigned at launch makes the session resumable at once.
         if info.native_session_id.is_some() {
             self.persist_resume_binding(&info.id).await;
         }
-        self.spawn_session_hook(SessionHookRequest::of(HookEvent::SessionStart, &info));
+        self.spawn_session_hook(
+            SessionHookRequest::of(HookEvent::SessionStart, &info).on(search_path),
+        );
         // An empty initial prompt is a no-op (like no prompt): there is
         // nothing to defer, so a blocked dialog rolls back instead of being
         // kept with an empty deferred prompt.
@@ -4840,6 +4859,7 @@ impl SessionRegistry {
         secret_env: LaunchEnv,
         spawned_by: Option<protocol::SpawnedBy>,
         create_request: Option<Box<CreateRequest>>,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<
         (
             SessionInfo,
@@ -4871,7 +4891,10 @@ impl SessionRegistry {
         let mut hook_stderr_tails = Vec::new();
         let mut worktree_source = None;
         let mut fetched_ref = None;
-        let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
+        let prepared = match self
+            .resolve_target(&id, &params, fallback_cwd, search_path)
+            .await
+        {
             Ok(mut target) => {
                 hook_stderr_tails = std::mem::take(&mut target.hook_stderr_tails);
                 worktree_source = target.worktree_source.take();
@@ -4879,7 +4902,7 @@ impl SessionRegistry {
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
                 if let Err(error) = self
-                    .check_store_relocation(&resolved, &target.launch_cwd)
+                    .check_store_relocation(&resolved, &target.launch_cwd, search_path)
                     .await
                 {
                     Err(error)
@@ -4889,6 +4912,7 @@ impl SessionRegistry {
                         self.outdated_integration_warning(
                             RuntimeRef::from(resolved.base.clone()),
                             profile,
+                            search_path,
                         )
                         .await,
                     );
@@ -4897,6 +4921,7 @@ impl SessionRegistry {
                             &resolved.definition,
                             &target.launch_cwd,
                             target.project_id.as_deref(),
+                            search_path,
                         )
                         .await;
                     self.create_spec(
@@ -4910,6 +4935,7 @@ impl SessionRegistry {
                         spawned_by,
                         create_request,
                         &trusted_args,
+                        search_path,
                     )
                     .await
                 }
@@ -4950,13 +4976,14 @@ impl SessionRegistry {
         &self,
         binding: &ResumeBinding,
         relaunch: &resume::RelaunchPlan,
+        search_path: &crate::runtime::SearchPath,
     ) -> Vec<SessionWarning> {
         let profile = relaunch
             .profile
             .revision
             .is_some()
             .then(|| binding.agent.clone());
-        self.outdated_integration_warning(binding.agent_base.clone(), profile)
+        self.outdated_integration_warning(binding.agent_base.clone(), profile, search_path)
             .await
             .into_iter()
             .collect()
@@ -4972,8 +4999,9 @@ impl SessionRegistry {
         &self,
         agent: RuntimeRef,
         profile: Option<String>,
+        search_path: &crate::runtime::SearchPath,
     ) -> Option<SessionWarning> {
-        let homes = match self.integration_homes() {
+        let homes = match self.integration_homes(search_path) {
             Ok(homes) => homes,
             Err(error) => {
                 debug!(
@@ -5303,6 +5331,7 @@ impl SessionRegistry {
         &self,
         resolved: &ResolvedAgent,
         cwd: &std::path::Path,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<(), ProtocolError> {
         let Some(native) = resolved.native_launch() else {
             return Ok(());
@@ -5314,7 +5343,7 @@ impl SessionRegistry {
                 None => return Ok(()),
             },
         };
-        let base_environment = self.launch_base_environment()?;
+        let base_environment = self.launch_base_environment(search_path)?;
         let profile_env = resolved
             .profile
             .as_ref()
@@ -5378,6 +5407,7 @@ impl SessionRegistry {
         spawned_by: Option<protocol::SpawnedBy>,
         create_request: Option<Box<CreateRequest>>,
         trusted_args: &[String],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
         let reference_launch = target.reference_launch();
         let TargetResolution {
@@ -5450,6 +5480,7 @@ impl SessionRegistry {
                 frozen_args: &snapshot.args,
                 name: name.as_deref(),
                 trusted_args,
+                search_path,
             },
         )?;
         // A slot never replaces a variable an earlier layer (descriptor,
@@ -5463,8 +5494,9 @@ impl SessionRegistry {
         let mut env_extra = inputs.env;
         env_extra.append(secret_env);
         if params.skip_repo_hooks {
-            let base = self.launch_base_environment()?;
-            launch_input::pin_git_hooks_off(&base, &mut env_extra, &launch_cwd).await?;
+            let base = self.launch_base_environment(search_path)?;
+            launch_input::pin_git_hooks_off(&base, &mut env_extra, &launch_cwd, search_path)
+                .await?;
         }
         let opts = LaunchOpts {
             cwd: launch_cwd.clone(),
@@ -5472,7 +5504,7 @@ impl SessionRegistry {
             rows: params.rows,
             env_extra,
             validated_program,
-            search_path: self.search_path(),
+            search_path: search_path.to_os_string(),
             worker_file: inputs.worker_file,
         };
         let plan = build_launch_command(
@@ -5516,6 +5548,7 @@ impl SessionRegistry {
             initial_input_pending: plan.pending_initial_input.is_some(),
             prompt_in_argv: plan.prompt_in_argv,
             package_authority: None,
+            search_path: search_path.clone(),
         };
         Ok((spec, plan.pending_initial_input))
     }
@@ -6985,11 +7018,12 @@ impl SessionRegistry {
             .await
             .get(id)
             .is_some_and(|entry| entry.reference_launch.is_some());
+        let search_path = self.search_path_snapshot();
         match tokio::task::spawn_blocking(move || {
-            let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref())?;
+            let resolved = resolve_cwd_association(cwd.as_path(), store.as_deref(), &search_path)?;
             let outside = marked
                 && resolved == CwdAssociation::default()
-                && crate::project::detect::confirmed_outside_repository(&cwd);
+                && crate::project::detect::confirmed_outside_repository(&cwd, &search_path);
             Ok::<_, ProtocolError>((resolved, outside))
         })
         .await
@@ -9122,8 +9156,9 @@ impl SessionRegistry {
             }
         }
         let store = self.inner.store.clone();
+        let search_path = self.search_path_snapshot();
         match tokio::task::spawn_blocking(move || {
-            resolve_cwd_association(cwd.as_path(), store.as_deref())
+            resolve_cwd_association(cwd.as_path(), store.as_deref(), &search_path)
         })
         .await
         {
@@ -9543,13 +9578,14 @@ fn external_session_info(
 fn resolve_cwd_association(
     cwd: &Path,
     store: Option<&Store>,
+    search_path: &crate::runtime::SearchPath,
 ) -> Result<CwdAssociation, ProtocolError> {
     let canonical_cwd = canonical_or_original(cwd);
     let worktree = match store {
         Some(store) => active_worktree_for_cwd(store, &canonical_cwd)?,
         None => None,
     };
-    let detected = detect_at(cwd)?;
+    let detected = detect_at(cwd, search_path)?;
     let mut association = match detected {
         Some(detected) => association_from_detected_project(&detected),
         None => CwdAssociation::default(),

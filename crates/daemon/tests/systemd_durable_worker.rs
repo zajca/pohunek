@@ -927,6 +927,13 @@ impl Fixture {
                 .create(&path)
                 .expect("create private application directory");
         }
+        // The installer creates the session temporary root; the daemon never does.
+        let session_tmp_root = root.join("cache").join("pohunek").join("session-tmp");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&session_tmp_root)
+            .expect("create the session temporary root");
         let state_root =
             std::fs::canonicalize(state_home.join("pohunek")).expect("canonical state root");
         let runtime_root =
@@ -940,6 +947,7 @@ impl Fixture {
             uid: nix::unistd::Uid::effective().as_raw(),
             state_root,
             runtime_root,
+            session_tmp_root,
             deadlines: Deadlines {
                 worker_connect: WORKER_CONNECT,
                 worker_initialize: WORKER_INITIALIZE,

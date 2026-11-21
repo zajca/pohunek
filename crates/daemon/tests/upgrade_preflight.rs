@@ -295,6 +295,7 @@ impl Host {
             self.env.root(),
             &fs::canonicalize(self.env.state_home().join("pohunek")).expect("state root"),
             &fs::canonicalize(&runtime).expect("runtime root"),
+            &self.env.cache_home().join("pohunek").join("session-tmp"),
             allowlist,
         );
         path

@@ -482,8 +482,11 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/runtime/manager_path.rs` — the systemd user manager's
   `PATH` a daemon follows. Each `ManagerPath`, owned by one session registry,
   holds its own search path and the registry refreshes it where it resolves or
-  launches an agent. Only the `git` and hook-interpreter resolvers still read a
-  process-wide mirror (#2494) (see
+  launches an agent. An operation takes one `SearchPath` snapshot from that
+  refresh and passes it to every resolver, `git` spawn and hook it reaches
+  (`git`, the hook interpreter, the hook `PATH`, the checkout-trust `git`, the
+  capability `git` probe); no process-wide copy exists. Work that starts no
+  agent takes the registry's last read without a new one (see
   `docs/knowledge/guides/environment-resolution.md`).
 - `docs/knowledge/guides/environment-resolution.md` — how the daemon and
   agents resolve `PATH` and executables.

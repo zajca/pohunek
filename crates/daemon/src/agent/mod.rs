@@ -542,17 +542,17 @@ pub(crate) fn which_executable(name: &str, path: Option<&OsStr>) -> Option<PathB
 }
 
 /// Resolve a helper program the daemon itself runs (`git`, the hook
-/// interpreter) to the absolute path to spawn.
+/// interpreter) on `search_path` to the absolute path to spawn.
 ///
 /// The lookup uses the shared trusted-executable policy, so a candidate another
 /// account could replace is skipped, and spawning the returned path means the
 /// kernel does no second `PATH` search. A program that is missing or untrusted
 /// yields a message naming it, which callers surface like a failed spawn.
-pub(crate) fn trusted_program(name: &str) -> Result<PathBuf, String> {
-    let path = crate::runtime::manager_path::helper_search_path();
-    #[cfg(test)]
-    let path = crate::test_support::with_thread_launch_path(path);
-    which_executable(name, path.as_deref())
+pub(crate) fn trusted_program(
+    name: &str,
+    search_path: &crate::runtime::SearchPath,
+) -> Result<PathBuf, String> {
+    which_executable(name, search_path.as_os_str())
         .ok_or_else(|| format!("{name} was not found, or is not trusted, on PATH"))
 }
 
@@ -569,6 +569,7 @@ fn invalid_session_ref(message: &'static str) -> ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::SearchPath;
     use crate::worktree::RepoHookLayer;
     use std::ffi::OsStr;
     use std::fs;
@@ -823,15 +824,17 @@ mod tests {
             let safe = fake_git(&second, "safe", 0o755);
             let path = std::env::join_paths([&first, &second]).expect("join");
             let repo = temp_dir("git-repo");
-            let (detected, output, resolved) = with_path(Path::new(&path), || {
-                let detected = crate::project::detect::git(&repo, &[]);
-                let output = crate::worktree::git_command(&repo, RepoHookLayer::Run)
-                    .expect("a trusted git exists")
-                    .output()
-                    .expect("spawn git");
-                (detected, output, trusted_program("git"))
-            });
-            let none = with_path(first.as_path(), || trusted_program("git"));
+            let search = SearchPath::new(Some(path), None);
+            let detected = crate::project::detect::git(&repo, &[], &search);
+            let output = crate::worktree::git_command(
+                &repo,
+                &crate::worktree::GitScope::new(RepoHookLayer::Run, &search),
+            )
+            .expect("a trusted git exists")
+            .output()
+            .expect("spawn git");
+            let resolved = trusted_program("git", &search);
+            let none = trusted_program("git", &SearchPath::new(Some(first.clone().into()), None));
             assert_eq!(detected.as_deref(), Some("safe"));
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "safe");
             assert_eq!(resolved, Ok(safe));
@@ -855,7 +858,8 @@ mod tests {
             let verdict = |path: &std::ffi::OsStr| {
                 let doctor = hostcheck::binary_with_path("git", true, Some(path), "");
                 let capability = hostcheck::resolve_executable("git", Some(path));
-                let spawn = with_path(Path::new(path), || trusted_program("git").ok());
+                let spawn =
+                    trusted_program("git", &SearchPath::new(Some(path.to_owned()), None)).ok();
                 (
                     doctor.status == protocol::DoctorStatus::Ok,
                     capability,

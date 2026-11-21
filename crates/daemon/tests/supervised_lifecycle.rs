@@ -251,6 +251,109 @@ async fn the_daemon_starts_on_a_newer_minor_file_and_warns_per_key() {
     assert!(!logged.contains(UNKNOWN_KEY_SECRET), "{logged}");
 }
 
+/// The daemon log of `fixture` as one text.
+fn daemon_log(fixture: &Installation) -> String {
+    let mut logged = String::new();
+    for entry in std::fs::read_dir(&fixture.paths.log_dir).expect("daemon log directory") {
+        let path = entry.expect("log entry").path();
+        if path.is_file() {
+            logged.push_str(&String::from_utf8_lossy(
+                &std::fs::read(&path).expect("read log"),
+            ));
+        }
+    }
+    logged
+}
+
+/// Creates the configured session temporary root `name` below the fixture with
+/// mode 0700, as the installer does for the default root; the daemon never
+/// creates it.
+fn private_tmp_root(fixture: &Installation, name: &str) -> PathBuf {
+    let root = fixture.root.join(name);
+    std::fs::create_dir(&root).expect("create the configured session temporary root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+        .expect("make the configured root private");
+    root
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+async fn a_launch_under_a_configured_session_tmp_root_gets_its_tmpdir_below_it() {
+    let mut fixture = Installation::new(Settings::default()).await;
+    let root = private_tmp_root(&fixture, "session-scratch");
+    fixture.rewrite_config(|spec| spec.session_tmp_root = root.clone());
+    fixture.start_daemon().await;
+
+    let session = fixture.new_session("tmp-root").await.id;
+
+    // `<root>/<store key>/<session id>`: one store key directory below the root.
+    let keys: Vec<PathBuf> = std::fs::read_dir(&root)
+        .expect("list the configured root")
+        .map(|entry| entry.expect("root entry").path())
+        .collect();
+    assert_eq!(keys.len(), 1, "one store key directory: {keys:?}");
+    assert!(
+        keys[0].join(&session.0).is_dir(),
+        "the session directory is below the configured root: {keys:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(fixture.paths.cache_dir.join("session-tmp"))
+            .expect("list the default root")
+            .count(),
+        0,
+        "nothing is created at the default location"
+    );
+    assert!(
+        !daemon_log(&fixture).contains("session.tmp_root_unusable"),
+        "a usable root logs no warning"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
+async fn a_missing_configured_session_tmp_root_fails_the_launch_and_the_daemon_keeps_serving() {
+    let mut fixture = Installation::new(Settings::default()).await;
+    let root = fixture.root.join("not-mounted");
+    fixture.rewrite_config(|spec| spec.session_tmp_root = root.clone());
+    fixture.start_daemon().await;
+
+    let result = fixture
+        .client()
+        .await
+        .call::<method::SessionNew>(fixture.new_params("tmp-root-missing"))
+        .await;
+    match result {
+        Err(ClientError::Protocol(error)) => {
+            assert_eq!(error.code, "session_tmpdir_failed", "{error:?}");
+            assert!(
+                error.msg.contains(&root.display().to_string()),
+                "the error names the configured root: {error:?}"
+            );
+        }
+        other => panic!("expected session_tmpdir_failed, got {other:?}"),
+    }
+    assert!(
+        std::fs::symlink_metadata(&root).is_err(),
+        "the daemon never creates the configured root"
+    );
+    assert!(
+        fixture.sessions().await.is_empty(),
+        "the refused session is not listed"
+    );
+    let logged = daemon_log(&fixture);
+    assert!(logged.contains("session.tmp_root_unusable"), "{logged}");
+    assert!(
+        logged.contains(&root.display().to_string()),
+        "the warning names the configured root: {logged}"
+    );
+}
+
 /// Column counts of the resizes each session gets before the first restart.
 const RESIZES_BEFORE_RESTART_COLS: [u16; 2] = [90, 91];
 

@@ -16,8 +16,8 @@ use protocol::{ErrorClass, ProtocolError, SessionDiffResult, SessionId, MAX_SESS
 use super::{runtime_error, SessionRegistry};
 use crate::store::Store;
 use crate::worktree::{
-    git_command, output_failure_message, run_output_bounded, validate_git_ref_arg, RepoHookLayer,
-    WorktreeManager, GIT_COMMAND_TIMEOUT,
+    git_command, output_failure_message, run_output_bounded, validate_git_ref_arg, GitScope,
+    RepoHookLayer, WorktreeManager, GIT_COMMAND_TIMEOUT,
 };
 
 /// Flags that make `git diff` output independent of the ambient git config.
@@ -63,7 +63,10 @@ impl SessionRegistry {
         let info = self.inspect(id).await?;
         // A session that skips its checkout's hooks reads that checkout with
         // git's own hooks off too.
-        let layer = RepoHookLayer::of_session(info.skip_repo_hooks);
+        let git = GitScope::new(
+            RepoHookLayer::of_session(info.skip_repo_hooks),
+            &self.search_path_snapshot(),
+        );
         let Some(worktree) = info.worktree_path else {
             return Err(session_no_worktree(id));
         };
@@ -73,12 +76,12 @@ impl SessionRegistry {
         tokio::task::spawn_blocking(move || -> Result<SessionDiffResult, ProtocolError> {
             let resolved_base = resolve_base(
                 base,
-                layer,
+                &git,
                 store.as_deref(),
                 &session_id,
                 repository.as_deref(),
             )?;
-            compute_session_diff(&worktree, layer, &resolved_base)
+            compute_session_diff(&worktree, &git, &resolved_base)
         })
         .await
         .map_err(|err| {
@@ -103,7 +106,7 @@ impl SessionRegistry {
 /// one — even absent an explicit `--base-branch` — before the worktree exists).
 pub(super) fn resolve_base(
     explicit: Option<String>,
-    layer: RepoHookLayer,
+    git: &GitScope,
     store: Option<&Store>,
     session_id: &str,
     repository: Option<&Path>,
@@ -129,7 +132,7 @@ pub(super) fn resolve_base(
     let repository = repository.expect(
         "SessionInfo.repo is always set alongside worktree_path when a session owns a worktree",
     );
-    WorktreeManager::default_branch(repository, layer)
+    WorktreeManager::default_branch(repository, git)
 }
 
 /// Compute the full `session.diff` result for an already-resolved `base` ref
@@ -141,13 +144,13 @@ pub(super) fn resolve_base(
 /// `SessionRegistry` plumbing above it.
 pub(super) fn compute_session_diff(
     worktree: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     base: &str,
 ) -> Result<SessionDiffResult, ProtocolError> {
-    let merge_base_sha = merge_base(worktree, layer, base)?;
-    let mut combined = tracked_diff(worktree, layer, &merge_base_sha)?;
-    for path in untracked_files(worktree, layer)? {
-        combined.push_str(&untracked_diff(worktree, layer, &path)?);
+    let merge_base_sha = merge_base(worktree, git, base)?;
+    let mut combined = tracked_diff(worktree, git, &merge_base_sha)?;
+    for path in untracked_files(worktree, git)? {
+        combined.push_str(&untracked_diff(worktree, git, &path)?);
     }
     let (diff, truncated) = cap_to_budget(&combined);
     Ok(SessionDiffResult {
@@ -162,10 +165,10 @@ pub(super) fn compute_session_diff(
 /// `--end-of-options` forces `base` to be parsed positionally even though
 /// [`validate_git_ref_arg`] already rejected a leading `-` — defense in depth,
 /// matching `crate::worktree`'s own git invocations.
-fn merge_base(worktree: &Path, layer: RepoHookLayer, base: &str) -> Result<String, ProtocolError> {
+fn merge_base(worktree: &Path, git: &GitScope, base: &str) -> Result<String, ProtocolError> {
     let output = git_output(
         worktree,
-        layer,
+        git,
         &["merge-base", "--end-of-options", base, "HEAD"],
     )?;
     if output.status.success() {
@@ -187,14 +190,14 @@ fn merge_base(worktree: &Path, layer: RepoHookLayer, base: &str) -> Result<Strin
 /// object).
 fn tracked_diff(
     worktree: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     merge_base_sha: &str,
 ) -> Result<String, ProtocolError> {
     let mut args = vec!["diff"];
     args.extend(DIFF_OUTPUT_FLAGS);
-    args.extend(layer.diff_options());
+    args.extend(git.layer.diff_options());
     args.extend(["--find-renames", "--end-of-options", merge_base_sha]);
-    let output = git_output(worktree, layer, &args)?;
+    let output = git_output(worktree, git, &args)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -214,10 +217,10 @@ fn tracked_diff(
 /// entry (status `R`/`C`) carries an extra NUL-separated original-path field;
 /// it is skipped so the following entry stays aligned, even though only `??`
 /// (untracked) entries are collected here.
-fn untracked_files(worktree: &Path, layer: RepoHookLayer) -> Result<Vec<String>, ProtocolError> {
+fn untracked_files(worktree: &Path, git: &GitScope) -> Result<Vec<String>, ProtocolError> {
     let output = git_output(
         worktree,
-        layer,
+        git,
         &["status", "--porcelain=v1", "--untracked-files=all", "-z"],
     )?;
     if !output.status.success() {
@@ -261,14 +264,14 @@ fn untracked_files(worktree: &Path, layer: RepoHookLayer) -> Result<Vec<String>,
 /// stanza, with no special-casing needed here.
 fn untracked_diff(
     worktree: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     relative_path: &str,
 ) -> Result<String, ProtocolError> {
     let mut args = vec!["diff"];
     args.extend(DIFF_OUTPUT_FLAGS);
-    args.extend(layer.diff_options());
+    args.extend(git.layer.diff_options());
     args.extend(["--no-index", "--", "/dev/null", relative_path]);
-    let output = git_output(worktree, layer, &args)?;
+    let output = git_output(worktree, git, &args)?;
     match output.status.code() {
         Some(0 | 1) => Ok(String::from_utf8_lossy(&output.stdout).into_owned()),
         _ => Err(session_diff_failed(&format!(
@@ -283,14 +286,10 @@ fn untracked_diff(
 /// command's own exit status (success or not) is left to the caller — every
 /// git operation `session::diff` runs has command-specific exit-code semantics
 /// (see e.g. [`untracked_diff`]'s use of exit code 1 as success).
-fn git_output(
-    worktree: &Path,
-    layer: RepoHookLayer,
-    args: &[&str],
-) -> Result<Output, ProtocolError> {
+fn git_output(worktree: &Path, git: &GitScope, args: &[&str]) -> Result<Output, ProtocolError> {
     let failed =
         |message: String| session_diff_failed(&format!("git {}: {message}", args.join(" ")));
-    let mut cmd = git_command(worktree, layer).map_err(failed)?;
+    let mut cmd = git_command(worktree, git).map_err(failed)?;
     cmd.args(args);
     run_output_bounded(cmd, GIT_COMMAND_TIMEOUT).map_err(failed)
 }

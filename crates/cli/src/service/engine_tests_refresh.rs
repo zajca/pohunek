@@ -1064,8 +1064,8 @@ async fn a_rerun_at_ready_reads_the_file_and_keeps_the_record_when_it_is_unusabl
     let harness = &r.harness;
     interrupt_after(harness, Step::Ready).await;
     let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     let record = record_bytes(harness);
     let replaced = replaces(harness);
@@ -1137,8 +1137,8 @@ async fn the_entry_refuses_an_unmanaged_host_before_the_schema_read_and_the_conn
         .clone()
         .with_path_discovery(crate::service::context::PathDiscovery::Unmanaged);
     let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     // A record the store cannot decode must not mask the refusal either.
     std::fs::write(harness.engine().store.path(), b"not a record").expect("junk record");
@@ -1159,7 +1159,7 @@ async fn the_entry_refuses_an_unmanaged_host_before_the_schema_read_and_the_conn
 async fn the_entry_reads_the_schema_before_it_connects_once_discovery_succeeded() {
     let mut r = refreshable().await;
     let text = String::from_utf8(config_bytes(&r.harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
     std::fs::write(r.harness.context.config_path(), &older).expect("write schema 6");
     r.harness.context = discovering(&r.harness.context, &r.harness.root, "shell-c", &r.new);
     let connected = std::cell::Cell::new(false);
@@ -1218,8 +1218,8 @@ async fn the_entry_returns_a_failed_login_shell_before_the_schema_read() {
     let mut harness = Harness::new();
     harness.install(V1).await.expect("install");
     let text = String::from_utf8(config_bytes(&harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     harness.context = failing_shell(&harness);
 
@@ -1600,8 +1600,8 @@ async fn the_entry_blocks_on_a_foreign_record_before_judging_the_schema() {
         .expect_err("the upgrade is interrupted");
     assert!(matches!(error, Error::Interrupted(_)), "{error:?}");
     let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     let record = record_bytes(harness);
 
@@ -1621,8 +1621,8 @@ async fn the_entry_returns_an_unreadable_record_before_judging_the_schema() {
     let r = refreshable().await;
     let harness = &r.harness;
     let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     let record = harness.engine().store.path();
     std::fs::write(&record, b"not a record").expect("junk record");
@@ -1640,8 +1640,8 @@ async fn the_entry_lets_a_pending_refresh_record_reach_the_schema_judgement() {
     let harness = &r.harness;
     interrupt_after(harness, Step::Config).await;
     let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
-    let older = text.replacen("schema_version = 7", "schema_version = 6", 1);
-    assert_ne!(older, text, "the fixture declares schema 7");
+    let older = text.replacen("schema_version = 8", "schema_version = 6", 1);
+    assert_ne!(older, text, "the fixture declares schema 8");
     std::fs::write(harness.context.config_path(), &older).expect("write schema 6");
     let record = record_bytes(harness);
 
@@ -1847,7 +1847,7 @@ async fn the_probe_gives_no_verdict_while_a_record_is_pending_or_the_file_is_unr
     let text = String::from_utf8(config_bytes(harness)).expect("utf-8");
     std::fs::write(
         harness.context.config_path(),
-        text.replacen("schema_version = 7", "schema_version = 6", 1),
+        text.replacen("schema_version = 8", "schema_version = 6", 1),
     )
     .expect("write schema 6");
     assert_eq!(behind(&harness.context), None, "another schema");

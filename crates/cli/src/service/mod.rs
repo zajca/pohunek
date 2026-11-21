@@ -1203,7 +1203,8 @@ pub(crate) fn check_local(
                 None,
             )
         } else {
-            let config_source = verified_config_source(context)?;
+            let config_source =
+                verified_config_source(context, Some(&context.canonical_cache_dir()?))?;
             engine::upgrade_preflight(context)?;
             let plan = engine::upgrade_plan(pending, version)?;
             if let Some(record) = plan.record() {
@@ -1226,7 +1227,7 @@ pub(crate) fn check_local(
                     installed: layout.prefix().to_path_buf(),
                 });
             }
-            engine::check_layout_dirs(context, layout)?;
+            engine::check_layout_dirs(context, layout, config.session_tmp_root())?;
             layout::verify_claim(layout, &config.namespace())?;
             // A previous-schema file means the checked upgrade is a migration: it stops
             // the daemon before it rewrites `service.toml`.
@@ -1548,8 +1549,8 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 /// Loads the installation recorded at `context.config_path()` and verifies
 /// its namespace inputs against the running process.
 ///
-/// The read is the upgrade-source read: a previous release's schema-2,
-/// schema-3 to schema-6 installation is reported, connected to,
+/// The read is the upgrade-source read: a previous release's schema-2 to
+/// schema-7 installation is reported, connected to,
 /// checked, and uninstalled by this version like a current one, while schemas
 /// this binary neither writes nor upgrades from stay refused.
 ///
@@ -1557,16 +1558,23 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 ///
 /// See [`verified_connection`].
 fn verified_config(context: &Context) -> Result<ServiceConfig, Error> {
-    Ok(verified_config_source(context)?.config)
+    Ok(verified_config_source(context, None)?.config)
 }
 
 /// Like [`verified_config`], and reports how `service.toml` was read.
 ///
+/// `cache_dir` is passed only by a caller that renders the migrated file: a
+/// previous schema's session temporary root is derived from it there and stays
+/// unrecorded otherwise.
+///
 /// # Errors
 ///
 /// See [`verified_connection`].
-fn verified_config_source(context: &Context) -> Result<UpgradeSource, Error> {
-    let source = ServiceConfig::load_upgrade_source(&context.config_path())?;
+fn verified_config_source(
+    context: &Context,
+    cache_dir: Option<&Path>,
+) -> Result<UpgradeSource, Error> {
+    let source = ServiceConfig::load_upgrade_source(&context.config_path(), cache_dir)?;
     source.config.verify_installation(
         context.uid(),
         &context.paths().state_dir,
@@ -1659,7 +1667,7 @@ mod tests {
     #[test]
     fn check_reports_a_pending_rollback_migration_only_when_it_would_upgrade_again() {
         let (_temp, root, context, _state) = installed();
-        let source = verified_config_source(&context).expect("current config");
+        let source = verified_config_source(&context, None).expect("current config");
         let record = record::Record {
             schema_version: record::SCHEMA_VERSION,
             operation: record::Operation::Upgrade,

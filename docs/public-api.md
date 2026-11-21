@@ -2894,24 +2894,34 @@ allowlist` of `service.toml`, by default `PATH`, `HOME`, `USER`, `LOGNAME`,
 `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and `XDG_*`), `TERM`, the agent
 profile's environment, and the reserved values above. `TMPDIR` names the
 session's private temporary directory,
-`<cache_dir>/session-tmp/<store key>/<session id>` below the daemon's cache
-directory (`$XDG_CACHE_HOME/pohunek` or the platform cache path), on Linux and
-macOS alike. The store key is the first 16 hex digits of the SHA-256 of the
-metadata store's canonical path (its directory resolved through
-`realpath`, then `metadata.jsonl`), so daemons with different stores that share
-a cache directory never share a root. It replaces a `TMPDIR` the allowlist
+`<session_tmp_root>/<store key>/<session id>`, where `session_tmp_root` is
+`namespace.session_tmp_root` of `service.toml` (`<cache_dir>/session-tmp` below the
+daemon's cache directory, `$XDG_CACHE_HOME/pohunek` or the platform cache path,
+unless the operator set another absolute path), on Linux and macOS alike. The
+store key is the first 16 hex digits of the SHA-256 of the metadata store's
+canonical path (its directory resolved through `realpath`, then
+`metadata.jsonl`), so daemons with different stores that share a
+`session_tmp_root` never share a root. It replaces a `TMPDIR` the allowlist
 forwards, so concurrent sessions never share temporary names; a profile that
 sets `TMPDIR` in its `[env]` keeps its own value and gets no private directory.
 A profile over an agent whose manifest declares `[program_status]` can switch the
 agent's program status off with the agent's own variable (`PI_PROGRAM_STATUS=0`
 for Pi, `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` for Claude); detection is then
 screen-only.
-The directory and the directories above it up to `session-tmp` have mode 0700 and must
-be directories of the daemon's user reached without a symlink; a launch whose
-directory fails that check fails with runtime-class `session_tmpdir_unsafe`,
-one whose directory cannot be created, or whose path is not valid UTF-8 and so
-cannot be exported, with `session_tmpdir_failed`, before
-any worker starts. A stop keeps the directory and a resume of the same session
+The configured `session_tmp_root` must already exist: the daemon never creates
+it, because a root on a filesystem that is not mounted would otherwise be
+created in the empty mount point. It, the store key directory and the session
+directory have mode 0700 and must be directories of the daemon's user reached
+without a symlink; the store key and session directories are created when
+missing. A launch whose existing directory fails that check fails with
+runtime-class `session_tmpdir_unsafe`, one whose configured root is missing, whose
+directory cannot be created, or whose path is not valid UTF-8 and so cannot be
+exported, with `session_tmpdir_failed`, before any worker starts. The message
+names the configured root, the session is not created, and the daemon keeps
+serving every other request. A daemon started from `service.toml` logs one
+warning `session.tmp_root_unusable` naming the root at start when it is missing
+or unsafe. A daemon without `service.toml` (`--dev-subprocess`) uses
+`<cache_dir>/session-tmp` and creates it at start. A stop keeps the directory and a resume of the same session
 reuses it (recreating it when it is gone). Every removal
 (`session.remove`, retention, a rolled-back create) deletes it with everything
 an agent left in it; a delete that fails is logged with its path and leaves
@@ -2950,7 +2960,7 @@ for #496 raised it to 3, and the `[waits]` table added for #858 (`turn_default_m
 and `turn_max_ms`, the default timeout and the ceiling of `session.wait_turn`,
 each in `5000..=3600000` with the default at most the ceiling; fresh installs
 and migrations write 300000 and 1800000) raised it to 4: the current release
-refuses to serve a schema-2 to schema-6 file to the daemon, reads it
+refuses to serve a schema-2 to schema-7 file to the daemon, reads it
 only at the `pohunek service upgrade` boundary, and upgrades it as a migration
 that assigns the defaults of the missing keys and tables and keeps every
 recorded value. The input write stall bound (`[input] write_stall_timeout_ms`, 3000 ms on fresh
@@ -2964,16 +2974,30 @@ the same way, with only the hooks default assigned. The `[events]` table
 bounds of the event journal; 33554432, 8 and 14 on fresh installs and
 migrations) raised it to 7: the table is required, so under the rule below it
 is a breaking change and not an optional additive key; a schema-6 file is
-migrated the same way, with only the events defaults assigned. The optional
+migrated the same way, with only the events defaults assigned. The required
+`namespace.session_tmp_root` key (an absolute normalized path, `<cache_dir>/session-tmp`
+on fresh installs and migrations) raised it to 8: it moves the root of every
+session's private `TMPDIR`, so an older binary must never skip it, and under the
+rule below that makes it a breaking change and not an optional key. A schema-7 file
+is migrated with only that key assigned, explicitly, as the cache-based default,
+so the upgrade moves nothing until the operator edits the key. Editing it moves only
+the directories of sessions launched afterwards: a session launched under the old
+root keeps its directory there, which neither a resume, a removal nor the startup
+cleanup of the new root moves or deletes, so delete the old tree by hand once no
+session uses it; its unknown keys are kept through the upgrade, as the schema-7 releases
+kept them. The key is not part of the job namespace. `pohunek service install` and
+`upgrade` create the root (mode 0700) only when its value is that cache-based
+default; a root the operator pointed elsewhere, for example onto another disk, must
+exist before the daemon needs it. The optional
 `[waits]` keys `keepalive_idle_ms` and `keepalive_interval_ms` (whole seconds
 written in milliseconds, `1000..=600000`, 30000 and 10000 by default) and
 `keepalive_count` (`1..=10`, 3 by default) set the TCP keepalive of every
 overlay connection the daemon accepts (#862); they are additive optional keys,
-so they leave `schema_version` at 7 and the writer omits each while it equals
+so they leave `schema_version` at 8 and the writer omits each while it equals
 its default. The optional `[deadlines]` key `registry_shutdown_ms` (`1..=600000`,
 5000 by default) bounds how long the daemon's session registry waits for its
 background tasks and in-flight store writes at shutdown; it is additive, so it
-leaves `schema_version` at 7 and the writer omits it while it equals its
+leaves `schema_version` at 8 and the writer omits it while it equals its
 default. The optional `[deadlines]` keys `create_drain_ms` (10000),
 `driver_shutdown_ms` (5000) and `event_log_flush_ms` (5000), all `1..=600000`,
 bound the other daemon shutdown phases the same way (see the shutdown tree in
@@ -2981,7 +3005,7 @@ the architecture). The optional `[deadlines]` keys `worker_send_ms` (15000) and
 `worker_answer_ms` (60000), `1..=600000` and `35000..=600000`, bound writing one request to a
 worker's control connection and waiting for the answer to a request that is not
 an input write or a stop; the daemon closes the connection when one elapses
-(additive: they leave `schema_version` at 7 and the writer omits each while it
+(additive: they leave `schema_version` at 8 and the writer omits each while it
 equals its default). The four phase bounds plus a 2000 ms margin should not exceed
 `daemon_exit_timeout_ms`. A file that exceeds it stays valid: `pohunekd` logs a
 warning at start and shortens the phase bounds in proportion so the service
@@ -2993,10 +3017,10 @@ after the last phase (a blocking write that never returns is left behind there, 
 `host.inspect`: `probe_cache_ttl_ms` and `probe_failure_ttl_ms` (`1..=600000`,
 120000 and 10000 by default), `probe_cache_max_entries` (`1..=4096`, 256) and
 `probe_parallelism` (`1..=256`, 32, the most probes one inventory runs at
-once); it is additive, so it leaves `schema_version` at 7 and the writer omits
+once); it is additive, so it leaves `schema_version` at 8 and the writer omits
 the table while every key equals its default. The `[hooks]` table also takes the optional `required` key, a list
 of the hook events whose failure ends `session.new` (only `"post-create"`, #670);
-it is additive, so it leaves `schema_version` at 7, the writer omits it while it
+it is additive, so it leaves `schema_version` at 8, the writer omits it while it
 is empty, and a previous release ignores the key and does not enforce it. The optional
 `[checkout_trust]` table takes `trusted_repositories`, a list of up to 256 GitHub
 `owner/repo` names (owner of 1 to 39 letters, digits or hyphens; repo of 1 to 100
@@ -3009,7 +3033,7 @@ release reports it as an unknown table. See "Trusted checkout arguments".
 changed meaning or unit, or validation that rejects a file that was valid
 before. An additive optional key with a documented default does not change it,
 and the writer omits such a key while it equals the default, so the previous
-release still reads a file this release rewrote. A schema-7 file with an
+release still reads a file this release rewrote. A schema-8 file with an
 unknown key or table loads; the key is ignored, and the daemon logs one
 `service_config.unknown_key` warning per key at start (key path, line and file,
 never the value; a worker generation logs it at debug only). `pohunek service

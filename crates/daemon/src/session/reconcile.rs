@@ -14744,6 +14744,7 @@ generation "$1"
             let context = crate::worktree::HookContext {
                 session_id: "s-312".to_owned(),
                 agent: "shell".to_owned(),
+                search_path: crate::runtime::SearchPath::process(),
                 ..crate::worktree::HookContext::default()
             };
             let runner = tokio::task::spawn_blocking(move || {

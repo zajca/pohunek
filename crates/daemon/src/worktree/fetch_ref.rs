@@ -20,7 +20,7 @@ use tracing::warn;
 use super::fetch::{fetch_into_ref_with, fetch_ref_name, FetchScope, FetchedBase};
 use super::{
     error, git_command, git_run, has_origin, output_failure_message, run_output_bounded,
-    worktree_add_error, RepoHookLayer, GIT_COMMAND_TIMEOUT,
+    worktree_add_error, GitScope, GIT_COMMAND_TIMEOUT,
 };
 
 /// Namespace of the per-session refs a `fetch_ref` fetch pins.
@@ -79,10 +79,10 @@ pub(crate) fn check_session_fetch_request(
 /// ref, so a one-level name is rejected here.
 fn check_session_fetch_ref_name(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     source_ref: &str,
 ) -> Result<(), ProtocolError> {
-    let mut cmd = match git_command(repo, layer) {
+    let mut cmd = match git_command(repo, git) {
         Ok(cmd) => cmd,
         Err(message) => return Err(fetch_ref_failed(source_ref, &message)),
     };
@@ -117,12 +117,12 @@ fn check_session_fetch_ref_name(
 /// fetched ref peels to another commit, `fetch_ref_failed` otherwise.
 pub(crate) fn fetch_session_temp(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     fetch: &FetchRefRequest,
 ) -> Result<FetchedBase, ProtocolError> {
     check_session_fetch_request(&fetch.source_ref, &fetch.commit)?;
-    check_session_fetch_ref_name(repo, layer, &fetch.source_ref)?;
-    if !has_origin(repo, layer) {
+    check_session_fetch_ref_name(repo, git, &fetch.source_ref)?;
+    if !has_origin(repo, git) {
         return Err(fetch_ref_not_found(
             &fetch.source_ref,
             "the repository has no origin remote",
@@ -130,12 +130,12 @@ pub(crate) fn fetch_session_temp(
     }
     let temp = fetch_ref_name().map_err(|message| fetch_ref_failed(&fetch.source_ref, &message))?;
     let fetched =
-        match fetch_into_ref_with(repo, layer, &fetch.source_ref, &temp, FetchScope::Untrusted) {
+        match fetch_into_ref_with(repo, git, &fetch.source_ref, &temp, FetchScope::Untrusted) {
             Ok(fetched) => fetched,
             Err(message) if message.contains("timed out") => {
                 return Err(fetch_ref_failed(&fetch.source_ref, &message));
             }
-            Err(message) => match remote_has_session_source(repo, layer, &fetch.source_ref) {
+            Err(message) => match remote_has_session_source(repo, git, &fetch.source_ref) {
                 Ok(false) => {
                     return Err(fetch_ref_not_found(
                         &fetch.source_ref,
@@ -169,14 +169,14 @@ pub(crate) fn fetch_session_temp(
 /// half-built value.
 pub(crate) fn promote_session_fetched_ref(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     session_id: &str,
     branch: &str,
     fetch: &FetchRefRequest,
     temp: FetchedBase,
 ) -> Result<FetchedRef, ProtocolError> {
     let ref_name = session_fetched_ref_name(session_id);
-    match read_session_ref_commit(repo, layer, &ref_name) {
+    match read_session_ref_commit(repo, git, &ref_name) {
         Ok(Some(existing)) if existing == temp.commit => {}
         Ok(Some(existing)) => {
             return Err(worktree_add_error(
@@ -185,8 +185,7 @@ pub(crate) fn promote_session_fetched_ref(
             ));
         }
         Ok(None) => {
-            if let Err(message) = git_run(repo, layer, &["update-ref", &ref_name, &temp.commit, ""])
-            {
+            if let Err(message) = git_run(repo, git, &["update-ref", &ref_name, &temp.commit, ""]) {
                 return Err(worktree_add_error(branch, &message));
             }
         }
@@ -209,12 +208,12 @@ pub(crate) fn promote_session_fetched_ref(
 /// the reuse path never trusts whatever the ref holds.
 pub(crate) fn require_session_fetched_ref(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     session_id: &str,
     fetch: &FetchRefRequest,
 ) -> Result<FetchedRef, ProtocolError> {
     let ref_name = session_fetched_ref_name(session_id);
-    match read_session_ref_commit(repo, layer, &ref_name) {
+    match read_session_ref_commit(repo, git, &ref_name) {
         Ok(Some(commit)) if commit == fetch.commit => Ok(FetchedRef {
             fetched_ref: ref_name,
             source_ref: fetch.source_ref.clone(),
@@ -242,10 +241,10 @@ pub(crate) fn require_session_fetched_ref(
 /// `fetch_ref_failed`.
 fn remote_has_session_source(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     source_ref: &str,
 ) -> Result<bool, String> {
-    let mut cmd = git_command(repo, layer)?;
+    let mut cmd = git_command(repo, git)?;
     cmd.args([
         "ls-remote",
         "--exit-code",
@@ -271,10 +270,10 @@ fn remote_has_session_source(
 /// other git failure of the bind.
 fn read_session_ref_commit(
     repo: &Path,
-    layer: RepoHookLayer,
+    git: &GitScope,
     ref_name: &str,
 ) -> Result<Option<String>, String> {
-    let mut cmd = git_command(repo, layer)?;
+    let mut cmd = git_command(repo, git)?;
     cmd.args(["rev-parse", "--verify", "--quiet", ref_name]);
     match run_output_bounded(cmd, GIT_COMMAND_TIMEOUT) {
         Ok(output) if output.status.success() => Ok(Some(
@@ -288,12 +287,12 @@ fn read_session_ref_commit(
 /// Delete the session ref of `session_id`, best-effort: binding cleanup owns
 /// the ref once the bind settled, so every path that drops a binding drops
 /// the ref with it. A missing repository (or ref) is not an error.
-pub(crate) fn delete_session_fetched_ref(repo: &Path, layer: RepoHookLayer, session_id: &str) {
+pub(crate) fn delete_session_fetched_ref(repo: &Path, git: &GitScope, session_id: &str) {
     if !repo.is_dir() {
         return;
     }
     let ref_name = session_fetched_ref_name(session_id);
-    if let Err(message) = git_run(repo, layer, &["update-ref", "-d", &ref_name]) {
+    if let Err(message) = git_run(repo, git, &["update-ref", "-d", &ref_name]) {
         warn!(
             fetch_ref = %ref_name,
             error = %message,

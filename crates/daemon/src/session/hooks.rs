@@ -39,6 +39,9 @@ pub(super) struct SessionHookRequest {
     pub(super) activity: Option<&'static str>,
     /// The session's recorded [`protocol::SessionInfo::skip_repo_hooks`].
     pub(super) skip_repo_hooks: bool,
+    /// The search path of the operation that fires the hook; `None` takes the
+    /// registry's cached snapshot when the hook starts.
+    pub(super) search_path: Option<crate::runtime::SearchPath>,
 }
 
 impl SessionHookRequest {
@@ -54,7 +57,14 @@ impl SessionHookRequest {
             stop_reason: None,
             activity: None,
             skip_repo_hooks: info.skip_repo_hooks,
+            search_path: None,
         }
+    }
+
+    /// The same hook on the `search_path` snapshot of the operation firing it.
+    pub(super) fn on(mut self, search_path: crate::runtime::SearchPath) -> Self {
+        self.search_path = Some(search_path);
+        self
     }
 }
 
@@ -132,6 +142,10 @@ impl SessionRegistry {
     fn spawn_session_hook_task(&self, request: SessionHookRequest) -> JoinHandle<()> {
         let timeout = self.inner.config.hook_timeout;
         let config_dir = self.inner.config.config_dir.clone();
+        let search_path = request
+            .search_path
+            .clone()
+            .unwrap_or_else(|| self.search_path_snapshot());
         tokio::task::spawn_blocking(move || {
             let ctx = HookContext {
                 session_id: request.session_id,
@@ -144,6 +158,7 @@ impl SessionRegistry {
                 stop_reason: request.stop_reason,
                 activity: request.activity,
                 repo_layer: RepoHookLayer::of_session(request.skip_repo_hooks),
+                search_path,
             };
             let mut warnings = Vec::new();
             run_hook(
@@ -504,6 +519,7 @@ fn fire_agent_state_hook(
         stop_reason: None,
         activity: Some(agent_activity_env(snapshot.activity)),
         skip_repo_hooks: snapshot.skip_repo_hooks,
+        search_path: None,
     });
     let done_tx = done_tx.clone();
     registry.spawn_background("agent_state_hook_done", async move {

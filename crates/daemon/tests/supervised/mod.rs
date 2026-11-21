@@ -226,7 +226,14 @@ impl Installation {
             },
         )
         .expect("resolve installation paths");
-        for path in [&paths.runtime_dir, &paths.state_dir, &paths.config_dir] {
+        // The installer creates the default session temporary root; the daemon
+        // never does.
+        for path in [
+            &paths.runtime_dir,
+            &paths.state_dir,
+            &paths.config_dir,
+            &paths.cache_dir.join("session-tmp"),
+        ] {
             private_dir(path);
         }
         let prefix = root.join("prefix");
@@ -1213,6 +1220,7 @@ fn service_config(
         uid: uid(),
         state_root: std::fs::canonicalize(&paths.state_dir).expect("canonical state root"),
         runtime_root: std::fs::canonicalize(&paths.runtime_dir).expect("canonical runtime root"),
+        session_tmp_root: paths.cache_dir.join("session-tmp"),
         deadlines: Deadlines {
             worker_connect: settings.worker_connect,
             worker_initialize: settings.worker_initialize,

@@ -3901,6 +3901,7 @@ fn write_installed_service(env: &TestEnv, version: &str) -> PathBuf {
         env.root(),
         &env.state_home().join("pohunek"),
         &env.runtime_dir().join("pohunek"),
+        &env.cache_home().join("pohunek").join("session-tmp"),
         &["PATH".to_owned()],
         version,
     );

@@ -110,7 +110,7 @@ impl LaunchEnvironment {
         path: &std::path::Path,
         source: EnvironmentSource,
     ) -> Result<Self, pohunek_service_config::ConfigError> {
-        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path)?;
+        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path, None)?;
         Ok(Self::new(
             config.config.environment_allowlist().to_vec(),
             source,

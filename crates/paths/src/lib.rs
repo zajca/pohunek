@@ -25,6 +25,9 @@ pub const LOGS_SUBDIR: &str = "logs";
 pub const BIN_SUBDIR: &str = "bin";
 /// Assistant knowledge cache subdirectory under the app cache directory.
 pub const KNOWLEDGE_CACHE_SUBDIR: &str = "knowledge";
+/// Default session temporary directory root under the app cache directory: the
+/// location `namespace.session_tmp_root` records when the operator sets none.
+pub const SESSION_TMP_SUBDIR: &str = "session-tmp";
 /// Assistant runtime subdirectory under the app runtime directory.
 pub const ASSISTANT_RUNTIME_SUBDIR: &str = "assistant";
 /// Daemon metadata store filename under [`BasePaths::data_dir`].

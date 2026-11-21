@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
+use crate::runtime::SearchPath;
 use crate::worktree::{canonical_or_original, redact_url_credentials, RepoHookLayer};
 
 /// Wall-clock bound on a single detection `git` call. Detection runs on the
@@ -83,11 +84,11 @@ pub struct DetectedProject {
 /// act on a failed detection asks this function instead. Any probe error other
 /// than "not found" answers `false`.
 #[must_use]
-pub fn confirmed_outside_repository(cwd: &Path) -> bool {
+pub(crate) fn confirmed_outside_repository(cwd: &Path, search_path: &SearchPath) -> bool {
     let Ok(canonical) = cwd.canonicalize() else {
         return false;
     };
-    if !canonical.is_dir() || !git_reports_no_repository(&canonical) {
+    if !canonical.is_dir() || !git_reports_no_repository(&canonical, search_path) {
         return false;
     }
     canonical.ancestors().all(|directory| {
@@ -104,8 +105,8 @@ pub fn confirmed_outside_repository(cwd: &Path) -> bool {
 /// Whether `git` answered for `cwd` that it is not inside any repository: a
 /// failed exit with git's "not a git repository" message, in the C locale. A
 /// missing executable, a timeout or any other failure answers `false`.
-fn git_reports_no_repository(cwd: &Path) -> bool {
-    let Ok(mut command) = crate::git::command() else {
+fn git_reports_no_repository(cwd: &Path, search_path: &SearchPath) -> bool {
+    let Ok(mut command) = crate::git::command(search_path) else {
         return false;
     };
     command
@@ -177,14 +178,19 @@ pub fn project_id(git_common_dir: &Path) -> String {
 /// never aborts a session, so today every failure path returns `Ok(None)`.
 ///
 /// Runs blocking `git` subprocesses; call it from `spawn_blocking`.
-pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the io::Result is the documented contract that lets a genuine I/O fault surface"
+)]
+pub(crate) fn detect(cwd: &Path, search_path: &SearchPath) -> io::Result<Option<DetectedProject>> {
     // Step 1: is this a work tree? A bare repo answers "false" here but "true"
     // to `--is-bare-repository`; anything else (a non-git dir, git absent) is
     // simply "no project".
-    let inside_work_tree = git(cwd, &["rev-parse", "--is-inside-work-tree"]);
+    let inside_work_tree = git(cwd, &["rev-parse", "--is-inside-work-tree"], search_path);
     if inside_work_tree.as_deref() != Some("true") {
-        if git(cwd, &["rev-parse", "--is-bare-repository"]).as_deref() == Some("true") {
-            return Ok(detect_bare(cwd));
+        if git(cwd, &["rev-parse", "--is-bare-repository"], search_path).as_deref() == Some("true")
+        {
+            return Ok(detect_bare(cwd, search_path));
         }
         return Ok(None);
     }
@@ -194,6 +200,7 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
     let Some(common_dir) = git(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        search_path,
     ) else {
         // Step 1 already confirmed a work tree (git is present and this is a repo),
         // yet `--path-format=absolute` failed: almost certainly git < 2.31, on which
@@ -205,13 +212,17 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
     let git_common_dir = canonical_or_original(Path::new(&common_dir));
 
     // Step 3: a linked worktree's git dir differs from the common dir.
-    let Some(git_dir) = git(cwd, &["rev-parse", "--path-format=absolute", "--git-dir"]) else {
+    let Some(git_dir) = git(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+        search_path,
+    ) else {
         return Ok(None);
     };
     let is_linked_worktree = canonical_or_original(Path::new(&git_dir)) != git_common_dir;
 
     // Step 4: this work tree's root.
-    let Some(toplevel) = git(cwd, &["rev-parse", "--show-toplevel"]) else {
+    let Some(toplevel) = git(cwd, &["rev-parse", "--show-toplevel"], search_path) else {
         return Ok(None);
     };
     let checkout_path = canonical_or_original(Path::new(&toplevel));
@@ -221,7 +232,7 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
     // main worktree, even for relocated/separate-git-dir layouts); fall back to
     // the common dir's parent (`.../repo/.git` → `.../repo`).
     let repo_root = if is_linked_worktree {
-        main_worktree(cwd)
+        main_worktree(cwd, search_path)
             .or_else(|| git_common_dir.parent().map(Path::to_path_buf))
             .map_or_else(
                 || checkout_path.clone(),
@@ -238,20 +249,21 @@ pub fn detect(cwd: &Path) -> io::Result<Option<DetectedProject>> {
         is_linked_worktree,
         is_bare: false,
         // Step 6: current branch; a detached HEAD / mid-rebase has none.
-        branch: git(cwd, &["symbolic-ref", "--short", "HEAD"]),
+        branch: git(cwd, &["symbolic-ref", "--short", "HEAD"], search_path),
         // Step 7: origin URL, credentials redacted before it can be stored,
         // sent on the wire, or surfaced to an agent.
-        origin_url: origin_url(cwd),
+        origin_url: origin_url(cwd, search_path),
     }))
 }
 
 /// Detection for a bare repository (no working tree). The common dir is the
 /// repository itself, so `repo_root` and `checkout_path` both point at it; the
 /// `is_bare` flag tells the UI not to promise an in-place checkout.
-fn detect_bare(cwd: &Path) -> Option<DetectedProject> {
+fn detect_bare(cwd: &Path, search_path: &SearchPath) -> Option<DetectedProject> {
     let Some(common_dir) = git(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        search_path,
     ) else {
         // Same too-old-git signal as in `detect`: `--is-bare-repository` answered
         // "true" (so git ran), but the absolute-path query failed. Warn once.
@@ -264,20 +276,20 @@ fn detect_bare(cwd: &Path) -> Option<DetectedProject> {
         checkout_path: git_common_dir.clone(),
         is_linked_worktree: false,
         is_bare: true,
-        branch: git(cwd, &["symbolic-ref", "--short", "HEAD"]),
-        origin_url: origin_url(cwd),
+        branch: git(cwd, &["symbolic-ref", "--short", "HEAD"], search_path),
+        origin_url: origin_url(cwd, search_path),
         git_common_dir,
     })
 }
 
 /// The `origin` remote URL with any embedded credentials redacted.
-fn origin_url(cwd: &Path) -> Option<String> {
-    git(cwd, &["remote", "get-url", "origin"]).map(|url| redact_url_credentials(&url))
+fn origin_url(cwd: &Path, search_path: &SearchPath) -> Option<String> {
+    git(cwd, &["remote", "get-url", "origin"], search_path).map(|url| redact_url_credentials(&url))
 }
 
 /// The main worktree's path from `git worktree list --porcelain` (its first
 /// `worktree <path>` line), or `None` if the command fails or is empty.
-fn main_worktree(cwd: &Path) -> Option<PathBuf> {
+fn main_worktree(cwd: &Path, search_path: &SearchPath) -> Option<PathBuf> {
     // `-z` makes the output NUL-delimited and, crucially, emits paths VERBATIM:
     // non-`-z` porcelain C-quotes any path containing a newline/tab/quote (wraps
     // it in `"…"` with backslash escapes), which would corrupt repo_root for an
@@ -285,7 +297,7 @@ fn main_worktree(cwd: &Path) -> Option<PathBuf> {
     // splitting on NUL is unambiguous; the first `worktree ` field is the main
     // worktree. (The project *key* comes from rev-parse, not this listing, so
     // this only ever affects the derived repo_root/label, never the identity.)
-    let listing = git(cwd, &["worktree", "list", "--porcelain", "-z"])?;
+    let listing = git(cwd, &["worktree", "list", "--porcelain", "-z"], search_path)?;
     listing
         .split('\0')
         .find_map(|field| field.strip_prefix("worktree "))
@@ -324,8 +336,8 @@ fn warn_git_too_old() {
 /// fsmonitor hook off ([`RepoHookLayer::Skip`]). Its read-only queries fire no
 /// hook event and apply no filter, so a configured hook or filter driver
 /// cannot run either.
-pub(crate) fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut command = crate::git::command().ok()?;
+pub(crate) fn git(cwd: &Path, args: &[&str], search_path: &SearchPath) -> Option<String> {
+    let mut command = crate::git::command(search_path).ok()?;
     command
         .args(RepoHookLayer::Skip.git_options())
         .arg("-C")
@@ -462,7 +474,9 @@ mod tests {
     #[test]
     fn detects_main_checkout() {
         let repo = init_repo("main-checkout");
-        let project = detect(&repo).expect("detect ok").expect("a project");
+        let project = detect(&repo, &crate::runtime::SearchPath::process())
+            .expect("detect ok")
+            .expect("a project");
 
         assert!(!project.is_linked_worktree, "main checkout is not linked");
         assert!(!project.is_bare);
@@ -491,8 +505,10 @@ mod tests {
             ],
         );
 
-        let main = detect(&repo).expect("detect main").expect("main project");
-        let linked = detect(&worktree)
+        let main = detect(&repo, &crate::runtime::SearchPath::process())
+            .expect("detect main")
+            .expect("main project");
+        let linked = detect(&worktree, &crate::runtime::SearchPath::process())
             .expect("detect linked")
             .expect("linked project");
 
@@ -516,7 +532,9 @@ mod tests {
     fn non_git_directory_is_no_project() {
         let dir = unique_dir("non-git");
         assert!(
-            detect(&dir).expect("detect ok").is_none(),
+            detect(&dir, &crate::runtime::SearchPath::process())
+                .expect("detect ok")
+                .is_none(),
             "a plain directory is not a project"
         );
     }
@@ -527,7 +545,9 @@ mod tests {
         let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
         git_ok(&repo, &["checkout", "-q", "--detach", &head]);
 
-        let project = detect(&repo).expect("detect ok").expect("a project");
+        let project = detect(&repo, &crate::runtime::SearchPath::process())
+            .expect("detect ok")
+            .expect("a project");
         assert_eq!(project.branch, None, "detached HEAD has no branch");
         assert!(!project.is_linked_worktree);
     }
@@ -538,8 +558,12 @@ mod tests {
         let link = unique_dir("symlink-link").join("alias");
         std::os::unix::fs::symlink(&repo, &link).expect("create symlink");
 
-        let direct = detect(&repo).expect("detect direct").expect("project");
-        let via_link = detect(&link).expect("detect via link").expect("project");
+        let direct = detect(&repo, &crate::runtime::SearchPath::process())
+            .expect("detect direct")
+            .expect("project");
+        let via_link = detect(&link, &crate::runtime::SearchPath::process())
+            .expect("detect via link")
+            .expect("project");
 
         assert_eq!(
             direct.git_common_dir, via_link.git_common_dir,
@@ -559,7 +583,9 @@ mod tests {
             .expect("git init --bare");
         assert!(init.status.success(), "git init --bare failed");
 
-        let project = detect(&bare).expect("detect ok").expect("a bare project");
+        let project = detect(&bare, &crate::runtime::SearchPath::process())
+            .expect("detect ok")
+            .expect("a bare project");
         assert!(project.is_bare, "a bare repo must be flagged");
         assert_eq!(
             project.git_common_dir,
