@@ -191,7 +191,10 @@
 //! A schema-7 file does not record the cache directory, so the caller passes it
 //! and the upgrade assigns `namespace.session_tmp_root` explicitly as
 //! [`default_session_tmp_root`] of it, the location a daemon without the key
-//! uses. The upgrade therefore moves nothing until the operator edits the key.
+//! uses. A reader that never writes the file passes no cache directory and gets
+//! the previous schema's values with no root ([`ServiceConfig::session_tmp_root`]
+//! is `None`), so it does not depend on the cache directory. The upgrade
+//! therefore moves nothing until the operator edits the key.
 //! Editing it moves only new session directories: the directories of sessions
 //! created under the old root stay there and are neither moved nor cleaned up.
 //!
@@ -1222,7 +1225,8 @@ pub struct ServiceConfig {
     uid: u32,
     state_root: PathBuf,
     runtime_root: PathBuf,
-    session_tmp_root: PathBuf,
+    /// `None` only for a previous-schema file read without a cache directory.
+    session_tmp_root: Option<PathBuf>,
     namespace: Namespace,
     deadlines: Deadlines,
     environment_allowlist: Vec<String>,
@@ -1334,7 +1338,7 @@ impl ServiceConfig {
             uid: spec.uid,
             state_root: spec.state_root,
             runtime_root: spec.runtime_root,
-            session_tmp_root: spec.session_tmp_root,
+            session_tmp_root: Some(spec.session_tmp_root),
             namespace,
             deadlines,
             environment_allowlist: spec.environment_allowlist,
@@ -1386,8 +1390,11 @@ impl ServiceConfig {
     /// [`default_session_tmp_root`] of `cache_dir` explicitly for the missing
     /// keys and tables and keeps every recorded value; normal daemon and
     /// worker loads still require every key of the current schema. `cache_dir`
-    /// is the application cache directory (`<XDG_CACHE_HOME>/pohunek`); a
-    /// current file ignores it. The caller must preserve the source
+    /// is the application cache directory (`<XDG_CACHE_HOME>/pohunek`) the
+    /// migration that writes the file derives the root from; a current file
+    /// ignores it. Without one (`None`), a previous schema's root stays
+    /// unrecorded ([`ServiceConfig::session_tmp_root`] is `None`), so a reader
+    /// that never writes the file does not depend on the cache directory. The caller must preserve the source
     /// schema across the transaction and restore it if the old daemon is
     /// restarted on rollback.
     ///
@@ -1398,7 +1405,7 @@ impl ServiceConfig {
     /// [`SCHEMA_VERSION`].
     pub fn load_upgrade_source(
         path: &Path,
-        cache_dir: &Path,
+        cache_dir: Option<&Path>,
     ) -> Result<UpgradeSource, ConfigError> {
         Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes(), cache_dir)
     }
@@ -1421,7 +1428,7 @@ impl ServiceConfig {
     pub fn load_upgrade_source_bytes(
         path: &Path,
         bytes: &[u8],
-        cache_dir: &Path,
+        cache_dir: Option<&Path>,
     ) -> Result<UpgradeSource, ConfigError> {
         let original_text =
             String::from_utf8(bytes.to_vec()).map_err(|error| ConfigError::Parse {
@@ -1446,6 +1453,8 @@ impl ServiceConfig {
     /// # Errors
     ///
     /// Returns [`ConfigError::ConfigPath`] for a relative or unnormalized path,
+    /// [`ConfigError::InvalidPath`] for a value without a recorded
+    /// `namespace.session_tmp_root`,
     /// [`ConfigError::Untrusted`] when the directory is foreign-owned or
     /// group- or world-writable,
     /// [`ConfigError::Io`] when it cannot be opened or created,
@@ -1453,6 +1462,14 @@ impl ServiceConfig {
     /// keeps, exceeds [`MAX_CONFIG_BYTES`] (the file is left untouched), and
     /// [`ConfigError::Write`] when the replacement fails.
     pub fn write(&self, path: &Path) -> Result<(), ConfigError> {
+        if self.session_tmp_root.is_none() {
+            return Err(ConfigError::InvalidPath {
+                key: "namespace.session_tmp_root",
+                length: 0,
+                reason: "is not recorded by the previous-schema file this value was read from",
+                max_bytes: MAX_PATH_BYTES,
+            });
+        }
         write_config_text(path, &self.to_toml())
     }
 
@@ -1519,7 +1536,12 @@ impl ServiceConfig {
                 uid: self.uid,
                 state_root: utf8(&self.state_root).to_owned(),
                 runtime_root: utf8(&self.runtime_root).to_owned(),
-                session_tmp_root: utf8(&self.session_tmp_root).to_owned(),
+                session_tmp_root: self
+                    .session_tmp_root
+                    .as_deref()
+                    .map(utf8)
+                    .unwrap_or_default()
+                    .to_owned(),
             },
             deadlines: RawDeadlines {
                 worker_connect_ms: millis(self.deadlines.worker_connect),
@@ -1593,7 +1615,7 @@ impl ServiceConfig {
             uid: self.uid,
             state_root: self.state_root.clone(),
             runtime_root: self.runtime_root.clone(),
-            session_tmp_root: self.session_tmp_root.clone(),
+            session_tmp_root: self.session_tmp_root.clone().unwrap_or_default(),
             deadlines: self.deadlines,
             environment_allowlist: self.environment_allowlist.clone(),
             search_path: self.search_path.clone(),
@@ -1704,9 +1726,12 @@ impl ServiceConfig {
     /// directories are placed.
     ///
     /// The daemon never creates it, and it is not part of the job namespace.
+    /// `None` only for a previous-schema file read by
+    /// [`ServiceConfig::load_upgrade_source`] without a cache directory: such a
+    /// value cannot be written or rewritten with another active version.
     #[must_use]
-    pub fn session_tmp_root(&self) -> &Path {
-        &self.session_tmp_root
+    pub fn session_tmp_root(&self) -> Option<&Path> {
+        self.session_tmp_root.as_deref()
     }
 
     /// Returns the job namespace derived from the recorded namespace inputs.
@@ -2667,15 +2692,11 @@ fn default_session_tmp_root_text(cache_dir: &Path) -> Result<String, ConfigError
 /// A previous schema gets the documented defaults for the tables it lacks
 /// and keeps every value it records. `cache_dir` is the application cache
 /// directory the default `namespace.session_tmp_root` of a previous schema is
-/// derived from.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per previous schema, each spelling its exact shape"
-)]
+/// derived from; without one the root stays unrecorded.
 fn parse_upgrade_source(
     path: &Path,
     text: &str,
-    cache_dir: &Path,
+    cache_dir: Option<&Path>,
 ) -> Result<(ServiceConfig, u32), ConfigError> {
     let parse_error = |error: toml::de::Error| ConfigError::Parse {
         path: path.to_path_buf(),
@@ -2683,9 +2704,36 @@ fn parse_upgrade_source(
     };
     let table: toml::Table = toml::from_str(text).map_err(parse_error)?;
     // Only a previous schema derives the value; the current one records it.
-    let session_tmp_root = match table.get("schema_version") {
-        Some(toml::Value::Integer(2..=7)) => default_session_tmp_root_text(cache_dir)?,
+    let session_tmp_root = match (table.get("schema_version"), cache_dir) {
+        (Some(toml::Value::Integer(2..=7)), Some(cache_dir)) => {
+            default_session_tmp_root_text(cache_dir)?
+        }
+        (Some(toml::Value::Integer(2..=7)), None) => "/".to_owned(),
         _ => String::new(),
+    };
+    let (mut config, source_schema) =
+        parse_upgrade_source_with(path, text, &table, session_tmp_root)?;
+    if cache_dir.is_none() && source_schema != SCHEMA_VERSION {
+        config.session_tmp_root = None;
+    }
+    Ok((config, source_schema))
+}
+
+/// One arm per accepted schema, each spelling its exact shape; a previous
+/// schema records `session_tmp_root` as the explicit value.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per previous schema, each spelling its exact shape"
+)]
+fn parse_upgrade_source_with(
+    path: &Path,
+    text: &str,
+    table: &toml::Table,
+    session_tmp_root: String,
+) -> Result<(ServiceConfig, u32), ConfigError> {
+    let parse_error = |error: toml::de::Error| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: diagnostic(text, &error),
     };
     match table.get("schema_version") {
         Some(toml::Value::Integer(7)) => {

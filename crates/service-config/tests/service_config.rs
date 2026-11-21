@@ -608,8 +608,8 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 2 })
     ));
-    let source =
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("schema 2 upgrade source");
+    let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
+        .expect("schema 2 upgrade source");
     assert_eq!(source.source_schema_version, 2);
     assert_eq!(source.config.input_timing(), DEFAULT_INPUT_TIMING);
     assert_eq!(source.config.wait_timing(), DEFAULT_WAIT_TIMING);
@@ -631,7 +631,7 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
         0o600
     );
     source.config.write(&path).expect("write current schema");
-    let current = ServiceConfig::load_upgrade_source(&path, &cache_dir())
+    let current = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
         .expect("current schema upgrade source");
     assert_eq!(current.source_schema_version, 8);
     assert_eq!(current.config, source.config);
@@ -651,7 +651,8 @@ fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
         ServiceConfig::load(&path).expect("migrated file loads"),
         source.config
     );
-    let saved = ServiceConfig::load_upgrade_source(&backup, &cache_dir()).expect("verified backup");
+    let saved =
+        ServiceConfig::load_upgrade_source(&backup, Some(&cache_dir())).expect("verified backup");
     assert_eq!(saved.source_schema_version, 2);
     saved
         .write_original(&path)
@@ -714,8 +715,8 @@ fn upgrade_source_migrates_schema_four_keeping_its_values_and_adding_the_stall_d
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 4 })
     ));
-    let source =
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("schema 4 upgrade source");
+    let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
+        .expect("schema 4 upgrade source");
     assert_eq!(source.source_schema_version, 4);
     assert_eq!(source.config.active_version(), "0.34.2");
     assert_eq!(
@@ -764,7 +765,8 @@ fn upgrade_source_migrates_schema_four_keeping_its_values_and_adding_the_stall_d
         source.config
     );
 
-    let saved = ServiceConfig::load_upgrade_source(&backup, &cache_dir()).expect("verified backup");
+    let saved =
+        ServiceConfig::load_upgrade_source(&backup, Some(&cache_dir())).expect("verified backup");
     assert_eq!(saved.source_schema_version, 4);
     saved
         .write_original(&path)
@@ -828,8 +830,8 @@ fn upgrade_source_migrates_schema_five_keeping_its_values_and_adding_the_hooks_d
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 5 })
     ));
-    let source =
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("schema 5 upgrade source");
+    let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
+        .expect("schema 5 upgrade source");
     assert_eq!(source.source_schema_version, 5);
     assert_eq!(source.config.active_version(), "0.34.2");
     assert_eq!(
@@ -882,7 +884,8 @@ fn upgrade_source_migrates_schema_five_keeping_its_values_and_adding_the_hooks_d
         source.config
     );
 
-    let saved = ServiceConfig::load_upgrade_source(&backup, &cache_dir()).expect("verified backup");
+    let saved =
+        ServiceConfig::load_upgrade_source(&backup, Some(&cache_dir())).expect("verified backup");
     assert_eq!(saved.source_schema_version, 5);
     saved
         .write_original(&path)
@@ -949,8 +952,8 @@ fn upgrade_source_migrates_schema_six_keeping_its_values_and_adding_the_events_d
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 6 })
     ));
-    let source =
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("schema 6 upgrade source");
+    let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
+        .expect("schema 6 upgrade source");
     assert_eq!(source.source_schema_version, 6);
     assert_eq!(source.config.hook_stderr_tail_bytes(), 2048);
     assert_eq!(source.config.event_retention(), DEFAULT_EVENT_RETENTION);
@@ -1088,8 +1091,8 @@ open_files = 8192
 fn a_file_written_by_release_0_35_2_upgrades_to_the_current_schema() {
     let fixture = Fixture::new();
     let path = fixture.write(RELEASED_0_35_2_GOLDEN, 0o600);
-    let source =
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("released schema-6 source");
+    let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
+        .expect("released schema-6 source");
     assert_eq!(source.source_schema_version, 6);
     assert_eq!(source.config.event_retention(), DEFAULT_EVENT_RETENTION);
     assert_eq!(source.original_bytes(), RELEASED_0_35_2_GOLDEN.as_bytes());
@@ -1112,11 +1115,12 @@ fn upgrade_source_migrates_schema_seven_recording_the_cache_based_session_tmp_ro
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 7 })
     ));
-    let source = ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("schema 7 source");
+    let source =
+        ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())).expect("schema 7 source");
     assert_eq!(source.source_schema_version, 7);
     assert_eq!(
         source.config.session_tmp_root(),
-        cache_dir().join("session-tmp")
+        Some(cache_dir().join("session-tmp").as_path())
     );
     assert_eq!(source.config.event_retention(), DEFAULT_EVENT_RETENTION);
     assert_eq!(source.config.uid(), 1000);
@@ -1157,9 +1161,10 @@ fn a_current_file_keeps_its_recorded_session_tmp_root_over_the_cache_directory()
         "session_tmp_root = \"/t/st\"",
     );
     let path = fixture.write(&custom, 0o600);
-    let source = ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("current source");
+    let source =
+        ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())).expect("current source");
     assert_eq!(source.source_schema_version, 8);
-    assert_eq!(source.config.session_tmp_root(), Path::new("/t/st"));
+    assert_eq!(source.config.session_tmp_root(), Some(Path::new("/t/st")));
 }
 
 /// The derived location is validated like a configured one, so an unusable
@@ -1168,7 +1173,7 @@ fn a_current_file_keeps_its_recorded_session_tmp_root_over_the_cache_directory()
 fn a_previous_schema_with_an_unusable_cache_directory_names_the_key() {
     let fixture = Fixture::new();
     let path = fixture.write(SCHEMA_SEVEN_GOLDEN, 0o600);
-    match ServiceConfig::load_upgrade_source(&path, Path::new("relative/cache")) {
+    match ServiceConfig::load_upgrade_source(&path, Some(Path::new("relative/cache"))) {
         Err(ConfigError::InvalidPath { key, .. }) => assert_eq!(key, "namespace.session_tmp_root"),
         other => panic!("expected an invalid session_tmp_root, got {other:?}"),
     }
@@ -1176,10 +1181,44 @@ fn a_previous_schema_with_an_unusable_cache_directory_names_the_key() {
     fixture.write(&newer, 0o600);
     assert!(
         matches!(
-            ServiceConfig::load_upgrade_source(&path, Path::new("relative/cache")),
+            ServiceConfig::load_upgrade_source(&path, Some(Path::new("relative/cache"))),
             Err(ConfigError::UnsupportedSchema { found: 9 })
         ),
         "an unsupported schema is reported before the cache directory is judged"
+    );
+}
+
+/// A reader that never writes the file passes no cache directory: a previous
+/// schema loads with every value it records and no derived root, and that
+/// value refuses to be written, so an unrecorded root never reaches a file.
+#[test]
+fn a_previous_schema_read_without_a_cache_directory_records_no_session_tmp_root() {
+    let fixture = Fixture::new();
+    for golden in [SCHEMA_SEVEN_GOLDEN, SCHEMA_SIX_GOLDEN] {
+        let path = fixture.write(golden, 0o600);
+        let source = ServiceConfig::load_upgrade_source(&path, None)
+            .expect("a previous schema reads without a cache directory");
+        assert_eq!(source.config.session_tmp_root(), None);
+        assert_eq!(source.config.uid(), 1000);
+        let target = fixture.dir("out").join("rewritten.toml");
+        match source.config.write(&target) {
+            Err(ConfigError::InvalidPath { key, .. }) => {
+                assert_eq!(key, "namespace.session_tmp_root");
+            }
+            other => panic!("expected the unrecorded root to refuse the write, got {other:?}"),
+        }
+        assert!(!target.exists(), "nothing was written");
+        assert!(
+            source.config.with_active_version("0.2.0").is_err(),
+            "an unrecorded root cannot be carried into another version"
+        );
+    }
+    let current = fixture.write(GOLDEN, 0o600);
+    let source = ServiceConfig::load_upgrade_source(&current, None).expect("current source");
+    assert_eq!(
+        source.config.session_tmp_root(),
+        Some(Path::new("/home/u/.cache/pohunek/session-tmp")),
+        "a current file records its root whatever the caller passes"
     );
 }
 
@@ -1194,7 +1233,7 @@ fn a_schema_seven_namespace_with_session_tmp_root_is_refused() {
         "runtime_root = \"/run/user/1000/pohunek\"\nsession_tmp_root = \"/t/st\"",
     );
     let path = fixture.write(&text, 0o600);
-    match ServiceConfig::load_upgrade_source(&path, &cache_dir()) {
+    match ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())) {
         Err(ConfigError::Parse { message, .. }) => {
             assert!(message.contains("session_tmp_root"), "{message}");
         }
@@ -1213,7 +1252,7 @@ fn a_schema_six_file_with_a_hand_added_key_names_it_in_the_refusal() {
         ),
         0o600,
     );
-    let message = match ServiceConfig::load_upgrade_source(&path, &cache_dir()) {
+    let message = match ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())) {
         Err(ConfigError::Parse { message, .. }) => message,
         other => panic!("expected a parse refusal, got {other:?}"),
     };
@@ -1267,8 +1306,8 @@ fn upgrade_source_migrates_schema_three_keeping_input_and_adding_default_waits()
         ServiceConfig::load(&path),
         Err(ConfigError::UnsupportedSchema { found: 3 })
     ));
-    let source =
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()).expect("schema 3 upgrade source");
+    let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
+        .expect("schema 3 upgrade source");
     assert_eq!(source.source_schema_version, 3);
     assert_eq!(source.config.active_version(), "0.40.0");
     assert_eq!(
@@ -1322,7 +1361,8 @@ fn upgrade_source_migrates_schema_three_keeping_input_and_adding_default_waits()
         source.config
     );
 
-    let saved = ServiceConfig::load_upgrade_source(&backup, &cache_dir()).expect("verified backup");
+    let saved =
+        ServiceConfig::load_upgrade_source(&backup, Some(&cache_dir())).expect("verified backup");
     assert_eq!(saved.source_schema_version, 3);
     saved
         .write_original(&path)
@@ -1341,13 +1381,13 @@ fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
     let missing = replace(&previous, "grace_ms = 5000\n", "");
     let path = fixture.write(&missing, 0o600);
     assert!(matches!(
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()),
+        ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())),
         Err(ConfigError::Parse { .. })
     ));
     let unexpected = format!("{previous}\n[unexpected]\nvalue = 1\n");
     fixture.write(&unexpected, 0o600);
     assert!(matches!(
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()),
+        ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())),
         Err(ConfigError::Parse { .. })
     ));
     fixture.write(
@@ -1355,7 +1395,7 @@ fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
         0o600,
     );
     assert!(matches!(
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()),
+        ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())),
         Err(ConfigError::UnsupportedSchema { found: 1 })
     ));
     // Schema 3 is parsed in its exact shape: it neither lacks `[input]` nor
@@ -1372,7 +1412,7 @@ fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
         ),
     ] {
         fixture.write(&text, 0o600);
-        match ServiceConfig::load_upgrade_source(&path, &cache_dir()) {
+        match ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())) {
             Err(ConfigError::Parse { .. }) => {}
             other => panic!("schema 3 of the wrong shape: {other:?}"),
         }
@@ -1382,7 +1422,7 @@ fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
         0o600,
     );
     assert!(matches!(
-        ServiceConfig::load_upgrade_source(&path, &cache_dir()),
+        ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())),
         Err(ConfigError::UnsupportedSchema { found: 9 })
     ));
 }
@@ -2630,11 +2670,11 @@ fn previous_schema_sources_stay_strict() {
         (6, SCHEMA_SIX_GOLDEN, "grace_ms = 5000"),
     ] {
         fixture.write(golden, 0o600);
-        let source = ServiceConfig::load_upgrade_source(&path, &cache_dir())
+        let source = ServiceConfig::load_upgrade_source(&path, Some(&cache_dir()))
             .unwrap_or_else(|error| panic!("schema {version} golden loads: {error}"));
         assert_eq!(
             source.config.session_tmp_root(),
-            cache_dir().join("session-tmp"),
+            Some(cache_dir().join("session-tmp").as_path()),
             "schema {version} records the cache-based session temp root"
         );
         for text in [
@@ -2647,11 +2687,15 @@ fn previous_schema_sources_stay_strict() {
             format!("{golden}\n[future]\nvalue = 1\n"),
         ] {
             fixture.write(&text, 0o600);
-            match ServiceConfig::load_upgrade_source(&path, &cache_dir()) {
+            match ServiceConfig::load_upgrade_source(&path, Some(&cache_dir())) {
                 Err(ConfigError::Parse { .. }) => {}
                 other => panic!("schema {version} with an unknown key: {other:?}"),
             }
-            match ServiceConfig::load_upgrade_source_bytes(&path, text.as_bytes(), &cache_dir()) {
+            match ServiceConfig::load_upgrade_source_bytes(
+                &path,
+                text.as_bytes(),
+                Some(&cache_dir()),
+            ) {
                 Err(ConfigError::Parse { .. }) => {}
                 other => panic!("schema {version} bytes with an unknown key: {other:?}"),
             }

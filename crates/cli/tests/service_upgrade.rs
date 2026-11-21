@@ -313,7 +313,7 @@ async fn repair_synthetic_previous_reader(installation: &Installation, backend: 
     let config_path = installation.context.config_path();
     let config = pohunek_service_config::ServiceConfig::load_upgrade_source(
         &config_path,
-        &installation.context.paths().cache_dir,
+        Some(&installation.context.paths().cache_dir),
     )
     .expect("read the fixture config")
     .config;
@@ -399,7 +399,7 @@ async fn pending_migration(
     let schema_two = install_schema_two(installation);
     let source = pohunek_service_config::ServiceConfig::load_upgrade_source(
         &installation.context.config_path(),
-        &installation.context.paths().cache_dir,
+        Some(&installation.context.paths().cache_dir),
     )
     .expect("read previous schema");
     let layout = source.config.layout();
@@ -693,7 +693,7 @@ async fn upgrade_migrates_a_schema_seven_config_recording_the_cache_based_sessio
     // key of the schema-7 file is kept.
     let current = pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
         .expect("current schema");
-    assert_eq!(current.session_tmp_root(), default_root);
+    assert_eq!(current.session_tmp_root(), Some(default_root.as_path()));
     let mode = std::fs::metadata(&default_root)
         .expect("the upgrade created the default root")
         .permissions()
@@ -851,7 +851,7 @@ async fn upgrade_refuses_a_migration_whose_source_it_cannot_trust() {
     assert_eq!(
         pohunek_service_config::ServiceConfig::load_upgrade_source(
             &installation.context.config_path(),
-            &installation.context.paths().cache_dir
+            Some(&installation.context.paths().cache_dir)
         )
         .expect("the source is unchanged in shape")
         .source_schema_version,

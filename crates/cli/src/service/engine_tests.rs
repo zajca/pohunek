@@ -1173,6 +1173,54 @@ async fn install_status_upgrade_and_uninstall_round_trip() {
     ));
 }
 
+/// An install records the cache-based session temporary root and creates it
+/// owner-private, because the daemon never creates a root. An upgrade of an
+/// installation whose recorded root is elsewhere keeps that root and creates
+/// nothing there.
+#[tokio::test]
+async fn install_creates_only_the_default_session_tmp_root_and_an_upgrade_keeps_a_configured_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let default_root = harness.context.paths().cache_dir.join("session-tmp");
+    let config = harness.config().expect("config");
+    assert_eq!(config.session_tmp_root(), Some(default_root.as_path()));
+    let mode = std::fs::metadata(&default_root)
+        .expect("the install created the default root")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    let elsewhere = harness.root.join("elsewhere").join("session-tmp");
+    let mut spec = config.to_spec();
+    spec.session_tmp_root.clone_from(&elsewhere);
+    ServiceConfig::new(spec)
+        .expect("configuration with another root")
+        .write(&harness.context.config_path())
+        .expect("write the configured root");
+    std::fs::remove_dir(&default_root).expect("remove the default root");
+
+    harness.upgrade(V2).await.expect("upgrade");
+    assert_eq!(
+        harness
+            .config()
+            .expect("config")
+            .session_tmp_root()
+            .map(Path::to_path_buf),
+        Some(elsewhere.clone()),
+        "the upgrade keeps the configured root"
+    );
+    assert!(
+        !elsewhere.exists() && !elsewhere.parent().is_some_and(Path::exists),
+        "a configured root is never created by the installer"
+    );
+    assert!(
+        !default_root.exists(),
+        "the default root is not recreated for another configured root"
+    );
+}
+
 /// An uninstall never starts the configured daemon from an active version
 /// directory that fails verification; deleting the directory itself stays
 /// refused until the operator removes it.

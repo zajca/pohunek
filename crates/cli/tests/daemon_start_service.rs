@@ -109,7 +109,7 @@ impl Host {
         fs::write(&config, source).expect("write the schema-2 source");
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).expect("private config");
         let upgraded =
-            ServiceConfig::load_upgrade_source(&config, &self.path("cache").join("pohunek"))
+            ServiceConfig::load_upgrade_source(&config, Some(&self.path("cache").join("pohunek")))
                 .expect("schema-2 source")
                 .config;
         ServiceConfig::new(upgraded.to_spec())

@@ -422,14 +422,10 @@ fn print_upgrade_preflight(
 fn launch_environment(paths: &Paths, lenient: bool) -> Result<LaunchEnvironment, String> {
     let path = paths.config_dir.join(pohunek_service_config::FILE_NAME);
     if lenient {
-        return LaunchEnvironment::from_service_file_if_present(
-            &path,
-            &paths.cache_dir,
-            EnvironmentSource::Process,
-        )
-        .map(|environment| environment.unwrap_or_else(LaunchEnvironment::subprocess_default));
+        return LaunchEnvironment::from_service_file_if_present(&path, EnvironmentSource::Process)
+            .map(|environment| environment.unwrap_or_else(LaunchEnvironment::subprocess_default));
     }
-    LaunchEnvironment::from_service_file(&path, &paths.cache_dir, EnvironmentSource::Process)
+    LaunchEnvironment::from_service_file(&path, EnvironmentSource::Process)
 }
 
 /// The release `runtime/` directory beside the running daemon executable.
@@ -1073,10 +1069,15 @@ async fn build_session_registry(
                 warn!(%shortfall, "service.toml shutdown bounds do not fit the exit timeout");
             }
             apply_service_settings(&mut config, &service);
-            warn_unusable_session_tmp_root(service.session_tmp_root());
+            let tmp_root = service.session_tmp_root().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "service.toml records no namespace.session_tmp_root",
+                )
+            })?;
+            warn_unusable_session_tmp_root(tmp_root);
             config.session_tmp_root = Some(pohunek_daemon::session::store_session_tmp_root(
-                service.session_tmp_root(),
-                store_path,
+                tmp_root, store_path,
             )?);
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             let manager_path = follow_manager_path(&service).await;

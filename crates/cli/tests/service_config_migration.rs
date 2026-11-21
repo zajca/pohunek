@@ -4,8 +4,8 @@
 //! schema-2 configuration a v0.33.1 release wrote, the exact schema-3 shape
 //! that precedes `[waits]`, the schema-4 shape that predates the input write
 //! stall bound, the schema-5 shape that predates `[hooks]`, the schema-6 shape
-//! that predates `[events]`, or a
-//! current-schema file. No service manager is
+//! that predates `[events]`, the schema-7 shape that predates
+//! `namespace.session_tmp_root`, or a current-schema file. No service manager is
 //! involved: the check of an existing installation contacts only the new
 //! daemon's `upgrade-preflight`, which reads the store below the isolated
 //! roots beside this build's binaries — so `pohunekd` is expected next to
@@ -189,11 +189,30 @@ impl Host {
         }
     }
 
+    /// A previous schema-7 installation, as the release before
+    /// `namespace.session_tmp_root` wrote it, with the given `[waits]` values.
+    fn schema_seven_with_waits(default_ms: u64, max_ms: u64) -> Self {
+        Self {
+            template: SCHEMA_THREE_TEMPLATE,
+            repair: Box::new(move |template| waits_file(template, 7, default_ms, max_ms)),
+            temporary: temp_root(),
+        }
+    }
+
+    /// A current-schema file the `edit` rewrites after it is rendered.
+    fn current_edited(edit: fn(String) -> String) -> Self {
+        Self {
+            template: SCHEMA_THREE_TEMPLATE,
+            repair: Box::new(move |template| edit(waits_file(template, 8, 300_000, 1_800_000))),
+            temporary: temp_root(),
+        }
+    }
+
     /// A current-schema file with the given `[waits]` values.
     fn current_with_waits(default_ms: u64, max_ms: u64) -> Self {
         Self {
             template: SCHEMA_THREE_TEMPLATE,
-            repair: Box::new(move |template| waits_file(template, 7, default_ms, max_ms)),
+            repair: Box::new(move |template| waits_file(template, 8, default_ms, max_ms)),
             temporary: temp_root(),
         }
     }
@@ -203,7 +222,7 @@ impl Host {
         Self {
             template: SCHEMA_THREE_TEMPLATE,
             repair: Box::new(move |template| {
-                waits_file(template, 7, 300_000, 1_800_000).replace(
+                waits_file(template, 8, 300_000, 1_800_000).replace(
                     "stderr_tail_bytes = 4096",
                     &format!("stderr_tail_bytes = 4096\nrequired = {entries}"),
                 )
@@ -226,10 +245,12 @@ impl Host {
 
 /// Turns the schema-3 template into a schema-`version` file (4 or later) with
 /// the given `[waits]` values: the input write stall bound exists from schema 5
-/// on, `[hooks]` from schema 6 on and `[events]` from schema 7 on. The
-/// `active_version` is the release that first shipped the schema: v0.35.0 for
-/// schema 6 and v0.36.0 for schema 7. Schemas 4 and 5 were never released on
-/// their own, so they carry the v0.35.0 release that superseded them.
+/// on, `[hooks]` from schema 6 on, `[events]` from schema 7 on and
+/// `namespace.session_tmp_root` from schema 8 on. The `active_version` is the
+/// release that first shipped the schema: v0.35.0 for schema 6 and v0.36.0
+/// for schema 7; schema 8 keeps the v0.36.0 installation, which an upgrade
+/// replaces. Schemas 4 and 5 were never released on their own, so they carry
+/// the v0.35.0 release that superseded them.
 fn waits_file(template: &str, version: u32, default_ms: u64, max_ms: u64) -> String {
     let active_version = if version >= 7 { "0.36.0" } else { "0.35.0" };
     let template = template
@@ -257,10 +278,18 @@ fn waits_file(template: &str, version: u32, default_ms: u64, max_ms: u64) -> Str
     } else {
         template
     };
-    if version >= 7 {
+    let template = if version >= 7 {
         template.replace(
             "[limits]",
             "[events]\nmax_file_bytes = 33554432\nmax_files = 8\nmax_age_days = 14\n\n[limits]",
+        )
+    } else {
+        template
+    };
+    if version >= 8 {
+        template.replace(
+            "runtime_root = \"{RUNTIME_ROOT}\"",
+            "runtime_root = \"{RUNTIME_ROOT}\"\nsession_tmp_root = \"{SESSION_TMP_ROOT}\"",
         )
     } else {
         template
@@ -312,6 +341,16 @@ fn check(host: &Host) -> (bool, Value) {
 
 /// Runs the real check after a fixture has set up an interrupted transaction.
 fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bool, Value) {
+    check_in(host, None, setup)
+}
+
+/// [`check_with_setup`] with the cache directory the child resolves
+/// (`XDG_CACHE_HOME`) replaced by `cache_home`.
+fn check_in(
+    host: &Host,
+    cache_home: Option<&Path>,
+    setup: impl FnOnce(&Path, &Path, &[u8]),
+) -> (bool, Value) {
     let root = host.temporary.path();
     let dir = |name: &str| {
         let path = root.join(name);
@@ -347,7 +386,16 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
         .replace("{PREFIX}", &root.join("prefix").display().to_string())
         .replace("{UID}", &nix::unistd::Uid::effective().as_raw().to_string())
         .replace("{STATE_ROOT}", &state.join("pohunek").display().to_string())
-        .replace("{RUNTIME_ROOT}", &run.join("pohunek").display().to_string());
+        .replace("{RUNTIME_ROOT}", &run.join("pohunek").display().to_string())
+        .replace(
+            "{SESSION_TMP_ROOT}",
+            &root
+                .join("cache")
+                .join("pohunek")
+                .join("session-tmp")
+                .display()
+                .to_string(),
+        );
     fs::write(&config, template).expect("write fixture, a checked-in value");
     // The previous release wrote the file owner-private.
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).expect("private service.toml");
@@ -369,7 +417,10 @@ fn check_with_setup(host: &Host, setup: impl FnOnce(&Path, &Path, &[u8])) -> (bo
         .env("XDG_RUNTIME_DIR", env_of(&run))
         .env("XDG_STATE_HOME", env_of(&state))
         .env("XDG_DATA_HOME", env_of(&root.join("data")))
-        .env("XDG_CACHE_HOME", env_of(&root.join("cache")))
+        .env(
+            "XDG_CACHE_HOME",
+            env_of(&cache_home.map_or_else(|| root.join("cache"), Path::to_path_buf)),
+        )
         .env("XDG_CONFIG_HOME", env_of(&config_home))
         .env("HOME", env_of(&root.join("home")));
     let output = match real_bus_address() {
@@ -416,7 +467,7 @@ fn pending_migration(
             .join("cache")
             .join("pohunek");
         let mut spec =
-            pohunek_service_config::ServiceConfig::load_upgrade_source(config, &cache_dir)
+            pohunek_service_config::ServiceConfig::load_upgrade_source(config, Some(&cache_dir))
                 .expect("schema-2 source")
                 .config
                 .to_spec();
@@ -564,6 +615,73 @@ fn check_accepts_a_schema_six_config_and_names_the_migration() {
         Some(6),
         "{envelope}: the check names the schema-6 migration"
     );
+}
+
+#[test]
+fn check_accepts_a_schema_seven_config_and_names_the_migration() {
+    let host = Host::schema_seven_with_waits(120_000, 2_700_000);
+    let Some((success, envelope)) = check_passing(&host) else {
+        return;
+    };
+    assert!(success, "{envelope}");
+    assert_eq!(
+        envelope
+            .get("ok")
+            .and_then(|report| report.get("config_schema_migration"))
+            .and_then(Value::as_u64),
+        Some(7),
+        "{envelope}: the check names the schema-7 migration"
+    );
+}
+
+/// The refusal document of a check that must fail on the configuration, with
+/// the asserted key named in its message.
+fn assert_config_refusal_naming(success: bool, envelope: &Value, key: &str) {
+    assert!(!success, "{envelope}: the check refuses the file");
+    let refusal = envelope.get("err").expect("the refusal document");
+    assert_eq!(
+        refusal.get("code").and_then(Value::as_str),
+        Some("service_config_invalid"),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal
+            .get("msg")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains(key)),
+        "{refusal:?}: the refusal names {key}"
+    );
+}
+
+#[test]
+fn check_refuses_a_current_schema_config_without_a_session_tmp_root_naming_the_key() {
+    let host = Host::current_edited(|text| {
+        text.replace("session_tmp_root = \"{SESSION_TMP_ROOT}\"\n", "")
+    });
+    let (success, envelope) = check(&host);
+    assert_config_refusal_naming(success, &envelope, "session_tmp_root");
+}
+
+#[test]
+fn check_refuses_a_relative_session_tmp_root_naming_the_key() {
+    let host =
+        Host::current_edited(|text| text.replace("\"{SESSION_TMP_ROOT}\"", "\"relative/tmp\""));
+    let (success, envelope) = check(&host);
+    assert_config_refusal_naming(success, &envelope, "namespace.session_tmp_root");
+}
+
+/// The migration preview derives the root of a schema-7 file from the cache
+/// directory and refuses a cache directory that cannot hold a recorded path.
+#[test]
+fn check_refuses_a_schema_seven_config_when_the_cache_directory_cannot_hold_the_derived_root() {
+    let host = Host::schema_seven_with_waits(120_000, 2_700_000);
+    let mut cache_home = host.temporary.path().join("cache");
+    // More than the 4096 bytes a recorded path may have.
+    for _ in 0..24 {
+        cache_home.push("c".repeat(200));
+    }
+    let (success, envelope) = check_in(&host, Some(&cache_home), |_, _, _| {});
+    assert_config_refusal_naming(success, &envelope, "namespace.session_tmp_root");
 }
 
 #[test]

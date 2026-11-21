@@ -1203,7 +1203,7 @@ pub(crate) fn check_local(
                 None,
             )
         } else {
-            let config_source = verified_config_source(context)?;
+            let config_source = verified_config_source(context, Some(&context.paths().cache_dir))?;
             engine::upgrade_preflight(context)?;
             let plan = engine::upgrade_plan(pending, version)?;
             if let Some(record) = plan.record() {
@@ -1557,17 +1557,23 @@ fn verified_connection(context: &Context) -> Result<(Namespace, Duration), Error
 ///
 /// See [`verified_connection`].
 fn verified_config(context: &Context) -> Result<ServiceConfig, Error> {
-    Ok(verified_config_source(context)?.config)
+    Ok(verified_config_source(context, None)?.config)
 }
 
 /// Like [`verified_config`], and reports how `service.toml` was read.
 ///
+/// `cache_dir` is passed only by a caller that renders the migrated file: a
+/// previous schema's session temporary root is derived from it there and stays
+/// unrecorded otherwise.
+///
 /// # Errors
 ///
 /// See [`verified_connection`].
-fn verified_config_source(context: &Context) -> Result<UpgradeSource, Error> {
-    let source =
-        ServiceConfig::load_upgrade_source(&context.config_path(), &context.paths().cache_dir)?;
+fn verified_config_source(
+    context: &Context,
+    cache_dir: Option<&Path>,
+) -> Result<UpgradeSource, Error> {
+    let source = ServiceConfig::load_upgrade_source(&context.config_path(), cache_dir)?;
     source.config.verify_installation(
         context.uid(),
         &context.paths().state_dir,
@@ -1586,6 +1592,8 @@ fn exists(path: &Path) -> Result<bool, Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use pohunek_paths::{BasePaths, PathEnv, Platform};
     use pohunek_service_config::ConfigError;
 
@@ -1602,11 +1610,28 @@ mod tests {
         state_home: &Path,
         runtime_dir: &Path,
     ) -> BasePaths {
+        paths_with_cache(
+            root,
+            config_home,
+            state_home,
+            runtime_dir,
+            &root.join("cache"),
+        )
+    }
+
+    /// [`moved_paths`] with the cache home a test names.
+    fn paths_with_cache(
+        root: &Path,
+        config_home: &Path,
+        state_home: &Path,
+        runtime_dir: &Path,
+        cache_home: &Path,
+    ) -> BasePaths {
         let env = PathEnv {
             xdg_runtime_dir: Some(OsString::from(runtime_dir)),
             xdg_data_home: Some(OsString::from(root.join("data"))),
             xdg_state_home: Some(OsString::from(state_home)),
-            xdg_cache_home: Some(OsString::from(root.join("cache"))),
+            xdg_cache_home: Some(OsString::from(cache_home)),
             xdg_config_home: Some(OsString::from(config_home)),
             home: Some(OsString::from(root.join("home"))),
         };
@@ -1657,10 +1682,60 @@ mod tests {
         (temp, root, context, state_root)
     }
 
+    /// A reader that never writes the file does not depend on the cache
+    /// directory a previous schema's session temporary root is derived from;
+    /// only the migration preview, which renders the migrated file, does.
+    #[test]
+    fn reading_a_previous_schema_file_does_not_depend_on_the_cache_directory() {
+        let (_temp, root, context, _state) = installed();
+        let current = fs::read_to_string(context.config_path()).expect("read the config");
+        let previous = current
+            .replace("schema_version = 8", "schema_version = 7")
+            .lines()
+            .filter(|line| !line.starts_with("session_tmp_root"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(context.config_path(), previous).expect("write the schema-7 file");
+
+        // More than the 4096 bytes a recorded path may have.
+        let mut cache_home = root.join("cache");
+        for _ in 0..24 {
+            cache_home.push("c".repeat(200));
+        }
+        let unusable = Context::new(
+            paths_with_cache(
+                &root,
+                &root.join("config"),
+                &root.join("state"),
+                &root.join("run"),
+                &cache_home,
+            ),
+            nix::unistd::Uid::effective().as_raw(),
+            Some(root.join("home")),
+            Some(root.join("run")),
+            root.join("units"),
+            PathBuf::from("/usr/bin/pohunek"),
+        );
+
+        let config = verified_config(&unusable).expect("a read-only path reads the file");
+        assert_eq!(config.session_tmp_root(), None);
+        assert_eq!(config.active_version(), "1.0.0");
+        let error = verified_config_source(&unusable, Some(&unusable.paths().cache_dir))
+            .expect_err("the migration preview derives the root from the cache directory");
+        assert!(
+            matches!(
+                &error,
+                Error::Config(ConfigError::InvalidPath { key, .. })
+                    if *key == "namespace.session_tmp_root"
+            ),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn check_reports_a_pending_rollback_migration_only_when_it_would_upgrade_again() {
         let (_temp, root, context, _state) = installed();
-        let source = verified_config_source(&context).expect("current config");
+        let source = verified_config_source(&context, None).expect("current config");
         let record = record::Record {
             schema_version: record::SCHEMA_VERSION,
             operation: record::Operation::Upgrade,

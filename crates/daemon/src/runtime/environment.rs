@@ -73,19 +73,14 @@ impl LaunchEnvironment {
     /// Reads the allowlist of the installed service file at `path`, read-only,
     /// as daemon startup reads it, over the environment `source`.
     ///
-    /// `cache_dir` is the application cache directory; a service file of a
-    /// previous schema derives its session temporary root from it, which this
-    /// read does not use.
-    ///
     /// # Errors
     ///
     /// Returns the reason the file cannot be read or parsed.
     pub fn from_service_file(
         path: &std::path::Path,
-        cache_dir: &std::path::Path,
         source: EnvironmentSource,
     ) -> Result<Self, String> {
-        Self::read_service_file(path, cache_dir, source).map_err(|error| error.to_string())
+        Self::read_service_file(path, source).map_err(|error| error.to_string())
     }
 
     /// [`Self::from_service_file`] for a host that may have no installed service
@@ -98,10 +93,9 @@ impl LaunchEnvironment {
     /// Returns the reason an existing file cannot be read or parsed.
     pub fn from_service_file_if_present(
         path: &std::path::Path,
-        cache_dir: &std::path::Path,
         source: EnvironmentSource,
     ) -> Result<Option<Self>, String> {
-        match Self::read_service_file(path, cache_dir, source) {
+        match Self::read_service_file(path, source) {
             Ok(environment) => Ok(Some(environment)),
             Err(pohunek_service_config::ConfigError::Io { source, .. })
                 if source.io_kind() == Some(std::io::ErrorKind::NotFound) =>
@@ -114,10 +108,9 @@ impl LaunchEnvironment {
 
     fn read_service_file(
         path: &std::path::Path,
-        cache_dir: &std::path::Path,
         source: EnvironmentSource,
     ) -> Result<Self, pohunek_service_config::ConfigError> {
-        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path, cache_dir)?;
+        let config = pohunek_service_config::ServiceConfig::load_upgrade_source(path, None)?;
         Ok(Self::new(
             config.config.environment_allowlist().to_vec(),
             source,

@@ -2463,12 +2463,8 @@ async fn the_service_file_allowlist_decides_the_path_the_version_probe_runs_unde
     let source = host.source();
     let judge = |allowlist: &[String]| {
         let service = host.write_service(allowlist);
-        let launch = LaunchEnvironment::from_service_file(
-            &service,
-            &host.env.cache_home().join("pohunek"),
-            source.clone(),
-        )
-        .expect("the service file reads");
+        let launch = LaunchEnvironment::from_service_file(&service, source.clone())
+            .expect("the service file reads");
         run_with(
             &host.inputs(),
             &PreflightOptions {
@@ -2513,11 +2509,7 @@ fn an_unreadable_service_file_refuses_the_plan() {
     host.write_store(&[built_in_line("claude", "s-1", "w-one")]);
     host.write_journal("s-1", "w-one", &journal("s-1", "w-one"));
     let missing = host.env.root().join("missing").join("service.toml");
-    let launch = LaunchEnvironment::from_service_file(
-        &missing,
-        &host.env.cache_home().join("pohunek"),
-        host.source(),
-    );
+    let launch = LaunchEnvironment::from_service_file(&missing, host.source());
     assert!(launch.is_err(), "a missing service file is not read");
 
     let report = run_with(
