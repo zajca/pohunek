@@ -217,6 +217,46 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
      earlier body, open a pohunek.dev pull request that sets that entry's
      `source` to `"release-notes"` and its `markdown` to the text between the
      markers of the published body, trimmed.
+   - **X.com thread (required).** The owner announces each release on X.com.
+     Draft the thread from the approved release post (the text between the
+     markers) as sent for review, so the owner reviews both together; redraft
+     it when the review changes the post. The skill never posts to X.com and never asks for X credentials:
+     publishing is the owner's action.
+     - **Shape.** English, 3 to 5 posts for every release, a patch included,
+       each at most 280 characters. A URL counts as 23 characters
+       whatever its length. The first post says what the release is and links
+       `https://github.com/zajca/pohunek/releases/tag/vX.Y.Z`; the following
+       posts each carry one highlight of the release post, in plain words and
+       in the post's order; the last post may link `https://pohunek.dev`. Name
+       only commands, flags and settings that the published release post names.
+       Make no claim the release post does not make: no performance numbers,
+       platform support or "now works everywhere" that the post does not state.
+       Follow the post's `Upgrading` section when a highlight needs an operator
+       action. No emoji, no hashtags.
+     - **Plugin releases.** A plugin release that ships in the same cycle
+       (`pohunekd/plugin-assistant` of step 9 included) is never part of the
+       thread. Once its release is verified (attestation checked) and the
+       plugin is admitted to the official plugin index, it gets a separate
+       single-post file, checked like the thread. Until then it is only a note
+       to the owner that it is not yet postable.
+     - **Draft file.** Write the posts to a file outside the checkout, in order,
+       separated by a line holding only `---`, with no numbering inside the
+       text. The file holds posts only; notes for the owner (a pending plugin
+       post, a link to confirm) go in the artifact or report next to it.
+     - **Length check.** Print each post's length; every value must be at most
+       280:
+
+       ```bash
+       X=$(mktemp -t pohunek-vX.Y.Z-x.XXXXXX)   # outside the checkout; keep the path
+       python3 -I -c 'import re,sys; ps=open(sys.argv[1]).read().split("\n---\n"); print([(i,len(re.sub(r"https?://\S+","x"*23,p.strip()))) for i,p in enumerate(ps,1)])' "$X"
+       ```
+
+       A post over 280 is shortened, not split into more posts than the
+       thread allows.
+     - **Review.** Hand the draft to the owner: for a manager session a board
+       artifact (`board.sh artifact`), otherwise the file path in the report of
+       step 11. State that nothing was published. The thread is posted only
+       after the release post is published and the website entry is checked.
 
 9. **Release `pohunekd/plugin-assistant` from the new core tag.** The assistant
    knowledge bundle ships as the context package `pohunek.context.assistant`, and
@@ -270,7 +310,8 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
 11. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
    the workflow failed, report why with output — a failed gate means no binary
-   was published. Include the release post URL and who approved it, the
+   was published. Include the release post URL and who approved it, the path or
+   board artifact of the X.com thread draft (not posted), the
    plugin-assistant release and its digest, and the state of each downstream
    consumer of step 10.
 
@@ -284,5 +325,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
   own pull requests and releases.
 - Never publish a release post that still holds `TODO(release-post)` or that
   the coordinator or owner has not approved.
+- Never post to X.com and never ask for X credentials: step 8 only drafts the
+  thread for the owner.
 - Verify the release actually published; never report "released" from the tag
   push alone without checking the workflow and the GitHub Release.

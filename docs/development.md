@@ -841,6 +841,10 @@ contract fixtures in `scripts/tests/fixtures/changelog` pin the byte-exact outpu
 
 ## Release
 
+The `release` skill also drafts the owner's X.com thread from the approved release
+post (3 to 5 posts of at most 280 characters, a URL counting 23, with a length
+check) and hands it over for review; the thread is never posted by the skill.
+
 `scripts/release` bumps the workspace version and refreshes the lockfile, folds the
 changelog fragments into `CHANGELOG.md`, then requires successful main and nightly
 CI evidence for the exact release commit before tagging `vX.Y.Z`. By default it pushes the release branch before waiting
