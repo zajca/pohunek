@@ -96,10 +96,6 @@ const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
 
 /// Subdirectory under the data dir holding per-session git worktrees.
 const WORKTREES_SUBDIR: &str = "worktrees";
-/// Directory under the cache dir that holds, per store, each session's private
-/// `TMPDIR`.
-const SESSION_TMP_SUBDIR: &str = "session-tmp";
-
 /// Subdirectory under the data dir holding the append-only event log.
 const EVENTS_SUBDIR: &str = "events";
 /// Per-session worker socket root under the owner-private runtime directory.
@@ -662,15 +658,10 @@ async fn run() -> Result<(), DaemonError> {
     // The schema migration runs before the registry exists so reconciliation and
     // adoption only ever see a store at the current schema.
     pohunek_daemon::store::migrate_at_startup(&store_path)?;
-    let session_tmp_root = pohunek_daemon::session::store_session_tmp_root(
-        &paths.cache_dir.join(SESSION_TMP_SUBDIR),
-        &store_path,
-    )?;
     let config = SessionRegistryConfig {
         socket_path: Some(paths.socket.clone()),
-        store_path: Some(store_path),
+        store_path: Some(store_path.clone()),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
-        session_tmp_root: Some(session_tmp_root),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),
         log_dir: Some(paths.log_dir.clone()),
@@ -690,7 +681,8 @@ async fn run() -> Result<(), DaemonError> {
         worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),
         ..SessionRegistryConfig::default()
     };
-    let (sessions, shutdown_plan) = build_session_registry(config, &paths, mode).await?;
+    let (sessions, shutdown_plan) =
+        build_session_registry(config, &store_path, &paths, mode).await?;
     let tasks = DaemonShutdown::new(shutdown_plan);
     // Load the durable retention policy before anything can sweep: a corrupt or
     // unsafely-permissioned document must fail startup rather than silently
@@ -1031,9 +1023,46 @@ fn warn_unknown_service_keys(service: &ServiceConfig, path: &Path) {
     }
 }
 
+/// Logs one warning when the configured session temporary root cannot be used.
+///
+/// The daemon keeps serving: each launch that needs the root fails with a typed
+/// error naming it, and the daemon never creates the root itself.
+fn warn_unusable_session_tmp_root(base: &Path) {
+    if let Some(reason) = pohunek_daemon::session::session_tmp_base_problem(base) {
+        warn!(
+            event = "session.tmp_root_unusable",
+            path = %base.display(),
+            reason = %reason,
+            "the configured session temporary root is unusable; session launches fail until it is fixed"
+        );
+    }
+}
+
+/// Returns the per-store session temporary root below the root `service.toml`
+/// records, warning once when that root is unusable.
+fn configured_store_tmp_root(
+    service: &ServiceConfig,
+    store_path: &Path,
+) -> Result<PathBuf, DaemonError> {
+    let tmp_root = service.session_tmp_root().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "service.toml records no namespace.session_tmp_root",
+        )
+    })?;
+    warn_unusable_session_tmp_root(tmp_root);
+    Ok(pohunek_daemon::session::store_session_tmp_root(
+        tmp_root, store_path,
+    )?)
+}
+
 /// Builds the session registry with the worker supervisor of `mode`.
+///
+/// `store_path` names the metadata store whose key separates this daemon's
+/// session temporary directories from another store's below the same root.
 async fn build_session_registry(
     mut config: SessionRegistryConfig,
+    store_path: &Path,
     paths: &Paths,
     mode: SupervisionMode,
 ) -> Result<(SessionRegistry, ShutdownPlan), DaemonError> {
@@ -1058,6 +1087,7 @@ async fn build_session_registry(
                 warn!(%shortfall, "service.toml shutdown bounds do not fit the exit timeout");
             }
             apply_service_settings(&mut config, &service);
+            config.session_tmp_root = Some(configured_store_tmp_root(&service, store_path)?);
             let (supervisor, worker_logs) = native_supervisor(&service, paths).await?;
             let manager_path = follow_manager_path(&service).await;
             if let Some(manager_path) = &manager_path {
@@ -1090,6 +1120,13 @@ async fn build_session_registry(
         }
         SupervisionMode::Subprocess => {
             config.worker_connect_deadline = DEV_WORKER_CONNECT;
+            // Without `service.toml` nothing records a root and no installer ran,
+            // so this daemon creates the default one it stands in for.
+            let tmp_base = pohunek_service_config::default_session_tmp_root(&paths.cache_dir);
+            ensure_private_dir(&tmp_base)?;
+            config.session_tmp_root = Some(pohunek_daemon::session::store_session_tmp_root(
+                &tmp_base, store_path,
+            )?);
             let namespace = Namespace::derive(
                 nix::unistd::Uid::effective().as_raw(),
                 &std::fs::canonicalize(&paths.state_dir)?,
@@ -2378,10 +2415,11 @@ mod supervision_tests {
             .expect("chmod config directory");
         let file = dir.path().join(pohunek_service_config::FILE_NAME);
         let text = format!(
-            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+            "schema_version = 8\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
              future_top = \"{SECRET}\"\n\
              [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
              runtime_root = \"/run/user/1000/pohunek\"\n\
+             session_tmp_root = \"/home/u/.cache/pohunek/session-tmp\"\n\
              [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
              launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
              daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\
@@ -2433,9 +2471,10 @@ mod supervision_tests {
             .expect("chmod config directory");
         let file = dir.path().join(pohunek_service_config::FILE_NAME);
         let text = String::from(
-            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+            "schema_version = 8\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
              [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
              runtime_root = \"/run/user/1000/pohunek\"\n\
+             session_tmp_root = \"/home/u/.cache/pohunek/session-tmp\"\n\
              [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
              launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
              daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\
@@ -2478,9 +2517,10 @@ mod supervision_tests {
             .expect("chmod config directory");
         let file = dir.path().join(pohunek_service_config::FILE_NAME);
         let text = String::from(
-            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+            "schema_version = 8\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
              [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
              runtime_root = \"/run/user/1000/pohunek\"\n\
+             session_tmp_root = \"/home/u/.cache/pohunek/session-tmp\"\n\
              [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
              launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
              daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\
@@ -2519,9 +2559,10 @@ mod supervision_tests {
             .expect("chmod config directory");
         let file = dir.path().join(pohunek_service_config::FILE_NAME);
         let text = String::from(
-            "schema_version = 7\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
+            "schema_version = 8\nprefix = \"/home/u/.local\"\nactive_version = \"0.35.2\"\n\
              [namespace]\nuid = 1000\nstate_root = \"/home/u/.local/state/pohunek\"\n\
              runtime_root = \"/run/user/1000/pohunek\"\n\
+             session_tmp_root = \"/home/u/.cache/pohunek/session-tmp\"\n\
              [deadlines]\nworker_connect_ms = 10000\nworker_initialize_ms = 45000\n\
              launchctl_command_ms = 10000\nworker_exit_timeout_ms = 30000\n\
              daemon_exit_timeout_ms = 30000\ndaemon_restart_throttle_ms = 5000\n\

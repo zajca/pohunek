@@ -197,6 +197,7 @@ mod tests {
             uid,
             state_root: fs::canonicalize(&paths.state_dir).expect("state root"),
             runtime_root: fs::canonicalize(&paths.runtime_dir).expect("runtime root"),
+            session_tmp_root: paths.cache_dir.join("session-tmp"),
             deadlines: Deadlines {
                 worker_connect: deadline,
                 worker_initialize: deadline,

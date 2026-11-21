@@ -199,6 +199,57 @@ submit_delay_ms = 275
 open_files = 8192
 "#;
 
+/// Frozen schema-7 shape, the last one without `namespace.session_tmp_root`.
+/// The `[sweep]` table holds a key schema 7 tolerated and an upgrade keeps.
+const SCHEMA_SEVEN_TEMPLATE: &str = r#"# Pohunek service configuration, written by `pohunek service install`.
+# Every key is required; unknown keys are rejected.
+
+schema_version = 7
+prefix = "{PREFIX}"
+active_version = "{VERSION}"
+
+[namespace]
+uid = {UID}
+state_root = "{STATE_ROOT}"
+runtime_root = "{RUNTIME_ROOT}"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = ["/usr/bin"]
+allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_*", "XDG_*"]
+
+[sweep]
+grace_ms = 5000
+future_sweep = 1
+
+[input]
+initial_startup_grace_ms = 5000
+submit_delay_ms = 150
+write_stall_timeout_ms = 3000
+
+[waits]
+turn_default_ms = 300000
+turn_max_ms = 1800000
+
+[hooks]
+stderr_tail_bytes = 4096
+
+[events]
+max_file_bytes = 33554432
+max_files = 8
+max_age_days = 14
+
+[limits]
+open_files = 8192
+"#;
+
 /// A schema-2 `service.toml` for this isolated installation. Tests capture
 /// these bytes before the transaction and compare them after exact restore.
 fn schema_two_config(installation: &Installation) -> Vec<u8> {
@@ -260,9 +311,12 @@ fn backup_path(installation: &Installation) -> PathBuf {
 /// only that synthetic reader: the current binary itself requires the current schema.
 async fn repair_synthetic_previous_reader(installation: &Installation, backend: &Backend) {
     let config_path = installation.context.config_path();
-    let config = pohunek_service_config::ServiceConfig::load_upgrade_source(&config_path)
-        .expect("read the fixture config")
-        .config;
+    let config = pohunek_service_config::ServiceConfig::load_upgrade_source(
+        &config_path,
+        Some(&installation.context.paths().cache_dir),
+    )
+    .expect("read the fixture config")
+    .config;
     config
         .write(&config_path)
         .expect("write a current-schema fixture config");
@@ -345,6 +399,7 @@ async fn pending_migration(
     let schema_two = install_schema_two(installation);
     let source = pohunek_service_config::ServiceConfig::load_upgrade_source(
         &installation.context.config_path(),
+        Some(&installation.context.paths().cache_dir),
     )
     .expect("read previous schema");
     let layout = source.config.layout();
@@ -593,6 +648,76 @@ async fn upgrade_migrates_a_schema_three_config_keeping_its_input_timing() {
     target_os = "linux",
     ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
 )]
+async fn upgrade_migrates_a_schema_seven_config_recording_the_cache_based_session_tmp_root() {
+    let mut installation = Installation::new();
+    installation.reported_version = Some(VERSION.to_owned());
+    let from = installation.stage();
+    let namespace = installation.context.namespace().expect("namespace");
+    let backend = connect(&installation.context, &namespace).await;
+    let prefix = installation.prefix();
+    let old = VERSION.to_owned();
+    let new = format!("{VERSION}{UPGRADE_SUFFIX}");
+
+    Engine::new(&installation.context, &backend)
+        .install(&from, &prefix, &old)
+        .await
+        .expect("install version A");
+    let old_daemon = daemon_process(&backend).await;
+    // A schema-7 installation never had the installer create the root.
+    let default_root = installation
+        .context
+        .default_session_tmp_root()
+        .expect("default root");
+    std::fs::remove_dir(&default_root).expect("remove the installed default root");
+    std::fs::write(
+        installation.context.config_path(),
+        previous_config(&installation, SCHEMA_SEVEN_TEMPLATE),
+    )
+    .expect("write the schema-7 source");
+
+    let report = Engine::new(&installation.context, &backend)
+        .with_reported_version(old.clone())
+        .upgrade(&from, &new)
+        .await
+        .expect("migrating upgrade");
+    assert_eq!(
+        report.config_schema_migration,
+        Some(7),
+        "{report:?}: the report names the schema-7 migration"
+    );
+    eventually("the daemon restarted from version B", || async {
+        let daemon = backend.daemon().inspect().await.ok()?;
+        daemon.process.filter(|process| *process != old_daemon)
+    })
+    .await;
+
+    // The root is recorded explicitly at the cache-based default, which the upgrade
+    // created owner-private because the daemon never creates it; the unknown
+    // key of the schema-7 file is kept.
+    let current = pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
+        .expect("current schema");
+    assert_eq!(current.session_tmp_root(), Some(default_root.as_path()));
+    let mode = std::fs::metadata(&default_root)
+        .expect("the upgrade created the default root")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+    assert!(
+        current
+            .unknown_keys()
+            .iter()
+            .any(|key| key.path == "sweep.future_sweep"),
+        "{:?}",
+        current.unknown_keys()
+    );
+    assert_eq!(pending_record(&installation), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1, a systemd user manager, and built daemon/worker binaries"
+)]
 async fn upgrade_resumes_a_migration_from_its_journaled_state() {
     let mut installation = Installation::new();
     installation.reported_version = Some(VERSION.to_owned());
@@ -728,7 +853,8 @@ async fn upgrade_refuses_a_migration_whose_source_it_cannot_trust() {
     );
     assert_eq!(
         pohunek_service_config::ServiceConfig::load_upgrade_source(
-            &installation.context.config_path()
+            &installation.context.config_path(),
+            Some(&installation.context.paths().cache_dir)
         )
         .expect("the source is unchanged in shape")
         .source_schema_version,

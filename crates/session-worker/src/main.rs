@@ -360,6 +360,7 @@ mod tests {
             uid: 1000,
             state_root: PathBuf::from("/home/u/.local/state/pohunek"),
             runtime_root: PathBuf::from("/run/user/1000/pohunek"),
+            session_tmp_root: PathBuf::from("/home/u/.cache/pohunek/session-tmp"),
             deadlines: Deadlines {
                 worker_connect: other,
                 worker_initialize,

@@ -88,7 +88,7 @@ pub(crate) fn load_installed_config(context: &Context) -> Result<(ServiceConfig,
     // One trusted read supplies the typed values and the exact bytes. A file of
     // another schema may not parse as the older one the upgrade reader accepts,
     // so a failure is classified by the strict reader, which names the schema.
-    let source = match ServiceConfig::load_upgrade_source(&config_path) {
+    let source = match ServiceConfig::load_upgrade_source(&config_path, None) {
         Ok(source) => source,
         Err(ConfigError::UnsupportedSchema { found }) => {
             return Err(Error::RefreshConfigSchema {

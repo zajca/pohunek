@@ -118,6 +118,7 @@ impl Host {
             self.env.root(),
             &state,
             &runtime,
+            &self.env.cache_home().join(APP_DIR).join("session-tmp"),
             allowlist,
         );
     }

@@ -8281,6 +8281,19 @@ const TMPDIR_SCRIPT: &str = concat!(
     "exec sleep 30",
 );
 
+/// Creates the configured session temporary root `name` below the test
+/// directory with mode 0700, as the installer does for the default root, and
+/// returns it. The daemon never creates this directory itself.
+fn private_tmp_base(socket: &TestSocket, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = socket.dir.join(name);
+    std::fs::create_dir(&base).expect("create the configured session temporary root");
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+        .expect("make the configured root private");
+    base
+}
+
 /// Starts a session of `agent` in `cwd` and returns it with the `TMPDIR` its
 /// child saw.
 async fn session_with_reported_tmpdir(
@@ -8320,7 +8333,7 @@ async fn every_session_gets_a_private_tmpdir_that_its_removal_deletes() {
     use std::os::unix::fs::PermissionsExt;
 
     let socket = temp_socket("session-tmpdir");
-    let tmp_root = socket.dir.join("cache").join("session-tmp");
+    let tmp_root = private_tmp_base(&socket, "cache").join("session-tmp");
     let profile_tmpdir = temp_dir("profile-tmpdir");
     let agents = socket.dir.join("agents");
     std::fs::create_dir(&agents).expect("create agent profiles");
@@ -8433,7 +8446,7 @@ async fn startup_deletes_the_tmpdirs_of_sessions_without_a_record() {
         "exec sleep 30",
     );
     let socket = temp_socket("session-tmpdir-orphans");
-    let tmp_root = socket.dir.join("cache").join("session-tmp");
+    let tmp_root = private_tmp_base(&socket, "cache").join("session-tmp");
     let store_path = socket.dir.join("metadata.jsonl");
     let outside = temp_dir("orphan-link-target");
     std::fs::write(outside.join("kept"), b"").expect("write the symlink target's file");
@@ -8540,7 +8553,7 @@ async fn a_wide_read_only_tmpdir_is_deleted_under_a_low_descriptor_limit() {
     }
 
     let socket = temp_socket("wide-tmpdir");
-    let tmp_root = socket.dir.join("cache").join("session-tmp");
+    let tmp_root = private_tmp_base(&socket, "cache").join("session-tmp");
     let script = format!(
         concat!(
             "mkdir \"$TMPDIR/wide\" && i=0 && ",
@@ -8695,6 +8708,115 @@ async fn a_symlinked_tmpdir_root_refuses_the_launch() {
     assert!(
         sessions.is_empty(),
         "the refused session is not listed: {sessions:?}"
+    );
+    assert!(!started.exists(), "the agent never starts");
+    assert_eq!(
+        std::fs::read_dir(&elsewhere)
+            .expect("list the symlink target")
+            .count(),
+        0,
+        "nothing is created through the symlink"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A session launched under a configured temporary root that is another
+/// directory than the default one gets its `TMPDIR` below that root.
+#[tokio::test]
+async fn a_session_under_a_configured_tmp_root_gets_its_tmpdir_below_it() {
+    let socket = temp_socket("session-tmpdir-configured");
+    let base = private_tmp_base(&socket, "st");
+    let tmp_root = base.join("0123456789abcdef");
+    let cwd = temp_dir("session-tmpdir-configured-cwd");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", TMPDIR_SCRIPT]),
+        session_tmp_root: Some(tmp_root.clone()),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let (session, tmpdir) = session_with_reported_tmpdir(&mut control, "shell", &cwd).await;
+    assert_eq!(tmpdir, tmp_root.join(&session.id.0));
+    assert!(
+        tmpdir.is_dir(),
+        "the session directory exists below the root"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A configured temporary root that does not exist fails the launch with the
+/// typed error naming it, leaves nothing at that path, and the daemon keeps
+/// serving other requests.
+#[tokio::test]
+async fn a_missing_configured_tmp_root_fails_the_launch_and_is_not_created() {
+    let socket = temp_socket("session-tmpdir-missing");
+    let base = socket.dir.join("not-mounted");
+    let started = socket.dir.join("agent-started");
+    let script = format!("touch '{}'; exec sleep 30", started.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        session_tmp_root: Some(base.join("0123456789abcdef")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let error =
+        err_payload(create_session_with_params(&mut control, session_params(&socket)).await);
+    assert_eq!(error.code, "session_tmpdir_failed", "{error}");
+    assert_eq!(error.class, ErrorClass::Runtime);
+    assert!(
+        error.msg.contains(&base.display().to_string()),
+        "the error names the configured root: {error}"
+    );
+    assert!(!started.exists(), "the agent never starts");
+    assert!(
+        std::fs::symlink_metadata(&base).is_err(),
+        "the daemon never creates the configured root"
+    );
+    let list = Request::make("tmpdir-missing-list", method::SESSION_LIST, Value::Null);
+    let sessions: Vec<SessionInfo> =
+        serde_json::from_value(ok_payload(exchange(&mut control, &list).await))
+            .expect("the daemon still serves requests");
+    assert!(
+        sessions.is_empty(),
+        "the refused session is not listed: {sessions:?}"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// A configured temporary root reached through a symlink is refused naming it,
+/// and nothing is created through the link.
+#[tokio::test]
+async fn a_symlinked_configured_tmp_root_refuses_the_launch() {
+    let socket = temp_socket("session-tmpdir-base-symlink");
+    let elsewhere = socket.dir.join("elsewhere");
+    std::fs::create_dir(&elsewhere).expect("create the symlink target");
+    let base = socket.dir.join("st");
+    std::os::unix::fs::symlink(&elsewhere, &base).expect("plant the symlinked root");
+    let started = socket.dir.join("agent-started");
+    let script = format!("touch '{}'; exec sleep 30", started.display());
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        session_tmp_root: Some(base.join("0123456789abcdef")),
+        ..support::hermetic_registry_config()
+    };
+    let (shutdown, handle, _) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let error =
+        err_payload(create_session_with_params(&mut control, session_params(&socket)).await);
+    assert_eq!(error.code, "session_tmpdir_unsafe", "{error}");
+    assert!(
+        error.msg.contains(&base.display().to_string()),
+        "the error names the configured root: {error}"
     );
     assert!(!started.exists(), "the agent never starts");
     assert_eq!(
