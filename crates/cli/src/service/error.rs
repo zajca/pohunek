@@ -1326,7 +1326,7 @@ impl Error {
                 Some("wait for the other `pohunek service` command to finish, then retry")
             }
             Self::SearchPathUnmanaged => Some(
-                "nothing to refresh: this installation takes the PATH of the service manager, which a login-shell discovery does not change",
+                "nothing to refresh: this installation takes the PATH of the service manager, which a login-shell discovery does not change; the daemon re-reads that PATH on each request, so a directory the login environment adds needs no restart (a daemon of an older release does: `systemctl --user restart` its unit)",
             ),
             Self::RefreshConfigSchema { found, current } if *found > i64::from(*current) => Some(
                 "service.toml was written by a newer release: run `pohunek service refresh-path` of the installed release (`<prefix>/bin/pohunek`); this binary never rewrites it",

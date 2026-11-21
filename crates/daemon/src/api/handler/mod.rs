@@ -425,6 +425,8 @@ async fn handle_negotiated(
     state: &DaemonState,
     selected_version: protocol::ProtocolVersion,
 ) -> Response {
+    state.sessions.refresh_manager_path().await;
+
     if let Some(target) = mutation_target(request) {
         if state
             .sessions

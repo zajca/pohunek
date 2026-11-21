@@ -102,7 +102,7 @@ impl PythonProbe {
     /// Builds the probe for this process from its `PATH` entries and, on macOS,
     /// the stub description.
     pub(super) fn from_environment() -> Self {
-        let search_dirs = std::env::var_os("PATH")
+        let search_dirs = crate::runtime::manager_path::search_path()
             .map(|path| std::env::split_paths(&path).collect())
             .unwrap_or_default();
         Self {

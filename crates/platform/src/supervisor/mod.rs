@@ -97,6 +97,30 @@ impl std::fmt::Debug for UnitEnvironment {
     }
 }
 
+impl UnitEnvironment {
+    /// Whether the unit, or anything the manager merged into it, can decide
+    /// the job's `PATH`, so the job does not simply inherit the manager's.
+    ///
+    /// The answer is conservative: any `EnvironmentFile=` counts, because the
+    /// file's content is not read here, and so does a unit whose properties
+    /// are stale until a `daemon-reload`.
+    #[must_use]
+    pub fn may_set_search_path(&self) -> bool {
+        let names_search_path = |entry: &String| {
+            entry
+                .split_once('=')
+                .map_or(entry.as_str(), |(name, _)| name)
+                == SEARCH_PATH_VARIABLE
+        };
+        self.need_daemon_reload
+            || self.environment.iter().any(names_search_path)
+            || !self.exec_search_path.is_empty()
+            || !self.environment_files.is_empty()
+            || self.pass_environment.iter().any(|name| name == SEARCH_PATH_VARIABLE)
+            || self.unset_environment.iter().any(names_search_path)
+    }
+}
+
 #[doc(inline)]
 pub use namespace::{Namespace, WorkerKey};
 

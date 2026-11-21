@@ -11,6 +11,7 @@ mod client;
 pub(crate) mod environment;
 mod launcher;
 pub mod lifecycle;
+pub mod manager_path;
 
 pub(crate) use client::WriteReservation;
 pub use client::{
@@ -24,3 +25,4 @@ pub use launcher::{
     SubprocessWorkerLauncher, WorkerLaunchError, WorkerLaunchFuture, WorkerLauncher,
 };
 pub use lifecycle::{SubprocessWorkerEnvironment, SupervisionConfig};
+pub use manager_path::{ManagerEnvironment, ManagerFuture, ManagerPath, ManagerReadError};

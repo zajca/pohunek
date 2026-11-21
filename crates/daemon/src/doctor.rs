@@ -738,18 +738,22 @@ fn standard_checks(
     overlays: OverlayChecks<'_>,
 ) -> Vec<DoctorCheck> {
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
-    hostcheck::standard_checks(StandardCheckInputs {
-        socket_dir: &paths.runtime_dir,
-        state_dir: &paths.data_dir,
-        log_dir: &paths.log_dir,
-        config_dir: &paths.config_dir,
-        home_dir: home_dir.as_deref(),
-        effective_uid: nix::unistd::Uid::effective().as_raw(),
-        worker,
-        access_dirs: &[],
-        supervision,
-        overlays,
-    })
+    let search_path = crate::runtime::manager_path::search_path();
+    hostcheck::standard_checks_on(
+        StandardCheckInputs {
+            socket_dir: &paths.runtime_dir,
+            state_dir: &paths.data_dir,
+            log_dir: &paths.log_dir,
+            config_dir: &paths.config_dir,
+            home_dir: home_dir.as_deref(),
+            effective_uid: nix::unistd::Uid::effective().as_raw(),
+            worker,
+            access_dirs: &[],
+            supervision,
+            overlays,
+        },
+        search_path.as_deref(),
+    )
 }
 
 /// The daemon's active worker executable and protocol readiness.
