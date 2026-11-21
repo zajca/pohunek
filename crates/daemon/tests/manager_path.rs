@@ -466,67 +466,71 @@ async fn a_manager_that_never_answers_leaves_the_process_path() {
     assert_eq!(inspected(&started.state).await, None);
 }
 
-/// R5: a daemon follows the manager only when it runs under a service
-/// manager, records no `search_path` and its unit cannot decide its own
-/// `PATH`.
-#[tokio::test]
-async fn a_unit_that_decides_its_own_path_is_not_followed() {
-    let source = |unit: UnitEnvironment| {
-        let manager = FakeManager::answering(Answer::NoPath);
-        *manager.1.lock().expect("unit settings") = unit;
-        Arc::new(manager)
-    };
-    let loaded = || UnitEnvironment {
+/// A unit whose manager-side settings are `unit`.
+fn loaded() -> UnitEnvironment {
+    UnitEnvironment {
         load_state: "loaded".to_owned(),
         ..UnitEnvironment::default()
-    };
-    let follow = |unit: UnitEnvironment| {
-        ManagerPath::follow(
-            source(unit),
-            "unit.service",
-            FOLLOWING,
-            NO_REUSE,
-            READ_DEADLINE,
-        )
-    };
+    }
+}
 
-    assert!(follow(loaded()).await.is_some(), "an inheriting unit");
-    for (reason, gate) in [
-        (
-            "the daemon is not a service manager's job",
+/// Whether a daemon with `gate` whose unit holds `unit` follows the manager.
+async fn follows(gate: FollowGate, unit: UnitEnvironment) -> bool {
+    let manager = FakeManager::answering(Answer::NoPath);
+    *manager.1.lock().expect("unit settings") = unit;
+    ManagerPath::follow(
+        Arc::new(manager),
+        "unit.service",
+        gate,
+        NO_REUSE,
+        READ_DEADLINE,
+    )
+    .await
+    .is_some()
+}
+
+/// R5: a daemon follows the manager only when it runs under a service
+/// manager and records no `search_path`.
+#[tokio::test]
+async fn a_daemon_that_is_not_a_service_job_or_records_a_search_path_is_not_followed() {
+    assert!(follows(FOLLOWING, loaded()).await, "a following daemon");
+    assert!(
+        !follows(
             FollowGate {
                 service_managed: false,
                 ..FOLLOWING
             },
-        ),
-        (
-            "the service configuration records a search_path",
+            loaded()
+        )
+        .await,
+        "the daemon is not a service manager's job"
+    );
+    assert!(
+        !follows(
             FollowGate {
                 search_path_recorded: true,
                 ..FOLLOWING
             },
-        ),
-    ] {
-        assert!(
-            ManagerPath::follow(
-                source(loaded()),
-                "unit.service",
-                gate,
-                NO_REUSE,
-                READ_DEADLINE
-            )
-            .await
-            .is_none(),
-            "{reason}"
-        );
-    }
+            loaded()
+        )
+        .await,
+        "the service configuration records a search_path"
+    );
+}
+
+/// R5: the manager is followed only when the daemon's unit cannot decide its
+/// own `PATH`.
+#[tokio::test]
+async fn a_unit_that_decides_its_own_path_is_not_followed() {
+    let follow = |unit: UnitEnvironment| follows(FOLLOWING, unit);
+
+    assert!(follow(loaded()).await, "an inheriting unit");
     assert!(
         follow(UnitEnvironment {
             environment: vec!["PATHEXT=/x".to_owned(), "CLAUDE_CONFIG_DIR=/c".to_owned()],
             ..loaded()
         })
-        .await
-        .is_some(),
+        .await,
         "other variables do not matter"
     );
     let deciding = [
@@ -575,6 +579,6 @@ async fn a_unit_that_decides_its_own_path_is_not_followed() {
         ("not loaded", UnitEnvironment::default()),
     ];
     for (setting, unit) in deciding {
-        assert!(follow(unit).await.is_none(), "{setting}");
+        assert!(!follow(unit).await, "{setting}");
     }
 }
