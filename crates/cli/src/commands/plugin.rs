@@ -1467,7 +1467,7 @@ async fn compat_report(client: &mut Client) -> Result<CompatReport, CliError> {
         .await?;
     let Some(runtime_api) = capabilities.runtime_api else {
         return Err(Error::CompatUnsupported {
-            daemon_version: capabilities.daemon_version,
+            daemon_version: sanitize(&capabilities.daemon_version),
         }
         .into());
     };

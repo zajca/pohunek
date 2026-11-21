@@ -164,7 +164,7 @@ pub(crate) fn host_capabilities(
 }
 
 /// The capability snapshot without any runtime inventory: the feature flags,
-/// the daemon version and `git`, with empty `supported_agents` and `runtimes`.
+/// the daemon version, `git` and the runtime API report, with empty `supported_agents` and `runtimes`.
 ///
 /// This is what `host.inspect` answers for a client that only needs the flags;
 /// it resolves and probes no program besides `git`.

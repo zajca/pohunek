@@ -4006,7 +4006,9 @@ fn host_capabilities_json_shape_roundtrips() {
             "package_create_preset_supported": true,
             "package_remove_profile_supported": true,
             "integration_agent_skill_supported": true,
-            "package_index_apply_supported": true
+            "package_index_apply_supported": true,
+            "runtime_api": 1,
+            "runtime_features": ["launch-env-v1"]
         })
     );
 

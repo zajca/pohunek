@@ -1,8 +1,8 @@
 //! `pohunek plugin compat` and the `runtime_api` / `runtime_features` fields of
 //! `host.inspect`, against a real `pohunekd` subprocess.
 //!
-//! The expected feature set comes from sources outside the daemon: the table
-//! documented in `docs/knowledge/guides/runtime-packages.md` and the `requires`
+//! The expected feature set comes from sources outside the daemon code: the
+//! committed registry snapshot (`fixtures/features.txt`) and the `requires`
 //! lists of the shipped `runtime-packages/*/runtime.toml`. The N-1 daemon (one
 //! that omits the fields) is covered in `plugin_cli.rs`.
 
@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 
@@ -32,11 +32,9 @@ const SHELL: &str = "/bin/sh";
 /// Name of the daemon binary beside the CLI binary.
 const DAEMON_NAME: &str = "pohunekd";
 
-/// The documented page that lists every runtime feature the core implements.
-const FEATURE_TABLE_PAGE: &str = "docs/knowledge/guides/runtime-packages.md";
-
-/// First cell of the documented feature table's header row.
-const FEATURE_TABLE_HEADER: &str = "| Feature |";
+/// The committed snapshot of the feature registry, one `<id> <since>` line per
+/// feature. A daemon test pins the registry to it, so it is a source of its own.
+const FEATURE_SNAPSHOT: &str = "crates/daemon/src/agent/host/fixtures/features.txt";
 
 /// A reply of a daemon from before the compat report: the keys `host.inspect`
 /// answered at release 0.44.0, which has neither `runtime_api` nor
@@ -146,30 +144,19 @@ fn bounded(mut command: Command, what: &str) -> Output {
 }
 
 fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("the repository root")
+    pohunek_test_support::workspace_root()
 }
 
-/// The feature ids of the documented table, in document order.
-fn documented_features() -> Vec<String> {
-    let page = fs::read_to_string(repository_root().join(FEATURE_TABLE_PAGE))
-        .expect("read the runtime package guide");
-    let mut rows = page
+/// The feature ids of the committed registry snapshot.
+fn snapshot_features() -> Vec<String> {
+    let snapshot = fs::read_to_string(repository_root().join(FEATURE_SNAPSHOT))
+        .expect("read the feature snapshot");
+    let ids: Vec<String> = snapshot
         .lines()
-        .skip_while(|line| !line.starts_with(FEATURE_TABLE_HEADER))
-        // The header row and its separator.
-        .skip(2)
-        .take_while(|line| line.starts_with('|'));
-    let ids: Vec<String> = rows
-        .by_ref()
-        .map(|row| {
-            let cell = row.split('|').nth(1).expect("a table row has a first cell");
-            cell.trim().trim_matches('`').to_owned()
-        })
+        .filter_map(|line| line.split_whitespace().next())
+        .map(str::to_owned)
         .collect();
-    assert!(!ids.is_empty(), "the documented feature table has rows");
+    assert!(!ids.is_empty(), "the feature snapshot has rows");
     ids
 }
 
@@ -211,7 +198,7 @@ fn strings(value: &Value) -> Vec<String> {
 
 /// Rows 2, 3 and 6 of #1659 D3: the report of a running daemon names runtime
 /// API 1, the core version `pohunekd --version` prints and exactly the
-/// documented features, a superset of everything the shipped packages require.
+/// snapshot's features, a superset of everything the shipped packages require.
 #[test]
 fn plugin_compat_reports_the_core_contract() {
     let daemon = Daemon::start();
@@ -239,18 +226,10 @@ fn plugin_compat_reports_the_core_contract() {
     );
 
     let reported = strings(&report["features"]);
-    // The documented table orders by the release that added a feature, the
-    // report by registry order, so the two agree as sets.
-    let documented = documented_features();
     assert_eq!(
-        reported.iter().collect::<BTreeSet<_>>().len(),
-        reported.len(),
-        "the report lists no feature twice: {reported:?}"
-    );
-    assert_eq!(
-        reported.iter().collect::<BTreeSet<_>>(),
-        documented.iter().collect::<BTreeSet<_>>(),
-        "the report and the documented table list the same features"
+        reported,
+        snapshot_features(),
+        "the report lists the snapshot's features in registry order"
     );
     let required = required_by_shipped_packages();
     assert!(
