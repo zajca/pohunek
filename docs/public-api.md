@@ -2979,9 +2979,12 @@ migrated the same way, with only the events defaults assigned. The required
 on fresh installs and migrations) raised it to 8: it moves the root of every
 session's private `TMPDIR`, so an older binary must never skip it, and under the
 rule below that makes it a breaking change and not an optional key. A schema-7 file
-is migrated with only that key assigned, explicitly, as the location the daemon
-used before the key existed, so the upgrade moves nothing until the operator edits
-the key; its unknown keys are kept through the upgrade, as the schema-7 releases
+is migrated with only that key assigned, explicitly, as the cache-based default,
+so the upgrade moves nothing until the operator edits the key. Editing it moves only
+the directories of sessions launched afterwards: a session launched under the old
+root keeps its directory there, which neither a resume, a removal nor the startup
+cleanup of the new root moves or deletes, so delete the old tree by hand once no
+session uses it; its unknown keys are kept through the upgrade, as the schema-7 releases
 kept them. The key is not part of the job namespace. `pohunek service install` and
 `upgrade` create the root (mode 0700) only when its value is that cache-based
 default; a root the operator pointed elsewhere, for example onto another disk, must

@@ -190,9 +190,10 @@
 //!
 //! A schema-7 file does not record the cache directory, so the caller passes it
 //! and the upgrade assigns `namespace.session_tmp_root` explicitly as
-//! [`default_session_tmp_root`] of it, the location the daemon used before the
-//! key existed. The upgrade therefore moves nothing until the operator edits
-//! the key.
+//! [`default_session_tmp_root`] of it, the location a daemon without the key
+//! uses. The upgrade therefore moves nothing until the operator edits the key.
+//! Editing it moves only new session directories: the directories of sessions
+//! created under the old root stay there and are neither moved nor cleaned up.
 //!
 //! `environment.search_path` is the executable search path the installer
 //! resolved (see `pohunek_platform::shell_env`) and hands to the daemon job as
@@ -2645,7 +2646,7 @@ fn keep_unknown_keys(
 }
 
 /// The default `namespace.session_tmp_root` below `cache_dir`: the directory
-/// the daemon placed session temporary directories in before the key existed.
+/// a daemon without the key places session temporary directories in.
 ///
 /// `cache_dir` is the application cache directory (`<XDG_CACHE_HOME>/pohunek`).
 #[must_use]
@@ -3422,7 +3423,6 @@ pub fn validate_prefix(prefix: &Path) -> Result<InstallLayout, ConfigError> {
     })
 }
 
-/// Validates one recorded path key.
 /// Validates the three `[namespace]` roots of `spec`.
 fn validate_namespace_paths(spec: &ConfigSpec) -> Result<(), ConfigError> {
     validate_path("namespace.state_root", &spec.state_root)?;
@@ -3430,6 +3430,7 @@ fn validate_namespace_paths(spec: &ConfigSpec) -> Result<(), ConfigError> {
     validate_path("namespace.session_tmp_root", &spec.session_tmp_root)
 }
 
+/// Validates one recorded path key.
 fn validate_path(key: &'static str, path: &Path) -> Result<(), ConfigError> {
     match path_error(path) {
         None => Ok(()),

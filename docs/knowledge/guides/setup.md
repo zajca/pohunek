@@ -140,7 +140,7 @@ empty, and a previous release reports it as an unknown table.
 `namespace.session_tmp_root` is the directory below which each session's private
 `TMPDIR` lives (`<root>/<store key>/<session id>`). A fresh install and an upgrade of
 a schema-7 file record `<cache_dir>/session-tmp` explicitly, so nothing moves until you
-edit the key; point it at a short absolute path on another disk (for example `/t/st`)
+edit the key (changing it does not move or clean up the directories of existing sessions under the old root: delete that tree yourself once no session uses it); point it at a short absolute path on another disk (for example `/t/st`)
 to keep session scratch off the cache filesystem, then restart the daemon. The
 installer creates the default root only. The daemon never creates the configured root,
 so create a root you chose yourself (mode 0700, owned by you, no symlink in the path)

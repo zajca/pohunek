@@ -688,7 +688,7 @@ async fn upgrade_migrates_a_schema_seven_config_recording_the_cache_based_sessio
     })
     .await;
 
-    // The root is recorded explicitly at today's location, which the upgrade
+    // The root is recorded explicitly at the cache-based default, which the upgrade
     // created owner-private because the daemon never creates it; the unknown
     // key of the schema-7 file is kept.
     let current = pohunek_service_config::ServiceConfig::load(&installation.context.config_path())
