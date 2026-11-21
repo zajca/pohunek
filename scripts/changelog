@@ -277,13 +277,13 @@ def selected(fragments: list[Fragment], surface: str | None) -> list[Fragment]:
 
 
 def issue_link_suffix(fragment: Fragment, repository: str) -> str:
-    """The issue link an entry ends with; empty when the fragment text already ends with it.
+    """The issue link an entry ends with; empty when the fragment text already contains it.
 
-    A fragment that cites several issues, `([#1](...), [#2](...))`, counts as linked when
-    the last citation is its own issue.
+    The text counts as linked wherever its own `[#N](url)` link sits, for example inside a
+    multi-issue citation or followed by punctuation.
     """
     link = f"[#{fragment.number}](https://github.com/{repository}/issues/{fragment.number})"
-    return "" if fragment.text.endswith(f"{link})") else f" ({link})"
+    return "" if link in fragment.text else f" ({link})"
 
 
 def render_section(fragments: list[Fragment], repository: str) -> str:

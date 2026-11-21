@@ -244,6 +244,21 @@ class IssueLink(ChangelogScenarios):
         section = self.folded_section(("7-both.md", f"Entry. ({other}, {own})"))
         self.assertIn(f"- Entry. ({other}, {own})\n", section)
 
+    def test_an_own_link_in_any_position_is_not_repeated(self):
+        other = "[#8](https://github.com/example/app/issues/8)"
+        own = self.LINK[1:-1]
+        cases = {
+            "7-first.md": f"Entry. ({own}, {other})",
+            "7-bare.md": f"Entry. {own}",
+            "7-period.md": f"Entry. ({own}).",
+            "7-middle.md": f"Entry {own} continues.",
+        }
+        section = self.folded_section(*((name, text) for name, text in cases.items()))
+        for name, text in cases.items():
+            with self.subTest(fragment=name):
+                self.assertIn(f"- {text}\n", section)
+        self.assertEqual(section.count(own), len(cases))
+
     def test_a_link_to_another_issue_does_not_replace_the_entry_link(self):
         other = "([#8](https://github.com/example/app/issues/8))"
         section = self.folded_section(("7-other.md", f"Entry. {other}"))
