@@ -1,6 +1,6 @@
 //! Append-only notification store.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -275,6 +275,27 @@ impl NotificationStore {
                     NotificationStatus::Unread | NotificationStatus::Read
                 )
         })
+    }
+
+    /// The sessions named by an `agent_blocked` or `approval_required` record
+    /// that is still `unread` or `read`.
+    pub(crate) fn active_attention_sessions(&self) -> HashSet<protocol::SessionId> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .records
+            .values()
+            .filter(|record| {
+                is_attention_kind(record.kind)
+                    && matches!(
+                        record.status,
+                        NotificationStatus::Unread | NotificationStatus::Read
+                    )
+            })
+            .filter_map(|record| record.session_id.clone())
+            .collect()
     }
 
     /// Removes the records that do not belong in the store and rewrites the
