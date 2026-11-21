@@ -341,13 +341,20 @@ async fn select_package(harness: &Harness, digest: &PackageDigest) {
     assert_eq!(code, 0, "select Hermes package: {selected:#}");
 }
 
-/// Installs the assistant context package by digest, as the owner does before
-/// the first `pohunek assistant`.
-async fn install_assistant_context_package(harness: &Harness, dir: &Path) {
+/// Installs the assistant context package of `version` by digest, as the owner
+/// does before the first `pohunek assistant`; with `update` it installs next to
+/// the selected version and selects the new one, as `plugin update` does.
+async fn install_assistant_context_package(
+    harness: &Harness,
+    dir: &Path,
+    version: &str,
+    update: bool,
+) {
+    let manifest = format!("schema = 1\nid = \"pohunek.context.assistant\"\nversion = \"{version}\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n");
     let context = [
         ArchiveEntry {
             path: "runtime.toml".to_owned(),
-            contents: b"schema = 1\nid = \"pohunek.context.assistant\"\nversion = \"1.0.0\"\nruntime_api = 1\nrequires = [\"package-context-v1\"]\n\n[context]\ndir = \"bundle\"\n".to_vec(),
+            contents: manifest.into_bytes(),
             executable: false,
         },
         ArchiveEntry {
@@ -362,18 +369,20 @@ async fn install_assistant_context_package(harness: &Harness, dir: &Path) {
         },
     ];
     let (context_bytes, context_digest) = archive_of(&context);
-    let context_archive = dir.join("assistant-context.tar.zst");
+    let context_archive = dir.join(format!("assistant-context-{version}.tar.zst"));
     fs::write(&context_archive, context_bytes).expect("write the context archive");
-    let (code, installed) = harness
-        .json(&[
-            "plugin",
-            "install",
-            path_str(&context_archive),
-            "--sha256",
-            context_digest.as_str().trim_start_matches("sha256:"),
-            "--yes",
-        ])
-        .await;
+    let verb = if update { "update" } else { "install" };
+    let mut arguments = vec!["plugin", verb];
+    if update {
+        arguments.push("pohunek.context.assistant");
+    }
+    arguments.extend([
+        path_str(&context_archive),
+        "--sha256",
+        context_digest.as_str().trim_start_matches("sha256:"),
+        "--yes",
+    ]);
+    let (code, installed) = harness.json(&arguments).await;
     assert_eq!(code, 0, "{installed}");
 }
 
@@ -3340,10 +3349,36 @@ async fn hermes_launches_only_from_the_installed_official_package() {
         no_bundle["err"]["code"], "assistant_package_missing",
         "{no_bundle}"
     );
-    install_assistant_context_package(&harness, &cwd).await;
+    // A bundle older than the core names the command that updates it; one at
+    // the core's version carries no note.
+    install_assistant_context_package(&harness, &cwd, "0.0.1", false).await;
     let (code, picked) = assistant().await;
     assert_eq!(code, 0, "{picked}");
     assert_eq!(picked["ok"]["agent"], "hermes", "{picked}");
+    let note = picked["ok"]["knowledge_bundle_note"]
+        .as_str()
+        .expect("an older bundle carries a note");
+    assert!(note.contains("0.0.1"), "{note}");
+    assert!(note.contains("pohunek setup"), "{note}");
+    let human = harness
+        .run(&[
+            "assistant",
+            "--print-prompt",
+            "--no-snapshot",
+            "--no-start-daemon",
+        ])
+        .await;
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("note: the assistant package"),
+        "{human:?}"
+    );
+    install_assistant_context_package(&harness, &cwd, env!("CARGO_PKG_VERSION"), true).await;
+    let (code, current) = assistant().await;
+    assert_eq!(code, 0, "{current}");
+    assert!(
+        current["ok"].get("knowledge_bundle_note").is_none(),
+        "{current}"
+    );
 
     let (code, stopped) = harness.json(&["session", "stop", &id]).await;
     assert_eq!(code, 0, "{stopped}");

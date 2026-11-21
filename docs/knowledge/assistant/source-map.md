@@ -27,7 +27,7 @@ Current CLI and command surface:
 - `crates/hostcheck/src/macos.rs` — macOS doctor checks and the bounded `launchctl` domain probe.
 - `crates/hostcheck/src/executable.rs` — exec-bit-aware executable resolution.
 - `crates/cli/src/commands/daemon.rs`
-- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`.
+- `crates/cli/src/commands/service.rs` — `pohunek service install|upgrade|uninstall|status|check|lock`; after an upgrade it reports the selected assistant package against the core (`assistant`, with the `pohunek setup` command when older).
 - `crates/cli/src/service/` — the service transactions: install journal and
   transaction lock with the holder record `pohunek service lock` publishes
   (`record.rs`), the holder token its command adopts the lock with through

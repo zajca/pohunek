@@ -532,8 +532,11 @@ is refused the same way.
 there is no second flag. See [debug session runtime](debug-session-runtime.md).
 
 After a core upgrade, move the assistant context package to the version that
-matches it: `pohunek plugin update pohunek.context.assistant <archive> --sha256
-<digest>` installs and selects it (a plain `plugin install` leaves the old version
+matches it. `pohunek service upgrade` never installs it: its report prints an
+`assistant` line (and `--json` an `assistant` object) when the selected version
+is older than the core, and `pohunek setup` installs the version the plugin
+index lists. Without the index, `pohunek plugin update pohunek.context.assistant
+<archive> --sha256 <digest>` installs and selects it (a plain `plugin install` leaves the old version
 selected); see `docs/install.md`, "Install the assistant package", and the
 [context package guide](../guides/runtime-packages.md#declaring-a-context-package).
 When the assistant feature is available, its update intent should compare the

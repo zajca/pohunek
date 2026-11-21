@@ -22,10 +22,13 @@ use pohunek_service_config::runtimes::{
     CatalogStatus, EnsureReport, PackageAction, PackageStatus, ProfileAction,
 };
 
-use crate::commands::render_json;
+use crate::client::Client;
+use crate::commands::{plugin, render_json, setup_assistant};
 use crate::error::CliError;
+use crate::paths::Paths;
 use crate::service::runtimes::{kept_selection_line, profile_detail, replaces_newer_warning};
 use crate::service::{self, report, UninstallOptions};
+use crate::target::LOCAL_HOST;
 
 /// `pohunek service` subcommands.
 #[derive(Debug, Subcommand)]
@@ -258,7 +261,8 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             json,
         } => {
             let budget = preflight_budget.map_or(PROBE_BUDGET, Duration::from_secs);
-            let report = service::upgrade(from, accept_runtime_loss, budget, repair).await?;
+            let mut report = service::upgrade(from, accept_runtime_loss, budget, repair).await?;
+            report.assistant = Some(assistant_state(&report.to_version, Paths::resolve()).await);
             emit(json, &report, render_upgrade)
         }
         Action::RefreshPath {
@@ -297,6 +301,88 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
         }
     }?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The assistant context package as the upgraded daemon lists it, compared
+/// with the core the upgrade installed. A daemon that cannot be asked is
+/// reported as `unchecked`; it never fails the upgrade, which has finished.
+pub(crate) async fn assistant_state(
+    core_version: &str,
+    paths: Result<Paths, CliError>,
+) -> report::AssistantPackageReport {
+    let listed = async {
+        let mut client = Client::connect(LOCAL_HOST, &paths?).await?;
+        plugin::list(&mut client).await
+    }
+    .await;
+    let mut state = report::AssistantPackageReport {
+        package_id: setup_assistant::PACKAGE_ID.to_owned(),
+        status: report::AssistantPackageStatus::Absent,
+        version: None,
+        core_version: core_version.to_owned(),
+        detail: None,
+        command: None,
+    };
+    let listed = match listed {
+        Ok(listed) => listed,
+        Err(error) => {
+            state.status = report::AssistantPackageStatus::Unchecked;
+            state.detail = Some(error.to_string());
+            return state;
+        }
+    };
+    let mut installed = listed
+        .packages
+        .iter()
+        .filter(|info| info.package.id.to_string() == setup_assistant::PACKAGE_ID)
+        .peekable();
+    if installed.peek().is_some() {
+        state.status = report::AssistantPackageStatus::Unselected;
+    }
+    if let Some(selected) = installed.find(|info| info.selected) {
+        let version = selected.package.version.to_string();
+        if setup_assistant::is_older(&version, core_version) {
+            state.status = report::AssistantPackageStatus::Outdated;
+            state.command = Some(setup_assistant::UPDATE_COMMAND.to_owned());
+        } else {
+            state.status = report::AssistantPackageStatus::Current;
+        }
+        state.version = Some(version);
+    }
+    state
+}
+
+/// Appends the assistant package line of an upgrade that has something to
+/// tell: an older selected package or a daemon that could not be asked.
+fn render_assistant(text: &mut String, state: &report::AssistantPackageReport) {
+    match state.status {
+        report::AssistantPackageStatus::Outdated => {
+            let _ = writeln!(
+                text,
+                "assistant  {} {} is older than pohunek {}; the upgrade does not install it. \
+                 Run `{}` to install the version the plugin index lists for this release",
+                state.package_id,
+                state.version.as_deref().unwrap_or("-"),
+                state.core_version,
+                state
+                    .command
+                    .as_deref()
+                    .unwrap_or(setup_assistant::UPDATE_COMMAND),
+            );
+        }
+        report::AssistantPackageStatus::Unchecked => {
+            let _ = writeln!(
+                text,
+                "assistant  {} was not checked ({}); compare it with pohunek {} using `pohunek plugin list`",
+                state.package_id,
+                state.detail.as_deref().unwrap_or("the daemon did not answer"),
+                state.core_version,
+            );
+        }
+        report::AssistantPackageStatus::Current
+        | report::AssistantPackageStatus::Absent
+        | report::AssistantPackageStatus::Unselected => {}
+    }
 }
 
 fn emit<T: serde::Serialize>(
@@ -810,6 +896,9 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
                 .as_ref()
                 .map_or_else(String::new, |detail| format!(": {detail}"))
         );
+    }
+    if let Some(assistant) = &report.assistant {
+        render_assistant(&mut text, assistant);
     }
     if let Some(preflight) = &report.preflight {
         if report
@@ -2005,6 +2094,7 @@ mod tests {
             integrations: Vec::new(),
             repair: None,
             refused_entries: Vec::new(),
+            assistant: None,
         });
         assert!(text.contains("pohunek 2.0.0 is already active"), "{text}");
         assert!(!text.contains("upgraded"), "{text}");

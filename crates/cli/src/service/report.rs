@@ -215,6 +215,44 @@ pub struct UpgradeReport {
         serialize_with = "serialize_purge_paths"
     )]
     pub refused_entries: Vec<PathBuf>,
+    /// The assistant context package as the new daemon reports it. The upgrade
+    /// never installs it; `null` while the daemon was not asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant: Option<AssistantPackageReport>,
+}
+
+/// State of the assistant context package after an upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssistantPackageReport {
+    /// The package id.
+    pub package_id: String,
+    /// `current`, `outdated`, `absent`, `unselected` or `unchecked`.
+    pub status: AssistantPackageStatus,
+    /// The selected version; `null` when none is selected.
+    pub version: Option<String>,
+    /// The version of the core the upgrade installed.
+    pub core_version: String,
+    /// Why the daemon could not be asked, for `unchecked`.
+    pub detail: Option<String>,
+    /// The command that moves an `outdated` package to the version the plugin
+    /// index lists for this core.
+    pub command: Option<String>,
+}
+
+/// How the selected assistant package compares with the upgraded core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantPackageStatus {
+    /// The selected version is not older than the core, or cannot be ordered.
+    Current,
+    /// The selected version is older than the core.
+    Outdated,
+    /// The package is not installed.
+    Absent,
+    /// The package is installed and no version is selected.
+    Unselected,
+    /// The daemon could not be asked.
+    Unchecked,
 }
 
 /// One integration hook reinstalled after an upgrade.

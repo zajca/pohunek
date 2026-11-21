@@ -30,6 +30,20 @@ pub mod host_setup {
     };
 }
 pub mod service;
+pub mod upgrade_assistant {
+    //! The assistant package state `pohunek service upgrade` reports, asked of
+    //! the daemon that serves the installation `base` describes.
+    use crate::paths::Paths;
+    use crate::service::report::AssistantPackageReport;
+
+    /// Compares the selected assistant package with `core_version`.
+    pub async fn state(
+        core_version: &str,
+        base: &pohunek_paths::BasePaths,
+    ) -> AssistantPackageReport {
+        crate::commands::service::assistant_state(core_version, Ok(Paths::from_base(base))).await
+    }
+}
 mod target;
 #[cfg(test)]
 mod test_daemon;
