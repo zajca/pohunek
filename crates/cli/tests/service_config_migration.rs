@@ -686,9 +686,9 @@ fn check_refuses_a_schema_seven_config_when_the_cache_directory_cannot_hold_the_
 }
 
 /// An interrupted `refresh-path` of a schema-7 installation is judged by the
-/// adoption gate with the recorded search path the rollback restores, which
-/// renders the migrated file: the gate derives the session temporary root for
-/// it instead of failing on an unrecorded one.
+/// adoption gate with the recorded search path the rollback restores; the
+/// judged copy revalidates every key, so the gate derives the session
+/// temporary root for it instead of failing on an unrecorded one.
 #[test]
 fn check_judges_a_pending_refresh_over_a_schema_seven_config_without_a_root_error() {
     let host = Host::schema_seven_with_waits(120_000, 2_700_000);

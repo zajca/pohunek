@@ -3749,8 +3749,8 @@ pub(crate) async fn adoption_job_path(
     let Some(record) = pending else {
         return installed_job_path(context).await;
     };
-    // A refresh rollback rewrites the file with the recorded search path, which
-    // renders the migrated root, so only that judgement derives it.
+    // `with_search_path` revalidates every key, so the judged copy of a
+    // previous-schema file needs a root; the copy is never written.
     let cache_dir =
         (record.operation == Operation::RefreshPath).then(|| context.paths().cache_dir.as_path());
     let source =
