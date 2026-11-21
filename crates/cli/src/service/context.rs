@@ -642,7 +642,12 @@ fn canonical_path_without_creating(path: &Path) -> Result<PathBuf, Error> {
                 canonical.extend(missing.iter().rev());
                 return Ok(canonical);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A name or path the platform refuses as too long cannot exist
+            // either (macOS checks the whole path before it walks it).
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENAMETOOLONG) =>
+            {
                 let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
                     return Err(io_error("canonicalize", path)(error));
                 };
