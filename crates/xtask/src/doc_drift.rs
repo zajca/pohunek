@@ -12,6 +12,8 @@
 //!   their constants ([`numeric_facts`]).
 //! - The onboarding floor check holds the onboarding guide's floor commands to
 //!   its Claude deny table ([`onboarding_floor`]).
+//! - The feature table check holds the runtime feature table of the runtime
+//!   package guide to the committed registry snapshot ([`feature_table`]).
 //! - The plugin boundary check rejects a top-level directory under
 //!   `runtime-packages/` or `compat/` that is not one of the four official
 //!   runtimes: a new plugin lives in its own repository.
@@ -28,6 +30,7 @@ use regex::Regex;
 use crate::checks::{collect_pohunek_examples, parse_failure_message};
 use crate::XtaskError;
 
+mod feature_table;
 mod numeric_facts;
 mod onboarding_floor;
 
@@ -1187,6 +1190,7 @@ pub(crate) fn check(repo: &Path) -> Result<Vec<&'static str>, XtaskError> {
         ("doc-index", check_index_reachability(repo)?),
         ("plugin-directories", check_plugin_directories(repo)?),
         ("onboarding-floor", onboarding_floor::check(repo)?),
+        ("feature-table", feature_table::check(repo)?),
     ];
     Ok(outcomes
         .into_iter()

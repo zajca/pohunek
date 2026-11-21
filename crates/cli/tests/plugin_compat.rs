@@ -38,7 +38,8 @@ const FEATURE_SNAPSHOT: &str = "crates/daemon/src/agent/host/fixtures/features.t
 
 /// A reply of a daemon from before the compat report: the keys `host.inspect`
 /// answered at release 0.44.0, which has neither `runtime_api` nor
-/// `runtime_features`.
+/// `runtime_features`. The fixture is refreshed to the previous release's
+/// keys at each release.
 const N_MINUS_1_REPLY: &str = include_str!("fixtures/host-inspect-n1.json");
 
 /// A running daemon and the hermetic environment the CLI runs in.
@@ -132,15 +133,29 @@ fn daemon_binary() -> PathBuf {
     bin_exe("pohunek").with_file_name(DAEMON_NAME)
 }
 
-/// Runs `command` to completion, failing with `what` after [`HANG_GUARD`].
+/// Runs `command` to completion; after [`HANG_GUARD`] the child is killed and
+/// the call fails with `what`.
 fn bounded(mut command: Command, what: &str) -> Output {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("{what} could not run: {error}"));
+    let pid = child.id();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(command.output());
+        let _ = tx.send(child.wait_with_output());
     });
-    rx.recv_timeout(HANG_GUARD)
-        .unwrap_or_else(|_| panic!("{what} did not finish within {HANG_GUARD:?}"))
-        .unwrap_or_else(|error| panic!("{what} could not run: {error}"))
+    let Ok(output) = rx.recv_timeout(HANG_GUARD) else {
+        // `wait_with_output` owns the child, so the kill goes by pid.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+        panic!("{what} did not finish within {HANG_GUARD:?}");
+    };
+    output.unwrap_or_else(|error| panic!("{what} could not run: {error}"))
 }
 
 fn repository_root() -> PathBuf {
@@ -220,9 +235,10 @@ fn plugin_compat_reports_the_core_contract() {
         printed.split_whitespace().any(|word| word == core_version),
         "`pohunekd --version` ({printed:?}) names the reported core version {core_version:?}"
     );
-    assert!(
-        report["protocol_version"].is_number() || report["protocol_version"].is_string(),
-        "the report names the protocol version: {report}"
+    assert_eq!(
+        report["protocol_version"],
+        serde_json::to_value(protocol::PROTOCOL_VERSION).expect("serialize the protocol version"),
+        "the report names the protocol version the daemon built from this tree speaks"
     );
 
     let reported = strings(&report["features"]);
