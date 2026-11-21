@@ -176,6 +176,8 @@ pub(super) struct RelaunchPlan {
     /// Base environment the launch hands to the agent.
     base_environment: BaseEnv,
     pub(super) profile: RecoveryProfile,
+    /// The search path snapshot of the resume that planned this relaunch.
+    search_path: crate::runtime::SearchPath,
 }
 
 struct ActivityGroup {
@@ -302,7 +304,8 @@ impl SessionRegistry {
         if lookups.iter().all(Option::is_none) {
             return modified;
         }
-        let Ok(base_environment) = self.launch_base_environment() else {
+        let Ok(base_environment) = self.launch_base_environment(&self.search_path_snapshot())
+        else {
             return modified;
         };
         let mut groups: Vec<ActivityGroup> = Vec::new();
@@ -536,8 +539,9 @@ impl SessionRegistry {
         change: ProfileChange,
     ) -> Result<SessionInfo, ProtocolError> {
         self.ensure_not_external(id).await?;
-        // The resume resolves and launches on the `PATH` the manager holds now.
-        self.refreshed_search_path().await;
+        // The resume resolves and launches on the `PATH` the manager holds now,
+        // and every step of it runs on this one snapshot.
+        let search_path = self.refreshed_search_path().await;
         // Held from resolving the pin until the detached registration has
         // persisted the resumed record, so an adopting package cannot be
         // uninstalled in between: the built-in pin does not count as a
@@ -618,7 +622,7 @@ impl SessionRegistry {
             .await?;
         #[cfg(test)]
         self.hold_definition().await;
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let relaunch = self.plan_relaunch(&binding, definition, launch, change, &search_path)?;
 
         let info = match self
             .resume_binding_with_registration(
@@ -849,17 +853,25 @@ impl SessionRegistry {
     /// A registry whose base environment cannot be built cannot launch an
     /// agent either; the inventory then probes under an empty environment, so
     /// it never reports a `PATH` no launch would see.
-    pub(crate) fn inspect_base_environment(&self) -> BaseEnv {
-        self.launch_base_environment().unwrap_or_default()
+    pub(crate) fn inspect_base_environment(
+        &self,
+        search_path: &crate::runtime::SearchPath,
+    ) -> BaseEnv {
+        self.launch_base_environment(search_path)
+            .unwrap_or_default()
     }
 
-    /// The base environment a launch of this registry hands to the agent.
-    pub(super) fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
+    /// The base environment a launch of this registry hands to the agent, with
+    /// the manager `PATH` of `search_path` swapped in for the process's.
+    pub(super) fn launch_base_environment(
+        &self,
+        search_path: &crate::runtime::SearchPath,
+    ) -> Result<BaseEnv, ProtocolError> {
         let lifecycle = self.lifecycle()?;
         crate::runtime::environment::base_environment_following(
             &lifecycle.config.environment_allowlist,
             &lifecycle.config.environment_source,
-            self.manager_search_path(),
+            search_path.manager(),
         )
         .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))
     }
@@ -948,13 +960,14 @@ impl SessionRegistry {
         definition: Arc<RuntimeDefinition>,
         launch: NativeSessionLaunch,
         change: ProfileChange,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<RelaunchPlan, ProtocolError> {
         // Build the native reference from the field the frozen reference kind
         // names, so a `path`-kind spec applies the absolute-path guard and an
         // `id`-kind spec the leading-dash guard (the documented asymmetry).
         let session_ref = session_ref_from_binding(launch.reference_kind(), binding)?;
         let profile = self.resolve_recovery_profile(binding, &definition, change)?;
-        let base_environment = self.launch_base_environment()?;
+        let base_environment = self.launch_base_environment(search_path)?;
         let program = binding_program(binding, &definition);
         // A runtime without a version probe validates the frozen program's
         // resolution the same way; its environment only matters when a
@@ -962,7 +975,7 @@ impl SessionRegistry {
         let environment = host::ProbeEnvironment::for_launch(
             &base_environment,
             profile.env.as_slice(),
-            self.search_path().as_deref(),
+            search_path.as_os_str(),
         );
         let validated_program = host::validate_launch_runtime(
             &definition,
@@ -977,6 +990,7 @@ impl SessionRegistry {
             validated_program,
             base_environment,
             profile,
+            search_path: search_path.clone(),
         })
     }
 
@@ -1038,7 +1052,13 @@ impl SessionRegistry {
         let definition = self.binding_definition(&binding)?;
         let launch = binding_native_launch(&binding, &definition)
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
-        let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let relaunch = self.plan_relaunch(
+            &binding,
+            definition,
+            launch,
+            change,
+            &self.search_path_snapshot(),
+        )?;
         let id = SessionId(binding.session_id.clone());
         let guard = self.lock_lifecycle(&id).await;
         let registration = match self.load_durable_session_record(&id).await? {
@@ -1089,7 +1109,9 @@ impl SessionRegistry {
         // binding without a snapshot program falls back to the base kind's
         // compiled spec.
         let id = SessionId(binding.session_id.clone());
-        let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
+        let outdated_hooks = self
+            .outdated_relaunch_warnings(&binding, &relaunch, &relaunch.search_path)
+            .await;
 
         // A legacy binding carries no snapshot program; fall back to the base kind's
         // default so it still relaunches. `program`/`input_rules` are frozen
@@ -1109,6 +1131,7 @@ impl SessionRegistry {
             program,
             validated_program,
             profile,
+            search_path,
             ..
         } = relaunch;
         let trusted_args = self
@@ -1124,6 +1147,7 @@ impl SessionRegistry {
                 frozen_args: &binding.args,
                 name: binding.name.as_deref(),
                 trusted_args: &trusted_args,
+                search_path: &search_path,
             },
         )?;
         let mut env_extra = inputs.env;
@@ -1136,7 +1160,7 @@ impl SessionRegistry {
             rows: binding.rows,
             env_extra,
             validated_program,
-            search_path: self.search_path(),
+            search_path: search_path.to_os_string(),
             worker_file: inputs.worker_file,
         };
         let command = resume_pty_command_from_launch(
@@ -1205,6 +1229,7 @@ impl SessionRegistry {
                 initial_input_pending: false,
                 prompt_in_argv: false,
                 package_authority,
+                search_path,
             },
             guard,
         )

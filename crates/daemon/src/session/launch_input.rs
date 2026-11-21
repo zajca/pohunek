@@ -42,6 +42,9 @@ pub(super) struct LaunchSubject<'a> {
     /// passed the trust predicate, else empty; see
     /// [`SessionRegistry::trusted_checkout_args`].
     pub(super) trusted_args: &'a [String],
+    /// The operation's search path snapshot, whose manager `PATH` the base
+    /// environment follows.
+    pub(super) search_path: &'a crate::runtime::SearchPath,
 }
 
 /// The environment and root-position arguments of one launch.
@@ -290,12 +293,14 @@ impl SessionRegistry {
             frozen_args,
             name,
             trusted_args,
+            search_path,
         } = subject;
         let base = self.launch_env(definition, profile_env, agent.clone(), id);
         let mut declared_args = placement_args(definition, frozen_args);
         declared_args.extend(naming_args(definition, name, id));
         declared_args.extend_from_slice(trusted_args);
-        let Some(contribution) = self.contribution(definition, &base, id, kind, frozen_args)?
+        let Some(contribution) =
+            self.contribution(definition, &base, id, kind, frozen_args, search_path)?
         else {
             return Ok(LaunchInputs {
                 env: base,
@@ -331,10 +336,11 @@ impl SessionRegistry {
         id: &SessionId,
         kind: LaunchKind,
         frozen_args: &[String],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<Vec<String>, ProtocolError> {
         let base = self.launch_env(definition, profile_env, agent, id);
         Ok(self
-            .contribution(definition, &base, id, kind, frozen_args)?
+            .contribution(definition, &base, id, kind, frozen_args, search_path)?
             .map_or_else(Vec::new, |input| {
                 input.env.into_iter().map(|(name, _)| name).collect()
             }))
@@ -349,6 +355,7 @@ impl SessionRegistry {
         id: &SessionId,
         kind: LaunchKind,
         frozen_args: &[String],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<Option<LaunchInput>, ProtocolError> {
         let Some(contributor) = crate::integration::launch_contributor(definition) else {
             return Ok(None);
@@ -356,7 +363,7 @@ impl SessionRegistry {
         let Some(state_root) = self.inner.config.worker_state_root.as_deref() else {
             return Err(unavailable_state_root());
         };
-        let environment = self.launch_base_environment()?;
+        let environment = self.launch_base_environment(search_path)?;
         let config_home = match definition.config_home() {
             Some(home) => Some(
                 home.resolve(&|name| effective_variable(&environment, base, name))

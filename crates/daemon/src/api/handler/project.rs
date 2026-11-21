@@ -121,7 +121,7 @@ pub(super) async fn handle_project_candidates(request: &Request, state: &DaemonS
     let wants_pohunek =
         params.sources.is_empty() || params.sources.contains(&CandidateSource::Pohunek);
     let homes = if params.sources.contains(&CandidateSource::History) {
-        match sessions.integration_homes() {
+        match sessions.integration_homes(&sessions.search_path_snapshot()) {
             Ok(homes) => Some(homes),
             Err(err) => return error_value(request, err),
         }

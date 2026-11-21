@@ -1092,7 +1092,8 @@ async fn status_and_doctor_report_a_misshapen_hooks_file_that_a_launch_would_ref
         .expect("create the Muse session");
     let homes = crate::integration::ConfigHomes::new(
         rig.registry.profiles().clone(),
-        rig.registry.inspect_base_environment(),
+        rig.registry
+            .inspect_base_environment(&rig.registry.search_path_snapshot()),
     );
     let agent = protocol::RuntimeRef::from_wire("muse");
     let status = |homes: &crate::integration::ConfigHomes| {
@@ -1217,7 +1218,8 @@ async fn install_status_and_uninstall_write_nothing_into_the_muse_home() {
     let names_before = fs::read_dir(&rig.muse_home).expect("home").count();
     let homes = crate::integration::ConfigHomes::new(
         rig.registry.profiles().clone(),
-        rig.registry.inspect_base_environment(),
+        rig.registry
+            .inspect_base_environment(&rig.registry.search_path_snapshot()),
     );
     let agent = protocol::RuntimeRef::from_wire("muse");
 

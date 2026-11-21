@@ -107,6 +107,10 @@ pub(super) struct PtySessionSpec {
     /// Shared package authority a launch holds until its registration ends,
     /// for launches that pin a package outside the create transaction.
     pub(super) package_authority: Option<crate::packages::OwnedLaunchGuard>,
+    /// The search path snapshot of the operation that built this
+    /// registration; the worker's base environment follows its manager
+    /// `PATH`.
+    pub(super) search_path: crate::runtime::SearchPath,
 }
 
 /// The canonical form of `path` when it is an absolute path of an existing
@@ -784,6 +788,7 @@ impl SessionRegistry {
             initial_input_pending,
             prompt_in_argv,
             package_authority: _package_authority,
+            search_path,
         } = spec;
 
         // A relaunch keeps the key of the session's creating request, which the
@@ -1053,6 +1058,7 @@ impl SessionRegistry {
                 command,
                 &transaction_id,
                 runtime_generation,
+                &search_path,
             )
             .await
         {
@@ -1337,6 +1343,7 @@ impl SessionRegistry {
         command: LaunchCommand,
         transaction_id: &str,
         runtime_generation: protocol::RuntimeGeneration,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<StartedRuntime, LaunchFailure> {
         // Nothing of the generation exists yet, so a refused directory leaves
         // nothing to retire.
@@ -1372,6 +1379,7 @@ impl SessionRegistry {
                 command,
                 transaction_id,
                 runtime_generation,
+                search_path,
             )
             .await
         {
@@ -1449,6 +1457,7 @@ impl SessionRegistry {
         command: LaunchCommand,
         transaction_id: &str,
         runtime_generation: protocol::RuntimeGeneration,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<StartedRuntime, ProtocolError> {
         let worker_id = worker.worker_id().await;
         let dimensions = Dimensions::new(command.cols, command.rows)
@@ -1479,7 +1488,7 @@ impl SessionRegistry {
         let base_environment = crate::runtime::environment::base_environment_following(
             &lifecycle.config.environment_allowlist,
             &lifecycle.config.environment_source,
-            self.manager_search_path(),
+            search_path.manager(),
         )
         .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let transaction_id = TransactionId::new(transaction_id)

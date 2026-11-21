@@ -1373,7 +1373,9 @@ struct LaunchHomeState {
 
 impl LaunchHomeRoots {
     fn new(registry: SessionRegistry) -> Self {
-        Self::from_source(Arc::new(move || registry.integration_homes()))
+        Self::from_source(Arc::new(move || {
+            registry.integration_homes(&registry.search_path_snapshot())
+        }))
     }
 
     fn from_source(homes: HomesSource) -> Self {

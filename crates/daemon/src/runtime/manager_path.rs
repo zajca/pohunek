@@ -50,6 +50,52 @@ fn store_helper(path: Option<OsString>) {
         .unwrap_or_else(PoisonError::into_inner) = path;
 }
 
+/// The executable search path of one operation, taken once from its registry
+/// and moved to every resolver, `git` spawn and hook the operation reaches.
+///
+/// A value, not a reader: it is `Send + Sync` and cheap to clone, so it crosses
+/// `spawn_blocking` and `spawn` boundaries by being moved into the closure, and
+/// a concurrent refresh of the registry never changes it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SearchPath {
+    /// The `PATH` executables resolve on: the manager's when the daemon
+    /// follows it and has read one, else the process's.
+    resolved: Option<Arc<OsStr>>,
+    /// The manager `PATH` of the read this snapshot was taken after; the base
+    /// environment of a launch swaps it in for the process's.
+    manager: Option<Arc<OsStr>>,
+}
+
+impl SearchPath {
+    /// A snapshot resolving on `resolved`, with `manager` as the manager
+    /// `PATH` the base environment follows.
+    #[must_use]
+    pub(crate) fn new(resolved: Option<OsString>, manager: Option<OsString>) -> Self {
+        Self {
+            resolved: resolved.map(Arc::from),
+            manager: manager.map(Arc::from),
+        }
+    }
+
+    /// The `PATH` executables resolve on.
+    #[must_use]
+    pub(crate) fn as_os_str(&self) -> Option<&OsStr> {
+        self.resolved.as_deref()
+    }
+
+    /// An owned copy of [`Self::as_os_str`].
+    #[must_use]
+    pub(crate) fn to_os_string(&self) -> Option<OsString> {
+        self.resolved.as_deref().map(OsStr::to_os_string)
+    }
+
+    /// The manager `PATH` the base environment of a launch follows.
+    #[must_use]
+    pub(crate) fn manager(&self) -> Option<OsString> {
+        self.manager.as_deref().map(OsStr::to_os_string)
+    }
+}
+
 /// Why the manager's `PATH` could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("the service manager's environment could not be read: {detail}")]

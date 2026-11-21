@@ -489,6 +489,79 @@ async fn two_registries_in_one_process_resolve_on_their_own_manager_path() {
     }
 }
 
+/// Writes an executable `git` into `directory` and makes the directory
+/// owner-private, so the trusted-executable policy accepts it.
+fn install_git(directory: &Path) {
+    std::fs::create_dir_all(directory).expect("create the git directory");
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .expect("make the git directory owner-private");
+    let program = directory.join("git");
+    std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("write git");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+        .expect("make git executable");
+}
+
+/// `git_available` of the flags-only `host.inspect` answer.
+async fn git_available(state: &DaemonState) -> bool {
+    let request = Request::new(
+        "manager-path",
+        method::HOST_INSPECT,
+        serde_json::json!({ "skip_runtime_probes": true }),
+    )
+    .expect("valid request");
+    let value = handle_request(&request, state)
+        .await
+        .into_result()
+        .unwrap_or_else(|error| panic!("host.inspect failed: {error}"));
+    serde_json::from_value::<HostCapabilities>(value)
+        .expect("host.inspect result")
+        .git_available
+}
+
+/// C1: each registry judges `git` on its own manager's `PATH`. Registry A's
+/// manager holds a `git`; B's manager and the process `PATH` hold none. The long
+/// reuse window makes A's later requests reuse its earlier read, so only a
+/// state shared between the registries could turn the answer.
+#[tokio::test]
+async fn two_registries_judge_git_on_their_own_manager_path() {
+    if !in_own_process() {
+        return;
+    }
+    let scratch = pohunek_test_support::tempdir().expect("scratch directory");
+    let process_dir = scratch.path().join("process-bin");
+    std::fs::create_dir_all(&process_dir).expect("process directory");
+    std::fs::set_permissions(&process_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("owner-private process directory");
+    let mut process = ProcessEnv::lock();
+    process
+        .set("PATH", &process_dir)
+        .remove(ENV_DAEMON_ID)
+        .remove(ENV_SESSION_ID);
+
+    let mut daemons = Vec::new();
+    for (name, has_git) in [("first", true), ("second", false)] {
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let manager_dir = root.path().join("manager-bin");
+        std::fs::create_dir_all(&manager_dir).expect("manager directory");
+        if has_git {
+            install_git(&manager_dir);
+        }
+        let manager_path = std::env::join_paths([&manager_dir, &process_dir]).expect("join PATH");
+        let manager = FakeManager::answering(Answer::Path(manager_path));
+        let state = state(root.path(), &manager, Launches::Never, LONG_REUSE).await;
+        daemons.push((name, has_git, root, state));
+    }
+
+    for index in [0, 1, 0, 1, 0] {
+        let (name, has_git, _root, state) = &daemons[index];
+        assert_eq!(
+            git_available(state).await,
+            *has_git,
+            "the {name} registry judges git on its own manager's PATH"
+        );
+    }
+}
+
 /// R4: a manager that cannot answer, or that has no `PATH`, leaves the `PATH`
 /// the daemon process started with; the process environment itself is never
 /// changed.

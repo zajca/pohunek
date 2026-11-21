@@ -865,35 +865,35 @@ impl SessionRegistry {
             .and_then(|supervision| supervision.manager_path.as_ref())
     }
 
-    /// The `PATH` this registry resolves executables on and gives its agents:
-    /// the service manager's last read when the daemon follows it, else the
-    /// process's.
-    pub(crate) fn search_path(&self) -> Option<std::ffi::OsString> {
-        let path = self.manager_path().map_or_else(
-            || std::env::var_os("PATH"),
-            crate::runtime::ManagerPath::search_path,
-        );
+    /// The `PATH` snapshot this registry resolves executables on and gives its
+    /// agents: the service manager's last read when the daemon follows it, else
+    /// the process's. It never reads the manager again.
+    ///
+    /// Background work (diff, retention, removal, session-stop hooks, cwd
+    /// tracking) takes this; an operation that resolves or launches an agent
+    /// starts from [`Self::refreshed_search_path`].
+    pub(crate) fn search_path_snapshot(&self) -> crate::runtime::SearchPath {
+        let manager = self
+            .manager_path()
+            .and_then(crate::runtime::ManagerPath::manager_path);
+        let resolved = manager.clone().or_else(|| std::env::var_os("PATH"));
+        // The one place the test launch-path seam is applied, so a fixture
+        // directory is never prefixed twice.
         #[cfg(test)]
-        let path = crate::test_support::with_thread_launch_path(path);
-        path
+        let resolved = crate::test_support::with_thread_launch_path(resolved);
+        crate::runtime::SearchPath::new(resolved, manager)
     }
 
-    /// The manager `PATH` of the last read, when the daemon follows it; the
-    /// base environment of a launch swaps it in for the process's.
-    pub(crate) fn manager_search_path(&self) -> Option<std::ffi::OsString> {
-        self.manager_path()
-            .and_then(crate::runtime::ManagerPath::manager_path)
-    }
-
-    /// [`Self::search_path`] after re-reading the service manager's `PATH`
-    /// when the daemon follows it. Every operation that resolves or launches
-    /// an agent starts from this, so it runs on the `PATH` the manager holds
-    /// now.
-    pub(crate) async fn refreshed_search_path(&self) -> Option<std::ffi::OsString> {
+    /// [`Self::search_path_snapshot`] after re-reading the service manager's
+    /// `PATH` when the daemon follows it. An operation that resolves or
+    /// launches an agent takes one snapshot from this and passes it down, so
+    /// it runs on the `PATH` the manager holds now and every step of the
+    /// operation agrees on it.
+    pub(crate) async fn refreshed_search_path(&self) -> crate::runtime::SearchPath {
         if let Some(manager_path) = self.manager_path() {
             manager_path.refresh().await;
         }
-        self.search_path()
+        self.search_path_snapshot()
     }
 
     /// Reaps the processes an ended generation's runtime left behind.

@@ -27434,7 +27434,7 @@ async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
         let capabilities = crate::capabilities::host_capabilities_uncached(
             "0.0.0",
             registry.profiles(),
-            &registry.inspect_base_environment(),
+            &registry.inspect_base_environment(&registry.search_path_snapshot()),
         );
         for (agent, launches) in [("pi", bare_launches), ("pi-in", true), ("pi-out", false)] {
             let listed = capabilities
@@ -28364,7 +28364,9 @@ fn warns_of_outdated_hooks(info: &SessionInfo) -> bool {
 #[cfg(unix)]
 fn install_claude_hooks(registry: &SessionRegistry) {
     crate::integration::install_in(
-        &registry.integration_homes().expect("config homes"),
+        &registry
+            .integration_homes(&registry.search_path_snapshot())
+            .expect("config homes"),
         Some(&protocol::RuntimeRef::claude()),
         &crate::integration::HomeSelection::Runtime,
         &crate::integration::RetainedSchemas::default(),
@@ -28514,7 +28516,9 @@ fn shadowing_profile_registry(
 #[cfg(unix)]
 fn install_shadowing_profile_hooks(registry: &SessionRegistry) {
     crate::integration::install_in(
-        &registry.integration_homes().expect("config homes"),
+        &registry
+            .integration_homes(&registry.search_path_snapshot())
+            .expect("config homes"),
         Some(&protocol::RuntimeRef::claude()),
         &crate::integration::HomeSelection::Profile("claude".to_owned()),
         &crate::integration::RetainedSchemas::default(),

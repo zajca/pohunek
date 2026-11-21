@@ -32,11 +32,11 @@ pub(super) async fn handle_host_inspect(
     };
     let daemon_version = health.daemon_version.clone();
     let protocol_version = selected_version(request);
-    // The flags-only answer probes `git` on the helper path, which a refresh
-    // keeps current.
+    // Both answers probe `git` on the snapshot this refresh took.
     let search_path = sessions.refreshed_search_path().await;
     if params.and_then(|params| params.skip_runtime_probes) == Some(true) {
-        let mut capabilities = crate::capabilities::host_capability_flags(&daemon_version);
+        let mut capabilities =
+            crate::capabilities::host_capability_flags(&daemon_version, search_path.as_os_str());
         capabilities.protocol_version = protocol_version;
         capabilities.package_install_index_supported =
             sessions.package_authority().index_install_supported();
@@ -53,8 +53,8 @@ pub(super) async fn handle_host_inspect(
             let mut capabilities = crate::capabilities::host_capabilities(
                 &daemon_version,
                 sessions.profiles(),
-                &sessions.inspect_base_environment(),
-                search_path.as_deref(),
+                &sessions.inspect_base_environment(&search_path),
+                search_path.as_os_str(),
                 sessions.probe_cache(),
             );
             capabilities.protocol_version = protocol_version;

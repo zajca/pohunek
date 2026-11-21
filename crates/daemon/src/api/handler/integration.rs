@@ -78,11 +78,22 @@ fn require_local_for_profiles(
     }
 }
 
-/// Resolves the config homes of this daemon, or answers with the error.
+/// Resolves the config homes of this daemon on the registry's cached search
+/// path, or answers with the error.
 fn homes_of(request: &Request, state: &DaemonState) -> Result<ConfigHomes, Response> {
+    homes_on(request, state, &state.sessions.search_path_snapshot())
+}
+
+/// Resolves the config homes of this daemon on `search_path`, or answers with
+/// the error.
+fn homes_on(
+    request: &Request,
+    state: &DaemonState,
+    search_path: &crate::runtime::SearchPath,
+) -> Result<ConfigHomes, Response> {
     state
         .sessions
-        .integration_homes()
+        .integration_homes(search_path)
         .map_err(|error| error_value(request, error))
 }
 
@@ -169,13 +180,13 @@ pub(super) async fn handle_integration_doctor(request: &Request, state: &DaemonS
     if let Err(err) = check_existing_agent(&runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
-    let homes = match homes_of(request, state) {
+    let search_path = state.sessions.refreshed_search_path().await;
+    let homes = match homes_on(request, state, &search_path) {
         Ok(homes) => homes,
         Err(response) => return response,
     };
-    let search_path = state.sessions.refreshed_search_path().await;
     run_integration_doctor_blocking(request, move || {
-        crate::integration::doctor_in(&homes, params, search_path.as_deref())
+        crate::integration::doctor_in(&homes, params, search_path.as_os_str())
     })
     .await
 }

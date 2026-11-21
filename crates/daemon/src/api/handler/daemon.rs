@@ -66,8 +66,8 @@ pub(super) async fn handle_daemon_doctor(
         sessions.active_supervision(),
         sessions.package_authority().catalog_trust(),
         sessions.profiles(),
-        sessions.inspect_base_environment(),
-        search_path,
+        sessions.inspect_base_environment(&search_path),
+        search_path.to_os_string(),
         hostcheck::OverlayChecks {
             diagnostics: &overlay_diagnostics,
             from_file: overlays_from_file,
