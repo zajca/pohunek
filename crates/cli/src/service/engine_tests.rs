@@ -1183,7 +1183,7 @@ async fn install_creates_only_the_default_session_tmp_root_and_an_upgrade_keeps_
 
     let harness = Harness::new();
     harness.install(V1).await.expect("install");
-    let default_root = harness.context.paths().cache_dir.join("session-tmp");
+    let default_root = harness.context.default_session_tmp_root().expect("default");
     let config = harness.config().expect("config");
     assert_eq!(config.session_tmp_root(), Some(default_root.as_path()));
     let mode = std::fs::metadata(&default_root)

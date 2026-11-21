@@ -142,7 +142,9 @@ empty, and a previous release reports it as an unknown table.
 a schema-7 file record `<cache_dir>/session-tmp` explicitly, so nothing moves until you
 edit the key (changing it does not move or clean up the directories of existing sessions under the old root: delete that tree yourself once no session uses it); point it at a short absolute path on another disk (for example `/t/st`)
 to keep session scratch off the cache filesystem, then restart the daemon. The
-installer creates the default root only. The daemon never creates the configured root,
+installer creates the default root only, below the real path of the cache directory
+(a symlinked `~/.cache` is resolved, and an untrusted real path is refused naming it);
+a root you configured elsewhere is neither created nor judged by the installer. The daemon never creates the configured root,
 so create a root you chose yourself (mode 0700, owned by you, no symlink in the path)
 before the daemon needs it: while it is missing or unsafe a session launch fails with
 `session_tmpdir_failed` or `session_tmpdir_unsafe` naming it, the daemon keeps serving,

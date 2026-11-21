@@ -1506,6 +1506,22 @@ impl ServiceConfig {
         Ok(config)
     }
 
+    /// Returns this configuration with only its session temporary root changed.
+    ///
+    /// Everything else is kept, including the unknown keys of the file this
+    /// value was loaded from.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation errors of [`ServiceConfig::new`].
+    pub fn with_session_tmp_root(&self, session_tmp_root: PathBuf) -> Result<Self, ConfigError> {
+        let mut spec = self.to_spec();
+        spec.session_tmp_root = session_tmp_root;
+        let mut config = Self::new(spec)?;
+        config.unknown = self.unknown.clone();
+        Ok(config)
+    }
+
     /// Returns the keys and tables of the loaded file that this version does
     /// not know, in file order.
     ///

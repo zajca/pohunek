@@ -794,10 +794,12 @@ impl<'a> Engine<'a> {
         // schema-2 to schema-7 installation upgrades into this one
         // instead of being refused: the migration below carries its exact bytes
         // and schema.
-        let source = load_config_for_upgrade(&config_path, Some(&self.context.paths().cache_dir))?
-            .ok_or(Error::NotInstalled {
+        let cache_dir = self.context.canonical_cache_dir()?;
+        let source = load_config_for_upgrade(&config_path, Some(&cache_dir))?.ok_or(
+            Error::NotInstalled {
                 path: config_path.clone(),
-            })?;
+            },
+        )?;
         if let Some(record) = &resume {
             // A resumed migration verifies its backup journal before any
             // further effect, so a moved, missing, or altered backup fails
@@ -807,7 +809,7 @@ impl<'a> Engine<'a> {
         let config = &source.config;
         check_upgrade_renderings(config, version, resume.is_some(), &config_path)?;
         let layout = config.layout().clone();
-        check_layout_dirs(self.context, &layout)?;
+        check_layout_dirs(self.context, &layout, config.session_tmp_root())?;
         layout::claim_prefix(&layout, &config.namespace())?;
         let state = self.checked_version_state(&layout, version)?;
         let resumed = resume.is_some();
@@ -2183,8 +2185,8 @@ impl<'a> Engine<'a> {
             path: self.store.path(),
             detail: "migration rollback has no config backup".to_owned(),
         })?;
-        let current =
-            ServiceConfig::load_upgrade_source(config_path, Some(&self.context.paths().cache_dir))?;
+        let cache_dir = self.context.canonical_cache_dir()?;
+        let current = ServiceConfig::load_upgrade_source(config_path, Some(&cache_dir))?;
         verify_pending_migration(self.context, &self.store, record, &current)?;
         let source = if record.step <= Step::StopDaemon {
             if record.step == Step::StopDaemon && digest_mismatch(current.original_bytes(), backup)
@@ -2196,7 +2198,7 @@ impl<'a> Engine<'a> {
                 ServiceConfig::load_upgrade_source_bytes(
                     &self.store.config_backup_path(),
                     &bytes,
-                    Some(&self.context.paths().cache_dir),
+                    Some(&cache_dir),
                 )?
             } else {
                 current
@@ -2206,11 +2208,7 @@ impl<'a> Engine<'a> {
                 .store
                 .read_config_backup()?
                 .ok_or_else(|| backup_error(self.store.config_backup_path(), "is missing"))?;
-            ServiceConfig::load_upgrade_source_bytes(
-                config_path,
-                &bytes,
-                Some(&self.context.paths().cache_dir),
-            )?
+            ServiceConfig::load_upgrade_source_bytes(config_path, &bytes, Some(&cache_dir))?
         };
         if digest_mismatch(source.original_bytes(), backup) {
             let path = if record.step < Step::Config {
@@ -2843,7 +2841,7 @@ impl<'a> Engine<'a> {
         version: &str,
     ) -> Result<Restore, Error> {
         let layout = install_layout(&record.prefix)?;
-        check_layout_dirs(self.context, &layout)?;
+        check_layout_dirs(self.context, &layout, None)?;
         layout::claim_prefix(&layout, &self.context.namespace()?)?;
         let state = self.checked_version_state(&layout, version)?;
         if matches!(state, layout::VersionState::Trusted) {
@@ -3405,7 +3403,7 @@ pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<Inst
     context.service_environment()?;
     layout::check_trusted(context.supervisor_dir())?;
     let layout = install_layout(prefix)?;
-    check_layout_dirs(context, &layout)?;
+    check_layout_dirs(context, &layout, Some(&context.default_session_tmp_root()?))?;
     Ok(layout)
 }
 
@@ -3522,26 +3520,33 @@ pub(crate) fn upgrade_preflight(context: &Context) -> Result<(), Error> {
 /// Checks every directory install or upgrade writes into.
 ///
 /// Those are the prefix, `<prefix>/bin`, `<prefix>/libexec`, the versions
-/// directory, the directory of `service.toml`, and the default session
-/// temporary root; a missing one is judged
-/// by its nearest existing ancestor, below which it will be created.
+/// directory, the directory of `service.toml`, and the session temporary root
+/// when `recorded_root` is the default the installer creates; a missing one
+/// is judged by its nearest existing ancestor, below which it will be
+/// created. A root the operator configured elsewhere is not the installer's to
+/// create, so it is not judged here, and neither is the cache directory.
+/// `recorded_root` is `None` for an operation that writes no root.
 ///
 /// # Errors
 ///
 /// Returns [`Error::UntrustedDirectory`] naming the offending directory.
-pub(crate) fn check_layout_dirs(context: &Context, layout: &InstallLayout) -> Result<(), Error> {
+pub(crate) fn check_layout_dirs(
+    context: &Context,
+    layout: &InstallLayout,
+    recorded_root: Option<&Path>,
+) -> Result<(), Error> {
     let versions = layout.versions_dir();
     let bin = layout.bin_dir();
     let config_path = context.config_path();
-    let session_tmp_root =
-        pohunek_service_config::default_session_tmp_root(&context.paths().cache_dir);
+    let default_root = context.default_session_tmp_root()?;
+    let session_tmp_root = recorded_root.filter(|root| *root == default_root.as_path());
     let directories = [
         Some(layout.prefix()),
         Some(bin.as_path()),
         versions.parent(),
         Some(versions.as_path()),
         config_path.parent(),
-        Some(session_tmp_root.as_path()),
+        session_tmp_root,
     ];
     for directory in directories.into_iter().flatten() {
         layout::check_trusted(directory)?;
@@ -3751,12 +3756,14 @@ pub(crate) async fn adoption_job_path(
     };
     // `with_search_path` revalidates every key, so the judged copy of a
     // previous-schema file needs a root; the copy is never written.
-    let cache_dir =
-        (record.operation == Operation::RefreshPath).then(|| context.paths().cache_dir.as_path());
-    let source =
-        load_config_for_upgrade(&context.config_path(), cache_dir)?.ok_or(Error::NotInstalled {
+    let cache_dir = (record.operation == Operation::RefreshPath)
+        .then(|| context.canonical_cache_dir())
+        .transpose()?;
+    let source = load_config_for_upgrade(&context.config_path(), cache_dir.as_deref())?.ok_or(
+        Error::NotInstalled {
             path: context.config_path(),
-        })?;
+        },
+    )?;
     let config = if record.operation == Operation::RefreshPath {
         let record_error = |detail: String| Error::Record {
             path: context.paths().state_dir.join(record::FILE_NAME),
@@ -4584,7 +4591,7 @@ pub(crate) fn verify_pending_migration(
             let previous = ServiceConfig::load_upgrade_source_bytes(
                 &store.config_backup_path(),
                 &bytes,
-                Some(&context.paths().cache_dir),
+                Some(&context.canonical_cache_dir()?),
             )?;
             if previous.source_schema_version != backup.source_schema_version {
                 return Err(backup_error(
@@ -4592,7 +4599,15 @@ pub(crate) fn verify_pending_migration(
                     "does not match the schema journaled in the transaction record",
                 ));
             }
-            let target = with_version(&previous.config, &record.version)?;
+            let mut target = with_version(&previous.config, &record.version)?;
+            // The written file records the root the migration derived when it
+            // ran, which the cache directory of this process may no longer
+            // give.
+            if source.source_schema_version == SCHEMA_VERSION {
+                if let Some(root) = source.config.session_tmp_root() {
+                    target = target.with_session_tmp_root(root.to_path_buf())?;
+                }
+            }
             if body_after_header(source.original_bytes())
                 == body_after_header(target.to_toml().as_bytes())
                 || (source.original_bytes() == bytes

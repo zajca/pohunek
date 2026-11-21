@@ -1203,7 +1203,8 @@ pub(crate) fn check_local(
                 None,
             )
         } else {
-            let config_source = verified_config_source(context, Some(&context.paths().cache_dir))?;
+            let config_source =
+                verified_config_source(context, Some(&context.canonical_cache_dir()?))?;
             engine::upgrade_preflight(context)?;
             let plan = engine::upgrade_plan(pending, version)?;
             if let Some(record) = plan.record() {
@@ -1226,7 +1227,7 @@ pub(crate) fn check_local(
                     installed: layout.prefix().to_path_buf(),
                 });
             }
-            engine::check_layout_dirs(context, layout)?;
+            engine::check_layout_dirs(context, layout, config.session_tmp_root())?;
             layout::verify_claim(layout, &config.namespace())?;
             // A previous-schema file means the checked upgrade is a migration: it stops
             // the daemon before it rewrites `service.toml`.

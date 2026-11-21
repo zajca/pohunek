@@ -215,7 +215,7 @@ impl Engine<'_> {
         }
         let config_path = self.context.config_path();
         let layout = config.layout().clone();
-        check_layout_dirs(self.context, &layout)?;
+        check_layout_dirs(self.context, &layout, None)?;
         layout::verify_claim(&layout, &config.namespace())?;
         let target = config.with_search_path(discovered.search_path.clone())?;
         check_rendering_size(&target, &config_path)?;
@@ -370,7 +370,7 @@ impl Engine<'_> {
             return Err(Error::RefreshConfigChanged);
         }
         let config_path = self.context.config_path();
-        check_layout_dirs(self.context, config.layout())?;
+        check_layout_dirs(self.context, config.layout(), None)?;
         layout::verify_claim(config.layout(), &config.namespace())?;
         check_rendering_size(&target, &config_path)?;
         let definition = daemon_definition(self.context, &target)?;

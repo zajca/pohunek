@@ -664,7 +664,10 @@ async fn upgrade_migrates_a_schema_seven_config_recording_the_cache_based_sessio
         .expect("install version A");
     let old_daemon = daemon_process(&backend).await;
     // A schema-7 installation never had the installer create the root.
-    let default_root = installation.context.paths().cache_dir.join("session-tmp");
+    let default_root = installation
+        .context
+        .default_session_tmp_root()
+        .expect("default root");
     std::fs::remove_dir(&default_root).expect("remove the installed default root");
     std::fs::write(
         installation.context.config_path(),

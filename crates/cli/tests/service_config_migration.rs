@@ -334,6 +334,26 @@ fn check_passing(host: &Host) -> Option<(bool, Value)> {
     Some((success, envelope))
 }
 
+/// [`check_passing`] for a check run with another cache directory and a
+/// fixture setup.
+fn check_in_passing(
+    host: &Host,
+    cache_home: &Path,
+    setup: impl FnOnce(&Path, &Path, &[u8]),
+) -> Option<(bool, Value)> {
+    let (success, envelope) = check_in(host, Some(cache_home), "check", setup);
+    if cfg!(target_os = "linux") && real_bus_address().is_none() {
+        assert!(!success, "{envelope}");
+        let code = envelope
+            .get("err")
+            .and_then(|refusal| refusal.get("code"))
+            .and_then(Value::as_str);
+        assert_eq!(code, Some("service_manager_environment_unavailable"));
+        return None;
+    }
+    Some((success, envelope))
+}
+
 /// Builds the fixture and runs `service check --json` against it.
 fn check(host: &Host) -> (bool, Value) {
     check_with_setup(host, |_, _, _| {})
@@ -683,6 +703,110 @@ fn check_refuses_a_schema_seven_config_when_the_cache_directory_cannot_hold_the_
     }
     let (success, envelope) = check_in(&host, Some(&cache_home), "check", |_, _, _| {});
     assert_config_refusal_naming(success, &envelope, "namespace.session_tmp_root");
+}
+
+/// Points `cache_home` at the fixture's `cache` directory through a symlink,
+/// the shape of a `~/.cache` that lives on another disk.
+fn symlinked_cache_home(host: &Host) -> std::path::PathBuf {
+    host.temporary.path().join("cache-link")
+}
+
+fn link_cache_home(config: &Path) {
+    let root = config
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("fixture root");
+    std::os::unix::fs::symlink(root.join("cache"), root.join("cache-link"))
+        .expect("symlink the cache home");
+}
+
+/// The installer writes only the root `service.toml` records: a root the
+/// operator configured elsewhere does not make an upgrade judge the cache
+/// directory, whatever its trust.
+#[test]
+fn check_accepts_a_configured_root_elsewhere_behind_an_untrusted_cache_path() {
+    let host =
+        Host::current_edited(|text| text.replace("{SESSION_TMP_ROOT}", "{PREFIX}/elsewhere"));
+    let cache_home = symlinked_cache_home(&host);
+    let Some((success, envelope)) = check_in_passing(&host, &cache_home, |config, _, _| {
+        link_cache_home(config);
+    }) else {
+        return;
+    };
+    assert!(success, "{envelope}");
+}
+
+/// A schema-7 migration derives its root from the real path of a cache
+/// directory reached through a symlink, so the host is not locked out.
+#[test]
+fn check_accepts_a_schema_seven_config_behind_a_symlinked_cache_directory() {
+    let host = Host::schema_seven_with_waits(120_000, 2_700_000);
+    let cache_home = symlinked_cache_home(&host);
+    let Some((success, envelope)) = check_in_passing(&host, &cache_home, |config, _, _| {
+        link_cache_home(config);
+    }) else {
+        return;
+    };
+    assert!(success, "{envelope}");
+    assert_eq!(
+        envelope
+            .get("ok")
+            .and_then(|report| report.get("config_schema_migration"))
+            .and_then(Value::as_u64),
+        Some(7),
+        "{envelope}"
+    );
+}
+
+/// A schema-7 migration whose real cache path the daemon could not trust is
+/// refused before any effect, naming that path.
+#[test]
+fn check_refuses_a_schema_seven_config_when_the_real_cache_path_is_untrusted() {
+    let host = Host::schema_seven_with_waits(120_000, 2_700_000);
+    let cache_home = host.temporary.path().join("cache-open");
+    let (success, envelope) = check_in(&host, Some(&cache_home), "check", |config, _, _| {
+        let open = config
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .expect("fixture root")
+            .join("cache-open");
+        fs::create_dir_all(&open).expect("create the cache home");
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("open cache home");
+    });
+    assert!(!success, "{envelope}");
+    let message = envelope
+        .get("err")
+        .and_then(|refusal| refusal.get("msg"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(message.contains("cache-open"), "{envelope}: names the path");
+}
+
+/// A migration written under one cache directory resumes and rolls back under
+/// another: the journal compares the file with the root the file records.
+#[test]
+fn a_written_migration_verifies_whatever_cache_directory_the_resume_resolves() {
+    let host = Host::schema_two();
+    let cache_home = host.temporary.path().join("another-cache");
+    let (success, envelope) = check_in(
+        &host,
+        Some(&cache_home),
+        "check",
+        |config, state, source| {
+            pending_migration(config, state, source, Step::Registered, Some(source));
+        },
+    );
+    assert!(success, "{envelope}");
+    assert_eq!(
+        envelope
+            .get("ok")
+            .and_then(|report| report.get("pending_action"))
+            .and_then(Value::as_str),
+        Some("resume"),
+        "{envelope}"
+    );
 }
 
 /// An interrupted `refresh-path` of a schema-7 installation is judged by the
