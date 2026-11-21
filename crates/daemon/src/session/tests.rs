@@ -58,7 +58,6 @@ use super::{
     WORKER_METADATA_RETRY_WARN_INTERVAL,
 };
 use crate::events::{EventOrigin, ProducedEvent};
-use crate::worktree::RepoHookLayer;
 
 mod cline_hook;
 mod codex_no_daemon;
@@ -6371,6 +6370,7 @@ async fn session_start_hook_is_terminated_after_hook_timeout() {
         stop_reason: None,
         activity: None,
         repo_layer: crate::worktree::RepoHookLayer::Run,
+        search_path: crate::runtime::SearchPath::process(),
     };
 
     // The hook is parked on the gate until the test releases it, so `run_hook`
@@ -21044,8 +21044,9 @@ fn session_diff_added_tracked_file_reflects_unstaged_edits_made_after_staging() 
     )
     .expect("unstaged edit atop the staged add");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(!result.truncated);
     assert!(result.diff.contains("new file mode"));
@@ -21062,8 +21063,9 @@ fn session_diff_deleted_tracked_file_appears_as_a_deletion() {
     let repo = init_git_repo("diff-deleted");
     std::fs::remove_file(repo.join("README.md")).expect("delete tracked file from disk");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(!result.truncated);
     assert!(result.diff.contains("deleted file mode"));
@@ -21091,8 +21093,9 @@ fn session_diff_renamed_tracked_file_with_an_edit_is_detected_as_a_rename() {
     )
     .expect("edit the renamed file");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(!result.truncated);
     assert!(result.diff.contains("rename from README.md"));
@@ -21104,8 +21107,9 @@ fn session_diff_untracked_text_file_appears_as_an_added_file_diff() {
     let repo = init_git_repo("diff-untracked-text");
     std::fs::write(repo.join("new.txt"), "hello\n").expect("write untracked file");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(!result.truncated);
     assert!(result.diff.contains("diff --git a/new.txt b/new.txt"));
@@ -21121,8 +21125,9 @@ fn session_diff_binary_tracked_file_change_shows_gits_binary_stanza() {
     git_in(&repo, &["commit", "-q", "-m", "add binary"]);
     std::fs::write(repo.join("bin.dat"), [0u8, 9, 9, 9, 255, 254]).expect("modify binary file");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(!result.truncated);
     assert!(result
@@ -21135,8 +21140,9 @@ fn session_diff_untracked_binary_file_shows_gits_binary_stanza() {
     let repo = init_git_repo("diff-binary-untracked");
     std::fs::write(repo.join("new.bin"), [0u8, 1, 2, 255]).expect("write untracked binary file");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(!result.truncated);
     assert!(result
@@ -21174,8 +21180,9 @@ fn session_diff_truncates_a_large_untracked_file_and_keeps_the_response_envelope
     let huge = "x".repeat(protocol::MAX_SESSION_DIFF_BYTES + 4096);
     std::fs::write(repo.join("huge.txt"), &huge).expect("write huge untracked file");
 
-    let result = super::diff::compute_session_diff(&repo, RepoHookLayer::Run, "main")
-        .expect("diff succeeds");
+    let result =
+        super::diff::compute_session_diff(&repo, &crate::worktree::GitScope::for_process(), "main")
+            .expect("diff succeeds");
 
     assert!(
         result.truncated,
@@ -21205,8 +21212,14 @@ fn session_diff_truncates_a_large_untracked_file_and_keeps_the_response_envelope
 fn resolve_base_falls_back_to_the_repository_default_branch_when_no_store_or_binding_exists() {
     let repo = init_git_repo("diff-default-fallback");
 
-    let resolved = super::diff::resolve_base(None, RepoHookLayer::Run, None, "s-none", Some(&repo))
-        .expect("the repository's current branch resolves");
+    let resolved = super::diff::resolve_base(
+        None,
+        &crate::worktree::GitScope::for_process(),
+        None,
+        "s-none",
+        Some(&repo),
+    )
+    .expect("the repository's current branch resolves");
 
     assert_eq!(resolved, "main");
 }
@@ -21362,7 +21375,8 @@ async fn session_diff_rejects_incomplete_git_output_from_a_pipe_holding_textconv
         .await
         .expect("create worktree session");
     let worktree = info.worktree_path.as_ref().expect("worktree");
-    let python = crate::agent::trusted_program("python3").expect("test Python");
+    let python = crate::agent::trusted_program("python3", &crate::runtime::SearchPath::process())
+        .expect("test Python");
     let converter = repo.join("converter.py");
     let ended = repo.join("converter-ended");
     std::fs::write(&converter, format!(
@@ -27434,7 +27448,7 @@ async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
         let capabilities = crate::capabilities::host_capabilities_uncached(
             "0.0.0",
             registry.profiles(),
-            &registry.inspect_base_environment(),
+            &registry.inspect_base_environment(&registry.search_path_snapshot()),
         );
         for (agent, launches) in [("pi", bare_launches), ("pi-in", true), ("pi-out", false)] {
             let listed = capabilities
@@ -28364,7 +28378,9 @@ fn warns_of_outdated_hooks(info: &SessionInfo) -> bool {
 #[cfg(unix)]
 fn install_claude_hooks(registry: &SessionRegistry) {
     crate::integration::install_in(
-        &registry.integration_homes().expect("config homes"),
+        &registry
+            .integration_homes(&registry.search_path_snapshot())
+            .expect("config homes"),
         Some(&protocol::RuntimeRef::claude()),
         &crate::integration::HomeSelection::Runtime,
         &crate::integration::RetainedSchemas::default(),
@@ -28514,7 +28530,9 @@ fn shadowing_profile_registry(
 #[cfg(unix)]
 fn install_shadowing_profile_hooks(registry: &SessionRegistry) {
     crate::integration::install_in(
-        &registry.integration_homes().expect("config homes"),
+        &registry
+            .integration_homes(&registry.search_path_snapshot())
+            .expect("config homes"),
         Some(&protocol::RuntimeRef::claude()),
         &crate::integration::HomeSelection::Profile("claude".to_owned()),
         &crate::integration::RetainedSchemas::default(),

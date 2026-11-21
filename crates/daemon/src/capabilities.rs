@@ -171,8 +171,11 @@ pub(crate) fn host_capabilities(
 /// This is what `host.inspect` answers for a client that only needs the flags;
 /// it resolves and probes no program besides `git`.
 #[must_use]
-pub(crate) fn host_capability_flags(daemon_version: &str) -> HostCapabilities {
-    capability_snapshot(daemon_version, Vec::new(), Vec::new())
+pub(crate) fn host_capability_flags(
+    daemon_version: &str,
+    search_path: Option<&OsStr>,
+) -> HostCapabilities {
+    capability_snapshot(daemon_version, Vec::new(), Vec::new(), search_path)
 }
 
 /// [`host_capabilities`] through a probe cache of its own, so a call never
@@ -335,7 +338,7 @@ fn host_capabilities_for(
         options::apply_floors(&mut entry.options, entry.version.as_deref());
     }
 
-    capability_snapshot(daemon_version, supported_agents, runtimes)
+    capability_snapshot(daemon_version, supported_agents, runtimes, search_path)
 }
 
 /// Reads each pending probe's raw `outputs` with its runtime's own grammar and
@@ -398,8 +401,9 @@ fn capability_snapshot(
     daemon_version: &str,
     supported_agents: Vec<String>,
     runtimes: Vec<AgentRuntime>,
+    search_path: Option<&OsStr>,
 ) -> HostCapabilities {
-    let git_available = which_on_path("git").is_some();
+    let git_available = which_on_path("git", search_path).is_some();
 
     HostCapabilities {
         daemon_version: daemon_version.to_owned(),
@@ -1063,9 +1067,8 @@ fn collect_probe(
 /// A small dependency-free `which`: splits `PATH`, joins the name, and returns
 /// the first executable file. Mirrors the agent launch-path probe rather than
 /// reporting a non-executable placeholder as available.
-fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
-    let path_var = crate::runtime::manager_path::helper_search_path()?;
-    which_on_path_value(name, &path_var)
+fn which_on_path(name: &str, search_path: Option<&OsStr>) -> Option<std::path::PathBuf> {
+    which_on_path_value(name, search_path?)
 }
 
 fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBuf> {

@@ -210,13 +210,14 @@ impl ProjectManager {
     /// [`ProjectSource::Manual`] (re-adding promotes an auto record), applying any
     /// explicit `name`/`base_branch` overrides in one write. Errors when `path` is
     /// not a git work tree (the operator named it deliberately) or `name` is blank.
-    pub fn add(
+    pub(crate) fn add(
         &self,
         path: &Path,
         name: Option<String>,
         base_branch: Option<String>,
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<ProjectInfo, ProtocolError> {
-        let detected = detect_at(path)?.ok_or_else(|| not_a_git_repo(path))?;
+        let detected = detect_at(path, search_path)?.ok_or_else(|| not_a_git_repo(path))?;
         let record = self.upsert(&detected, true, name, base_branch)?;
         Ok(to_info(&record))
     }
@@ -261,10 +262,11 @@ impl ProjectManager {
     /// `git worktree list --porcelain` on the common dir and enriched with which
     /// worktrees pohunek created (an active binding for this project) and which
     /// have a live session (`live`, supplied by the caller from the registry).
-    pub fn show(
+    pub(crate) fn show(
         &self,
         reference: &str,
         live: &[LiveSession],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<ProjectShowResult, ProtocolError> {
         let record = self.resolve(reference)?;
         let info = to_info(&record);
@@ -295,7 +297,7 @@ impl ProjectManager {
                 (session.session_id.clone(), paths)
             })
             .collect();
-        let worktrees = git_worktrees(&record.git_common_dir)
+        let worktrees = git_worktrees(&record.git_common_dir, search_path)
             .into_iter()
             .map(|raw| {
                 let canonical = canonical_or_original(&raw.path);
@@ -369,8 +371,15 @@ struct RawWorktree {
 /// List a repository's worktrees live, bounded by the detection git timeout
 /// (`-z` so exotic paths are verbatim, not C-quoted). Best-effort: a git failure
 /// yields an empty list, so `project show` still renders the record.
-fn git_worktrees(git_common_dir: &Path) -> Vec<RawWorktree> {
-    match detect::git(git_common_dir, &["worktree", "list", "--porcelain", "-z"]) {
+fn git_worktrees(
+    git_common_dir: &Path,
+    search_path: &crate::runtime::SearchPath,
+) -> Vec<RawWorktree> {
+    match detect::git(
+        git_common_dir,
+        &["worktree", "list", "--porcelain", "-z"],
+        search_path,
+    ) {
         Some(output) => parse_worktrees_porcelain(&output),
         None => Vec::new(),
     }
@@ -504,8 +513,11 @@ fn project_ambiguous(reference: &str, candidates: &[ProjectRecord]) -> ProtocolE
 
 /// Detect the project rooted at `path`, mapping a genuine I/O fault to a typed
 /// error. A non-git directory (or any non-fatal detection failure) is `Ok(None)`.
-pub fn detect_at(path: &Path) -> Result<Option<DetectedProject>, ProtocolError> {
-    detect::detect(path).map_err(|err| {
+pub(crate) fn detect_at(
+    path: &Path,
+    search_path: &crate::runtime::SearchPath,
+) -> Result<Option<DetectedProject>, ProtocolError> {
+    detect::detect(path, search_path).map_err(|err| {
         ProtocolError::new(
             ErrorClass::Runtime,
             "project_detect_failed",
@@ -576,7 +588,12 @@ mod tests {
 
         // add → Manual source, label = repo basename.
         let added = pm
-            .add(&repo, None, Some("develop".to_owned()))
+            .add(
+                &repo,
+                None,
+                Some("develop".to_owned()),
+                &crate::runtime::SearchPath::process(),
+            )
             .expect("add the repo");
         assert_eq!(added.source, ProjectSource::Manual);
         assert_eq!(added.label, "repo");
@@ -588,7 +605,9 @@ mod tests {
         assert_eq!(listed[0].id, added.id);
 
         // show → the project plus its (single, main) live worktree, not owned.
-        let shown = pm.show(&added.id, &[]).expect("show by id");
+        let shown = pm
+            .show(&added.id, &[], &crate::runtime::SearchPath::process())
+            .expect("show by id");
         assert_eq!(shown.project.id, added.id);
         assert_eq!(
             shown.worktrees.len(),
@@ -615,7 +634,9 @@ mod tests {
     fn show_marks_owned_worktree_and_live_session() {
         let (pm, store) = manager("show-owned");
         let repo = init_repo("show-owned");
-        let added = pm.add(&repo, None, None).expect("add");
+        let added = pm
+            .add(&repo, None, None, &crate::runtime::SearchPath::process())
+            .expect("add");
 
         // Create a real linked worktree and record a binding owned by this project.
         let wt = unique_dir("show-owned-wt").join("checkout");
@@ -652,7 +673,9 @@ mod tests {
             cwd: canonical_wt.clone(),
             worktree_path: Some(canonical_wt),
         }];
-        let shown = pm.show(&added.id, &live).expect("show");
+        let shown = pm
+            .show(&added.id, &live, &crate::runtime::SearchPath::process())
+            .expect("show");
 
         assert_eq!(
             shown.worktrees.len(),
@@ -674,7 +697,9 @@ mod tests {
     fn rename_sets_custom_label_without_changing_id() {
         let (pm, _store) = manager("rename");
         let repo = init_repo("rename");
-        let added = pm.add(&repo, None, None).expect("add");
+        let added = pm
+            .add(&repo, None, None, &crate::runtime::SearchPath::process())
+            .expect("add");
         assert_eq!(added.label, "repo");
 
         let renamed = pm
@@ -686,7 +711,9 @@ mod tests {
             "id is key-derived, unchanged by rename"
         );
         // The label is now resolvable.
-        let shown = pm.show("dashboard", &[]).expect("show by new label");
+        let shown = pm
+            .show("dashboard", &[], &crate::runtime::SearchPath::process())
+            .expect("show by new label");
         assert_eq!(shown.project.id, added.id);
     }
 
@@ -694,7 +721,9 @@ mod tests {
     fn rename_and_add_reject_a_blank_name() {
         let (pm, _store) = manager("blank-name");
         let repo = init_repo("blank-name");
-        let added = pm.add(&repo, None, None).expect("add");
+        let added = pm
+            .add(&repo, None, None, &crate::runtime::SearchPath::process())
+            .expect("add");
         // A whitespace-only rename is rejected (would blank the label).
         let err = pm
             .rename(&added.id, "   ".to_owned())
@@ -703,7 +732,12 @@ mod tests {
         // A blank --name on add is rejected too, before any write.
         let repo2 = init_repo("blank-name-2");
         let err = pm
-            .add(&repo2, Some(String::new()), None)
+            .add(
+                &repo2,
+                Some(String::new()),
+                None,
+                &crate::runtime::SearchPath::process(),
+            )
             .expect_err("blank add name");
         assert_eq!(err.code, "bad_request", "got: {err:?}");
 
@@ -723,7 +757,7 @@ mod tests {
         let (pm, _store) = manager("add-nongit");
         let non_git = unique_dir("add-nongit-dir");
         let err = pm
-            .add(&non_git, None, None)
+            .add(&non_git, None, None, &crate::runtime::SearchPath::process())
             .expect_err("non-git path errors");
         assert_eq!(err.code, "not_a_git_repo");
     }
@@ -733,8 +767,20 @@ mod tests {
         let (pm, _store) = manager("filter");
         let a = init_repo("filter-a");
         let b = init_repo("filter-b");
-        pm.add(&a, Some("alpha".to_owned()), None).expect("add a");
-        pm.add(&b, Some("beta".to_owned()), None).expect("add b");
+        pm.add(
+            &a,
+            Some("alpha".to_owned()),
+            None,
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("add a");
+        pm.add(
+            &b,
+            Some("beta".to_owned()),
+            None,
+            &crate::runtime::SearchPath::process(),
+        )
+        .expect("add b");
 
         let by_label = pm
             .list(&[protocol::ProjectListFilter::Label("alpha".to_owned())])
@@ -767,13 +813,18 @@ mod tests {
                 .expect("git init");
             assert!(init.status.success());
         }
-        pm.add(&a, None, None).expect("add a");
-        pm.add(&b, None, None).expect("add b");
+        pm.add(&a, None, None, &crate::runtime::SearchPath::process())
+            .expect("add a");
+        pm.add(&b, None, None, &crate::runtime::SearchPath::process())
+            .expect("add b");
 
         let err = pm.resolve("shared").expect_err("ambiguous label");
         assert_eq!(err.code, "project_ambiguous");
         // Both candidate ids must be listed so the operator can disambiguate.
-        let id_a = pm.add(&a, None, None).expect("re-add a").id;
+        let id_a = pm
+            .add(&a, None, None, &crate::runtime::SearchPath::process())
+            .expect("re-add a")
+            .id;
         assert!(
             err.msg.contains(&id_a),
             "ambiguous message names candidate ids: {}",

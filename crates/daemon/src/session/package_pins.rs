@@ -90,7 +90,9 @@ impl SessionRegistry {
     /// agent. A base environment that cannot be formed leaves `search_path`
     /// as an error and every run unavailable.
     pub(crate) fn package_command_host(&self) -> crate::package_command::CommandHost {
-        let search_path = self.integration_homes().map(|homes| homes.search_path());
+        let search_path = self
+            .integration_homes(&self.search_path_snapshot())
+            .map(|homes| homes.search_path());
         crate::package_command::CommandHost {
             store: self.inner.profiles.runtimes().package_store().cloned(),
             search_path,
@@ -108,7 +110,10 @@ impl SessionRegistry {
     ///
     /// Returns `worker_initialize_invalid` when the configured allowlist or
     /// the daemon's environment cannot form a base environment.
-    pub(crate) fn integration_homes(&self) -> Result<ConfigHomes, ProtocolError> {
+    pub(crate) fn integration_homes(
+        &self,
+        search_path: &crate::runtime::SearchPath,
+    ) -> Result<ConfigHomes, ProtocolError> {
         let (allowlist, source) = match self.inner.config.supervision.as_ref() {
             Some(supervision) => (
                 supervision.environment_allowlist.clone(),
@@ -125,7 +130,7 @@ impl SessionRegistry {
         let base = crate::runtime::environment::base_environment_following(
             &allowlist,
             &source,
-            self.manager_search_path(),
+            search_path.manager(),
         )
         .map_err(|error| {
             ProtocolError::new(

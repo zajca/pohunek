@@ -42,6 +42,9 @@ pub(super) struct LaunchSubject<'a> {
     /// passed the trust predicate, else empty; see
     /// [`SessionRegistry::trusted_checkout_args`].
     pub(super) trusted_args: &'a [String],
+    /// The operation's search path snapshot, whose manager `PATH` the base
+    /// environment follows.
+    pub(super) search_path: &'a crate::runtime::SearchPath,
 }
 
 /// The environment and root-position arguments of one launch.
@@ -100,6 +103,7 @@ impl SessionRegistry {
         &self,
         definition: &RuntimeDefinition,
         binding: &ResumeBinding,
+        search_path: &crate::runtime::SearchPath,
     ) -> Vec<String> {
         if definition.checkout_trust().is_none()
             || self.inner.config.trusted_repositories.is_empty()
@@ -113,7 +117,12 @@ impl SessionRegistry {
             }
             Some(launch) => {
                 return self
-                    .trusted_checkout_args(definition, &launch.cwd, launch.project_id.as_deref())
+                    .trusted_checkout_args(
+                        definition,
+                        &launch.cwd,
+                        launch.project_id.as_deref(),
+                        search_path,
+                    )
                     .await;
             }
         };
@@ -159,6 +168,7 @@ impl SessionRegistry {
         definition: &RuntimeDefinition,
         cwd: &Path,
         project_id: Option<&str>,
+        search_path: &crate::runtime::SearchPath,
     ) -> Vec<String> {
         let Some(trust) = definition.checkout_trust() else {
             return Vec::new();
@@ -195,10 +205,11 @@ impl SessionRegistry {
         if self.checkout_is_stalled(&checkout) {
             return Vec::new();
         }
-        let (cwd, project_id, paths) = (
+        let (cwd, project_id, paths, search_path) = (
             checkout.clone(),
             project_id.to_owned(),
             trust.paths().to_vec(),
+            search_path.clone(),
         );
         let run = Arc::new(EvaluationRun::default());
         let (task_run, stalled) = (Arc::clone(&run), Arc::clone(&self.inner.stalled_checkouts));
@@ -215,6 +226,7 @@ impl SessionRegistry {
                     scratch_root: &scratch_root,
                     remote_source: remote_source.as_ref(),
                     read_observer: read_observer.as_ref(),
+                    search_path: &search_path,
                 },
             );
             let trusted = outcome.trusted();
@@ -290,12 +302,14 @@ impl SessionRegistry {
             frozen_args,
             name,
             trusted_args,
+            search_path,
         } = subject;
         let base = self.launch_env(definition, profile_env, agent.clone(), id);
         let mut declared_args = placement_args(definition, frozen_args);
         declared_args.extend(naming_args(definition, name, id));
         declared_args.extend_from_slice(trusted_args);
-        let Some(contribution) = self.contribution(definition, &base, id, kind, frozen_args)?
+        let Some(contribution) =
+            self.contribution(definition, &base, id, kind, frozen_args, search_path)?
         else {
             return Ok(LaunchInputs {
                 env: base,
@@ -323,6 +337,10 @@ impl SessionRegistry {
     ///
     /// As [`Self::launch_inputs`] for the contributor's own refusal and the
     /// unresolved environment.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the launch identity (definition, profile env, agent, id, kind, frozen args) plus the operation's search path"
+    )]
     pub(super) fn contributed_env_names(
         &self,
         definition: &RuntimeDefinition,
@@ -331,10 +349,11 @@ impl SessionRegistry {
         id: &SessionId,
         kind: LaunchKind,
         frozen_args: &[String],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<Vec<String>, ProtocolError> {
         let base = self.launch_env(definition, profile_env, agent, id);
         Ok(self
-            .contribution(definition, &base, id, kind, frozen_args)?
+            .contribution(definition, &base, id, kind, frozen_args, search_path)?
             .map_or_else(Vec::new, |input| {
                 input.env.into_iter().map(|(name, _)| name).collect()
             }))
@@ -349,6 +368,7 @@ impl SessionRegistry {
         id: &SessionId,
         kind: LaunchKind,
         frozen_args: &[String],
+        search_path: &crate::runtime::SearchPath,
     ) -> Result<Option<LaunchInput>, ProtocolError> {
         let Some(contributor) = crate::integration::launch_contributor(definition) else {
             return Ok(None);
@@ -356,7 +376,7 @@ impl SessionRegistry {
         let Some(state_root) = self.inner.config.worker_state_root.as_deref() else {
             return Err(unavailable_state_root());
         };
-        let environment = self.launch_base_environment()?;
+        let environment = self.launch_base_environment(search_path)?;
         let config_home = match definition.config_home() {
             Some(home) => Some(
                 home.resolve(&|name| effective_variable(&environment, base, name))
@@ -578,6 +598,7 @@ pub(super) async fn pin_git_hooks_off(
     base: &BaseEnv,
     env: &mut LaunchEnv,
     cwd: &Path,
+    search_path: &crate::runtime::SearchPath,
 ) -> Result<(), ProtocolError> {
     let first = git_config_count(|name| {
         env.iter()
@@ -592,15 +613,17 @@ pub(super) async fn pin_git_hooks_off(
         .chain(env.iter().cloned())
         .collect();
     let dir = cwd.to_path_buf();
-    let hooks = tokio::task::spawn_blocking(move || list_config_hooks(&dir, &layered))
-        .await
-        .map_err(|join| join.to_string())
-        .and_then(|listed| listed)
-        .map_err(|detail| {
-            git_hooks_env_conflict(&format!(
-                "the configured git hooks of the agent could not be listed: {detail}"
-            ))
-        })?;
+    let search_path = search_path.clone();
+    let hooks =
+        tokio::task::spawn_blocking(move || list_config_hooks(&search_path, &dir, &layered))
+            .await
+            .map_err(|join| join.to_string())
+            .and_then(|listed| listed)
+            .map_err(|detail| {
+                git_hooks_env_conflict(&format!(
+                    "the configured git hooks of the agent could not be listed: {detail}"
+                ))
+            })?;
     env.append(LaunchEnv::new(git_hooks_off_pairs(first, &hooks)?));
     Ok(())
 }
