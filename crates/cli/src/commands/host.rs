@@ -463,6 +463,8 @@ mod tests {
             worktree_supported: true,
             session_new_agent_options_supported: true,
             host_hooks: None,
+            runtime_api: None,
+            runtime_features: Vec::new(),
             session_new_skip_repo_hooks_supported: false,
         };
         let output = render_capabilities_human("host-b", &caps);
@@ -530,6 +532,8 @@ mod tests {
             session_new_branch_source_supported: true,
             session_new_agent_options_supported: true,
             host_hooks: None,
+            runtime_api: None,
+            runtime_features: Vec::new(),
             session_new_skip_repo_hooks_supported: false,
         };
         let output = render_capabilities_human("host-b", &caps);

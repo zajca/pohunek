@@ -390,6 +390,26 @@ pub struct HostCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub host_hooks: Option<HostHookScripts>,
+    /// The `runtime_api` generation this core accepts in a runtime package
+    /// descriptor (`runtime_api = N`). Answered with `skip_runtime_probes` too.
+    ///
+    /// A daemon that predates the field omits it, which decodes as `None`:
+    /// unknown, not "no support". It travels with
+    /// [`runtime_features`](Self::runtime_features), so a client decides on
+    /// this field, never on the list being empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub runtime_api: Option<u32>,
+    /// The runtime feature ids this core implements, in the order they were
+    /// added: the ids a runtime package descriptor may list in `requires`.
+    /// Answered with `skip_runtime_probes` too.
+    ///
+    /// A daemon that predates the field omits it, which decodes as an empty
+    /// list; an empty list also never appears on the wire. A client reads it
+    /// only when [`runtime_api`](Self::runtime_api) is present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<Vec<String>>"))]
+    pub runtime_features: Vec<String>,
 }
 
 /// Whether the host-global hook layer has a script for each lifecycle event.

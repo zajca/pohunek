@@ -130,6 +130,26 @@ renamed, because a published descriptor may require it; the table equals a
 snapshot file that a test compares. Which core version first has a feature is
 not part of the refusal, because an older core cannot know it.
 
+### Compatibility report
+
+`pohunek plugin compat [--json]` asks the local daemon what its core accepts
+from a runtime package, so you can check a package against this host before an
+install. It prints the core version (the daemon's `daemon_version`, the same
+string `pohunekd --version` prints), the protocol version negotiated for the
+connection, the `runtime_api` generation the core accepts and every feature id
+of the table above, in the core's registry order. With `--json` the document
+is `{core_version, protocol_version, runtime_api, features}`. Compare it with
+the package's `runtime_api` and `requires`: a package whose `runtime_api` the
+core does not accept, or whose `requires` names a feature the report does not
+list, is refused at install.
+
+The same two fields, `runtime_api` and `runtime_features`, are part of every
+`host.inspect` answer, also one made with `skip_runtime_probes`, so a client
+can read them without the command. A daemon that predates them omits both.
+The command then fails with `plugin_compat_unsupported` (exit 1) instead of
+printing an empty feature list: absent means unknown, not "supports nothing".
+The command runs against the local daemon only; `--host` is rejected.
+
 ## Agent skill location
 
 A runtime whose agent reads user-level skills declares where, in an optional

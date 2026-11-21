@@ -69,6 +69,19 @@ pub(crate) enum Action {
         json: bool,
     },
 
+    /// Report what the local daemon's core accepts from a runtime package.
+    ///
+    /// Prints the core version, the protocol version, the `runtime_api`
+    /// generation and the runtime feature ids a package descriptor may list in
+    /// `requires`, so you can check a package against this host before an
+    /// install. Fails with `plugin_compat_unsupported` against a daemon that
+    /// does not report them.
+    Compat {
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manage the stored plugin index.
     Index {
         #[command(subcommand)]
@@ -182,6 +195,7 @@ impl Action {
     pub(crate) fn wants_json(&self) -> bool {
         match self {
             Self::List { json }
+            | Self::Compat { json }
             | Self::Inspect { json, .. }
             | Self::Select { json, .. }
             | Self::Enable { json, .. }
@@ -663,6 +677,14 @@ pub(crate) enum Error {
         detail: String,
     },
 
+    /// The daemon's `host.inspect` carries no `runtime_api`, so what its core
+    /// accepts from a runtime package is unknown.
+    #[error("the local daemon {daemon_version} does not report its runtime compatibility")]
+    CompatUnsupported {
+        /// Version string the daemon answered with.
+        daemon_version: String,
+    },
+
     /// The daemon predates `package.create_profile`.
     #[error("the local daemon is too old for `plugin profile create`")]
     ProfileCreateUnsupported,
@@ -767,6 +789,7 @@ impl Error {
             Self::UpdateVersionUnordered { .. } => "plugin_update_version_unordered",
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
             Self::ProfileTarget { .. } => "profile_target_invalid",
+            Self::CompatUnsupported { .. } => "plugin_compat_unsupported",
             Self::ProfileCreateUnsupported => "profile_create_unsupported",
             Self::ProfileCreateOptionsUnsupported => "profile_create_options_unsupported",
             Self::ProfileCreatePresetUnsupported => "profile_create_preset_unsupported",
@@ -864,7 +887,8 @@ impl Error {
             Self::ProfileDirectory { .. } => {
                 "the agents directory must be owned by you and not group- or world-writable"
             }
-            Self::ProfileCreateUnsupported
+            Self::CompatUnsupported { .. }
+            | Self::ProfileCreateUnsupported
             | Self::ProfileCreateOptionsUnsupported
             | Self::ProfileCreatePresetUnsupported
             | Self::ProfileRemoveUnsupported => {
@@ -1032,6 +1056,11 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             let mut client = connect().await?;
             let result = list(&mut client).await?;
             print_output(json, &result, || render_list(&result))?;
+        }
+        Action::Compat { json } => {
+            let mut client = connect().await?;
+            let report = compat_report(&mut client).await?;
+            print_output(json, &report, || render_compat(&report))?;
         }
         Action::Inspect { selector, json } => run_inspect(&selector, json).await?,
         Action::Select { selector, json } => {
@@ -1410,6 +1439,60 @@ async fn connect() -> Result<Client, CliError> {
 async fn connect_ingest() -> Result<Client, CliError> {
     let paths = Paths::resolve()?;
     Client::connect_with_request_timeout(LOCAL_HOST, &paths, INSTALL_RESPONSE_TIMEOUT).await
+}
+
+/// What `pohunek plugin compat` reports: the local core's side of the runtime
+/// package contract.
+#[derive(Debug, serde::Serialize)]
+struct CompatReport {
+    /// Version string of the daemon (the core) answering on this host.
+    core_version: String,
+    /// Protocol version negotiated for this connection.
+    protocol_version: protocol::ProtocolVersion,
+    /// The `runtime_api` generation the core accepts in a descriptor.
+    runtime_api: u32,
+    /// The feature ids the core implements, in registry order.
+    features: Vec<String>,
+}
+
+/// Asks the daemon for its runtime compatibility.
+///
+/// The decision rests on `runtime_api`: a daemon that predates the fields
+/// omits both, and an empty feature list is indistinguishable from it.
+async fn compat_report(client: &mut Client) -> Result<CompatReport, CliError> {
+    let capabilities = client
+        .host_inspect_with(protocol::HostInspectParams {
+            skip_runtime_probes: Some(true),
+        })
+        .await?;
+    let Some(runtime_api) = capabilities.runtime_api else {
+        return Err(Error::CompatUnsupported {
+            daemon_version: capabilities.daemon_version,
+        }
+        .into());
+    };
+    Ok(CompatReport {
+        core_version: capabilities.daemon_version,
+        protocol_version: capabilities.protocol_version,
+        runtime_api,
+        features: capabilities.runtime_features,
+    })
+}
+
+fn render_compat(report: &CompatReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "core version:     {}",
+        sanitize(&report.core_version)
+    );
+    let _ = writeln!(output, "protocol version: {}", report.protocol_version);
+    let _ = writeln!(output, "runtime_api:      {}", report.runtime_api);
+    let _ = writeln!(output, "features ({}):", report.features.len());
+    for feature in &report.features {
+        let _ = writeln!(output, "  {}", sanitize(feature));
+    }
+    output
 }
 
 pub(super) async fn list(client: &mut Client) -> Result<PackageListResult, CliError> {

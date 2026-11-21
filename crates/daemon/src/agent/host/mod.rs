@@ -45,6 +45,7 @@ pub use definition::{
     MAX_DEFINITION_BYTES, MAX_LABEL_BYTES, MAX_LAUNCH_ARGS, SUPPORTED_RUNTIME_API,
     SUPPORTED_SCHEMA,
 };
+pub(crate) use features::runtime_feature_ids;
 pub use handle::{PackageReport, ReloadError, RuntimeHost};
 #[cfg(test)]
 pub(crate) use launch::check_pin;

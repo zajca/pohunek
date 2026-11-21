@@ -86,6 +86,8 @@ mod pi_package;
 mod plugin_catalog_install;
 #[path = "plugin_cli.rs"]
 mod plugin_cli;
+#[path = "plugin_compat.rs"]
+mod plugin_compat;
 #[path = "plugin_daemon.rs"]
 mod plugin_daemon;
 #[path = "plugin_index_install.rs"]

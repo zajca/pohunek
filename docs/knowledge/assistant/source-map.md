@@ -660,7 +660,7 @@ Runtime package archive format:
 - `crates/daemon/src/api/handler/package.rs` — `package.*` handlers and the local-only gate.
 - `crates/daemon/src/agent/profile.rs` — profile `package`/`digest` pins and `pinned_digests`.
 - `crates/protocol/src/package.rs` — `package.*` payloads and stable error codes.
-- `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
+- `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor|compat`; `compat` reports the `runtime_api` and `runtime_features` of `host.inspect`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate|create|show`, including `create --options-file` and `create --preset-of`.
 - `crates/cli/src/commands/profile_fold.rs` — `pohunek plugin profile fold`: the proposal of a parent with options and one preset per input.
 - `crates/package/src/credential.rs` — the credential-literal detector the daemon's profile checks and `plugin profile fold` share.

@@ -75,6 +75,7 @@ fn subcommand_completion_lists_each_group_in_declaration_order() {
             &["pohunek", "plugin", ""],
             &[
                 "list",
+                "compat",
                 "index",
                 "inspect",
                 "install",

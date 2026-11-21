@@ -296,4 +296,24 @@ export type HostCapabilities = {
    * unknown, not "no scripts".
    */
   host_hooks?: HostHookScripts;
+  /**
+   * The `runtime_api` generation this core accepts in a runtime package
+   * descriptor (`runtime_api = N`). Answered with `skip_runtime_probes` too.
+   *
+   * A daemon that predates the field omits it, which decodes as `None`:
+   * unknown, not "no support". It travels with
+   * [`runtime_features`](Self::runtime_features), so a client decides on
+   * this field, never on the list being empty.
+   */
+  runtime_api?: number;
+  /**
+   * The runtime feature ids this core implements, in the order they were
+   * added: the ids a runtime package descriptor may list in `requires`.
+   * Answered with `skip_runtime_probes` too.
+   *
+   * A daemon that predates the field omits it, which decodes as an empty
+   * list; an empty list also never appears on the wire. A client reads it
+   * only when [`runtime_api`](Self::runtime_api) is present.
+   */
+  runtime_features?: Array<string>;
 };
