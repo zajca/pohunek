@@ -426,6 +426,25 @@ fn assert_upgrade_report(report: &Value, from: &str, to: &str) {
     );
 }
 
+/// Checks that the head's `service upgrade --no-assistant-package` ran the
+/// assistant package step, reported the opt-out and asked no plugin index, so
+/// the release workflow stays offline and independent of the live index.
+fn assert_assistant_step_skipped(report: &Value) {
+    let assistant = &report["assistant"];
+    assert_eq!(
+        assistant["package_id"], "pohunek.context.assistant",
+        "the upgrade carries the assistant package state: {report}"
+    );
+    assert_ne!(
+        assistant["status"], "unchecked",
+        "the upgraded daemon answered: {report}"
+    );
+    assert_eq!(
+        assistant["install"]["result"], "skipped",
+        "the opt-out is reported and nothing is installed: {report}"
+    );
+}
+
 /// Inputs and paths of one run.
 struct Run {
     home: PathBuf,
@@ -2233,11 +2252,17 @@ impl Upgrade {
         self.assert_strict_repins("service check");
 
         let from = self.run.head_dir.display().to_string();
-        let report = self
-            .head
-            .json(&["service", "upgrade", "--from", &from, "--json"]);
+        let report = self.head.json(&[
+            "service",
+            "upgrade",
+            "--from",
+            &from,
+            "--no-assistant-package",
+            "--json",
+        ]);
         eprintln!("service upgrade: {report}");
         assert_upgrade_report(&report, &self.previous_version, &self.head_version);
+        assert_assistant_step_skipped(&report);
         // After an apply the upgrade's preflight is the judgement against the
         // installed packages, which carries no plan; `service check` above
         // carries the plan and `runtimes` below the applied step.

@@ -33,6 +33,7 @@ pub(crate) mod setup;
 pub(crate) mod setup_assistant;
 pub(crate) mod setup_hooks;
 pub(crate) mod setup_host;
+pub(crate) mod upgrade_assistant;
 
 /// Render a command result as the pretty-printed JSON document (with a trailing
 /// newline) emitted under `--json`.

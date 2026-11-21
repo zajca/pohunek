@@ -31,19 +31,22 @@ pub mod host_setup {
 }
 pub mod service;
 pub mod upgrade_assistant {
-    //! The assistant package state `pohunek service upgrade` reports, asked of
-    //! the daemon that serves the installation `base` describes.
+    //! The assistant package step of `pohunek service upgrade`, run against the
+    //! daemon that serves the installation `base` describes.
     //!
-    //! Test seam: `tests/release_upgrade.rs` runs the real `pohunek service
-    //! upgrade` under a real service manager, but it is opt-in on Linux
-    //! (`POHUNEK_SYSTEMD_E2E=1`) and stages neither an older assistant package
-    //! selected before the swap nor a stopped daemon after it, which the
-    //! `outdated` and `unchecked` rows need. `tests/service_upgrade.rs` calls
-    //! the engine below the CLI action that attaches the assistant state. The
-    //! scenario in `tests/assistant_package_upgrade.rs` therefore drives the
-    //! functions the upgrade calls against a daemon of the harness.
+    //! Test seam: the CLI action calls [`reconcile`] right after the engine
+    //! commits the upgrade, so the seam is the action minus the engine. The
+    //! full binary cannot stage an older-to-newer core change in-process (the
+    //! engine's version override is a builder the binary never reaches), and
+    //! `tests/release_upgrade.rs` is opt-in on Linux (`POHUNEK_SYSTEMD_E2E=1`)
+    //! and stages neither an older assistant package selected before the swap
+    //! nor a stopped daemon after it. `tests/assistant_package_upgrade.rs`
+    //! therefore drives [`reconcile`] against a daemon of the harness, and runs
+    //! the real binary for the rows that need no committed upgrade.
     use crate::paths::Paths;
     use crate::service::report::AssistantPackageReport;
+
+    pub use crate::commands::upgrade_assistant::Options;
 
     /// Compares the selected assistant package with `core_version`.
     pub async fn state(
@@ -53,13 +56,15 @@ pub mod upgrade_assistant {
         crate::commands::service::assistant_state(core_version, Ok(Paths::from_base(base))).await
     }
 
-    /// `report` carrying the assistant package state, as `service upgrade`
-    /// finishes it.
-    pub async fn attach(
+    /// `report` carrying the assistant package state and the outcome of the
+    /// install step, as `service upgrade` finishes it.
+    pub async fn reconcile(
         report: crate::service::report::UpgradeReport,
         base: &pohunek_paths::BasePaths,
+        options: &Options<'_>,
     ) -> crate::service::report::UpgradeReport {
-        crate::commands::service::with_assistant(report, Ok(Paths::from_base(base))).await
+        crate::commands::upgrade_assistant::reconcile(report, Ok(Paths::from_base(base)), options)
+            .await
     }
 
     /// The text `service upgrade` prints for `report`.

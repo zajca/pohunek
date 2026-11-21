@@ -50,25 +50,44 @@
 # upgrade, and no session is changed. A store the new daemon refuses
 # to start with is never overridable. `service install` takes no such flag and
 # is never given it.
+#
+# A committed `service upgrade` to a newer version installs the assistant
+# context package the signed plugin index lists for the new release, which asks
+# the network and never fails the upgrade. `--no-assistant-package` is passed to
+# `service upgrade` to skip that step on a host without access to the index;
+# `service install` takes no such flag and is never given it. A fresh host gets
+# the package from `pohunek setup`, which the final hint names.
 
 set -eu
 
 usage() {
-    echo "usage: $0 [--accept-runtime-loss]" >&2
-    echo "  --accept-runtime-loss  accept live sessions the upgraded daemon would not adopt or" >&2
-    echo "                         would lose native recovery for; a store the new daemon" >&2
-    echo "                         refuses is never accepted" >&2
+    echo "usage: $0 [--accept-runtime-loss] [--no-assistant-package]" >&2
+    echo "  --accept-runtime-loss   accept live sessions the upgraded daemon would not adopt or" >&2
+    echo "                          would lose native recovery for; a store the new daemon" >&2
+    echo "                          refuses is never accepted" >&2
+    echo "  --no-assistant-package  do not install the assistant context package after an" >&2
+    echo "                          upgrade (it asks the plugin index over the network)" >&2
 }
 
 accept_runtime_loss=0
-if [ "${1:-}" = "--accept-runtime-loss" ]; then
-    accept_runtime_loss=1
+no_assistant_package=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --accept-runtime-loss)
+            [ "$accept_runtime_loss" -eq 0 ] || { usage; exit 2; }
+            accept_runtime_loss=1
+            ;;
+        --no-assistant-package)
+            [ "$no_assistant_package" -eq 0 ] || { usage; exit 2; }
+            no_assistant_package=1
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
     shift
-fi
-if [ "$#" -ne 0 ]; then
-    usage
-    exit 2
-fi
+done
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 archive_dir=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
@@ -119,6 +138,9 @@ fi
 if [ -z "${POHUNEK_SERVICE_LOCK_TOKEN:-}" ]; then
     if [ "$accept_runtime_loss" -eq 1 ]; then
         set -- --accept-runtime-loss
+    fi
+    if [ "$no_assistant_package" -eq 1 ]; then
+        set -- "$@" --no-assistant-package
     fi
     exec "$archive_dir/pohunek" service lock -- sh "$script_dir/install-daemon.sh" "$@"
 fi
@@ -271,6 +293,9 @@ if [ "$service_action" = upgrade ]; then
     if [ "$accept_runtime_loss" -eq 1 ]; then
         set -- "$@" --accept-runtime-loss
     fi
+    if [ "$no_assistant_package" -eq 1 ]; then
+        set -- "$@" --no-assistant-package
+    fi
 else
     set -- service install --from "$archive_dir" --prefix "$prefix"
 fi
@@ -286,5 +311,8 @@ if [ "$status" -eq 0 ]; then
     echo "(add \`--profile <name>\` for a host profile's home)" >&2
     echo "for an outdated Hermes plugin run \`pohunek integration update --agent hermes\`" >&2
     echo "with the \`--hermes-profile\` or \`--hermes-home\` it was installed with" >&2
+    if [ "$service_action" = install ]; then
+        echo "install the assistant context package with \`pohunek setup\`" >&2
+    fi
 fi
 exit "$status"
