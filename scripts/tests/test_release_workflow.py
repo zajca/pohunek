@@ -1270,6 +1270,17 @@ class AssetNameTests(ReleaseWorkflowFiles):
         for build, staged in positions:
             self.assertLess(build, staged)
 
+    def test_the_kit_macos_job_builds_through_build_release_and_audits_the_staged_tree(self):
+        kit = self.build_jobs["kit-macos"]
+        self.assertNotIn("cargo build --", kit)
+        self.assertIn('bindir="$(packaging/macos/build-release kit)"', kit)
+        self.assertIn("BINDIR: ${{ steps.build.outputs.bindir }}", kit)
+        audit = kit.split("packaging/macos/audit-macho", 1)[1].split("packaging/archive-kit", 1)[0]
+        for program in ("pohunek", "pohunekd", "pohunek-sessiond", "pohunek-plugin-kit"):
+            self.assertIn(f"--require {program}", audit)
+        self.assertIn('"stage/$name"', audit)
+        self.assertLess(kit.index("packaging/stage-kit-bundle"), kit.index("packaging/macos/audit-macho"))
+
     def test_the_macos_jobs_equal_the_policy_archives(self):
         darwin = {slot["component"] for slot in self.policy["archives"] if slot["target"].endswith("-apple-darwin")}
         targets = {slot["target"] for slot in self.policy["archives"] if slot["target"].endswith("-apple-darwin")}

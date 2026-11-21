@@ -402,7 +402,8 @@ Release packaging and contributor verification:
 - `packaging/macos/DEPLOYMENT_TARGET` — the macOS deployment target (`14.0`)
   every native macOS build and audit uses.
 - `packaging/macos/build-release` — locked, deployment-target-pinned,
-  path-remapped native Apple Silicon release build of one component.
+  path-remapped native Apple Silicon release build of one component (`cli`,
+  `daemon`, or the plugin `kit`).
 - `packaging/macos/audit-macho` — fails a release tree unless every Mach-O file
   is thin arm64, within the deployment target, linked only against system
   libraries, with no runtime search path and no build-machine path.

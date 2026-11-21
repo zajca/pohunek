@@ -449,31 +449,30 @@ jobs:
           shared-key: release-kit-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The same locked, deployment-target-pinned, path-remapped build as the
+      # core macOS archives; the kit binaries are audited below.
       - name: Build the kit binaries
+        id: build
         shell: bash
+        timeout-minutes: 90
         run: |
           set -euo pipefail
-          cargo build --locked --release --target "$TARGET" \
-            -p pohunek-cli \
-            -p pohunek-daemon \
-            -p pohunek-session-worker \
-            -p pohunek-plugin-kit \
-            --bin pohunek \
-            --bin pohunekd \
-            --bin pohunek-sessiond \
-            --bin pohunek-plugin-kit
+          bindir="$(packaging/macos/build-release kit)"
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
 
       - name: Stage and archive the kit bundle
         shell: bash
+        timeout-minutes: 15
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          BINDIR: ${{ steps.build.outputs.bindir }}
         run: |
           set -euo pipefail
           # Archives are stamped with the commit time, so rebuilding the same
           # commit yields the same archive bytes.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
-          bindir="target/$TARGET/release"
+          bindir="$BINDIR"
           packaging/check-no-embedded-knowledge docs/knowledge/assistant/system.md \
             "$bindir/pohunek" \
             "$bindir/pohunekd" \
@@ -485,6 +484,14 @@ jobs:
             echo "::error::staged bundle $name does not match the kit name"
             exit 1
           fi
+          # The staged tree gets the audit the core macOS archives get: thin
+          # arm64, deployment target, system libraries only, no build-machine
+          # path, and every program a Mach-O file. The kit bundle is attested,
+          # not signed, so `verify-signed` does not apply.
+          packaging/macos/audit-macho \
+            --require pohunek --require pohunekd \
+            --require pohunek-sessiond --require pohunek-plugin-kit \
+            --forbid-string "$PWD" "stage/$name"
           packaging/archive-kit stage "$name" dist
 
       # A rerun of the job replaces the uploads of its failed attempt.
