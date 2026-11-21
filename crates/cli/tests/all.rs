@@ -14,6 +14,8 @@
 mod agent_skill;
 #[path = "assistant.rs"]
 mod assistant;
+#[path = "assistant_package_upgrade.rs"]
+mod assistant_package_upgrade;
 #[path = "attach_ended_refused.rs"]
 mod attach_ended_refused;
 #[path = "attach_menu_keys.rs"]

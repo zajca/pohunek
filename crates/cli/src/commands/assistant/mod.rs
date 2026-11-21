@@ -127,9 +127,19 @@ struct AssistantMeta<'a> {
     intent: &'a str,
     agent: &'a str,
     knowledge_bundle_version: &'a str,
+    /// Set when the bundle is older than this pohunek release, with the
+    /// command that updates it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    knowledge_bundle_note: Option<String>,
     snapshot_included: bool,
     auto_started_daemon: bool,
     knowledge: &'a str,
+}
+
+/// The note for a bundle of `version` that is older than the daemon
+/// (`daemon_version`) that serves it.
+fn bundle_note(version: &str, daemon_version: &str) -> Option<String> {
+    crate::commands::setup_assistant::outdated_note(version, daemon_version)
 }
 
 /// Run `pohunek assistant`.
@@ -230,6 +240,8 @@ fn print_prompt(
             bundle_path: Option<&'a str>,
             snapshot_path: &'a str,
             knowledge_bundle_version: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            knowledge_bundle_note: Option<String>,
             knowledge: &'a str,
         }
         print!(
@@ -242,6 +254,10 @@ fn print_prompt(
                 bundle_path: prepared.knowledge.bundle_path.as_deref(),
                 snapshot_path: &prepared.knowledge.snapshot_path,
                 knowledge_bundle_version: &prepared.knowledge.version,
+                knowledge_bundle_note: bundle_note(
+                    &prepared.knowledge.version,
+                    &prepared.knowledge.daemon_version,
+                ),
                 knowledge: prepared.knowledge.label,
             })?
         );
@@ -255,6 +271,12 @@ fn print_prompt(
             "knowledge: {} ({})",
             prepared.knowledge.version, prepared.knowledge.label
         );
+        if let Some(note) = bundle_note(
+            &prepared.knowledge.version,
+            &prepared.knowledge.daemon_version,
+        ) {
+            eprintln!("note: {note}");
+        }
         if let Some(bundle_path) = &prepared.knowledge.bundle_path {
             println!("bundle: {bundle_path}");
         }
@@ -314,6 +336,10 @@ fn emit_launch_output(
                     intent: opts.intent.as_str(),
                     agent: &result.assistant.agent,
                     knowledge_bundle_version: &result.assistant.knowledge_bundle_version,
+                    knowledge_bundle_note: bundle_note(
+                        &result.assistant.knowledge_bundle_version,
+                        &result.assistant.daemon_version,
+                    ),
                     snapshot_included: result.assistant.snapshot_included,
                     auto_started_daemon: result.assistant.auto_started_daemon,
                     knowledge: result.assistant.knowledge,
@@ -352,6 +378,12 @@ fn emit_launch_output(
             "knowledge: {} ({})",
             result.assistant.knowledge_bundle_version, result.assistant.knowledge
         );
+        if let Some(note) = bundle_note(
+            &result.assistant.knowledge_bundle_version,
+            &result.assistant.daemon_version,
+        ) {
+            eprintln!("note: {note}");
+        }
         println!(
             "snapshot: {}",
             if opts.no_snapshot {

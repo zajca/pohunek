@@ -30,6 +30,44 @@ pub mod host_setup {
     };
 }
 pub mod service;
+pub mod upgrade_assistant {
+    //! The assistant package state `pohunek service upgrade` reports, asked of
+    //! the daemon that serves the installation `base` describes.
+    use crate::paths::Paths;
+    use crate::service::report::AssistantPackageReport;
+
+    /// Compares the selected assistant package with `core_version`.
+    pub async fn state(
+        core_version: &str,
+        base: &pohunek_paths::BasePaths,
+    ) -> AssistantPackageReport {
+        crate::commands::service::assistant_state(core_version, Ok(Paths::from_base(base))).await
+    }
+
+    /// `report` carrying the assistant package state, as `service upgrade`
+    /// finishes it.
+    pub async fn attach(
+        report: crate::service::report::UpgradeReport,
+        base: &pohunek_paths::BasePaths,
+    ) -> crate::service::report::UpgradeReport {
+        crate::commands::service::with_assistant(report, Ok(Paths::from_base(base))).await
+    }
+
+    /// The text `service upgrade` prints for `report`.
+    #[must_use]
+    pub fn render_report(report: &crate::service::report::UpgradeReport) -> String {
+        crate::commands::service::render_upgrade(report)
+    }
+
+    /// The text the upgrade prints for `state`; empty when there is nothing to
+    /// tell.
+    #[must_use]
+    pub fn render(state: &AssistantPackageReport) -> String {
+        let mut text = String::new();
+        crate::commands::service::render_assistant(&mut text, state);
+        text
+    }
+}
 mod target;
 #[cfg(test)]
 mod test_daemon;

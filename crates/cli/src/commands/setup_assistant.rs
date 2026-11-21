@@ -239,9 +239,30 @@ pub(crate) async fn apply(
     }
 }
 
+/// The command that replaces an older selected package with the version the
+/// plugin index lists for this core release.
+pub(crate) const UPDATE_COMMAND: &str = "pohunek setup";
+
+/// The package id of the assistant context package.
+pub(crate) const PACKAGE_ID: &str = ASSISTANT_PACKAGE;
+
+/// The note for an assistant bundle `bundle` that is older than the core
+/// `core`, with the command that updates it; `None` when it is not older or
+/// not comparable.
+pub(crate) fn outdated_note(bundle: &str, core: &str) -> Option<String> {
+    is_older(bundle, core).then(|| {
+        format!(
+            "the assistant package {ASSISTANT_PACKAGE} {bundle} is older than pohunek {core}; \
+             run `{UPDATE_COMMAND}` on the host that runs the session to install the version \
+             the plugin index lists for this release (a package you disabled or did not select \
+             stays as set and the command names the steps)"
+        )
+    })
+}
+
 /// Whether `current` is a semantic version lower than `listed`; a version
 /// that is not semantic is never older.
-fn is_older(current: &str, listed: &str) -> bool {
+pub(crate) fn is_older(current: &str, listed: &str) -> bool {
     match (
         semver::Version::parse(current),
         semver::Version::parse(listed),

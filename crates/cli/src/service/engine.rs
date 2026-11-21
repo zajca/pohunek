@@ -930,6 +930,7 @@ impl<'a> Engine<'a> {
                 resumed_daemon(daemon_replaced, set_aside.is_some()),
             ),
             refused_entries: layout::refused_entries(&layout)?,
+            assistant: None,
         })
     }
 
@@ -2967,6 +2968,7 @@ impl<'a> Engine<'a> {
             integrations: Vec::new(),
             repair: self.repair_report(version, set_aside, published, daemon),
             refused_entries: layout::refused_entries(layout)?,
+            assistant: None,
         })
     }
 

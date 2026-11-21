@@ -466,7 +466,16 @@ with the step to take; build the archive from a checkout of
 [`plugin-assistant`](https://github.com/pohunekd/plugin-assistant) (its README)
 instead.
 
-After a core upgrade, move to the package version whose release notes name your
+`pohunek service upgrade` (and `packaging/install-daemon.sh`, which runs it) does
+not install or replace this package, because the release archive does not carry
+it. The upgrade report says so: an `assistant` line names the selected version
+and `pohunek setup` when the package is older than the new core, and
+`pohunek assistant` prints the same note while the older bundle is selected.
+`pohunek setup` replaces the older selected package with the version the signed
+plugin index lists for the release (the package is published right after the core
+release, so a run just after the release can find the index without it); a package
+you disabled or did not select stays as set and `setup` names the steps.
+Without the index, move to the package version whose release notes name your
 core version with `plugin update`, which installs the new version next to the old
 one and selects it (a plain `plugin install` keeps the old version selected):
 
